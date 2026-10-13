@@ -1,0 +1,11 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+physics = { path = "../physics" }
+world = { path = "../world" }
+
+[lints]
+workspace = true
