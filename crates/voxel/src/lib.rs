@@ -8,3 +8,16 @@
 //! 禁止:IO、时钟、随机数、线程(确定性核纪律,蓝图 §4)。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 voxel](../../docs/design/codebase-layout.md)
+
+mod block;
+mod chunk;
+mod edit;
+mod world;
+
+pub use block::{BlockRegistry, SimpleRegistry, SimpleRegistryError};
+pub use chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
+pub use edit::VoxelEdit;
+pub use world::{VoxelError, VoxelWorld};
+
+/// 便捷 re-export(单一事实源在 types,蓝图 §0)。
+pub use types::BlockId;

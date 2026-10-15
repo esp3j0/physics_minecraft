@@ -1,6 +1,6 @@
 # REQ-001:总体架构——Rapier 多世界分片并行 + 单世界激活
 
-- 状态:**已确认**(2026-10-15 用户拍板,13 项开放问题全部决议,见 §9)
+- 状态:**开发中**(2026-10-15 确认并开工;13 项决议见 §9;代码布局按 docs/design/codebase-layout.md,已落地:骨架 8 crate、types、voxel)
 - 提出日期:2026-10-14;确认日期:2026-10-15
 - 关联 demo:`demos/shard-migration`(A)、`demos/voxel-collider`(B)、`demos/solidify-bridge`(C)、`demos/cross-shard-explosion`(D)
 - 代码证据:`docs/research/ferrumc-v2-survey.md`(下称【调研】,file:line 证据在里面)
