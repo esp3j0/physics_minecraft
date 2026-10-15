@@ -34,10 +34,11 @@
    app 层将来要 async 可以在边缘包一层;
 2. **两个 trait 都加 `Send` supertrait**:worker 线程持有 `Box<dyn ChunkStore>` /
    `Box<dyn CheckpointStore>`,与 voxel `BlockRegistry: Send` 同理;
-3. **chunk 序列化用 bincode 3**(serde 已在 voxel Chunk 上 derive;bincode 3 API 与
-   1.x 完全不同,用 `bincode::serde::encode_to_vec/decode_from_slice` +
-   `config::standard()`,以编译器与文档为准);checkpoint blob 对 storage 不透明
-   (sim-api 侧负责编码);
+3. **chunk 序列化用 bincode 2(当前 2.0.1)**(serde 已在 voxel Chunk 上 derive;
+   用 `bincode::serde::encode_to_vec/decode_from_slice` + `config::standard()`,
+   以编译器与文档为准)。**注意:crates.io 的 bincode 3.0.0 是 `compile_error!`
+   占位包(源码仅一行),不得使用**——2026-10-14 骨架实现者实测发现,升为决议;
+   checkpoint blob 对 storage 不透明(sim-api 侧负责编码);
 4. **redb 4.4 表设计**:chunk 表 key = `(world u32, dim u32, x i32, z i32)`,value =
    bincode(Chunk);checkpoint 表 key = `CheckpointId(u64)`(从 1 起),value 编码
    `(tick, blob)`(bincode 或 redb 原生元组,以能表达语义为准)。数据库路径由

@@ -20,7 +20,7 @@ crate `storage` 目前只有 lib.rs 文档注释。建立编译通过的模块�
    types = { path = "../types" }
    voxel = { path = "../voxel" }
    redb = "4"
-   bincode = "3"
+   bincode = "2"
    thiserror = "2"
 
    [dev-dependencies]
