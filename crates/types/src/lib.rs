@@ -8,3 +8,16 @@
 //! 禁止:其他 crate 重复定义这些类型(单一事实源,蓝图 §0)。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 types](../../docs/design/codebase-layout.md)
+
+pub mod coords;
+pub mod ids;
+pub mod state;
+pub mod tick;
+
+pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
+pub use ids::{BlockId, DimensionId, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId};
+pub use state::EntityState;
+pub use tick::Tick;
+
+/// 数学库唯一转发入口(蓝图 §2):其他 crate `use types::glam`。
+pub use glam;

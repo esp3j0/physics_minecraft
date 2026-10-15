@@ -3,5 +3,9 @@ name = "types"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+glam = { version = "0.30", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
 [lints]
 workspace = true
