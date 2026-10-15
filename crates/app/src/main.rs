@@ -1,14 +1,54 @@
-//! # app —— 装配与驱动(L4)
-//!
-//! 职责:配置装配(全部参数单一来源)、驱动 loop(biased select:关机>tick>命令,
-//! MissedTickBehavior::Skip)、tick 末端收 outbox→盖章分发→持久化屏障→下一拍、
-//! 度量告警(step P95>5ms×60tick,只度量不决策)、(未来)网络与 CLI。
-//!
-//! 依赖边界:唯一允许"认识所有人"的 crate;但业务调用只能经 sim-api 或装配期构造,
-//! 禁止直操 physics-sim/shard 内部(蓝图 §2 依赖规则)。
-//!
-//! 图纸:[docs/design/codebase-layout.md §3 app](../../docs/design/codebase-layout.md)
+//! 装配入口:命令行 → Config → bootstrap → 驱动 loop → 打印 outcome(蓝图 §3 main)。
+
+use std::path::Path;
+use std::time::Duration;
+
+use app::config::Config;
+use app::driver::{DriverArgs, DriverCommand, bootstrap, run};
+use voxel::SimpleRegistry;
 
 fn main() {
-    println!("physics_minecraft v{}", env!("CARGO_PKG_VERSION"));
+    // 命令行第一个参数 = 配置路径(无则 None → 全默认,Config::load 语义)。
+    let config_path = std::env::args().nth(1);
+    let config =
+        Config::load(config_path.as_deref().map(Path::new)).expect("配置加载失败(fail-stop)");
+
+    // 装配:开库 → 查最新检查点 → replay 恢复或全新(registry 用 SimpleRegistry::builtin)。
+    let (session, log, store, resume_from) =
+        bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("装配失败(fail-stop)");
+
+    // 驱动:起 mpsc 通道 + spawn run + 等待完成(生产开 ctrl_c;发送端在驱动
+    // 存活期间由将来接入的外部缝持有,本轮随 main 存续)。
+    let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(config.inbox_capacity);
+    std::mem::forget(tx); // TODO(REQ-003):命令发送端移交网络任务;届时移除 forget。
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime 构建失败");
+    let outcome = runtime.block_on(async move {
+        let handle = tokio::spawn(run(DriverArgs {
+            config: config.clone(),
+            session,
+            store,
+            log,
+            commands: rx,
+            listen_ctrl_c: true,
+        }));
+        handle.await.expect("驱动任务 panic(fail-stop)")
+    });
+    runtime.shutdown_timeout(Duration::from_secs(1));
+
+    // 一行摘要:续跑起点 + tick / 检查点 / 反压 / 告警。
+    match resume_from {
+        Some(tick) => println!("续跑自拍 {}", tick.0),
+        None => println!("全新会话"),
+    }
+    println!(
+        "驱动完成:ticks={}, checkpoints={:?}, rejected={}, alert_at_exit={}",
+        outcome.ticks_run,
+        outcome.checkpoints_written,
+        outcome.commands_rejected,
+        outcome.alert_active_at_exit
+    );
 }

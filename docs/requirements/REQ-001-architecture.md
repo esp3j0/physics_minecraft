@@ -1,6 +1,6 @@
 # REQ-001:总体架构——Rapier 多世界分片并行 + 单世界激活
 
-- 状态:**开发中**(2026-10-15 确认并开工;13 项决议见 §9;代码布局按 docs/design/codebase-layout.md,已落地:骨架 8 crate、types、voxel、messaging、physics-sim 完整(ShardSim 含迁移/凝固桥/爆炸/**快照恢复 rapier serde**,AC1/AC2/AC3/AC7 单分片侧测试通过)、shard 完整(调度器 worker 池/所有权/生命周期/路由,双分片迁移全链路 + AC1 多线程侧 + AC5/AC6 侧测试通过,2026-10-14 qwen 工作流实现)、storage 完整(ChunkStore/CheckpointStore trait + redb 4/bincode 2 后端 + 单写 worker 持久化屏障,2026-10-14 glm 实现 + qwen 交叉验证)、sim-api 完整(Session 缝/GlobalSnapshot/CommandLog/replay,**AC8 回放终态位级一致已验证**,2026-10-16 glm 实现 + qwen 交叉验证 + 架构师修正)。核心五 crate + L3 全部就位,仅剩 app 装配层)
+- 状态:**主体完工**(2026-10-15 确认并开工,2026-10-16 八 crate 全部落地;13 项决议见 §9;代码布局按 docs/design/codebase-layout.md。已落地:骨架 8 crate、types、voxel、messaging、physics-sim(ShardSim 含迁移/凝固桥/爆炸/快照恢复 rapier serde,AC1/AC2/AC3/AC7 单分片侧)、shard(调度器 worker 池/所有权/生命周期/路由,双分片迁移全链路 + AC1 多线程侧 + AC5/AC6 侧)、storage(redb 4/bincode 2 + 单写 worker 持久化屏障)、sim-api(Session 缝/快照/回放,**AC8 终态位级一致已验证**)、app(配置单一来源/biased select 驱动/P95 告警/真库断点续跑)。实现方式:qwen/glm 双模型工作流交叉验证三轮。**挂账**:AC4 激活不变量、仓库根 tests/ 等价性套件(AC2/AC3 全档)、600 拍长程回放、真实墙钟长跑性能、REQ-002 网络/chunk-stream)
 - 提出日期:2026-10-14;确认日期:2026-10-15
 - 关联 demo:`demos/shard-migration`(A)、`demos/voxel-collider`(B)、`demos/solidify-bridge`(C)、`demos/cross-shard-explosion`(D)
 - 代码证据:`docs/research/ferrumc-v2-survey.md`(下称【调研】,file:line 证据在里面)

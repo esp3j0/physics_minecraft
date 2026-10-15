@@ -3,5 +3,24 @@ name = "app"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+messaging = { path = "../messaging" }
+voxel = { path = "../voxel" }
+physics-sim = { path = "../physics-sim" }
+shard = { path = "../shard" }
+storage = { path = "../storage" }
+sim-api = { path = "../sim-api" }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+# 只为并入 test-util feature(start_paused 确定性驱动测试),cargo 会与上面合并。
+tokio = { version = "1", features = ["test-util"] }
+
 [lints]
 workspace = true
