@@ -1,0 +1,11 @@
+# 确定性核纪律(蓝图 §4):在启用 clippy::disallowed_* 的 crate 中禁用以下 API。
+# 核 crate(types/voxel/messaging/physics-sim/shard)经 [workspace.lints] 生效;
+# 边缘 crate(app::telemetry 计时、storage 缓存)如确需,局部 #[allow] 并注明理由。
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "确定性核禁墙钟;计时只属于 app::telemetry" },
+    { path = "std::time::SystemTime::now", reason = "确定性核禁墙钟" },
+]
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "核内禁无序容器:用 BTreeMap 或收集后按 canonical 序排序" },
+    { path = "std::collections::HashSet", reason = "核内禁无序容器:用 BTreeSet" },
+]

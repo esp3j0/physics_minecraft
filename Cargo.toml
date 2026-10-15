@@ -8,3 +8,9 @@ edition = "2024"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+# 确定性核纪律(蓝图 §4):配合根目录 clippy.toml 的禁用清单。
+# 边缘 crate(app/storage)确需墙钟/哈希容器时,局部 #[allow] 并注明理由。
+disallowed-methods = "deny"
+disallowed-types = "deny"

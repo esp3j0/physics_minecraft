@@ -5,15 +5,31 @@ version = 4
 [[package]]
 name = "app"
 version = "0.1.0"
-dependencies = [
- "physics",
- "world",
-]
 
 [[package]]
-name = "physics"
+name = "messaging"
 version = "0.1.0"
 
 [[package]]
-name = "world"
+name = "physics-sim"
+version = "0.1.0"
+
+[[package]]
+name = "shard"
+version = "0.1.0"
+
+[[package]]
+name = "sim-api"
+version = "0.1.0"
+
+[[package]]
+name = "storage"
+version = "0.1.0"
+
+[[package]]
+name = "types"
+version = "0.1.0"
+
+[[package]]
+name = "voxel"
 version = "0.1.0"

@@ -7,21 +7,23 @@
 
 ```
 physics_minecraft/
-├── Cargo.toml            # workspace,聚合 crates/ 下所有成员
-├── crates/
-│   ├── app/              # 可执行入口,把各模块拼在一起(cargo run -p app)
-│   ├── physics/          # 物理模拟:重力、碰撞、流体(参考 rapier)
-│   └── world/            # 方块世界:方块、区块、存档(参考 pumpkin / ferrumc)
+├── Cargo.toml            # workspace + 统一 lints(确定性核纪律)
+├── crates/               # 布局与规则见 docs/design/codebase-layout.md
+│   ├── types/            # L0 ID/坐标/tick/迁移载荷(类型地基)
+│   ├── voxel/            # L0 体素世界唯一真相
+│   ├── messaging/        # L1 命令/事件/信封
+│   ├── physics-sim/      # L1 单分片物理(rapier,不出此 crate)
+│   ├── shard/            # L2 调度/所有权/tick/生命周期
+│   ├── storage/          # L3 持久化(trait + redb/内存)
+│   ├── sim-api/          # L3 命令进/快照出/回放
+│   └── app/              # L4 装配/驱动/配置
 ├── docs/
 │   ├── process.md        # 开发流程:需求驱动 + 测试驱动 + demo 驱动
-│   └── requirements/     # 需求文档(REQ-xxx,确认后才开发)
-├── demos/                # Python 验证性 demo(验证通过后迁移进 crates/)
+│   ├── requirements/     # 需求文档(REQ-001 总体架构已确认)
+│   ├── design/           # 设计:代码布局蓝图
+│   └── research/         # 参考项目调研(ferrumc v2)
+├── demos/                # Python 验证性 demo(结论转成 Rust 测试)
 └── references/           # 参考项目(gitignore,仅本地)
-    ├── RustCraft-Public/
-    ├── pumpkin/
-    ├── ferrumc/
-    ├── ferrumc-v2/
-    └── rapier/
 ```
 
 ## 快速开始

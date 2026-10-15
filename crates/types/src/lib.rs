@@ -1,0 +1,10 @@
+//! # types —— 跨 crate 类型地基(L0)
+//!
+//! 职责:全项目共享的标识(EntityId/ShardId/BlockId)、坐标(BlockPos/ChunkPos/
+//! ShardPos)、逻辑时钟(Tick)、实体迁移载荷(EntityState);`glam` 数学库的唯一
+//! 转发入口(其他 crate 一律 `use types::glam`)。
+//!
+//! 依赖边界:仅依赖 `glam`;不含任何业务逻辑、IO、时钟、随机数。
+//! 禁止:其他 crate 重复定义这些类型(单一事实源,蓝图 §0)。
+//!
+//! 图纸:[docs/design/codebase-layout.md §3 types](../../docs/design/codebase-layout.md)

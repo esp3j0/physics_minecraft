@@ -1,23 +1,14 @@
-//! 入口:把世界和物理拼在一起的最小演示。
-
-use physics::{step, Vec3};
-use world::{AIR, BlockId, Chunk, CHUNK_X, CHUNK_Y, CHUNK_Z};
+//! # app —— 装配与驱动(L4)
+//!
+//! 职责:配置装配(全部参数单一来源)、驱动 loop(biased select:关机>tick>命令,
+//! MissedTickBehavior::Skip)、tick 末端收 outbox→盖章分发→持久化屏障→下一拍、
+//! 度量告警(step P95>5ms×60tick,只度量不决策)、(未来)网络与 CLI。
+//!
+//! 依赖边界:唯一允许"认识所有人"的 crate;但业务调用只能经 sim-api 或装配期构造,
+//! 禁止直操 physics-sim/shard 内部(蓝图 §2 依赖规则)。
+//!
+//! 图纸:[docs/design/codebase-layout.md §3 app](../../docs/design/codebase-layout.md)
 
 fn main() {
     println!("physics_minecraft v{}", env!("CARGO_PKG_VERSION"));
-
-    // 世界:一个全是石头的区块,把中心顶部挖成空气(占位演示)。
-    let mut chunk = Chunk::filled(BlockId(1));
-    chunk.set(CHUNK_X / 2, CHUNK_Y - 1, CHUNK_Z / 2, AIR);
-    println!(
-        "chunk {CHUNK_X}x{CHUNK_Y}x{CHUNK_Z} 已创建,中心顶部方块已设为空气"
-    );
-
-    // 物理:一个从 y=64 开始下落的实体,半隐式欧拉,每 0.5s 打印一次。
-    let (mut pos, mut vel) = (Vec3::new(0.0, 64.0, 0.0), Vec3::ZERO);
-    println!("t(s)    y        vy");
-    for i in 1..=10 {
-        (pos, vel) = step(pos, vel, 0.5);
-        println!("{:>4.1}  {:>7.2}  {:>7.2}", i as f64 * 0.5, pos.y, vel.y);
-    }
 }
