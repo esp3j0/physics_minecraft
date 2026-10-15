@@ -3,5 +3,19 @@ name = "sim-api"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+messaging = { path = "../messaging" }
+shard = { path = "../shard" }
+storage = { path = "../storage" }
+physics-sim = { path = "../physics-sim" }
+voxel = { path = "../voxel" }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

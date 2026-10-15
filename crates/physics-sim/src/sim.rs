@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use rapier3d::prelude::*;
+use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
 use types::{
     BlockPos, CHUNK_SIZE, ChunkPos, EntityDesc, EntityId, EntityState, SHARD_CHUNKS, ShardId,
@@ -19,8 +20,8 @@ use crate::conv;
 use crate::solidify;
 use messaging::{CrossEvent, EnvelopePayload, InputPayload, Intent, SimCommand, StampedInput};
 
-/// 凝固桥触发参数(P2 + 睡眠兜底,REQ-001 §9.5 / demo C)。
-#[derive(Debug, Clone, Copy)]
+/// 凝固桥触发参数(P2 + 睡眠兜底,REQ-001 §9.5 / demo C)。可序列化(快照)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolidifyConfig {
     /// 总开关。几何测试等场景可关闭;生产恒开(共识 6)。
     pub enabled: bool,
@@ -49,8 +50,9 @@ impl Default for SolidifyConfig {
     }
 }
 
-/// 单分片配置。
-#[derive(Debug, Clone)]
+/// 单分片配置。可序列化(快照,任务书 01 细则 2:gravity 为 glam Vec3,
+/// types 的 glam 已开 serde)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardSimConfig {
     pub shard: ShardId,
     pub gravity: Vec3,
@@ -70,7 +72,8 @@ impl ShardSimConfig {
 }
 
 /// 本 tick 产出(调度器消费):迁移意图、collider 重建过的 chunk、凝固记录。
-#[derive(Debug, Default, PartialEq)]
+/// 可序列化 + 可克隆(快照携带未消费的产出,任务书 01 细则 1)。
+#[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Outbox {
     /// 迁移意图(调度器盖章成信封,REQ-001 §4.2 (b))。
     pub migrations: Vec<Intent>,
@@ -80,23 +83,23 @@ pub struct Outbox {
     pub solidified: Vec<(EntityId, BlockPos)>,
 }
 
-/// 实体的分片侧记录。
-struct EntityRecord {
-    handle: RigidBodyHandle,
-    desc: EntityDesc,
+/// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
+pub(crate) struct EntityRecord {
+    pub(crate) handle: RigidBodyHandle,
+    pub(crate) desc: EntityDesc,
     /// 连续"低速"tick 计数(P2 触发用)。
-    slow_ticks: u32,
+    pub(crate) slow_ticks: u32,
 }
 
-/// 单分片模拟器。
+/// 单分片模拟器(字段 crate 内可见:snapshot.rs 读写快照结构)。
 pub struct ShardSim {
-    cfg: ShardSimConfig,
-    registry: Box<dyn BlockRegistry>,
-    voxels: VoxelWorld,
-    phys: PhysicsWorld,
-    entities: BTreeMap<EntityId, EntityRecord>,
-    chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
-    outbox: Outbox,
+    pub(crate) cfg: ShardSimConfig,
+    pub(crate) registry: Box<dyn BlockRegistry>,
+    pub(crate) voxels: VoxelWorld,
+    pub(crate) phys: PhysicsWorld,
+    pub(crate) entities: BTreeMap<EntityId, EntityRecord>,
+    pub(crate) chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
+    pub(crate) outbox: Outbox,
 }
 
 impl ShardSim {
@@ -183,7 +186,7 @@ impl ShardSim {
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         let orients = solidify::axis_aligned_orientations();
-        let cfg = self.cfg.solidify;
+        let cfg = self.cfg.solidify.clone();
         for id in ids {
             let Some(rec) = self.entities.get(&id) else {
                 continue;

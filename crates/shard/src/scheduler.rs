@@ -62,6 +62,9 @@ pub struct SchedulerConfig {
     pub router: RouterConfig,
     /// 传给各分片 lifecycle(本轮只接线,不自动 despawn;README 决策 4)。
     pub despawn_after_ticks: u64,
+    /// 起始拍(README 决策 6):回放从快照拍对齐续跑;默认 `Tick::ZERO`,
+    /// tick 语义不变(第 k 次 `tick()` 执行第 k-1 拍)。
+    pub start_tick: Tick,
 }
 
 impl Default for SchedulerConfig {
@@ -70,6 +73,7 @@ impl Default for SchedulerConfig {
             worker_count: 4,
             router: RouterConfig::default(),
             despawn_after_ticks: 1800,
+            start_tick: Tick::ZERO,
         }
     }
 }
@@ -126,7 +130,7 @@ impl Scheduler {
         }
         Self {
             router: Router::new(cfg.router),
-            coordinator: TickCoordinator::new(Tick::ZERO),
+            coordinator: TickCoordinator::new(cfg.start_tick),
             ownership: OwnershipMap::new(),
             lifecycles: BTreeMap::new(),
             sims: BTreeMap::new(),
@@ -269,6 +273,16 @@ impl Scheduler {
         self.sims.get(&shard)?.entity_state(entity)
     }
 
+    /// 分片快照(任务书 01):委托 `ShardSim::snapshot` 产出确定性字节。
+    ///
+    /// **只在两拍之间调用**(sims 全部归位、屏障已收齐):tick 进行中不存在
+    /// 该窗口——本调度器是单线程驱动,`tick()` 返回后调用方才能再进,
+    /// 借此满足"调用时 sim 必在手"的约定,无运行期检查。
+    /// 未注册分片 → None。
+    pub fn snapshot_shard(&self, shard: ShardId) -> Option<Vec<u8>> {
+        self.sims.get(&shard).map(ShardSim::snapshot)
+    }
+
     /// 已注册分片,ShardId 升序(BTreeMap 键序)。
     pub fn shard_ids(&self) -> Vec<ShardId> {
         self.sims.keys().copied().collect()
@@ -331,9 +345,10 @@ impl Drop for Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use physics_sim::ShardSimConfig;
-    use types::{DimensionId, ShardPos, WorldId};
+    use physics_sim::{ShardSimConfig, SolidifyConfig};
+    use types::{BlockPos, DimensionId, ShardPos, WorldId};
     use voxel::SimpleRegistry;
+    use voxel::VoxelWorld;
 
     fn shard_id(x: i32, z: i32) -> ShardId {
         ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
@@ -342,15 +357,17 @@ mod tests {
     /// 虚空分片(凝固桥关闭:调度器测试不关心桥行为)。
     fn sim(x: i32, z: i32) -> ShardSim {
         let mut cfg = ShardSimConfig::new(shard_id(x, z));
-        cfg.solidify.enabled = false;
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
         ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
     }
 
     fn sched_cfg(worker_count: usize) -> SchedulerConfig {
         SchedulerConfig {
             worker_count,
-            router: RouterConfig::default(),
-            despawn_after_ticks: 1800,
+            ..SchedulerConfig::default()
         }
     }
 
@@ -374,6 +391,84 @@ mod tests {
                 migrations_admitted: 0,
             }
         );
+        sched.shutdown();
+    }
+
+    /// 测试清单(shard):start_tick = Tick(100) → 首次 tick() 的 summary.tick
+    /// == Tick(100),tick_now 从 100 走到 101(README 决策 6)。
+    #[test]
+    fn start_tick_advances_from_given_tick() {
+        let cfg = SchedulerConfig {
+            start_tick: Tick(100),
+            ..sched_cfg(2)
+        };
+        let mut sched = Scheduler::new(cfg);
+        assert_eq!(sched.tick_now(), Tick(100), "起动即对齐到起始拍");
+        sched.register(sim(0, 0));
+        let summary = sched.tick();
+        assert_eq!(
+            summary.tick,
+            Tick(100),
+            "第 1 次 tick() 执行第 start_tick 拍"
+        );
+        assert_eq!(sched.tick_now(), Tick(101), "拍号恰 +1");
+        sched.shutdown();
+    }
+
+    /// 测试清单(shard):注册 sim → snapshot_shard → restore → 再注册可跑;
+    /// 未注册 → None。
+    #[test]
+    fn snapshot_shard_roundtrip_via_restore() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        assert_eq!(
+            sched.snapshot_shard(shard_id(9, 9)),
+            None,
+            "未注册分片 → None"
+        );
+
+        let shard = shard_id(0, 0);
+        let mut cfg = ShardSimConfig::new(shard);
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        // 放一块地形,让快照字节非平凡(体素路径)。
+        let ground = BlockPos::new(1, 0, 1);
+        let mut voxels = VoxelWorld::new();
+        voxels.set_block(ground, types::BlockId(1)).expect("界内");
+        for cp in voxels.chunk_positions().collect::<Vec<_>>() {
+            let chunk = voxels.remove_chunk(cp).expect("刚列出");
+            sim0.load_chunk(cp, chunk);
+        }
+        // 再注入一个实体(实体路径)。
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity: types::EntityId::from_parts(1, 1),
+                state: types::EntityState {
+                    translation: types::glam::Vec3::new(1.5, 3.0, 1.5),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        sched.register(sim0);
+
+        let bytes = sched.snapshot_shard(shard).expect("已注册分片必有快照");
+        assert!(!bytes.is_empty());
+
+        let registry = Box::new(SimpleRegistry::builtin());
+        let restored = ShardSim::restore(&bytes, registry).expect("自有快照必可解码");
+        assert_eq!(restored.shard(), shard, "恢复后分片身份不变");
+
+        // 恢复实例可注册、可跑(冒烟)。
+        let mut sched2 = Scheduler::new(sched_cfg(2));
+        sched2.register(restored);
+        sched2.tick();
+        sched2.shutdown();
         sched.shutdown();
     }
 }

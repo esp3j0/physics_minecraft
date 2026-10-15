@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use types::{BlockId, BlockPos, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
 
 use crate::chunk::Chunk;
@@ -14,7 +15,10 @@ pub enum VoxelError {
 }
 
 /// 世界锚定的体素世界。水平方向无限(按需建 chunk),y 限 [-64, 319]。
-#[derive(Debug, Default)]
+///
+/// 可序列化(ShardSim 快照,任务书 01):BTreeMap 键序 + `Chunk` 的 Vec 布局,
+/// 字节序确定。
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct VoxelWorld {
     chunks: BTreeMap<ChunkPos, Chunk>,
 }

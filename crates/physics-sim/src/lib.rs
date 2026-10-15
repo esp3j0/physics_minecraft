@@ -12,8 +12,10 @@
 pub mod collider_build;
 pub mod explosion;
 pub mod sim;
+pub mod snapshot;
 
 mod conv;
 mod solidify;
 
 pub use sim::{Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
+pub use snapshot::SimSnapshotError;

@@ -7,7 +7,10 @@ edition.workspace = true
 types = { path = "../types" }
 voxel = { path = "../voxel" }
 messaging = { path = "../messaging" }
-rapier3d = "0.36.1"
+rapier3d = { version = "0.36.1", features = ["serde-serialize"] }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
 
 [lints]
 workspace = true
