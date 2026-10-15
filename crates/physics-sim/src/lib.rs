@@ -8,3 +8,6 @@
 //! 禁止:线程、IO、时钟、随机数;一切位姿变更 = 删除+重建(REQ-001 §5 行 10)。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 physics-sim](../../docs/design/codebase-layout.md)
+
+pub mod collider_build;
+pub mod explosion;

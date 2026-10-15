@@ -39,6 +39,10 @@ dependencies = [
 [[package]]
 name = "physics-sim"
 version = "0.1.0"
+dependencies = [
+ "types",
+ "voxel",
+]
 
 [[package]]
 name = "proc-macro2"

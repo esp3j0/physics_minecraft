@@ -3,5 +3,9 @@ name = "physics-sim"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+voxel = { path = "../voxel" }
+
 [lints]
 workspace = true
