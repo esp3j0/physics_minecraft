@@ -217,7 +217,7 @@ pub fn greedy_colliders(
 
     // 分组:(axis, positive, plane_local) → 切向 mask
     use std::collections::BTreeMap;
-    let mut groups: BTreeMap<(usize, bool, i32), (Vec<Vec<bool>>, usize, usize)> = BTreeMap::new();
+    let mut groups: BTreeMap<(usize, bool, i32), FaceGroup> = BTreeMap::new();
     for f in faces {
         let (d1, d2) = match f.axis {
             0 => (CHUNK_Y, CHUNK_Z),
@@ -231,13 +231,17 @@ pub fn greedy_colliders(
         };
         let entry = groups
             .entry((f.axis, f.positive, f.plane_local()))
-            .or_insert_with(|| (vec![vec![false; d2]; d1], d1, d2));
-        entry.0[r][c] = true;
+            .or_insert_with(|| FaceGroup {
+                mask: vec![vec![false; d2]; d1],
+                h: d1,
+                w: d2,
+            });
+        entry.mask[r][c] = true;
     }
 
     let mut out = Vec::new();
-    for ((axis, _positive, plane), (mask, h, w)) in groups {
-        for (r1, c1, r2, c2) in merge_rects(&mask, h, w) {
+    for ((axis, _positive, plane), group) in groups {
+        for (r1, c1, r2, c2) in merge_rects(&group.mask, group.h, group.w) {
             let plane_world = match axis {
                 0 => min.x as f32 + plane as f32,
                 1 => WORLD_Y_MIN as f32 + plane as f32,
@@ -247,6 +251,13 @@ pub fn greedy_colliders(
         }
     }
     out
+}
+
+/// 贪心分组:同一(法向, 平面)上暴露面的切向布尔 mask 及其尺寸。
+struct FaceGroup {
+    mask: Vec<Vec<bool>>,
+    h: usize,
+    w: usize,
 }
 
 /// 行内扩 run、再向下扩等宽 run 的贪心矩形合并(demo B 移植,返回含端点矩形)。
@@ -270,9 +281,9 @@ fn merge_rects(mask: &[Vec<bool>], h: usize, w: usize) -> Vec<(usize, usize, usi
                     }
                     i2 += 1;
                 }
-                for r in i..=i2 {
-                    for c in j..=j2 {
-                        used[r][c] = true;
+                for row in used.iter_mut().take(i2 + 1).skip(i) {
+                    for cell in row.iter_mut().take(j2 + 1).skip(j) {
+                        *cell = true;
                     }
                 }
                 rects.push((i, j, i2, j2));
