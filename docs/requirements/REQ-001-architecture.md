@@ -257,6 +257,10 @@
 (messaging 是纯类型叶子,被 shard 与 sim-api 引用;shard 的调度器驱动 physics-sim 的
 ShardSim;physics-sim 依赖 rapier Rust 版与 voxel)。
 
+> **细化**:开工前的完整 crate 设计(增补 `types`/`storage` 两 crate、五层依赖图、
+> 文件级模块图纸、横切规范、AC→测试映射、配置单一来源、变更归属判定表)见
+> [docs/design/codebase-layout.md](../design/codebase-layout.md),以该文档为准。
+
 ## 9. 决议记录(2026-10-15 用户拍板:1-12 按建议全部采纳;13 为用户补充并同日拍板)
 
 以下决议即时生效并已回写正文;后续任何 REQ 需要变更其中一条时,必须先修订本节。
