@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 types = { path = "../types" }
 voxel = { path = "../voxel" }
+messaging = { path = "../messaging" }
+rapier3d = "0.36.1"
 
 [lints]
 workspace = true

@@ -11,3 +11,9 @@
 
 pub mod collider_build;
 pub mod explosion;
+pub mod sim;
+
+mod conv;
+mod solidify;
+
+pub use sim::{Outbox, ShardSim, ShardSimConfig, SolidifyConfig};

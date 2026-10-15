@@ -67,6 +67,16 @@ impl VoxelWorld {
         self.chunks.entry(cp).or_insert_with(Chunk::air)
     }
 
+    /// 插入/替换一个 chunk,返回旧值。collider 重建由调用方(physics-sim)负责。
+    pub fn insert_chunk(&mut self, cp: ChunkPos, chunk: Chunk) -> Option<Chunk> {
+        self.chunks.insert(cp, chunk)
+    }
+
+    /// 移除一个 chunk(持久化屏障用),返回它;不存在返回 None。
+    pub fn remove_chunk(&mut self, cp: ChunkPos) -> Option<Chunk> {
+        self.chunks.remove(&cp)
+    }
+
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -133,6 +143,24 @@ mod tests {
         assert_eq!(world.chunk_count(), 3);
         assert_eq!(world.get_block(BlockPos::new(16, 0, 0)), STONE);
         assert_eq!(world.get_block(BlockPos::new(-1, 0, 0)), STONE);
+    }
+
+    #[test]
+    fn insert_and_remove_chunk() {
+        let mut world = VoxelWorld::new();
+        let cp = ChunkPos::new(5, -5);
+        assert!(world.get_chunk(cp).is_none());
+        let mut chunk = Chunk::air();
+        chunk.set(0, 0, 0, STONE);
+        assert!(world.insert_chunk(cp, chunk).is_none(), "首次插入无旧值");
+        assert_eq!(world.get_block(cp.block_min()), STONE);
+        assert!(world.remove_chunk(cp).is_some());
+        assert!(world.get_chunk(cp).is_none());
+        assert_eq!(
+            world.get_block(cp.block_min()),
+            BlockId::AIR,
+            "卸载后读为空气"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use types::{EntityId, EntityState, ShardId, Tick};
+use types::{EntityDesc, EntityId, EntityState, ShardId, Tick};
 
 /// 队列默认容量(REQ-001 §4.2 决议:1024)。
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -12,10 +12,11 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// 信封载荷。变体只允许**追加**。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EnvelopePayload {
-    /// 实体迁移(REQ-001 §4.2 (b)):tick N 末提取的四向量状态 + 实体 ID。
+    /// 实体迁移(REQ-001 §4.2 (b)):tick N 末提取的四向量状态 + 实体描述。
     MigrateEntity {
         entity: EntityId,
         state: EntityState,
+        desc: EntityDesc,
     },
 }
 
@@ -162,6 +163,7 @@ mod tests {
                 payload: EnvelopePayload::MigrateEntity {
                     entity: EntityId::from_parts(1, seq as u32),
                     state: EntityState::default(),
+                    desc: EntityDesc::default(),
                 },
             },
             Tick(10),
@@ -174,6 +176,7 @@ mod tests {
         let p = EnvelopePayload::MigrateEntity {
             entity: EntityId::from_parts(1, 1),
             state: EntityState::default(),
+            desc: EntityDesc::default(),
         };
         assert_eq!(p.ordinal(), 0);
     }

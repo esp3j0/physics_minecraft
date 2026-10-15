@@ -83,6 +83,7 @@ mod tests {
                 payload: EnvelopePayload::MigrateEntity {
                     entity: EntityId::from_parts(1, 1),
                     state: EntityState::default(),
+                    desc: types::EntityDesc::default(),
                 },
             },
             Tick(41),

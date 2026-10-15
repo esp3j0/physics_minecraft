@@ -16,7 +16,7 @@ pub mod tick;
 
 pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
 pub use ids::{BlockId, DimensionId, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId};
-pub use state::EntityState;
+pub use state::{EntityDesc, EntityState};
 pub use tick::Tick;
 
 /// 数学库唯一转发入口(蓝图 §2):其他 crate `use types::glam`。

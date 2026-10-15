@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, EntityId, EntityState, Tick};
+use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, Tick};
 
 /// 输入来源:外部命令 = 连接/会话序号(app 层分配);内部 = 分片序号(shard 注册表)。
 /// 0 保留给调度器注入的输入。
@@ -25,6 +25,7 @@ pub enum SimCommand {
     SpawnDynamic {
         entity: EntityId,
         state: EntityState,
+        desc: EntityDesc,
     },
     RemoveEntity {
         entity: EntityId,
@@ -99,6 +100,7 @@ mod tests {
             SimCommand::SpawnDynamic {
                 entity: EntityId::from_parts(1, 1),
                 state: EntityState::default(),
+                desc: EntityDesc::default(),
             },
             SimCommand::RemoveEntity {
                 entity: EntityId::from_parts(1, 1),
