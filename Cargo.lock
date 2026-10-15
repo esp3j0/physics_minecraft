@@ -483,6 +483,13 @@ dependencies = [
 [[package]]
 name = "shard"
 version = "0.1.0"
+dependencies = [
+ "messaging",
+ "physics-sim",
+ "thiserror",
+ "types",
+ "voxel",
+]
 
 [[package]]
 name = "sim-api"

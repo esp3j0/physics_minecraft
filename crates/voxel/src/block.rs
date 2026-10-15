@@ -5,7 +5,10 @@ use std::collections::BTreeMap;
 use types::BlockId;
 
 /// 方块注册表:名称 ↔ BlockId、方块属性。ID 分配后必须保持稳定(存档兼容)。
-pub trait BlockRegistry {
+///
+/// `Send` supertrait:shard worker 池要跨线程转移持有 `Box<dyn BlockRegistry>` 的
+/// `ShardSim`(任务书 05 / README 决策 5);数据注册表(`SimpleRegistry`)自动满足。
+pub trait BlockRegistry: Send {
     fn id_of(&self, name: &str) -> Option<BlockId>;
     fn name_of(&self, id: BlockId) -> Option<&str>;
     /// 是否参与碰撞与暴露面判定(空气与非实心方块为 false)。

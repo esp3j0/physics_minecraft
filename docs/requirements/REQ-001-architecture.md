@@ -1,6 +1,6 @@
 # REQ-001:总体架构——Rapier 多世界分片并行 + 单世界激活
 
-- 状态:**开发中**(2026-10-15 确认并开工;13 项决议见 §9;代码布局按 docs/design/codebase-layout.md,已落地:骨架 8 crate、types、voxel、messaging、physics-sim 完整(ShardSim 含迁移/凝固桥/爆炸,AC1/AC2/AC3/AC7 单分片侧测试通过))
+- 状态:**开发中**(2026-10-15 确认并开工;13 项决议见 §9;代码布局按 docs/design/codebase-layout.md,已落地:骨架 8 crate、types、voxel、messaging、physics-sim 完整(ShardSim 含迁移/凝固桥/爆炸,AC1/AC2/AC3/AC7 单分片侧测试通过)、shard 完整(调度器 worker 池/所有权/生命周期/路由,双分片迁移全链路 + AC1 多线程侧 + AC5/AC6 侧测试通过,2026-10-14 qwen 工作流实现))
 - 提出日期:2026-10-14;确认日期:2026-10-15
 - 关联 demo:`demos/shard-migration`(A)、`demos/voxel-collider`(B)、`demos/solidify-bridge`(C)、`demos/cross-shard-explosion`(D)
 - 代码证据:`docs/research/ferrumc-v2-survey.md`(下称【调研】,file:line 证据在里面)

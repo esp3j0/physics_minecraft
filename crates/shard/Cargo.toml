@@ -3,5 +3,14 @@ name = "shard"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+messaging = { path = "../messaging" }
+physics-sim = { path = "../physics-sim" }
+thiserror = "2"
+
+[dev-dependencies]
+voxel = { path = "../voxel" }
+
 [lints]
 workspace = true

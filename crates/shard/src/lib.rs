@@ -10,3 +10,11 @@
 //! 禁止:IO、墙钟(逻辑 tick 不看墙钟,REQ-001 §4.4)。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 shard](../../docs/design/codebase-layout.md)
+
+pub mod coordinator;
+pub mod lifecycle;
+pub mod ownership;
+pub mod router;
+pub mod scheduler;
+
+pub use scheduler::{Scheduler, SchedulerConfig, TickSummary};
