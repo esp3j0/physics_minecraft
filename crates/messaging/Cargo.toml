@@ -3,5 +3,10 @@ name = "messaging"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
 [lints]
 workspace = true

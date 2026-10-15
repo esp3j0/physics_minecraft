@@ -7,3 +7,15 @@
 //! 依赖边界:仅依赖 `types`;不含 IO、rapier 类型、voxel 内部结构。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 messaging](../../docs/design/codebase-layout.md)
+
+mod command;
+mod envelope;
+mod event;
+mod ordering;
+
+pub use command::{InputPayload, InputSource, SimCommand, StampedInput};
+pub use envelope::{
+    AdmitError, CrossShardQueue, DEFAULT_QUEUE_CAPACITY, Envelope, EnvelopePayload, Intent,
+};
+pub use event::CrossEvent;
+pub use ordering::CanonicalKey;
