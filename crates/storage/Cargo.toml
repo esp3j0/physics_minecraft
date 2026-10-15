@@ -3,5 +3,15 @@ name = "storage"
 version.workspace = true
 edition.workspace = true
 
+[dependencies]
+types = { path = "../types" }
+voxel = { path = "../voxel" }
+redb = "4"
+bincode = { version = "2", features = ["serde"] }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

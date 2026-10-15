@@ -8,3 +8,8 @@
 //! 泄漏出本 crate。
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 storage](../../docs/design/codebase-layout.md)
+
+pub mod mem;
+pub mod redb;
+pub mod traits;
+pub mod worker;
