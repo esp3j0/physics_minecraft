@@ -11,10 +11,11 @@ use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
 use types::{
-    BlockPos, CHUNK_SIZE, ChunkPos, EntityDesc, EntityId, EntityState, SHARD_CHUNKS, ShardId,
+    BlockPos, CHUNK_SIZE, ChunkPos, EntityDesc, EntityId, EntityState, SHARD_CHUNKS, ShardId, Tick,
 };
 use voxel::{BlockRegistry, Chunk, VoxelEdit, VoxelWorld};
 
+use crate::activation::{ActivationConfig, ActivationDecisions};
 use crate::collider_build::{BoxCollider, NeighborChunks, greedy_colliders};
 use crate::conv;
 use crate::solidify;
@@ -58,6 +59,8 @@ pub struct ShardSimConfig {
     pub gravity: Vec3,
     pub dt: f32,
     pub solidify: SolidifyConfig,
+    /// 激活参数(§4.3;Default 默认,任务书 02)。
+    pub activation: crate::activation::ActivationConfig,
 }
 
 impl ShardSimConfig {
@@ -67,6 +70,7 @@ impl ShardSimConfig {
             gravity: Vec3::new(0.0, -9.81, 0.0),
             dt: 1.0 / 60.0,
             solidify: SolidifyConfig::default(),
+            activation: crate::activation::ActivationConfig::default(),
         }
     }
 }
@@ -100,6 +104,16 @@ pub struct ShardSim {
     pub(crate) entities: BTreeMap<EntityId, EntityRecord>,
     pub(crate) chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
     pub(crate) outbox: Outbox,
+    /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
+    pub(crate) activation: crate::activation::ActivationController,
+    /// 激活内部拍:`apply_activation` 已执行次数(随快照走,恢复后冷却
+    /// 相对差不变;`apply_activation` 签名无 tick 参数,由本计数供拍)。
+    pub(crate) activation_now: Tick,
+    /// 观察者注册状态(README 决策 6 的命令唤醒淘汰前提;随快照走,语义同
+    /// 任务书 02 细则 5 的 Option 开关:`None` = 从未注册 → 激活完全不生效,
+    /// 行为与历史一致;`Some` = 最近一次 `apply_activation` 的观察者表,
+    /// 命令唤醒路径的预算强制以其为距离中心)。
+    pub(crate) observed: Option<Vec<Vec3>>,
 }
 
 impl ShardSim {
@@ -107,6 +121,7 @@ impl ShardSim {
         let mut phys = PhysicsWorld::new();
         phys.gravity = conv::vec3_to_rapier(cfg.gravity);
         phys.integration_parameters.dt = cfg.dt;
+        let activation = crate::activation::ActivationController::new(cfg.activation);
         Self {
             cfg,
             registry,
@@ -115,6 +130,9 @@ impl ShardSim {
             entities: BTreeMap::new(),
             chunk_bodies: BTreeMap::new(),
             outbox: Outbox::default(),
+            activation,
+            activation_now: Tick::ZERO,
+            observed: None,
         }
     }
 
@@ -158,6 +176,12 @@ impl ShardSim {
     }
 
     /// 应用一个 tick 的输入前缀(命令/事件/信封,按 canonical 序)。
+    ///
+    /// README 决策 6(绑定):命令唤醒路径(Spawn/Teleport 重建即醒,§9.12)
+    /// 超预算时**同一拍立即**按距离淘汰(`enforce_budget` 语义;hook 在 apply
+    /// 末尾、step 之前,淘汰与 step 同拍生效)。淘汰 = 冻结落实(清速 +
+    /// kinematic)+ 按决策即簿记记入冷却表;追加产出并入 outbox 无额外通道。
+    /// 预算内 → 零额外动作(唤醒当拍行为与历史完全一致)。
     pub fn apply_prefix(&mut self, inputs: &[StampedInput]) {
         let mut sorted: Vec<&StampedInput> = inputs.iter().collect();
         sorted.sort_by_key(|i| i.canonical_key());
@@ -178,6 +202,44 @@ impl ShardSim {
                 },
             }
         }
+        self.enforce_budget_after_command_wake();
+    }
+
+    /// 命令唤醒路径的预算强制(README 决策 6):观察者已注册过(激活生效中)
+    /// 且醒数超限时,按到最近观察者距离降序给出应冻结者并**立即落实**。
+    /// 淘汰条目照 plan 的超预算路径记入冷却簿记(唤醒须等冷却/显式命令)。
+    /// 从未注册观察者 → 恒空,行为与历史一致(向后兼容开关,任务书 02 细则 5)。
+    fn enforce_budget_after_command_wake(&mut self) {
+        let Some(observers) = self.observed.clone() else {
+            return;
+        };
+        let awake: Vec<(EntityId, Vec3)> = self
+            .entities
+            .iter()
+            .map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                (*id, conv::rapier_to_vec3(b.translation()))
+            })
+            .collect();
+        for id in self.activation.enforce_budget(&observers, &awake) {
+            let now = self.activation_now;
+            self.freeze_entity(&id);
+            self.activation.note_flip(&id, now);
+        }
+    }
+
+    /// 冻结落实(tier③;apply_activation 与命令唤醒淘汰共用):
+    /// rapier 0.36 语义:KinematicPositionBased 下 set_linvel/set_angvel 是
+    /// no-op → 必须先清速度再切类型。
+    fn freeze_entity(&mut self, id: &EntityId) {
+        let rec = self
+            .entities
+            .get(id)
+            .expect("决策实体必在实体表(输入即来源)");
+        let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+        body.set_linvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+        body.set_angvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+        body.set_body_type(RigidBodyType::KinematicPositionBased, true);
     }
 
     /// 推进一拍:物理步进 → 凝固桥检测 → 迁移检测(demo A/C 时序)。
@@ -199,6 +261,18 @@ impl ShardSim {
                 .get(handle)
                 .expect("handle 有效")
                 .is_sleeping();
+            // 冻结体(kinematic)跳过凝固桥与迁移检测(§9.12/任务书 02):
+            // 不凝固(冻结清零速度会使 slow 判据恒真)、不迁移(防御性;
+            // kinematic 零速度本就静止,两跳为不变量的显式保证)。
+            let is_frozen = self
+                .phys
+                .bodies
+                .get(handle)
+                .expect("handle 有效")
+                .is_kinematic();
+            if is_frozen {
+                continue;
+            }
 
             // ---- 凝固桥(P2 + 睡眠兜底,§9.5)----
             let slow = state.linvel.length() < cfg.linear_threshold
@@ -249,6 +323,51 @@ impl ShardSim {
     /// 取走并清空本 tick 产出。
     pub fn take_outbox(&mut self) -> Outbox {
         std::mem::take(&mut self.outbox)
+    }
+
+    /// 激活刷新(README 决策 5):tier③ 落实(冻结 = set_body_type
+    /// KinematicPositionBased + 清速度;唤醒 = Dynamic + wake_up),
+    /// tier①② 以决策返回(chunk 数据源在 REQ-002,本轮调用方可忽略)。
+    /// 冻结体跳过:detonate(§9.12 事件免疫)、凝固桥、迁移检测(防御性)。
+    ///
+    /// 供拍的激活时钟 = 本方法已执行次数(随快照走,恢复后冷却相对差不变);
+    /// 每 tick 恰好调用一次时即全局拍号。同输入两次调用第二次输出空
+    /// (决策即簿记,见 `ActivationController::plan`)。首次调用即注册
+    /// 观察者(`observed = Some`,覆盖式更新)→ 命令唤醒路径的预算强制
+    /// 随之生效(README 决策 6)。
+    pub fn apply_activation(&mut self, observers: &[Vec3]) -> ActivationDecisions {
+        let now = self.activation_now;
+        self.activation_now = now.next();
+        self.observed = Some(observers.to_vec());
+        let loaded: Vec<ChunkPos> = self.voxels.chunk_positions().collect();
+        let entities: Vec<(EntityId, Vec3, bool)> = self
+            .entities
+            .iter()
+            .map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                (*id, conv::rapier_to_vec3(b.translation()), b.is_kinematic())
+            })
+            .collect();
+        let decisions = self.activation.plan(observers, &loaded, &entities, now);
+
+        // tier③ 落实:施体类型切换。
+        for id in &decisions.entities_to_freeze {
+            self.freeze_entity(id);
+        }
+        for id in &decisions.entities_to_wake {
+            let rec = self
+                .entities
+                .get(id)
+                .expect("决策实体必在实体表(输入即来源)");
+            let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+            body.set_body_type(RigidBodyType::Dynamic, true);
+        }
+        decisions
+    }
+
+    /// 激活配置(测试/注入用)。
+    pub fn activation_config(&self) -> &ActivationConfig {
+        &self.cfg.activation
     }
 
     // ---- 内部 ----
@@ -368,13 +487,12 @@ impl ShardSim {
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         for id in ids {
             let rec = self.entities.get(&id).expect("存在");
-            let pos = conv::rapier_to_vec3(
-                self.phys
-                    .bodies
-                    .get(rec.handle)
-                    .expect("handle 有效")
-                    .translation(),
-            );
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            // §9.12 事件免疫:冻结体不响应事件(爆炸对其无效)。
+            if body.is_kinematic() {
+                continue;
+            }
+            let pos = conv::rapier_to_vec3(body.translation());
             let Some(impulse) = crate::explosion::explosion_impulse(center, power, radius, pos)
             else {
                 continue;
@@ -430,4 +548,274 @@ fn expand_boundary(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::{DimensionId, ShardPos, WorldId};
+
+    fn shard_id(x: i32, z: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
+    }
+
+    fn sim(x: i32, z: i32) -> ShardSim {
+        ShardSim::new(
+            ShardSimConfig::new(shard_id(x, z)),
+            Box::new(voxel::SimpleRegistry::builtin()),
+        )
+    }
+
+    fn entity(n: u32) -> EntityId {
+        EntityId::from_parts(1, n)
+    }
+
+    fn spawn_input(seq: u64, id: EntityId, pos: Vec3) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: pos,
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            }),
+        }
+    }
+
+    fn detonate_input(seq: u64, center: Vec3, power: f32, radius: f32) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::Detonate {
+                center,
+                power,
+                radius,
+            }),
+        }
+    }
+
+    fn teleport_input(seq: u64, id: EntityId, pos: Vec3) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::TeleportEntity {
+                entity: id,
+                state: EntityState {
+                    translation: pos,
+                    ..EntityState::default()
+                },
+            }),
+        }
+    }
+
+    /// 测试清单(sim)1:apply_activation 冻结远处实体后 Detonate:
+    /// 冻结体状态位级不变(§9.12 事件免疫),近处实体受冲量。
+    #[test]
+    fn frozen_body_ignores_detonate() {
+        let mut s = sim(0, 0);
+        let (near, far) = (entity(1), entity(2));
+        // 近 (8,3,8)、远 (100,3,100)——爆炸中心取两者正中,几何对称。
+        s.apply_prefix(&[
+            spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
+            spawn_input(1, far, Vec3::new(100.0, 3.0, 100.0)),
+        ]);
+        let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert!(
+            decisions.entities_to_freeze.contains(&far),
+            "远处实体(距 ≈130 > 32)必须被冻结:{decisions:?}"
+        );
+        assert!(!decisions.entities_to_freeze.contains(&near));
+        let far_before = s.entity_state(far).expect("冻结体仍在实体表");
+
+        // 对称爆炸:两者到爆心等距(≈65 < 70)。
+        s.apply_prefix(&[detonate_input(2, Vec3::new(54.0, 3.0, 54.0), 30.0, 70.0)]);
+
+        let far_after = s.entity_state(far).expect("冻结体未被移除");
+        assert_eq!(far_after, far_before, "冻结体对爆炸免疫:状态位级不变");
+        let near_after = s.entity_state(near).expect("近处实体仍在");
+        assert!(
+            near_after.linvel.length() > 2.0 && near_after.linvel.x < 0.0,
+            "近处实体受冲量且方向背离爆心:{:?}",
+            near_after.linvel
+        );
+    }
+
+    /// 测试清单(sim)2:冻结体不凝固、不产生迁移意图(200 拍冒烟)。
+    /// 实体放本体区外 (130,·,100)(若不冻结第 1 拍即迁移),速度冻结后清零
+    /// (若不跳过凝固,slow 判据恒真 → ≤20 拍即凝固移除);另设无激活对照
+    /// 证明场景非退化。
+    #[test]
+    fn frozen_body_excluded_from_solidify_and_migration() {
+        let e = entity(1);
+        // 对照:不做激活 → 第 1 拍即迁出(场景确实会触发两条路径)。
+        let mut control = sim(0, 0);
+        control.apply_prefix(&[spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0))]);
+        control.step();
+        assert!(
+            control.entity_state(e).is_none(),
+            "非退化前提:动态体在本体区外第 1 拍即迁移"
+        );
+        assert_eq!(control.take_outbox().migrations.len(), 1);
+
+        // 冻结路径:apply_activation → 200 拍仍原位原态,outbox 全空。
+        let mut s = sim(0, 0);
+        s.apply_prefix(&[spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0))]);
+        let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(decisions.entities_to_freeze, vec![e], "远处实体被冻结");
+        let frozen_state = s.entity_state(e).expect("冻结后仍在表");
+        for _ in 0..200 {
+            s.step();
+        }
+        assert_eq!(
+            s.entity_state(e),
+            Some(frozen_state),
+            "冻结体 200 拍位级不变"
+        );
+        let outbox = s.take_outbox();
+        assert!(outbox.migrations.is_empty(), "冻结体不迁移(防御性跳过)");
+        assert!(outbox.solidified.is_empty(), "冻结体不凝固");
+        assert_eq!(s.voxel().chunk_count(), 0, "凝固桥未写入任何体素");
+    }
+
+    /// activation_config 返回注入配置(非默认值可辨)。
+    #[test]
+    fn activation_config_reflects_injection() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.activation.max_awake_dynamic = 7;
+        let s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        assert_eq!(s.activation_config().max_awake_dynamic, 7);
+        let expected = ActivationConfig {
+            max_awake_dynamic: 7,
+            ..ActivationConfig::default()
+        };
+        assert_eq!(s.activation_config(), &expected);
+    }
+
+    /// sim 级配置:关闭凝固桥、压低醒预算(其余默认)。
+    fn budget_cfg(max_awake: usize) -> ShardSimConfig {
+        let mut c = ShardSimConfig::new(shard_id(0, 0));
+        c.solidify.enabled = false;
+        c.activation.max_awake_dynamic = max_awake;
+        c
+    }
+
+    /// 测试清单(sim)3(README 决策 6,绑定):命令唤醒(Teleport 重建即醒)
+    /// 超预算 → **同一拍立即**按距离淘汰(enforce_budget 语义),不得把超限
+    /// 窗口拖到下一拍 plan。场景:预算 1,观察者 (8,3,8);拍 0 生成 e1(距 5)、
+    /// e3(距 ≈130,当拍冻结);拍 2 前缀 Teleport(e3 → 距 2)→ 重建即醒,
+    /// 醒数 {e1@5, e3@2} = 2 > 1 → 同拍淘汰最远者 e1:step 前 e1 已清速 +
+    /// kinematic → 此后逐拍位级悬停;命令唤醒者 e3 照常下落。
+    #[test]
+    fn command_wake_culls_immediately_same_tick() {
+        let mut s = ShardSim::new(budget_cfg(1), Box::new(voxel::SimpleRegistry::builtin()));
+        let (e1, e3) = (entity(1), entity(3));
+        s.apply_prefix(&[
+            spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
+            spawn_input(1, e3, Vec3::new(100.0, 3.0, 100.0)),
+        ]);
+        // 拍 0(观察者已设):e3 距 ≈130 > 32 → 冻结;同时注册观察者供
+        // 后续命令唤醒路径复用。醒数 {e1} = 1 ≤ 预算 1,不淘汰。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.entities_to_freeze, vec![e3], "非退化:e3 先被滞回冻结");
+        s.step(); // 拍 1:无输入,e1 继续下落。
+
+        // 拍 2:命令唤醒 e3(Teleport 重建,距 2 ≤ 24)→ 醒数 2 > 1 →
+        // 同拍淘汰最远醒者 e1(距 5)。
+        s.apply_prefix(&[teleport_input(2, e3, Vec3::new(10.0, 3.0, 8.0))]);
+        s.step();
+        let e3_after = s.entity_state(e3).expect("e3 命令唤醒存活");
+        assert_eq!(e3_after.translation.x, 10.0, "传送落点位级生效");
+        assert!(
+            e3_after.translation.y < 3.0,
+            "命令唤醒者当拍已受重力下落:y={}",
+            e3_after.translation.y
+        );
+        let frozen1 = s.entity_state(e1).expect("e1 被淘汰,仍在实体表");
+        assert_eq!(frozen1.linvel, Vec3::ZERO, "e1 淘汰:速度清零");
+        for k in 3..8 {
+            s.step();
+            assert_eq!(
+                s.entity_state(e1),
+                Some(frozen1),
+                "拍 {k}:e1 在唤醒拍 2 已被淘汰,位级悬停"
+            );
+        }
+        // 后续拍观察者刷新(plan 路径)无残余决策:醒数已回预算内,
+        // 淘汰条目在冷却窗内不得被唤醒。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert!(
+            d.entities_to_freeze.is_empty() && d.entities_to_wake.is_empty(),
+            "同拍淘汰后 plan 无残余决策:{d:?}"
+        );
+    }
+
+    /// 测试清单(sim)4:命令唤醒不超预算 → 零额外决策(淘汰只发生在超限拍)。
+    #[test]
+    fn command_wake_within_budget_no_cull() {
+        let mut s = ShardSim::new(budget_cfg(2), Box::new(voxel::SimpleRegistry::builtin()));
+        let (e1, e2) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
+            spawn_input(1, e2, Vec3::new(100.0, 3.0, 100.0)),
+        ]);
+        // 注册观察者(e2 远 → 冻结);醒数 {e1} = 1 ≤ 预算 2。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.entities_to_freeze, vec![e2]);
+        s.step();
+        // 命令唤醒 e2(重建至近处):醒数 {e1@5, e2@2} = 2 ≤ 预算 2 → 不淘汰。
+        s.apply_prefix(&[teleport_input(2, e2, Vec3::new(10.0, 3.0, 8.0))]);
+        s.step();
+        let s2 = s.entity_state(e2).expect("e2 唤醒存活");
+        assert!(
+            s2.translation.y < 3.0,
+            "e2 命令唤醒后正常下落:y={}",
+            s2.translation.y
+        );
+        assert!(
+            s.entity_state(e1).expect("e1 存活").translation.y < 3.0,
+            "e1 未被淘汰,正常下落"
+        );
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert!(
+            d.entities_to_freeze.is_empty(),
+            "预算内命令唤醒不得触发淘汰:{d:?}"
+        );
+    }
+
+    /// 测试清单(sim)5:命令唤醒路径的淘汰条目按「决策即簿记」记冷却 →
+    /// 窗口内 plan 不得把它唤醒(§9.4 kinematic 化语义:解冻只走显式命令
+    /// 或冷却满两条路)。
+    #[test]
+    fn command_wake_cull_respects_cooldown() {
+        let mut s = ShardSim::new(budget_cfg(1), Box::new(voxel::SimpleRegistry::builtin()));
+        let (e1, e2) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
+            spawn_input(1, e2, Vec3::new(100.0, 3.0, 100.0)),
+        ]);
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.entities_to_freeze, vec![e2], "e2 远 → 冻结(观察者已注册)");
+        s.step();
+        // 拍 2:命令唤醒 e2 → 醒数 {e1, e2} = 2 > 1 → 同拍淘汰 e1(距 5 最远)。
+        s.apply_prefix(&[teleport_input(2, e2, Vec3::new(10.0, 3.0, 8.0))]);
+        s.step();
+        assert_eq!(
+            s.entity_state(e1).expect("e1 已淘汰").linvel,
+            Vec3::ZERO,
+            "e1 淘汰落实"
+        );
+        // 紧接的观察者刷新:e1 距 5 ≤ 24(唤醒半径)但淘汰簿记刚记 →
+        // 冷却窗内 plan 不得唤醒。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert!(
+            d.entities_to_wake.is_empty(),
+            "淘汰条目入冷却簿记:窗口内 plan 不得唤醒:{d:?}"
+        );
+    }
 }

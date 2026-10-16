@@ -105,6 +105,10 @@ pub struct Scheduler {
     workers: Vec<Option<JoinHandle<()>>>,
     /// 静态轮转游标:每分配一个分片后 +1 取模 worker 数。
     next_slot: usize,
+    /// 激活观察者(演员位置;任务书 req001-backlog/02 细则 5):
+    /// `None` = 从未设置 → tick 完全不做激活刷新(行为与历史一致);
+    /// `Some` = 每 tick 在取前缀之前对每分片 `apply_activation`。
+    observers: Option<Vec<types::glam::Vec3>>,
 }
 
 impl Scheduler {
@@ -138,8 +142,15 @@ impl Scheduler {
             result_rxs,
             workers,
             next_slot: 0,
+            observers: None,
             cfg,
         }
+    }
+
+    /// 设置激活观察者(演员位置;两拍之间调用,下一 tick 生效——tick 流程
+    /// 开头即读取)。覆盖式设置(再次调用即整表替换)。
+    pub fn set_observers(&mut self, observers: Vec<types::glam::Vec3>) {
+        self.observers = Some(observers);
     }
 
     /// 注册一个分片(以构造好的 ShardSim 形式进入)。已注册 → panic;
@@ -186,6 +197,17 @@ impl Scheduler {
     pub fn tick(&mut self) -> TickSummary {
         // 1. 本拍号。
         let at = self.coordinator.tick();
+
+        // 1.5(README 决策 8;任务书 req001-backlog/02):观察者已设置过 →
+        //     每分片激活刷新(tier③ 冻结/唤醒在本拍 step 生效);返回的
+        //     tier①② chunk 装卸请求本轮忽略(数据源属 REQ-002)。
+        //     从未设置过观察者 = Option::None → 完全跳过,行为与历史一致
+        //     (向后兼容开关,任务书细则 5)。
+        if let Some(observers) = &self.observers {
+            for sim in self.sims.values_mut() {
+                let _decisions = sim.apply_activation(observers);
+            }
+        }
 
         // 2+3. 按 ShardId 升序取本拍前缀(BTreeMap into_iter 即升序),
         //      静态轮转分配 WorkerSlot:每分配一个分片后游标 +1 取模。
@@ -469,6 +491,109 @@ mod tests {
         sched2.register(restored);
         sched2.tick();
         sched2.shutdown();
+        sched.shutdown();
+    }
+
+    /// 测试清单(shard,任务书 02):set_observers 后 tick:远处实体冻结
+    /// (经 TickSummary 之外的实体状态查询验证——冻结体清速度且不再下落,
+    /// 近处实体继续下落)。
+    #[test]
+    fn observers_drive_freeze_via_scheduler() {
+        use types::glam::Vec3;
+
+        let shard = shard_id(0, 0);
+        let mut cfg = ShardSimConfig::new(shard);
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let (near, far) = (
+            types::EntityId::from_parts(1, 1),
+            types::EntityId::from_parts(1, 2),
+        );
+        for (seq, id, pos) in [
+            (0, near, Vec3::new(8.0, 3.0, 8.0)),
+            (1, far, Vec3::new(100.0, 3.0, 100.0)),
+        ] {
+            sim0.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: seq,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: id,
+                    state: types::EntityState {
+                        translation: pos,
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            }]);
+        }
+
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim0);
+        sched.set_observers(vec![Vec3::new(8.0, 3.0, 8.0)]);
+        let summary = sched.tick();
+        assert_eq!(summary.stepped_shards, 1);
+
+        // 冻结体:清速度 + kinematic → 原位悬停(位级 ==);近处实体继续下落。
+        let expected_far = types::EntityState {
+            translation: Vec3::new(100.0, 3.0, 100.0),
+            ..types::EntityState::default()
+        };
+        for _ in 0..10 {
+            sched.tick();
+            assert_eq!(
+                sched.entity_state(shard, far),
+                Some(expected_far),
+                "远处实体冻结悬停(位级)"
+            );
+            let near_state = sched.entity_state(shard, near).expect("近处实体仍在");
+            assert!(near_state.translation.y < 3.0, "近处实体未被冻结,继续下落");
+        }
+        sched.shutdown();
+    }
+
+    /// 测试清单(shard,任务书 02 细则 5):未设置观察者 → tick 行为与
+    /// 现状一致(激活刷新完全跳过):远处实体照常下落,不被冻结。
+    #[test]
+    fn no_observers_set_behavior_unchanged() {
+        use types::glam::Vec3;
+
+        let shard = shard_id(0, 0);
+        let mut cfg = ShardSimConfig::new(shard);
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let far = types::EntityId::from_parts(1, 2);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity: far,
+                state: types::EntityState {
+                    translation: Vec3::new(100.0, 3.0, 100.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim0);
+        sched.tick();
+        let s1 = sched.entity_state(shard, far).expect("实体仍在");
+        assert!(s1.translation.y < 3.0, "未设观察者 → 不冻结,实体照常下落");
+        sched.tick();
+        let s2 = sched.entity_state(shard, far).expect("实体仍在");
+        assert!(
+            s2.translation.y < s1.translation.y,
+            "持续下落(与历史行为一致)"
+        );
         sched.shutdown();
     }
 }

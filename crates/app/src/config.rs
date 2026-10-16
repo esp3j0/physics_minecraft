@@ -1,7 +1,7 @@
 //! 全部参数(蓝图 §6)+ toml 可覆写;唯一默认值来源。
 //!
-//! 激活参数(REQ-001 §4.3):三档激活尚未实现,参数先入表作为单一来源,
-//! 消费者在后续轮次接入。
+//! 激活参数(REQ-001 §4.3):经 `shard_sim_config` 换算注入激活策略机
+//! (任务书 req001-backlog/02 接入)。
 
 use std::path::{Path, PathBuf};
 
@@ -12,8 +12,8 @@ use shard::SchedulerConfig;
 use sim_api::session::SessionConfig;
 use types::{ShardId, Tick};
 
-/// 激活参数(REQ-001 §4.3;三档激活尚未实现,参数先入表作为单一来源,
-/// 消费者在后续轮次接入——doc 注明)。
+/// 激活参数(REQ-001 §4.3;经 `shard_sim_config` 换算注入策略机
+/// `physics_sim::ActivationConfig`,任务书 req001-backlog/02 已接入)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ActivationConfig {
@@ -153,13 +153,25 @@ impl Config {
         }
     }
 
-    /// → ShardSimConfig(gravity=(0,-9.81,0)、dt、solidify 默认)。
+    /// → ShardSimConfig(gravity=(0,-9.81,0)、dt、solidify 默认;
+    /// activation 由本表换算(任务书 req001-backlog/02 接入):
+    /// 半径 u32 → f32 直传,cooldown_secs 按拍换算(与 despawn_after_ticks
+    /// 同式),预算字段直传)。
     pub fn shard_sim_config(&self, shard: ShardId) -> ShardSimConfig {
         ShardSimConfig {
             shard,
             gravity: types::glam::Vec3::new(0.0, -9.81, 0.0),
             dt: self.dt,
             solidify: SolidifyConfig::default(),
+            activation: physics_sim::ActivationConfig {
+                chunk_load_radius: self.activation.load_radius as f32,
+                chunk_unload_radius: self.activation.unload_radius as f32,
+                awake_load_radius: self.activation.awake_load_radius as f32,
+                awake_unload_radius: self.activation.awake_unload_radius as f32,
+                cooldown_ticks: (self.activation.cooldown_secs as f32 / self.dt).round() as u64,
+                max_awake_dynamic: self.max_awake_dynamic,
+                swap_budget_chunks_per_tick: self.swap_budget_chunks_per_tick as usize,
+            },
         }
     }
 }
@@ -339,5 +351,34 @@ mod tests {
             ..Config::default()
         };
         let _ = c.scheduler_config();
+    }
+
+    /// 测试清单 8(任务书 req001-backlog/02 授权接线):shard_sim_config 的
+    /// activation 换算——3s @ 1/60 → 180 拍;半径 u32 → f32;预算直传。
+    /// 另以非默认值 + 非 1/60 的 dt 验证换算公式(round)而非巧合。
+    #[test]
+    fn shard_sim_config_converts_activation() {
+        let c = Config::default();
+        let a = c.shard_sim_config(shard_id(0, 0)).activation;
+        assert_eq!(a.chunk_load_radius, 32.0, "加载半径 f32 化(§4.3)");
+        assert_eq!(a.chunk_unload_radius, 48.0, "卸载半径 f32 化");
+        assert_eq!(a.awake_load_radius, 24.0, "唤醒半径 f32 化");
+        assert_eq!(a.awake_unload_radius, 32.0, "冻结半径 f32 化");
+        assert_eq!(a.cooldown_ticks, 180, "3s × 60Hz = 180 拍(§4.3)");
+        assert_eq!(a.max_awake_dynamic, 512, "预算直传(§9.4)");
+        assert_eq!(a.swap_budget_chunks_per_tick, 2, "换装预算直传(§4.3)");
+
+        // 换算公式:cooldown_secs=3(默认)@ dt=0.05(每拍 0.05s)= 60 拍。
+        let c2 = Config {
+            dt: 0.05,
+            ..Config::default()
+        };
+        assert_eq!(
+            c2.shard_sim_config(shard_id(0, 0))
+                .activation
+                .cooldown_ticks,
+            60,
+            "cooldown_secs/dt 四舍五入换算"
+        );
     }
 }

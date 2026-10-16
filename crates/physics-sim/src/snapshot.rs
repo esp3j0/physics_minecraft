@@ -15,9 +15,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use voxel::BlockRegistry;
 
+use crate::activation::ActivationController;
 use crate::sim::{Outbox, ShardSim, ShardSimConfig};
 use rapier3d::prelude::*;
-use types::{ChunkPos, EntityDesc, EntityId};
+use types::{ChunkPos, EntityDesc, EntityId, Tick};
 
 /// 快照层可预期失败:残缺/错误字节(一致性违规仍走 panic,蓝图 §4)。
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +40,14 @@ struct ShardSimSnapshot {
     entities: BTreeMap<EntityId, SnapshotEntityRecord>,
     chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
     outbox: Outbox,
+    /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
+    activation: ActivationController,
+    /// 激活内部拍(`apply_activation` 已执行次数;与冷却表同源,恢复后相对差不变)。
+    activation_now: Tick,
+    /// 观察者注册状态(命令唤醒预算强制的前提;`None` = 从未注册 → 行为与
+    /// 历史一致;`Some` = 最近一次 `apply_activation` 的观察者表。随快照走:
+    /// 恢复后激活生效状态与距离中心不变)。
+    observed: Option<Vec<types::glam::Vec3>>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -93,6 +102,9 @@ impl ShardSim {
                 .collect(),
             chunk_bodies: self.chunk_bodies.clone(),
             outbox: self.outbox.clone(),
+            activation: self.activation.clone(),
+            activation_now: self.activation_now,
+            observed: self.observed.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -130,6 +142,9 @@ impl ShardSim {
             entities,
             chunk_bodies: snap.chunk_bodies,
             outbox: snap.outbox,
+            activation: snap.activation,
+            activation_now: snap.activation_now,
+            observed: snap.observed,
         })
     }
 }
@@ -285,5 +300,59 @@ mod tests {
             types::BlockId(1),
             "restore 后 SetBlock 经重注入 registry 生效"
         );
+    }
+
+    /// 测试清单 5(任务书 02):冷却簿记随快照往返——装→快照→恢复→
+    /// 冷却窗口仍在。场景:远处实体冻结(簿记 flip@0,激活拍 +1)→ 快照 →
+    /// 恢复实例换近观察者刷新:唤醒候选但冷却未过 → 不醒;满 180 拍后
+    /// 同输入 → 醒(证明簿记与激活拍计数均随快照走)。
+    #[test]
+    fn snapshot_roundtrip_keeps_activation_state() {
+        let e = types::EntityId::from_parts(1, 1);
+        let mut a = ShardSim::new(cfg(), Box::new(SimpleRegistry::builtin()));
+        a.apply_prefix(&[StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: InputSource(1),
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(100.0, 3.0, 100.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            }),
+        }]);
+        // 拍 0(远观察者):实体冻结,簿记 flip@0,激活拍 → 1。
+        let d = a.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.entities_to_freeze, vec![e], "远处实体被冻结");
+
+        let bytes = a.snapshot();
+        let mut b = ShardSim::restore(&bytes, Box::new(SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        assert_eq!(
+            b.activation_config(),
+            a.activation_config(),
+            "激活配置随快照走"
+        );
+
+        // 恢复实例,激活拍 1:换近观察者(距实体 ≈5.7 ≤ 24)→ 唤醒候选,
+        // 但冷却未过(簿记 flip@0 随快照走)→ 不醒。
+        // (tier①② 的 chunk 装载请求与实体冷却无关,空世界照常产生装载
+        // 候选是策略的正确行为,不在此断言。)
+        let d = b.apply_activation(&[Vec3::new(96.0, 0.0, 96.0)]);
+        assert!(
+            d.entities_to_wake.is_empty() && d.entities_to_freeze.is_empty(),
+            "冷却簿记随快照保留:唤醒被挡下"
+        );
+
+        // 再刷 179 次(激活拍 2..=180):满 180 拍冷却已过 → 醒(§9.12 冻结
+        // 须显式激活唤醒;此处由策略冷却窗证明簿记完整)。
+        let mut last = crate::ActivationDecisions::default();
+        for _ in 0..179 {
+            last = b.apply_activation(&[Vec3::new(96.0, 0.0, 96.0)]);
+        }
+        assert_eq!(last.entities_to_wake, vec![e], "180 拍冷却满 → 唤醒");
+        assert!(last.entities_to_freeze.is_empty());
     }
 }

@@ -9,6 +9,7 @@
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 physics-sim](../../docs/design/codebase-layout.md)
 
+pub mod activation;
 pub mod collider_build;
 pub mod explosion;
 pub mod sim;
@@ -17,5 +18,6 @@ pub mod snapshot;
 mod conv;
 mod solidify;
 
+pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
 pub use sim::{Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
 pub use snapshot::SimSnapshotError;
