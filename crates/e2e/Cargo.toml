@@ -17,7 +17,9 @@ rapier3d = "0.36.1"
 app = { path = "../app" }
 sim-api = { path = "../sim-api" }
 storage = { path = "../storage" }
-tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util"] }
+# REQ-003 验收套件(任务书 04 授权增补):tokio 增 net + io-util
+# (内嵌测试客户端 = 真 TCP TcpStream + 帧读写;README 决策 10)。
+tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util", "net", "io-util"] }
 tempfile = "3"
 bincode = { version = "2", features = ["serde"] }
 

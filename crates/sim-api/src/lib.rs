@@ -12,6 +12,11 @@
 //! 图纸:[docs/design/codebase-layout.md §3 sim-api](../../docs/design/codebase-layout.md)
 
 pub mod log;
+pub mod proto;
 pub mod replay;
 pub mod session;
 pub mod snapshot;
+
+pub use proto::{
+    C2S, FRAME_MAX, S2C, decode_c2s_frame, decode_frame, encode_c2s_frame, encode_frame,
+};

@@ -1,6 +1,13 @@
 # REQ-003:网络与每玩家 chunk 流
 
-- 状态:**已确认**(2026-10-17 用户拍板:§8 四项决议按推荐全部采纳,开工)
+- 状态:**完成**(2026-10-17 确认并开工,2026-10-18 落地。§8 四项决议执行完毕;
+  AC-N1~N6 全部有测试(e2e/network.rs,内嵌测试客户端 + 真 TCP);
+  评审抓出 1 high(远程白名单命令 DoS,fail-stop 语义泄漏到 hostile 输入——
+  已修:驱动侧 validate_external_command 门卫两条外部入口全覆盖)+ 2 medium
+  (观察者移除 API 缺失→remove_observer 全链;泵 try_send 无回滚→差分回滚),
+  均已修复并有回归测试。实现:glm + qwen 交叉验证 + cargo 门禁 + 架构师终审。
+  挂账:出站侧 2MiB 帧上限未强制(密集场景全量表可超限,评审 low,分包待做)、
+  Welcome 双发(连接层+驱动各一,字面偏差)、WAN/压缩/加密不做)
 - 提出日期:2026-10-17
 - 上游:[REQ-001](REQ-001-architecture.md) §9.9(网络独立 REQ-003;照搬 v2 chunk_stream
   + v1 网络线程模式)、[REQ-002](REQ-002-world-loading.md)(观察者命令化/票据/ChunkProvider

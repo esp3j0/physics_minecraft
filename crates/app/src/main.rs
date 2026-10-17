@@ -29,6 +29,9 @@ fn main() {
     // 存活期间由将来接入的外部缝持有,本轮随 main 存续)。
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(config.inbox_capacity);
     std::mem::forget(tx); // TODO(REQ-003):命令发送端移交网络任务;届时移除 forget。
+    // 观察输出缝(任务书 03):serve 装配(任务 04)未接线前恒 None——
+    // 驱动侧编排整体关闭,既有行为不变。
+    let observe: Option<app::driver::ObserveLink> = None;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -44,6 +47,7 @@ fn main() {
             listen_ctrl_c: true,
             provider,
             new_sim,
+            observe,
         }));
         handle.await.expect("驱动任务 panic(fail-stop)")
     });

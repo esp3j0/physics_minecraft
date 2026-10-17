@@ -275,6 +275,7 @@ async fn acg3_observer_walk_builds_playable_world() {
         listen_ctrl_c: false,
         provider,
         new_sim: new_sim_no_bridge(config.clone()),
+        observe: None,
     }));
 
     // 观察者进分片 (1,0) 新区(x=200 → chunk 12 → 分片 (1,0));y 取地面顶面
@@ -398,6 +399,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
 
     let shard = shard_id(1, 0);
@@ -870,6 +872,7 @@ async fn acg6_persisted_after_process_restart() {
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
 
     let shard = shard_id(1, 0);

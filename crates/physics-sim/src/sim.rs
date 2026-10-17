@@ -171,6 +171,15 @@ impl ShardSim {
         Some(self.read_state(rec))
     }
 
+    /// 全实体表(观察输出用,REQ-003 §4.4):`(EntityId, EntityState)` 列表,
+    /// 按 EntityId 升序(底层 BTreeMap 键序,确定性)。空表 → 空列表。
+    pub fn entity_states(&self) -> Vec<(EntityId, EntityState)> {
+        self.entities
+            .iter()
+            .map(|(id, rec)| (*id, self.read_state(rec)))
+            .collect()
+    }
+
     /// 加载一个体素 chunk 并(与已加载邻居一起)重建边界 collider。
     pub fn load_chunk(&mut self, cp: ChunkPos, chunk: Chunk) {
         self.voxels.insert_chunk(cp, chunk);
@@ -1096,5 +1105,45 @@ mod tests {
         }
         assert_eq!(solidified, 1, "门关闭:慢漂实体照旧凝固一次(直通)");
         assert!(s.entity_state(e).is_none(), "实体已凝固移除");
+    }
+
+    // ---- 任务书 00(REQ-003):观察输出 API(测试清单) ----
+
+    /// 测试清单 4 `entity_states_lists_all_in_id_order`:3 实体分片 → 全表
+    /// 升序、逐条状态与单查一致;空分片 → 空表。
+    #[test]
+    fn entity_states_lists_all_in_id_order() {
+        // 空分片:空表。
+        let empty = sim(0, 0);
+        assert!(empty.entity_states().is_empty(), "空分片 → 空表");
+
+        // 3 实体(乱序注入);关凝固桥(不关心桥行为)。
+        let mut s = {
+            let mut cfg = zero_g_cfg();
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        let ids = [entity(3), entity(1), entity(2)];
+        for (seq, id) in ids.iter().enumerate() {
+            s.apply_prefix(&[spawn_input(
+                seq as u64,
+                *id,
+                Vec3::new(60.0, 3.0 + seq as f32, 60.0),
+            )]);
+        }
+        let table = s.entity_states();
+        let got_ids: Vec<EntityId> = table.iter().map(|(id, _)| *id).collect();
+        assert_eq!(
+            got_ids,
+            vec![entity(1), entity(2), entity(3)],
+            "全表 = EntityId 升序(注入乱序无关)"
+        );
+        for (id, state) in &table {
+            assert_eq!(
+                Some(state),
+                s.entity_state(*id).as_ref(),
+                "逐条状态与单查一致:{id:?}"
+            );
+        }
     }
 }

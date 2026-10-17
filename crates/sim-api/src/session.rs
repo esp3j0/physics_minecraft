@@ -5,7 +5,7 @@ use physics_sim::{ShardSim, SimSnapshotError};
 use shard::router::RouteError;
 use shard::{Scheduler, SchedulerConfig, TickSummary};
 use types::glam::Vec3;
-use types::{DimensionId, EntityId, EntityState, ShardId, Tick, WorldId};
+use types::{BlockPos, DimensionId, EntityId, EntityState, ShardId, Tick, WorldId};
 use voxel::BlockRegistry;
 
 use crate::log::LogEntry;
@@ -162,6 +162,18 @@ impl Session {
         self.scheduler.take_activation_requests()
     }
 
+    /// 调度器透传(REQ-003 §4.4 观察输出源②;任务书 00 签名固定):本拍凝固
+    /// 写入的方块(世界坐标),取走即清(恰一次)。
+    pub fn take_solidified(&mut self) -> Vec<(ShardId, BlockPos, voxel::BlockId)> {
+        self.scheduler.take_solidified()
+    }
+
+    /// 调度器透传(REQ-003 §4.4 观察输出源①;任务书 00):分片全实体表
+    /// (EntityId 升序);未注册分片 → `None`。
+    pub fn entity_states(&self, shard: ShardId) -> Option<Vec<(EntityId, EntityState)>> {
+        self.scheduler.entity_states(shard)
+    }
+
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
     pub fn apply_chunk_load(&mut self, shard: ShardId, pos: types::ChunkPos, chunk: voxel::Chunk) {
         self.scheduler.apply_chunk_load(shard, pos, chunk)
@@ -193,6 +205,13 @@ impl Session {
     /// 调度器语义 → panic,fail-stop)。
     pub fn submit_observer_raw(&mut self, input: StampedInput) {
         self.scheduler.submit_observer(input);
+    }
+
+    /// 移除一个观察者(REQ-003 §4.2/03;评审修复②:断连 → 票撤——
+    /// 观察者表条目删除,空片无票可 despawn)。调度器透传:在表 →
+    /// `Some`(原位置);不在表 → `None`(幂等)。
+    pub fn remove_observer(&mut self, source: InputSource) -> Option<Vec3> {
+        self.scheduler.remove_observer(source)
     }
 
     /// 执行一拍(全屏障;摘要透传)。
@@ -566,6 +585,109 @@ mod tests {
         let chunks = session.unload_shard(shard);
         assert_eq!(chunks, vec![(cp, voxel::Chunk::air())], "逐 chunk 卸载返回");
         assert!(!session.shard_ids().contains(&shard), "卸载后不含该分片");
+        session.shutdown();
+    }
+
+    // ---- 任务书 00(REQ-003):观察输出透传(测试清单) ----
+
+    /// 测试清单 5 `take_solidified_exactly_once`:真静止实体经凝固桥落格 →
+    /// 该拍 tick 后 take_solidified 得 `(shard, pos, block)`;再取 = 空(恰一次)。
+    #[test]
+    fn take_solidified_exactly_once() {
+        // 凝固桥开启 + 关位移门(直通,几拍内即凝固)。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.displacement_gate_m = 0.0;
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let e = EntityId::from_parts(1, 1);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource(1),
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(60.5, 3.5, 60.5),
+                    ..EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        let shard = shard_id(0, 0);
+        let mut session = Session::new(session_cfg());
+        session.register(sim0);
+
+        // 跑到凝固发生(真静止 20 tick 内;位移门已关)。
+        let mut cell = None;
+        for _ in 0..40 {
+            session.tick();
+            let taken = session.take_solidified();
+            if !taken.is_empty() {
+                cell = Some(taken);
+                break;
+            }
+        }
+        let taken = cell.expect("真静止 40 拍内凝固,观察输出必收到");
+        assert_eq!(taken.len(), 1, "单实体单格");
+        let (got_shard, pos, block) = taken[0];
+        assert_eq!(got_shard, shard);
+        assert_eq!(pos, BlockPos::new(60, 3, 60), "格 = snap 后的体素中心格");
+        assert_eq!(block, types::BlockId(1), "方块 = EntityDesc 默认写入值");
+        assert!(
+            session.take_solidified().is_empty(),
+            "再取 = 空(恰一次:取走即清)"
+        );
+        session.shutdown();
+    }
+
+    /// 测试清单 6 `solidified_survives_via_session`:Session 透传可达(最小
+    /// 冒烟)——entity_states 透传与调度器行为一致(全表升序/未注册 None),
+    /// 与 take_solidified 同一会话内并存可用。
+    #[test]
+    fn solidified_survives_via_session() {
+        let shard = shard_id(0, 0);
+        let mut session = Session::new(session_cfg());
+        assert!(session.entity_states(shard).is_none(), "未注册分片 → None");
+
+        // 凝固桥开启 + 关位移门:实体真静止落格(复用清单 5 场景)。
+        let mut cfg = ShardSimConfig::new(shard);
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.displacement_gate_m = 0.0;
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let e = EntityId::from_parts(1, 1);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource(1),
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(60.5, 3.5, 60.5),
+                    ..EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        session.register(sim0);
+
+        // 凝固前:全表可见(单条,升序)。
+        let table = session.entity_states(shard).expect("已注册分片必有表");
+        assert_eq!(table.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![e]);
+
+        // 跑到凝固:take_solidified 收到,实体从表中消失(已凝固移除)。
+        let mut solidified = false;
+        for _ in 0..40 {
+            session.tick();
+            if !session.take_solidified().is_empty() {
+                solidified = true;
+                break;
+            }
+        }
+        assert!(solidified, "透传链可达:凝固方块经 Session 冒出");
+        assert!(
+            session.entity_states(shard).expect("表可达").is_empty(),
+            "实体已凝固移除 → 全表为空"
+        );
         session.shutdown();
     }
 }

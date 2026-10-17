@@ -120,6 +120,7 @@ async fn drive(
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -214,6 +215,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -250,6 +252,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -365,6 +368,7 @@ async fn telemetry_wired_into_driver_outcome() {
         listen_ctrl_c: false,
         provider,
         new_sim,
+        observe: None,
     }));
     tx.send(DriverCommand::Send {
         shard,

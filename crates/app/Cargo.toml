@@ -11,7 +11,7 @@ physics-sim = { path = "../physics-sim" }
 shard = { path = "../shard" }
 storage = { path = "../storage" }
 sim-api = { path = "../sim-api" }
-tokio = { version = "1", features = ["macros", "rt", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync", "signal", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1"
 bincode = { version = "2", features = ["serde"] }

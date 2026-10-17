@@ -16,7 +16,7 @@ use std::thread::JoinHandle;
 
 use messaging::{AdmitError, InputPayload, InputSource, StampedInput};
 use physics_sim::{Outbox, ShardSim};
-use types::{ChunkPos, EntityId, EntityState, ShardId, Tick};
+use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, ShardId, Tick};
 
 use crate::coordinator::TickCoordinator;
 use crate::lifecycle::{LifecycleConfig, ShardLifecycle};
@@ -119,6 +119,9 @@ pub struct Scheduler {
     /// 本拍激活决策(tick 步骤 1.5 收集,两拍之间经 take_activation_requests
     /// 取走;恰一次语义)。
     activation_requests: BTreeMap<ShardId, physics_sim::ActivationDecisions>,
+    /// 本拍凝固写入的方块(REQ-003 §4.4 观察输出源②:tick 内收集,两拍之间
+    /// 经 take_solidified 取走;恰一次语义)。
+    solidified: Vec<(ShardId, BlockPos, BlockId)>,
     /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
     despawn_requests: BTreeSet<ShardId>,
 }
@@ -158,6 +161,7 @@ impl Scheduler {
             observers_ever_set: false,
             observer_inbox: VecDeque::new(),
             activation_requests: BTreeMap::new(),
+            solidified: Vec::new(),
             despawn_requests: BTreeSet::new(),
             cfg,
         }
@@ -205,6 +209,19 @@ impl Scheduler {
         self.observer_table.iter().map(|(k, v)| (*k, *v)).collect()
     }
 
+    /// 移除一个观察者(REQ-003 §4.2/03:断连 → 观察者移除——票与激活中心
+    /// 随条目消失,空片无票可 despawn;REQ-003 评审修复②)。在表 → `Some`
+    /// (原位置);不在 → `None`(幂等,重复移除无害)。直通保留键
+    /// `InputSource::SCHEDULER` 同样可移(同表同权);表空不清
+    /// `observers_ever_set`("无激活中心"语义,距票判定自然无票)。
+    pub fn remove_observer(&mut self, source: InputSource) -> Option<types::glam::Vec3> {
+        let removed = self.observer_table.remove(&source);
+        if removed.is_some() {
+            eprintln!("[scheduler] 观察者移除:source={source:?}");
+        }
+        removed
+    }
+
     /// 观察者输入入箱(REQ-002 §4.2:调度器级专用收件箱;README 决策 3)。
     /// apply_at 到期应用(迟到即丢弃,与 router inbox 同语义);收件箱
     /// unbounded(任务书语义细则 1:观察者频率低,有界语义复杂度不值得,
@@ -231,6 +248,22 @@ impl Scheduler {
         std::mem::take(&mut self.activation_requests)
             .into_iter()
             .collect()
+    }
+
+    /// 两拍之间取本拍凝固写入的方块(REQ-003 §4.4 观察输出源②;签名固定,
+    /// 任务书 00):`(分片, 世界坐标方块格, 写入的方块 ID)` 列表,每拍 tick 内
+    /// 收集、取走即清(恰一次;再取 = 空)。方块 ID 读自分片体素世界
+    /// (`Outbox.solidified` 只携带 `(实体, 格)`,写入值经 `get_block` 查表)。
+    pub fn take_solidified(&mut self) -> Vec<(ShardId, BlockPos, BlockId)> {
+        std::mem::take(&mut self.solidified)
+    }
+
+    /// 分片全实体表(REQ-003 §4.4 观察输出源①;任务书 00 签名固定):
+    /// `(EntityId, EntityState)`,EntityId 升序(委托 [`ShardSim::entity_states`])。
+    /// 未注册分片 → `None`。
+    pub fn entity_states(&self, shard: ShardId) -> Option<Vec<(EntityId, EntityState)>> {
+        let sim = self.sims.get(&shard)?;
+        Some(sim.entity_states())
     }
 
     /// 两拍之间装载一个 chunk(幂等:重复装载同 chunk = 重建)。
@@ -435,6 +468,9 @@ impl Scheduler {
         // 6. sim 放回自有表;按 ShardId 升序处理 outbox(results 即 BTreeMap,
         //    迭代天然升序):迁移意图盖章入队。
         let mut migrations_admitted = 0usize;
+        // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
+        // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
+        self.solidified.clear();
         for (shard, (sim, outbox)) in results {
             match self.router.collect_intents(shard, &outbox.migrations, at) {
                 Ok(()) => migrations_admitted += outbox.migrations.len(),
@@ -446,6 +482,12 @@ impl Scheduler {
                     at.0
                 ),
                 Err(e) => panic!("迁移盖章被拒(编程错误,fail-stop):{e}"),
+            }
+            // (shard, 格, 写入的方块):Outbox 只记 (实体, 格),写入值读自
+            // sim 体素世界(写入先于本处,凝固路径已落格)。
+            for (_, cell) in &outbox.solidified {
+                self.solidified
+                    .push((shard, *cell, sim.voxel().get_block(*cell)));
             }
             self.sims.insert(shard, sim);
         }
@@ -876,6 +918,54 @@ mod tests {
             sched.observers(),
             vec![(InputSource(1), pos), (InputSource(2), pos)],
             "拍 5 后:第二条已应用,InputSource 升序"
+        );
+        sched.shutdown();
+    }
+
+    /// 评审修复②(REQ-003):`remove_observer` 断连票撤语义——在表移除
+    /// 返回原位置且 despawn 票消失(空片 idle 到期成候选);不在表幂等
+    /// `None`;表空不复活 despawn(从未设置语义不回退)。
+    #[test]
+    fn remove_observer_revokes_ticket() {
+        use types::glam::Vec3;
+
+        // 唯一分片 (0,0) 空片;观察者落在核心区 → 有票。
+        let cfg = SchedulerConfig {
+            despawn_after_ticks: 3,
+            ..sched_cfg(2)
+        };
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(cfg);
+        sched.register(sim(0, 0));
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 8.0)));
+        for _ in 0..5 {
+            sched.tick(); // idle 窗口跑满
+        }
+        assert!(
+            sched.take_despawn_requests().is_empty(),
+            "前置:观察者在场 = 有票,空片不成 despawn 候选"
+        );
+
+        // 断连移除:返回原位置;续跑过窗口 → 候选出现。
+        assert_eq!(
+            sched.remove_observer(InputSource(1)),
+            Some(Vec3::new(8.0, 0.0, 8.0)),
+            "在表移除返回原位置"
+        );
+        for _ in 0..6 {
+            sched.tick();
+        }
+        assert_eq!(
+            sched.take_despawn_requests(),
+            vec![shard],
+            "移除后无票:idle 到期成 despawn 候选"
+        );
+
+        // 幂等:再次移除 = None。
+        assert_eq!(
+            sched.remove_observer(InputSource(1)),
+            None,
+            "不在表 → None(幂等)"
         );
         sched.shutdown();
     }
