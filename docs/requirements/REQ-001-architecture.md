@@ -273,8 +273,13 @@ ShardSim;physics-sim 依赖 rapier Rust 版与 voxel)。
    Stopped;出生点票据保活;
 4. **超预算动态体**:冻结(kinematic 化)+ 按距最近演员距离淘汰;`MAX_AWAKE_DYNAMIC = 512`
    (配置化);
-5. **凝固桥参数**:P2(线速度 0.1 / 角速度 0.05 连续 20 tick)+ 睡眠兜底;误差 > 半格或
-   > 45° 升级为等睡眠;斜坡/堆叠慢爬行 demo 在 REQ-002 定稿前补;
+5. **凝固桥参数**:P2(线速度 0.1 m/s / 角速度 0.05 rad/s 连续 20 tick)+ 睡眠兜底;
+   误差 > 半格或 > 45° 升级为等睡眠;**〔2026-10-17 修订,依据 REQ-002 决议 4 与
+   demos/solidify-slopes 实验〕自动触发谓词加位移门:P2′ = P2 ∧ 最近 20 tick
+   位移 ≤3mm(适用于 P2 计数与睡眠兜底两条自动路径);有活动移动命令的演员实体
+   政策层豁免,仅显式命令触发凝固;睡眠兜底不得视为误凝固保险(对受驱实体空转);
+   阈值单位明确为 m/s、rad/s(0.1 m/s ≈ 每 tick 1.67mm)**;斜坡/堆叠慢爬行
+   demo 已补(demos/solidify-slopes,受驱慢爬行 100% 误凝固实证);
 6. **canonical 排序键**:`(apply_at, destination, 类型序号, source, sequence)` 五元组
    字典序;类型序号 = 枚举声明序(编译期固定),同时覆盖命令事件与涌现事件(§4.2);
 7. **实体 ID**:`(origin_shard, local_seq)` 打包为 u64,单调递增不回收,迁移后不变;

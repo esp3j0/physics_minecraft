@@ -1,6 +1,6 @@
 # REQ-002:世界数据源与分片生命周期闭环
 
-- 状态:**草案**(§9 决议待用户拍板;拍板后定稿开工)
+- 状态:**已确认**(2026-10-17 用户拍板:§9 四项决议按推荐全部采纳,开工)
 - 提出日期:2026-10-17
 - 上游:[REQ-001](REQ-001-architecture.md)(已完成,AC1-AC8 落地;本 REQ 落实其遗留:tier①② chunk 数据源、despawn 票据自动化)
 - 关联 demo:`demos/solidify-slopes`(决议 5 义务,实验中;结论回填 §3)
@@ -65,10 +65,13 @@ app 跑起来——观察者移动,分片按需创建、chunk 按激活半径/�
   (枚举只许追加,决议 6 兼容);
 - 观察者表 = `BTreeMap<InputSource, Vec3>`(**source 即玩家/agent ID**,
   多玩家天然支持;source 0 保留给调度器);
-- 调度器在分发前缀时**截获**该变体(不转发分片):更新观察者表;`dest` 取
-  position 所在分片(信息性;前缀过滤后 worker 不见此命令);
-- `Session::move_observer(position) -> LogEntry` 为生产入口(盖章+入日志);
-  `Scheduler::set_observers` 保留为测试/装配直通(同一张表,doc 注明生产路径)。
+- 投递路径 = **调度器级专用收件箱**(实现细化,2026-10-17):不走按分片 submit
+  ——观察者必然走进尚未注册的分片区域,per-shard 通道会触发"未注册分片"
+  fail-stop;调度器维护自己的观察者收件箱,`tick()` 开头应用当拍到期的
+  `SetObserverPosition`(分片前缀里永远不会出现该变体);
+- `Session::move_observer(position) -> LogEntry` 为生产入口(盖章+入日志,
+  LogEntry.dest 取 position 所在分片,信息性);`Scheduler::set_observers`
+  保留为测试/装配直通(同一张表)。
 
 ### 4.3 ChunkProvider(storage)
 
@@ -128,7 +131,7 @@ app 跑起来——观察者移动,分片按需创建、chunk 按激活半径/�
 | move_observer、种子配置、tick 末端编排(取数/回填/despawn 屏障) | app(sim-api 透传 move_observer) |
 | 验收套件 | e2e |
 
-## 9. 决议(草案,待用户拍板)
+## 9. 决议(2026-10-17 用户拍板:按推荐全部采纳)
 
 1. **地形范围**:v1 = Superflat + SeededScatter,**不做噪声地形**(推荐:
    物理玩法(拆/炸/塌/凝固)在 superflat 上已完整;噪声地形牵扯高度图/生物群系
