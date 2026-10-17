@@ -7,10 +7,8 @@ edition.workspace = true
 types = { path = "../types" }
 messaging = { path = "../messaging" }
 physics-sim = { path = "../physics-sim" }
-thiserror = "2"
-
-[dev-dependencies]
 voxel = { path = "../voxel" }
+thiserror = "2"
 
 [lints]
 workspace = true

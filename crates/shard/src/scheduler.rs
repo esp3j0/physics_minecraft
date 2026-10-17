@@ -10,13 +10,13 @@
 //! 静态轮转(照 v2 scheduler.rs `WorkerSlot(ordinal % worker_slots)` 语义);
 //! 内部通道 send/recv 失败 = 一致性违规 → panic(fail-stop)。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-use messaging::{AdmitError, StampedInput};
+use messaging::{AdmitError, InputPayload, InputSource, StampedInput};
 use physics_sim::{Outbox, ShardSim};
-use types::{EntityId, EntityState, ShardId, Tick};
+use types::{ChunkPos, EntityId, EntityState, ShardId, Tick};
 
 use crate::coordinator::TickCoordinator;
 use crate::lifecycle::{LifecycleConfig, ShardLifecycle};
@@ -105,10 +105,22 @@ pub struct Scheduler {
     workers: Vec<Option<JoinHandle<()>>>,
     /// 静态轮转游标:每分配一个分片后 +1 取模 worker 数。
     next_slot: usize,
-    /// 激活观察者(演员位置;任务书 req001-backlog/02 细则 5):
-    /// `None` = 从未设置 → tick 完全不做激活刷新(行为与历史一致);
-    /// `Some` = 每 tick 在取前缀之前对每分片 `apply_activation`。
-    observers: Option<Vec<types::glam::Vec3>>,
+    /// 观察者表(REQ-002 §4.2:**同一张表**——命令化条目以 `InputSource`
+    /// 为键(玩家/agent ID),直通 `set_observers` 的整表以调度器保留位
+    /// `InputSource::SCHEDULER` 落表)。激活刷新与票判定都只读本表。
+    observer_table: BTreeMap<InputSource, types::glam::Vec3>,
+    /// 向后兼容开关(任务书 req001-backlog/02 细则 5):任一路径设置过
+    /// 观察者(直通或命令化)→ true;从未设置 → tick 完全跳过激活刷新,
+    /// 行为与历史一致(表为空但设置过 = "无激活中心"语义,不等同跳过)。
+    observers_ever_set: bool,
+    /// 调度器级观察者专用收件箱(REQ-002 §4.2;unbounded——任务书语义
+    /// 细则 1:观察者频率低,有界语义复杂度不值得,REQ-003 网络层再收口)。
+    observer_inbox: VecDeque<StampedInput>,
+    /// 本拍激活决策(tick 步骤 1.5 收集,两拍之间经 take_activation_requests
+    /// 取走;恰一次语义)。
+    activation_requests: BTreeMap<ShardId, physics_sim::ActivationDecisions>,
+    /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
+    despawn_requests: BTreeSet<ShardId>,
 }
 
 impl Scheduler {
@@ -142,15 +154,152 @@ impl Scheduler {
             result_rxs,
             workers,
             next_slot: 0,
-            observers: None,
+            observer_table: BTreeMap::new(),
+            observers_ever_set: false,
+            observer_inbox: VecDeque::new(),
+            activation_requests: BTreeMap::new(),
+            despawn_requests: BTreeSet::new(),
             cfg,
         }
     }
 
     /// 设置激活观察者(演员位置;两拍之间调用,下一 tick 生效——tick 流程
     /// 开头即读取)。覆盖式设置(再次调用即整表替换)。
+    ///
+    /// REQ-002 §4.2 保留为测试/装配直通:整表替换命令化观察者表(同一张
+    /// 表)。直通列表**逐条落表、一条不丢**(旧语义 `observers: Vec<Vec3>`
+    /// 全量作激活/票中心,位置集无序语义):**末位**沿用保留键
+    /// `InputSource::SCHEDULER`(0;单位置调用与历史行为逐位一致),其余
+    /// 位置自 `u32::MAX` 向左依次落键(第 j 个 → `u32::MAX-(len-2-j)`)。
+    /// 该高位段专属直通,与分配给连接/会话的正向 source(1,2,…)永不相交
+    /// ——同键覆盖的静默截断(评审回归)不可能重现;observers() 键升序
+    /// 视图因此为 [末位, 首位, …] 的确定性逆序(顺序无语义,仅确定性)。
     pub fn set_observers(&mut self, observers: Vec<types::glam::Vec3>) {
-        self.observers = Some(observers);
+        self.observer_table.clear();
+        let len = observers.len();
+        for (j, pos) in observers.into_iter().enumerate() {
+            let key = if j + 1 == len {
+                InputSource::SCHEDULER
+            } else {
+                InputSource(u32::MAX - (len - 2 - j) as u32)
+            };
+            self.observer_table.insert(key, pos);
+        }
+        self.observers_ever_set = true;
+    }
+
+    /// 激活/票判定的观察者位置集(表值;确定性:InputSource 升序)。
+    /// `None` = 从未设置过任一路径 → tick 完全不做激活刷新、无票
+    /// (向后兼容开关);`Some(空)` = 设置过但表空 → 无激活中心语义
+    /// (§4.3:距离 +∞,不唤醒任何实体)。
+    fn activation_centers(&self) -> Option<Vec<types::glam::Vec3>> {
+        if !self.observers_ever_set {
+            return None;
+        }
+        Some(self.observer_table.values().copied().collect())
+    }
+
+    /// 观察者只读视图(REQ-002 §4.2;驱动 ensure_shard/票判定用):
+    /// `(source, position)`,按 InputSource 升序(BTreeMap 键序)。
+    pub fn observers(&self) -> Vec<(InputSource, types::glam::Vec3)> {
+        self.observer_table.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// 观察者输入入箱(REQ-002 §4.2:调度器级专用收件箱;README 决策 3)。
+    /// apply_at 到期应用(迟到即丢弃,与 router inbox 同语义);收件箱
+    /// unbounded(任务书语义细则 1:观察者频率低,有界语义复杂度不值得,
+    /// REQ-003 网络层再收口)。
+    ///
+    /// 迟到语义说明:分片收件箱的迟到输入是 panic(权威输入迟到 = 调用方
+    /// bug);观察者命令的生产入口 `Session::move_observer` 盖当前拍,
+    /// 回放原章直投的条目 tick ≤ 快照拍已被 replay 过滤,再晚不可能——
+    /// 沿用同一 fail-stop 语义(迟到 = 一致性违规)。
+    pub fn submit_observer(&mut self, input: StampedInput) {
+        let now = self.coordinator.tick();
+        if input.apply_at < now {
+            panic!(
+                "迟到观察者输入:apply_at = {} < 当前拍 {}(该拍已应用,fail-stop)",
+                input.apply_at.0, now.0
+            );
+        }
+        self.observer_inbox.push_back(input);
+    }
+
+    /// 两拍之间取本拍激活决策(REQ-002 §4.4;每拍 tick 内收集,取走即清:
+    /// 恰一次语义)。
+    pub fn take_activation_requests(&mut self) -> Vec<(ShardId, physics_sim::ActivationDecisions)> {
+        std::mem::take(&mut self.activation_requests)
+            .into_iter()
+            .collect()
+    }
+
+    /// 两拍之间装载一个 chunk(幂等:重复装载同 chunk = 重建)。
+    /// 委托 `ShardSim::load_chunk`(insert + 边界 collider 重建)。未注册分片
+    /// → panic(与 submit 同款 fail-stop;分片由驱动 ensure 后才可能来数)。
+    pub fn apply_chunk_load(&mut self, shard: ShardId, pos: ChunkPos, chunk: voxel::Chunk) {
+        let sim = self
+            .sims
+            .get_mut(&shard)
+            .expect("装载到未注册分片(调用方 bug,fail-stop)");
+        sim.load_chunk(pos, chunk);
+    }
+
+    /// 两拍之间卸载一个 chunk(返回它供持久化;未装载 → None)。
+    /// 分片未注册或 chunk 未装载都算"未装载" → None(无东西可卸,持久化
+    /// 调用方按 None 跳过);装载路径的未注册分片才 panic(ensure 前装载 =
+    /// 调用方 bug)。
+    pub fn apply_chunk_unload(&mut self, shard: ShardId, pos: ChunkPos) -> Option<voxel::Chunk> {
+        let sim = self.sims.get_mut(&shard)?;
+        sim.unload_chunk(pos)
+    }
+
+    /// 两拍之间取 despawn 候选(REQ-002 §4.5:空片+无票+idle_expired)。
+    /// 只记录不清:重复取返回同一集合,直到下一 tick 刷新。
+    pub fn take_despawn_requests(&mut self) -> Vec<ShardId> {
+        self.despawn_requests.iter().copied().collect()
+    }
+
+    /// 卸载整个分片(REQ-002 §4.5):lifecycle 走 Draining→Stopped→release,
+    /// 逐 chunk 卸载返回(供持久化屏障)。实体非空 → panic(候选条件被破坏,
+    /// fail-stop);未注册 → panic。调用前提:两拍之间(不在 tick 内)。
+    pub fn unload_shard(&mut self, shard: ShardId) -> Vec<(ChunkPos, voxel::Chunk)> {
+        let sim = self
+            .sims
+            .get(&shard)
+            .unwrap_or_else(|| panic!("卸载未注册分片 {shard:?}(调用方 bug,fail-stop)"));
+        if sim.entity_count() > 0 {
+            panic!("unload_shard 触及非空分片 {shard:?}(despawn 候选条件被破坏,fail-stop)");
+        }
+        let lifecycle = self
+            .lifecycles
+            .get_mut(&shard)
+            .expect("已注册分片必有生命周期记录");
+        lifecycle.begin_draining();
+        lifecycle.note_drained();
+        lifecycle.stop();
+
+        let sim = self.sims.remove(&shard).expect("上方已查");
+        // lifecycle 记录保留(Stage::Stopped 供观测;同分片再注册时覆盖重建)。
+        self.activation_requests.remove(&shard);
+        self.despawn_requests.remove(&shard);
+        self.ownership.release(shard);
+        // 逐 chunk 卸载:BTreeMap 键序 = ChunkPos 升序(确定性)。
+        let positions: Vec<ChunkPos> = sim.voxel().chunk_positions().collect();
+        let mut sim = sim;
+        let mut out = Vec::with_capacity(positions.len());
+        for cp in positions {
+            if let Some(chunk) = sim.unload_chunk(cp) {
+                out.push((cp, chunk));
+            }
+        }
+        out
+    }
+
+    /// 生命周期阶段查询(观测用):无记录(未注册)→ None。
+    pub fn lifecycle_stage(&self, shard: ShardId) -> Option<crate::lifecycle::Stage> {
+        self.lifecycles
+            .get(&shard)
+            .map(crate::lifecycle::ShardLifecycle::stage)
     }
 
     /// 注册一个分片(以构造好的 ShardSim 形式进入)。已注册 → panic;
@@ -198,14 +347,45 @@ impl Scheduler {
         // 1. 本拍号。
         let at = self.coordinator.tick();
 
+        // 1.2(REQ-002 §4.2):应用观察者收件箱中 apply_at == at 的全部条目
+        //     (按 canonical 序;未来拍留存——与 router inbox 同语义;过期拍
+        //     在 submit 时已被拒,不会出现)。分片输入前缀永不出现该变体。
+        {
+            let mut due: Vec<StampedInput> = Vec::new();
+            let mut kept = VecDeque::with_capacity(self.observer_inbox.len());
+            for input in self.observer_inbox.drain(..) {
+                if input.apply_at == at {
+                    due.push(input);
+                } else {
+                    kept.push_back(input);
+                }
+            }
+            self.observer_inbox = kept;
+            due.sort_by_key(|input| input.canonical_key());
+            for input in due {
+                let (source, position) = match input.payload {
+                    InputPayload::Command(messaging::SimCommand::SetObserverPosition {
+                        position,
+                    }) => (input.source, position),
+                    _ => panic!(
+                        "观察者收件箱只收 SetObserverPosition(收到其它载荷,调用方 bug,fail-stop)"
+                    ),
+                };
+                self.observer_table.insert(source, position);
+                self.observers_ever_set = true;
+            }
+        }
+
         // 1.5(README 决策 8;任务书 req001-backlog/02):观察者已设置过 →
-        //     每分片激活刷新(tier③ 冻结/唤醒在本拍 step 生效);返回的
-        //     tier①② chunk 装卸请求本轮忽略(数据源属 REQ-002)。
-        //     从未设置过观察者 = Option::None → 完全跳过,行为与历史一致
-        //     (向后兼容开关,任务书细则 5)。
-        if let Some(observers) = &self.observers {
-            for sim in self.sims.values_mut() {
-                let _decisions = sim.apply_activation(observers);
+        //     每分片激活刷新(tier③ 冻结/唤醒在本拍 step 生效);tier①②
+        //     chunk 装卸请求自本任务起外露(REQ-002 §4.4,两拍之间取用)。
+        //     观察者中心集 = 命令化表 + 直通列表(两条写入路径,一张语义表);
+        //     两者皆从未设置 → 完全跳过,行为与历史一致(向后兼容开关)。
+        self.activation_requests.clear();
+        if let Some(observers) = self.activation_centers() {
+            for (shard, sim) in self.sims.iter_mut() {
+                let decisions = sim.apply_activation(&observers);
+                self.activation_requests.insert(*shard, decisions);
             }
         }
 
@@ -272,12 +452,28 @@ impl Scheduler {
 
         // 7. lifecycle 接线(README 决策 4:只记活动,不自动 despawn):
         //    本拍有输入前缀或非空实体 → 活动;空片不记,空闲计时才走得动。
+        //    despawn 候选(REQ-002 §4.5):空片 + 无票 + idle_expired → 记录
+        //    (不自动拆,卸载由 unload_shard 显式驱动;lifecycle 本身不推进)。
+        //    票 = 任一观察者到分片核心 AABB(8×8 chunk 立柱)的水平距离
+        //    ≤ chunk_unload_radius(48m)。
+        self.despawn_requests.clear();
         for (&shard, sim) in &self.sims {
-            if had_prefix.contains(&shard) || sim.entity_count() > 0 {
+            let active = had_prefix.contains(&shard) || sim.entity_count() > 0;
+            if active {
                 self.lifecycles
                     .get_mut(&shard)
                     .expect("已注册分片必有生命周期记录")
                     .note_activity(at);
+            }
+            let lifecycle = self
+                .lifecycles
+                .get(&shard)
+                .expect("已注册分片必有生命周期记录");
+            if sim.entity_count() == 0
+                && !self.shard_is_ticketed(shard)
+                && lifecycle.idle_expired(at)
+            {
+                self.despawn_requests.insert(shard);
             }
         }
 
@@ -293,6 +489,34 @@ impl Scheduler {
     /// 查询:未注册或实体不在该分片 → None。
     pub fn entity_state(&self, shard: ShardId, entity: EntityId) -> Option<EntityState> {
         self.sims.get(&shard)?.entity_state(entity)
+    }
+
+    /// 票判定(REQ-002 §4.5):任一观察者到分片核心 AABB(8×8 chunk 立柱,
+    /// 水平投影为 `shard.pos.min_chunk()..+8` chunk 的方块区)的水平距离
+    /// ≤ chunk_unload_radius(48m)→ 有票。观察者从未设置(两路径皆未)→ 无票。
+    fn shard_is_ticketed(&self, shard: ShardId) -> bool {
+        let Some(observers) = self.activation_centers() else {
+            return false;
+        };
+        // 取激活配置的卸载半径(票半径与 tier①② 卸载半径同源,REQ-002 §4.5)。
+        let radius = self
+            .sims
+            .values()
+            .next()
+            .map(|s| s.activation_config().chunk_unload_radius)
+            .unwrap_or(48.0);
+        let radius_sq = radius * radius;
+        let min = shard.pos.min_chunk();
+        let min_x = (min.x * types::CHUNK_SIZE) as f32;
+        let min_z = (min.z * types::CHUNK_SIZE) as f32;
+        let max_x = min_x + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        let max_z = min_z + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        observers.iter().any(|o| {
+            // 水平点到 AABB 距离(立方体外取分量差,内含取 0)。
+            let dx = (o.x.clamp(min_x, max_x) - o.x).abs();
+            let dz = (o.z.clamp(min_z, max_z) - o.z).abs();
+            dx * dx + dz * dz <= radius_sq
+        })
     }
 
     /// 分片快照(任务书 01):委托 `ShardSim::snapshot` 产出确定性字节。
@@ -324,6 +548,11 @@ impl Scheduler {
     /// 幂等(句柄与发送端均 take/clear)。
     pub fn shutdown(mut self) {
         for lifecycle in self.lifecycles.values_mut() {
+            // despawn(unload_shard)后的终态记录已 Stopped:幂等跳过,不重走
+            // 三连转移(begin_draining 只允许从 Active 进入,重走 = panic)。
+            if lifecycle.is_stopped() {
+                continue;
+            }
             lifecycle.begin_draining();
             lifecycle.note_drained();
             lifecycle.stop();
@@ -594,6 +823,407 @@ mod tests {
             s2.translation.y < s1.translation.y,
             "持续下落(与历史行为一致)"
         );
+        sched.shutdown();
+    }
+
+    // ---- 任务书 02:观察者命令化 + 装载编排 + despawn(测试清单) ----
+
+    use messaging::{InputPayload, InputSource, SimCommand, StampedInput};
+
+    /// 带位置的观察者输入(StampedInput,source 可控;SetObserverPosition)。
+    fn observer_input(
+        source: u32,
+        sequence: u64,
+        apply_at: Tick,
+        pos: types::glam::Vec3,
+    ) -> StampedInput {
+        StampedInput {
+            apply_at,
+            source: InputSource(source),
+            sequence,
+            payload: InputPayload::Command(SimCommand::SetObserverPosition { position: pos }),
+        }
+    }
+
+    /// 测试清单 1 `observer_command_updates_table_at_tick`:
+    /// submit_observer(apply_at=N) → tick N 后 observers() 反映;N 前未应用。
+    #[test]
+    fn observer_command_updates_table_at_tick() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let pos = types::glam::Vec3::new(8.0, 3.0, 8.0);
+        // 当前拍 0,投递 apply_at = 0 的观察者命令。
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, pos));
+        // apply_at 未到之前不应用(此例 apply_at=0 首个 tick 即到;先验未来拍)。
+        sched.submit_observer(observer_input(2, 0, Tick(5), pos));
+        assert!(sched.observers().is_empty(), "tick 前:观察者命令尚未应用");
+        // tick 拍 0:apply_at=0 到期 → source 1 入表;source 2(拍 5)留存。
+        sched.tick();
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource(1), pos)],
+            "拍 0 后:仅到期条目入表"
+        );
+        for _ in 0..4 {
+            sched.tick();
+        }
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource(1), pos)],
+            "拍 4 末:未来拍条目仍未应用"
+        );
+        sched.tick(); // 拍 5:第二条到期。
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource(1), pos), (InputSource(2), pos)],
+            "拍 5 后:第二条已应用,InputSource 升序"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 2 `set_observers_direct_still_works`:整表替换直通(兼容开关)
+    /// ——观察者表与激活行为同旧语义;且 observers() 视图反映直通内容
+    /// (同一张表,REQ-002 §4.2)。
+    #[test]
+    fn set_observers_direct_still_works() {
+        use types::glam::Vec3;
+        let shard = shard_id(0, 0);
+        let mut sim0 = sim(0, 0);
+        let far = types::EntityId::from_parts(1, 2);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: far,
+                state: types::EntityState {
+                    translation: Vec3::new(100.0, 3.0, 100.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim0);
+        // 直通:整表替换。表内位置也以 (InputSource, Vec3) 视图可见——
+        // 直通路径固定使用调度器保留 source(InputSource::SCHEDULER)。
+        sched.set_observers(vec![Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource::SCHEDULER, Vec3::new(8.0, 3.0, 8.0))],
+            "直通设置反映在同一张表上(调度器保留 source)"
+        );
+        sched.tick();
+        let s = sched.entity_state(shard, far).expect("实体仍在");
+        assert_eq!(
+            s,
+            types::EntityState {
+                translation: Vec3::new(100.0, 3.0, 100.0),
+                ..types::EntityState::default()
+            },
+            "远处实体冻结悬停(直通路径激活语义与历史一致)"
+        );
+        // 再次调用 = 覆盖替换。
+        sched.set_observers(vec![Vec3::new(96.0, 0.0, 96.0)]);
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource::SCHEDULER, Vec3::new(96.0, 0.0, 96.0))],
+            "整表替换:旧表清空"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 3 `activation_requests_exposed_between_ticks`:观察者移动后
+    /// take_activation_requests 非空、含 chunk 装载请求;第二次取为空(恰一次)。
+    #[test]
+    fn activation_requests_exposed_between_ticks() {
+        use types::glam::Vec3;
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 8.0)));
+        sched.tick();
+        let requests = sched.take_activation_requests();
+        assert!(
+            !requests.is_empty(),
+            "有观察者 → 本拍激活决策被收集(含装载请求)"
+        );
+        let (_, decisions) = &requests[0];
+        assert!(
+            !decisions.chunks_to_load.is_empty(),
+            "空世界 + 近观察者 → 必有 chunk 装载请求:{decisions:?}"
+        );
+        assert!(
+            sched.take_activation_requests().is_empty(),
+            "第二次取为空(恰一次:取走即清)"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 4 `chunk_load_unload_roundtrip_via_orchestr_api`:
+    /// apply_chunk_load 后物理可见(实体落在生成的地面上被支撑);unload 返回该 chunk。
+    #[test]
+    fn chunk_load_unload_roundtrip_via_orchestr_api() {
+        use types::glam::Vec3;
+        use voxel::{Superflat, WorldGenerator};
+
+        let shard = shard_id(0, 0);
+        let mut sim0 = sim(0, 0);
+        let e = types::EntityId::from_parts(1, 1);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: types::EntityState {
+                    // 地面顶面(世界 y=-60)上方 5m:短程下落,几十拍内驻留。
+                    translation: Vec3::new(8.5, -55.0, 8.5),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim0);
+        // 装载生成的 chunk(Superflat classic:stone×1 + dirt×3,层底在
+        // 世界 y = -64 → 地面顶面 y = -60)。
+        let cp = types::ChunkPos::new(0, 0);
+        let chunk = Superflat::classic().generate(types::WorldSeed(0), cp);
+        sched.apply_chunk_load(shard, cp, chunk);
+        // 幂等:重复装载同 chunk = 重建(不 panic)。
+        sched.apply_chunk_load(
+            shard,
+            cp,
+            Superflat::classic().generate(types::WorldSeed(0), cp),
+        );
+        // 实体落到地面顶面(y=-60)驻留:中心 ≈ -59.5。
+        for _ in 0..60 {
+            sched.tick();
+        }
+        let s = sched.entity_state(shard, e).expect("实体仍在");
+        assert!(
+            s.translation.y > -60.0 && s.translation.y < -58.5,
+            "实体落在生成的地面上被支撑:y={}",
+            s.translation.y
+        );
+        // 卸载:返回该 chunk(供持久化);未装载位置 → None。
+        let unloaded = sched.apply_chunk_unload(shard, cp).expect("已装载必有返回");
+        assert_eq!(
+            unloaded,
+            Superflat::classic().generate(types::WorldSeed(0), cp),
+            "卸载返回装载时的 chunk(未被修改)"
+        );
+        assert!(
+            sched.apply_chunk_unload(shard, cp).is_none(),
+            "未装载 → None"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 5 `despawn_candidate_only_when_empty_and_unticketed`:
+    /// 空片无票 idle 到期 → 候选;有实体或有票 → 无候选。
+    #[test]
+    fn despawn_candidate_only_when_empty_and_unticketed() {
+        use types::glam::Vec3;
+
+        // 分片 A(0,0) 空片;B(0,1) 有实体;C(0,2) 空片但有观察者票。
+        // 专用小 despawn 窗口(测试不必跑 1800 拍)。
+        let cfg = SchedulerConfig {
+            despawn_after_ticks: 5,
+            ..sched_cfg(2)
+        };
+        let mut sched = Scheduler::new(cfg);
+        sched.register(sim(0, 0));
+        sched.register(sim(0, 1));
+        sched.register(sim(0, 2));
+        let b = shard_id(0, 1);
+        let mut sim_b = sim(0, 1);
+        sim_b.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: types::EntityId::from_parts(1, 1),
+                state: types::EntityState {
+                    // B 核心区内(分片 8×8 chunk = 128 块跨;z=136 ∈ [128,256))。
+                    translation: Vec3::new(8.0, 3.0, 136.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        // 用带实体的 sim_b 顶替 B(先注册了空壳,直接换表内同键值 = 覆盖)。
+        sched.sims.insert(b, sim_b);
+        // 观察者落在 C 的核心区深处(z=383 ∈ [384-1,·):383 < 384,取 383 在
+        // C 区间 [256,384) 内,距 A/B 的 AABB 远超 48m → 只给 C 票)。
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 383.0)));
+        // 跑过 idle 窗口(5 拍)+ 余量。
+        for _ in 0..8 {
+            sched.tick();
+        }
+        let candidates = sched.take_despawn_requests();
+        assert_eq!(
+            candidates,
+            vec![shard_id(0, 0)],
+            "只有 A(空+无票+idle 到期)是候选"
+        );
+        assert_eq!(
+            sched.take_despawn_requests(),
+            vec![shard_id(0, 0)],
+            "候选只记录不清:重复取返回同集(任务书语义细则 5:只记录不清)"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 2 补遗(评审回归):多位置直通——旧语义(`observers:
+    /// Option<Vec<Vec3>>`)下整个列表都作为激活/票中心,直通落到
+    /// `BTreeMap` 后必须一条不丢。断言:表视图全量再生(键升序 = 列表
+    /// 序);票判定按多中心生效(单中心只会给 A 票,丢中心则 C 漏票)。
+    #[test]
+    fn set_observers_multi_position_all_take_effect() {
+        use types::glam::Vec3;
+
+        // A(0,0) 空片 idle 候选;B(0,1) 有实体;C(0,2) 空片,票只来自
+        // 第二个直通位置。despawn 窗口专用小值(测试不必跑 1800 拍)。
+        let cfg = SchedulerConfig {
+            despawn_after_ticks: 5,
+            ..sched_cfg(2)
+        };
+        let mut sched = Scheduler::new(cfg);
+        sched.register(sim(0, 0));
+        sched.register(sim(0, 1));
+        sched.register(sim(0, 2));
+        let b = shard_id(0, 1);
+        let mut sim_b = sim(0, 1);
+        sim_b.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: types::EntityId::from_parts(1, 1),
+                state: types::EntityState {
+                    translation: Vec3::new(8.0, 3.0, 136.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        sched.sims.insert(b, sim_b);
+
+        // 两个直通位置:pos_a 距 A 核心区近、距 C 极远;pos_c 在 C 核心区
+        // 深处、距 A 极远(几何与 despawn_candidate_only_when_empty_and_unticketed
+        // 同款:48m 半径下互不重叠)。旧 bug:同键覆盖 → 仅 pos_c 存活,
+        // A 无票被记候选(且表视图只剩 1 条)。
+        let pos_a = Vec3::new(8.0, 0.0, 8.0);
+        let pos_c = Vec3::new(8.0, 0.0, 383.0);
+        sched.set_observers(vec![pos_a, pos_c]);
+
+        // 表视图:两条直通位置全在,一条不丢(高位直通段键 > SCHEDULER 键,
+        // 键升序视图 = [末位, 首位] 的确定性逆序;激活/票按位置集,无序语义)。
+        let view = sched.observers();
+        assert_eq!(
+            view.len(),
+            2,
+            "多位置直通必须全部落表(旧实现同键覆盖只剩末位):{view:?}"
+        );
+        assert_eq!(
+            view.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
+            vec![pos_c, pos_a],
+            "键升序读出确定性:末位(SCHEDULER 键 0)在前,高位段其次"
+        );
+
+        // 票判定按多中心生效:跑过 idle 窗口(5 拍)+ 余量。两分片都有票
+        // → 无候选(B 非空也不可能是候选)。
+        for _ in 0..8 {
+            sched.tick();
+        }
+        assert!(
+            sched.take_despawn_requests().is_empty(),
+            "A 有票(第一中心)、C 有票(第二中心)→ 均非候选(旧实现丢第一\
+             中心时 A 会误入候选)"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单 6 `unload_shard_walks_lifecycle_and_releases`:卸载后
+    /// shard_ids 不含、ownership 释放、再 register 同分片可行;实体非空 → panic。
+    #[test]
+    fn unload_shard_walks_lifecycle_and_releases() {
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        let cp = types::ChunkPos::new(0, 0);
+        sched.apply_chunk_load(shard, cp, voxel::Chunk::air());
+        // 实体非空 → panic(fail-stop:候选条件被破坏)。
+        {
+            let mut sim_e = sim(0, 0);
+            sim_e.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 0,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: types::EntityId::from_parts(1, 9),
+                    state: types::EntityState::default(),
+                    desc: types::EntityDesc::default(),
+                }),
+            }]);
+            let mut other = Scheduler::new(sched_cfg(2));
+            other.register(sim_e);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                other.unload_shard(shard)
+            }));
+            assert!(
+                result.is_err(),
+                "实体非空 → unload_shard 必须 panic(fail-stop)"
+            );
+            other.shutdown();
+        }
+        // 空片:正常卸载。
+        let chunks = sched.unload_shard(shard);
+        assert_eq!(chunks, vec![(cp, voxel::Chunk::air())], "逐 chunk 卸载返回");
+        assert!(
+            !sched.shard_ids().contains(&shard),
+            "卸载后 shard_ids 不含该分片"
+        );
+        assert!(!sched.ownership.contains(shard), "ownership 已释放");
+        assert!(
+            matches!(
+                sched.lifecycle_stage(shard),
+                Some(crate::lifecycle::Stage::Stopped)
+            ),
+            "卸载后 lifecycle = Stopped"
+        );
+        assert_eq!(
+            sched.apply_chunk_unload(shard, cp),
+            None,
+            "chunk 随分片卸载"
+        );
+        // 再 register 同分片可行(复活路径)。
+        sched.register(sim(0, 0));
+        assert!(sched.shard_ids().contains(&shard), "再注册可行(复活)");
+        // 未注册 → panic。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sched.unload_shard(shard_id(7, 7))
+        }));
+        assert!(result.is_err(), "未注册分片 → panic(fail-stop)");
+        sched.shutdown();
+    }
+
+    /// 回归(任务 04 授权修复):despawn(unload_shard)保留 Stopped 记录后
+    /// 直接 shutdown 不得 panic(终态记录幂等跳过)——真实链路 = 运行中途
+    /// despawn → 驱动正常关机(session.shutdown → Scheduler::shutdown)。
+    #[test]
+    fn shutdown_after_unload_does_not_panic() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        let chunks = sched.unload_shard(shard_id(0, 0));
+        assert_eq!(chunks.len(), 1, "前置:卸载返回 chunk");
+        assert!(sched.shard_ids().is_empty(), "前置:分片已卸载");
+        // despawn 后直接关机:不得 panic(修复前在此触发非法阶段转移)。
         sched.shutdown();
     }
 }

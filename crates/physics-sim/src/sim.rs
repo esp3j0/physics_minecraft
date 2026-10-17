@@ -5,7 +5,7 @@
 //! 凝固桥检测与迁移检测(demo A/C 协议);产出经 `take_outbox` 交给调度器。
 //! rapier 类型不出本模块的公开接口(防腐层,蓝图 §0)。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -26,9 +26,9 @@ use messaging::{CrossEvent, EnvelopePayload, InputPayload, Intent, SimCommand, S
 pub struct SolidifyConfig {
     /// 总开关。几何测试等场景可关闭;生产恒开(共识 6)。
     pub enabled: bool,
-    /// 线速度阈值(m/tick)。
+    /// 线速度阈值(m/s;REQ-002 决议 4c 单位澄清:0.1 m/s ≈ 每 tick 1.67mm)。
     pub linear_threshold: f32,
-    /// 角速度阈值(rad/tick)。
+    /// 角速度阈值(rad/s;决议 4c 单位澄清)。
     pub angular_threshold: f32,
     /// 连续低于阈值的 tick 数。
     pub consecutive_ticks: u32,
@@ -36,6 +36,11 @@ pub struct SolidifyConfig {
     pub max_snap_blocks: f32,
     /// snap 角度误差超过此值 → 升级为等睡眠。
     pub max_snap_angle_deg: f32,
+    /// 自动触发位移门(REQ-001 §9.5 修订,REQ-002 决议 4a/demos/solidify-slopes):
+    /// 最近 20 tick 位移 ≤ 此值(m)才允许凝固;0 = 关闭门(直通,兼容开关)。
+    /// 默认 0.003(3mm;实验:合法落定 d20 ≤1.4mm,受驱爬行 ≥6.3mm)。
+    /// 同时约束 P2 计数路径与睡眠兜底路径(决议:d)兜底不得视为误凝固保险)。
+    pub displacement_gate_m: f32,
 }
 
 impl Default for SolidifyConfig {
@@ -47,9 +52,14 @@ impl Default for SolidifyConfig {
             consecutive_ticks: 20,
             max_snap_blocks: 0.5,
             max_snap_angle_deg: 45.0,
+            displacement_gate_m: 0.003,
         }
     }
 }
+
+/// 位移门滚动窗口的样本数:最近 20 tick 位移 = 21 个 translation
+/// (每 tick step 后采一个点,首尾相距 20 tick;任务书 01 接口设计)。
+pub(crate) const DISPLACEMENT_WINDOW_LEN: usize = 21;
 
 /// 单分片配置。可序列化(快照,任务书 01 细则 2:gravity 为 glam Vec3,
 /// types 的 glam 已开 serde)。
@@ -93,6 +103,12 @@ pub(crate) struct EntityRecord {
     pub(crate) desc: EntityDesc,
     /// 连续"低速"tick 计数(P2 触发用)。
     pub(crate) slow_ticks: u32,
+    /// 演员标记(REQ-002 决议 4b 政策层豁免):置位后完全豁免自动凝固
+    /// (P2 计数与睡眠兜底两条路径),仅显式命令将来触发。默认 false。
+    pub(crate) actor: bool,
+    /// 位移门滚动窗口:最近 21 个 translation(首尾距离 = 窗口位移)。
+    /// 实体存在期间持续滚动;凝固/迁移重建后随实体重置为单点(细则 1)。
+    pub(crate) window: VecDeque<Vec3>,
 }
 
 /// 单分片模拟器(字段 crate 内可见:snapshot.rs 读写快照结构)。
@@ -253,7 +269,7 @@ impl ShardSim {
             let Some(rec) = self.entities.get(&id) else {
                 continue;
             };
-            let (handle, desc) = (rec.handle, rec.desc);
+            let (handle, desc, slow_ticks_base) = (rec.handle, rec.desc, rec.slow_ticks);
             let state = self.read_state(rec);
             let is_sleeping = self
                 .phys
@@ -274,12 +290,38 @@ impl ShardSim {
                 continue;
             }
 
-            // ---- 凝固桥(P2 + 睡眠兜底,§9.5)----
+            // ---- 位移门滚动窗口(P2′,REQ-001 §9.5 修订)----
+            // 每拍采当前 translation;窗口在实体存在期间持续滚动,首尾距离
+            // 即"最近 20 tick 位移"。演员豁免只影响凝固,窗口照常滚动。
+            let gate_passes = {
+                let rec = self.entities.get_mut(&id).expect("存在");
+                rec.window.push_back(state.translation);
+                while rec.window.len() > DISPLACEMENT_WINDOW_LEN {
+                    rec.window.pop_front();
+                }
+                cfg.displacement_gate_m <= 0.0
+                    || rec.window.front().is_none_or(|oldest| {
+                        (*oldest - state.translation).length() <= cfg.displacement_gate_m
+                    })
+            };
+
+            // ---- 凝固桥(P2′ + 睡眠兜底,§9.5 修订)----
+            // 演员实体(政策层,REQ-002 决议 4b)完全豁免自动凝固(两条
+            // 自动路径),仅显式命令将来触发;位移门同时约束 P2 计数路径
+            // 与睡眠兜底路径(决议 d:兜底不得视为误凝固保险)。
             let slow = state.linvel.length() < cfg.linear_threshold
                 && state.angvel.length() < cfg.angular_threshold;
-            let slow_ticks = if slow { rec.slow_ticks + 1 } else { 0 };
-            self.entities.get_mut(&id).expect("存在").slow_ticks = slow_ticks;
-            if cfg.enabled && (slow_ticks >= cfg.consecutive_ticks || is_sleeping) {
+            let slow_ticks = if slow { slow_ticks_base + 1 } else { 0 };
+            let actor = {
+                let rec = self.entities.get_mut(&id).expect("存在");
+                rec.slow_ticks = slow_ticks;
+                rec.actor
+            };
+            if cfg.enabled
+                && !actor
+                && gate_passes
+                && (slow_ticks >= cfg.consecutive_ticks || is_sleeping)
+            {
                 let snapped = solidify::nearest_orientation(state.rotation, &orients);
                 let (cell, _center, disp) = solidify::snap_position(state.translation);
                 let ang_err = solidify::snap_angle_error(state.rotation, snapped);
@@ -403,6 +445,18 @@ impl ShardSim {
                 power,
                 radius,
             } => self.detonate(center, power, radius),
+            SimCommand::MarkActor { entity, actor } => {
+                let rec = self
+                    .entities
+                    .get_mut(&entity)
+                    .expect("MarkActor 触及不存在实体(fail-stop)");
+                rec.actor = actor;
+            }
+            // SetObserverPosition 永不走本路径(REQ-002 §4.2:调度器级专用
+            // 收件箱消费,分片输入前缀里不出现)→ 出现即一致性违规 fail-stop。
+            SimCommand::SetObserverPosition { .. } => {
+                panic!("SetObserverPosition 不得进入分片输入前缀(调度器专用收件箱,fail-stop)");
+            }
         }
     }
 
@@ -461,6 +515,8 @@ impl ShardSim {
                 handle,
                 desc,
                 slow_ticks: 0,
+                actor: false,
+                window: VecDeque::new(),
             },
         );
     }
@@ -817,5 +873,228 @@ mod tests {
             d.entities_to_wake.is_empty(),
             "淘汰条目入冷却簿记:窗口内 plan 不得唤醒:{d:?}"
         );
+    }
+
+    // ---- 任务书 01:P2′ 位移门 + 演员豁免(测试清单) ----
+
+    /// 零重力配置:虚空运动学场景(悬停/匀速漂移不受重力干扰——重力会使
+    /// 1 tick 后 |linvel| ≈ 0.16 > 0.1,slow 判据恒假,与被测语义无关)。
+    fn zero_g_cfg() -> ShardSimConfig {
+        let mut c = ShardSimConfig::new(shard_id(0, 0));
+        c.gravity = Vec3::ZERO;
+        c
+    }
+
+    fn zero_g_sim() -> ShardSim {
+        ShardSim::new(zero_g_cfg(), Box::new(voxel::SimpleRegistry::builtin()))
+    }
+
+    /// 虚空匀速漂移实体:零重力无碰撞,rapier 默认阻尼 0 → linvel 恒定;
+    /// 0.08 m/s < 0.1(P2 slow 判据恒真)。
+    fn drift_input(seq: u64, id: EntityId, v: f32) -> StampedInput {
+        let mut inp = spawn_input(seq, id, Vec3::new(60.0, 3.0, 60.0));
+        if let InputPayload::Command(SimCommand::SpawnDynamic { state, .. }) = &mut inp.payload {
+            state.linvel = Vec3::new(v, 0.0, 0.0);
+        }
+        inp
+    }
+
+    fn mark_actor_input(seq: u64, id: EntityId, actor: bool) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::MarkActor { entity: id, actor }),
+        }
+    }
+
+    /// 禁用实体的引擎睡眠(场景构造;rapier 阈值 <0 = 永不睡眠)。匀速慢漂体
+    /// 在 rapier 默认阈值下 30 tick 即被引擎睡眠(判据 `drift·0.5 < 0.05·dt`
+    /// ⟺ v < 0.1 m/s,与 P2 线阈值同界),会把"P2 计数 + 位移门"场景混入
+    /// 睡眠兜底——此辅助隔离出纯计数路径(demo H:受驱实体永不睡眠)。
+    fn disable_engine_sleep(s: &mut ShardSim, id: EntityId) {
+        let rec = s.entities.get(&id).expect("实体存在");
+        let body = s.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+        let act = body.activation_mut();
+        act.normalized_linear_threshold = -1.0;
+        act.angular_threshold = -1.0;
+    }
+
+    /// 测试清单 1 `gate_blocks_sustained_slow_drift`:虚空实体 linvel=0.08 m/s
+    /// 漂 600 tick:窗口 20 tick 位移 ≈26.7mm ≫ 3mm,P2 计数 @tick 20 达标但
+    /// 位移门挡住 → 永不凝固;实体仍在(禁引擎睡眠以隔离计数路径,见上)。
+    #[test]
+    fn gate_blocks_sustained_slow_drift() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[drift_input(0, e, 0.08)]);
+        disable_engine_sleep(&mut s, e);
+        let mut solidified = 0;
+        for _ in 0..600 {
+            s.step();
+            solidified += s.take_outbox().solidified.len();
+        }
+        assert_eq!(solidified, 0, "位移门挡住慢漂:600 tick 零凝固");
+        assert!(
+            s.entity_state(e).is_some(),
+            "实体仍在(600×0.08/60=0.8m,本体区内未迁移)"
+        );
+    }
+
+    /// 测试清单 2 `gate_passes_true_rest`:真静止 20 tick 照常凝固
+    /// (窗口位移 ≈0 ≤ 门);snap 正常(体素写入 = outbox 记录格)。
+    #[test]
+    fn gate_passes_true_rest() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(0, e, Vec3::new(60.5, 3.5, 60.5))]);
+        let mut cell = None;
+        for _ in 0..100 {
+            s.step();
+            let out = s.take_outbox();
+            if let Some((id, c)) = out.solidified.first() {
+                assert_eq!(*id, e);
+                cell = Some(*c);
+                break;
+            }
+        }
+        let cell = cell.expect("真静止 20 tick 内凝固(门不阻合法)");
+        assert_eq!(s.voxel().get_block(cell), types::BlockId(1), "snap 正常");
+        assert!(s.entity_state(e).is_none(), "实体已移除");
+    }
+
+    /// 测试清单 3 `sleeping_body_freezes_only_after_stop`:linvel=0.03 m/s
+    /// 滑行体(demo 场景 C 语义):滑行中不截断——P2 计数 @20 被位移门挡
+    /// (20 tick 位移 10mm > 3mm);引擎睡眠(30 tick 累积,@31)后速度冻结,
+    /// 窗口随滚动衰减(首端逐步排空带位移样本)→ 凝固只发生在睡眠之后
+    /// (t > 31),即兜底不再抢在睡眠/衰减前凝固。
+    #[test]
+    fn sleeping_body_freezes_only_after_stop() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[drift_input(0, e, 0.03)]);
+        let mut freeze_tick = None;
+        for tick in 1..=600u32 {
+            s.step();
+            if !s.take_outbox().solidified.is_empty() {
+                freeze_tick = Some(tick);
+                break;
+            }
+        }
+        let t = freeze_tick.expect("睡眠后窗口位移衰减,600 tick 内应凝固");
+        // 引擎睡眠最早 @tick 31(time_until_sleep=0.5s=30 tick 累积);
+        // 睡着后 translation 冻结,窗口再滚 ~18 tick 首尾距离才衰减到
+        // ≤3mm(t=48 实测)→ 凝固必须晚于睡眠(细则 1/决策 1:窗口约束
+        // 睡眠兜底路径,衰减后方放行)。
+        assert!(
+            t > 31,
+            "凝固必须发生在引擎睡眠(≥31)之后(窗口先衰减再放行):t={t}"
+        );
+    }
+
+    /// 测试清单 4 `mark_actor_exempts_all_auto_paths`:MarkActor{true} 后真静止
+    /// 600 tick 不凝固(P2 与睡眠兜底两路全豁免);MarkActor{false} 后恢复凝固。
+    #[test]
+    fn mark_actor_exempts_all_auto_paths() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input(0, e, Vec3::new(60.5, 3.5, 60.5)),
+            mark_actor_input(1, e, true),
+        ]);
+        for _ in 0..600 {
+            s.step();
+        }
+        assert_eq!(
+            s.take_outbox().solidified.len(),
+            0,
+            "演员实体 600 tick 真静止不凝固(完全豁免)"
+        );
+        assert!(s.entity_state(e).is_some(), "演员实体仍在实体表");
+
+        s.apply_prefix(&[mark_actor_input(2, e, false)]);
+        let mut restored = false;
+        for _ in 0..100 {
+            s.step();
+            if !s.take_outbox().solidified.is_empty() {
+                restored = true;
+                break;
+            }
+        }
+        assert!(restored, "取消演员后恢复自动凝固");
+    }
+
+    /// 测试清单 5 `mark_actor_unknown_entity_panics`:触及不存在实体 →
+    /// panic(fail-stop)。
+    #[test]
+    #[should_panic]
+    fn mark_actor_unknown_entity_panics() {
+        let mut s = zero_g_sim();
+        s.apply_prefix(&[mark_actor_input(0, entity(9), true)]);
+    }
+
+    /// 测试清单 6 `snapshot_keeps_actor_and_window`:窗口满的慢漂实体快照/恢复
+    /// 后继续被门挡住(窗口空会使首尾距离=0 → 直通,即失败);演员标记随快照
+    /// 走,恢复后 600 tick 真静止仍不凝固;字节幂等(窗口序列化行为一致)。
+    #[test]
+    fn snapshot_keeps_actor_and_window() {
+        let reg = || Box::new(voxel::SimpleRegistry::builtin()) as Box<dyn BlockRegistry>;
+        // 窗口:漂 100 tick(窗口满)→ 快照 → 恢复实例继续漂仍被挡。
+        // (禁引擎睡眠:窗口语义不与睡眠兜底衰减耦合。)
+        let mut a = zero_g_sim();
+        let e = entity(1);
+        a.apply_prefix(&[drift_input(0, e, 0.08)]);
+        disable_engine_sleep(&mut a, e);
+        for _ in 0..100 {
+            a.step();
+        }
+        a.take_outbox();
+        let bytes = a.snapshot();
+        let mut b = ShardSim::restore(&bytes, reg()).expect("自有快照必可解码");
+        for _ in 0..100 {
+            b.step();
+        }
+        assert!(
+            b.entity_state(e).is_some(),
+            "恢复实例的窗口延续:慢漂仍被位移门挡住"
+        );
+
+        // 演员标记:演员 → 快照 → 恢复 → 600 tick 真静止仍不凝固。
+        let mut c = zero_g_sim();
+        let e2 = entity(2);
+        c.apply_prefix(&[
+            spawn_input(0, e2, Vec3::new(60.5, 3.5, 60.5)),
+            mark_actor_input(1, e2, true),
+        ]);
+        c.step();
+        let s1 = c.snapshot();
+        let mut d = ShardSim::restore(&s1, reg()).expect("自有快照必可解码");
+        for _ in 0..600 {
+            d.step();
+        }
+        assert!(
+            d.entity_state(e2).is_some(),
+            "演员标记随快照走:恢复后 600 tick 真静止仍不凝固"
+        );
+        // 字节幂等(既有 idempotence 测试同款,窗口参与序列化)。
+        let d2 = ShardSim::restore(&s1, reg()).expect("自有快照必可解码");
+        assert_eq!(s1, d2.snapshot(), "restore→snapshot 字节一致(含窗口)");
+    }
+
+    /// 测试清单 7 `gate_disabled_when_zero`:displacement_gate_m=0 → 门关闭
+    /// (直通):同样的慢漂实体照旧凝固(兼容开关)。
+    #[test]
+    fn gate_disabled_when_zero() {
+        let mut s = zero_g_sim();
+        s.cfg.solidify.displacement_gate_m = 0.0;
+        let e = entity(1);
+        s.apply_prefix(&[drift_input(0, e, 0.08)]);
+        let mut solidified = 0;
+        for _ in 0..600 {
+            s.step();
+            solidified += s.take_outbox().solidified.len();
+        }
+        assert_eq!(solidified, 1, "门关闭:慢漂实体照旧凝固一次(直通)");
+        assert!(s.entity_state(e).is_none(), "实体已凝固移除");
     }
 }

@@ -12,6 +12,14 @@ messaging = { path = "../messaging" }
 physics-sim = { path = "../physics-sim" }
 shard = { path = "../shard" }
 rapier3d = "0.36.1"
+# REQ-002 验收套件(任务书 05 授权增补):app 驱动路径 + storage 真路径 +
+# sim-api 会话/回放 + tokio(暂停时间驱动测试)/ tempfile(redb 临时库)。
+app = { path = "../app" }
+sim-api = { path = "../sim-api" }
+storage = { path = "../storage" }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util"] }
+tempfile = "3"
+bincode = { version = "2", features = ["serde"] }
 
 [lints]
 workspace = true

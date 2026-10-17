@@ -5,7 +5,9 @@ use types::glam::Vec3;
 use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, Tick};
 
 /// 输入来源:外部命令 = 连接/会话序号(app 层分配);内部 = 分片序号(shard 注册表)。
-/// 0 保留给调度器注入的输入。
+/// 0 保留给调度器注入的输入;`u32` 高位段自 `u32::MAX` 向左为调度器
+/// `set_observers` 直通多观察者落表保留(见 `Scheduler::set_observers`),
+/// 分配给连接/会话的正向序号(1,2,…)永不触及该段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct InputSource(pub u32);
 
@@ -39,6 +41,19 @@ pub enum SimCommand {
         power: f32,
         radius: f32,
     },
+    /// 演员标记(REQ-002 决议 4b):置位/清除实体的政策层豁免标记;
+    /// 演员实体完全豁免自动凝固(P2 计数与睡眠兜底),仅显式命令将来触发。
+    /// 触及不存在实体 → panic(fail-stop)。
+    MarkActor {
+        entity: EntityId,
+        actor: bool,
+    },
+    /// 观察者移动(REQ-002 §4.2 命令化):设置来源玩家/agent 的观察者位置。
+    /// 不进分片收件箱——由调度器级专用收件箱消费(`Scheduler::submit_observer`),
+    /// 分片输入前缀里永远不会出现本变体(回放确定性的硬要求)。
+    SetObserverPosition {
+        position: Vec3,
+    },
 }
 
 impl SimCommand {
@@ -50,6 +65,8 @@ impl SimCommand {
             Self::RemoveEntity { .. } => 2,
             Self::TeleportEntity { .. } => 3,
             Self::Detonate { .. } => 4,
+            Self::MarkActor { .. } => 5,
+            Self::SetObserverPosition { .. } => 6,
         }
     }
 }
@@ -110,11 +127,38 @@ mod tests {
                 state: EntityState::default(),
             },
             cmd_detonate(),
+            // 任务书 01:MarkActor 追加(声明序最后,ordinal = 5)。
+            SimCommand::MarkActor {
+                entity: EntityId::from_parts(1, 1),
+                actor: true,
+            },
+            // 任务书 02:SetObserverPosition 追加(声明序最后,ordinal = 6)。
+            SimCommand::SetObserverPosition {
+                position: Vec3::ZERO,
+            },
         ];
         for (i, c) in all.iter().enumerate() {
             assert_eq!(c.ordinal() as usize, i, "声明序 = 类型序号");
         }
         assert!(cmd_set().ordinal() < cmd_detonate().ordinal());
+        // 追加变体:ordinal 续在最后(枚举只许追加,REQ-001 §9.6)。
+        assert_eq!(
+            SimCommand::MarkActor {
+                entity: EntityId::from_parts(1, 1),
+                actor: false
+            }
+            .ordinal(),
+            5,
+            "MarkActor = 追加序 5"
+        );
+        assert_eq!(
+            SimCommand::SetObserverPosition {
+                position: Vec3::ZERO
+            }
+            .ordinal(),
+            6,
+            "SetObserverPosition = 追加序 6(任务书 02)"
+        );
     }
 
     #[test]

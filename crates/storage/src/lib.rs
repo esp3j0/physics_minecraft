@@ -10,6 +10,7 @@
 //! 图纸:[docs/design/codebase-layout.md §3 storage](../../docs/design/codebase-layout.md)
 
 pub mod mem;
+pub mod provider;
 pub mod redb;
 pub mod traits;
 pub mod worker;

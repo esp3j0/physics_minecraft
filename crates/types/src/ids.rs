@@ -19,6 +19,10 @@ impl BlockId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct WorldId(pub u32);
 
+/// 世界生成种子(REQ-002 §4.1):同 `(seed, pos)` 必须位级确定生成(AC-G1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct WorldSeed(pub u64);
+
 /// 维度 ID(主世界/下界/末地,含义由游戏层定义)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DimensionId(pub u32);

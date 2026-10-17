@@ -12,6 +12,7 @@
 //! 不 panic、中文 panic 消息。
 
 use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use types::Tick;
@@ -19,8 +20,10 @@ use voxel::Chunk;
 
 use crate::traits::{CheckpointStore, ChunkKey, ChunkStore, StoreError};
 
-/// 存储操作命令(私有;通道 FIFO 即执行序,flush 的 ack 语义靠它)。
-enum StoreOp {
+/// 存储操作命令(通道 FIFO 即执行序,flush 的 ack 语义靠它;变体只许追加,
+/// 声明序续在最后)。`pub(crate)`:操作协议是 worker 的私有面,`ChunkProvider`
+/// 经同一通道发读请求(同模块树内可见,不泄漏出 crate)。
+pub(crate) enum StoreOp {
     /// 原子批量写 chunk(同批重复键后写覆盖,由后端保证)。
     PutChunks(Vec<(ChunkKey, Chunk)>),
     /// 追加一条检查点(blob 对存储不透明)。
@@ -28,13 +31,26 @@ enum StoreOp {
     /// 屏障:此前全部操作应用完后,经 oneshot 通道回 `Result<(), StoreError>`。
     /// `SyncSender` 容量 1 即 oneshot;send 失败 = 对端已放弃 → panic(fail-stop)。
     Flush(SyncSender<Result<(), StoreError>>),
+    /// 同步读(REQ-002 §4.3):oneshot 回 `Option<Chunk>`,未存 = `None`。
+    /// worker 单执行者,读写天然串行;读失败不 panic——记入粘滞错误(决策 6,
+    /// 与写一致)并回 `None`(调用方兜底;粘滞错误经下一次 flush/shutdown 显形)。
+    Get(ChunkKey, SyncSender<Option<Chunk>>),
 }
+
+/// 操作通道强发送端的共享槽(`ChunkProvider` 专用,`pub(crate)`):槽内是唯一
+/// 强发送端,句柄 shutdown/Drop 将其取走 = 通道关闭。给 provider 弱化语义
+/// (std mpsc stable 1.98 无 `WeakSender`/`downgrade`,实测):provider 存活
+/// 不会令 worker 的 `recv` 永不退出,shutdown 的 join 不被阻塞;槽已空后再
+/// `get` = 一致性违规 fail-stop(任务 03 细则 3)。
+pub(crate) type SharedOpTx = Arc<Mutex<Option<std::sync::mpsc::Sender<StoreOp>>>>;
 
 /// 单写 worker 的句柄(不 `Clone`:单句柄语义,多生产者由调用方持 `&self` 共享;
 /// 内部通道多生产者安全)。
 pub struct StoreWorker {
-    /// 操作发送端;`Option` 供 shutdown/Drop 幂等释放(take 后 worker 的 recv 退出)。
-    op_tx: Option<std::sync::mpsc::Sender<StoreOp>>,
+    /// 操作发送端共享槽:槽内是唯一强发送端,shutdown/Drop 从槽中 `take` 走即
+    /// 释放(worker 的 recv 退出);`ChunkProvider` 持槽克隆(`SharedOpTx`),
+    /// 槽空后其 `get` panic fail-stop(任务 03 细则 3)。
+    op_tx: SharedOpTx,
     /// 写线程句柄;`Option::take` 保证 shutdown 与 Drop 不会双 join(照 Scheduler)。
     worker: Option<JoinHandle<()>>,
 }
@@ -49,7 +65,7 @@ impl StoreWorker {
             .spawn(move || worker_main(op_rx, chunks, checkpoints))
             .expect("storage-writer 线程创建失败(系统资源耗尽)");
         Self {
-            op_tx: Some(op_tx),
+            op_tx: Arc::new(Mutex::new(Some(op_tx))),
             worker: Some(worker),
         }
     }
@@ -72,11 +88,21 @@ impl StoreWorker {
         ack_rx
     }
 
+    /// 操作通道共享槽的克隆(`ChunkProvider` 专用,`pub(crate)`,细则 3)。
+    pub(crate) fn shared_op_tx(&self) -> SharedOpTx {
+        Arc::clone(&self.op_tx)
+    }
+
     /// 向操作通道投递一条命令。句柄已关停后再投递 = 一致性违规 panic
     /// (fail-stop,照 Scheduler 对"通道已关闭"的处理);线程意外死亡同此。
     fn send(&self, op: StoreOp) {
-        let tx = self
+        // 锁中毒 = 持锁线程 panic 中(unwind 跨 Mutex)→ 一致性违规 fail-stop;
+        // 槽空 = 句柄已关停后再投递,同 fail-stop。
+        let guard = self
             .op_tx
+            .lock()
+            .expect("操作通道槽锁中毒:一致性违规(fail-stop)");
+        let tx = guard
             .as_ref()
             .expect("StoreWorker 已关停后再投递操作(调用方 bug,fail-stop)");
         if tx.send(op).is_err() {
@@ -97,8 +123,12 @@ impl StoreWorker {
         let sticky = ack
             .recv()
             .expect("storage-writer 在终末 flush 前死亡:一致性违规(fail-stop)");
-        // 释放发送端 → worker 的 recv 返回 Err → 正常退出;take 保证与 Drop 不双 join。
-        self.op_tx.take();
+        // 释放发送端(槽中取走,provider 的后续 get 同样 fail-stop)→ worker 的
+        // recv 返回 Err → 正常退出;take 保证与 Drop 不双 join。
+        self.op_tx
+            .lock()
+            .expect("操作通道槽锁中毒:一致性违规(fail-stop)")
+            .take();
         if let Some(handle) = self.worker.take()
             && handle.join().is_err()
         {
@@ -113,7 +143,9 @@ impl Drop for StoreWorker {
     /// 与 shutdown 不双 join)。此处 join 失败不 panic(Drop 路径 panic 会 abort;
     /// fail-stop 的显式路径由 shutdown 承担,照 Scheduler::drop)。
     fn drop(&mut self) {
-        let _ = self.op_tx.take();
+        if let Ok(mut guard) = self.op_tx.lock() {
+            guard.take();
+        }
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
@@ -142,6 +174,25 @@ fn worker_main(
             StoreOp::AppendCheckpoint(at, blob) => {
                 if let Err(e) = checkpoints.append(at, &blob) {
                     sticky.get_or_insert(e);
+                }
+            }
+            StoreOp::Get(key, ack_tx) => {
+                // 单次读:Ok(Some/None) 照答;Err 记入粘滞(决策 6,与写一致)后
+                // 回 `None` 让调用方兜底——粘滞错误经下一次 flush/shutdown 显形
+                // (fail-stop 由粘滞通道保证,读路径自身不 panic)。ack send 失败 =
+                // 调用方放弃 → panic(fail-stop,与 Flush ack 同款)。
+                let answer = match chunks.get(key) {
+                    Ok(found) => found,
+                    Err(e) => {
+                        sticky.get_or_insert(e);
+                        None
+                    }
+                };
+                if ack_tx.send(answer).is_err() {
+                    panic!(
+                        "get 应答对端已放弃:一致性违规(fail-stop),\
+                         调用方不应在应答前释放 oneshot 接收端"
+                    );
                 }
             }
             StoreOp::Flush(ack_tx) => {

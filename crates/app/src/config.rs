@@ -10,7 +10,7 @@ use physics_sim::{ShardSimConfig, SolidifyConfig};
 use serde::{Deserialize, Serialize};
 use shard::SchedulerConfig;
 use sim_api::session::SessionConfig;
-use types::{ShardId, Tick};
+use types::{ShardId, Tick, WorldSeed};
 
 /// 激活参数(REQ-001 §4.3;经 `shard_sim_config` 换算注入策略机
 /// `physics_sim::ActivationConfig`,任务书 req001-backlog/02 已接入)。
@@ -41,6 +41,16 @@ impl Default for ActivationConfig {
     }
 }
 
+/// 世界种类(REQ-002 §4.1 决议 1:v1 只有两个;枚举只许追加)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorldKind {
+    /// 超平坦(经典层表)。
+    #[default]
+    Superflat,
+    /// 种子化散布(超平坦基底 + 坐标哈希散布)。
+    SeededScatter,
+}
+
 /// 全部参数(蓝图 §6 表 + app 装配参数,app README 决策 9)。
 /// 结构体级 `#[serde(default)]`:toml 文件可只写要覆写的字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +79,10 @@ pub struct Config {
     pub worker_count: usize,
     /// 数据目录(redb 库目录,装配参数)。
     pub data_dir: PathBuf,
+    /// 世界种子(REQ-002 §4.1;单一来源,装配期固化进 ChunkProvider)。
+    pub world_seed: WorldSeed,
+    /// 世界种类(REQ-002 §4.1;决定 bootstrap 装配的生成器)。
+    pub world_kind: WorldKind,
 }
 
 impl Default for Config {
@@ -86,6 +100,8 @@ impl Default for Config {
             shard_alert_ms: 5.0,
             worker_count: 4,
             data_dir: PathBuf::from("data"),
+            world_seed: WorldSeed(0),
+            world_kind: WorldKind::Superflat,
         }
     }
 }
@@ -222,6 +238,16 @@ mod tests {
         assert_eq!(c.shard_alert_ms, 5.0, "shard_alert_ms = 5(§9.2)");
         assert_eq!(c.worker_count, 4, "worker_count = 4(决策 9)");
         assert_eq!(c.data_dir, PathBuf::from("data"), "data_dir = data(决策 9)");
+        assert_eq!(
+            c.world_seed,
+            WorldSeed(0),
+            "world_seed 默认 0(README 决策 9)"
+        );
+        assert_eq!(
+            c.world_kind,
+            WorldKind::Superflat,
+            "world_kind 默认 Superflat(README 决策 9)"
+        );
     }
 
     /// 测试清单 2:toml 只写 `dt = 0.02` 与 `worker_count = 8` → 其余全默认
@@ -351,6 +377,26 @@ mod tests {
             ..Config::default()
         };
         let _ = c.scheduler_config();
+    }
+
+    /// 测试清单 9(任务 04):world_seed/world_kind 的 serde(default)——toml
+    /// 只写其它字段时两新字段取默认;覆写值 roundtrip 无损(§6 单一来源)。
+    #[test]
+    fn world_config_serde_defaults_and_roundtrip() {
+        // 缺省:两新字段取默认(结构体级 serde(default))。
+        let c = Config::from_toml_str("dt = 0.02\n").expect("可解析");
+        assert_eq!(c.world_seed, WorldSeed(0), "缺省 world_seed = 0");
+        assert_eq!(c.world_kind, WorldKind::Superflat, "缺省 world_kind");
+
+        // 覆写:显式给值可解析(枚举名 = serde 默认外部形式)。
+        let custom = Config::from_toml_str("world_seed = 42\nworld_kind = \"SeededScatter\"\n")
+            .expect("可解析");
+        assert_eq!(custom.world_seed, WorldSeed(42));
+        assert_eq!(custom.world_kind, WorldKind::SeededScatter);
+
+        // roundtrip:覆写实例无损(新字段真实走序列化)。
+        let back = Config::from_toml_str(&custom.to_toml_string()).expect("自有输出可解析");
+        assert_eq!(back, custom, "world 字段 roundtrip 无损");
     }
 
     /// 测试清单 8(任务书 req001-backlog/02 授权接线):shard_sim_config 的

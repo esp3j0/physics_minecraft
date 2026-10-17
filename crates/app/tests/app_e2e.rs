@@ -99,6 +99,8 @@ async fn advance_ticks(ticks: u32) {
 
 /// 无注入的一段驱动:spawn run → 推进 ticks 拍 → Shutdown → 收 outcome。
 /// 命令发送端在推进期间保持存活(通道关闭 = 关机,不能提前 drop)。
+/// 任务 04 起:用 wire_provider_and_new_sim 装配 provider/new_sim(无观察者
+/// 场景编排零动作,行为与历史一致)。
 async fn drive(
     config: Config,
     session: sim_api::session::Session,
@@ -107,6 +109,8 @@ async fn drive(
     ticks: u32,
 ) -> app::driver::DriverOutcome {
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
     let driver = tokio::spawn(run(DriverArgs {
         config,
         session,
@@ -114,6 +118,8 @@ async fn drive(
         log,
         commands: rx,
         listen_ctrl_c: false,
+        provider,
+        new_sim,
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -197,6 +203,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
     assert_eq!(resume_from, None);
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),
         session,
@@ -204,6 +212,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
         log,
         commands: rx,
         listen_ctrl_c: false,
+        provider,
+        new_sim,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -229,6 +239,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
 
     // —— 续跑后向同分片发 SetBlock,跑 1 拍(全局第 7 拍)生效 ——
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store2, new_registry());
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),
         session: session2,
@@ -236,6 +248,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
         log: log2,
         commands: rx,
         listen_ctrl_c: false,
+        provider,
+        new_sim,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -340,6 +354,8 @@ async fn telemetry_wired_into_driver_outcome() {
         Box::new(MemCheckpointStore::new()),
     );
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
     let driver = tokio::spawn(run(DriverArgs {
         config,
         session,
@@ -347,6 +363,8 @@ async fn telemetry_wired_into_driver_outcome() {
         log: sim_api::log::CommandLog::new(),
         commands: rx,
         listen_ctrl_c: false,
+        provider,
+        new_sim,
     }));
     tx.send(DriverCommand::Send {
         shard,

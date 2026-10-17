@@ -12,11 +12,13 @@
 mod block;
 mod chunk;
 mod edit;
+mod generator;
 mod world;
 
 pub use block::{BlockRegistry, SimpleRegistry, SimpleRegistryError};
 pub use chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
 pub use edit::VoxelEdit;
+pub use generator::{SeededScatter, Superflat, WorldGenerator};
 pub use world::{VoxelError, VoxelWorld};
 
 /// 便捷 re-export(单一事实源在 types,蓝图 §0)。

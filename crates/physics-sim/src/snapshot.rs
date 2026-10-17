@@ -70,12 +70,15 @@ fn clone_world(w: &PhysicsWorld) -> PhysicsWorld {
     }
 }
 
-/// `EntityRecord` 的可序列化镜像(`slow_ticks` 原样,细则 1)。
+/// `EntityRecord` 的可序列化镜像(`slow_ticks` 原样,细则 1;actor 与位移窗口
+/// 随快照走,任务书 01 细则 4)。
 #[derive(Serialize, Deserialize)]
 struct SnapshotEntityRecord {
     handle: RigidBodyHandle,
     desc: EntityDesc,
     slow_ticks: u32,
+    actor: bool,
+    window: std::collections::VecDeque<types::glam::Vec3>,
 }
 
 impl ShardSim {
@@ -96,6 +99,8 @@ impl ShardSim {
                             handle: rec.handle,
                             desc: rec.desc,
                             slow_ticks: rec.slow_ticks,
+                            actor: rec.actor,
+                            window: rec.window.clone(),
                         },
                     )
                 })
@@ -130,6 +135,8 @@ impl ShardSim {
                         handle: rec.handle,
                         desc: rec.desc,
                         slow_ticks: rec.slow_ticks,
+                        actor: rec.actor,
+                        window: rec.window,
                     },
                 )
             })
