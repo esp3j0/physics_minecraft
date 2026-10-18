@@ -570,6 +570,7 @@ impl ObserveOrchestrator {
                     tick,
                     states,
                     removed,
+                    full,
                 },
             );
         }
@@ -2438,6 +2439,7 @@ mod tests {
                     tick,
                     states,
                     removed,
+                    ..
                 } = s2c
                 else {
                     unreachable!("上层已判定变体")

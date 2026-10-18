@@ -35,11 +35,13 @@ pub enum ViewEvent {
     Chunk { pos: ChunkPos, chunk: Chunk },
     /// chunk 卸载(移出视距)。
     ChunkGone { pos: ChunkPos },
-    /// 实体增量(变化 + 消失;全量包 removed 恒空,语义同协议)。
+    /// 实体流(增量 = 变化 + 消失;全量 = 整表对账,`full` 时以 states 为准
+    /// 重建实体表——驱散幽灵实体,协议 EntityStates.full 同语义)。
     Entities {
         tick: Tick,
         states: Vec<(EntityId, EntityState)>,
         removed: Vec<EntityId>,
+        full: bool,
     },
     /// 方块增量(凝固/挖掘/放置的渲染面)。
     Blocks { updates: Vec<(BlockPos, BlockId)> },
@@ -111,10 +113,12 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
             tick,
             states,
             removed,
+            full,
         } => Some(ViewEvent::Entities {
             tick,
             states,
             removed,
+            full,
         }),
         S2C::BlockUpdates { updates } => Some(ViewEvent::Blocks { updates }),
         S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
@@ -376,6 +380,7 @@ mod tests {
                     },
                 )],
                 removed: vec![EntityId::from_parts(9, 9)],
+                full: false,
             },
             S2C::BlockUpdates {
                 updates: vec![
@@ -420,14 +425,20 @@ mod tests {
                         tick,
                         states,
                         removed,
+                        full,
                     },
                     Some(ViewEvent::Entities {
                         tick: t,
                         states: s,
                         removed: r,
+                        full: f,
                     }),
                 ) => {
-                    assert_eq!((t, s, r), (tick, states, removed), "EntityStates 字段一致");
+                    assert_eq!(
+                        (t, s, r, f),
+                        (tick, states, removed, full),
+                        "EntityStates 字段一致"
+                    );
                 }
                 (S2C::BlockUpdates { updates }, Some(ViewEvent::Blocks { updates: u })) => {
                     assert_eq!(u, updates, "BlockUpdates 字段一致");

@@ -27,7 +27,7 @@ use crate::mesh::chunk_mesh;
 /// 相机移动速度(格/秒)。
 const MOVE_SPEED: f32 = 16.0;
 /// 鼠标灵敏度(弧度/像素)。
-const LOOK_SENSITIVITY: f32 = 0.003;
+const LOOK_SENSITIVITY: f32 = 0.008;
 /// MoveObserver 节流间隔(≥100ms 一次,任务书接口设计)。
 const OBSERVER_SEND_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 /// 实体立方体边长(约一格;EntityDesc::default half_size 0.5 的直觉呈现)。
@@ -38,9 +38,12 @@ const DISCONNECT_GRACE_SECS: f32 = 3.0;
 const SPAWN_AHEAD: f32 = 8.0;
 const SPAWN_LIFT: f32 = 6.0;
 const BLAST_AHEAD: f32 = 12.0;
-/// X 爆炸参数(与 e2e 爆炸测试同量级:全命中、可感飞散)。
+/// X 爆炸参数(power 12 与 e2e 同量级;radius 8 覆盖瞄准误差;爆心 y 固定
+/// 在地表平面——见 X 键注释)。
 const BLAST_POWER: f32 = 12.0;
-const BLAST_RADIUS: f32 = 6.0;
+const BLAST_RADIUS: f32 = 8.0;
+/// 爆心高度(超平坦地表顶面 y=4 + 0.7 ≈ 落地立方体中心)。
+const BLAST_Y: f32 = 4.7;
 /// viewer 生成实体的 EntityId origin 段(服务器分片序号 <<32 打包;9999 远离
 /// 一切真实分片号,保证客户端生成 ID 不与服务器侧冲突——决议 7 单调不回收)。
 const SPAWN_ORIGIN: u32 = 9999;
@@ -78,7 +81,9 @@ impl FlyCamera {
     /// 每帧推进(鼠标视角 + WASD 平移 + Shift/Ctrl 升降;dt 秒)。
     fn update(&mut self, dt: f32) {
         let delta = mouse_delta_position();
-        self.yaw += delta.x * LOOK_SENSITIVITY;
+        // 水平:鼠标右移 → 视角右转(常规 FPS 方向;ACV4 实跑反馈 1——原
+        // += 与渲染朝向组合后反向,翻转符号)。俯仰:鼠标上移 → 抬头。
+        self.yaw -= delta.x * LOOK_SENSITIVITY;
         self.pitch = (self.pitch - delta.y * LOOK_SENSITIVITY)
             .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
 
@@ -176,8 +181,15 @@ impl WorldView {
                 tick,
                 states,
                 removed,
+                full,
             } => {
                 self.tick = tick.0;
+                if full {
+                    // 全量对账:以 states 为准重建实体表——增量 removed 丢失或
+                    // 移除恰逢服务器全量周期(该路径不发 removed)时驱散幽灵
+                    // 实体(ACV4 实跑反馈 2 修复)。
+                    self.entities.clear();
+                }
                 for (id, state) in states {
                     let t = state.translation; // types::glam(0.33)→ macroquad(0.27)字段换算
                     self.entities.insert(id, vec3(t.x, t.y, t.z));
@@ -277,9 +289,12 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
                 desc: EntityDesc::default(),
             });
         }
-        // X:准星处引爆(把立方体炸飞;ACV4 ③)。
+        // X:准星处引爆(把立方体炸飞;ACV4 ③)。爆心 y 落到地表平面——
+        // 相机平面与落地立方体垂直落差可超半径导致恒不命中(实跑反馈 3 的
+        // 根因;超平坦地表顶面 world y=4,+0.7 对准立方体中心)。
         if is_key_pressed(KeyCode::X) && disconnected.is_none() {
-            let c = camera.position + camera.forward() * BLAST_AHEAD;
+            let mut c = camera.position + camera.forward() * BLAST_AHEAD;
+            c.y = BLAST_Y;
             control.command(SimCommand::Detonate {
                 center: types::glam::Vec3::new(c.x, c.y, c.z),
                 power: BLAST_POWER,

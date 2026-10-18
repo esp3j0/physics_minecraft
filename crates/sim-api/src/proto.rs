@@ -50,12 +50,17 @@ pub enum S2C {
     ChunkUnload {
         pos: ChunkPos,
     },
-    /// 增量:变化实体 + 消失实体(迁移/凝固/移除);全量时 removed 为空
-    /// (REQ-003 决议 3:删除通知显式携带)。
+    /// 实体状态流:增量 = 变化实体 + 消失实体(迁移/凝固/移除,REQ-003 决议 3);
+    /// 全量 = 整表(removed 恒空)。`full` 标记供客户端对账:全量包以 states
+    /// 为准**重建**实体表——增量 removed 丢失(队列丢最旧)或移除恰逢全量
+    /// 周期(driver 全量路径不发 removed)时,下一个全量周期自愈幽灵实体
+    /// (ACV4 实跑反馈 2 修复,Refs #6)。S2C 不参与 canonical 输入排序,
+    /// 字段追加不破坏既有决议。
     EntityStates {
         tick: Tick,
         states: Vec<(EntityId, EntityState)>,
         removed: Vec<EntityId>,
+        full: bool,
     },
     BlockUpdates {
         updates: Vec<(BlockPos, BlockId)>,
@@ -162,6 +167,7 @@ mod tests {
                     },
                 )],
                 removed: vec![EntityId::from_parts(9, 9)],
+                full: false,
             },
             S2C::BlockUpdates {
                 updates: vec![
@@ -207,6 +213,7 @@ mod tests {
             tick: Tick(0),
             states: states.clone(),
             removed: Vec::new(),
+            full: true,
         };
         let encoded = encode_frame(&big);
         let payload_len = encoded.len() - 4;
@@ -225,6 +232,7 @@ mod tests {
             tick: Tick(0),
             states: states.into_iter().take(10).collect(),
             removed: Vec::new(),
+            full: true,
         };
         let encoded = encode_frame(&small);
         assert!(encoded.len() - 4 <= FRAME_MAX, "小载荷在上限内");
