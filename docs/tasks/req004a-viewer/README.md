@@ -1,6 +1,7 @@
 # REQ-004A 实现任务书(总览)
 
 - 状态:已定稿(需求 [REQ-004A](../../requirements/REQ-004A-visual-viewer.md) 2026-10-18 确认)
+- GitHub issue:[#6](https://github.com/esp3j0/physics_minecraft/issues/6);实现提交请用 `Refs #6`
 - 实现方式:glm 实现(00-01),qwen 验收与评审(02);cargo 门禁;架构师终审
   (含 ACV4 手动验收清单实跑)。
 
