@@ -632,14 +632,22 @@ fn orchestrate(
     provider: &storage::provider::ChunkProvider,
     new_sim: &mut dyn FnMut(types::ShardId) -> physics_sim::ShardSim,
     pending_streams: &mut PendingStreams,
+    ensure_radius: f32,
     counters: &mut OrchestrationCounters,
 ) {
-    // ① 观察者分片 ensure(读 observers 视图;未注册 → new_sim + register)。
+    // ① 观察者分片 + 邻片 ensure(REQ-005 D5):观察者核心区距离
+    // `ensure_radius`(= awake_unload_radius,默认 32m)内的所有分片都
+    // ensure——醒着实体的迁移目的地/扩张副本的 owner 必在其中(醒着要求
+    // 观察者 24m 内,32m 有裕度);同拍去重,计数并入 shards_spawned。
+    // (Router pending destinations 的驱动接线需 sim-api 透传,留任务 01;
+    // 黑洞兜底由 Scheduler::tick 的信封黑洞 fail-stop 承担,见偏离说明。)
+    let mut ensured: std::collections::BTreeSet<types::ShardId> = std::collections::BTreeSet::new();
     for (_source, position) in session.observers() {
-        let shard = shard_of_position(position);
-        if !session.shard_ids().contains(&shard) {
-            session.register(new_sim(shard));
-            counters.shards_spawned += 1;
+        for shard in shards_within(position, ensure_radius) {
+            if ensured.insert(shard) && !session.shard_ids().contains(&shard) {
+                session.register(new_sim(shard));
+                counters.shards_spawned += 1;
+            }
         }
     }
 
@@ -747,16 +755,31 @@ fn orchestrate(
 
 /// 位置 → 所在分片(与 `Session::move_observer` 的 dest 换算同口径:
 /// chunk_of → shard_of,floor 语义)。
-fn shard_of_position(position: types::glam::Vec3) -> types::ShardId {
-    types::ShardId::new(
-        types::WorldId(0),
-        types::DimensionId(0),
-        types::ChunkPos::new(
-            (position.x / 16.0).floor() as i32,
-            (position.z / 16.0).floor() as i32,
-        )
-        .shard_of(),
-    )
+/// 位置 `p` 核心区 AABB 距离 ≤ `radius` 的全部分片(水平 x/z 口径;
+/// REQ-005 D5 邻片 ensure 用)。分片边长 128m → radius < 128 时至多 4 个。
+fn shards_within(p: types::glam::Vec3, radius: f32) -> Vec<types::ShardId> {
+    const SHARD_M: f32 = (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+    let min_x = ((p.x - radius) / SHARD_M).floor() as i32;
+    let max_x = ((p.x + radius) / SHARD_M).floor() as i32;
+    let min_z = ((p.z - radius) / SHARD_M).floor() as i32;
+    let max_z = ((p.z + radius) / SHARD_M).floor() as i32;
+    let mut out = Vec::new();
+    for sx in min_x..=max_x {
+        for sz in min_z..=max_z {
+            // 点到该分片核心 AABB 的水平距离(每轴 clamp 到盒外量)。
+            let (cx, cz) = (sx as f32 * SHARD_M, sz as f32 * SHARD_M);
+            let dx = (cx - p.x).max(0.0).max(p.x - (cx + SHARD_M));
+            let dz = (cz - p.z).max(0.0).max(p.z - (cz + SHARD_M));
+            if (dx * dx + dz * dz).sqrt() <= radius {
+                out.push(types::ShardId::new(
+                    types::WorldId(0),
+                    types::DimensionId(0),
+                    types::ShardPos::new(sx, sz),
+                ));
+            }
+        }
+    }
+    out
 }
 
 /// 驱动主循环(biased:关机 > tick > 命令;决策 2/3/5)。
@@ -804,6 +827,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 挂起 chunk 流请求(REQ-003 §4.4:命令分支收下、tick 末端编排第 ④ 步
     // 处理——同拍或下一拍,永不阻塞 tick)。
     let mut pending_streams = PendingStreams::default();
+    // 邻片 ensure 半径(REQ-005 D5 = awake_unload_radius,默认 32m)。
+    let ensure_radius = config.activation.awake_unload_radius as f32;
     // 观察输出编排(REQ-003 §4.4;任务书 03):observe 缝在场才建(tick 末端
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
@@ -858,6 +883,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     &provider,
                     &mut new_sim,
                     &mut pending_streams,
+                    ensure_radius,
                     &mut counters,
                 );
                 shards_spawned += counters.shards_spawned;
@@ -1733,6 +1759,34 @@ mod tests {
     /// 测试清单 4 `move_observer_command_routed`:DriverCommand::MoveObserver →
     /// session 观察者表更新(两个口径:命令日志含 SetObserverPosition = 已盖章
     /// 路由;编排 ① 从 observers() 视图 ensure 出新分片 = 表已更新且驱动可见)。
+    /// 任务书 req005/00 测试 10:观察者距边界 <32m → 邻片在 ensure 集合;
+    /// >32m 不在(shards_within 纯函数 = 驱动邻片 ensure 的判定核心)。
+    #[test]
+    fn ensure_covers_observer_neighbors() {
+        use types::glam::Vec3;
+        let shard = |x: i32, z: i32| {
+            types::ShardId::new(
+                types::WorldId(0),
+                types::DimensionId(0),
+                types::ShardPos::new(x, z),
+            )
+        };
+        // 片 (0,0) 中心:距四界均 64m > 32m → 无邻片。
+        let center = shards_within(Vec3::new(64.0, 0.0, 64.0), 32.0);
+        assert_eq!(center, vec![shard(0, 0)]);
+        // 贴东界(x=120):片 (1,0) 核心 AABB 距 8m ≤ 32 → 两片;斜角远不含。
+        let east = shards_within(Vec3::new(120.0, 0.0, 64.0), 32.0);
+        assert!(east.contains(&shard(0, 0)));
+        assert!(east.contains(&shard(1, 0)), "32m 内邻片被 ensure:{east:?}");
+        assert_eq!(east.len(), 2, "只东邻,不含斜角:{east:?}");
+        // 角落(x=120, z=120):四分片都在(东/南 8m;斜角 sqrt(8²+8²)≈11m)。
+        let corner = shards_within(Vec3::new(120.0, 0.0, 120.0), 32.0);
+        assert_eq!(corner.len(), 4, "角落四分片都在:{corner:?}");
+        // 距界 33m:邻片不在(无过度 ensure)。
+        let far = shards_within(Vec3::new(95.0, 0.0, 64.0), 32.0);
+        assert_eq!(far, vec![shard(0, 0)], "33m > 32m 不 ensure 邻片");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn move_observer_command_routed() {
         let config = test_config(600);
@@ -1761,10 +1815,13 @@ mod tests {
         );
 
         // 观察者表更新(任务书口径):编排 ① 读 observers() 视图 ensure 出分片
-        // ——表未更新则 shards_spawned 必为 0;恰 1 即表已更新且驱动可见。
-        assert_eq!(
-            outcome.shards_spawned, 1,
-            "观察者表更新且驱动 ensure 出恰好 1 个新分片"
+        // ——表未更新则 shards_spawned 必为 0;≥1 即表已更新且驱动可见。
+        // (REQ-005 D5:观察者 (200,·,8) 距 z=0 分片界 8m ≤ 32m → 邻片
+        // (1,-1) 同拍 ensure,恰 2;断言取 ≥1 保持口径稳定。)
+        assert!(
+            outcome.shards_spawned >= 1,
+            "观察者表更新且驱动 ensure 出新分片(邻片 ensure 下 ≥1):{}",
+            outcome.shards_spawned
         );
     }
 
@@ -1794,7 +1851,9 @@ mod tests {
         assert!(outcome.shards_spawned >= 1, "ensure 建片计数");
         assert!(outcome.chunks_loaded >= 1, "装载计数");
         assert!(outcome.chunks_unloaded >= 1, "卸载计数");
-        assert_eq!(outcome.shards_despawned, 1, "离开后唯一分片 despawn");
+        // REQ-005 D5:观察者 (200,·,8) 距 z 界 8m → 邻片 (1,-1) 同步 ensure;
+        // 远走后两片皆空+无票 → despawn 2(原"唯一分片"口径随邻片 ensure 更新)。
+        assert_eq!(outcome.shards_despawned, 2, "离开后本片+邻片 despawn");
     }
 
     /// 测试清单 6 `no_observers_no_orchestration`:无观察者时编排零动作
@@ -2299,9 +2358,12 @@ mod tests {
         // 评审修复②回填:Left → Session::remove_observer → 票撤;空片在
         // despawn_after_secs = 0 下被回收(任务书测试清单第 6 项的
         // despawn 断言,原实现因移除缝缺失而 `let _ = outcome` 放弃)。
+        // REQ-005 D5:观察者 (8,·,8) 贴分片角落(x/z 均距界 8m ≤ 32m)→
+        // 四分片同拍 ensure;断连票撤后四片皆回收(原"唯一分片"口径随
+        // 邻片 ensure 更新)。
         assert_eq!(
-            outcome.shards_despawned, 1,
-            "断连票撤 → 唯一分片 despawn(缩短配置验证)"
+            outcome.shards_despawned, 4,
+            "断连票撤 → 角落四分片 despawn(缩短配置验证)"
         );
         assert!(
             outcome.chunks_unloaded >= 1,

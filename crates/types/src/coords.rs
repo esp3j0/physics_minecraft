@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{SHARD_CHUNKS, ShardPos};
+use crate::ids::{SHARD_CHUNKS, ShardId, ShardPos};
 
 /// chunk 一条边的方块数。
 pub const CHUNK_SIZE: i32 = 16;
@@ -76,6 +76,38 @@ pub(crate) fn floor_div(a: i32, b: i32) -> i32 {
     }
 }
 
+/// chunk 网格的闭区间矩形(单位:chunk;REQ-005 §4.1,D2/D4)。
+/// 分片的静态范围 = `core(shard).expanded(region_margin_chunks)`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ChunkRegion {
+    pub min: ChunkPos,
+    pub max: ChunkPos,
+}
+
+impl ChunkRegion {
+    /// 分片本体区:8×8 chunk,闭区间(负方向 floor 语义由 `min_chunk` 保证)。
+    pub fn core(shard: ShardId) -> Self {
+        let min = shard.pos.min_chunk();
+        Self {
+            min,
+            max: ChunkPos::new(min.x + SHARD_CHUNKS - 1, min.z + SHARD_CHUNKS - 1),
+        }
+    }
+
+    /// 向外扩 margin 个 chunk(四边都扩;0 恒等,负值允许收缩,测试用)。
+    pub fn expanded(self, margin: i32) -> Self {
+        Self {
+            min: ChunkPos::new(self.min.x - margin, self.min.z - margin),
+            max: ChunkPos::new(self.max.x + margin, self.max.z + margin),
+        }
+    }
+
+    /// 闭区间包含判定。
+    pub fn contains(&self, pos: ChunkPos) -> bool {
+        pos.x >= self.min.x && pos.x <= self.max.x && pos.z >= self.min.z && pos.z <= self.max.z
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +153,42 @@ mod tests {
             assert_eq!(ChunkPos::new(x, 8).shard_of(), ShardPos::new(0, 1));
         }
         assert_eq!(ChunkPos::new(-1, 8).shard_of(), sp);
+    }
+
+    /// 任务书 req005/00 测试 1:core 8×8;expanded(1) 四边各扩 1;contains
+    /// 边界正确(闭区间)。
+    #[test]
+    fn chunk_region_core_and_margin() {
+        let shard = ShardId::new(
+            crate::WorldId(0),
+            crate::DimensionId(0),
+            ShardPos::new(0, 0),
+        );
+        let core = ChunkRegion::core(shard);
+        // 8×8 闭区间:min = (0,0),max = (7,7)。
+        assert_eq!(core.min, ChunkPos::new(0, 0));
+        assert_eq!(core.max, ChunkPos::new(7, 7));
+        assert!(core.contains(ChunkPos::new(0, 0)));
+        assert!(core.contains(ChunkPos::new(7, 7)));
+        assert!(!core.contains(ChunkPos::new(8, 0)), "x=8 属邻片本体区");
+        assert!(!core.contains(ChunkPos::new(-1, 0)));
+
+        // 负方向分片:floor 语义。
+        let west = ChunkRegion::core(ShardId::new(
+            crate::WorldId(0),
+            crate::DimensionId(0),
+            ShardPos::new(-1, 0),
+        ));
+        assert_eq!(west.min, ChunkPos::new(-8, 0));
+        assert_eq!(west.max, ChunkPos::new(-1, 7), "8×8 方形:x 与 z 都扩 7");
+
+        // expanded(1):四边各扩 1 → 10×10。
+        let ring = core.expanded(1);
+        assert_eq!(ring.min, ChunkPos::new(-1, -1));
+        assert_eq!(ring.max, ChunkPos::new(8, 8));
+        assert!(ring.contains(ChunkPos::new(8, 0)), "扩张环含邻片第 1 列");
+        assert!(!ring.contains(ChunkPos::new(9, 0)), "扩张环不含第 2 列");
+        // expanded(0) 恒等。
+        assert_eq!(core.expanded(0), core);
     }
 }

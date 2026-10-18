@@ -14,7 +14,7 @@ pub mod ids;
 pub mod state;
 pub mod tick;
 
-pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
+pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, ChunkRegion, WORLD_Y_MAX, WORLD_Y_MIN};
 pub use ids::{
     BlockId, DimensionId, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId, WorldSeed,
 };

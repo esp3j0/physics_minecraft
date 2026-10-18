@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
-use types::{CHUNK_SIZE, ChunkPos, EntityId, Tick};
+use types::{CHUNK_SIZE, ChunkPos, ChunkRegion, EntityId, Tick};
 
 /// 激活配置(§4.3 三档;核内独立结构,app::Config 注入,无全局单例)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -37,6 +37,11 @@ pub struct ActivationConfig {
     pub max_awake_dynamic: usize,
     /// 每拍换装预算(装+卸合计)。
     pub swap_budget_chunks_per_tick: usize,
+    /// 激活/扩张区外扩 chunk 数(REQ-005 D4):装载候选必须落在
+    /// `core ∪ margin_ring`;由 app::Config.margin_meters 换算
+    /// (ceil(m/16),默认 16m → 1)。0 显式允许(测试/实验;边界 collider
+    /// 可能缺失),生产默认 1。
+    pub region_margin_chunks: i32,
 }
 
 impl Default for ActivationConfig {
@@ -49,6 +54,7 @@ impl Default for ActivationConfig {
             cooldown_ticks: 180,
             max_awake_dynamic: 512,
             swap_budget_chunks_per_tick: 2,
+            region_margin_chunks: 1,
         }
     }
 }
@@ -159,11 +165,14 @@ impl ActivationController {
         loaded: &[ChunkPos],
         entities: &[(EntityId, Vec3, bool)],
         now: Tick,
+        region: ChunkRegion,
     ) -> ActivationDecisions {
         let mut d = ActivationDecisions::default();
 
         // ---- tier①② chunk 档(决策返回给调用方执行,数据源属 REQ-002)----
-        // 装载候选网格:各观察者所在 chunk 周围 ceil(unload/16)+2(README 决策 7)。
+        // 装载候选网格:各观察者周围 ceil(unload/16)+2;再按区域过滤
+        // (REQ-005 D4):区域外(即使距观察者很近)一律不请求——分片不
+        // 装载自己 core ∪ margin_ring 之外的 chunk。
         let chunk_f = CHUNK_SIZE as f32;
         let reach = (self.cfg.chunk_unload_radius / chunk_f).ceil() as i32 + 2;
         let mut grid: BTreeSet<ChunkPos> = BTreeSet::new();
@@ -177,10 +186,15 @@ impl ActivationController {
             }
         }
         let loaded_set: BTreeSet<ChunkPos> = loaded.iter().copied().collect();
-        // 候选集:(chunk, 最近距离, 是否装载);装载候选限网格内未载者。
+        // 候选集:(chunk, 最近距离, 是否装载);装载候选限网格 ∩ 区域内未载者。
         let mut cands: Vec<(ChunkPos, f32, bool)> = Vec::new();
         for &cp in &grid {
             if loaded_set.contains(&cp) {
+                continue;
+            }
+            // 区域过滤(REQ-005 D4):仅装载候选受区域约束;卸载候选不强制
+            // 在区域内(已加载的扩张副本可正常卸载)。
+            if !region.contains(cp) {
                 continue;
             }
             let dist = chunk_distance(cp, observers);
@@ -314,6 +328,61 @@ impl ActivationController {
 mod tests {
     use super::*;
 
+    /// 任务书 req005/00 测试 2:装载候选受区域过滤——区域内请求、区域外
+    /// 即使距观察者很近也不请求;卸载候选不受区域约束。
+    #[test]
+    fn activation_never_loads_outside_region() {
+        // shard(0,0) core、margin = 0(纯本体区;测试用显式语义)。
+        let cfg = ActivationConfig {
+            region_margin_chunks: 0,
+            ..ActivationConfig::default()
+        };
+        let mut c = ActivationController::new(cfg);
+        let core = types::ChunkRegion::core(types::ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        ));
+
+        // 观察者贴东界(x=120):chunk 7(区域内)与 chunk 8(区域外,中心
+        // x=136)都在装载半径内。
+        let obs = [Vec3::new(120.0, 0.0, 8.0)];
+        let d = c.plan(&obs, &[], &[], Tick::ZERO, core);
+        assert!(
+            d.chunks_to_load.contains(&types::ChunkPos::new(7, 0)),
+            "区域内且近 → 请求装载:{:?}",
+            d.chunks_to_load
+        );
+        assert!(
+            !d.chunks_to_load.contains(&types::ChunkPos::new(8, 0)),
+            "区域外即使距观察者 ≤ 半径也不请求:{:?}",
+            d.chunks_to_load
+        );
+
+        // 卸载不受区域约束:已加载的区域外远 chunk 照常卸载。观察者放在
+        // 本体区外(装载候选全被区域过滤 → 预算留给卸载,隔离被测语义)。
+        let mut c2 = ActivationController::new(cfg);
+        let outside = [Vec3::new(200.0, 0.0, 8.0)];
+        let far_loaded = [types::ChunkPos::new(30, 0)];
+        let d2 = c2.plan(&outside, &far_loaded, &[], Tick::ZERO, core);
+        assert!(
+            d2.chunks_to_unload.contains(&types::ChunkPos::new(30, 0)),
+            "卸载候选不强制在区域内:{:?}",
+            d2.chunks_to_unload
+        );
+    }
+
+    /// 测试用宽区域(覆盖既有测试全部坐标;区域语义本身由
+    /// `activation_never_loads_outside_region` 专项测试)。
+    fn wide_region() -> types::ChunkRegion {
+        types::ChunkRegion::core(types::ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        ))
+        .expanded(64)
+    }
+
     /// 测试用实体身份。
     fn eid(n: u32) -> EntityId {
         EntityId::from_parts(1, n)
@@ -326,7 +395,7 @@ mod tests {
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mid = [ChunkPos::new(3, 0)];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d = c.plan(&obs, &mid, &[], Tick::ZERO);
+        let d = c.plan(&obs, &mid, &[], Tick::ZERO, wide_region());
         assert!(
             !d.chunks_to_load.contains(&ChunkPos::new(3, 0))
                 && !d.chunks_to_unload.contains(&ChunkPos::new(3, 0)),
@@ -341,6 +410,7 @@ mod tests {
                 (eid(2), Vec3::new(33.0, 0.0, 8.0), true),
             ],
             Tick::ZERO,
+            wide_region(),
         );
         assert!(
             d.entities_to_wake.is_empty() && d.entities_to_freeze.is_empty(),
@@ -349,7 +419,7 @@ mod tests {
         // 非退化对照:同拍近距离 chunk 会被装载((0,0) 距 0;次近 16m 组按
         // (x, z) 字典序取 (-1,0)),预算 2 截断。
         let mut c2 = ActivationController::new(ActivationConfig::default());
-        let d2 = c2.plan(&obs, &[], &[], Tick::ZERO);
+        let d2 = c2.plan(&obs, &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d2.chunks_to_load,
             vec![ChunkPos::new(0, 0), ChunkPos::new(-1, 0)]
@@ -365,7 +435,7 @@ mod tests {
         let far = [Vec3::new(1000.0, 0.0, 0.0)];
         let mut c = ActivationController::new(ActivationConfig::default());
         // 拍 0:近 → 装载(簿记 swap@0);(1,0) 距 0,(0,0) 距 16。
-        let d0 = c.plan(&obs, &[], &[], Tick::ZERO);
+        let d0 = c.plan(&obs, &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d0.chunks_to_load,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -393,18 +463,18 @@ mod tests {
         let loaded_far: Vec<ChunkPos> = d0.chunks_to_load.iter().copied().chain(far_ring).collect();
         // 拍 1 / 179:卸载候选但冷却未过 → 不卸。
         assert!(
-            c.plan(&far, &loaded_far, &[], Tick(1))
+            c.plan(&far, &loaded_far, &[], Tick(1), wide_region())
                 .chunks_to_unload
                 .is_empty()
         );
         assert!(
-            c.plan(&far, &loaded_far, &[], Tick(179))
+            c.plan(&far, &loaded_far, &[], Tick(179), wide_region())
                 .chunks_to_unload
                 .is_empty(),
             "179 拍仍在冷却窗内"
         );
         // 第 180 拍:冷却已过 → 卸载,按距离升序((1,0)@≈976 先于 (0,0)@≈992)。
-        let d = c.plan(&far, &loaded_far, &[], Tick(180));
+        let d = c.plan(&far, &loaded_far, &[], Tick(180), wide_region());
         assert_eq!(
             d.chunks_to_unload,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -452,7 +522,7 @@ mod tests {
             })
             .chain(far)
             .collect();
-        let d = c.plan(&obs, &loaded1, &[], Tick::ZERO);
+        let d = c.plan(&obs, &loaded1, &[], Tick::ZERO, wide_region());
         assert_eq!(
             d.chunks_to_load.len() + d.chunks_to_unload.len(),
             2,
@@ -473,7 +543,7 @@ mod tests {
             .filter(|cp| *cp != ChunkPos::new(0, 0))
             .chain(far)
             .collect();
-        let d2 = c2.plan(&obs, &loaded2, &[], Tick::ZERO);
+        let d2 = c2.plan(&obs, &loaded2, &[], Tick::ZERO, wide_region());
         assert_eq!(d2.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(
             d2.chunks_to_unload,
@@ -502,6 +572,7 @@ mod tests {
                 (e3, Vec3::new(20.0, 0.0, 0.0), true),
             ],
             Tick::ZERO,
+            wide_region(),
         );
         assert_eq!(d0.entities_to_wake, vec![e1, e2, e3]);
         // 拍 1:3 醒 > 2 → 最远者(e3,距 20)立即冻结,不受冷却(flip@0 才过 1 拍)。
@@ -514,6 +585,7 @@ mod tests {
                 (e3, Vec3::new(20.0, 0.0, 0.0), false),
             ],
             Tick(1),
+            wide_region(),
         );
         assert_eq!(d1.entities_to_freeze, vec![e3], "距离降序淘汰超出者");
         assert!(d1.entities_to_wake.is_empty());
@@ -542,6 +614,7 @@ mod tests {
                 (far, Vec3::new(100.0, 0.0, 0.0), false),
             ],
             Tick::ZERO,
+            wide_region(),
         );
         assert_eq!(
             d.entities_to_freeze,
@@ -560,6 +633,7 @@ mod tests {
             &[],
             &[(near, Vec3::new(5.0, 0.0, 0.0), false)],
             Tick::ZERO,
+            wide_region(),
         );
         assert!(
             d2.entities_to_freeze.is_empty(),
@@ -581,6 +655,7 @@ mod tests {
                 (eid(4), Vec3::new(20.0, 0.0, 0.0), false),
             ],
             Tick::ZERO,
+            wide_region(),
         );
         assert_eq!(
             d3.entities_to_freeze,
@@ -601,6 +676,7 @@ mod tests {
             &[],
             &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true)],
             Tick::ZERO,
+            wide_region(),
         );
         assert_eq!(d.entities_to_wake, vec![eid(3)], "≤ 24 → 唤醒");
         let d = c.plan(
@@ -608,6 +684,7 @@ mod tests {
             &[],
             &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false)],
             Tick::ZERO,
+            wide_region(),
         );
         assert!(d.entities_to_freeze.is_empty(), "32 不冻(> 32 才冻)");
 
@@ -616,37 +693,37 @@ mod tests {
         let e = eid(1);
         let near = (e, Vec3::new(20.0, 0.0, 0.0), true);
         let far = (e, Vec3::new(40.0, 0.0, 0.0), false);
-        let d = c.plan(&obs, &[], &[near], Tick::ZERO);
+        let d = c.plan(&obs, &[], &[near], Tick::ZERO, wide_region());
         assert_eq!(d.entities_to_wake, vec![e], "冻 @20(≤ 24)→ 唤醒(flip@0)");
         assert!(
-            c.plan(&obs, &[], &[far], Tick(1))
+            c.plan(&obs, &[], &[far], Tick(1), wide_region())
                 .entities_to_freeze
                 .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[far], Tick(179))
+            c.plan(&obs, &[], &[far], Tick(179), wide_region())
                 .entities_to_freeze
                 .is_empty(),
             "> 32 但 179 拍仍在冷却 → 不冻"
         );
-        let d = c.plan(&obs, &[], &[far], Tick(180));
+        let d = c.plan(&obs, &[], &[far], Tick(180), wide_region());
         assert_eq!(
             d.entities_to_freeze,
             vec![e],
             "> 32 且冷却已过 → 冻结(flip@180)"
         );
         assert!(
-            c.plan(&obs, &[], &[near], Tick(181))
+            c.plan(&obs, &[], &[near], Tick(181), wide_region())
                 .entities_to_wake
                 .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[near], Tick(359))
+            c.plan(&obs, &[], &[near], Tick(359), wide_region())
                 .entities_to_wake
                 .is_empty(),
             "回 ≤ 24 但 179 拍仍在冷却 → 不醒"
         );
-        let d = c.plan(&obs, &[], &[near], Tick(360));
+        let d = c.plan(&obs, &[], &[near], Tick(360), wide_region());
         assert_eq!(d.entities_to_wake, vec![e], "≤ 24 且冷却已过 → 唤醒");
     }
 
@@ -676,13 +753,13 @@ mod tests {
             (e2, Vec3::new(100.0, 0.0, 0.0), false), // 醒、距 100 > 32 → 冻
         ];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d1 = c.plan(&obs, &loaded, &ents, Tick::ZERO);
+        let d1 = c.plan(&obs, &loaded, &ents, Tick::ZERO, wide_region());
         assert_eq!(d1.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(d1.chunks_to_unload, vec![ChunkPos::new(3, 1)]);
         assert_eq!(d1.entities_to_wake, vec![e1]);
         assert_eq!(d1.entities_to_freeze, vec![e2]);
         // 同输入第二次:全部被冷却簿记挡下 → 空。
-        let d2 = c.plan(&obs, &loaded, &ents, Tick::ZERO);
+        let d2 = c.plan(&obs, &loaded, &ents, Tick::ZERO, wide_region());
         assert_eq!(
             d2,
             ActivationDecisions::default(),

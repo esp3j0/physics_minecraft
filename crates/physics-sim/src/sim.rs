@@ -386,10 +386,18 @@ impl ShardSim {
     /// (决策即簿记,见 `ActivationController::plan`)。首次调用即注册
     /// 观察者(`observed = Some`,覆盖式更新)→ 命令唤醒路径的预算强制
     /// 随之生效(README 决策 6)。
+    /// 本分片允许加载的静态范围 = core ∪ margin_ring(REQ-005 D2/D4;
+    /// `ChunkRegion::core(shard).expanded(region_margin_chunks)`)。
+    /// holder 副本只允许出现在这个范围(调度器装载校验用)。
+    pub fn activation_region(&self) -> types::ChunkRegion {
+        types::ChunkRegion::core(self.cfg.shard).expanded(self.cfg.activation.region_margin_chunks)
+    }
+
     pub fn apply_activation(&mut self, observers: &[Vec3]) -> ActivationDecisions {
         let now = self.activation_now;
         self.activation_now = now.next();
         self.observed = Some(observers.to_vec());
+        let region = self.activation_region();
         let loaded: Vec<ChunkPos> = self.voxels.chunk_positions().collect();
         let entities: Vec<(EntityId, Vec3, bool)> = self
             .entities
@@ -399,7 +407,9 @@ impl ShardSim {
                 (*id, conv::rapier_to_vec3(b.translation()), b.is_kinematic())
             })
             .collect();
-        let decisions = self.activation.plan(observers, &loaded, &entities, now);
+        let decisions = self
+            .activation
+            .plan(observers, &loaded, &entities, now, region);
 
         // tier③ 落实:施体类型切换。
         for id in &decisions.entities_to_freeze {

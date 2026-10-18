@@ -191,8 +191,15 @@ impl Config {
                 cooldown_ticks: (self.activation.cooldown_secs as f32 / self.dt).round() as u64,
                 max_awake_dynamic: self.max_awake_dynamic,
                 swap_budget_chunks_per_tick: self.swap_budget_chunks_per_tick as usize,
+                region_margin_chunks: self.region_margin_chunks(),
             },
         }
+    }
+
+    /// margin_meters → 激活/扩张区外扩 chunk 数(REQ-005 D4):
+    /// ceil(m / 16),至少 0;默认 16m → 1。
+    pub fn region_margin_chunks(&self) -> i32 {
+        ((self.margin_meters as f32) / 16.0).ceil().max(0.0) as i32
     }
 }
 
@@ -423,6 +430,31 @@ mod tests {
         assert_eq!(back, custom, "listen_addr roundtrip 无损");
         // Default 直取同值(默认值唯一来源纪律)。
         assert_eq!(Config::default().listen_addr, "127.0.0.1:25565");
+    }
+
+    /// 任务书 req005/00 测试 11:margin_meters → region_margin_chunks 换算。
+    #[test]
+    fn margin_config_converts_to_chunks() {
+        assert_eq!(Config::default().region_margin_chunks(), 1, "16m → 1");
+        let zero = Config {
+            margin_meters: 0,
+            ..Config::default()
+        };
+        assert_eq!(zero.region_margin_chunks(), 0, "0m → 0(显式允许)");
+        let odd = Config {
+            margin_meters: 17,
+            ..Config::default()
+        };
+        assert_eq!(odd.region_margin_chunks(), 2, "17m → 2(ceil)");
+        // 换算确实注入 shard_sim_config(激活区域过滤用)。
+        assert_eq!(
+            Config::default()
+                .shard_sim_config(shard_id(0, 0))
+                .activation
+                .region_margin_chunks,
+            1,
+            "margin 注入 ActivationConfig(D4)"
+        );
     }
 
     /// 测试清单 8(任务书 req001-backlog/02 授权接线):shard_sim_config 的

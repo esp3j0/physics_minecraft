@@ -11,6 +11,7 @@
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 shard](../../docs/design/codebase-layout.md)
 
+pub mod chunks;
 pub mod coordinator;
 pub mod lifecycle;
 pub mod ownership;

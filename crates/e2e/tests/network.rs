@@ -1042,9 +1042,12 @@ async fn acn6_disconnect_reconnect() {
     assert!(b_alive, "B 仍能收帧(A 域生命周期事件零外溢)");
 
     let outcome = shutdown(h).await;
+    // REQ-005 D5(任务 00 连带):观察者贴分片角落 → 邻片同拍 ensure;断连
+    // 票撤后四分片(本片 + 三邻片)皆空+无票回收。原"恰 1"口径随邻片
+    // ensure 更新;孤儿扩张副本由 owner despawn 一并撤销(不阻塞回收)。
     assert_eq!(
-        outcome.shards_despawned, 1,
-        "断连票撤(Left → remove_observer)→ 缩短窗口下分片回收"
+        outcome.shards_despawned, 4,
+        "断连票撤(Left → remove_observer)→ 缩短窗口下角落四分片回收(邻片 ensure,REQ-005 D5)"
     );
     assert!(outcome.chunks_unloaded >= 1, "回收分片的 chunk 被卸载落库");
     assert!(outcome.shards_spawned >= 2, "初生 + 复活各一次 ensure(≥2)");

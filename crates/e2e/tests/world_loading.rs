@@ -605,6 +605,21 @@ fn acg5_orchestrate(
 ) {
     for (shard, decisions) in session.take_activation_requests() {
         for pos in decisions.chunks_to_load {
+            // REQ-005 D5(任务 00 连带):扩张 chunk 的 owner 必须先注册——
+            // 原线/重放线共用的编排此前无 ensure,依赖"装载无归属校验"的
+            // 旧行为;新不变量下按 owner 惰性 ensure(与驱动 ① 同语义)。
+            let owner = types::ShardId::new(shard.world, shard.dimension, pos.shard_of());
+            if !session.shard_ids().contains(&owner) {
+                let cfg = ShardSimConfig {
+                    activation: acg5_activation_config(),
+                    solidify: SolidifyConfig {
+                        enabled: false,
+                        ..SolidifyConfig::default()
+                    },
+                    ..ShardSimConfig::new(owner)
+                };
+                session.register(ShardSim::new(cfg, acg5_registry()));
+            }
             let key = ChunkKey {
                 world: shard.world,
                 dim: shard.dimension,

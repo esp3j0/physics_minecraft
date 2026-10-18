@@ -124,6 +124,10 @@ pub struct Scheduler {
     solidified: Vec<(ShardId, BlockPos, BlockId)>,
     /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
     despawn_requests: BTreeSet<ShardId>,
+    /// chunk 持有表(REQ-005 D2/D4):`(owner, chunk) → holder 集合`。
+    /// owner 是纯函数(`owner_of`);本表随 apply_chunk_load/unload 维护,
+    /// 不入快照(恢复时 rebuild_holders 重建)。
+    chunk_holders: crate::chunks::ChunkHolders,
 }
 
 impl Scheduler {
@@ -163,6 +167,7 @@ impl Scheduler {
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
             despawn_requests: BTreeSet::new(),
+            chunk_holders: crate::chunks::ChunkHolders::new(),
             cfg,
         }
     }
@@ -269,21 +274,65 @@ impl Scheduler {
     /// 两拍之间装载一个 chunk(幂等:重复装载同 chunk = 重建)。
     /// 委托 `ShardSim::load_chunk`(insert + 边界 collider 重建)。未注册分片
     /// → panic(与 submit 同款 fail-stop;分片由驱动 ensure 后才可能来数)。
-    pub fn apply_chunk_load(&mut self, shard: ShardId, pos: ChunkPos, chunk: voxel::Chunk) {
-        let sim = self
-            .sims
-            .get_mut(&shard)
-            .expect("装载到未注册分片(调用方 bug,fail-stop)");
-        sim.load_chunk(pos, chunk);
+    /// chunk 的 owner(REQ-005 D2,纯函数):本体区分片;world/dim 取自
+    /// `shard` 参数(单世界单维度 v1,一切调用都发生在某个已知分片上下文)。
+    pub fn owner_of(shard: ShardId, pos: ChunkPos) -> ShardId {
+        ShardId::new(shard.world, shard.dimension, pos.shard_of())
     }
 
-    /// 两拍之间卸载一个 chunk(返回它供持久化;未装载 → None)。
-    /// 分片未注册或 chunk 未装载都算"未装载" → None(无东西可卸,持久化
-    /// 调用方按 None 跳过);装载路径的未注册分片才 panic(ensure 前装载 =
-    /// 调用方 bug)。
+    /// 当前持有 `(owner, pos)` 副本的分片集合(含 owner,若它加载着);
+    /// 未加载 → 空集(REQ-005 D2)。
+    pub fn holders_of(&self, owner: ShardId, pos: ChunkPos) -> BTreeSet<ShardId> {
+        self.chunk_holders.holders(owner, pos)
+    }
+
+    /// Router 待投递信封的目的分片(两拍之间;REQ-005 D5,驱动 ensure 用)。
+    pub fn pending_shard_destinations(&self) -> BTreeSet<ShardId> {
+        self.router.pending_destinations()
+    }
+
+    pub fn apply_chunk_load(&mut self, shard: ShardId, pos: ChunkPos, chunk: voxel::Chunk) {
+        // 区域校验(REQ-005 D4):分片只装载自己 core ∪ margin_ring 内的
+        // chunk——区域外装载 = 编排 bug(激活请求已被区域过滤)→ fail-stop。
+        if !self
+            .sims
+            .get(&shard)
+            .unwrap_or_else(|| panic!("装载到未注册分片 {shard:?}(调用方 bug,fail-stop)"))
+            .activation_region()
+            .contains(pos)
+        {
+            panic!(
+                "装载区域外 chunk {pos:?} 到分片 {shard:?}(core ∪ margin 之外,编排 bug,fail-stop)"
+            );
+        }
+        let owner = Self::owner_of(shard, pos);
+        if !self.sims.contains_key(&owner) {
+            panic!(
+                "chunk {pos:?} 的 owner {owner:?} 未注册先装载(holder = {shard:?};\
+                 驱动 ensure 必须先建 owner,REQ-005 D5,fail-stop)"
+            );
+        }
+        self.sims
+            .get_mut(&shard)
+            .expect("上方已校验注册")
+            .load_chunk(pos, chunk);
+        self.chunk_holders.register(owner, pos, shard);
+    }
+
+    /// 两拍之间卸载一个 chunk(REQ-005 D6:**owner-only 持久化**)。
+    /// 分片未注册或 chunk 未装载 → None;owner 卸载 → `Some(chunk)` 交驱动
+    /// 持久化;**非 owner 的扩张副本 → 丢弃副本返回 None(不写库)**。
     pub fn apply_chunk_unload(&mut self, shard: ShardId, pos: ChunkPos) -> Option<voxel::Chunk> {
         let sim = self.sims.get_mut(&shard)?;
-        sim.unload_chunk(pos)
+        let chunk = sim.unload_chunk(pos)?;
+        // chunk 在手(= 确曾加载):撤 holder 登记,按归属决定去留。
+        let owner = Self::owner_of(shard, pos);
+        self.chunk_holders.unregister(owner, pos, shard);
+        if shard == owner {
+            Some(chunk)
+        } else {
+            None // 扩张副本:丢弃,不写库(REQ-005 D6)
+        }
     }
 
     /// 两拍之间取 despawn 候选(REQ-002 §4.5:空片+无票+idle_expired)。
@@ -316,16 +365,58 @@ impl Scheduler {
         self.activation_requests.remove(&shard);
         self.despawn_requests.remove(&shard);
         self.ownership.release(shard);
-        // 逐 chunk 卸载:BTreeMap 键序 = ChunkPos 升序(确定性)。
+        // 逐 chunk 卸载(REQ-005 D6:只返回 owner chunk;扩张副本丢弃)。
+        // BTreeMap 键序 = ChunkPos 升序(确定性);每个 chunk 的 holder 登记
+        // 一并撤销。
         let positions: Vec<ChunkPos> = sim.voxel().chunk_positions().collect();
         let mut sim = sim;
-        let mut out = Vec::with_capacity(positions.len());
+        let mut out = Vec::new();
+        // owner chunk 集合:despawn 后其余 holder 的扩张副本成为"owner 缺席的
+        // 孤儿"(REQ-005 §4.1.3:owner 必须存在)。邻片 idle 窗口与本片不同拍
+        // 到期,不能等它们各自 despawn——一律就地撤销副本(holder 登记同撤),
+        // 邻片激活随后按需重请求(cooldown 已过或观察者仍在即重载)。
+        let mut orphan_positions: Vec<ChunkPos> = Vec::new();
         for cp in positions {
+            let owner = Self::owner_of(shard, cp);
             if let Some(chunk) = sim.unload_chunk(cp) {
-                out.push((cp, chunk));
+                self.chunk_holders.unregister(owner, cp, shard);
+                if shard == owner {
+                    out.push((cp, chunk));
+                    orphan_positions.push(cp);
+                } // 扩张副本:丢弃,不写库(D6)
+            }
+        }
+        // 撤销孤儿副本:仍注册的其余 holder 逐个卸载该 chunk(丢弃,不写库)。
+        // 顺带清这些 holder 对本片 chunk 的扩张请求缓存(activation_requests
+        // 中的卸载请求无需干预——chunk 已不在,下一拍 plan 重算)。
+        for cp in orphan_positions {
+            for holder in self.chunk_holders.holders(shard, cp) {
+                if let Some(sim) = self.sims.get_mut(&holder) {
+                    let _ = sim.unload_chunk(cp);
+                    self.chunk_holders.unregister(shard, cp, holder);
+                }
             }
         }
         out
+    }
+
+    /// 从各分片已加载 chunk 重建 holder 表(REQ-005 D2:恢复/回放用;
+    /// 表不入快照,恢复后调用一次)。
+    pub fn rebuild_holders(&mut self) {
+        let entries: Vec<(ShardId, Vec<ChunkPos>)> = self
+            .sims
+            .iter()
+            .map(|(shard, sim)| (*shard, sim.voxel().chunk_positions().collect()))
+            .collect();
+        self.chunk_holders
+            .rebuild(entries.iter().map(|(shard, chunks)| {
+                let s = *shard;
+                (
+                    s,
+                    chunks.as_slice(),
+                    Box::new(move |cp| Self::owner_of(s, cp)) as Box<dyn Fn(ChunkPos) -> ShardId>,
+                )
+            }));
     }
 
     /// 生命周期阶段查询(观测用):无记录(未注册)→ None。
@@ -379,6 +470,32 @@ impl Scheduler {
     pub fn tick(&mut self) -> TickSummary {
         // 1. 本拍号。
         let at = self.coordinator.tick();
+
+        // 0.一致性校验(REQ-005 D5,两 invariant):
+        // a) 不允许信封黑洞:待投递信封的目的分片若未注册且 apply_at ≤ 本拍,
+        //    说明驱动 ensure 漏了(内部一致性违规)→ fail-stop。正常路径由
+        //    驱动"观察者 32m 邻片 + pending destinations"ensure 覆盖。
+        for dest in self.router.pending_destinations() {
+            let Some(earliest) = self.router.pending_earliest(dest) else {
+                continue;
+            };
+            if earliest <= at && !self.sims.contains_key(&dest) {
+                panic!(
+                    "信封黑洞:目的分片 {dest:?} 未注册且最早 apply_at {earliest:?} \
+                     ≤ 当前拍 {at:?}(驱动 ensure 漏了,内部一致性违规,fail-stop)"
+                );
+            }
+        }
+        // b) holder 的 owner 必须已注册(装配期允许先 holder 后 owner,
+        //    但第一拍开始前必须齐;REQ-005 §4.1.3)。
+        for owner in self.chunk_holders.owners() {
+            if !self.sims.contains_key(&owner) {
+                panic!(
+                    "holder 表中的 owner {owner:?} 未注册(装配顺序违规,\
+                     第一拍前 owner 必须就位,REQ-005 D5,fail-stop)"
+                );
+            }
+        }
 
         // 1.2(REQ-002 §4.2):应用观察者收件箱中 apply_at == at 的全部条目
         //     (按 canonical 序;未来拍留存——与 router inbox 同语义;过期拍
@@ -1045,6 +1162,162 @@ mod tests {
             sched.take_activation_requests().is_empty(),
             "第二次取为空(恰一次:取走即清)"
         );
+        sched.shutdown();
+    }
+
+    // ---- REQ-005 任务 00(归属/持有/owner-only 持久化/信封黑洞) ----
+    /// 任务书测试 4(scheduler 级):holder 登记——load 后 holders_of 含该分片;
+    /// 重复 load 不重复;unload 后移除。owner 与扩张 holder 都登记。
+    #[test]
+    fn holders_track_load_unload() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // 片 0 本体区东缘
+        // owner(0,0) 装载自己的 chunk。
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        assert!(
+            sched
+                .holders_of(shard_id(0, 0), cp)
+                .contains(&shard_id(0, 0))
+        );
+        // 重复装载同 chunk(幂等重建):holder 仍只 1 个。
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        assert_eq!(sched.holders_of(shard_id(0, 0), cp).len(), 1);
+        // 邻片(1,0)装载同 chunk 作扩张副本(margin=1 → chunk 7 在其区域内)。
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        let holders = sched.holders_of(shard_id(0, 0), cp);
+        assert_eq!(holders.len(), 2, "owner + 邻片扩张副本都登记:{holders:?}");
+        // owner 卸载 → 登记剩邻片。
+        let _ = sched.apply_chunk_unload(shard_id(0, 0), cp);
+        assert_eq!(sched.holders_of(shard_id(0, 0), cp).len(), 1);
+        // 邻片也卸 → 条目清空。
+        let _ = sched.apply_chunk_unload(shard_id(1, 0), cp);
+        assert!(sched.holders_of(shard_id(0, 0), cp).is_empty());
+        sched.shutdown();
+    }
+
+    /// 任务书测试 5:邻片扩张副本 unload → None(owner 的 chunk 仍在表内)。
+    #[test]
+    fn non_owner_unload_returns_none() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // owner = 片 0
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        assert!(
+            sched.apply_chunk_unload(shard_id(1, 0), cp).is_none(),
+            "非 owner 副本卸载:丢弃不写库(D6)"
+        );
+        assert!(
+            sched.apply_chunk_unload(shard_id(0, 0), cp).is_some(),
+            "owner 卸载:返回 chunk 交持久化"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 6:owner unload → Some(原 chunk 内容往返)。
+    #[test]
+    fn owner_unload_returns_chunk() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        let cp = types::ChunkPos::new(3, 4);
+        let mut chunk = voxel::Chunk::air();
+        chunk.set(5, 100, 5, types::BlockId(2));
+        sched.apply_chunk_load(shard_id(0, 0), cp, chunk);
+        let back = sched
+            .apply_chunk_unload(shard_id(0, 0), cp)
+            .expect("owner 卸载返回 chunk");
+        assert_eq!(back.get(5, 100, 5), types::BlockId(2), "内容往返无损");
+        sched.shutdown();
+    }
+
+    /// 任务书测试 7:unload_shard 只返回 owner chunk;扩张副本丢弃。
+    /// 片 0 持:本体 chunk(0,0) + 片 1 的扩张副本 chunk(8,0)(margin=1
+    /// 时在片 0 区域内)。片 1 已注册(holder 的 owner 在位)。
+    #[test]
+    fn unload_shard_filters_to_owner_chunks() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        sched.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        // chunk(8,0) 的 owner = 片 1;片 0 作为 holder 装载扩张副本。
+        sched.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(8, 0),
+            voxel::Chunk::air(),
+        );
+        let out = sched.unload_shard(shard_id(0, 0));
+        assert_eq!(
+            out.len(),
+            1,
+            "despawn 只返回 owner chunk(扩张副本丢弃,D6):{out:?}"
+        );
+        assert_eq!(out[0].0, types::ChunkPos::new(0, 0));
+        sched.shutdown();
+    }
+
+    /// 任务书测试 9:迟到兜底——apply_at ≤ 当前拍且目的分片未注册的信封
+    /// → tick fail-stop(不允许信封黑洞)。
+    #[test]
+    #[should_panic(expected = "信封黑洞")]
+    fn late_unregistered_destination_panics() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        // 构造一片 9 的迁移信封(produced_at = 0 → apply_at = 1):
+        // 片 9 未注册 → 第 1 拍 tick 开头即触发(驱动 ensure 缺席的等价物)。
+        // 同 crate 测试直达私有 router:走真实盖章路径构造迁移信封。
+        sched
+            .router
+            .collect_intents(
+                shard_id(0, 0),
+                &[messaging::Intent {
+                    destination: shard_id(9, 9),
+                    payload: messaging::EnvelopePayload::MigrateEntity {
+                        entity: types::EntityId::from_parts(0, 1),
+                        state: types::EntityState::default(),
+                        desc: types::EntityDesc::default(),
+                    },
+                }],
+                Tick::ZERO,
+            )
+            .expect("队列未满");
+        sched.tick(); // 拍 0:apply_at(1) > at(0) → 不触发
+        sched.tick(); // 拍 1:apply_at ≤ at 且未注册 → panic
+    }
+
+    /// 任务书测试 3:两分片 + 一观察者——各自激活请求只落自己的
+    /// core ∪ margin;同一 chunk 的本体请求只来自 owner(扩张请求是
+    /// holder 副本,属设计语义,不算重复本体)。
+    #[test]
+    fn activation_two_shards_no_cross_core_duplicates() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // 观察者贴边界(x=126):两片的激活都会跑。
+        sched.set_observers(vec![types::glam::Vec3::new(126.0, 0.0, 64.0)]);
+        sched.tick();
+        let reqs = sched.take_activation_requests();
+        for (shard, decisions) in &reqs {
+            let region = types::ChunkRegion::core(*shard).expanded(1);
+            for cp in decisions
+                .chunks_to_load
+                .iter()
+                .chain(decisions.chunks_to_unload.iter())
+            {
+                assert!(
+                    region.contains(*cp),
+                    "分片 {shard:?} 请求了区域外 chunk {cp:?}(D4 不变量)"
+                );
+            }
+        }
+        // 同一 chunk 的"本体装载"只应来自 owner:两片请求集合中,owner≠请求者
+        // 的 chunk 必须落在请求者的 margin 环内(即扩张副本语义)。
         sched.shutdown();
     }
 

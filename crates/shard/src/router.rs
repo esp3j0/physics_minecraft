@@ -5,7 +5,7 @@
 //! `Envelope::stamp` 入 [`CrossShardQueue`],下一拍作为目的分片的输入前缀,
 //! 与收件箱中同拍命令按 canonical 序合并分发。
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use messaging::{
     AdmitError, CrossShardQueue, DEFAULT_QUEUE_CAPACITY, Envelope, InputPayload, InputSource,
@@ -44,6 +44,10 @@ pub struct Router {
     inboxes: BTreeMap<ShardId, VecDeque<StampedInput>>,
     /// 每个 source 分片的信封序号计数器(单调 +1,从 0 起)。
     sequences: BTreeMap<ShardId, u64>,
+    /// 待投递信封的目的分片 → 最早 apply_at(REQ-005 D5:驱动 ensure 用;
+    /// 只在 dispatch 取走该拍桶后移除。与 queue 同步维护,不入快照——
+    /// 任务 02 的 RouterSnapshot 直接序列化 queue 内容,本表由快照重建)。
+    pending: BTreeMap<ShardId, Tick>,
     cfg: RouterConfig,
 }
 
@@ -53,6 +57,7 @@ impl Router {
             queue: CrossShardQueue::new(cfg.queue_capacity),
             inboxes: BTreeMap::new(),
             sequences: BTreeMap::new(),
+            pending: BTreeMap::new(),
             cfg,
         }
     }
@@ -81,7 +86,13 @@ impl Router {
             let seq = self.sequences.entry(source).or_insert(0);
             let envelope = Envelope::stamp(source, intent, produced_at, *seq);
             *seq += 1;
+            let apply_at = envelope.apply_at;
             self.queue.admit(envelope)?;
+            // 待投递登记(REQ-005 D5):记最早 apply_at(已有更早的保留)。
+            self.pending
+                .entry(intent.destination)
+                .and_modify(|t| *t = (*t).min(apply_at))
+                .or_insert(apply_at);
         }
         Ok(())
     }
@@ -115,11 +126,27 @@ impl Router {
                 sequence: e.source_sequence,
                 payload: InputPayload::Envelope(e),
             });
+        // 该拍桶已取走:全部桶取尽时清空登记;否则保守保留(无法从 queue
+        // 读回桶信息——messaging 不外露;已取走该拍桶意味着最早 apply_at
+        // ≥ apply_at.next(),迟到校验语义不受影响)。
+        if self.pending_envelopes() == 0 {
+            self.pending.clear();
+        }
         let mut prefix = due;
         prefix.extend(envelopes);
         // 稳定排序:命令间/信封间相对序不变,信封排在命令后(类型序号决定)。
         prefix.sort_by_key(|input| input.canonical_key());
         prefix
+    }
+
+    /// 待投递信封的目的分片集合(REQ-005 D5:驱动 ensure 用;两拍之间)。
+    pub fn pending_destinations(&self) -> BTreeSet<ShardId> {
+        self.pending.keys().copied().collect()
+    }
+
+    /// `destination` 待投递信封的最早 apply_at(无 → None;迟到校验用)。
+    pub fn pending_earliest(&self, destination: ShardId) -> Option<Tick> {
+        self.pending.get(&destination).copied()
     }
 
     pub fn pending_inbox(&self, shard: ShardId) -> usize {
