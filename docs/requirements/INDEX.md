@@ -11,7 +11,7 @@
 | REQ-002 | ✅ 完成 | [#4](https://github.com/esp3j0/physics_minecraft/issues/4) | [REQ-002](REQ-002-world-loading.md) | [req002-world](../tasks/req002-world) | [df813c7](https://github.com/esp3j0/physics_minecraft/commit/df813c7) 定稿;[7019ff9](https://github.com/esp3j0/physics_minecraft/commit/7019ff9) 落地 |
 | REQ-003 | ✅ 完成 | [#5](https://github.com/esp3j0/physics_minecraft/issues/5) | [REQ-003](REQ-003-network.md) | [req003-net](../tasks/req003-net) | [f03230c](https://github.com/esp3j0/physics_minecraft/commit/f03230c) 定稿;[ea581df](https://github.com/esp3j0/physics_minecraft/commit/ea581df) 落地 |
 | REQ-004A | 🚧 开发中 | [#6](https://github.com/esp3j0/physics_minecraft/issues/6) | [REQ-004A](REQ-004A-visual-viewer.md) | [req004a-viewer](../tasks/req004a-viewer) | [ee857cc](https://github.com/esp3j0/physics_minecraft/commit/ee857cc) 定稿;实现待提交 |
-| REQ-005 | 📝 待拍板 | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | 本次追踪文档提交(见 #7/#8);实现未开始 |
+| REQ-005 | 📝 待拍板 | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | [ca57b1f](https://github.com/esp3j0/physics_minecraft/commit/ca57b1f) 文档;实现未开始 |
 
 ## 说明
 
