@@ -44,10 +44,6 @@ pub struct Router {
     inboxes: BTreeMap<ShardId, VecDeque<StampedInput>>,
     /// 每个 source 分片的信封序号计数器(单调 +1,从 0 起)。
     sequences: BTreeMap<ShardId, u64>,
-    /// 待投递信封的目的分片 → 最早 apply_at(REQ-005 D5:驱动 ensure 用;
-    /// 只在 dispatch 取走该拍桶后移除。与 queue 同步维护,不入快照——
-    /// 任务 02 的 RouterSnapshot 直接序列化 queue 内容,本表由快照重建)。
-    pending: BTreeMap<ShardId, Tick>,
     cfg: RouterConfig,
 }
 
@@ -57,7 +53,6 @@ impl Router {
             queue: CrossShardQueue::new(cfg.queue_capacity),
             inboxes: BTreeMap::new(),
             sequences: BTreeMap::new(),
-            pending: BTreeMap::new(),
             cfg,
         }
     }
@@ -86,13 +81,7 @@ impl Router {
             let seq = self.sequences.entry(source).or_insert(0);
             let envelope = Envelope::stamp(source, intent, produced_at, *seq);
             *seq += 1;
-            let apply_at = envelope.apply_at;
             self.queue.admit(envelope)?;
-            // 待投递登记(REQ-005 D5):记最早 apply_at(已有更早的保留)。
-            self.pending
-                .entry(intent.destination)
-                .and_modify(|t| *t = (*t).min(apply_at))
-                .or_insert(apply_at);
         }
         Ok(())
     }
@@ -126,12 +115,8 @@ impl Router {
                 sequence: e.source_sequence,
                 payload: InputPayload::Envelope(e),
             });
-        // 该拍桶已取走:全部桶取尽时清空登记;否则保守保留(无法从 queue
-        // 读回桶信息——messaging 不外露;已取走该拍桶意味着最早 apply_at
-        // ≥ apply_at.next(),迟到校验语义不受影响)。
-        if self.pending_envelopes() == 0 {
-            self.pending.clear();
-        }
+        // 该拍桶已取走(take_batch 恰好一次);待投递查询直查 queue 桶键
+        // (评审 Blocker 2:不再维护冗余表,无陈旧条目)。
         let mut prefix = due;
         prefix.extend(envelopes);
         // 稳定排序:命令间/信封间相对序不变,信封排在命令后(类型序号决定)。
@@ -140,13 +125,14 @@ impl Router {
     }
 
     /// 待投递信封的目的分片集合(REQ-005 D5:驱动 ensure 用;两拍之间)。
+    /// 直查队列桶键——dispatch 取走的桶即从集合消失,不陈旧。
     pub fn pending_destinations(&self) -> BTreeSet<ShardId> {
-        self.pending.keys().copied().collect()
+        self.queue.destinations()
     }
 
     /// `destination` 待投递信封的最早 apply_at(无 → None;迟到校验用)。
     pub fn pending_earliest(&self, destination: ShardId) -> Option<Tick> {
-        self.pending.get(&destination).copied()
+        self.queue.earliest_apply_at(destination)
     }
 
     pub fn pending_inbox(&self, shard: ShardId) -> usize {
@@ -341,6 +327,37 @@ mod tests {
             router.dispatch_prefix(b, Tick(11)).is_empty(),
             "同拍二次分发必为空"
         );
+    }
+
+    /// 评审 Blocker 2(单元级):A/B 两目的各一封,dispatch A 后集合不含 A、
+    /// 仍含 B——待投递查询直查桶键,无冗余表陈旧条目。
+    #[test]
+    fn pending_destinations_drop_after_dispatch() {
+        let mut r = Router::new(RouterConfig::default());
+        let migrate = |dest| messaging::Intent {
+            destination: dest,
+            payload: messaging::EnvelopePayload::MigrateEntity {
+                entity: types::EntityId::from_parts(1, 1),
+                state: types::EntityState::default(),
+                desc: types::EntityDesc::default(),
+            },
+        };
+        r.collect_intents(
+            shard(0, 0),
+            &[migrate(shard(1, 0)), migrate(shard(2, 0))],
+            Tick(0),
+        )
+        .expect("队列未满");
+        assert_eq!(
+            r.pending_destinations(),
+            BTreeSet::from([shard(1, 0), shard(2, 0)])
+        );
+        assert_eq!(r.pending_earliest(shard(1, 0)), Some(Tick(1)));
+        // dispatch A 的拍 1 桶 → A 从集合消失,B 仍在。
+        let _ = r.dispatch_prefix(shard(1, 0), Tick(1));
+        assert_eq!(r.pending_destinations(), BTreeSet::from([shard(2, 0)]));
+        assert_eq!(r.pending_earliest(shard(1, 0)), None, "取尽即无");
+        assert_eq!(r.pending_earliest(shard(2, 0)), Some(Tick(1)));
     }
 
     #[test]

@@ -428,6 +428,9 @@ impl Scheduler {
 
     /// 注册一个分片(以构造好的 ShardSim 形式进入)。已注册 → panic;
     /// 同时 ownership.claim + lifecycle.activate(懒创建语义由注册方掌握)。
+    /// 末尾重建 holder 表:预载 chunk 的 sim(回放恢复/测试手工装载/任务 02
+    /// 的 restore)凭已加载 chunk 登记 holder——装配期允许先 holder 后 owner,
+    /// owner 在位校验仍由 tick 开头的 fail-stop 承担(评审 Blocker 1)。
     pub fn register(&mut self, sim: ShardSim) {
         let shard = sim.shard();
         if self.sims.contains_key(&shard) {
@@ -445,6 +448,7 @@ impl Scheduler {
             ),
         );
         self.sims.insert(shard, sim);
+        self.rebuild_holders();
     }
 
     /// 本地权威命令入箱(经 Router)。未注册分片 → panic(README 决策 2);
@@ -1289,6 +1293,96 @@ mod tests {
             .expect("队列未满");
         sched.tick(); // 拍 0:apply_at(1) > at(0) → 不触发
         sched.tick(); // 拍 1:apply_at ≤ at 且未注册 → panic
+    }
+
+    /// 评审 Blocker 1:预载 chunk 的分片 register 后 holder 表正确填充
+    /// (回放恢复/手工装载此前漏 holders_of;任务 01 的 SetBlock 广播靠它)。
+    #[test]
+    fn register_preloaded_sim_populates_holders() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // shard (0,0) 的 sim 预载 chunk (8,0)(owner = 片 1,0;在片 0 的
+        // margin 环内)——先 holder 后 owner(装配期允许)。
+        let mut sim0 = sim(0, 0);
+        sim0.load_chunk(types::ChunkPos::new(8, 0), voxel::Chunk::air());
+        sched.register(sim0);
+        // owner 注册后(重建以 sims 全量为准,先注册的 holder 不丢)。
+        sched.register(sim(1, 0));
+        assert!(
+            sched
+                .holders_of(shard_id(1, 0), types::ChunkPos::new(8, 0))
+                .contains(&shard_id(0, 0)),
+            "预载 chunk 经 register 重建进 holder 表"
+        );
+        // 非 owner 卸载扩张副本 → None(D6)。
+        assert!(
+            sched
+                .apply_chunk_unload(shard_id(0, 0), types::ChunkPos::new(8, 0))
+                .is_none(),
+            "非 owner unload 返回 None(不写库)"
+        );
+        sched.shutdown();
+    }
+
+    /// 评审 Blocker 2(场景级):dispatch 取走 A 的桶后 A despawn,
+    /// 下一拍不得误报信封黑洞(旧冗余表的陈旧条目会 panic)。
+    #[test]
+    fn dispatched_destination_can_despawn_without_false_blackhole() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        let a = shard_id(1, 0);
+        sched.register(sim(1, 0));
+        // B 侧产生迁移信封 → dest A(produced_at=0 → apply_at=1)。
+        sched
+            .router
+            .collect_intents(
+                shard_id(0, 0),
+                &[messaging::Intent {
+                    destination: a,
+                    // 出生位姿必须落在 A 的核心区(x∈[128,256)),否则当拍
+                    // 又被迁移走、RemoveEntity 找不到实体。
+                    payload: messaging::EnvelopePayload::MigrateEntity {
+                        entity: types::EntityId::from_parts(0, 1),
+                        state: types::EntityState {
+                            translation: types::glam::Vec3::new(140.0, 10.0, 8.0),
+                            ..types::EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    },
+                }],
+                Tick::ZERO,
+            )
+            .expect("队列未满");
+        assert_eq!(
+            sched.pending_shard_destinations(),
+            std::collections::BTreeSet::from([a])
+        );
+        // 拍 0:apply_at(1) > 0,桶留存;拍 1:dispatch 取走 → 目的集合为空。
+        sched.tick();
+        sched.tick();
+        assert!(
+            !sched.pending_shard_destinations().contains(&a),
+            "dispatch 后目的从待投递集合消失(直查桶键,无陈旧条目)"
+        );
+        // A 收到迁移实体 → 移除它,使 A 可 despawn。
+        sched
+            .submit(
+                a,
+                StampedInput {
+                    apply_at: Tick(2),
+                    source: InputSource::SCHEDULER,
+                    sequence: 0,
+                    payload: InputPayload::Command(SimCommand::RemoveEntity {
+                        entity: types::EntityId::from_parts(0, 1),
+                    }),
+                },
+            )
+            .expect("收件箱未满");
+        sched.tick(); // 拍 2:实体移除
+        let _ = sched.unload_shard(a);
+        // 旧冗余表在此处 tick 会因陈旧 {A:1} 误 panic;直查实现无此问题。
+        sched.tick();
+        sched.tick();
+        sched.shutdown();
     }
 
     /// 任务书测试 3:两分片 + 一观察者——各自激活请求只落自己的

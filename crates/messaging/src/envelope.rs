@@ -138,6 +138,22 @@ impl CrossShardQueue {
             None => Vec::new(),
         }
     }
+
+    /// 仍在队的全部目的分片(升序;桶键即真相,REQ-005 D5 驱动 ensure 用)。
+    /// 桶数 ≤ 队列容量(1024),每次全扫可接受。
+    pub fn destinations(&self) -> std::collections::BTreeSet<ShardId> {
+        self.buckets.keys().map(|(dest, _)| *dest).collect()
+    }
+
+    /// destination 仍在队信封的最早 apply_at(无 → None)。
+    /// 与 `destinations()` 同源(桶键),不存在陈旧条目问题。
+    pub fn earliest_apply_at(&self, destination: ShardId) -> Option<Tick> {
+        self.buckets
+            .keys()
+            .filter(|(dest, _)| *dest == destination)
+            .map(|(_, apply_at)| *apply_at)
+            .min()
+    }
 }
 
 impl Default for CrossShardQueue {
