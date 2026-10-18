@@ -1,6 +1,6 @@
 # REQ-005:分片静态一致性、全局快照与跨片事件
 
-- 状态:**草案**(2026-10-18 起草;§9 决议待用户拍板,拍板后转 `已确认`)
+- 状态:**已确认**(2026-10-18 用户拍板:D1–D12 全部按推荐 A;开工)
 - GitHub issue:[#7](https://github.com/esp3j0/physics_minecraft/issues/7)
 - 提出日期:2026-10-18
 - 上游:
@@ -311,13 +311,13 @@ Router 信封的 destination 要么已注册、要么可被 ensure;不满足 →
   不会出现"每个已注册分片都装载同一批 chunk";事件 fanout ≤ 目标分片数;
   checkpoint 字节大小随状态线性、无重复副本。
 
-## 9. 决议(待拍板)
+## 9. 决议(2026-10-18 拍板:D1–D12 全部按推荐 A)
 
 逐条清单、推荐选项、备选与影响见 [REQ-005-decisions.md](REQ-005-decisions.md)。
 拍板后本节回写为最终决议(编号 D1–D12),并同步任务书
 [docs/tasks/req005-consistency/README.md](../tasks/req005-consistency/README.md)。
 
-| ID | 议题 | 推荐 |
+| ID | 议题 | 决议(= 推荐) |
 | --- | --- | --- |
 | D1 | 范围与编号 | REQ-005 只做三件事 + 观察者可回放;实体所有权/破坏延后 |
 | D2 | chunk owner 语义 | 静态 owner = 本体分片;holder 表可变;不做动态 claim |

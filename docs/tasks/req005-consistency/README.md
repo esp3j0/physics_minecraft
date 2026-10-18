@@ -1,8 +1,8 @@
 # REQ-005 实现任务书(总览)
 
-- 状态:**草案(待拍板)**。需求 [REQ-005](../../requirements/REQ-005-consistency.md)
-  与 [决策清单](../../requirements/REQ-005-decisions.md) 尚未拍板;拍板后本文
-  去掉"草案",按最终决议执行。
+- 状态:**已定稿**。需求 [REQ-005](../../requirements/REQ-005-consistency.md)
+  与 [决策清单](../../requirements/REQ-005-decisions.md) 已拍板(2026-10-18,
+  D1–D12 全部按推荐 A);按最终决议执行。
 - GitHub issue:[#7](https://github.com/esp3j0/physics_minecraft/issues/7)
 - 实现方式:glm 写核心(00–03),qwen 写验收(04)+ 独立评审;cargo 门禁;
   架构师终审。
@@ -35,8 +35,7 @@
 ## 架构师决策(拍板后不得偏离)
 
 以 [REQ-005-decisions.md](../../requirements/REQ-005-decisions.md) 的
-**D1–D12 最终选择**为准。起草时的推荐(拍板前可改;D1 范围/编号见决策清单,
-下面不重复):
+**D1–D12 最终选择(全 A)**为准:
 
 1. **D2**:owner = 本体分片纯函数;holder 表可变;不做动态 claim;
 2. **D3**:外部 `SetBlock` 同拍复制到 owner+holders,每片一条日志,整批原子;
