@@ -221,6 +221,7 @@ demo → Rust 移植对应表:demos/shard-migration→AC2 测试;voxel-collider�
 | `envelope_queue_capacity` | 1024 | §4.2 |
 | `checkpoint_interval_ticks` | 600 | §9.11 |
 | `shard_alert_ms`(仅告警) | 5(P95,持续 60 tick) | §9.2 |
+| `listen_addr` | "127.0.0.1:25565" | REQ-003 §4.2 |
 | `dt` | 1/60 | 共识 1 |
 
 核 crate 拿到的只是 `ShardSimConfig`、`SchedulerConfig` 等子结构(字段全显式,无全局单例)→ 测试可构造任意组合。

@@ -1,0 +1,15 @@
+[package]
+name = "viewer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+types = { path = "../types" }
+messaging = { path = "../messaging" }
+voxel = { path = "../voxel" }
+sim-api = { path = "../sim-api" }
+tokio = { version = "1", features = ["macros", "rt", "time", "sync", "net", "io-util", "signal"] }
+macroquad = "0.4"
+
+[lints]
+workspace = true

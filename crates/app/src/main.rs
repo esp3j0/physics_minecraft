@@ -25,18 +25,25 @@ fn main() {
             Box::new(SimpleRegistry::builtin())
         });
 
-    // 驱动:起 mpsc 通道 + spawn run + 等待完成(生产开 ctrl_c;发送端在驱动
-    // 存活期间由将来接入的外部缝持有,本轮随 main 存续)。
-    let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(config.inbox_capacity);
-    std::mem::forget(tx); // TODO(REQ-003):命令发送端移交网络任务;届时移除 forget。
-    // 观察输出缝(任务书 03):serve 装配(任务 04)未接线前恒 None——
-    // 驱动侧编排整体关闭,既有行为不变。
-    let observe: Option<app::driver::ObserveLink> = None;
-
+    // tokio runtime(网络装配与驱动同 runtime;REQ-003 决议 2 并发模型)。
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("tokio runtime 构建失败");
+
+    // 驱动:起 mpsc 通道 + spawn run + 等待完成(生产开 ctrl_c;命令发送端
+    // 随 main 存续——外部命令缝本轮无写方,通道关闭 = 关机,故不能 drop)。
+    let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(config.inbox_capacity);
+    std::mem::forget(tx);
+
+    // 网络装配(REQ-004A 任务 00):serve(spawn accept 循环)+ ObserveLink
+    // 三缝真值;失败 = fail-stop(启动期错误)。async 装配经 block_on 在驱动
+    // spawn 前完成,监听就绪后模拟才起跑;observe 三缝随 DriverArgs 移交。
+    let network = runtime
+        .block_on(app::net::assemble_network(&config))
+        .unwrap_or_else(|e| panic!("网络监听失败(fail-stop):{e}"));
+    println!("监听 {}", network.addr);
+
     let outcome = runtime.block_on(async move {
         let handle = tokio::spawn(run(DriverArgs {
             config,
@@ -47,10 +54,12 @@ fn main() {
             listen_ctrl_c: true,
             provider,
             new_sim,
-            observe,
+            observe: Some(network.observe),
         }));
         handle.await.expect("驱动任务 panic(fail-stop)")
     });
+    // 驱动已退(ctrl_c/通道关闭):广播网络关机(accept 停止 + 存量连接收口)。
+    network.shutdown.shutdown();
     runtime.shutdown_timeout(Duration::from_secs(1));
 
     // 一行摘要:续跑起点 + tick / 检查点 / 反压 / 告警 / 世界生长计数。

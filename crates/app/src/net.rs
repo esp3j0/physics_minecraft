@@ -1034,6 +1034,62 @@ async fn flush_outbound(outbound: &mut Outbound, stream: &mut TcpStream) -> io::
     }
 }
 
+// ---- 装配(REQ-004A 任务 00):main 与测试共用的网络装配缝 ----
+
+/// 网络装配产出(main 与 smoke 测试共用;测试书授权的抽取件):
+/// `observe` 交驱动(`DriverArgs.observe`),`addr` 供打印「监听 {addr}」
+/// 与测试连入,`shutdown` 为关停句柄。
+pub struct NetworkHandle {
+    /// 驱动观察缝(DriverArgs.observe 三件套)。
+    pub observe: crate::driver::ObserveLink,
+    /// 实际绑定地址(端口 0 = OS 分配,`serve` 回传)。
+    pub addr: std::net::SocketAddr,
+    /// 网络关停句柄(存活 = 监听常驻)。
+    pub shutdown: ShutdownHandle,
+}
+
+/// 网络关停句柄:存活 = accept 循环常驻;显式 [`ShutdownHandle::shutdown`]
+/// 广播关机(accept 停止 + 存量连接退出);句柄 drop(sender 析构)同样令
+/// accept 循环经 recv `Closed` 收口——进程正常退出的自然语义。
+#[derive(Debug, Clone)]
+pub struct ShutdownHandle(tokio::sync::broadcast::Sender<()>);
+
+impl ShutdownHandle {
+    /// 广播关机(幂等;发送端自持,无接收者亦无害)。
+    pub fn shutdown(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// 装配网络(REQ-004A 任务 00;main 与测试共用):Config.listen_addr +
+/// NetConfig 默认(超时/泵/观察节奏)→ serve 起监听(spawn accept 循环)→
+/// ObserveLink(up/hub/cadence 三缝)交驱动。监听失败 = `Err`(启动期错误,
+/// 调用方 fail-stop expect)。
+///
+/// 观察节奏投影 `ObserveCadence::from(&NetConfig)`(默认 10/60 拍);up 通道
+/// 容量 256(REQ-003 测试装配同款);关停句柄存活 = 监听常驻(main 持有至
+/// 进程退出,勿忘)。
+pub async fn assemble_network(config: &crate::config::Config) -> io::Result<NetworkHandle> {
+    let net_cfg = NetConfig {
+        listen_addr: config.listen_addr.clone(),
+        ..NetConfig::default()
+    };
+    let cadence = crate::driver::ObserveCadence::from(&net_cfg);
+    let (up_tx, up_rx) = mpsc::channel(256);
+    let hub = std::sync::Arc::new(OutboundHub::new());
+    let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel::<()>(1);
+    let addr = serve(net_cfg, up_tx, shutdown_rx, hub.clone()).await?;
+    Ok(NetworkHandle {
+        observe: crate::driver::ObserveLink {
+            up: up_rx,
+            hub,
+            cadence,
+        },
+        addr,
+        shutdown: ShutdownHandle(shutdown_tx),
+    })
+}
+
 // ---- 测试清单(内嵌;全走 127.0.0.1:0 + 内嵌迷你客户端) ----
 
 #[cfg(test)]
@@ -2292,5 +2348,73 @@ pub(crate) mod tests {
         }
         assert!(!leaked, "断连后无孤儿泵请求(连接 task 终止即停)");
         bcast_shutdown(&shutdown).await;
+    }
+
+    // ---- 任务书 req004a-viewer/00:main 网络装配接线(测试清单)----
+
+    /// 测试清单 2 `main_wiring_smoke`:`assemble_network` 装配出的 ObserveLink
+    /// 非空 + serve 起后外部迷你客户端连接收 Welcome(装配函数 = main 与测试
+    /// 共用;任务书授权)。驱动侧以真 tick 循环接线(Welcome 拍号刷新路径),
+    /// 关机 = Shutdown 命令 + 广播。
+    #[tokio::test]
+    async fn main_wiring_smoke() {
+        // 装配输入:监听地址覆写为 0 端口(OS 分配;其余字段默认)。
+        let config = crate::config::Config {
+            listen_addr: "127.0.0.1:0".to_string(),
+            ..crate::config::Config::default()
+        };
+
+        // 装配:serve 起监听,ObserveLink 在场(Option::Some = 装配非空)。
+        let handle = assemble_network(&config)
+            .await
+            .expect("装配监听成功(127.0.0.1:0)");
+        assert!(handle.addr.port() > 0, "实际绑定地址已知(端口 0 → OS 分配)",);
+
+        // 驱动侧最小装配:真会话 + mem 后端 + observe 三缝真接(与 driver.rs
+        // observe_harness 同款链路;真 tick 让 Welcome 拍号经编排刷新)。
+        let session = sim_api::session::Session::new(config.session_config());
+        let (tx, rx) = mpsc::channel::<crate::driver::DriverCommand>(256);
+        let store = storage::worker::StoreWorker::new(
+            Box::new(storage::mem::MemChunkStore::new()),
+            Box::new(storage::mem::MemCheckpointStore::new()),
+        );
+        let (provider, new_sim) =
+            crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(voxel::SimpleRegistry::builtin())
+            });
+        let driver = tokio::spawn(crate::driver::run(crate::driver::DriverArgs {
+            config,
+            session,
+            store,
+            log: sim_api::log::CommandLog::new(),
+            commands: rx,
+            listen_ctrl_c: false,
+            provider,
+            new_sim,
+            observe: Some(handle.observe),
+        }));
+
+        // 外部客户端连入:Hello + Subscribe → 首帧 Welcome(ACV1 冒烟)。
+        let mut c = MiniClient::connect(handle.addr).await.expect("客户端连入");
+        c.send(&C2S::Hello { client_id: 1 })
+            .await
+            .expect("Hello 写入");
+        c.send(&C2S::Subscribe { view_distance: 4 })
+            .await
+            .expect("Subscribe 写入");
+        match c.recv_timeout().await {
+            S2C::Welcome { player_id, .. } => {
+                assert_eq!(player_id, InputSource(1), "装配出的服务器分配身份 1");
+            }
+            other => panic!("装配后外部客户端首帧应为 Welcome,实为 {other:?}"),
+        }
+
+        // 收口:驱动 Shutdown(join = 驱动退出路径跑完:终末 checkpoint +
+        // store 关停,不泄后台任务)+ 网络广播关机(句柄公开面可用)。
+        tx.send(crate::driver::DriverCommand::Shutdown)
+            .await
+            .expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+        handle.shutdown.shutdown();
     }
 }

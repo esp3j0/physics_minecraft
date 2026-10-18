@@ -20,6 +20,10 @@ storage = { path = "../storage" }
 # REQ-003 验收套件(任务书 04 授权增补):tokio 增 net + io-util
 # (内嵌测试客户端 = 真 TCP TcpStream + 帧读写;README 决策 10)。
 tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util", "net", "io-util"] }
+# REQ-004A 验收套件(任务书 02 授权增补):viewer::client 端到端冒烟
+# (client 模块零 macroquad 依赖,README 决策 1;viewer 为此增补 lib target,
+# 架构师决议授权)。
+viewer = { path = "../viewer" }
 tempfile = "3"
 bincode = { version = "2", features = ["serde"] }
 

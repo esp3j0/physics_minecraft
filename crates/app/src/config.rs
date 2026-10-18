@@ -83,6 +83,9 @@ pub struct Config {
     pub world_seed: WorldSeed,
     /// 世界种类(REQ-002 §4.1;决定 bootstrap 装配的生成器)。
     pub world_kind: WorldKind,
+    /// 服务器监听地址(REQ-004A 决策 4;main 网络装配 `assemble_network`
+    /// 的 listen 输入;端口 0 = OS 分配,测试用)。
+    pub listen_addr: String,
 }
 
 impl Default for Config {
@@ -102,6 +105,7 @@ impl Default for Config {
             data_dir: PathBuf::from("data"),
             world_seed: WorldSeed(0),
             world_kind: WorldKind::Superflat,
+            listen_addr: "127.0.0.1:25565".to_string(),
         }
     }
 }
@@ -397,6 +401,28 @@ mod tests {
         // roundtrip:覆写实例无损(新字段真实走序列化)。
         let back = Config::from_toml_str(&custom.to_toml_string()).expect("自有输出可解析");
         assert_eq!(back, custom, "world 字段 roundtrip 无损");
+    }
+
+    /// 测试清单 10(REQ-004A 任务 00):`listen_addr` 默认 "127.0.0.1:25565"
+    /// (README 决策 6),toml 覆写生效且 roundtrip 无损(§6 单一来源)。
+    #[test]
+    fn config_listen_addr_default_and_override() {
+        // 缺省:结构体级 serde(default) → 默认监听地址(本机 25565 端口)。
+        let c = Config::from_toml_str("dt = 0.02\n").expect("可解析");
+        assert_eq!(
+            c.listen_addr, "127.0.0.1:25565",
+            "缺省 listen_addr = 127.0.0.1:25565(REQ-004A 决策 4)"
+        );
+
+        // 覆写:显式给值可解析(测试/多实例场景换端口)。
+        let custom = Config::from_toml_str("listen_addr = \"127.0.0.1:0\"\n").expect("可解析");
+        assert_eq!(custom.listen_addr, "127.0.0.1:0", "toml 覆写生效");
+
+        // roundtrip:覆写实例无损(该字段真实走序列化)。
+        let back = Config::from_toml_str(&custom.to_toml_string()).expect("自有输出可解析");
+        assert_eq!(back, custom, "listen_addr roundtrip 无损");
+        // Default 直取同值(默认值唯一来源纪律)。
+        assert_eq!(Config::default().listen_addr, "127.0.0.1:25565");
     }
 
     /// 测试清单 8(任务书 req001-backlog/02 授权接线):shard_sim_config 的

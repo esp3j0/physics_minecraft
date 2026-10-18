@@ -1,7 +1,10 @@
 # REQ-004A:最小可视化 viewer(demo)
 
-- 状态:**已确认**(2026-10-18 用户拍板:viewer 为可视化 demo;正式客户端未来重新设计;
-  MC 客户端直连不做——自定义物理实体无法在 MC 客户端忠实呈现)
+- 状态:**代码侧完成**(2026-10-18 用户拍板与落地;4/4 任务过门禁,全仓 330 测试绿。
+  评审 6 条已由架构师处置:Top/Bottom 面绕序修正、客户端周期 Ping 自保
+  (静止 10s 被踢修复)、控制通道关闭停询(100% CPU 空转修复)、蓝图 §6 表补
+  listen_addr、测试注释数字勘误、tokio features 对齐。
+  **ACV4 手动验收清单待用户实跑**(运行方式见 §5))
 - GitHub issue:[#6](https://github.com/esp3j0/physics_minecraft/issues/6)
 - 上游:[REQ-003](REQ-003-network.md)(自定义协议/连接层/chunk 流/观察输出——viewer 的全部数据源)
 
@@ -45,3 +48,14 @@
 2. 渲染代码**不写窗口类测试**;纯函数(暴露面/颜色/顶点)单测覆盖;
 3. viewer::client 与 render 分模块,client 零 macroquad 依赖;
 4. 服务器监听地址入 app::Config(`listen_addr`,默认 "127.0.0.1:25565")。
+
+## 5. 运行方式(ACV4 实跑)
+
+```
+终端 1:cargo run -p app        # 服务器,启动打印「监听 127.0.0.1:25565」,Ctrl+C 关停
+终端 2:cargo run -p viewer     # viewer(默认连 127.0.0.1:25565;
+                               # 环境变量 VIEWER_ADDR / VIEWER_VIEW 可覆写地址与视距)
+```
+
+操作:WASD 移动 + 鼠标视角 + Shift/Ctrl 升降;空格切换「相机→观察者耦合」
+(默认耦合:相机走到哪,世界装载到哪)。验收对照 §3 ACV4 六项。
