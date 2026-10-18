@@ -7,14 +7,17 @@ use std::time::Instant;
 
 use macroquad::camera::{Camera3D, Projection, set_camera, set_default_camera};
 use macroquad::color::{BLUE, DARKGRAY, SKYBLUE, WHITE, YELLOW};
-use macroquad::input::{KeyCode, is_key_down, is_key_pressed, mouse_delta_position};
+use macroquad::input::{
+    KeyCode, is_key_down, is_key_pressed, mouse_delta_position, set_cursor_grab, show_mouse,
+};
 use macroquad::math::vec3;
 use macroquad::miniquad::conf::Conf;
 use macroquad::models::{Mesh, draw_cube, draw_mesh};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
 use macroquad::window::{clear_background, next_frame, screen_height};
-use types::{ChunkPos, EntityId};
+use messaging::SimCommand;
+use types::{ChunkPos, EntityDesc, EntityId, EntityState};
 // 注:macroquad 0.4 内嵌 glam 0.27,types 用 glam 0.33——两版 Vec3 不互认,
 // 一切跨界处按字段换算(下文 vec3(t.x, t.y, t.z) / types::glam::Vec3::new)。
 
@@ -31,6 +34,16 @@ const OBSERVER_SEND_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 const ENTITY_CUBE_SIZE: f32 = 0.9;
 /// 断连后自动退出的等待(秒;给用户看清 HUD 提示)。
 const DISCONNECT_GRACE_SECS: f32 = 3.0;
+/// 交互命令的目标距离(米):B 生成点 = 相机前 8m 抬 6m;X 爆心 = 相机前 12m。
+const SPAWN_AHEAD: f32 = 8.0;
+const SPAWN_LIFT: f32 = 6.0;
+const BLAST_AHEAD: f32 = 12.0;
+/// X 爆炸参数(与 e2e 爆炸测试同量级:全命中、可感飞散)。
+const BLAST_POWER: f32 = 12.0;
+const BLAST_RADIUS: f32 = 6.0;
+/// viewer 生成实体的 EntityId origin 段(服务器分片序号 <<32 打包;9999 远离
+/// 一切真实分片号,保证客户端生成 ID 不与服务器侧冲突——决议 7 单调不回收)。
+const SPAWN_ORIGIN: u32 = 9999;
 
 /// 自由飞行相机(欧拉:偏航绕 y,俯仰;WASD + 鼠标视角,Shift/Ctrl 升降)。
 struct FlyCamera {
@@ -40,10 +53,10 @@ struct FlyCamera {
 }
 
 impl FlyCamera {
-    /// 初始位姿:站在原点上方,俯视地面。
+    /// 初始位姿:地表上方(超平坦顶面 world y=4),俯视地面。
     fn new() -> Self {
         Self {
-            position: vec3(8.0, -50.0, 24.0),
+            position: vec3(8.0, 12.0, 24.0),
             yaw: -90.0_f32.to_radians(),
             pitch: -30.0_f32.to_radians(),
         }
@@ -205,6 +218,14 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
     let mut camera = FlyCamera::new();
     let mut world = WorldView::new();
     let mut coupled = true; // 相机 → 观察者耦合(默认开)
+    // 鼠标视角:锁定指针并隐藏光标(未锁定时指针到屏缘 delta 归零,视角
+    // 转不动——ACV4 实跑反馈);M 键切换锁定,便于切出窗口。
+    let mut mouse_grabbed = true;
+    set_cursor_grab(mouse_grabbed);
+    show_mouse(!mouse_grabbed);
+    // viewer 生成实体的序号(SPAWN_ORIGIN 段内单调;断线重连从 0 重来,
+    // 与服务器侧实体永不冲突——服务器分片号远小于 9999)。
+    let mut spawn_seq: u32 = 0;
     // 节流用墙钟(渲染节流不属确定性核;边缘 crate 局部 allow 并注明,
     // clippy.toml 纪律,driver.rs 同款手法)。
     #[allow(clippy::disallowed_methods)]
@@ -233,6 +254,37 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
         // 空格切换耦合(边沿触发,不连发)。
         if is_key_pressed(KeyCode::Space) {
             coupled = !coupled;
+        }
+        // M 切换鼠标锁定(释放后可正常使用指针;再按 M 重新锁定转视角)。
+        if is_key_pressed(KeyCode::M) {
+            mouse_grabbed = !mouse_grabbed;
+            set_cursor_grab(mouse_grabbed);
+            show_mouse(!mouse_grabbed);
+        }
+        // B:准星前方生成动态立方体(落下→静止→凝固成地形色;ACV4 ③④)。
+        if is_key_pressed(KeyCode::B) && disconnected.is_none() {
+            let entity = EntityId::from_parts(SPAWN_ORIGIN, spawn_seq);
+            spawn_seq = spawn_seq.wrapping_add(1);
+            let p = camera.position
+                + camera.forward() * SPAWN_AHEAD
+                + macroquad::math::Vec3::Y * SPAWN_LIFT;
+            control.command(SimCommand::SpawnDynamic {
+                entity,
+                state: EntityState {
+                    translation: types::glam::Vec3::new(p.x, p.y, p.z),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            });
+        }
+        // X:准星处引爆(把立方体炸飞;ACV4 ③)。
+        if is_key_pressed(KeyCode::X) && disconnected.is_none() {
+            let c = camera.position + camera.forward() * BLAST_AHEAD;
+            control.command(SimCommand::Detonate {
+                center: types::glam::Vec3::new(c.x, c.y, c.z),
+                power: BLAST_POWER,
+                radius: BLAST_RADIUS,
+            });
         }
         // 耦合时:相机位姿节流上报(≥100ms 一次;仅未断连时)。
         if coupled && disconnected.is_none() {
@@ -286,7 +338,7 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
             YELLOW,
         );
         draw_text(
-            "WASD+鼠标飞行 Shift/Ctrl 升降",
+            "WASD+鼠标飞行 Shift/Ctrl 升降 | B 生成立方体 X 爆炸 | M 释放/锁定鼠标",
             12.0,
             screen_height() - 12.0,
             16.0,

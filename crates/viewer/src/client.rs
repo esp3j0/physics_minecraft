@@ -52,6 +52,9 @@ pub enum ViewEvent {
 pub(crate) enum Control {
     /// 观察者位姿(渲染节流后送达;连接循环原样发 `C2S::MoveObserver`)。
     Move(Vec3),
+    /// 白名单命令(生成/引爆等;连接循环发 `C2S::Command`,翻译层在服务器侧)。
+    /// ACV4 ③④ 的交互入口(评审后补,Refs #6)。
+    Command(messaging::SimCommand),
     /// 主动离场(`C2S::Goodbye`)。
     Goodbye,
 }
@@ -69,6 +72,11 @@ impl ControlHandle {
     /// 发观察者位姿(latest-wins:满即弃上一帧,渲染侧不做背压)。
     pub fn move_observer(&self, position: Vec3) {
         let _ = self.tx.try_send(Control::Move(position));
+    }
+
+    /// 发白名单命令(生成/引爆;ACV4 ③④ 交互入口)。
+    pub fn command(&self, command: messaging::SimCommand) {
+        let _ = self.tx.try_send(Control::Command(command));
     }
 
     /// 主动离场(尽力而为;连接亡故时静默)。
@@ -252,6 +260,12 @@ async fn run_connection(
             command = control_rx.recv(), if control_open => match command {
                 Some(Control::Move(position)) => {
                     let frame = encode_c2s_frame(&C2S::MoveObserver { position });
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
+                Some(Control::Command(command)) => {
+                    let frame = encode_c2s_frame(&C2S::Command(command));
                     if write_all(&mut stream, &frame).await.is_err() {
                         break 'read;
                     }
