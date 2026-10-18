@@ -4,6 +4,7 @@
   全部有测试(e2e/world_loading.rs);REQ-001 §9.5 修订(P2′ 位移门+演员豁免)同步落地。
   实现方式:glm 实现 + qwen 验收/评审交叉验证 + cargo 门禁 + 架构师终审;
   过程升级 3 次(Session 编排透传、shutdown 对 Stopped 记录幂等跳过、app 配置接线)均带证据批复)
+- GitHub issue:[#4](https://github.com/esp3j0/physics_minecraft/issues/4)
 - 提出日期:2026-10-17
 - 上游:[REQ-001](REQ-001-architecture.md)(已完成,AC1-AC8 落地;本 REQ 落实其遗留:tier①② chunk 数据源、despawn 票据自动化)
 - 关联 demo:`demos/solidify-slopes`(决议 5 义务,实验中;结论回填 §3)

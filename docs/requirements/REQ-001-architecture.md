@@ -2,6 +2,7 @@
 
 - 状态:**完成**(2026-10-15 确认并开工,2026-10-17 全部落地。13 项决议见 §9;代码布局按 docs/design/codebase-layout.md。九 crate:types、voxel、messaging、physics-sim(迁移/凝固桥/爆炸/快照恢复/激活策略机)、shard(调度器/所有权/生命周期/路由)、storage(redb/bincode+单写 worker 屏障)、sim-api(Session 缝/快照/回放)、app(配置/驱动/告警/断点续跑)、e2e(等价性验收套件)。**AC1-AC8 全部有测试**:AC1 位级确定性、AC2 接触态迁移等价(裸世界参考,实测误差位级 0)、AC3 爆炸位级等价、AC4 激活不变量(滞回/冷却/预算/冻结语义+端到端)、AC5 所有权转移结构保证、AC6 tick 纪律、AC7 桥一致、AC8 回放位级一致(含 600 拍长程)。实现方式:qwen/glm 双模型工作流交叉验证四轮。**后续**:REQ-002(网络/chunk-stream、tier①② chunk 数据源接线、despawn 票据自动化)、REQ-003(网络协议)、真实墙钟长跑性能校准)
 - 提出日期:2026-10-14;确认日期:2026-10-15
+- GitHub issue:[#3](https://github.com/esp3j0/physics_minecraft/issues/3)
 - 关联 demo:`demos/shard-migration`(A)、`demos/voxel-collider`(B)、`demos/solidify-bridge`(C)、`demos/cross-shard-explosion`(D)
 - 代码证据:`docs/research/ferrumc-v2-survey.md`(下称【调研】,file:line 证据在里面)
 

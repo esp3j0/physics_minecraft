@@ -2,6 +2,7 @@
 
 - 状态:**已确认**(2026-10-18 用户拍板:viewer 为可视化 demo;正式客户端未来重新设计;
   MC 客户端直连不做——自定义物理实体无法在 MC 客户端忠实呈现)
+- GitHub issue:[#6](https://github.com/esp3j0/physics_minecraft/issues/6)
 - 上游:[REQ-003](REQ-003-network.md)(自定义协议/连接层/chunk 流/观察输出——viewer 的全部数据源)
 
 ## 1. 目标

@@ -8,6 +8,7 @@
   均已修复并有回归测试。实现:glm + qwen 交叉验证 + cargo 门禁 + 架构师终审。
   挂账:出站侧 2MiB 帧上限未强制(密集场景全量表可超限,评审 low,分包待做)、
   Welcome 双发(连接层+驱动各一,字面偏差)、WAN/压缩/加密不做)
+- GitHub issue:[#5](https://github.com/esp3j0/physics_minecraft/issues/5)
 - 提出日期:2026-10-17
 - 上游:[REQ-001](REQ-001-architecture.md) §9.9(网络独立 REQ-003;照搬 v2 chunk_stream
   + v1 网络线程模式)、[REQ-002](REQ-002-world-loading.md)(观察者命令化/票据/ChunkProvider
