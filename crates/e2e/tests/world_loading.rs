@@ -318,7 +318,8 @@ async fn acg3_observer_walk_builds_playable_world() {
         };
         let bundle = decode_bundle(&blob);
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard_id(1, 0))
             .expect("观察者分片在快照中");
@@ -327,7 +328,7 @@ async fn acg3_observer_walk_builds_playable_world() {
         let state = restored
             .entity_state(eid(1))
             .expect("凝固桥关闭:实体恒存在");
-        samples.push((bundle.snapshot.tick.0, state.translation.y));
+        samples.push((bundle.world.shards.tick.0, state.translation.y));
     }
     assert!(
         samples.len() >= 10,
@@ -473,7 +474,8 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         .expect("必有终末检查点");
     let bundle = decode_bundle(&blob);
     let bytes = bundle
-        .snapshot
+        .world
+        .shards
         .per_shard
         .get(&shard)
         .expect("分片复活并进入终末快照");

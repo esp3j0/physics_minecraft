@@ -192,6 +192,10 @@ pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
             types::ShardPos::new(entity.origin_shard() as i32, 0)
         }
         SimCommand::MarkActor { .. } | SimCommand::SetObserverPosition { .. } => return None,
+        // 观察者移除(REQ-005 D9):观察者收件箱专用命令,不走分片前缀——
+        // 无上行映射(客户端白名单拒绝;driver::validate_external_command
+        // 同口径防御层)。
+        SimCommand::RemoveObserver => return None,
     };
     Some(types::ShardId::new(
         types::WorldId(0),

@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
+
 use messaging::{
     AdmitError, CrossShardQueue, DEFAULT_QUEUE_CAPACITY, Envelope, InputPayload, InputSource,
     Intent, StampedInput,
@@ -36,6 +38,16 @@ impl Default for RouterConfig {
 pub enum RouteError {
     #[error("分片收件箱已满(容量 {capacity})")]
     InboxFull { capacity: usize },
+}
+
+/// 路由快照(REQ-005 任务书 02,签名固定):待投递信封 + per-source sequence。
+/// **inboxes 不入快照**——本地命令都在命令日志里,回放按 dest 重投;
+/// `sequences` 原样恢复(不恢复会改变后续迁移的 source_sequence,破坏
+/// canonical 序,AC-C5 位级一致性的第一坑)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RouterSnapshot {
+    pub envelopes: Vec<Envelope>,
+    pub sequences: BTreeMap<ShardId, u64>,
 }
 
 /// 命令路由器:有界收件箱 + 信封盖章队列(任务书 04)。
@@ -146,6 +158,25 @@ impl Router {
 
     pub fn pending_envelopes(&self) -> usize {
         self.queue.len()
+    }
+
+    /// 快照(REQ-005 D7):待投递信封全量(canonical 全序,见
+    /// `CrossShardQueue::snapshot`)+ per-source sequence 原样。
+    /// 两拍之间调用(dispatch 取走的桶已清,快照即此刻真相)。
+    pub fn snapshot(&self) -> RouterSnapshot {
+        RouterSnapshot {
+            envelopes: self.queue.snapshot(),
+            sequences: self.sequences.clone(),
+        }
+    }
+
+    /// 从快照恢复(REQ-005 D7):信封经 `CrossShardQueue::restore` 的不变量
+    /// 校验(`apply_at == produced_at + 1`、容量;违反 = 内部状态损坏 →
+    /// panic fail-stop)后放回桶;sequences 原样覆盖(不 merge——恢复线
+    /// sequence 表只来自快照)。queue 容量由本 Router 的当前 cfg 承载。
+    pub fn restore(&mut self, snap: RouterSnapshot) {
+        self.queue.restore(snap.envelopes);
+        self.sequences = snap.sequences;
     }
 }
 

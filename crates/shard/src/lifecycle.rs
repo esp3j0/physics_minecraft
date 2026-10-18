@@ -5,10 +5,22 @@
 //! "空片+无票"的判据(实体数、票务)由调度器掌握,本模块只跟踪阶段与空闲计时,
 //! 提供判定原语(README 决策 4:本轮只接线不自动化)。
 
+use serde::{Deserialize, Serialize};
 use types::Tick;
 
+/// 生命周期快照(REQ-005 任务书 02,签名固定):阶段 + 空闲计时 + 排空标志。
+/// cfg 不入快照(restore 用当前配置);despawn 计时不被重置靠 `last_activity`
+/// 原样恢复(AC-C5)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleSnapshot {
+    pub stage: Stage,
+    pub last_activity: Tick,
+    pub drained: bool,
+}
+
 /// 生命周期阶段。Created 阶段由"记录不存在"表达(懒创建:首次活动即 Active)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// serde(REQ-005 D7):阶段入 [`LifecycleSnapshot`] 随快照序列化。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Stage {
     Active,
     Draining,
@@ -16,7 +28,7 @@ pub enum Stage {
 }
 
 /// 生命周期配置。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct LifecycleConfig {
     /// 空闲多少拍后可 despawn(默认 1800 = 30s × 60Hz,§9.3)。
     pub despawn_after_ticks: u64,
@@ -46,6 +58,26 @@ impl ShardLifecycle {
             stage: Stage::Active,
             last_activity: at,
             drained: false,
+            cfg,
+        }
+    }
+
+    /// 快照(REQ-005 D7):阶段 + 空闲计时 + 排空标志;cfg 不入(恢复用当前
+    /// 配置,计时基准 `last_activity` 是本表唯一必须跨 checkpoint 保留的状态)。
+    pub fn snapshot(&self) -> LifecycleSnapshot {
+        LifecycleSnapshot {
+            stage: self.stage,
+            last_activity: self.last_activity,
+            drained: self.drained,
+        }
+    }
+
+    /// 从快照恢复(REQ-005 D7):cfg 用调用方当前配置(不入快照)。
+    pub fn restore(snap: LifecycleSnapshot, cfg: LifecycleConfig) -> Self {
+        Self {
+            stage: snap.stage,
+            last_activity: snap.last_activity,
+            drained: snap.drained,
             cfg,
         }
     }

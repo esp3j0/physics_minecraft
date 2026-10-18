@@ -9,7 +9,7 @@ use types::{BlockPos, DimensionId, EntityId, EntityState, ShardId, Tick, WorldId
 use voxel::BlockRegistry;
 
 use crate::log::LogEntry;
-use crate::snapshot::GlobalSnapshot;
+use crate::snapshot::{GlobalSnapshot, WorldSnapshot};
 
 /// 会话配置(接口设计,签名固定):调度器配置 + 会话作为输入源。
 #[derive(Debug, Clone)]
@@ -86,13 +86,26 @@ impl Session {
     /// `source` = 本会话、`sequence` 单调;返回 [`LogEntry`] 供调用方记录(决策 5)。
     /// 收件箱满 → `Err(SessionError::Route)`;未注册分片 → panic(调度器语义)。
     pub fn send(&mut self, shard: ShardId, command: SimCommand) -> Result<LogEntry, SessionError> {
+        self.send_from(self.source, shard, command)
+    }
+
+    /// 带来源的命令进入缝(REQ-005 任务书 02,签名固定):与 [`Session::send`]
+    /// 同语义(盖章 `apply_at = tick_now()`、沿会话单调 `next_sequence`),
+    /// 但 `source` 用参数——网络路径的日志 source 必须是真实玩家,不是会话 1
+    /// (D9:回放 canonical 序与观察者来源一致)。`send` 即 `send_from(会话)。
+    pub fn send_from(
+        &mut self,
+        source: InputSource,
+        shard: ShardId,
+        command: SimCommand,
+    ) -> Result<LogEntry, SessionError> {
         let tick = self.scheduler.tick_now();
         let sequence = self.next_sequence;
         self.scheduler.submit(
             shard,
             StampedInput {
                 apply_at: tick,
-                source: self.source,
+                source,
                 sequence,
                 payload: InputPayload::Command(command),
             },
@@ -101,7 +114,7 @@ impl Session {
         Ok(LogEntry {
             tick,
             dest: shard,
-            source: self.source,
+            source,
             sequence,
             command,
         })
@@ -118,6 +131,19 @@ impl Session {
     /// 且已注册。收件箱满 → `Err(SessionError::Route)`(不消耗 sequence)。
     pub fn send_broadcast(
         &mut self,
+        owner: ShardId,
+        command: SimCommand,
+    ) -> Result<Vec<LogEntry>, SessionError> {
+        self.send_broadcast_from(self.source, owner, command)
+    }
+
+    /// 带来源的外部广播命令(REQ-005 任务书 02,签名固定):与
+    /// [`Session::send_broadcast`] 同语义(校验/目标集/同一盖章/整批原子),
+    /// 但 `source` 用参数——网络 SetBlock 的日志 source 必须是真实玩家;
+    /// `send_broadcast` 即 `send_broadcast_from(会话)`。
+    pub fn send_broadcast_from(
+        &mut self,
+        source: InputSource,
         owner: ShardId,
         command: SimCommand,
     ) -> Result<Vec<LogEntry>, SessionError> {
@@ -143,7 +169,7 @@ impl Session {
         let sequence = self.next_sequence;
         let stamped = StampedInput {
             apply_at: tick,
-            source: self.source,
+            source,
             sequence,
             payload: InputPayload::Command(command),
         };
@@ -155,7 +181,7 @@ impl Session {
             .map(|dest| LogEntry {
                 tick,
                 dest,
-                source: self.source,
+                source,
                 sequence,
                 command,
             })
@@ -179,6 +205,12 @@ impl Session {
         self.scheduler.is_chunk_loaded(shard, pos)
     }
 
+    /// 分片某个已加载 chunk 的只读视图(REQ-005 任务 02:重放一致性测试
+    /// 断言用;调度器透传)。未注册分片或未加载 → None。
+    pub fn voxel_chunk(&self, shard: ShardId, pos: types::ChunkPos) -> Option<&voxel::Chunk> {
+        self.scheduler.voxel_chunk(shard, pos)
+    }
+
     /// Router 待投递信封的目的分片(REQ-005 D5;驱动 tick 末 ensure 用;
     /// 调度器透传)。
     pub fn pending_shard_destinations(&self) -> std::collections::BTreeSet<ShardId> {
@@ -198,20 +230,75 @@ impl Session {
     /// `tick()` 生效)后走调度器专用收件箱(`submit_observer`);返回
     /// [`LogEntry`] 供调用方记录外部命令日志——dest = position 所在分片
     /// (信息性,`chunk_of().shard_of()`,floor 语义),sequence 沿会话
-    /// 单调序列(与 `send` 共用)。
+    /// 单调序列(与 `send` 共用)。source = 会话(测试/装配入口)。
     pub fn move_observer(&mut self, position: Vec3) -> Result<LogEntry, SessionError> {
+        self.move_observer_from(self.source, position)
+    }
+
+    /// 带来源的观察者移动(REQ-005 任务书 02,签名固定):与
+    /// [`Session::move_observer`] 同语义(盖章当前拍、沿会话 `next_sequence`
+    /// 单调、走观察者专用收件箱),但 `source` 用参数——网络玩家的日志
+    /// source 必须是玩家身份,不是会话 1(D9);`move_observer` 即
+    /// `move_observer_from(会话)`。
+    pub fn move_observer_from(
+        &mut self,
+        source: InputSource,
+        position: Vec3,
+    ) -> Result<LogEntry, SessionError> {
         let tick = self.scheduler.tick_now();
         let sequence = self.next_sequence;
         self.scheduler.submit_observer(StampedInput {
             apply_at: tick,
-            source: self.source,
+            source,
             sequence,
             payload: InputPayload::Command(SimCommand::SetObserverPosition { position }),
         });
         self.next_sequence += 1;
         // dest = position 所在分片(chunk → shard,floor 语义;信息性,不用于投递
         // ——观察者必然可走进未注册分片区域,投递走调度器专用收件箱)。
-        let dest = ShardId::new(
+        let dest = Self::observer_dest_of(position);
+        Ok(LogEntry {
+            tick,
+            dest,
+            source,
+            sequence,
+            command: SimCommand::SetObserverPosition { position },
+        })
+    }
+
+    /// 带来源的观察者移除(REQ-005 D9;签名固定):盖章 [`SimCommand::RemoveObserver`]
+    /// 走观察者专用收件箱(`apply_at` 到期后删除该 source 条目,幂等——
+    /// 不在表无害,票撤语义与 `remove_observer` 一致);沿会话 `next_sequence`
+    /// 单调;返回 [`LogEntry`] 供调用方记录(断线入日志 → 可回放,无幽灵观察者)。
+    ///
+    /// `dest` 用**哨兵分片** `WorldId(0)/DimensionId(0)/ShardPos(0,0)`:观察者
+    /// 命令不看 dest(投递走调度器收件箱,不经分片),日志的 dest 字段仅为
+    /// 满足 `LogEntry` 形状;回放对观察者命令也忽略 dest(走
+    /// `submit_observer_raw`)。以会话 source 直呼的便捷入口
+    /// [`Session::remove_observer`](立即生效版)保留不动。
+    pub fn remove_observer_from(&mut self, source: InputSource) -> Result<LogEntry, SessionError> {
+        let tick = self.scheduler.tick_now();
+        let sequence = self.next_sequence;
+        self.scheduler.submit_observer(StampedInput {
+            apply_at: tick,
+            source,
+            sequence,
+            payload: InputPayload::Command(SimCommand::RemoveObserver),
+        });
+        self.next_sequence += 1;
+        Ok(LogEntry {
+            tick,
+            // 哨兵分片(见 doc):观察者命令不看 dest,仅满足 LogEntry 形状。
+            dest: ShardId::new(WorldId(0), DimensionId(0), types::ShardPos::new(0, 0)),
+            source,
+            sequence,
+            command: SimCommand::RemoveObserver,
+        })
+    }
+
+    /// 观察者命令的 dest 换算(信息性):position 所在分片(floor 语义)。
+    fn observer_dest_of(position: Vec3) -> ShardId {
+        ShardId::new(
             WorldId(0),
             DimensionId(0),
             types::ChunkPos::new(
@@ -219,14 +306,7 @@ impl Session {
                 (position.z / 16.0).floor() as i32,
             )
             .shard_of(),
-        );
-        Ok(LogEntry {
-            tick,
-            dest,
-            source: self.source,
-            sequence,
-            command: SimCommand::SetObserverPosition { position },
-        })
+        )
     }
 
     /// 观察者只读视图(调度器透传):`(source, position)`,InputSource 升序。
@@ -295,6 +375,15 @@ impl Session {
         self.scheduler.submit_observer(input);
     }
 
+    /// 调度器状态恢复(REQ-005 D7;`replay_world` 专用缝):委托
+    /// `Scheduler::restore_state`——校验 tick/键集/信封目的地(违反 =
+    /// 内部状态损坏 → panic fail-stop),恢复观察者表/Router/ lifecycles,
+    /// 并从各片已加载 chunk 重建 holder 表。调用前提:分片已全部注册、
+    /// coordinator 已对齐快照拍。
+    pub fn restore_scheduler_state(&mut self, snap: shard::SchedulerSnapshot) {
+        self.scheduler.restore_state(snap);
+    }
+
     /// 移除一个观察者(REQ-003 §4.2/03;评审修复②:断连 → 票撤——
     /// 观察者表条目删除,空片无票可 despawn)。调度器透传:在表 →
     /// `Some`(原位置);不在表 → `None`(幂等)。
@@ -337,6 +426,22 @@ impl Session {
             snap.insert_shard(shard, bytes);
         }
         snap
+    }
+
+    /// 世界快照(REQ-005 D7;**只在两拍之间调用**,同 [`Session::global_snapshot`]):
+    /// 分片快照 + 调度器状态一次取齐(checkpoint 的原子单位)。两个子快照的
+    /// tick 不等 = 内部状态错位 → panic fail-stop(细则 3:断言 tick 相等;
+    /// 单线程取数下两者同源 `tick_now`,不可能不等)。
+    pub fn world_snapshot(&self) -> WorldSnapshot {
+        let shards = self.global_snapshot();
+        let scheduler = self.scheduler.snapshot_state();
+        if shards.tick != scheduler.tick {
+            panic!(
+                "世界快照拍错位:分片快照 tick {} ≠ 调度器快照 tick {}(fail-stop)",
+                shards.tick.0, scheduler.tick.0
+            );
+        }
+        WorldSnapshot { shards, scheduler }
     }
 
     /// 关停:生命周期收尾,释放 sim 与 worker(join 全部)。
@@ -996,5 +1101,156 @@ mod tests {
             "透传 = 调度器视图"
         );
         session.shutdown();
+    }
+
+    // ---- 任务书 req005-consistency/02:全局快照 / 观察者来源 API(测试清单)----
+
+    /// 任务书测试 `world_snapshot_tick_consistency`:`world.shards.tick ==
+    /// world.scheduler.tick`(同一 tick_now 同源;不等 = 内部错位 panic,
+    /// 正常路径断言相等即可)。
+    #[test]
+    fn world_snapshot_tick_consistency() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        for _ in 0..5 {
+            session.tick();
+        }
+        let world = session.world_snapshot();
+        assert_eq!(world.shards.tick, Tick(5));
+        assert_eq!(
+            world.shards.tick, world.scheduler.tick,
+            "两个子快照的 tick 必相等(两拍之间同源取数)"
+        );
+        session.shutdown();
+    }
+
+    /// 任务书测试 `send_from_logs_player_source`:网络 Send 的 LogEntry.source
+    /// = 玩家(source 参数),不是会话 1;sequence 沿会话单调与 send 共用。
+    #[test]
+    fn send_from_logs_player_source() {
+        let mut session = Session::new(session_cfg());
+        let shard = shard_id(0, 0);
+        session.register(sim(0, 0));
+        let player = InputSource(9);
+        let entry = session
+            .send_from(
+                player,
+                shard,
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(1, 2, 3),
+                    block: types::BlockId(1),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(entry.source, player, "日志 source = 玩家,非会话 1");
+        assert_ne!(entry.source, InputSource(1));
+        assert_eq!(entry.tick, Tick::ZERO);
+        assert_eq!(entry.dest, shard);
+
+        // 广播版同语义:send_broadcast_from 的全部条目 source = 玩家。
+        session.apply_chunk_load(shard, types::ChunkPos::new(0, 0), voxel::Chunk::air());
+        let entries = session
+            .send_broadcast_from(
+                player,
+                shard,
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(4, 5, 4),
+                    block: types::BlockId(2),
+                },
+            )
+            .expect("收件箱未满");
+        assert!(entries.iter().all(|e| e.source == player));
+        // sequence 沿同一单调序列:send_from(0) → 广播批(1)→ 会话 send(2)。
+        let session_entry = session
+            .send(
+                shard,
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(1, 2, 3),
+                    block: types::BlockId(1),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(session_entry.sequence, 2, "三种入口共用会话单调序列");
+        assert_eq!(
+            session_entry.source,
+            InputSource(1),
+            "会话入口 = 会话 source"
+        );
+        session.shutdown();
+    }
+
+    /// 任务书测试 `checkpoint_bytes_deterministic`:同状态两次 `world_snapshot`
+    /// 编码字节相等(确定性:快照字节同输入确定,AC-C5)。
+    #[test]
+    fn checkpoint_bytes_deterministic() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session
+            .move_observer(Vec3::new(8.0, 3.0, 8.0))
+            .expect("unbounded");
+        for _ in 0..3 {
+            session.tick();
+        }
+        let a = session.world_snapshot();
+        let b = session.world_snapshot();
+        // 两路确定性口径:分片字节(bcrate 编码)+ 调度器快照整字段 + 整体
+        // bincode 字节直接对拍再解码对拍(serde 现已派生,CheckpointBundle
+        // 落盘路径同源)。
+        assert_eq!(a.shards.to_bytes(), b.shards.to_bytes(), "分片快照字节确定");
+        assert_eq!(a.scheduler, b.scheduler, "调度器快照逐字段相等");
+        let bytes_a = bincode::serde::encode_to_vec(&a, bincode::config::standard())
+            .expect("编码不可能失败(fail-stop)");
+        let bytes_b = bincode::serde::encode_to_vec(&b, bincode::config::standard())
+            .expect("编码不可能失败(fail-stop)");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "同状态两次 world_snapshot 的整体编码字节相等"
+        );
+        let (ea, _): (WorldSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes_a, bincode::config::standard())
+                .expect("自有编码必可解码");
+        let (eb, _): (WorldSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes_b, bincode::config::standard())
+                .expect("自有编码必可解码");
+        assert_eq!(ea, eb, "同状态两次 world_snapshot 的编码解码后逐字段相等");
+        session.shutdown();
+    }
+
+    /// 任务书测试 `checkpoint_restores_observers_without_move`:快照后经
+    /// replay_world 恢复,不发任何 MoveObserver,observers() 非空且激活继续
+    /// (观察者表快照兜底 + 无需日志条目)。
+    #[test]
+    fn checkpoint_restores_observers_without_move() {
+        use crate::replay::replay_world;
+
+        let mut original = Session::new(session_cfg());
+        original.register(sim(0, 0));
+        let pos = Vec3::new(8.0, 3.0, 8.0);
+        let entry = original.move_observer(pos).expect("unbounded");
+        let mut log = crate::log::CommandLog::new();
+        log.append(entry);
+        original.tick(); // 拍 0:观察者入表(进入快照)
+        let world = original.world_snapshot();
+        original.shutdown();
+        assert_eq!(world.scheduler.observers.len(), 1, "前置:观察者入快照");
+
+        // 空日志重放:表来自快照兜底,不再发 MoveObserver。
+        let empty_log = crate::log::CommandLog::new();
+        let mut replayed = replay_world(&world, &empty_log, session_cfg(), || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("自有快照必可恢复");
+        assert_eq!(
+            replayed.observers(),
+            vec![(InputSource(1), pos)],
+            "恢复线观察者表非空(不发 MoveObserver,快照兜底)"
+        );
+        // 激活继续:再 tick 一拍,激活请求仍按观察者收集(非空)。
+        replayed.tick();
+        assert!(
+            !replayed.take_activation_requests().is_empty(),
+            "恢复线激活继续(观察者中心生效)"
+        );
+        replayed.shutdown();
     }
 }

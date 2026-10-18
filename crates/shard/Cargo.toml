@@ -8,6 +8,7 @@ types = { path = "../types" }
 messaging = { path = "../messaging" }
 physics-sim = { path = "../physics-sim" }
 voxel = { path = "../voxel" }
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
 [lints]

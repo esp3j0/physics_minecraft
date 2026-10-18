@@ -1,8 +1,10 @@
-//! GlobalSnapshot:tick + 每分片不透明字节。
+//! GlobalSnapshot:tick + 每分片不透明字节;WorldSnapshot = 分片 + 调度器(REQ-005 D7)。
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use types::{ShardId, Tick};
+
+use shard::SchedulerSnapshot;
 
 /// 全局快照:拍号 + 每分片不透明字节(ShardId 升序,ownership ≡ 键集,README 决策 3)。
 /// 分片字节由 `ShardSim::snapshot` 产出,对本 crate 不透明(不自解、不重组)。
@@ -39,6 +41,16 @@ impl GlobalSnapshot {
                 .map_err(|e| SnapshotError::Decode(e.to_string()))?;
         Ok(snap)
     }
+}
+
+/// 世界快照(REQ-005 D7):分片快照 + 调度器状态(观察者表/Router 待投递
+/// 信封与 sequences/生命周期)。checkpoint 的原子单位;`shards.tick` 必须等于
+/// `scheduler.tick`(下一待执行拍;不等 = 快照拍错位,`Session::world_snapshot`
+/// 内部 panic fail-stop)。serde(CheckpointBundle 整体 bincode 编解码用)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorldSnapshot {
+    pub shards: GlobalSnapshot,
+    pub scheduler: SchedulerSnapshot,
 }
 
 /// 快照层可预期失败:残缺/错误字节(一致性违规仍走 panic,蓝图 §4)。

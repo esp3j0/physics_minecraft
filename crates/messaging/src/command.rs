@@ -54,6 +54,12 @@ pub enum SimCommand {
     SetObserverPosition {
         position: Vec3,
     },
+    /// 观察者移除(REQ-005 任务书 02/D9):删除 `source`(由
+    /// `StampedInput.source` 隐含,无字段)的观察者条目;不存在 = 幂等。
+    /// **不走分片前缀**——与 [`SimCommand::SetObserverPosition`] 同走调度器
+    /// 级观察者收件箱(观察者收件箱专用);分片输入前缀出现本变体 = 一致性
+    /// 违规 fail-stop。客户端白名单拒绝(C2S translate 无上行映射)。
+    RemoveObserver,
 }
 
 impl SimCommand {
@@ -67,6 +73,7 @@ impl SimCommand {
             Self::Detonate { .. } => 4,
             Self::MarkActor { .. } => 5,
             Self::SetObserverPosition { .. } => 6,
+            Self::RemoveObserver => 7,
         }
     }
 }
@@ -136,6 +143,8 @@ mod tests {
             SimCommand::SetObserverPosition {
                 position: Vec3::ZERO,
             },
+            // REQ-005 任务书 02:RemoveObserver 追加(声明序最后,ordinal = 7)。
+            SimCommand::RemoveObserver,
         ];
         for (i, c) in all.iter().enumerate() {
             assert_eq!(c.ordinal() as usize, i, "声明序 = 类型序号");
@@ -158,6 +167,12 @@ mod tests {
             .ordinal(),
             6,
             "SetObserverPosition = 追加序 6(任务书 02)"
+        );
+        // REQ-005 任务书 02:RemoveObserver = 追加序 7(枚举只许追加)。
+        assert_eq!(
+            SimCommand::RemoveObserver.ordinal(),
+            7,
+            "RemoveObserver = 追加序 7(REQ-005 任务书 02)"
         );
     }
 

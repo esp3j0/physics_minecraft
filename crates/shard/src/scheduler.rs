@@ -16,12 +16,14 @@ use std::thread::JoinHandle;
 
 use messaging::{AdmitError, InputPayload, InputSource, StampedInput};
 use physics_sim::{Outbox, ShardSim};
+use serde::{Deserialize, Serialize};
+use types::glam::Vec3;
 use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, ShardId, Tick};
 
 use crate::coordinator::TickCoordinator;
-use crate::lifecycle::{LifecycleConfig, ShardLifecycle};
+use crate::lifecycle::{LifecycleConfig, LifecycleSnapshot, ShardLifecycle};
 use crate::ownership::OwnershipMap;
-use crate::router::{RouteError, Router, RouterConfig};
+use crate::router::{RouteError, Router, RouterConfig, RouterSnapshot};
 
 /// 一个 worker 本拍的批次任务:同 worker 分到的多个分片打包成一个消息
 /// (元素 = (分片, sim 所有权, 本拍输入前缀),ShardId 升序)。
@@ -87,6 +89,23 @@ pub struct TickSummary {
     pub stepped_shards: usize,
     /// 本拍成功入队的迁移信封数。
     pub migrations_admitted: usize,
+}
+
+/// 调度器快照(REQ-005 任务书 02,签名固定):观察者表 + 设置过标志 +
+/// Router 待投递信封与 sequences + 各分片生命周期。
+///
+/// **不入快照**(细则 1):`observer_inbox`/`router.inboxes`(观察者与分片
+/// 的未来命令由日志回放)、`activation_requests`/`despawn_requests`/
+/// `solidified`/`block_updates`(每拍派生物,下一拍重算)、`chunk_holders`
+/// (从各分片已加载 chunk 重建)、`lifecycles` 的 `Stopped` 观测残留
+/// (unload_shard 留下;快照只存当前 `sims` 键集)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerSnapshot {
+    pub tick: Tick,
+    pub observers: BTreeMap<InputSource, Vec3>,
+    pub observers_ever_set: bool,
+    pub router: RouterSnapshot,
+    pub lifecycles: BTreeMap<ShardId, LifecycleSnapshot>,
 }
 
 /// 固定 worker 池调度器(OS 线程 + capacity-one 通道 + 每拍全员汇合屏障)。
@@ -560,6 +579,9 @@ impl Scheduler {
         // 1.2(REQ-002 §4.2):应用观察者收件箱中 apply_at == at 的全部条目
         //     (按 canonical 序;未来拍留存——与 router inbox 同语义;过期拍
         //     在 submit 时已被拒,不会出现)。分片输入前缀永不出现该变体。
+        //     REQ-005 任务书 02:SetObserverPosition → 插入/覆盖 (source,
+        //     position);RemoveObserver → 删除 source(不存在 = 幂等不
+        //     panic,票与激活中心随条目消失);其它载荷 = 一致性违规 fail-stop。
         {
             let mut due: Vec<StampedInput> = Vec::new();
             let mut kept = VecDeque::with_capacity(self.observer_inbox.len());
@@ -573,16 +595,24 @@ impl Scheduler {
             self.observer_inbox = kept;
             due.sort_by_key(|input| input.canonical_key());
             for input in due {
-                let (source, position) = match input.payload {
+                match input.payload {
                     InputPayload::Command(messaging::SimCommand::SetObserverPosition {
                         position,
-                    }) => (input.source, position),
+                    }) => {
+                        self.observer_table.insert(input.source, position);
+                        self.observers_ever_set = true;
+                    }
+                    InputPayload::Command(messaging::SimCommand::RemoveObserver) => {
+                        // 幂等:不在表 = 无动作(断线竞先/重复移除无害,票撤
+                        // 语义与 `remove_observer` 一致);表空不清
+                        // `observers_ever_set`(同 `remove_observer`)。
+                        self.observer_table.remove(&input.source);
+                    }
                     _ => panic!(
-                        "观察者收件箱只收 SetObserverPosition(收到其它载荷,调用方 bug,fail-stop)"
+                        "观察者收件箱只收 SetObserverPosition/RemoveObserver\
+                         (收到其它载荷,调用方 bug,fail-stop)"
                     ),
-                };
-                self.observer_table.insert(source, position);
-                self.observers_ever_set = true;
+                }
             }
         }
 
@@ -756,6 +786,80 @@ impl Scheduler {
     /// 未注册分片 → None。
     pub fn snapshot_shard(&self, shard: ShardId) -> Option<Vec<u8>> {
         self.sims.get(&shard).map(ShardSim::snapshot)
+    }
+
+    /// 调度器快照(REQ-005 任务书 02;**只在两拍之间调用**,同
+    /// [`Scheduler::snapshot_shard`]):tick 取 coordinator(= 下一待执行拍,
+    /// 与 GlobalSnapshot.tick 同源)、观察者表直出、Router 全量、lifecycles
+    /// 只存当前 `sims` 键集(unload_shard 留下的 `Stopped` 观测残留不入——
+    /// 恢复线按已注册分片重建 Active/恢复记录)。
+    pub fn snapshot_state(&self) -> SchedulerSnapshot {
+        SchedulerSnapshot {
+            tick: self.coordinator.tick(),
+            observers: self.observer_table.clone(),
+            observers_ever_set: self.observers_ever_set,
+            router: self.router.snapshot(),
+            lifecycles: self
+                .lifecycles
+                .iter()
+                .filter(|(shard, _)| self.sims.contains_key(shard))
+                .map(|(shard, lc)| (*shard, lc.snapshot()))
+                .collect(),
+        }
+    }
+
+    /// 从快照恢复调度器状态(REQ-005 任务书 02;调用前提:分片已全部
+    /// 注册、coordinator 已对齐 `start_tick = snap.tick`)。
+    ///
+    /// 校验(违反 = **内部状态**不一致 → panic fail-stop,细则 6):
+    /// - `snap.tick == coordinator.tick()`(快照拍对齐);
+    /// - lifecycles 键集 == 当前 `sims` 键集(少/多都 = 恢复装配错误);
+    /// - Router 信封目的地必须在当前已注册分片内(允许先沉队再 ensure 的
+    ///   分片**不在**此列——恢复线上驱动 ensure 只发生在日志回放后的编排;
+    ///   恢复时刻目的地未注册 = 拍 N 末已产生信封而分片不在快照,即快照
+    ///   不完整,内部状态损坏)。
+    ///
+    /// 恢复顺序:观察者表整表替换(含 `observers_ever_set`)→ Router
+    /// (envelopes 经队列不变量校验放回;sequences 原样——不恢复会改变
+    /// 后续迁移的 canonical 序)→ lifecycles 逐片 restore(cfg 用当前配置)
+    /// → 从各 sim 已加载 chunk 重建 holder 表(表不入快照,REQ-005 D2)。
+    pub fn restore_state(&mut self, snap: SchedulerSnapshot) {
+        let now = self.coordinator.tick();
+        if snap.tick != now {
+            panic!(
+                "调度器快照拍不一致:快照 tick {} ≠ 当前 coordinator tick {}(fail-stop)",
+                snap.tick.0, now.0
+            );
+        }
+        let snap_keys: BTreeSet<ShardId> = snap.lifecycles.keys().copied().collect();
+        let sim_keys: BTreeSet<ShardId> = self.sims.keys().copied().collect();
+        if snap_keys != sim_keys {
+            panic!("调度器快照分片键集不一致:快照 {snap_keys:?} ≠ 已注册 {sim_keys:?}(fail-stop)");
+        }
+        for envelope in &snap.router.envelopes {
+            if !self.sims.contains_key(&envelope.destination) {
+                panic!(
+                    "快照信封目的地 {dest:?} 未注册(快照时刻待投递信封的目的分片\
+                     必须已在快照分片集内,内部状态损坏,fail-stop)",
+                    dest = envelope.destination
+                );
+            }
+        }
+        // 观察者表整表替换(快照是 checkpoint 时刻兜底;日志是其后权威)。
+        self.observer_table = snap.observers;
+        self.observers_ever_set = snap.observers_ever_set;
+        // Router:envelopes 校验 + 放桶,sequences 原样。
+        self.router.restore(snap.router);
+        // lifecycles:逐片恢复(cfg 用当前配置);键集已校验一致。
+        for (shard, lc_snap) in snap.lifecycles {
+            let cfg = LifecycleConfig {
+                despawn_after_ticks: self.cfg.despawn_after_ticks,
+            };
+            self.lifecycles
+                .insert(shard, ShardLifecycle::restore(lc_snap, cfg));
+        }
+        // holder 表从各分片已加载 chunk 重建(表不入快照)。
+        self.rebuild_holders();
     }
 
     /// 已注册分片,ShardId 升序(BTreeMap 键序)。
@@ -2009,6 +2113,200 @@ mod tests {
         assert!(
             !sched.is_chunk_loaded(shard_id(9, 9), cp),
             "未注册分片 → false"
+        );
+        sched.shutdown();
+    }
+
+    // ---- REQ-005 任务书 02:全局快照(SchedulerSnapshot)+ 观察者移除命令 ----
+
+    /// 任务书测试 `scheduler_snapshot_roundtrip`:观察者/信封/sequences/
+    /// lifecycle 快照→恢复逐字段相等;恢复线续跑时 pending 信封在 apply_at 拍
+    /// 照常投递(数据面 + 功能面)。
+    #[test]
+    fn scheduler_snapshot_roundtrip() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // 观察者直通落表(设置过语义)。
+        sched.set_observers(vec![types::glam::Vec3::new(8.0, 0.0, 8.0)]);
+        sched.tick(); // 拍 0
+        // 拍 0 末:两个来源各产一封迁移信封(apply_at = 1,下一拍)。
+        // 出生位姿必须落在目的片核心区(同 dispatched_destination_can_despawn_
+        // without_false_blackhole 的坑:否则目的片当拍迁移检测又把它送走)。
+        let migrate_to = |dest| messaging::Intent {
+            destination: dest,
+            payload: messaging::EnvelopePayload::MigrateEntity {
+                entity: types::EntityId::from_parts(0, 1),
+                state: types::EntityState {
+                    translation: if dest == shard_id(1, 0) {
+                        types::glam::Vec3::new(140.0, 10.0, 8.0)
+                    } else {
+                        types::glam::Vec3::new(8.0, 10.0, 8.0)
+                    },
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            },
+        };
+        sched
+            .router
+            .collect_intents(shard_id(0, 0), &[migrate_to(shard_id(1, 0))], Tick::ZERO)
+            .expect("队列未满");
+        sched
+            .router
+            .collect_intents(shard_id(1, 0), &[migrate_to(shard_id(0, 0))], Tick::ZERO)
+            .expect("队列未满");
+
+        let snap = sched.snapshot_state();
+        assert_eq!(snap.tick, Tick(1), "tick = coordinator(tick_now)");
+        assert_eq!(
+            snap.observers,
+            std::iter::once((
+                InputSource::SCHEDULER,
+                types::glam::Vec3::new(8.0, 0.0, 8.0)
+            ))
+            .collect(),
+            "观察者表直通条目入快照"
+        );
+        assert!(snap.observers_ever_set);
+        assert_eq!(snap.router.envelopes.len(), 2, "两封在队信封入快照");
+        assert_eq!(
+            snap.router.sequences,
+            [(shard_id(0, 0), 1u64), (shard_id(1, 0), 1u64)]
+                .into_iter()
+                .collect(),
+            "per-source sequence 原样入快照"
+        );
+        assert_eq!(snap.lifecycles.len(), 2, "lifecycles 只存当前 sims 键集");
+        assert!(
+            snap.lifecycles
+                .values()
+                .all(|lc| lc.stage == crate::lifecycle::Stage::Active && !lc.drained),
+            "已注册分片 = Active 未排空"
+        );
+        sched.shutdown();
+
+        // 恢复:同 start_tick、同键集空片;先设干扰观察者验证整表替换。
+        let mut restored = Scheduler::new(SchedulerConfig {
+            start_tick: snap.tick,
+            ..sched_cfg(2)
+        });
+        restored.register(sim(0, 0));
+        restored.register(sim(1, 0));
+        restored.set_observers(vec![types::glam::Vec3::new(999.0, 999.0, 999.0)]);
+        restored.restore_state(snap.clone());
+        assert_eq!(
+            restored.snapshot_state(),
+            snap,
+            "恢复后再快照 = 原快照(逐字段相等)"
+        );
+
+        // 功能面:pending 信封在 apply_at(拍 1)照常投递——片 (1,0) 重建实体。
+        restored.tick();
+        assert!(
+            restored
+                .entity_state(shard_id(1, 0), types::EntityId::from_parts(0, 1))
+                .is_some(),
+            "恢复线拍 1:迁移信封照常投递(队列 + sequences 恢复有效)"
+        );
+        // sequences 原样恢复:同一来源再产信封序号从 1 续(不归零)。
+        restored
+            .router
+            .collect_intents(shard_id(0, 0), &[migrate_to(shard_id(1, 0))], Tick(1))
+            .expect("队列未满");
+        let again = restored.snapshot_state();
+        assert_eq!(
+            again.router.sequences.get(&shard_id(0, 0)),
+            Some(&2),
+            "恢复后 sequence 从恢复值续计(不归零,canonical 序不变)"
+        );
+        restored.shutdown();
+    }
+
+    /// 任务书测试 `checkpoint_restores_lifecycle_timers`:空闲计时跨 checkpoint
+    /// 不重置——原线与恢复线的 despawn 候选拍一致(lifecycle.last_activity
+    /// 恢复;若被 register 的 activate 重置,恢复线候选会晚 3 拍)。
+    #[test]
+    fn checkpoint_restores_lifecycle_timers() {
+        let mk = |start_tick| SchedulerConfig {
+            despawn_after_ticks: 5,
+            start_tick,
+            ..sched_cfg(2)
+        };
+        // 原线:拍 0 注册(activate at=0),空片无输入 → last_activity 停在 0;
+        // 候选在拍 5(at - 0 >= 5)。
+        let mut orig = Scheduler::new(mk(Tick::ZERO));
+        orig.register(sim(0, 0));
+        for _ in 0..3 {
+            orig.tick();
+        }
+        let snap = orig.snapshot_state();
+        assert_eq!(snap.tick, Tick(3));
+        orig.tick(); // 拍 3
+        orig.tick(); // 拍 4
+        orig.tick(); // 拍 5:候选出现
+        assert_eq!(
+            orig.take_despawn_requests(),
+            vec![shard_id(0, 0)],
+            "原线拍 5 出候选(空闲计时基准 = 注册拍 0)"
+        );
+        orig.shutdown();
+
+        // 恢复线:快照(拍 3 之前)→ restore → 跑到拍 5,候选拍不变。
+        let mut restored = Scheduler::new(mk(snap.tick));
+        restored.register(sim(0, 0));
+        restored.restore_state(snap);
+        for _ in 0..3 {
+            restored.tick();
+        }
+        assert_eq!(
+            restored.take_despawn_requests(),
+            vec![shard_id(0, 0)],
+            "恢复线候选仍在拍 5(last_activity 跨 checkpoint 保留;重置则拍 8)"
+        );
+        restored.shutdown();
+    }
+
+    /// REQ-005 D9:观察者收件箱的 RemoveObserver 分支——apply_at 到期后删除
+    /// observer_table 的 source(票撤);不存在 = 幂等不 panic;SetObserverPosition
+    /// 保持原语义。
+    #[test]
+    fn observer_remove_command_deletes_entry() {
+        use types::glam::Vec3;
+
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 8.0)));
+        // 同拍再投 RemoveObserver(source 1):同拍两输入按 canonical 序
+        // (source 同 → sequence 0 < 1)先设置后移除 → 表空。
+        sched.submit_observer(StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource(1),
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::RemoveObserver),
+        });
+        sched.tick();
+        assert!(
+            sched.observers().is_empty(),
+            "同拍 Set 后 Remove:条目被删除(票撤)"
+        );
+        // 幂等:再投一条 RemoveObserver(不在表)→ 不 panic,表仍空。
+        sched.submit_observer(StampedInput {
+            apply_at: Tick(1),
+            source: InputSource(1),
+            sequence: 2,
+            payload: InputPayload::Command(SimCommand::RemoveObserver),
+        });
+        sched.tick();
+        assert!(sched.observers().is_empty(), "幂等:移除不在表条目无害");
+
+        // SetObserverPosition 语义保持:再设置 → 入表。
+        sched.submit_observer(observer_input(2, 0, Tick(2), Vec3::new(40.0, 0.0, 40.0)));
+        sched.tick();
+        assert_eq!(
+            sched.observers(),
+            vec![(InputSource(2), Vec3::new(40.0, 0.0, 40.0))],
+            "SetObserverPosition 原语义保持"
         );
         sched.shutdown();
     }

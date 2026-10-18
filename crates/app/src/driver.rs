@@ -152,14 +152,20 @@ pub fn validate_external_command(
         messaging::SimCommand::SpawnDynamic { .. }
         | messaging::SimCommand::Detonate { .. }
         | messaging::SimCommand::SetObserverPosition { .. } => Ok(()),
+        // 观察者移除(REQ-005 D9):观察者收件箱专用命令,不可外部投递
+        // (客户端白名单拒绝;network translate 同口径)。经本缝到达 =
+        // 拒绝丢弃(hostile 路径不 panic)。
+        messaging::SimCommand::RemoveObserver => Err("观察者命令不可外部投递"),
     }
 }
 
 /// 外部命令的统一投递(REQ-005 §4.1.2 / 任务书 req005-consistency/01;
-/// commands 通道与网络上行两条 Send 路径共用一处收口):
-/// - `SetBlock` → `session.set_block`(同拍广播 owner + holders,每个目标
-///   一条 [`LogEntry`],整批原子)→ 全部入日志;
-/// - 其余命令照旧单分片 `session.send` → 入日志;
+/// commands 通道与网络上行两条 Send 路径共用一处收口)。`source` 参数决定
+/// 日志 source:网络路径(有玩家)传玩家身份(REQ-005 D9:日志 source 必须
+/// 是玩家,不是会话 1),commands 通道(本地权威)传会话 source:
+/// - `SetBlock` → `session.send_broadcast_from`(同拍广播 owner + holders,
+///   每个目标一条 [`LogEntry`],整批原子)→ 全部入日志;
+/// - 其余命令照旧单分片 `session.send_from` → 入日志;
 /// - `Err(Rejected)`(owner 不匹配/不支持的广播命令)→ eprintln + 计数,
 ///   不断链(hostile 路径丢弃;先经 [`validate_external_command`] 预检,
 ///   正常不可达,防御层兜底);
@@ -169,21 +175,22 @@ fn dispatch_external(
     session: &mut sim_api::session::Session,
     log: &mut sim_api::log::CommandLog,
     commands_rejected: &mut u64,
+    source: messaging::InputSource,
     shard: types::ShardId,
     command: messaging::SimCommand,
 ) {
     let result = if matches!(command, messaging::SimCommand::SetBlock { .. }) {
-        let (pos, block) = match command {
-            messaging::SimCommand::SetBlock { pos, block } => (pos, block),
-            _ => unreachable!("上方 matches 已判定"),
-        };
         // 广播路径:返回全目标的 LogEntry(dest 升序,同盖章),逐条入日志。
-        session.set_block(shard, pos, block).map(|entries| {
-            entries.iter().for_each(|entry| log.append(entry.clone()));
-        })
+        session
+            .send_broadcast_from(source, shard, command)
+            .map(|entries| {
+                entries.iter().for_each(|entry| log.append(entry.clone()));
+            })
     } else {
         // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
-        session.send(shard, command).map(|entry| log.append(entry))
+        session
+            .send_from(source, shard, command)
+            .map(|entry| log.append(entry))
     };
     match result {
         Ok(()) => {}
@@ -291,10 +298,18 @@ pub struct DriverOutcome {
     pub chunks_unloaded: u64,
 }
 
-/// 检查点捆绑:快照拍 + 此后命令日志,原子一体(README 决策 4)。
+/// 检查点格式版本(REQ-005 D8;任务书 02):预发布阶段不兼容旧格式——
+/// 升版即破格,磁盘上现存旧 checkpoint 从此不可用(bootstrap 显式报错,
+/// 不写迁移逻辑)。`format_version != CHECKPOINT_FORMAT_VERSION` →
+/// `AppError::Decode`(明确、不静默降级)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+/// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
+/// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
 #[derive(Serialize, Deserialize)]
 pub struct CheckpointBundle {
-    pub snapshot: sim_api::snapshot::GlobalSnapshot,
+    pub format_version: u32,
+    pub world: sim_api::snapshot::WorldSnapshot,
     pub log_bytes: Vec<u8>,
 }
 
@@ -317,30 +332,48 @@ fn encode(bundle: &CheckpointBundle) -> Vec<u8> {
         .expect("检查点捆绑编码不可能失败(全字段可序列化,fail-stop)")
 }
 
-/// bincode 字节 → bundle;损坏 → `Err(AppError::Decode)`(可预期失败走类型化错误)。
+/// bincode 字节 → bundle(REQ-005 D8):
+/// - 解码失败(含任务 01 前旧布局 `{snapshot, log_bytes}` 的字节——无版本
+///   字段,结构不同自然解不开)→ `Err(AppError::Decode)`;
+/// - 解码成功但 `format_version != CHECKPOINT_FORMAT_VERSION` →
+///   `Err(AppError::Decode)` 带版本说明(不兼容旧格式,不静默降级)。
 fn decode(bytes: &[u8]) -> Result<CheckpointBundle, AppError> {
     let (bundle, _len): (CheckpointBundle, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
             .map_err(|e| AppError::Decode(e.to_string()))?;
+    if bundle.format_version != CHECKPOINT_FORMAT_VERSION {
+        return Err(AppError::Decode(format!(
+            "unsupported checkpoint format version {}, expected {}(REQ-005 D8:不兼容旧格式;\
+             请清空 data_dir 后重开)",
+            bundle.format_version, CHECKPOINT_FORMAT_VERSION
+        )));
+    }
     Ok(bundle)
 }
 
-/// 检查点节奏:`ticks_run % interval == 0` → bundle = {global_snapshot(),
+/// 检查点节奏:`ticks_run % interval == 0` → bundle = {world_snapshot(),
 /// log.take() 的 to_bytes} → `append_checkpoint`(fire-and-forget,决策 5);
 /// log.take() 重置后日志只存增量(崩溃丢失窗口 = checkpoint 间隔,§9.11)。
 /// 期中与终末同构,差别只在 fire-and-forget 与否。
+///
+/// **原子性(REQ-005 任务书 02 风险备注)**:`world_snapshot()` 必须先于
+/// `log.take()`,且两者之间不得插入任何 `session` 调用——同一拍边界的
+/// 世界状态与日志窗口才互相一致(先 world 后 log:log 的窗口恰好是
+/// snapshot.tick 之后的命令,与 replay_world 的 `>=` 重放窗对齐)。
 fn write_checkpoint(
     session: &sim_api::session::Session,
     log: &mut sim_api::log::CommandLog,
     store: &storage::worker::StoreWorker,
     checkpoints_written: &mut Vec<types::Tick>,
 ) {
+    let world = session.world_snapshot();
     let taken = log.take();
     let bundle = CheckpointBundle {
-        snapshot: session.global_snapshot(),
+        format_version: CHECKPOINT_FORMAT_VERSION,
+        world,
         log_bytes: encode_log(taken),
     };
-    let tick = bundle.snapshot.tick;
+    let tick = bundle.world.shards.tick;
     store.append_checkpoint(tick, encode(&bundle));
     checkpoints_written.push(tick);
 }
@@ -397,8 +430,6 @@ struct ObserveOrchestrator {
     ticks_since_full: u64,
     /// Join 未带 Welcome 的玩家 → 欢迎拍(下一个输出点入 Critical,细则 5)。
     pending_welcome: BTreeMap<messaging::InputSource, types::Tick>,
-    /// 玩家私有 sequence 计数(观察者原章直投的序号;断连随玩家清理)。
-    player_sequences: BTreeMap<messaging::InputSource, u64>,
     /// 跨拍积压的方块变更源(格 → 写入值;后写覆盖先写)。
     pending_blocks: BTreeMap<types::BlockPos, types::BlockId>,
     /// 节奏副本(输出点用)。
@@ -412,23 +443,26 @@ impl ObserveOrchestrator {
             ticks_since_interval: 0,
             ticks_since_full: 0,
             pending_welcome: BTreeMap::new(),
-            player_sequences: BTreeMap::new(),
             pending_blocks: BTreeMap::new(),
             _cadence: cadence,
         }
     }
 
-    /// 网络上行事件消费(任务书 03 编排 ①②)。
+    /// 网络上行事件消费(任务书 03 编排 ①②;REQ-005 D9 观察者命令入日志)。
     ///
     /// - `Joined` → 登记欢迎拍(Welcome 下个输出点入 Critical);
     /// - `Subscribed` → 距离过滤半径更新(钳制值 × 16,README 决策 8);
-    /// - `Left` → 观察流清理(断连即弃,last_sent 同弃,细则 3);
-    /// - `DriverCommand` → MoveObserver 以玩家身份原章直投观察者收件箱
-    ///   (工程现实,notes:`Session::move_observer` 以会话 source 盖章,
-    ///   多玩家互相覆盖——网络玩家必须以玩家身份入观察者表;与回放线
-    ///   replay.rs 直投同语义,不进命令日志,观察者表随检查点再生);
-    ///   Send 照既有命令分支语义(先缝后日志、反压计数),SetBlock 成功
-    ///   镜像入 BlockUpdates 源。
+    /// - `Left` → 观察流清理(断连即弃,last_sent 同弃,细则 3)+
+    ///   `session.remove_observer_from(player)` + `log.append`(断线移除入
+    ///   日志 → 可回放,无幽灵观察者;幂等,不在表无害);
+    /// - `DriverCommand::MoveObserver` → `session.move_observer_from(player,
+    ///   position)` + `log.append`(D9:盖章 source = 玩家,sequence 沿会话
+    ///   单调——删除了旧 `player_sequences` 表与手工 `StampedInput` 构造;
+    ///   收件箱 unbounded,无失败路径);
+    /// - `DriverCommand::Send` → 前置校验后 `dispatch_external`(source =
+    ///   玩家;SetBlock 走 `send_broadcast_from` 全部条目入日志,其余单发入
+    ///   日志);SetBlock 成功镜像入 BlockUpdates 源(`record_block_changes`
+    ///   统一从 `take_block_updates` 取,无需在此镜像)。
     fn consume_net_up(
         &mut self,
         event: NetUp,
@@ -451,30 +485,27 @@ impl ObserveOrchestrator {
                 stream.view_distance_m = f32::from(view_distance) * 16.0;
             }
             NetUp::Left { player, .. } => {
-                // 断连即弃(细则 3):观察流状态清理 + 模拟侧观察者移除
-                // (评审修复②:Session::remove_observer 缝已落地——票与激活
-                // 中心随条目消失,空片无票可 despawn;幂等,不在表无害)。
+                // 断连即弃(细则 3):观察流状态清理 + 模拟侧观察者移除入日志
+                // (REQ-005 D9:remove_observer_from 盖章玩家 source + 会话
+                // 单调 sequence,log.append → 可回放;幂等——不在表无害)。
                 self.players.remove(&player);
                 self.pending_welcome.remove(&player);
-                self.player_sequences.remove(&player);
-                session.remove_observer(player);
+                match session.remove_observer_from(player) {
+                    Ok(entry) => log.append(entry),
+                    // 观察者收件箱 unbounded → 无失败路径;非预期错误 fail-stop。
+                    Err(other) => panic!("观察者移除失败(非预期):{other:?}"),
+                }
             }
             NetUp::DriverCommand { player, cmd } => match cmd {
                 DriverCommand::MoveObserver { position } => {
-                    let tick = session.tick_now();
-                    let seq = self.player_sequences.entry(player).or_insert(0);
-                    let input = messaging::StampedInput {
-                        apply_at: tick,
-                        source: player,
-                        sequence: *seq,
-                        payload: messaging::InputPayload::Command(
-                            messaging::SimCommand::SetObserverPosition { position },
-                        ),
-                    };
-                    *seq += 1;
-                    // 观察者收件箱 unbounded(REQ-002 细则 1),无失败路径;
-                    // 迟到不可能(盖当前拍)。原章直投与 replay 同语义。
-                    session.submit_observer_raw(input);
+                    // 观察者移动入日志(REQ-005 D9):盖章 source = 玩家、
+                    // sequence 沿会话单调;返回 LogEntry 直接 append。
+                    // 收件箱 unbounded(REQ-002 细则 1),无失败路径;
+                    // 迟到不可能(盖当前拍)。
+                    match session.move_observer_from(player, position) {
+                        Ok(entry) => log.append(entry),
+                        Err(other) => panic!("观察者移动失败(非预期):{other:?}"),
+                    }
                 }
                 DriverCommand::Send { shard, command } => {
                     // 前置校验(评审修复①):网络上行的命令参数全部客户端可
@@ -485,9 +516,10 @@ impl ObserveOrchestrator {
                         *commands_rejected += 1;
                         return;
                     }
-                    // 统一投递收口(REQ-005):SetBlock 走广播(每目标一条
-                    // LogEntry 全入日志),其余单发;反压/拒绝计数不断链。
-                    dispatch_external(session, log, commands_rejected, shard, command);
+                    // 统一投递收口(REQ-005 D9):source = 玩家——SetBlock 走
+                    // 广播(每目标一条 LogEntry 全入日志),其余单发入日志;
+                    // 反压/拒绝计数不断链。
+                    dispatch_external(session, log, commands_rejected, player, shard, command);
                 }
                 DriverCommand::Shutdown | DriverCommand::StreamChunks { .. } => {
                     // 网络上行不含这两类(关机走 commands 通道;chunk 流回执
@@ -859,6 +891,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         mut new_sim,
         observe,
     } = args;
+    // 会话 source(commands 通道本地权威命令的日志 source;网络路径用玩家,
+    // REQ-005 D9)。
+    let session_source = config.session_config().source;
 
     let mut ticker = tokio::time::interval(Duration::from_secs_f32(config.dt));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1002,8 +1037,16 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                         }
                         // 统一投递收口(REQ-005;先缝后日志由收口内保证,失败
                         // 即不入日志):SetBlock 广播全目标入日志,其余单发;
-                        // 反压/拒绝只计数,不断链(任务书语义细则 2)。
-                        dispatch_external(&mut session, &mut log, &mut commands_rejected, shard, command);
+                        // 反压/拒绝只计数,不断链(任务书语义细则 2)。source
+                        // = 会话(本地权威 commands 通道,无玩家身份)。
+                        dispatch_external(
+                            &mut session,
+                            &mut log,
+                            &mut commands_rejected,
+                            session_source,
+                            shard,
+                            command,
+                        );
                     }
                     Some(DriverCommand::MoveObserver { position }) => {
                         // 观察者移动(REQ-002 §4.2 生产入口):盖章 + 专用收件箱
@@ -1088,19 +1131,21 @@ pub fn bootstrap(
     let latest = checkpoints.read_latest()?;
     let (session, log, resume_from) = match latest {
         Some((at, blob)) => {
-            // 有检查点:解码 bundle → replay 恢复(Session + log 续跑,拍号对齐)。
+            // 有检查点:解码 bundle(replay_world 恢复 Session + scheduler
+            // 状态 + log 续跑,拍号对齐)。旧格式/未知版本 → Err(AppError::
+            // Decode),不静默降级(REQ-005 D8)。
             let bundle = decode(&blob)?;
             let log = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
                 .map_err(|e| AppError::Decode(e.to_string()))?;
-            if bundle.snapshot.tick != at {
+            if bundle.world.shards.tick != at {
                 // 库内 (tick, blob) 元组与 bundle 快照拍不一致 = 存储损坏,fail-stop。
                 panic!(
                     "检查点元数据不一致:记录 tick {} ≠ bundle 快照拍 {:?}(fail-stop)",
-                    at.0, bundle.snapshot.tick
+                    at.0, bundle.world.shards.tick
                 );
             }
-            let session = sim_api::replay::replay(
-                &bundle.snapshot,
+            let session = sim_api::replay::replay_world(
+                &bundle.world,
                 &log,
                 config.session_config(),
                 new_registry,
@@ -1163,6 +1208,20 @@ mod tests {
     /// 测试用分片身份(与 sim-api/shard 测试同风格)。
     fn shard_id(x: i32, z: i32) -> types::ShardId {
         types::ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
+    }
+
+    /// 空调度器快照(手工构造 CheckpointBundle 的测试用;tick 可控)。
+    fn empty_scheduler_snapshot(tick: types::Tick) -> shard::SchedulerSnapshot {
+        shard::SchedulerSnapshot {
+            tick,
+            observers: std::collections::BTreeMap::new(),
+            observers_ever_set: false,
+            router: shard::RouterSnapshot {
+                envelopes: Vec::new(),
+                sequences: std::collections::BTreeMap::new(),
+            },
+            lifecycles: std::collections::BTreeMap::new(),
+        }
     }
 
     /// 凝固桥关闭的虚空分片(session 测试同款:不关心桥行为)。
@@ -1315,9 +1374,10 @@ mod tests {
 
         // 实体出现:终末检查点的分片快照恢复后可查到该实体。
         let bundle = latest_bundle(&checkpoints);
-        assert_eq!(bundle.snapshot.tick, types::Tick(3));
+        assert_eq!(bundle.world.shards.tick, types::Tick(3));
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard)
             .expect("快照含分片 (0,0)");
@@ -1368,7 +1428,7 @@ mod tests {
             "间隔 5 写 [5,10],终末 12"
         );
         let bundle = latest_bundle(&checkpoints);
-        assert_eq!(bundle.snapshot.tick, types::Tick(12), "最新 = 终末");
+        assert_eq!(bundle.world.shards.tick, types::Tick(12), "最新 = 终末");
     }
 
     /// 测试清单 4:小 inbox(1)灌 2 条同拍命令 → rejected==1,循环仍活。
@@ -1497,7 +1557,7 @@ mod tests {
         // 终末检查点(bundle.tick = 3)里的日志:新序下命令在 tick#3 之后处理,
         // 盖章 = 已推进的 3 拍。
         let bundle = latest_bundle(&checkpoints);
-        assert_eq!(bundle.snapshot.tick, types::Tick(3));
+        assert_eq!(bundle.world.shards.tick, types::Tick(3));
         let entries = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
             .expect("自有编码必可解码")
             .take();
@@ -1509,28 +1569,107 @@ mod tests {
         );
     }
 
-    /// 测试清单 6:bundle 编解码往返相等;空拍照常出 checkpoint(0 分片快照合法)。
+    /// 测试清单 6:bundle 编解码往返相等;空拍照常出 checkpoint(0 分片快照合法);
+    /// 版本字段带当前 CHECKPOINT_FORMAT_VERSION(统一常量,任务书 02)。
     #[test]
     fn checkpoint_bundle_roundtrip() {
         // 非空:带分片字节 + 日志字节。
         let mut snap = sim_api::snapshot::GlobalSnapshot::new(types::Tick(7));
         snap.insert_shard(shard_id(0, 0), vec![1, 2, 3]);
         let bundle = CheckpointBundle {
-            snapshot: snap,
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            world: sim_api::snapshot::WorldSnapshot {
+                shards: snap,
+                scheduler: empty_scheduler_snapshot(types::Tick(7)),
+            },
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
         };
         let decoded = decode(&encode(&bundle)).expect("自有编码必可解码");
-        assert_eq!(decoded.snapshot, bundle.snapshot, "快照往返逐字段相等");
+        assert_eq!(
+            decoded.world.shards, bundle.world.shards,
+            "快照往返逐字段相等"
+        );
         assert_eq!(decoded.log_bytes, bundle.log_bytes);
 
         // 空快照(0 分片)+ 空日志:同样合法。
         let empty = CheckpointBundle {
-            snapshot: sim_api::snapshot::GlobalSnapshot::new(types::Tick(0)),
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            world: sim_api::snapshot::WorldSnapshot {
+                shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(0)),
+                scheduler: empty_scheduler_snapshot(types::Tick(0)),
+            },
             log_bytes: Vec::new(),
         };
         let decoded = decode(&encode(&empty)).expect("空 bundle 必可解码");
-        assert!(decoded.snapshot.per_shard.is_empty(), "0 分片快照合法");
-        assert_eq!(decoded.snapshot.tick, types::Tick(0));
+        assert!(decoded.world.shards.per_shard.is_empty(), "0 分片快照合法");
+        assert_eq!(decoded.world.shards.tick, types::Tick(0));
+    }
+
+    /// 任务书测试 `old_checkpoint_version_rejected`(REQ-005 D8):两条路径
+    /// 都必须明确 Err、不静默降级——
+    /// ① 手工编码 `format_version` 错值的合法 bundle → 版本不符 Err;
+    /// ② 任务 01 前旧布局字节(`{snapshot, log_bytes}` 形状,无版本字段)
+    ///    → bincode 解码失败 Err。
+    #[test]
+    fn old_checkpoint_version_rejected() {
+        let mk_world = |tick: types::Tick| sim_api::snapshot::WorldSnapshot {
+            shards: sim_api::snapshot::GlobalSnapshot::new(tick),
+            scheduler: empty_scheduler_snapshot(tick),
+        };
+
+        // ① 错误版本号:结构合法但 format_version = 99 → 明确版本错误。
+        let future = CheckpointBundle {
+            format_version: 99,
+            world: mk_world(types::Tick(7)),
+            log_bytes: sim_api::log::CommandLog::new().to_bytes(),
+        };
+        let bytes = encode(&future);
+        match decode(&bytes) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 99"),
+                    "错误信息必须指明版本不符:{msg}"
+                );
+            }
+            other => panic!(
+                "错误版本必须 Err(AppError::Decode),实为 {:?}",
+                other.is_err()
+            ),
+        }
+
+        // 0(旧版本起点)同样拒绝。
+        let zero = CheckpointBundle {
+            format_version: 0,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+        };
+        assert!(decode(&encode(&zero)).is_err(), "版本 0 = 旧格式,拒绝");
+
+        // ② 任务 01 前旧布局:{snapshot: GlobalSnapshot, log_bytes}。手工
+        //    bincode 编码(结构形状与新 bundle 不同,无 format_version 字段
+        //    前缀)→ 新 decode 必然解码失败(不是静默解释成别的世界)。
+        let mut old_snap = sim_api::snapshot::GlobalSnapshot::new(types::Tick(5));
+        old_snap.insert_shard(shard_id(0, 0), vec![1, 2, 3]);
+        #[derive(serde::Serialize)]
+        struct PreTask01Bundle {
+            snapshot: sim_api::snapshot::GlobalSnapshot,
+            log_bytes: Vec<u8>,
+        }
+        let old_bytes = bincode::serde::encode_to_vec(
+            PreTask01Bundle {
+                snapshot: old_snap,
+                log_bytes: Vec::new(),
+            },
+            bincode::config::standard(),
+        )
+        .expect("旧布局编码(测试构造)");
+        match decode(&old_bytes) {
+            Err(AppError::Decode(_)) => {}
+            other => panic!(
+                "任务 01 前旧布局字节必须 Err(Decode),实为 {:?}",
+                other.is_err()
+            ),
+        }
     }
 
     // ---- 任务 04:驱动接线(测试清单)----
@@ -1600,7 +1739,8 @@ mod tests {
         // 物理支撑"才会发生。
         let bundle = latest_bundle(&_checkpoints);
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard_id(1, 0))
             .expect("观察者分片已创建并进入快照");
@@ -1785,11 +1925,11 @@ mod tests {
         // B(带实体)仍在:终末检查点快照含 B、不含 A。
         let bundle = latest_bundle(&checkpoints);
         assert!(
-            !bundle.snapshot.per_shard.contains_key(&shard_id(0, 0)),
+            !bundle.world.shards.per_shard.contains_key(&shard_id(0, 0)),
             "despawn 的 A 不在终末快照"
         );
         assert!(
-            bundle.snapshot.per_shard.contains_key(&shard_id(0, 1)),
+            bundle.world.shards.per_shard.contains_key(&shard_id(0, 1)),
             "有实体的 B 不 despawn"
         );
     }
@@ -1975,7 +2115,8 @@ mod tests {
         // 副作用面:终末快照恢复后,未加载 chunk 不得被自动建成空气 chunk。
         let bundle = latest_bundle(&checkpoints);
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard_id(0, 0))
             .expect("分片 (0,0) 在快照");
@@ -2081,7 +2222,8 @@ mod tests {
         assert_eq!(entries.len(), 1, "单分片 SetBlock = 一条日志");
         assert_eq!(entries[0].dest, shard_id(0, 0));
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard_id(0, 0))
             .expect("快照");
@@ -2250,7 +2392,8 @@ mod tests {
         // 模拟侧重载面:终末快照恢复后 chunk (12,0) 的编辑格 = dirt。
         let bundle = latest_bundle(&checkpoints);
         let bytes = bundle
-            .snapshot
+            .world
+            .shards
             .per_shard
             .get(&shard_id(1, 0))
             .expect("复活的 owner 片在终末快照");

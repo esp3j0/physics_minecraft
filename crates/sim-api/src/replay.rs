@@ -1,18 +1,26 @@
 //! restore checkpoint + 重放命令日志;终态位级一致(AC8)。
+//! REQ-005 任务书 02:`replay_world`(WorldSnapshot + scheduler 状态恢复)。
 
 use messaging::{InputPayload, SimCommand, StampedInput};
+use types::Tick;
 use voxel::BlockRegistry;
 
 use crate::log::{CommandLog, LogEntry};
 use crate::session::{Session, SessionConfig, SessionError};
-use crate::snapshot::GlobalSnapshot;
+use crate::snapshot::{GlobalSnapshot, WorldSnapshot};
 
-/// 从全局快照 + 命令日志重建会话(AC8 执行侧)。
+/// 从全局快照 + 命令日志重建会话(AC8 执行侧;旧入口,保留给既有
+/// GlobalSnapshot 测试——回放规则与 [`replay_world`] 一致)。
 ///
-/// - `start_tick` 对齐 `snapshot.tick`(README 决策 6):**覆盖**
-///   `cfg.scheduler.start_tick = snapshot.tick`(以快照为准,语义细则 2);
-/// - 只重放 `tick > snapshot.tick` 的条目(≤ 的已烙进快照),按日志条目序
-///   (append 序)原章直投:经 `submit_raw(dest, …)` 显式携带目的地,
+/// - `start_tick` 对齐 `snapshot.tick`(**覆盖** `cfg.scheduler.start_tick`,
+///   以快照为准,语义细则 2);
+/// - 重放窗口 **`entry.tick >= snapshot.tick`**(细则 7 修正):checkpoint 的
+///   `tick` 是"下一待执行拍"(`tick_now()`),等于该拍的命令尚未应用,必须
+///   回放;`< snapshot.tick` 的已烙进快照。旧 `>` 过滤会把"checkpoint 后、
+///   下一拍前到达"的 `==` 条目丢掉(数据丢失面),本任务统一 `>=`;
+/// - 按日志条目序(append 序)原章直投:观察者命令(SetObserverPosition)→
+///   `submit_observer_raw` 原章重投(apply_at = entry.tick、source =
+///   entry.source、sequence = entry.sequence);其余 → `submit_raw(dest)`,
 ///   不重新盖章、不改 sequence(README 决策 8/9——重新盖章会让序号漂移,
 ///   两线 canonical 序不再一致);
 /// - registry 经工厂逐分片注入(不序列化,任务 01 决策)。
@@ -32,23 +40,61 @@ pub fn replay(
     for bytes in snapshot.per_shard.values() {
         session.register_snapshot(bytes, new_registry())?;
     }
-    // 按日志条目序投递(tick/source/sequence/command/dest 全部原样):
-    // SetObserverPosition → 观察者专用收件箱原章直投(README 决策 3——
-    // 它不走分片收件箱;经 submit_raw 会触发"未注册分片"或沉入分片前缀,
-    // 两者都错);其余 → submit_raw(dest, …) 照旧。
-    // 迟到检查说明:submit_observer 拒绝 apply_at < 起始拍的输入(fail-stop),
-    // 而 replay 只重放 tick > snapshot.tick 的条目 = 起始拍之后,恒通过。
-    for entry in log.entries() {
-        if entry.tick > snapshot.tick {
-            match entry.command {
-                SimCommand::SetObserverPosition { position: _ } => {
-                    session.submit_observer_raw(stamped(entry.clone()));
-                }
-                _ => session.submit_raw(entry.dest, stamped(entry.clone()))?,
+    replay_log_entries(&mut session, snapshot.tick, log.entries())?;
+    Ok(session)
+}
+
+/// 从世界快照 + 命令日志重建会话(REQ-005 任务书 02:恢复顺序细则 6):
+/// 1. `Scheduler::new(start_tick = world.shards.tick)`(覆盖 cfg,快照为准);
+/// 2. 逐片 `register_snapshot`(ShardId 升序;分片字节先恢复注册——
+///    register 末尾的 holder 重建此刻只看本片);
+/// 3. `restore_state(world.scheduler)`:校验 tick/键集/信封目的地(内部状态
+///    不一致 → panic fail-stop),恢复观察者表/Router(sequences 原样)/
+///    lifecycles,并从各片已加载 chunk 重建 holder 表;
+/// 4. 回放日志 `tick >= snapshot.tick`(观察者命令走观察者收件箱,其余按
+///    dest 原章直投)。
+///
+/// 调用方随后照常 ensure/装载/despawn(驱动编排)并 tick 到目标拍。
+pub fn replay_world(
+    world: &WorldSnapshot,
+    log: &CommandLog,
+    cfg: SessionConfig,
+    new_registry: impl Fn() -> Box<dyn BlockRegistry>,
+) -> Result<Session, SessionError> {
+    let mut cfg = cfg;
+    cfg.scheduler.start_tick = world.shards.tick;
+
+    let mut session = Session::new(cfg);
+    for bytes in world.shards.per_shard.values() {
+        session.register_snapshot(bytes, new_registry())?;
+    }
+    session.restore_scheduler_state(world.scheduler.clone());
+    replay_log_entries(&mut session, world.shards.tick, log.entries())?;
+    Ok(session)
+}
+
+/// 日志条目按重放窗口投递(两条回放入口共用;细则 7):
+/// `entry.tick < snapshot.tick` 跳过(已烙进快照);`>=` 全部回放——`==` 的
+/// 待执行命令(checkpoint 后、下一拍前到达)必须应用,丢了 = 数据丢失。
+/// 观察者命令(SetObserverPosition/RemoveObserver)→ 观察者专用收件箱原章
+/// 重投;其余 → `submit_raw(dest)` 原章(不重新盖章、不改 sequence)。
+fn replay_log_entries(
+    session: &mut Session,
+    snapshot_tick: Tick,
+    entries: &[LogEntry],
+) -> Result<(), SessionError> {
+    for entry in entries {
+        if entry.tick < snapshot_tick {
+            continue;
+        }
+        match entry.command {
+            SimCommand::SetObserverPosition { .. } | SimCommand::RemoveObserver => {
+                session.submit_observer_raw(stamped(entry.clone()));
             }
+            _ => session.submit_raw(entry.dest, stamped(entry.clone()))?,
         }
     }
-    Ok(session)
+    Ok(())
 }
 
 /// 日志条目 → 盖章输入(重放直投用):tick → apply_at,其余字段原样;
@@ -106,10 +152,12 @@ mod tests {
         }
     }
 
-    /// 测试清单 5:快照拍 20;日志含 tick 10/20/21 → 只重放 21
-    /// (观察:重放后 send 的 next_sequence 不受干扰、tick_now == 20)。
+    /// 测试清单 5(替换旧 `..._at_or_before` 语义):`replay_skips_only_entries_
+    /// before_snapshot_tick`——`< snapshot.tick` 跳过;`==` 与 `>` 都回放
+    /// (细则 7:snapshot.tick 是下一待执行拍,== 的待执行命令必须应用)。
+    /// 观察面:重放后 send 的 next_sequence 不受干扰、tick_now == 快照拍。
     #[test]
-    fn replay_skips_entries_at_or_before_snapshot_tick() {
+    fn replay_skips_only_entries_before_snapshot_tick() {
         let shard = shard_id(0, 0);
         // 真快照:建会话注册分片跑 20 拍后取(保证 register_snapshot 可解码)。
         let mut original = Session::new(session_cfg());
@@ -126,14 +174,14 @@ mod tests {
 
         let mut log = CommandLog::new();
         log.append(log_entry(10, 0, shard));
-        log.append(log_entry(20, 1, shard));
+        log.append(log_entry(20, 1, shard)); // == 快照拍:必须回放(不丢)
         log.append(log_entry(21, 2, shard));
 
         let mut replayed =
             replay(&snapshot, &log, session_cfg(), registry_factory).expect("快照自有必可恢复");
         assert_eq!(replayed.tick_now(), Tick(20), "start_tick 对齐快照拍");
 
-        // 只重放 tick 21:send 的 next_sequence 不受重放条目干扰(从 0 起)。
+        // 只回放 20/21:send 的 next_sequence 不受重放条目干扰(从 0 起)。
         let entry = replayed
             .send(
                 shard,
@@ -203,10 +251,9 @@ mod tests {
         let snapshot = original.global_snapshot();
         assert_eq!(snapshot.tick, Tick(3));
 
-        // 命令在拍 3 末投递(盖拍 3,拍 3 是下一拍)。为使条目 tick 严格
-        // > 快照拍(重放过滤条件),先跑 1 拍把 tick_now 推到 4,再投命令
-        // (盖拍 4)。原线再跑 2 拍(拍 4/5)→ 观察者命令在拍 4 应用。
-        original.tick();
+        // 命令在拍 3 末投递(盖拍 3,拍 3 是下一拍)。重放窗口 >= 快照拍:
+        // 盖拍 3 的条目(==)也回放——与生产时序一致(checkpoint 后、下一拍前
+        // 到达的命令不再丢失)。原线再跑 2 拍(拍 3/4)→ 观察者命令在拍 3 应用。
         let p1 = Vec3::new(8.0, 3.0, 8.0);
         let p2 = Vec3::new(40.0, 3.0, 40.0);
         let e1 = original.move_observer(p1).expect("unbounded");
@@ -220,7 +267,7 @@ mod tests {
             )
             .expect("收件箱未满");
         let e3 = original.move_observer(p2).expect("unbounded");
-        assert_eq!(e1.tick, Tick(4), "命令盖拍 4(> 快照拍 3)");
+        assert_eq!(e1.tick, Tick(3), "命令盖拍 3(== 快照拍,>= 回放)");
         for _ in 0..2 {
             original.tick();
         }
@@ -231,7 +278,7 @@ mod tests {
         );
         original.shutdown();
 
-        // 重放:同快照 + 同日志 → 条目全部重放(tick 4 > 3),观察者表再生。
+        // 重放:同快照 + 同日志 → 条目全部重放(tick 3 >= 3),观察者表再生。
         let mut log = CommandLog::new();
         log.append(e1);
         log.append(e2);
@@ -240,10 +287,9 @@ mod tests {
             replay(&snapshot, &log, session_cfg(), registry_factory).expect("快照自有必可恢复");
         assert!(
             replayed.observers().is_empty(),
-            "重放条目入收件箱,尚未 tick:表暂空(与原线拍 4 前一致)"
+            "重放条目入收件箱,尚未 tick:表暂空(与原线拍 3 前一致)"
         );
-        replayed.tick(); // 执行拍 3:无观察者条目到期。
-        replayed.tick(); // 执行拍 4:观察者条目到期 → 表再生。
+        replayed.tick(); // 执行拍 3:观察者条目到期 → 表再生。
         assert_eq!(
             replayed.observers(),
             vec![(InputSource(1), p2)],

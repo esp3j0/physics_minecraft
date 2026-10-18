@@ -413,3 +413,209 @@ fn ac8_long_blast_actually_moved_e2() {
         "爆炸必须把 e2 炸动(30 拍窗内 |v|max = {max_after} m/s ≤ 0.5 → 场景退化)"
     );
 }
+
+// ---- REQ-005 任务书 02:replay_world 600 拍(迁移/多观察者/断线 全窗口)----
+
+use sim_api::replay::replay_world;
+use sim_api::snapshot::WorldSnapshot;
+
+/// 600 拍场景的固定时间线(全在两拍之间下发;ac8 同款走廊/实体轨迹):
+/// - 拍 1:SpawnDynamic e1 @ (110,146,10) linvel=(24,0,0) → 拍 ~45 空中越
+///   x=128 迁移到 (1,0),落地后摩擦停在 (1,0) 本体区(ac8 已验轨迹);
+/// - 拍 15:SpawnDynamic e2 @ (100,146,10) 静止出生 → 落地驻留 (0,0);
+/// - 观察者沿飞行走廊布置(tier③ 冻结半径 32m 按 3D 距离:e1/e2 全程
+///   ≤32m 醒着,物理与 ac8 无冻结差;乙在远处不构成第三中心):
+///   - 拍 20:观察者甲(会话 source 1)入表 @PA;
+///   - 拍 120:观察者乙(玩家 source 9,`move_observer_from`)入表 @PC;
+///   - 拍 200:甲移动 @PB;拍 250:乙断线(`remove_observer_from` 入日志);
+///   - 拍 300:WorldSnapshot checkpoint(观察者表 = {甲:PB}——乙已于
+///     拍 250 断线移除,其 RemoveObserver 先于快照 = 已烙进快照,不出现在
+///     重放窗;断线命令的重放演练由 network_remove_observer_logged_and_
+///     replayed 覆盖。迁移早已完结,e1 驻留 (1,0));
+/// - 拍 320:两分片广播 Detonate(爆心 = e2 驻位点,常量参数两线同源;
+///   e2 被炸动滑行,仍在 (0,0) 本体区);
+/// - 拍 380:甲移回 @PA——checkpoint 后的观察者命令走日志回放面;
+/// - 拍 600:终态(观察者表 = {甲:PA},乙无幽灵)。checkpoint 后每拍断言
+///   「两线位级一致」(实体 + 观察者表)。
+const W_SPAWN_E1_TICK: u64 = 1;
+const W_SPAWN_E2_TICK: u64 = 15;
+const W_OBS_A_ENTER_TICK: u64 = 20;
+const W_OBS_B_ENTER_TICK: u64 = 120;
+const W_OBS_A_MOVE_TICK: u64 = 200;
+const W_OBS_B_REMOVE_TICK: u64 = 250;
+const W_SNAPSHOT_TICK: u64 = 300;
+const W_BLAST_TICK: u64 = 320;
+const W_OBS_A_FINAL_TICK: u64 = 380;
+
+const PA: Vec3 = Vec3::new(110.0, 144.0, 8.0);
+const PB: Vec3 = Vec3::new(130.0, 144.0, 8.0);
+const PC: Vec3 = Vec3::new(300.0, 144.0, 8.0);
+
+/// 每拍采样(两线对拍面:实体 + 观察者表)。
+#[derive(Debug, PartialEq)]
+struct WorldSample {
+    /// e1 两分片视图(源片, 目的片)——迁移取证需要分片归属。
+    e1_src: Option<EntityState>,
+    e1_dst: Option<EntityState>,
+    e2_src: Option<EntityState>,
+    e2_dst: Option<EntityState>,
+    observers: Vec<(messaging::InputSource, Vec3)>,
+}
+
+struct WorldLine {
+    samples: Vec<WorldSample>,
+    log: CommandLog,
+}
+
+fn world_sample(session: &Session) -> WorldSample {
+    let (src, dst) = (shard_id(0, 0), shard_id(1, 0));
+    WorldSample {
+        e1_src: session.entity_state(src, entity(1)),
+        e1_dst: session.entity_state(dst, entity(1)),
+        e2_src: session.entity_state(src, entity(2)),
+        e2_dst: session.entity_state(dst, entity(2)),
+        observers: session.observers(),
+    }
+}
+
+/// 跑原线:600 拍,拍 300 取 WorldSnapshot(两拍之间)。
+fn run_world_original(snapshot_at: Option<Tick>) -> (WorldLine, Option<WorldSnapshot>) {
+    let (src, dst) = (shard_id(0, 0), shard_id(1, 0));
+    let mut session = Session::new(session_cfg());
+    session.register(ground_sim(0, 0..8));
+    session.register(ground_sim(1, 8..16));
+
+    let mut log = CommandLog::new();
+    let mut samples = Vec::new();
+    let mut snapshot = None;
+    while session.tick_now() < FINAL_TICK {
+        let at = session.tick_now();
+        if Some(at) == snapshot_at {
+            snapshot = Some(session.world_snapshot());
+        }
+        match at.0 {
+            W_SPAWN_E1_TICK => send_log(
+                &mut session,
+                &mut log,
+                src,
+                spawn_command(
+                    entity(1),
+                    Vec3::new(110.0, 146.0, 10.0),
+                    Vec3::new(24.0, 0.0, 0.0),
+                ),
+            ),
+            W_SPAWN_E2_TICK => send_log(
+                &mut session,
+                &mut log,
+                src,
+                spawn_command(entity(2), Vec3::new(100.0, 146.0, 10.0), Vec3::ZERO),
+            ),
+            W_OBS_A_ENTER_TICK | W_OBS_A_MOVE_TICK | W_OBS_A_FINAL_TICK => {
+                let position = match at.0 {
+                    W_OBS_A_MOVE_TICK => PB,
+                    _ => PA,
+                };
+                let entry = session.move_observer(position).expect("unbounded");
+                log.append(entry);
+            }
+            W_OBS_B_ENTER_TICK => {
+                let entry = session
+                    .move_observer_from(messaging::InputSource(9), PC)
+                    .expect("unbounded");
+                log.append(entry);
+            }
+            W_OBS_B_REMOVE_TICK => {
+                let entry = session
+                    .remove_observer_from(messaging::InputSource(9))
+                    .expect("unbounded");
+                log.append(entry);
+            }
+            W_BLAST_TICK => {
+                // 广播语义(ac8 同款):常量参数两份分别投两分片;爆心 = e2
+                // 驻位点(与实体轨迹对拍,非空爆——重放窗内爆炸动力学被压)。
+                for shard in [src, dst] {
+                    send_log(
+                        &mut session,
+                        &mut log,
+                        shard,
+                        SimCommand::Detonate {
+                            center: Vec3::new(100.0, 136.5, 10.0),
+                            power: 12.0,
+                            radius: 8.0,
+                        },
+                    );
+                }
+            }
+            _ => {}
+        }
+        session.tick();
+        samples.push(world_sample(&session));
+    }
+    let line = WorldLine { samples, log };
+    session.shutdown();
+    (line, snapshot)
+}
+
+/// 任务书测试 `replay_world_600_ticks_matches`:含迁移/多观察者/断线的
+/// 600 拍场景,拍 300 WorldSnapshot → replay_world 续跑到拍 600,重放窗
+/// 逐拍采样位级一致(实体 + 观察者表;AC-C5/AC-C6 的长程面)。
+#[test]
+fn replay_world_600_ticks_matches() {
+    let (orig, snapshot) = run_world_original(Some(Tick(W_SNAPSHOT_TICK)));
+    let snapshot = snapshot.expect("拍 300 必已截取世界快照");
+    assert_eq!(snapshot.shards.tick, Tick(W_SNAPSHOT_TICK));
+    assert_eq!(snapshot.scheduler.tick, snapshot.shards.tick);
+    // 非退化:时间线日志齐全(2 出生 + 3 甲移动 + 乙入表 + 乙移除 + 2 爆炸)。
+    assert_eq!(orig.log.len(), 9, "固定时间线 9 条:{:?}", orig.log.len());
+
+    // 重放线:WorldSnapshot + 日志 → 续跑到 600。
+    let mut replayed = replay_world(&snapshot, &orig.log, session_cfg(), registry_factory)
+        .expect("自有快照必可恢复");
+    assert_eq!(replayed.tick_now(), Tick(W_SNAPSHOT_TICK), "自快照拍对齐");
+    let mut replay_samples = Vec::new();
+    while replayed.tick_now() < FINAL_TICK {
+        replayed.tick();
+        replay_samples.push(world_sample(&replayed));
+    }
+
+    // 重放窗 [300,600) 逐拍位级一致。
+    assert_eq!(replay_samples.len(), (600 - W_SNAPSHOT_TICK) as usize);
+    for (i, (o, r)) in orig.samples[W_SNAPSHOT_TICK as usize..]
+        .iter()
+        .zip(&replay_samples)
+        .enumerate()
+    {
+        assert_eq!(
+            o,
+            r,
+            "重放窗内绝对拍 {} 采样位级一致(实体 + 观察者表)",
+            W_SNAPSHOT_TICK + i as u64
+        );
+    }
+    // 终态非退化:两实体存活;甲在 PA(拍 380 移回再生),乙无幽灵。
+    let end = replay_samples.last().expect("非空");
+    assert!(
+        (end.e1_dst.is_some() || end.e1_src.is_some())
+            && (end.e2_src.is_some() || end.e2_dst.is_some()),
+        "终态两实体存活"
+    );
+    assert_eq!(
+        end.observers,
+        vec![(messaging::InputSource(1), PA)],
+        "终态观察者表:甲在 PA(拍 380 移回再生),乙已移除(无幽灵)"
+    );
+    // 非退化:e1 在快照拍前完成 (0,0) → (1,0) 迁移(源片 Some→None 的窗口
+    // 存在;终态驻留片以位级逐拍一致为准)。
+    let vanished = orig.samples[..W_SNAPSHOT_TICK as usize]
+        .windows(2)
+        .any(|w| w[0].e1_src.is_some() && w[1].e1_src.is_none() && w[1].e1_dst.is_none());
+    let appeared = orig.samples[..W_SNAPSHOT_TICK as usize]
+        .iter()
+        .any(|s| s.e1_dst.is_some());
+    assert!(
+        vanished && appeared,
+        "非退化:e1 必须在快照拍前完成 (0,0) → (1,0) 迁移(vanish={vanished} appear={appeared})"
+    );
+    assert!(end.e1_dst.is_some(), "e1 终态驻留目的片 (1,0)(迁移未回退)");
+    replayed.shutdown();
+}

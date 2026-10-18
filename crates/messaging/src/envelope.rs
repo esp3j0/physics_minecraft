@@ -154,6 +154,51 @@ impl CrossShardQueue {
             .map(|(_, apply_at)| *apply_at)
             .min()
     }
+
+    /// 全部在队信封汇总(REQ-005 D7:Router 快照载荷),按
+    /// `(destination, apply_at, payload ordinal, source, source_sequence)`
+    /// 升序输出——桶内已 canonical(take_batch 同键),跨桶再排一次即全序;
+    /// 恢复后的 take_batch 行为与原队逐位一致。
+    pub fn snapshot(&self) -> Vec<Envelope> {
+        let mut all: Vec<Envelope> = self.buckets.values().flatten().copied().collect();
+        all.sort_by_key(|e| {
+            (
+                e.destination,
+                e.apply_at,
+                e.payload.ordinal(),
+                e.source,
+                e.source_sequence,
+            )
+        });
+        all
+    }
+
+    /// 从快照恢复(REQ-005 D7):逐封校验 `apply_at == produced_at + 1`(违反 =
+    /// 内部状态损坏 → panic fail-stop)与队列容量(超出 = 损坏 → panic)后
+    /// 按 `(destination, apply_at)` 放回对应桶。恢复即重建桶,不清旧(调用方
+    /// 约定只在空队列上恢复);桶容量耗尽的判定与 `admit` 同口径(计数)。
+    pub fn restore(&mut self, envelopes: Vec<Envelope>) {
+        if envelopes.len() > self.capacity {
+            panic!(
+                "跨片队列恢复超容量:{} > {}(内部状态损坏,fail-stop)",
+                envelopes.len(),
+                self.capacity
+            );
+        }
+        for envelope in envelopes {
+            if envelope.apply_at != envelope.produced_at.next() {
+                panic!(
+                    "跨片队列恢复遇非法信封:apply_at {} ≠ produced_at {} + 1\
+                     (内部状态损坏,fail-stop)",
+                    envelope.apply_at.0, envelope.produced_at.0
+                );
+            }
+            self.buckets
+                .entry((envelope.destination, envelope.apply_at))
+                .or_default()
+                .push(envelope);
+        }
+    }
 }
 
 impl Default for CrossShardQueue {
@@ -255,5 +300,84 @@ mod tests {
         assert!(q.take_batch(dest, Tick(11)).is_empty());
         // 其他桶仍在
         assert_eq!(q.len(), 1);
+    }
+
+    // ---- REQ-005 任务书 02:跨拍队列快照/恢复(D7:Router 待投递信封入快照)----
+
+    /// 测试 `queue_snapshot_restore_roundtrip`(任务书 02):多桶多来源在队 →
+    /// snapshot() 全量汇总且按 (destination, apply_at, payload ordinal, source,
+    /// source_sequence) canonical 全序;restore 到空队列 → 逐字段相等、
+    /// take_batch 行为不变。
+    #[test]
+    fn queue_snapshot_restore_roundtrip() {
+        let mut q = CrossShardQueue::with_default_capacity();
+        // 三个桶:dest A(拍 11)、dest B(拍 11)、dest B(拍 12);来源交错。
+        q.admit(migrate(3, shard(5, 5), shard(1, 0))).unwrap();
+        q.admit(migrate(1, shard(1, 1), shard(1, 0))).unwrap();
+        q.admit(migrate(2, shard(5, 5), shard(2, 0))).unwrap();
+        q.admit(migrate(9, shard(0, 0), shard(2, 0))).unwrap();
+        // dest B 拍 12:produced_at = 11。
+        let mut later = migrate(4, shard(5, 5), shard(2, 0));
+        later.produced_at = Tick(11);
+        later.apply_at = Tick(12);
+        q.admit(later).unwrap();
+
+        let snap = q.snapshot();
+        assert_eq!(snap.len(), 5, "全部在队信封汇总");
+        // canonical 全序:跨桶按 (destination, apply_at, …)。
+        let keys: Vec<_> = snap
+            .iter()
+            .map(|e| {
+                (
+                    e.destination,
+                    e.apply_at,
+                    e.payload.ordinal(),
+                    e.source,
+                    e.source_sequence,
+                )
+            })
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "snapshot 输出已按 canonical 全序排序");
+
+        // 恢复到等容量空队列 → 逐封相等;分发行为不变。
+        let mut restored = CrossShardQueue::with_default_capacity();
+        restored.restore(snap);
+        assert_eq!(restored.len(), 5, "恢复后条数一致");
+        assert_eq!(
+            restored.snapshot(),
+            q.snapshot(),
+            "恢复后快照与原队逐封相等"
+        );
+        // 分发语义不变:A 拍 11 的桶恰 2 封,canonical 序保持。
+        let batch = restored.take_batch(shard(1, 0), Tick(11));
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].source, shard(1, 1));
+        assert_eq!(batch[1].source_sequence, 3);
+        assert_eq!(restored.take_batch(shard(2, 0), Tick(12)).len(), 1);
+    }
+
+    /// 测试 `queue_restore_rejects_broken_invariant`:apply_at ≠ produced_at+1
+    /// 的信封 = 内部状态损坏 → panic(fail-stop),不走类型化错误。
+    #[test]
+    #[should_panic(expected = "内部状态损坏")]
+    fn queue_restore_rejects_broken_invariant() {
+        let mut e = migrate(1, shard(0, 0), shard(1, 0));
+        e.apply_at = Tick(10); // 破坏 produced_at + 1
+        let mut q = CrossShardQueue::with_default_capacity();
+        q.restore(vec![e]);
+    }
+
+    /// 测试 `queue_restore_respects_capacity`:恢复超过容量的集合 → panic
+    /// (恢复路径的桶容量校验;快照本不可能超容,超容 = 损坏)。
+    #[test]
+    #[should_panic(expected = "容量")]
+    fn queue_restore_respects_capacity() {
+        let mut q = CrossShardQueue::new(1);
+        q.restore(vec![
+            migrate(1, shard(0, 0), shard(1, 0)),
+            migrate(2, shard(0, 0), shard(1, 0)),
+        ]);
     }
 }

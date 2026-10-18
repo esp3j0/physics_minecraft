@@ -511,6 +511,11 @@ impl ShardSim {
             SimCommand::SetObserverPosition { .. } => {
                 panic!("SetObserverPosition 不得进入分片输入前缀(调度器专用收件箱,fail-stop)");
             }
+            // RemoveObserver 同款(REQ-005 任务书 02:观察者命令永不进分片前缀)
+            // → 出现即一致性违规 fail-stop(match 穷举强制)。
+            SimCommand::RemoveObserver => {
+                panic!("RemoveObserver 不得进入分片输入前缀(观察者收件箱专用,fail-stop)");
+            }
         }
     }
 

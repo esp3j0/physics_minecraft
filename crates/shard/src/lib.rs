@@ -18,4 +18,6 @@ pub mod ownership;
 pub mod router;
 pub mod scheduler;
 
-pub use scheduler::{Scheduler, SchedulerConfig, TickSummary};
+pub use lifecycle::LifecycleSnapshot;
+pub use router::RouterSnapshot;
+pub use scheduler::{Scheduler, SchedulerConfig, SchedulerSnapshot, TickSummary};

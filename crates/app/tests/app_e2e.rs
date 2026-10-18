@@ -138,7 +138,7 @@ fn latest_bundle_from_disk(dir: &Path) -> CheckpointBundle {
         bincode::serde::decode_from_slice(&blob, bincode::config::standard())
             .expect("驱动自有编码必可解码");
     assert_eq!(
-        bundle.snapshot.tick, tick,
+        bundle.world.shards.tick, tick,
         "库内元组 tick 与 bundle 快照拍一致"
     );
     bundle
@@ -275,9 +275,10 @@ async fn commands_after_resume_apply_to_restored_shards() {
 
     // —— 磁盘读回终末快照:命令确实在恢复后的分片上生效 ——
     let bundle = latest_bundle_from_disk(dir.path());
-    assert_eq!(bundle.snapshot.tick, Tick(8));
+    assert_eq!(bundle.world.shards.tick, Tick(8));
     let bytes = bundle
-        .snapshot
+        .world
+        .shards
         .per_shard
         .get(&shard)
         .expect("快照含分片 (0,0)");
