@@ -11,7 +11,6 @@ use macroquad::input::{
     KeyCode, is_key_down, is_key_pressed, mouse_delta_position, set_cursor_grab, show_mouse,
 };
 use macroquad::math::vec3;
-use macroquad::miniquad::conf::Conf;
 use macroquad::models::{Mesh, draw_cube, draw_mesh};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
@@ -135,13 +134,23 @@ fn hud_lines(tick: u64, chunks: usize, entities: usize, fps: i32) -> [String; 4]
     ]
 }
 
+/// 实体渲染位姿:服务器流(默认 10 tick 一帧)只推进 target,渲染帧对
+/// current 指数逼近——阶梯更新被平滑成连续运动(下落不"一格一格跳")。
+struct EntityPose {
+    current: macroquad::math::Vec3,
+    target: macroquad::math::Vec3,
+}
+
+/// 位置插值速率(1/s;越大越紧跟,14 ≈ 70ms 追平大半)。
+const POSE_SMOOTH: f32 = 14.0;
+
 /// 世界渲染态(chunk Mesh 表 + 方块镜像 + 实体位姿表;增量事件驱动)。
 struct WorldView {
     chunks: BTreeMap<ChunkPos, Mesh>,
     /// chunk 方块镜像(BlockUpdates 就地改写后整块重算 Mesh;demo 定位)。
     blocks: BTreeMap<ChunkPos, voxel::Chunk>,
     /// 实体位姿(增量 latest-wins;removed 即移除——README 决策 5)。
-    entities: BTreeMap<EntityId, macroquad::math::Vec3>,
+    entities: BTreeMap<EntityId, EntityPose>,
     tick: u64,
 }
 
@@ -192,7 +201,16 @@ impl WorldView {
                 }
                 for (id, state) in states {
                     let t = state.translation; // types::glam(0.33)→ macroquad(0.27)字段换算
-                    self.entities.insert(id, vec3(t.x, t.y, t.z));
+                    let target = vec3(t.x, t.y, t.z);
+                    // 新实体(含全量重建):current 从 target 起步,不从原点飞入;
+                    // 已有实体:只推进 target,渲染帧插值逼近。
+                    self.entities
+                        .entry(id)
+                        .and_modify(|pose| pose.target = target)
+                        .or_insert(EntityPose {
+                            current: target,
+                            target,
+                        });
                 }
                 for id in removed {
                     self.entities.remove(&id);
@@ -274,12 +292,16 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
             show_mouse(!mouse_grabbed);
         }
         // B:准星前方生成动态立方体(落下→静止→凝固成地形色;ACV4 ③④)。
+        // 连按散布:同点重叠的刚体被求解器永久抖动、永不满足凝固判据
+        // (实跑反馈的蓝方块存留根因之一)——按序号在 5×5 网格散开出生点。
         if is_key_pressed(KeyCode::B) && disconnected.is_none() {
             let entity = EntityId::from_parts(SPAWN_ORIGIN, spawn_seq);
+            let gx = (spawn_seq % 5) as f32 - 2.0;
+            let gz = ((spawn_seq / 5) % 5) as f32 - 2.0;
             spawn_seq = spawn_seq.wrapping_add(1);
             let p = camera.position
                 + camera.forward() * SPAWN_AHEAD
-                + macroquad::math::Vec3::Y * SPAWN_LIFT;
+                + vec3(gx * 1.6, SPAWN_LIFT, gz * 1.6);
             control.command(SimCommand::SpawnDynamic {
                 entity,
                 state: EntityState {
@@ -321,9 +343,12 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
         for mesh in world.chunks.values() {
             draw_mesh(mesh);
         }
-        for translation in world.entities.values() {
+        // 实体:current 指数逼近 target(帧率无关),画 current。
+        for pose in world.entities.values_mut() {
+            let k = 1.0 - (-POSE_SMOOTH * dt).exp();
+            pose.current += (pose.target - pose.current) * k;
             draw_cube(
-                *translation,
+                pose.current,
                 vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
                 None,
                 BLUE,
@@ -379,13 +404,22 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
 /// 窗口配置(标题/尺寸;crate 根 `#[macroquad::main(window_conf)]` 入口用)。
 /// 测试目标下不可达(dead_code 实警),allow 并注明。
 #[allow(dead_code)] // 测试目标(cargo test)不含窗口入口;bin 装配需要
-pub(crate) fn window_conf() -> Conf {
-    Conf {
-        window_title: "physics_minecraft viewer(REQ-004A demo)".to_owned(),
-        window_width: 1280,
-        window_height: 720,
-        window_resizable: true,
-        ..Conf::default()
+pub(crate) fn window_conf() -> macroquad::conf::Conf {
+    macroquad::conf::Conf {
+        miniquad_conf: macroquad::miniquad::conf::Conf {
+            window_title: "physics_minecraft viewer(REQ-004A demo)".to_owned(),
+            window_width: 1280,
+            window_height: 720,
+            window_resizable: true,
+            ..macroquad::miniquad::conf::Conf::default()
+        },
+        // 批缓冲扩容(ACV4 实跑反馈 3):macroquad 默认 10000 顶点/5000 索引,
+        // 单个超平坦 chunk mesh ≈ 3072 顶点/4608 索引——再凝固十几个立方体
+        // 索引即越过 5000,geometry() 截断该 mesh(警告刷屏 + 缺三角形"穿模")。
+        // 扩到 30 万索引后稠密 chunk 也安全(批缓冲 ~12MB,一次性分配)。
+        draw_call_vertex_capacity: 200_000,
+        draw_call_index_capacity: 300_000,
+        ..macroquad::conf::Conf::default()
     }
 }
 
