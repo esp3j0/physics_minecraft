@@ -122,6 +122,9 @@ pub struct Scheduler {
     /// 本拍凝固写入的方块(REQ-003 §4.4 观察输出源②:tick 内收集,两拍之间
     /// 经 take_solidified 取走;恰一次语义)。
     solidified: Vec<(ShardId, BlockPos, BlockId)>,
+    /// 本拍方块写入的 owner 发布集(REQ-005 D11:tick 内收集,两拍之间经
+    /// `take_block_updates` 取走;恰一次语义)。
+    block_updates: Vec<(ShardId, BlockPos, BlockId)>,
     /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
     despawn_requests: BTreeSet<ShardId>,
     /// chunk 持有表(REQ-005 D2/D4):`(owner, chunk) → holder 集合`。
@@ -166,6 +169,7 @@ impl Scheduler {
             observer_inbox: VecDeque::new(),
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
+            block_updates: Vec::new(),
             despawn_requests: BTreeSet::new(),
             chunk_holders: crate::chunks::ChunkHolders::new(),
             cfg,
@@ -263,6 +267,14 @@ impl Scheduler {
         std::mem::take(&mut self.solidified)
     }
 
+    /// 本拍 block write 的 owner 视角发布集(REQ-005 D11;取走即清,恰一次):
+    /// `(分片, 世界坐标方块格, 写入的方块 ID)`,只含 `shard == owner(pos.chunk_of())`
+    /// 的条目——广播时每个 holder 副本各产生一条同格写入,非 owner 的条目
+    /// 在此丢弃(网络/持久化看到恰一次;跨界涌现写入的任务 03 信封另接)。
+    pub fn take_block_updates(&mut self) -> Vec<(ShardId, BlockPos, BlockId)> {
+        std::mem::take(&mut self.block_updates)
+    }
+
     /// 分片全实体表(REQ-003 §4.4 观察输出源①;任务书 00 签名固定):
     /// `(EntityId, EntityState)`,EntityId 升序(委托 [`ShardSim::entity_states`])。
     /// 未注册分片 → `None`。
@@ -289,6 +301,21 @@ impl Scheduler {
     /// Router 待投递信封的目的分片(两拍之间;REQ-005 D5,驱动 ensure 用)。
     pub fn pending_shard_destinations(&self) -> BTreeSet<ShardId> {
         self.router.pending_destinations()
+    }
+
+    /// 分片是否已加载某个 chunk(REQ-005 任务 01:外部 SetBlock 的未加载
+    /// chunk 门卫透传;`VoxelWorld::set_block` 会自动建空气 chunk,hostile
+    /// 输入必须在驱动侧拦下)。未注册分片 → false。
+    pub fn is_chunk_loaded(&self, shard: ShardId, pos: ChunkPos) -> bool {
+        self.sims
+            .get(&shard)
+            .is_some_and(|sim| sim.voxel().get_chunk(pos).is_some())
+    }
+
+    /// 分片某个已加载 chunk 的只读视图(REQ-005 任务 01:副本逐字节一致
+    /// 断言用)。未注册分片或未加载 → None。
+    pub fn voxel_chunk(&self, shard: ShardId, pos: ChunkPos) -> Option<&voxel::Chunk> {
+        self.sims.get(&shard)?.voxel().get_chunk(pos)
     }
 
     pub fn apply_chunk_load(&mut self, shard: ShardId, pos: ChunkPos, chunk: voxel::Chunk) {
@@ -468,6 +495,35 @@ impl Scheduler {
         self.router.route_local(shard, input)
     }
 
+    /// 原子批量投递(REQ-005 D3:外部编辑同拍广播;签名固定):先全量预检
+    /// ——每个目标已注册且收件箱有空位(`pending_inbox < inbox_capacity`);
+    /// 任一不满足 → `Err` 且**一片都不投**(不半投;未注册也返回 `Err`——
+    /// 广播路径的防御层,调用方 Session 已校验过,不 panic)。预检通过后逐个
+    /// `route_local`;单线程驱动下预检与投递之间无并发入箱者,中途失败 =
+    /// 内部一致性违规 → panic(fail-stop)。
+    pub fn submit_batch(
+        &mut self,
+        shards: &[ShardId],
+        input: StampedInput,
+    ) -> Result<(), RouteError> {
+        let capacity = self.router.capacity();
+        for &shard in shards {
+            if !self.sims.contains_key(&shard) {
+                eprintln!("[scheduler] 批量投递目标未注册:{shard:?}(广播防御层拒绝)");
+                return Err(RouteError::InboxFull { capacity });
+            }
+            if self.router.pending_inbox(shard) >= capacity {
+                return Err(RouteError::InboxFull { capacity });
+            }
+        }
+        for &shard in shards {
+            if self.router.route_local(shard, input.clone()).is_err() {
+                panic!("submit_batch 预检通过后投递失败(单线程下不可达,内部一致性违规,fail-stop)");
+            }
+        }
+        Ok(())
+    }
+
     /// 执行一拍(全屏障,流程严格按任务书 05 的 1→8):
     /// 分发前缀 → 静态轮转派批 → capacity-one 发送 → 屏障回收(BTreeMap 归一)
     /// → 迁移盖章 → lifecycle 接线 → advance。
@@ -592,6 +648,8 @@ impl Scheduler {
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
+        // 方块写入收集(REQ-005 D11):同款恰一次;owner 过滤逐条判定。
+        self.block_updates.clear();
         for (shard, (sim, outbox)) in results {
             match self.router.collect_intents(shard, &outbox.migrations, at) {
                 Ok(()) => migrations_admitted += outbox.migrations.len(),
@@ -609,6 +667,14 @@ impl Scheduler {
             for (_, cell) in &outbox.solidified {
                 self.solidified
                     .push((shard, *cell, sim.voxel().get_block(*cell)));
+            }
+            // 方块写入(REQ-005 D11):广播下每个 holder 副本各记一条同格
+            // 写入;只发布 owner 的条目(非 owner 的丢弃——任务 03 的跨界
+            // BlockWrite 信封再接),网络/持久化由此看到恰一次。
+            for write in &outbox.block_updates {
+                if shard == Self::owner_of(shard, write.pos.chunk_of()) {
+                    self.block_updates.push((shard, write.pos, write.block));
+                }
             }
             self.sims.insert(shard, sim);
         }
@@ -1681,6 +1747,269 @@ mod tests {
         assert_eq!(chunks.len(), 1, "前置:卸载返回 chunk");
         assert!(sched.shard_ids().is_empty(), "前置:分片已卸载");
         // despawn 后直接关机:不得 panic(修复前在此触发非法阶段转移)。
+        sched.shutdown();
+    }
+
+    // ---- 任务书 req005-consistency/01(外部编辑扩张一致性) ----
+
+    /// 一条盖章 SetBlock(apply_at/pos/block 可控,source 固定会话型 1)。
+    fn setblock_input(
+        apply_at: Tick,
+        sequence: u64,
+        pos: BlockPos,
+        block: types::BlockId,
+    ) -> StampedInput {
+        StampedInput {
+            apply_at,
+            source: InputSource(1),
+            sequence,
+            payload: InputPayload::Command(SimCommand::SetBlock { pos, block }),
+        }
+    }
+
+    /// 任务书测试 `setblock_batch_atomic_on_inbox_full`:批量目标之一收件箱
+    /// 满 → Err;全部 sim 体素未变、已注册目标的收件箱也未增(不半投)。
+    #[test]
+    fn setblock_batch_atomic_on_inbox_full() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            router: crate::router::RouterConfig {
+                inbox_capacity: 1,
+                ..crate::router::RouterConfig::default()
+            },
+            ..sched_cfg(2)
+        });
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // owner = 片 (0,0);片 (1,0) 持扩张副本
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+
+        // 先占满片 (1,0) 的收件箱(容量 1)。
+        sched
+            .submit(
+                shard_id(1, 0),
+                setblock_input(Tick(0), 0, BlockPos::new(119, 5, 8), types::BlockId(9)),
+            )
+            .expect("首条入箱");
+        // 批量(owner + holder)第二格:片 (1,0) 满 → 整批 Err。
+        let targets = [shard_id(0, 0), shard_id(1, 0)];
+        let batch = setblock_input(Tick(0), 1, BlockPos::new(121, 5, 8), types::BlockId(3));
+        assert!(
+            sched.submit_batch(&targets, batch).is_err(),
+            "任一收件箱满 → 整批拒绝"
+        );
+        // 不半投:拍 0 后,被拒批次的格 (121,·,8) 在两片都未写;
+        // 占位单发条目 (119,·,8) 照常生效(对照)。
+        sched.tick();
+        let owner_chunk = sched.voxel_chunk(shard_id(0, 0), cp).expect("已装载");
+        let holder_chunk = sched.voxel_chunk(shard_id(1, 0), cp).expect("已装载");
+        for (name, chunk) in [("owner", owner_chunk), ("holder", holder_chunk)] {
+            assert_eq!(
+                chunk.get(9, 69, 8),
+                types::BlockId::AIR,
+                "{name} 副本:被拒批次 (121,·,8) 未写(不半投)"
+            );
+        }
+        assert_eq!(
+            holder_chunk.get(7, 69, 8),
+            types::BlockId(9),
+            "占位单发条目照常生效(对照,局部 (7,69,8) = 世界 (119,5,8))"
+        );
+        assert_eq!(sched.router.pending_inbox(shard_id(0, 0)), 0, "不半投");
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `block_updates_published_once_by_owner`:同格编辑广播到
+    /// owner + holder,两片各产生一条 block_update;`take_block_updates`
+    /// 只返回 owner 的一条(且取走即清,再取 = 空)。
+    #[test]
+    fn block_updates_published_once_by_owner() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // owner = 片 (0,0)
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        // 同格同章批量广播(两片各产生一条同格写入)。
+        let batch = setblock_input(Tick(0), 0, BlockPos::new(120, 5, 8), types::BlockId(2));
+        sched
+            .submit_batch(&[shard_id(0, 0), shard_id(1, 0)], batch)
+            .expect("收件箱未满");
+        sched.tick();
+        let updates = sched.take_block_updates();
+        assert_eq!(
+            updates,
+            vec![(shard_id(0, 0), BlockPos::new(120, 5, 8), types::BlockId(2))],
+            "两片各产生一条,只发布 owner 的一条:{updates:?}"
+        );
+        assert!(sched.take_block_updates().is_empty(), "取走即清(恰一次)");
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `block_edit_copies_bitwise_equal`:边界格编辑同拍生效后,
+    /// 两片该 chunk 的 `Chunk` 逐字节相等(`Chunk` = Vec<BlockId>,PartialEq
+    /// 即逐格全等)。
+    #[test]
+    fn block_edit_copies_bitwise_equal() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // owner = 片 (0,0);片 (1,0) 持扩张副本
+        let chunk = voxel::Chunk::air();
+        sched.apply_chunk_load(shard_id(0, 0), cp, chunk.clone());
+        sched.apply_chunk_load(shard_id(1, 0), cp, chunk);
+        let batch = setblock_input(Tick(0), 0, BlockPos::new(120, 40, 8), types::BlockId(7));
+        sched
+            .submit_batch(&[shard_id(0, 0), shard_id(1, 0)], batch)
+            .expect("收件箱未满");
+        sched.tick();
+        let a = sched.voxel_chunk(shard_id(0, 0), cp).expect("已装载");
+        let b = sched.voxel_chunk(shard_id(1, 0), cp).expect("已装载");
+        assert_eq!(a, b, "同格编辑后两片副本逐字节相等");
+        // 非退化:编辑格确为新值(chunk 局部 = 世界格 mod 16,y +64)。
+        assert_eq!(a.get(8, 104, 8), types::BlockId(7));
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `boundary_edit_physics_matches_single_world`:边界格编辑 +
+    /// 实体滚动穿越,双片 vs 单世界(整走廊单 ShardSim 参考)同时间线终态
+    /// 位移差 < 1e-4 m。参考基线:AC2 e2e 已证明"分片走廊 vs 裸 PhysicsWorld
+    /// 单世界"误差 ~5e-6 m(crates/e2e/tests/migration.rs),本测试在此之上
+    /// 验证"编辑格两片同拍生效"不引入额外差异(单世界参考不经广播)。
+    #[test]
+    fn boundary_edit_physics_matches_single_world() {
+        use types::glam::Vec3;
+
+        const GROUND_TOP_LY: usize = 128; // 顶面 world y = 64(AC2 同款)
+        fn ground_chunk() -> voxel::Chunk {
+            let mut c = voxel::Chunk::air();
+            for y in 0..GROUND_TOP_LY {
+                for x in 0..voxel::CHUNK_X {
+                    for z in 0..voxel::CHUNK_Z {
+                        c.set(x, y, z, types::BlockId(1));
+                    }
+                }
+            }
+            c
+        }
+        // 双片:本体 + 扩张带重叠(片 0 = chunk 0..=8,片 1 = chunk 7..=15)。
+        let mut sched = Scheduler::new(sched_cfg(2));
+        for (x, range) in [(0i32, 0..9), (1, 7..16)] {
+            let mut s = {
+                let mut cfg = ShardSimConfig::new(shard_id(x, 0));
+                cfg.solidify.enabled = false;
+                ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+            };
+            for cx in range {
+                s.load_chunk(types::ChunkPos::new(cx, 0), ground_chunk());
+            }
+            sched.register(s);
+        }
+        // 边界格台阶(chunk 7/8 交界):owner (0,0) + holder (1,0) 同拍广播。
+        let step = BlockPos::new(127, 64, 8);
+        let batch = setblock_input(Tick(0), 0, step, types::BlockId(1));
+        sched
+            .submit_batch(&[shard_id(0, 0), shard_id(1, 0)], batch)
+            .expect("收件箱未满");
+        // 实体:出生活在地面上方,linvel 60 m/s 沿 +x,滚动穿越台阶与分片边界
+        // (拍 1 前缀生效,共 44 步物理;AC2 同款时间线)。
+        let e = types::EntityId::from_parts(1, 1);
+        sched
+            .submit(
+                shard_id(0, 0),
+                StampedInput {
+                    apply_at: Tick(1),
+                    source: InputSource(7),
+                    sequence: 0,
+                    payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                        entity: e,
+                        state: types::EntityState {
+                            translation: Vec3::new(100.0, 65.5, 8.0),
+                            linvel: Vec3::new(60.0, 0.0, 0.0),
+                            ..types::EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    }),
+                },
+            )
+            .expect("收件箱未满");
+        const TICKS: usize = 45;
+        for _ in 0..TICKS {
+            sched.tick();
+        }
+        // 实体高速穿边界:迁移当拍源片删除、下一拍目的片重建,终态可能在任一
+        // 片(实验:45 拍实体冲出片 1 本体区,被片 2 接住;迁移链属 AC2 已验
+        // 面本测试不展开)——两路对照取并集口径:任一片查到即终态。
+        let two_shard_end = sched
+            .entity_state(shard_id(1, 0), e)
+            .or_else(|| sched.entity_state(shard_id(0, 0), e))
+            .or_else(|| sched.entity_state(shard_id(2, 0), e))
+            .expect("实体仍在两片走廊的某一片");
+        sched.shutdown();
+
+        // 单世界参考:整走廊单 ShardSim(chunk 0..16 全量装载,同格直接 SetBlock;
+        // 凝固桥关闭)。不经广播路径——两路终态位移差 < 1e-4 m。
+        let mut single = {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        for cx in 0..16 {
+            single.load_chunk(types::ChunkPos::new(cx, 0), ground_chunk());
+        }
+        single.apply_prefix(&[
+            StampedInput {
+                apply_at: Tick(0),
+                source: InputSource(1),
+                sequence: 0,
+                payload: InputPayload::Command(SimCommand::SetBlock {
+                    pos: step,
+                    block: types::BlockId(1),
+                }),
+            },
+            StampedInput {
+                apply_at: Tick(1),
+                source: InputSource(7),
+                sequence: 0,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: types::EntityState {
+                        translation: Vec3::new(100.0, 65.5, 8.0),
+                        linvel: Vec3::new(60.0, 0.0, 0.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+        ]);
+        // 44 步物理(拍 1..44 各一步;apply_at=1 的输入在首步前应用)。
+        for _ in 1..TICKS {
+            single.step();
+        }
+        let single_end = single.entity_state(e).expect("单世界实体常驻");
+        let d = two_shard_end.translation - single_end.translation;
+        assert!(
+            d.x.abs() < 1e-4 && d.y.abs() < 1e-4 && d.z.abs() < 1e-4,
+            "边界编辑后双片 vs 单世界终态位移差超限:Δ=({},{},{}) m",
+            d.x,
+            d.y,
+            d.z
+        );
+    }
+
+    /// is_chunk_loaded 透传:已装载 true、未装载 false、未注册分片 false。
+    #[test]
+    fn is_chunk_loaded_passthrough() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        let cp = types::ChunkPos::new(2, 3);
+        assert!(!sched.is_chunk_loaded(shard_id(0, 0), cp), "未装载 → false");
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        assert!(sched.is_chunk_loaded(shard_id(0, 0), cp), "已装载 → true");
+        assert!(
+            !sched.is_chunk_loaded(shard_id(9, 9), cp),
+            "未注册分片 → false"
+        );
         sched.shutdown();
     }
 }

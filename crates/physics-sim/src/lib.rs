@@ -19,5 +19,5 @@ mod conv;
 mod solidify;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
-pub use sim::{Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
+pub use sim::{BlockWrite, BlockWriteKind, Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
 pub use snapshot::SimSnapshotError;

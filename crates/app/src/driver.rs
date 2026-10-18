@@ -91,9 +91,14 @@ type CommandGuard = Result<(), &'static str>;
 /// 各变体的模拟侧权威判定对齐:
 /// - 路由分片未注册 → 丢弃(调度器 `Scheduler::submit` 对未注册分片
 ///   fail-stop;ensure 只对观察者所在分片惰性建片,命令目标不在其列);
-/// - `SetBlock` → y 界内(`WORLD_Y_MIN..=WORLD_Y_MAX`,与
+/// - `SetBlock` → ① y 界内(`WORLD_Y_MIN..=WORLD_Y_MAX`,与
 ///   `VoxelEdit::apply` / `VoxelWorld::set_block` 同界;x/z 无界——set_block
-///   自动建 chunk);
+///   自动建 chunk);② owner 匹配:路由分片 == 由 `pos.chunk_of()` + 分片
+///   world/dimension 组装的归属分片(REQ-005 §4.1.2,`Scheduler::owner_of`
+///   同口径;不匹配的投递会命中广播校验 `SessionError::Rejected`,先拦);
+///   ③ chunk 已加载(REQ-005 任务 01,语义细则 7:`VoxelWorld::set_block`
+///   会自动建空气 chunk,之后生成器/持久化会把地形覆盖成空气——未加载
+///   chunk 的外部 SetBlock 必须丢弃,不自动建片);
 /// - `RemoveEntity` / `TeleportEntity` / `MarkActor` → 实体存在(按信息性
 ///   路由分片查 `entity_state`——`command_shard` 换算口径;迁移中的实体在
 ///   原 origin 分片表内,查询同键);
@@ -111,11 +116,23 @@ pub fn validate_external_command(
     }
     match command {
         messaging::SimCommand::SetBlock { pos, .. } => {
-            if (WORLD_Y_MIN..=WORLD_Y_MAX).contains(&pos.y) {
-                Ok(())
-            } else {
-                Err("SetBlock y 越界")
+            if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&pos.y) {
+                return Err("SetBlock y 越界");
             }
+            // owner 匹配(REQ-005 §4.1.2):路由分片必须 == 归属分片
+            // (world/dimension 取自分片身份,单世界单维度下恒等,仍按
+            // 组装口径判——与 session 广播校验同源,hostile 不投)。
+            let true_owner = shard::Scheduler::owner_of(shard, pos.chunk_of());
+            if shard != true_owner {
+                return Err("SetBlock owner 不匹配(非归属分片)");
+            }
+            // chunk 已加载(REQ-005 任务 01 语义细则 7):未加载 chunk 的
+            // 外部 SetBlock 必须拒绝——set_block 会自动建空气 chunk,之后
+            // 生成器/持久化会把地形覆盖成空气。
+            if !session.is_chunk_loaded(shard, pos.chunk_of()) {
+                return Err("SetBlock 目标 chunk 未加载");
+            }
+            Ok(())
         }
         messaging::SimCommand::RemoveEntity { entity }
         | messaging::SimCommand::TeleportEntity { entity, .. } => {
@@ -135,6 +152,52 @@ pub fn validate_external_command(
         messaging::SimCommand::SpawnDynamic { .. }
         | messaging::SimCommand::Detonate { .. }
         | messaging::SimCommand::SetObserverPosition { .. } => Ok(()),
+    }
+}
+
+/// 外部命令的统一投递(REQ-005 §4.1.2 / 任务书 req005-consistency/01;
+/// commands 通道与网络上行两条 Send 路径共用一处收口):
+/// - `SetBlock` → `session.set_block`(同拍广播 owner + holders,每个目标
+///   一条 [`LogEntry`],整批原子)→ 全部入日志;
+/// - 其余命令照旧单分片 `session.send` → 入日志;
+/// - `Err(Rejected)`(owner 不匹配/不支持的广播命令)→ eprintln + 计数,
+///   不断链(hostile 路径丢弃;先经 [`validate_external_command`] 预检,
+///   正常不可达,防御层兜底);
+/// - `Err(Route(InboxFull))` → 只计数,不断链(反压);
+/// - 其它 Err → panic(非反压的会话层失败,fail-stop)。
+fn dispatch_external(
+    session: &mut sim_api::session::Session,
+    log: &mut sim_api::log::CommandLog,
+    commands_rejected: &mut u64,
+    shard: types::ShardId,
+    command: messaging::SimCommand,
+) {
+    let result = if matches!(command, messaging::SimCommand::SetBlock { .. }) {
+        let (pos, block) = match command {
+            messaging::SimCommand::SetBlock { pos, block } => (pos, block),
+            _ => unreachable!("上方 matches 已判定"),
+        };
+        // 广播路径:返回全目标的 LogEntry(dest 升序,同盖章),逐条入日志。
+        session.set_block(shard, pos, block).map(|entries| {
+            entries.iter().for_each(|entry| log.append(entry.clone()));
+        })
+    } else {
+        // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
+        session.send(shard, command).map(|entry| log.append(entry))
+    };
+    match result {
+        Ok(()) => {}
+        Err(sim_api::session::SessionError::Rejected(why)) => {
+            eprintln!("[driver] 外部命令拒绝(广播校验):{why}");
+            *commands_rejected += 1;
+        }
+        Err(sim_api::session::SessionError::Route(shard::router::RouteError::InboxFull {
+            ..
+        })) => {
+            // 反压:只计数,不断链(与既有命令分支同款)。
+            *commands_rejected += 1;
+        }
+        Err(other) => panic!("会话发送失败(非反压):{other:?}"),
     }
 }
 
@@ -422,23 +485,9 @@ impl ObserveOrchestrator {
                         *commands_rejected += 1;
                         return;
                     }
-                    match session.send(shard, command) {
-                        Ok(entry) => {
-                            // BlockUpdates 源①(任务书 03 编排 ④):外部
-                            // SetBlock 成功发送 → 镜像(格位 → 写入值)。
-                            if let messaging::SimCommand::SetBlock { pos, block } = entry.command {
-                                self.record_external_set_block(pos, block);
-                            }
-                            log.append(entry);
-                        }
-                        Err(sim_api::session::SessionError::Route(
-                            shard::router::RouteError::InboxFull { .. },
-                        )) => {
-                            // 反压:只计数,不断链(与既有命令分支同款)。
-                            *commands_rejected += 1;
-                        }
-                        Err(other) => panic!("会话发送失败(非反压):{other:?}"),
-                    }
+                    // 统一投递收口(REQ-005):SetBlock 走广播(每目标一条
+                    // LogEntry 全入日志),其余单发;反压/拒绝计数不断链。
+                    dispatch_external(session, log, commands_rejected, shard, command);
                 }
                 DriverCommand::Shutdown | DriverCommand::StreamChunks { .. } => {
                     // 网络上行不含这两类(关机走 commands 通道;chunk 流回执
@@ -449,18 +498,16 @@ impl ObserveOrchestrator {
         }
     }
 
-    /// 外部 SetBlock 成功发送镜像(README 决策 9:BlockUpdates 源 = 驱动镜像
-    /// 的外部 SetBlock + take_solidified;**路径无关**——commands 通道与网络
-    /// 上行两条 Send 路径同权镜像,任务书 03 编排 ④)。
-    fn record_external_set_block(&mut self, pos: types::BlockPos, block: types::BlockId) {
-        self.pending_blocks.insert(pos, block);
-    }
-
-    /// 方块变更源积累(任务书 03 编排 ④ 源侧):`take_solidified` 凝固写入
-    /// 镜像(外部 SetBlock 镜像在 `consume_net_up` 的 Send 成功处)。后写
-    /// 覆盖先写(格位键);下一个输出点按视距覆盖广播(单包合并)后清空。
+    /// 方块变更源积累(REQ-005 D11:统一从 `session.take_block_updates()` 取
+    /// 外部 SetBlock 的 owner 写入——不再镜像驱动侧发送;后接
+    /// `take_solidified()` 凝固写入,本任务保留,任务 03 迁 Emergent)。
+    /// 后写覆盖先写(格位键;同格凝固覆盖外部);下一个输出点按视距覆盖
+    /// 广播(单包合并)后清空。
     fn record_block_changes(&mut self, session: &mut sim_api::session::Session) {
         // (shard, 格, 值):单世界单维度,BlockPos 即全局格位,shard 仅信息性。
+        for (_shard, cell, block) in session.take_block_updates() {
+            self.pending_blocks.insert(cell, block);
+        }
         for (_shard, cell, block) in session.take_solidified() {
             self.pending_blocks.insert(cell, block);
         }
@@ -639,8 +686,6 @@ fn orchestrate(
     // `ensure_radius`(= awake_unload_radius,默认 32m)内的所有分片都
     // ensure——醒着实体的迁移目的地/扩张副本的 owner 必在其中(醒着要求
     // 观察者 24m 内,32m 有裕度);同拍去重,计数并入 shards_spawned。
-    // (Router pending destinations 的驱动接线需 sim-api 透传,留任务 01;
-    // 黑洞兜底由 Scheduler::tick 的信封黑洞 fail-stop 承担,见偏离说明。)
     let mut ensured: std::collections::BTreeSet<types::ShardId> = std::collections::BTreeSet::new();
     for (_source, position) in session.observers() {
         for shard in shards_within(position, ensure_radius) {
@@ -648,6 +693,17 @@ fn orchestrate(
                 session.register(new_sim(shard));
                 counters.shards_spawned += 1;
             }
+        }
+    }
+
+    // ①′ 迁移目的地 ensure(REQ-005 D5/§4.1.4):Router 待投递信封的目的
+    // 分片逐个 ensure——保证下一拍 tick() 开头的「信封黑洞」不变量不触发
+    // (目的分片已注册)。观察者邻片 ensure 覆盖常规路径,此处是兜底
+    // (队列里可能沉有早于观察者移动产生的信封)。
+    for dest in session.pending_shard_destinations() {
+        if ensured.insert(dest) && !session.shard_ids().contains(&dest) {
+            session.register(new_sim(dest));
+            counters.shards_spawned += 1;
         }
     }
 
@@ -944,28 +1000,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                             commands_rejected += 1;
                             continue;
                         }
-                        // send + append(决策 5:先缝后日志,失败即不发)。
-                        match session.send(shard, command) {
-                            Ok(entry) => {
-                                // BlockUpdates 源①(README 决策 9,任务书 03):
-                                // 外部 SetBlock 成功发送镜像——路径无关
-                                //(commands 通道与网络上行的 Send 同权)。
-                                if let Some((orchestrator, ..)) = observe_state.as_mut()
-                                    && let messaging::SimCommand::SetBlock { pos, block } =
-                                        entry.command
-                                {
-                                    orchestrator.record_external_set_block(pos, block);
-                                }
-                                log.append(entry);
-                            }
-                            Err(sim_api::session::SessionError::Route(
-                                shard::router::RouteError::InboxFull { .. },
-                            )) => {
-                                // 反压:只计数,不断链(任务书语义细则 2)。
-                                commands_rejected += 1;
-                            }
-                            Err(other) => panic!("会话发送失败(非反压):{other:?}"),
-                        }
+                        // 统一投递收口(REQ-005;先缝后日志由收口内保证,失败
+                        // 即不入日志):SetBlock 广播全目标入日志,其余单发;
+                        // 反压/拒绝只计数,不断链(任务书语义细则 2)。
+                        dispatch_external(&mut session, &mut log, &mut commands_rejected, shard, command);
                     }
                     Some(DriverCommand::MoveObserver { position }) => {
                         // 观察者移动(REQ-002 §4.2 生产入口):盖章 + 专用收件箱
@@ -1875,6 +1913,411 @@ mod tests {
         assert_eq!(outcome.chunks_unloaded, 0, "无观察者:不卸载");
     }
 
+    // ---- 任务书 req005-consistency/01:外部编辑门卫 / outbox 源 / 持久化归属 ----
+
+    /// 起一个预注册分片 (0,0)、手工装载 chunk(0,0) 与 chunk(8,0) 的会话
+    /// (chunk (8,0) 的 owner = 片 (1,0),扩张副本语义;分片 (1,0) 不注册时
+    /// 装载会被 owner-在位校验拦下,故同时注册空片 (1,0))。
+    fn session_two_loaded_chunks(config: &Config) -> sim_api::session::Session {
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        // chunk (8,0):owner = 片 (1,0);片 (1,0) 装自己的本体 chunk。
+        session.apply_chunk_load(
+            shard_id(1, 0),
+            types::ChunkPos::new(8, 0),
+            voxel::Chunk::air(),
+        );
+        session
+    }
+
+    /// 任务书测试 `setblock_unloaded_chunk_rejected`:外部 SetBlock 落在未加载
+    /// chunk → 驱动丢弃(commands_rejected 计数),**不自动建空气 chunk**
+    /// (副作用面:该 chunk 在 sim 内仍不存在;加载态 chunk 的同型命令照常
+    /// 生效作对照)。
+    #[tokio::test(start_paused = true)]
+    async fn setblock_unloaded_chunk_rejected() {
+        let config = test_config(600);
+        let session = session_two_loaded_chunks(&config);
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        // 未加载 chunk(3,3) 的 SetBlock(路由分片 (0,0) 已注册、y 界内)。
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(56, 5, 56), // chunk (3,3) 未装载
+                block: types::BlockId(1),
+            },
+        )
+        .await;
+        // 对照:已加载 chunk (0,0) 内的 SetBlock 照常生效。
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(4, 5, 4),
+                block: types::BlockId(1),
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert_eq!(outcome.commands_rejected, 1, "未加载 chunk 命令恰拒 1 条");
+
+        // 副作用面:终末快照恢复后,未加载 chunk 不得被自动建成空气 chunk。
+        let bundle = latest_bundle(&checkpoints);
+        let bytes = bundle
+            .snapshot
+            .per_shard
+            .get(&shard_id(0, 0))
+            .expect("分片 (0,0) 在快照");
+        let restored =
+            ShardSim::restore(bytes, Box::new(SimpleRegistry::builtin())).expect("自有快照");
+        assert!(
+            restored
+                .voxel()
+                .get_chunk(types::ChunkPos::new(3, 3))
+                .is_none(),
+            "未加载 chunk 未被自动建空气 chunk(set_block 的自动建路径未触发)"
+        );
+        assert_eq!(
+            restored.voxel().get_block(types::BlockPos::new(4, 5, 4)),
+            types::BlockId(1),
+            "对照:已加载 chunk 的编辑照常生效"
+        );
+    }
+
+    /// 任务书测试 `network_block_updates_from_outbox`:网络 SetBlock 成功 →
+    /// 客户端收 BlockUpdates,**不再依赖驱动镜像**(镜像已删,源 =
+    /// `take_block_updates`)。观察者在场(ensure 建片 + 激活装载 → chunk
+    /// 已加载,SetBlock 不被新门卫拦截)。
+    #[tokio::test(start_paused = true)]
+    async fn network_block_updates_from_outbox() {
+        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _id = join_player(&mut c, 4).await;
+        // 观察者就位 → 编排 ensure 分片 + 激活装载(1 拍 ensure,装载晚一拍)。
+        inject_move(&tx, Vec3::new(8.0, 3.0, 8.0)).await;
+        advance_ticks(3).await;
+
+        // 网络 SetBlock(走 send_broadcast 广播;单分片下目标 = owner 一个)。
+        tx.send(DriverCommand::Send {
+            shard: shard_id(0, 0),
+            command: messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(4, 3, 4),
+                block: types::BlockId(1),
+            },
+        })
+        .await
+        .expect("命令仍存活");
+        advance_ticks(6).await;
+
+        // 客户端收 BlockUpdates(软窗:与 EntityStates/ChunkData 混流跳过)。
+        let mut got = false;
+        for _ in 0..320 {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await;
+            match frame {
+                Ok(Ok(S2C::BlockUpdates { updates })) => {
+                    if updates.contains(&(types::BlockPos::new(4, 3, 4), types::BlockId(1))) {
+                        got = true;
+                        break;
+                    }
+                }
+                Ok(Ok(_)) => {}
+                _ => {}
+            }
+        }
+        assert!(got, "SetBlock 经 outbox 源广播 BlockUpdates(非驱动镜像)");
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// 任务书测试 `single_shard_regression`:单分片 SetBlock/网络命令行为不变
+    /// ——合法 SetBlock 生效(终态快照可查)、日志一条、无拒绝计数。
+    #[tokio::test(start_paused = true)]
+    async fn single_shard_regression() {
+        let config = test_config(600);
+        // 单分片 + 手工装载目标 chunk(不经激活编排,消除观察者依赖)。
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(4, 5, 4),
+                block: types::BlockId(1),
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert_eq!(outcome.commands_rejected, 0, "合法命令零拒绝");
+
+        // 日志一条(单分片 = 单目标一条 LogEntry)且生效。
+        let bundle = latest_bundle(&checkpoints);
+        let entries = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
+            .expect("自有编码必可解码")
+            .take();
+        assert_eq!(entries.len(), 1, "单分片 SetBlock = 一条日志");
+        assert_eq!(entries[0].dest, shard_id(0, 0));
+        let bytes = bundle
+            .snapshot
+            .per_shard
+            .get(&shard_id(0, 0))
+            .expect("快照");
+        let restored =
+            ShardSim::restore(bytes, Box::new(SimpleRegistry::builtin())).expect("自有快照");
+        assert_eq!(
+            restored.voxel().get_block(types::BlockPos::new(4, 5, 4)),
+            types::BlockId(1),
+            "SetBlock 行为不变(体素生效)"
+        );
+    }
+
+    /// 任务书测试 `non_owner_unload_does_not_persist` + `owner_unload_persists_edit`
+    /// 的合场景:两片各持一份边界 chunk(片 (0,0) 持本体 (0,0) 与片 (1,0)
+    /// 本体的扩张副本 (8,0)),SetBlock(130,10,4) 广播两片后,观察者不在场
+    /// + despawn 窗口 0 → 两片先后 despawn(shard 升序:非 owner 片 (0,0)
+    /// 先卸——其扩张副本被丢弃**不写库**;owner 片 (1,0) 后卸——写库)。
+    /// 库内 chunk (8,0) 必为编辑值:若非 owner 也写库且后写覆盖,先卸的
+    /// 旧副本不会出现——D6「卸载顺序任意、不后写覆盖」的回归面。
+    #[tokio::test(start_paused = true)]
+    async fn non_owner_unload_does_not_persist() {
+        let mut config = test_config(600);
+        config.despawn_after_secs = 0; // 空片当拍即 despawn 候选
+        let mut session = session_two_loaded_chunks(&config);
+        // 片 (0,0) 作为 holder 装载片 (1,0) 本体的扩张副本(margin=1 允许;
+        // 装载校验:owner 片 (1,0) 已注册)。
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(8, 0),
+            voxel::Chunk::air(),
+        );
+
+        // 共享 chunk 库句柄:驱动 put 后测试侧直接读(mem 后端等价"重开库")。
+        #[derive(Clone, Default)]
+        struct SharedChunks(Arc<Mutex<storage::mem::MemChunkStore>>);
+
+        impl storage::traits::ChunkStore for SharedChunks {
+            fn put_batch(
+                &mut self,
+                batch: &[(storage::traits::ChunkKey, voxel::Chunk)],
+            ) -> Result<(), storage::traits::StoreError> {
+                self.0.lock().expect("chunk 锁毒化").put_batch(batch)
+            }
+            fn get(
+                &self,
+                key: storage::traits::ChunkKey,
+            ) -> Result<Option<voxel::Chunk>, storage::traits::StoreError> {
+                self.0.lock().expect("chunk 锁毒化").get(key)
+            }
+            fn len(&self) -> Result<usize, storage::traits::StoreError> {
+                self.0.lock().expect("chunk 锁毒化").len()
+            }
+            fn is_empty(&self) -> Result<bool, storage::traits::StoreError> {
+                self.0.lock().expect("chunk 锁毒化").is_empty()
+            }
+        }
+        let chunks_shared = SharedChunks::default();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let store = storage::worker::StoreWorker::new(
+            Box::new(chunks_shared.clone()),
+            Box::new(SharedCheckpoints::default()),
+        );
+        let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
+            Box::new(SimpleRegistry::builtin())
+        });
+        let driver = tokio::spawn(run(DriverArgs {
+            config,
+            session,
+            store,
+            log: sim_api::log::CommandLog::new(),
+            commands: rx,
+            listen_ctrl_c: false,
+            provider,
+            new_sim,
+            observe: None,
+        }));
+
+        // 编辑 chunk (8,0)(owner = 片 (1,0);两片各持一份 → 广播两片)。
+        inject_send(
+            &tx,
+            shard_id(1, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(130, 10, 4),
+                block: types::BlockId(2),
+            },
+        )
+        .await;
+        advance_ticks(3).await;
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert!(
+            outcome.shards_despawned >= 2,
+            "前置:两片(空+无票,窗口 0)先后 despawn,实 {}",
+            outcome.shards_despawned
+        );
+
+        // 库内 chunk (8,0) = 编辑值:owner 卸载写库;非 owner 先卸的扩张副本
+        // 未写库(否则旧空气值已覆盖编辑)。
+        let key = storage::traits::ChunkKey {
+            world: types::WorldId(0),
+            dim: types::DimensionId(0),
+            pos: types::ChunkPos::new(8, 0),
+        };
+        let stored = storage::traits::ChunkStore::get(&*chunks_shared.0.lock().expect("锁"), key)
+            .expect("读库不失败")
+            .expect("owner 卸载已落库");
+        assert_eq!(
+            stored.get(2, 74, 4),
+            types::BlockId(2),
+            "owner 卸载写库:取回编辑值(局部 (2,74,4) = 世界 (130,10,4))"
+        );
+        // owner_unload_persists_edit 的重载面:同一库句柄再取(chunk 全量
+        // 往返 == 期望构造)——重开 redb 的进程重启面由 e2e AC-G6 覆盖。
+        let mut expected = voxel::Chunk::air();
+        expected.set(2, 74, 4, types::BlockId(2));
+        assert_eq!(stored, expected, "owner 卸载的 chunk 内容完整(全量)");
+        assert!(
+            outcome.chunks_unloaded >= 2,
+            "owner chunk 卸载计数兑现(扩张副本不计)"
+        );
+    }
+
+    /// 任务书测试 `owner_unload_persists_edit`(owner 卸载 → `Some(编辑后
+    /// chunk)`,重载取回编辑):单分片持自己的 chunk,编辑 → despawn 落库 →
+    /// 分片重活(观察者回归 ensure)→ 激活装载命中持久层编辑值(终末快照
+    /// 验证模拟侧取回;库侧直接读)。与 `non_owner_unload_does_not_persist`
+    /// 分立:本测试单分片,钉「owner 卸载确写库、重载确取回」的正样本。
+    #[tokio::test(start_paused = true)]
+    async fn owner_unload_persists_edit() {
+        let mut config = test_config(600);
+        config.despawn_after_secs = 0;
+        config.activation.cooldown_secs = 0;
+        config.swap_budget_chunks_per_tick = 14;
+        let session = sim_api::session::Session::new(config.session_config());
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        // ① 进区:ensure 建片 (1,0) + 激活装载 chunk (12,0)(superflat)。
+        inject_move(&tx, Vec3::new(200.0, GROUND_TOP_Y, 8.0)).await;
+        advance_ticks(4).await;
+        // ② 编辑(chunk (12,0) 已激活装载;stone → dirt 可区分)。
+        inject_send(
+            &tx,
+            shard_id(1, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(200, types::WORLD_Y_MIN, 8),
+                block: types::BlockId(2),
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+        // ③ 远走:卸载(despawn 窗口 0,空片无票即候选)→ owner 卸载写库。
+        inject_move(&tx, Vec3::new(50_000.0, 0.0, 8.0)).await;
+        advance_ticks(150).await;
+        // ④ 回归:ensure 复活 → 激活装载命中持久层 → 模拟侧取回编辑值。
+        inject_move(&tx, Vec3::new(200.0, GROUND_TOP_Y, 8.0)).await;
+        advance_ticks(8).await;
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert!(
+            outcome.shards_despawned >= 1,
+            "前置:owner 片 despawn(卸载写库)"
+        );
+        assert!(outcome.shards_spawned >= 2, "前置:复活 ensure(初生 + 回归)");
+
+        // 模拟侧重载面:终末快照恢复后 chunk (12,0) 的编辑格 = dirt。
+        let bundle = latest_bundle(&checkpoints);
+        let bytes = bundle
+            .snapshot
+            .per_shard
+            .get(&shard_id(1, 0))
+            .expect("复活的 owner 片在终末快照");
+        let restored =
+            ShardSim::restore(bytes, Box::new(SimpleRegistry::builtin())).expect("自有快照");
+        assert_eq!(
+            restored
+                .voxel()
+                .get_block(types::BlockPos::new(200, types::WORLD_Y_MIN, 8)),
+            types::BlockId(2),
+            "重载取回编辑值(owner 卸载写库 → 复活装载命中持久层)"
+        );
+    }
+
+    /// 任务书测试 `pending_destination_ensured_before_next_tick`:拍内产生
+    /// 迁移信封(pending 目的分片)后 orchestrate → 目的分片已注册,
+    /// 下一拍 tick() 不触发信封黑洞 fail-stop(ensure 后才进下一拍)。
+    /// 驱动级编排经 run 驱动:观察者贴边界造迁移 → despawn 候选清空目的片
+    /// 的对立面不可达(空片才 despawn)——直接以「观察者驱动 + pending 目的
+    /// 分片被 ①′ ensure」为断言面。
+    #[tokio::test(start_paused = true)]
+    async fn pending_destination_ensured_before_next_tick() {
+        // 场景:观察者站分片 (0,0) 深处 → ensure 建片 + 装载;注入高速实体
+        // 冲向分片 (1,0)(拍内产生迁移信封,pending 目的 = 片 (1,0));下一拍
+        // tick 前编排 ①′ 必须已 ensure 片 (1,0)——若漏,下一拍 tick 开头
+        // 「信封黑洞」fail-stop panic,驱动任务连坐(测试以驱动不 panic +
+        // shards_spawned 计数兑现为判据)。
+        let config = test_config(600);
+        let session = sim_api::session::Session::new(config.session_config());
+        let (args, tx, _checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        // 观察者就位(ensure 片 (0,0))+ 装载窗口。
+        inject_move(&tx, Vec3::new(8.0, 3.0, 8.0)).await;
+        advance_ticks(2).await;
+        // 高速实体(linvel 600 m/s ≈ 10 m/tick):出生 8 拍后必越 x=128 边界,
+        // 产生发往片 (1,0) 的迁移信封。
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnDynamic {
+                entity: EntityId::from_parts(1, 1),
+                state: EntityState {
+                    translation: Vec3::new(48.0, 3.0, 8.0),
+                    linvel: Vec3::new(600.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            },
+        )
+        .await;
+        // 实体出生拍不在片 (0,0) 装载区也无妨(虚空运动):8 拍内越界。
+        // 每拍末编排读 pending destinations 并 ensure 片 (1,0)——黑洞不变量
+        // 在后续每拍 tick 开头校验,漏 ensure 即 panic(驱动连坐)。
+        advance_ticks(20).await;
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver
+            .await
+            .expect("驱动不 panic(pending 目的片已被 ①′ ensure)");
+        assert!(
+            outcome.shards_spawned >= 2,
+            "片 (0,0)(观察者)与片 (1,0)(pending 目的)都被 ensure,实 {}",
+            outcome.shards_spawned
+        );
+    }
+
     // ---- 任务书 req003-net/03:观察输出编排与出站背压(测试清单)----
 
     use crate::net::{NetConfig, OutboundHub, serve};
@@ -2276,6 +2719,10 @@ mod tests {
         // 两拍:第 1 拍命令分支收下 MoveObserver(盖章),第 2 拍 tick 分支
         // 应用观察者 + 编排 ① ensure 分片(命令分支优先级最低,1 拍不够)。
         advance_ticks(2).await;
+        // REQ-005 任务 01 适配(既有测试最小适配,单列汇报):外部 SetBlock
+        // 新增「chunk 已加载」门卫(未加载 chunk 不再自动建空气 chunk)——
+        // 等激活装载完成(2 + 4 拍裕度)再编辑,载荷与断言不变。
+        advance_ticks(4).await;
 
         // 原点旁 SetBlock(距 A 5m,距 B ~2000m)。
         let _ = id_a;

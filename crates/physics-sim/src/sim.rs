@@ -11,7 +11,8 @@ use rapier3d::prelude::*;
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
 use types::{
-    BlockPos, CHUNK_SIZE, ChunkPos, EntityDesc, EntityId, EntityState, SHARD_CHUNKS, ShardId, Tick,
+    BlockId, BlockPos, CHUNK_SIZE, ChunkPos, EntityDesc, EntityId, EntityState, SHARD_CHUNKS,
+    ShardId, Tick,
 };
 use voxel::{BlockRegistry, Chunk, VoxelEdit, VoxelWorld};
 
@@ -85,6 +86,25 @@ impl ShardSimConfig {
     }
 }
 
+/// 方块写入来源(REQ-005 D11):外部命令(同拍广播,本任务)或涌现
+/// (凝固桥/未来破坏,下一拍信封,任务 03 接入)。追加枚举:声明序即序号。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BlockWriteKind {
+    /// 外部 SetBlock(同拍广播到 owner + holders)。
+    External,
+    /// 涌现写入(凝固桥等;任务 03 起产出版本)。
+    Emergent,
+}
+
+/// 一次方块写入(REQ-005 D11:网络/持久化统一从 `Outbox.block_updates` 取,
+/// 不再靠驱动镜像外部命令)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockWrite {
+    pub pos: BlockPos,
+    pub block: BlockId,
+    pub kind: BlockWriteKind,
+}
+
 /// 本 tick 产出(调度器消费):迁移意图、collider 重建过的 chunk、凝固记录。
 /// 可序列化 + 可克隆(快照携带未消费的产出,任务书 01 细则 1)。
 #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
@@ -95,6 +115,13 @@ pub struct Outbox {
     pub dirty_chunks: BTreeSet<ChunkPos>,
     /// 凝固完成记录:(实体, 写入的格)。
     pub solidified: Vec<(EntityId, BlockPos)>,
+    /// 本拍物理/命令产生的方块写入(REQ-005 D11;本任务只产生 `External`,
+    /// 凝固桥仍走 `solidified`——任务 03 迁 `Emergent` 并经信封)。快照格式
+    /// 随本字段变更:bincode 为非自描述定长格式,旧检查点(三字段 Outbox)
+    /// 用新二进制解码必报 UnexpectedEnd(bootstrap 显式 fail-stop,不静默
+    /// 错);`#[serde(default)]` 在此格式下对缺失尾字段不生效,不可用它声称
+    /// 旧快照兼容。格式版本化由任务 02 的 format_version 处理。
+    pub block_updates: Vec<BlockWrite>,
 }
 
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
@@ -442,6 +469,14 @@ impl ShardSim {
                         for cp in expand_boundary(dirty, &self.voxels) {
                             self.rebuild_chunk_collider(cp);
                         }
+                        // 方块写入统一出口(REQ-005 D11):外部命令成功写体素
+                        // 后记 `External`;调度器 `take_block_updates` 只发布
+                        // owner 的条目(非 owner 副本的条目由调度器丢弃)。
+                        self.outbox.block_updates.push(BlockWrite {
+                            pos,
+                            block,
+                            kind: BlockWriteKind::External,
+                        });
                     }
                     Err(e) => panic!("SetBlock 越界(fail-stop):{e}"),
                 }
@@ -1155,5 +1190,69 @@ mod tests {
                 "逐条状态与单查一致:{id:?}"
             );
         }
+    }
+
+    // ---- 任务书 req005-consistency/01:block write outbox(REQ-005 D11) ----
+
+    /// 任务书测试(block write outbox):SetBlock 写体素成功 → `take_outbox()`
+    /// 的 `block_updates` 含恰一条 `External` 写入(pos/block 逐字段一致);
+    /// 凝固桥路径不产生本字段条目(任务 03 迁 Emergent)。
+    #[test]
+    fn setblock_records_external_block_write_in_outbox() {
+        let mut s = sim(0, 0);
+        // 装载一块地面(写体素前 chunk 必须在;VoxelEdit 会自动建 chunk,
+        // 但本测试要证明的是"已加载格写入也记录",与自动建路径无涉)。
+        s.load_chunk(types::ChunkPos::new(0, 0), voxel::Chunk::air());
+        let pos = BlockPos::new(3, 5, 4);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource(1),
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SetBlock {
+                pos,
+                block: types::BlockId(2),
+            }),
+        }]);
+        let outbox = s.take_outbox();
+        assert_eq!(
+            outbox.block_updates,
+            vec![BlockWrite {
+                pos,
+                block: types::BlockId(2),
+                kind: BlockWriteKind::External,
+            }],
+            "SetBlock 成功 → outbox 恰一条 External 写入"
+        );
+        assert!(outbox.solidified.is_empty(), "凝固桥路径不在本字段");
+        // 体素确已写入。
+        assert_eq!(s.voxel().get_block(pos), types::BlockId(2));
+    }
+
+    /// 快照携带(REQ-005 D11):含未消费 block_updates 的新格式快照往返一致
+    /// (仅自有新格式;旧格式检查点与本字段不兼容,见 Outbox::block_updates
+    /// 注释——bincode 非自描述,不存在"旧字节补默认值"路径)。
+    #[test]
+    fn outbox_block_updates_survive_snapshot() {
+        let mut s = sim(0, 0);
+        s.load_chunk(types::ChunkPos::new(0, 0), voxel::Chunk::air());
+        let pos = BlockPos::new(1, 2, 3);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource(1),
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SetBlock {
+                pos,
+                block: types::BlockId(1),
+            }),
+        }]);
+        // 不 take_outbox:未消费产出随快照走(任务书 01 细则 1)。
+        let bytes = s.snapshot();
+        let mut restored = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        assert_eq!(
+            restored.take_outbox().block_updates,
+            s.take_outbox().block_updates,
+            "未消费的 block_updates 随快照往返"
+        );
     }
 }

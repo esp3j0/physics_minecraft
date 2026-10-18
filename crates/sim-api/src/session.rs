@@ -29,7 +29,9 @@ impl Default for SessionConfig {
     }
 }
 
-/// 会话层可预期失败:路由(收件箱满)与快照恢复(残缺字节)透传。
+/// 会话层可预期失败:路由(收件箱满)与快照恢复(残缺字节)透传;
+/// `Rejected` = 广播路径的校验拒绝(owner 不匹配 / 不支持的广播命令 /
+/// 目标未注册;hostile 路径由调用方丢弃,不 panic)。
 /// 其余(未注册分片、迟到输入、原始直投未登记)沿用调度器语义 → panic(fail-stop)。
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -37,6 +39,8 @@ pub enum SessionError {
     Route(#[from] RouteError),
     #[error("快照恢复失败:{0}")]
     Snapshot(#[from] SimSnapshotError),
+    #[error("命令被拒绝:{0}")]
+    Rejected(&'static str),
 }
 
 /// headless 会话:命令进/快照出(蓝图 §3 session;网络形状后置 REQ-003)。
@@ -103,6 +107,84 @@ impl Session {
         })
     }
 
+    /// 外部广播命令(REQ-005 D3,任务书 req005-consistency/01 签名固定):
+    /// dest = `owner` + 当前 holders(按 ShardId 升序去重);同一
+    /// apply_at/source/sequence(整批只 +1,不是每 dest +1);每个 dest 一条
+    /// [`LogEntry`](dest 升序);整批原子(`submit_batch` 任一收件箱满 → 全拒)。
+    ///
+    /// 校验(不过 → `Err(SessionError::Rejected)`,hostile 路径由调用方丢弃):
+    /// 本任务只支持 `SetBlock`;owner 必须确为 `command 作用位置` 的归属分片
+    /// (`pos.chunk_of()` + world/dim 组装,与 [`Scheduler::owner_of`] 同口径)
+    /// 且已注册。收件箱满 → `Err(SessionError::Route)`(不消耗 sequence)。
+    pub fn send_broadcast(
+        &mut self,
+        owner: ShardId,
+        command: SimCommand,
+    ) -> Result<Vec<LogEntry>, SessionError> {
+        let pos = match command {
+            SimCommand::SetBlock { pos, .. } => pos,
+            _ => return Err(SessionError::Rejected("不支持的广播命令(仅 SetBlock)")),
+        };
+        let chunk = pos.chunk_of();
+        let true_owner = Scheduler::owner_of(owner, chunk);
+        if owner != true_owner {
+            return Err(SessionError::Rejected("owner 不匹配(非归属分片)"));
+        }
+        if !self.scheduler.shard_ids().contains(&owner) {
+            return Err(SessionError::Rejected("owner 分片未注册"));
+        }
+        // 目标集 = {owner} ∪ holders(owner, chunk),升序去重(BTreeSet);
+        // owner 一定在 holder 表里(它加载着该 chunk 才可能有这次编辑)。
+        let mut targets: std::collections::BTreeSet<ShardId> =
+            self.scheduler.holders_of(owner, chunk);
+        targets.insert(owner);
+        // 盖章:同一 apply_at/source/sequence(整批 +1);走 submit_batch(整批原子)。
+        let tick = self.scheduler.tick_now();
+        let sequence = self.next_sequence;
+        let stamped = StampedInput {
+            apply_at: tick,
+            source: self.source,
+            sequence,
+            payload: InputPayload::Command(command),
+        };
+        let targets: Vec<ShardId> = targets.into_iter().collect();
+        self.scheduler.submit_batch(&targets, stamped)?;
+        self.next_sequence += 1;
+        Ok(targets
+            .into_iter()
+            .map(|dest| LogEntry {
+                tick,
+                dest,
+                source: self.source,
+                sequence,
+                command,
+            })
+            .collect())
+    }
+
+    /// SetBlock 专用便捷入口(REQ-005 D3):校验 `pos` 的归属分片 == `owner`
+    /// 后组 `SetBlock` 走 [`Session::send_broadcast`](同款校验/原子性/日志)。
+    pub fn set_block(
+        &mut self,
+        owner: ShardId,
+        pos: BlockPos,
+        block: voxel::BlockId,
+    ) -> Result<Vec<LogEntry>, SessionError> {
+        self.send_broadcast(owner, SimCommand::SetBlock { pos, block })
+    }
+
+    /// 该分片是否已加载该 chunk(REQ-005 任务 01:外部 SetBlock 的未加载
+    /// chunk 门卫;Session → Scheduler → ShardSim 透传)。未注册分片 → false。
+    pub fn is_chunk_loaded(&self, shard: ShardId, pos: types::ChunkPos) -> bool {
+        self.scheduler.is_chunk_loaded(shard, pos)
+    }
+
+    /// Router 待投递信封的目的分片(REQ-005 D5;驱动 tick 末 ensure 用;
+    /// 调度器透传)。
+    pub fn pending_shard_destinations(&self) -> std::collections::BTreeSet<ShardId> {
+        self.scheduler.pending_shard_destinations()
+    }
+
     /// 原章输入直投(回放专用;不得用于普通路径,README 决策 8):
     /// 不重新盖章、不改 sequence,目的地由调用方显式给出(决策 9——
     /// `StampedInput` 不携带 dest,显式参数比内部登记表直白,无身份冲突面)。
@@ -166,6 +248,12 @@ impl Session {
     /// 写入的方块(世界坐标),取走即清(恰一次)。
     pub fn take_solidified(&mut self) -> Vec<(ShardId, BlockPos, voxel::BlockId)> {
         self.scheduler.take_solidified()
+    }
+
+    /// 调度器透传(REQ-005 D11;任务书 01 签名固定):本拍方块写入的 owner
+    /// 发布集(非 owner 副本的写入已由调度器丢弃),取走即清(恰一次)。
+    pub fn take_block_updates(&mut self) -> Vec<(ShardId, BlockPos, voxel::BlockId)> {
+        self.scheduler.take_block_updates()
     }
 
     /// 调度器透传(REQ-003 §4.4 观察输出源①;任务书 00):分片全实体表
@@ -687,6 +775,225 @@ mod tests {
         assert!(
             session.entity_states(shard).expect("表可达").is_empty(),
             "实体已凝固移除 → 全表为空"
+        );
+        session.shutdown();
+    }
+
+    // ---- 任务书 req005-consistency/01:外部编辑同拍广播(测试清单) ----
+
+    /// 两片装载同一边界 chunk(owner (0,0) + 扩张副本 (1,0))的会话。
+    fn session_two_holders() -> Session {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let cp = types::ChunkPos::new(7, 0); // owner = 片 (0,0)
+        session.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        session.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        session
+    }
+
+    /// 任务书测试 `setblock_broadcast_reaches_owner_and_holders`:两片持有同一
+    /// chunk;`set_block` 后下一拍两个 sim 的该格都变为新值。
+    #[test]
+    fn setblock_broadcast_reaches_owner_and_holders() {
+        let mut session = session_two_holders();
+        let (owner, holder) = (shard_id(0, 0), shard_id(1, 0));
+        let pos = BlockPos::new(120, 40, 8);
+        let entries = session
+            .set_block(owner, pos, types::BlockId(2))
+            .expect("两片收件箱均未满");
+        assert_eq!(entries.len(), 2, "owner + holder 各一条");
+        session.tick();
+        let cp = types::ChunkPos::new(7, 0);
+        for shard in [owner, holder] {
+            assert_eq!(
+                session
+                    .scheduler
+                    .voxel_chunk(shard, cp)
+                    .expect("已装载")
+                    .get(8, 104, 8),
+                types::BlockId(2),
+                "{shard:?} 的副本同拍变为新值"
+            );
+        }
+        session.shutdown();
+    }
+
+    /// 任务书测试 `setblock_broadcast_same_apply_at`:两片的广播输入 apply_at
+    /// 相同(同一盖章拍),下一拍同时生效。
+    #[test]
+    fn setblock_broadcast_same_apply_at() {
+        let mut session = session_two_holders();
+        let owner = shard_id(0, 0);
+        for _ in 0..3 {
+            session.tick();
+        }
+        let pos = BlockPos::new(120, 40, 8);
+        let entries = session
+            .set_block(owner, pos, types::BlockId(2))
+            .expect("收件箱未满");
+        assert_eq!(session.tick_now(), Tick(3));
+        assert!(
+            entries.iter().all(|e| e.tick == Tick(3)),
+            "全部条目同一 apply_at = 当前拍:{entries:?}"
+        );
+        // 生效前不应用。
+        assert!(
+            session
+                .scheduler
+                .voxel_chunk(shard_id(1, 0), types::ChunkPos::new(7, 0))
+                .expect("已装载")
+                .get(8, 104, 8)
+                == types::BlockId::AIR,
+            "apply_at 拍未执行:holder 副本尚未变"
+        );
+        session.tick();
+        // 下一拍同时生效(两片同拍)。
+        for shard in [shard_id(0, 0), shard_id(1, 0)] {
+            assert_eq!(
+                session
+                    .scheduler
+                    .voxel_chunk(shard, types::ChunkPos::new(7, 0))
+                    .expect("已装载")
+                    .get(8, 104, 8),
+                types::BlockId(2),
+                "{shard:?} 同一拍生效"
+            );
+        }
+        session.shutdown();
+    }
+
+    /// 任务书测试 `setblock_broadcast_logs_one_entry_per_shard`:返回 2 条
+    /// LogEntry,dest 升序、同 tick/source/sequence(整批只 +1)。
+    #[test]
+    fn setblock_broadcast_logs_one_entry_per_shard() {
+        let mut session = session_two_holders();
+        let owner = shard_id(0, 0);
+        let pos = BlockPos::new(120, 40, 8);
+        let entries = session
+            .set_block(owner, pos, types::BlockId(2))
+            .expect("收件箱未满");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.iter().map(|e| e.dest).collect::<Vec<_>>(),
+            vec![shard_id(0, 0), shard_id(1, 0)],
+            "dest 升序"
+        );
+        let first = &entries[0];
+        for e in &entries {
+            assert_eq!(e.tick, first.tick, "同 tick");
+            assert_eq!(e.source, first.source, "同 source");
+            assert_eq!(e.sequence, first.sequence, "同 sequence(整批 +1)");
+            assert_eq!(
+                e.command,
+                SimCommand::SetBlock {
+                    pos,
+                    block: types::BlockId(2)
+                },
+                "同命令"
+            );
+        }
+        // sequence 恰 +1:下一次 send 用下一号(不是每 dest +1)。
+        let next = session
+            .send(
+                owner,
+                SimCommand::SetBlock {
+                    pos,
+                    block: types::BlockId(3),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(
+            next.sequence,
+            first.sequence + 1,
+            "广播一批只消耗一个 sequence"
+        );
+        session.shutdown();
+    }
+
+    /// 任务书测试 `setblock_owner_mismatch_rejected`:pos 的 owner != 传入
+    /// owner → `Err(SessionError::Rejected)`,不投任何片、不消耗 sequence。
+    #[test]
+    fn setblock_owner_mismatch_rejected() {
+        let mut session = session_two_holders();
+        let pos = BlockPos::new(120, 40, 8); // 归属 = 片 (0,0)
+        let entries = session.set_block(shard_id(1, 0), pos, types::BlockId(2));
+        match entries {
+            Err(SessionError::Rejected(why)) => {
+                assert!(why.contains("owner"), "理由指明 owner 不匹配:{why}");
+            }
+            other => panic!("owner 不匹配必须 Err(Rejected),实为 {other:?}"),
+        }
+        // 未消耗 sequence:下一个合法命令仍是 0 号。
+        let legit = session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SetBlock {
+                    pos,
+                    block: types::BlockId(2),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(legit.sequence, 0, "被拒广播不消耗 sequence");
+        session.shutdown();
+    }
+
+    /// send_broadcast 对非 SetBlock 命令 → Err(Rejected)(本任务只支持
+    /// SetBlock;Detonate 广播属 REQ-005 §4.3 后续任务)。
+    #[test]
+    fn send_broadcast_rejects_non_setblock() {
+        let mut session = session_two_holders();
+        let result = session.send_broadcast(
+            shard_id(0, 0),
+            SimCommand::Detonate {
+                center: Vec3::ZERO,
+                power: 6.0,
+                radius: 5.0,
+            },
+        );
+        assert!(
+            matches!(result, Err(SessionError::Rejected(_))),
+            "非 SetBlock 广播 → Err(Rejected)"
+        );
+        session.shutdown();
+    }
+
+    /// is_chunk_loaded 透传:已装载 true / 未装载 false / 未注册分片 false。
+    #[test]
+    fn is_chunk_loaded_passthrough_session() {
+        let session = session_two_holders();
+        let cp = types::ChunkPos::new(7, 0);
+        assert!(
+            session.is_chunk_loaded(shard_id(0, 0), cp),
+            "owner 已装载 → true"
+        );
+        assert!(
+            session.is_chunk_loaded(shard_id(1, 0), cp),
+            "holder 已装载 → true"
+        );
+        assert!(
+            !session.is_chunk_loaded(shard_id(0, 0), types::ChunkPos::new(3, 3)),
+            "未装载 chunk → false"
+        );
+        assert!(
+            !session.is_chunk_loaded(shard_id(9, 9), cp),
+            "未注册分片 → false"
+        );
+        session.shutdown();
+    }
+
+    /// pending_shard_destinations 透传:无待投递信封 → 空集(转发 = 调度器
+    /// 视图;信封产出的端到端场景由 shard 级 pending_destinations 测试与
+    /// app 级 pending_destination_ensured_before_next_tick 覆盖)。
+    #[test]
+    fn pending_shard_destinations_passthrough() {
+        use std::collections::BTreeSet;
+
+        let session = Session::new(session_cfg());
+        assert_eq!(
+            session.pending_shard_destinations(),
+            BTreeSet::new(),
+            "透传 = 调度器视图"
         );
         session.shutdown();
     }

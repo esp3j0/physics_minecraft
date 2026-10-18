@@ -139,6 +139,11 @@ impl Router {
         self.inboxes.get(&shard).map_or(0, VecDeque::len)
     }
 
+    /// 收件箱容量(REQ-005 任务 01:批量投递预检用)。
+    pub fn capacity(&self) -> usize {
+        self.cfg.inbox_capacity
+    }
+
     pub fn pending_envelopes(&self) -> usize {
         self.queue.len()
     }
