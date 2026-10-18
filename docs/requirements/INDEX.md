@@ -21,3 +21,10 @@
   不改写历史、不 rebase。
 - **新提交**:commit message 末尾加 `Refs #<issue>`;PR 用 `Closes #<issue>`。
 - **完成**:REQ 文档状态改“已完成” → 关闭 issue(completed)→ 更新本表。
+
+## 设计讨论(未立项)
+
+- [#9 未来客户端架构:服务器权威 / 复制 / 预测 / 客户端侧物理](https://github.com/esp3j0/physics_minecraft/issues/9)
+  —— 讨论“客户端能否跑 sim 内核 / 只发碰撞事件 / 本地生成物体”;结论收敛后
+  再决定是否立 REQ-006。REQ-005 实现不受本讨论阻塞。
+
