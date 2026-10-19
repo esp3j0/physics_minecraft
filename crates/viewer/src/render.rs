@@ -416,9 +416,13 @@ pub(crate) fn window_conf() -> macroquad::conf::Conf {
         // 批缓冲扩容(ACV4 实跑反馈 3):macroquad 默认 10000 顶点/5000 索引,
         // 单个超平坦 chunk mesh ≈ 3072 顶点/4608 索引——再凝固十几个立方体
         // 索引即越过 5000,geometry() 截断该 mesh(警告刷屏 + 缺三角形"穿模")。
-        // 扩到 30 万索引后稠密 chunk 也安全(批缓冲 ~12MB,一次性分配)。
-        draw_call_vertex_capacity: 200_000,
-        draw_call_index_capacity: 300_000,
+        // 顶点容量上限 65_535:quad_gl.rs 的批内索引重映射是
+        // `index + vertices_count as u16`(macroquad 0.4.16 硬编码 u16),
+        // 批内顶点 > 65_535 即溢出 panic(实跑反馈 4:扩到 20 万后启动闪退,
+        // ~29 个 chunk 同批即触发)。65_535 × 每顶点 2 索引 → 索引容量 13 万,
+        // 两容量任一到顶 macroquad 自动切批,draw call 数随 chunk 数有界增长。
+        draw_call_vertex_capacity: 65_535,
+        draw_call_index_capacity: 130_000,
         ..macroquad::conf::Conf::default()
     }
 }
