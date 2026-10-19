@@ -20,7 +20,9 @@ use crate::activation::{ActivationConfig, ActivationDecisions};
 use crate::collider_build::{BoxCollider, NeighborChunks, greedy_colliders};
 use crate::conv;
 use crate::solidify;
-use messaging::{CrossEvent, EnvelopePayload, InputPayload, Intent, SimCommand, StampedInput};
+use messaging::{
+    CrossEvent, EnvelopePayload, InputPayload, InputSource, Intent, SimCommand, StampedInput,
+};
 
 /// 凝固桥触发参数(P2 + 睡眠兜底,REQ-001 §9.5 / demo C)。可序列化(快照)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +131,12 @@ pub struct Outbox {
     /// 分片 apply_at = N+1 本地求值)。本任务模拟核不主动产事件,字段恒空,
     /// 测试可直接调 `Scheduler::broadcast_event`。
     pub events: Vec<CrossEvent>,
+    /// 本拍新出现的实体(REQ-006 任务 00):调度器据此 claim 全局 ownership。
+    /// 迁移目的重建 / Teleport 重建 / 普通 spawn 都记录;恰好一次。
+    pub spawned: Vec<EntityId>,
+    /// 本拍删除的实体(REQ-006 任务 00):调度器据此 release ownership。
+    /// 迁移源删除、RemoveEntity、凝固都记录;与 `spawned` 同拍时先 release。
+    pub despawned: Vec<EntityId>,
 }
 
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
@@ -140,6 +148,9 @@ pub(crate) struct EntityRecord {
     /// 演员标记(REQ-002 决议 4b 政策层豁免):置位后完全豁免自动凝固
     /// (P2 计数与睡眠兜底两条路径),仅显式命令将来触发。默认 false。
     pub(crate) actor: bool,
+    /// 实体来源(REQ-006):外部 spawn = 玩家;服务端/内部 = None。
+    /// 迁移/传送必须保留;快照随记录走。
+    pub(crate) source: Option<InputSource>,
     /// 位移门滚动窗口:最近 21 个 translation(首尾距离 = 窗口位移)。
     /// 实体存在期间持续滚动;凝固/迁移重建后随实体重置为单点(细则 1)。
     pub(crate) window: VecDeque<Vec3>,
@@ -214,6 +225,15 @@ impl ShardSim {
             .collect()
     }
 
+    /// 全实体归属元数据(REQ-006 任务 00:调度器恢复 ownership 用):
+    /// `(EntityId, source, actor)` 按 EntityId 升序;不暴露 rapier handle。
+    pub fn entity_owners(&self) -> Vec<(EntityId, Option<InputSource>, bool)> {
+        self.entities
+            .iter()
+            .map(|(id, rec)| (*id, rec.source, rec.actor))
+            .collect()
+    }
+
     /// 加载一个体素 chunk 并(与已加载邻居一起)重建边界 collider。
     pub fn load_chunk(&mut self, cp: ChunkPos, chunk: Chunk) {
         self.voxels.insert_chunk(cp, chunk);
@@ -246,7 +266,7 @@ impl ShardSim {
         sorted.sort_by_key(|i| i.canonical_key());
         for input in sorted {
             match input.payload {
-                InputPayload::Command(cmd) => self.apply_command(cmd),
+                InputPayload::Command(cmd) => self.apply_command(cmd, input.source),
                 InputPayload::Event(CrossEvent::Detonate {
                     center,
                     power,
@@ -257,7 +277,9 @@ impl ShardSim {
                         entity,
                         state,
                         desc,
-                    } => self.spawn_entity(entity, state, desc),
+                        actor,
+                        source,
+                    } => self.spawn_entity(entity, state, desc, source, actor),
                     // 涌现事件(REQ-005 任务 03):共享参数本地求值,复用同一
                     // 纯函数;冻结体免疫语义不变(§9.12)。CrossEvent 未来变体
                     // 追加时本 match 穷举强制处理。
@@ -336,7 +358,8 @@ impl ShardSim {
             let Some(rec) = self.entities.get(&id) else {
                 continue;
             };
-            let (handle, desc, slow_ticks_base) = (rec.handle, rec.desc, rec.slow_ticks);
+            let (handle, desc, slow_ticks_base, source) =
+                (rec.handle, rec.desc, rec.slow_ticks, rec.source);
             let state = self.read_state(rec);
             let is_sleeping = self
                 .phys
@@ -402,6 +425,7 @@ impl ShardSim {
                         }
                         self.entities.remove(&id).expect("存在");
                         self.phys.remove_body(handle);
+                        self.outbox.despawned.push(id);
                         // 涌现写入(REQ-005 任务 03):凝固桥经 block_updates 的
                         // `Emergent` 出片——调度器 tick 末发布产生者 + 对
                         // owner/holders 盖 `EnvelopePayload::BlockWrite`
@@ -425,12 +449,15 @@ impl ShardSim {
                 );
                 self.entities.remove(&id).expect("存在");
                 self.phys.remove_body(handle);
+                self.outbox.despawned.push(id);
                 self.outbox.migrations.push(Intent {
                     destination: dest,
                     payload: EnvelopePayload::MigrateEntity {
                         entity: id,
                         state,
                         desc,
+                        actor,
+                        source,
                     },
                 });
             }
@@ -499,7 +526,7 @@ impl ShardSim {
 
     // ---- 内部 ----
 
-    fn apply_command(&mut self, cmd: SimCommand) {
+    fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
         match cmd {
             SimCommand::SetBlock { pos, block } => {
                 let edit = VoxelEdit::new().set(pos, block);
@@ -524,14 +551,24 @@ impl ShardSim {
                 entity,
                 state,
                 desc,
-            } => self.spawn_entity(entity, state, desc),
+            } => {
+                // 调度器自身注入的命令 = 服务端实体(source=None);玩家来源
+                // = 外部 spawn(owner 权限用)。
+                let owner_source = if source == InputSource::SCHEDULER {
+                    None
+                } else {
+                    Some(source)
+                };
+                self.spawn_entity(entity, state, desc, owner_source, false);
+            }
             SimCommand::RemoveEntity { entity } => {
                 self.despawn_entity(entity);
             }
             SimCommand::TeleportEntity { entity, state } => {
-                // 一切位姿变更 = 删除 + 重建(REQ-001 §5 行 10)
-                let (_, desc) = self.despawn_entity(entity);
-                self.spawn_entity(entity, state, desc);
+                // 一切位姿变更 = 删除 + 重建(REQ-001 §5 行 10);actor/source
+                // 是政策状态,必须跨重建保留(REQ-006 任务 00)。
+                let (_, desc, owner_source, actor) = self.despawn_entity(entity);
+                self.spawn_entity(entity, state, desc, owner_source, actor);
             }
             SimCommand::Detonate {
                 center,
@@ -591,7 +628,14 @@ impl ShardSim {
         self.outbox.dirty_chunks.insert(cp);
     }
 
-    fn spawn_entity(&mut self, id: EntityId, state: EntityState, desc: EntityDesc) {
+    fn spawn_entity(
+        &mut self,
+        id: EntityId,
+        state: EntityState,
+        desc: EntityDesc,
+        source: Option<InputSource>,
+        actor: bool,
+    ) {
         assert!(
             !self.entities.contains_key(&id),
             "实体重复 spawn(fail-stop):{id:?}"
@@ -613,18 +657,26 @@ impl ShardSim {
                 handle,
                 desc,
                 slow_ticks: 0,
-                actor: false,
+                actor,
+                source,
                 window: VecDeque::new(),
             },
         );
+        // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
+        self.outbox.spawned.push(id);
     }
 
-    /// 删除实体(迁移/传送/凝固),返回最后状态与描述。
-    fn despawn_entity(&mut self, id: EntityId) -> (EntityState, EntityDesc) {
+    /// 删除实体(迁移/传送/凝固),返回最后状态、描述与政策状态。
+    fn despawn_entity(
+        &mut self,
+        id: EntityId,
+    ) -> (EntityState, EntityDesc, Option<InputSource>, bool) {
         let rec = self.entities.remove(&id).expect("实体存在(fail-stop)");
         let state = self.read_state(&rec);
         self.phys.remove_body(rec.handle);
-        (state, rec.desc)
+        // 调度器据此 release 全局 ownership(REQ-006 任务 00)。
+        self.outbox.despawned.push(id);
+        (state, rec.desc, rec.source, rec.actor)
     }
 
     fn read_state(&self, rec: &EntityRecord) -> EntityState {
@@ -1225,6 +1277,161 @@ mod tests {
         }
         assert_eq!(solidified, 1, "门关闭:慢漂实体照旧凝固一次(直通)");
         assert!(s.entity_state(e).is_none(), "实体已凝固移除");
+    }
+
+    // ---- REQ-006 任务 00:实体生命周期/来源/actor ----
+
+    fn spawn_input_from(source: InputSource, seq: u64, id: EntityId, pos: Vec3) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: pos,
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            }),
+        }
+    }
+
+    /// 任务 00:spawn/despawn 生命周期记录 + entity_owners 元数据。
+    #[test]
+    fn lifecycle_outbox_and_entity_owners() {
+        let mut s = {
+            let mut cfg = zero_g_cfg();
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input_from(
+            InputSource(7),
+            1,
+            e,
+            Vec3::new(8.0, 10.0, 8.0),
+        )]);
+        let out = s.take_outbox();
+        assert_eq!(out.spawned, vec![e], "spawn 记 spawned");
+        assert!(out.despawned.is_empty());
+        assert_eq!(
+            s.entity_owners(),
+            vec![(e, Some(InputSource(7)), false)],
+            "来源/actor 记录"
+        );
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource(7),
+            sequence: 2,
+            payload: InputPayload::Command(SimCommand::RemoveEntity { entity: e }),
+        }]);
+        let out = s.take_outbox();
+        assert_eq!(out.despawned, vec![e], "Remove 记 despawned");
+        assert!(out.spawned.is_empty());
+        assert!(s.entity_owners().is_empty());
+    }
+
+    /// 任务 00:Teleport 保留 actor/source。
+    #[test]
+    fn teleport_preserves_source_and_actor() {
+        let mut s = {
+            let mut cfg = zero_g_cfg();
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input_from(
+            InputSource(7),
+            1,
+            e,
+            Vec3::new(8.0, 10.0, 8.0),
+        )]);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 2,
+            payload: InputPayload::Command(SimCommand::MarkActor {
+                entity: e,
+                actor: true,
+            }),
+        }]);
+        s.apply_prefix(&[teleport_input(3, e, Vec3::new(20.0, 10.0, 8.0))]);
+        assert_eq!(
+            s.entity_owners(),
+            vec![(e, Some(InputSource(7)), true)],
+            "Teleport 后 actor/source 保持"
+        );
+    }
+
+    /// 任务 00:快照保留实体 source/actor,恢复后 ownership 元数据一致。
+    #[test]
+    fn snapshot_keeps_source_and_actor() {
+        let reg = || Box::new(voxel::SimpleRegistry::builtin()) as Box<dyn BlockRegistry>;
+        let mut s = {
+            let mut cfg = zero_g_cfg();
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input_from(InputSource(7), 0, e, Vec3::new(8.0, 10.0, 8.0)),
+            mark_actor_input(1, e, true),
+        ]);
+        let bytes = s.snapshot();
+        let restored = ShardSim::restore(&bytes, reg()).expect("自有快照必可解码");
+        assert_eq!(
+            restored.entity_owners(),
+            vec![(e, Some(InputSource(7)), true)],
+            "source/actor 随快照往返"
+        );
+    }
+
+    /// 任务 00:迁移 payload 携带 actor/source,源片记录 despawned。
+    #[test]
+    fn migration_payload_preserves_actor_source() {
+        let mut s = {
+            let mut cfg = zero_g_cfg();
+            cfg.solidify.enabled = false;
+            ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        };
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input_from(
+            InputSource(7),
+            1,
+            e,
+            Vec3::new(120.0, 10.0, 8.0),
+        )]);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 2,
+            payload: InputPayload::Command(SimCommand::MarkActor {
+                entity: e,
+                actor: true,
+            }),
+        }]);
+        // 传送到 core 外;本拍 step 触发迁移。
+        s.apply_prefix(&[teleport_input(3, e, Vec3::new(136.0, 10.0, 8.0))]);
+        s.step();
+        let out = s.take_outbox();
+        // Teleport 先 despawn+spawn,step 再迁移同一 ID:本拍有两次
+        // despawn 生命周期事件(旧身/迁移身);最终表已无实体。
+        assert_eq!(out.despawned, vec![e, e], "Teleport + 迁移各记一次 despawn");
+        assert_eq!(out.migrations.len(), 1);
+        match out.migrations[0].payload {
+            EnvelopePayload::MigrateEntity {
+                entity,
+                actor,
+                source,
+                ..
+            } => {
+                assert_eq!(entity, e);
+                assert!(actor, "actor 随迁移 payload");
+                assert_eq!(source, Some(InputSource(7)), "source 随迁移 payload");
+            }
+            other => panic!("期望 MigrateEntity,实得 {other:?}"),
+        }
     }
 
     // ---- 任务书 00(REQ-003):观察输出 API(测试清单) ----

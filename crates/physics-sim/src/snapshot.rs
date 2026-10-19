@@ -78,6 +78,8 @@ struct SnapshotEntityRecord {
     desc: EntityDesc,
     slow_ticks: u32,
     actor: bool,
+    /// REQ-006:外部 spawn 来源(玩家) / 服务端 None。
+    source: Option<messaging::InputSource>,
     window: std::collections::VecDeque<types::glam::Vec3>,
 }
 
@@ -100,6 +102,7 @@ impl ShardSim {
                             desc: rec.desc,
                             slow_ticks: rec.slow_ticks,
                             actor: rec.actor,
+                            source: rec.source,
                             window: rec.window.clone(),
                         },
                     )
@@ -136,6 +139,7 @@ impl ShardSim {
                         desc: rec.desc,
                         slow_ticks: rec.slow_ticks,
                         actor: rec.actor,
+                        source: rec.source,
                         window: rec.window,
                     },
                 )

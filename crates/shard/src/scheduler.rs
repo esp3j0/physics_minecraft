@@ -21,6 +21,7 @@ use types::glam::Vec3;
 use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, ShardId, Tick};
 
 use crate::coordinator::TickCoordinator;
+use crate::entities::{EntityOwner, EntityOwnership};
 use crate::lifecycle::{LifecycleConfig, LifecycleSnapshot, ShardLifecycle};
 use crate::ownership::OwnershipMap;
 use crate::router::{RouteError, Router, RouterConfig, RouterSnapshot};
@@ -150,6 +151,9 @@ pub struct Scheduler {
     /// owner 是纯函数(`owner_of`);本表随 apply_chunk_load/unload 维护,
     /// 不入快照(恢复时 rebuild_holders 重建)。
     chunk_holders: crate::chunks::ChunkHolders,
+    /// 实体归属索引(REQ-006 任务 00):各分片实体表是真相,本表每拍同步;
+    /// 不入快照,恢复时 `rebuild_entity_ownership` 从实体表重建。
+    entity_ownership: EntityOwnership,
 }
 
 impl Scheduler {
@@ -191,6 +195,7 @@ impl Scheduler {
             block_updates: Vec::new(),
             despawn_requests: BTreeSet::new(),
             chunk_holders: crate::chunks::ChunkHolders::new(),
+            entity_ownership: EntityOwnership::new(),
             cfg,
         }
     }
@@ -553,6 +558,73 @@ impl Scheduler {
             }));
     }
 
+    /// 从各分片实体表重建全局 ownership(REQ-006 任务 00;表不入快照)。
+    /// 重复 EntityId → panic(fail-stop)。
+    pub fn rebuild_entity_ownership(&mut self) {
+        let entries: Vec<(EntityId, EntityOwner)> = self
+            .sims
+            .iter()
+            .flat_map(|(shard, sim)| {
+                sim.entity_owners()
+                    .into_iter()
+                    .map(move |(id, source, actor)| {
+                        (
+                            id,
+                            EntityOwner {
+                                shard: *shard,
+                                source,
+                                actor,
+                            },
+                        )
+                    })
+            })
+            .collect();
+        self.entity_ownership.rebuild(entries);
+    }
+
+    /// 用分片实体表(真相)同步本拍 ownership:释放消失的实体,claim 新实体,
+    /// 更新 actor 元数据;同一 ID 出现在两个分片 → claim/duplicate panic。
+    fn sync_entity_ownership(&mut self, shard: ShardId, sim: &ShardSim) {
+        let current = sim.entity_owners();
+        let current_ids: BTreeSet<EntityId> = current.iter().map(|(id, _, _)| *id).collect();
+        // 先释放本片已消失的条目(迁移/Remove/凝固)。
+        let stale: Vec<EntityId> = self
+            .entity_ownership
+            .entities_of(shard)
+            .into_iter()
+            .filter(|id| !current_ids.contains(id))
+            .collect();
+        for id in stale {
+            self.entity_ownership.release(id);
+        }
+        // 再 claim/update 当前实体;若 ID 属于别的分片 = 全局重复,fail-stop。
+        for (id, source, actor) in current {
+            let owner = EntityOwner {
+                shard,
+                source,
+                actor,
+            };
+            match self.entity_ownership.owner_of(id) {
+                None => self.entity_ownership.claim(id, owner),
+                Some(prev) if prev.shard == shard => self.entity_ownership.update(id, owner),
+                Some(prev) => panic!(
+                    "实体 {id:?} 同时出现在分片 {shard:?} 与 {:?}(全局唯一性 fail-stop)",
+                    prev.shard
+                ),
+            }
+        }
+    }
+
+    /// 实体当前归属(REQ-006);不存在/迁移窗口 → None。
+    pub fn owner_of_entity(&self, entity: EntityId) -> Option<EntityOwner> {
+        self.entity_ownership.owner_of(entity)
+    }
+
+    /// 某分片当前持有的实体集合(升序)。
+    pub fn entities_of(&self, shard: ShardId) -> BTreeSet<EntityId> {
+        self.entity_ownership.entities_of(shard)
+    }
+
     /// 生命周期阶段查询(观测用):无记录(未注册)→ None。
     pub fn lifecycle_stage(&self, shard: ShardId) -> Option<crate::lifecycle::Stage> {
         self.lifecycles
@@ -583,6 +655,7 @@ impl Scheduler {
         );
         self.sims.insert(shard, sim);
         self.rebuild_holders();
+        self.rebuild_entity_ownership();
     }
 
     /// 本地权威命令入箱(经 Router)。未注册分片 → panic(README 决策 2);
@@ -862,6 +935,9 @@ impl Scheduler {
                     }
                 }
             }
+            // 本拍实体生命周期:以分片实体表(真相)同步全局 ownership
+            // (REQ-006 任务 00:spawn/migrate/remove/solidify/teleport 都覆盖)。
+            self.sync_entity_ownership(shard, &sim);
             self.sims.insert(shard, sim);
         }
 
@@ -1016,6 +1092,8 @@ impl Scheduler {
         }
         // holder 表从各分片已加载 chunk 重建(表不入快照)。
         self.rebuild_holders();
+        // ownership 从各分片实体表重建并校验全局唯一(REQ-006 任务 00)。
+        self.rebuild_entity_ownership();
     }
 
     /// 已注册分片,ShardId 升序(BTreeMap 键序)。
@@ -1612,6 +1690,8 @@ mod tests {
                         entity: types::EntityId::from_parts(0, 1),
                         state: types::EntityState::default(),
                         desc: types::EntityDesc::default(),
+                        actor: false,
+                        source: None,
                     },
                 }],
                 Tick::ZERO,
@@ -1673,6 +1753,8 @@ mod tests {
                             ..types::EntityState::default()
                         },
                         desc: types::EntityDesc::default(),
+                        actor: false,
+                        source: None,
                     },
                 }],
                 Tick::ZERO,
@@ -2368,7 +2450,13 @@ mod tests {
         let migrate_to = |dest| messaging::Intent {
             destination: dest,
             payload: messaging::EnvelopePayload::MigrateEntity {
-                entity: types::EntityId::from_parts(0, 1),
+                // REQ-006 任务 00:同拍两个目的片不能重建同一个 EntityId
+                // (全局唯一);用两个不同 ID 各测一条信封。
+                entity: if dest == shard_id(1, 0) {
+                    types::EntityId::from_parts(0, 1)
+                } else {
+                    types::EntityId::from_parts(0, 2)
+                },
                 state: types::EntityState {
                     translation: if dest == shard_id(1, 0) {
                         types::glam::Vec3::new(140.0, 10.0, 8.0)
@@ -2378,6 +2466,8 @@ mod tests {
                     ..types::EntityState::default()
                 },
                 desc: types::EntityDesc::default(),
+                actor: false,
+                source: None,
             },
         };
         sched
@@ -3012,5 +3102,216 @@ mod tests {
         let e = types::EntityId::from_parts(1, 1);
         spawn_resting_entity(&mut sched, shard_id(0, 0), e, Vec3::new(120.5, 5.5, 8.5));
         run_until_emergent(&mut sched, shard_id(0, 0), e);
+    }
+
+    // ---- REQ-006 任务 00:全局实体 ownership ----
+
+    fn cmd_input(
+        source: InputSource,
+        sequence: u64,
+        apply_at: Tick,
+        cmd: SimCommand,
+    ) -> StampedInput {
+        StampedInput {
+            apply_at,
+            source,
+            sequence,
+            payload: InputPayload::Command(cmd),
+        }
+    }
+
+    fn spawn_cmd(entity: EntityId, x: f32, z: f32) -> SimCommand {
+        SimCommand::SpawnDynamic {
+            entity,
+            state: types::EntityState {
+                translation: Vec3::new(x, 10.0, z),
+                ..types::EntityState::default()
+            },
+            desc: types::EntityDesc::default(),
+        }
+    }
+
+    #[test]
+    fn ownership_claims_on_spawn_releases_on_remove() {
+        let mut sched = Scheduler::new(sched_cfg(1));
+        sched.register(sim(0, 0));
+        let e = types::EntityId::from_parts(1, 1);
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(InputSource(7), 1, Tick::ZERO, spawn_cmd(e, 8.0, 8.0)),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert_eq!(
+            sched
+                .owner_of_entity(e)
+                .map(|o| (o.shard, o.source, o.actor)),
+            Some((shard_id(0, 0), Some(InputSource(7)), false)),
+            "spawn 后 ownership 记录 owner/source/actor"
+        );
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(
+                    InputSource(7),
+                    2,
+                    Tick(1),
+                    SimCommand::RemoveEntity { entity: e },
+                ),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert!(
+            sched.owner_of_entity(e).is_none(),
+            "Remove 后 ownership 释放"
+        );
+        sched.shutdown();
+    }
+
+    #[test]
+    fn teleport_keeps_owner_source_and_actor() {
+        let mut sched = Scheduler::new(sched_cfg(1));
+        sched.register(sim(0, 0));
+        let e = types::EntityId::from_parts(1, 1);
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(InputSource(7), 1, Tick::ZERO, spawn_cmd(e, 8.0, 8.0)),
+            )
+            .expect("入箱");
+        sched.tick();
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(
+                    InputSource::SCHEDULER,
+                    2,
+                    Tick(1),
+                    SimCommand::MarkActor {
+                        entity: e,
+                        actor: true,
+                    },
+                ),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert_eq!(
+            sched.owner_of_entity(e).map(|o| (o.source, o.actor)),
+            Some((Some(InputSource(7)), true))
+        );
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(
+                    InputSource(7),
+                    3,
+                    Tick(2),
+                    SimCommand::TeleportEntity {
+                        entity: e,
+                        state: types::EntityState {
+                            translation: Vec3::new(20.0, 10.0, 8.0),
+                            ..types::EntityState::default()
+                        },
+                    },
+                ),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert_eq!(
+            sched
+                .owner_of_entity(e)
+                .map(|o| (o.shard, o.source, o.actor)),
+            Some((shard_id(0, 0), Some(InputSource(7)), true)),
+            "Teleport 后 owner 不变,source/actor 保留"
+        );
+        sched.shutdown();
+    }
+
+    #[test]
+    fn migration_moves_owner_at_envelope_apply_tick() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let e = types::EntityId::from_parts(1, 1);
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(InputSource(7), 1, Tick::ZERO, spawn_cmd(e, 120.0, 8.0)),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert_eq!(
+            sched.owner_of_entity(e).map(|o| o.shard),
+            Some(shard_id(0, 0))
+        );
+        // 传送到本片 core 外 → 本拍 despawn、信封 apply_at=N+1;窗口内 owner=None。
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(
+                    InputSource(7),
+                    2,
+                    Tick(1),
+                    SimCommand::TeleportEntity {
+                        entity: e,
+                        state: types::EntityState {
+                            translation: Vec3::new(136.0, 10.0, 8.0),
+                            ..types::EntityState::default()
+                        },
+                    },
+                ),
+            )
+            .expect("入箱");
+        sched.tick();
+        assert!(sched.owner_of_entity(e).is_none(), "迁移窗口 owner 缺失");
+        sched.tick();
+        assert_eq!(
+            sched.owner_of_entity(e).map(|o| (o.shard, o.source)),
+            Some((shard_id(1, 0), Some(InputSource(7)))),
+            "目的片 spawn 后 owner=dest,source 保留"
+        );
+        sched.shutdown();
+    }
+
+    #[test]
+    #[should_panic(expected = "全局唯一性")]
+    fn duplicate_entity_spawn_across_shards_panics() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let e = types::EntityId::from_parts(1, 1);
+        sched
+            .submit(
+                shard_id(0, 0),
+                cmd_input(InputSource(7), 1, Tick::ZERO, spawn_cmd(e, 8.0, 8.0)),
+            )
+            .expect("入箱");
+        sched
+            .submit(
+                shard_id(1, 0),
+                cmd_input(InputSource(7), 2, Tick::ZERO, spawn_cmd(e, 136.0, 8.0)),
+            )
+            .expect("入箱");
+        sched.tick();
+    }
+
+    #[test]
+    #[should_panic(expected = "全局唯一性")]
+    fn rebuild_detects_duplicate_entity_across_shards() {
+        let mut s0 = sim(0, 0);
+        let mut s1 = sim(1, 0);
+        let e = types::EntityId::from_parts(1, 1);
+        for (s, x) in [(&mut s0, 8.0), (&mut s1, 136.0)] {
+            s.apply_prefix(&[cmd_input(
+                InputSource(7),
+                1,
+                Tick::ZERO,
+                spawn_cmd(e, x, 8.0),
+            )]);
+        }
+        let mut sched = Scheduler::new(sched_cfg(1));
+        sched.register(s0);
+        sched.register(s1); // rebuild 全量时发现重复
     }
 }

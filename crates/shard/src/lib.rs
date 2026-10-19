@@ -13,11 +13,13 @@
 
 pub mod chunks;
 pub mod coordinator;
+pub mod entities;
 pub mod lifecycle;
 pub mod ownership;
 pub mod router;
 pub mod scheduler;
 
+pub use entities::{EntityOwner, EntityOwnership};
 pub use lifecycle::LifecycleSnapshot;
 pub use router::RouterSnapshot;
 pub use scheduler::{Scheduler, SchedulerConfig, SchedulerSnapshot, TickSummary};

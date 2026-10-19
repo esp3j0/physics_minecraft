@@ -1,6 +1,6 @@
 # REQ-006 决策清单(待拍板)
 
-- 状态:**待拍板**(2026-10-19)
+- 状态:**已确认**(2026-10-19 用户确认 D1–D5 全 A)
 - 用途:逐条选择;拍板后回写 [REQ-006-entity-authority.md](REQ-006-entity-authority.md) §8。
 - 默认建议:**D1–D5 全部 A**。
 
@@ -65,10 +65,10 @@
 
 | ID | 选择 | 备注 |
 | --- | --- | --- |
-| D1 |  |  |
-| D2 |  |  |
-| D3 |  |  |
-| D4 |  |  |
-| D5 |  |  |
+| D1 | A | 外部 spawn 服务端分配 ID |
+| D2 | A | `C2S::Spawn` + `S2C::Spawned` |
+| D3 | A | ownership 不入快照,恢复重建 |
+| D4 | A | actor/source 入迁移 payload;Teleport 保留 |
+| D5 | A | 外部只允许 `Spawn`;`SpawnDynamic` 外部拒绝 |
 
 > 拍板后:回写 REQ-006 §8，更新任务书 README，再交实现。

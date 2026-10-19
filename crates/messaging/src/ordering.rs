@@ -84,6 +84,8 @@ mod tests {
                     entity: EntityId::from_parts(1, 1),
                     state: EntityState::default(),
                     desc: types::EntityDesc::default(),
+                    actor: false,
+                    source: None,
                 },
             },
             Tick(41),

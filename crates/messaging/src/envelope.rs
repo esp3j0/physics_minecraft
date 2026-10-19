@@ -14,11 +14,16 @@ pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
 /// 信封载荷。变体只允许**追加**。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EnvelopePayload {
-    /// 实体迁移(REQ-001 §4.2 (b)):tick N 末提取的四向量状态 + 实体描述。
+    /// 实体迁移(REQ-001 §4.2 (b)):tick N 末提取的四向量状态 + 实体描述 +
+    /// 政策状态(REQ-006:actor/source 必须随迁移保留)。
     MigrateEntity {
         entity: EntityId,
         state: EntityState,
         desc: EntityDesc,
+        /// 演员政策标记(REQ-002 决议 4b);迁移后不得丢。
+        actor: bool,
+        /// 实体来源:外部 spawn = 玩家;服务端/内部 = None。
+        source: Option<crate::InputSource>,
     },
     /// 涌现事件(REQ-005 §4.3.2/D10):共享参数,各片本地求值;apply_at = N+1。
     Event(CrossEvent),
@@ -234,6 +239,8 @@ mod tests {
                     entity: EntityId::from_parts(1, seq as u32),
                     state: EntityState::default(),
                     desc: EntityDesc::default(),
+                    actor: false,
+                    source: None,
                 },
             },
             Tick(10),
@@ -247,6 +254,8 @@ mod tests {
             entity: EntityId::from_parts(1, 1),
             state: EntityState::default(),
             desc: EntityDesc::default(),
+            actor: false,
+            source: None,
         };
         assert_eq!(p.ordinal(), 0);
     }
@@ -270,6 +279,8 @@ mod tests {
             entity: EntityId::from_parts(1, 1),
             state: EntityState::default(),
             desc: EntityDesc::default(),
+            actor: false,
+            source: None,
         };
         assert!(migrate.ordinal() < event.ordinal());
         assert!(event.ordinal() < write.ordinal(), "声明序 = 序号升序");

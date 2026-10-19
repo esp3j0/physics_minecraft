@@ -202,9 +202,7 @@ impl Router {
 mod tests {
     use super::*;
     use messaging::SimCommand;
-    use types::{
-        BlockId, BlockPos, DimensionId, EntityDesc, EntityId, EntityState, ShardPos, WorldId,
-    };
+    use types::{BlockId, BlockPos, DimensionId, EntityId, EntityState, ShardPos, WorldId};
 
     fn shard(x: i32, z: i32) -> ShardId {
         ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
@@ -229,7 +227,9 @@ mod tests {
             payload: messaging::EnvelopePayload::MigrateEntity {
                 entity: EntityId::from_parts(1, entity),
                 state: EntityState::default(),
-                desc: EntityDesc::default(),
+                desc: types::EntityDesc::default(),
+                actor: false,
+                source: None,
             },
         }
     }
@@ -394,6 +394,8 @@ mod tests {
                 entity: types::EntityId::from_parts(1, 1),
                 state: types::EntityState::default(),
                 desc: types::EntityDesc::default(),
+                actor: false,
+                source: None,
             },
         };
         r.collect_intents(

@@ -1,7 +1,7 @@
 # REQ-006 实现任务书(总览)
 
-- 状态:**草案(待 D1–D5 拍板)**。需求 [REQ-006](../../requirements/REQ-006-entity-authority.md)
-  与 [决策清单](../../requirements/REQ-006-decisions.md) 尚未拍板。
+- 状态:**已确认(2026-10-19 用户确认 D1–D5 全 A);任务 00 实现中**。需求 [REQ-006](../../requirements/REQ-006-entity-authority.md)
+  与 [决策清单](../../requirements/REQ-006-decisions.md) 已拍板。
 - 上游:REQ-001/002/003/005;issue [#10](https://github.com/esp3j0/physics_minecraft/issues/10)。
 - 实现顺序:00 → 01 → 02 → 03 → 04,串行;每任务独立门禁。
 
