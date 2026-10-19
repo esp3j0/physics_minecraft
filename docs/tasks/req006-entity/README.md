@@ -7,12 +7,12 @@
 
 ## 任务表
 
-进度:**00 ✅ 完成;01–04 待开始**。
+进度:**00 ✅ 完成;01 ✅ 完成;02–04 待开始**。
 
 | # | 任务书 | 内容 | 门禁包 |
 | --- | --- | --- | --- |
 | 0 | [00-ownership.md](00-ownership.md) | EntityOwnership 表、生命周期 outbox、owner 查询/重建/唯一性 | messaging physics-sim shard ✅ |
-| 1 | [01-routing.md](01-routing.md) | 外部实体命令按 owner 路由、权限、actor/传送保真 | sim-api app |
+| 1 | [01-routing.md](01-routing.md) | 外部实体命令按 owner 路由、权限、actor/传送保真 | sim-api app ✅ |
 | 2 | [02-spawn-protocol.md](02-spawn-protocol.md) | 服务端 ID 分配、`C2S::Spawn`/`S2C::Spawned`、viewer 适配 | sim-api app viewer e2e |
 | 3 | [03-snapshot.md](03-snapshot.md) | ownership 重建、快照/回放校验、format_version | shard sim-api app |
 | 4 | [04-acceptance.md](04-acceptance.md) | AC-E1~E8 端到端验收 + 独立评审 | e2e |

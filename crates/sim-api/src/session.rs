@@ -482,6 +482,34 @@ impl Session {
         self.scheduler.entity_state(shard, entity)
     }
 
+    /// 实体当前权威归属(REQ-006 任务 01);迁移窗口/不存在 → None。
+    pub fn entity_owner(&self, entity: EntityId) -> Option<shard::EntityOwner> {
+        self.scheduler.owner_of_entity(entity)
+    }
+
+    /// 按实体 owner 投递命令(REQ-006 任务 01):不再由调用方猜分片。
+    /// 未知实体/迁移窗口 → `Rejected`;成功与 `send_from` 同款入日志。
+    pub fn send_to_entity(
+        &mut self,
+        source: InputSource,
+        entity: EntityId,
+        command: SimCommand,
+    ) -> Result<LogEntry, SessionError> {
+        let command_entity = match &command {
+            SimCommand::RemoveEntity { entity }
+            | SimCommand::TeleportEntity { entity, .. }
+            | SimCommand::MarkActor { entity, .. } => Some(*entity),
+            _ => None,
+        };
+        if command_entity != Some(entity) {
+            return Err(SessionError::Rejected("实体命令与目标实体不一致"));
+        }
+        let owner = self
+            .entity_owner(entity)
+            .ok_or(SessionError::Rejected("实体不存在或迁移窗口"))?;
+        self.send_from(source, owner.shard, command)
+    }
+
     /// 全局快照:**只在两拍之间调用**(tick 进行中不存在该窗口——单线程驱动,
     /// `tick()` 返回后调用方才能再进;调度器 `snapshot_shard` 同款约定)。
     /// tick 取 `tick_now()`(下一将被执行的拍号 = 已完成拍数,与重放
@@ -1840,6 +1868,80 @@ mod tests {
             types::BlockId(1),
             "owner 卸载的 chunk 含 Emergent 编辑(局部 (2,69,8) = 世界 (130,5,8))"
         );
+        session.shutdown();
+    }
+
+    /// REQ-006 任务 01:实体迁移后 `send_to_entity` 仍命中新 owner,
+    /// LogEntry.dest = 当前 owner。
+    #[test]
+    fn send_to_entity_routes_after_migration() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let e = EntityId::from_parts(1, 1);
+        session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(120.0, 10.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                },
+            )
+            .expect("入箱");
+        session.tick();
+        assert_eq!(
+            session.entity_owner(e).map(|o| o.shard),
+            Some(shard_id(0, 0))
+        );
+        // 传送到 core 外 → 本拍迁移源删除;下一拍目的片重建。
+        session
+            .send(
+                shard_id(0, 0),
+                SimCommand::TeleportEntity {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(136.0, 10.0, 8.0),
+                        ..EntityState::default()
+                    },
+                },
+            )
+            .expect("入箱");
+        session.tick();
+        assert!(session.entity_owner(e).is_none(), "迁移窗口 owner 缺失");
+        session.tick();
+        assert_eq!(
+            session.entity_owner(e).map(|o| o.shard),
+            Some(shard_id(1, 0)),
+            "目的片重建后 owner=dest"
+        );
+        let entry = session
+            .send_to_entity(InputSource(1), e, SimCommand::RemoveEntity { entity: e })
+            .expect("按 owner 投递");
+        assert_eq!(entry.dest, shard_id(1, 0), "日志 dest = 新 owner");
+        session.tick();
+        assert!(session.entity_state(shard_id(1, 0), e).is_none());
+        session.shutdown();
+    }
+
+    /// REQ-006 任务 01:未知实体/迁移窗口 → 类型化 Rejected,不 panic。
+    #[test]
+    fn send_to_entity_unknown_is_rejected() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        let err = session
+            .send_to_entity(
+                InputSource(1),
+                EntityId::from_parts(1, 99),
+                SimCommand::RemoveEntity {
+                    entity: EntityId::from_parts(1, 99),
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, SessionError::Rejected(_)));
         session.shutdown();
     }
 }

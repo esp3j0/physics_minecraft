@@ -106,6 +106,7 @@ type CommandGuard = Result<(), &'static str>;
 /// - `Detonate` → **只做参数校验**且**先于**分片注册检查(REQ-005 任务 03)。
 pub fn validate_external_command(
     session: &sim_api::session::Session,
+    source: Option<messaging::InputSource>,
     shard: types::ShardId,
     command: &messaging::SimCommand,
 ) -> CommandGuard {
@@ -124,6 +125,35 @@ pub fn validate_external_command(
         } else {
             Err("Detonate 参数非法(需有限 power/radius 且 radius > 0)")
         };
+    }
+    // 实体命令(REQ-006 任务 01):路由以全局 owner 为准,不再用网络层
+    // 伪造的 `origin_shard` 分片;未知实体/迁移窗口 → 拒绝。
+    // 网络来源必须与 spawn 时的 owner.source 一致;commands 通道传 None
+    // (本地权威)可操作服务端实体。
+    match command {
+        messaging::SimCommand::RemoveEntity { entity }
+        | messaging::SimCommand::TeleportEntity { entity, .. } => {
+            let Some(owner) = session.entity_owner(*entity) else {
+                return Err("实体不存在或迁移窗口");
+            };
+            if let Some(player) = source
+                && owner.source != Some(player)
+            {
+                return Err("越权:实体不属于该玩家");
+            }
+            return Ok(());
+        }
+        messaging::SimCommand::MarkActor { entity, .. } => {
+            if source.is_some() {
+                return Err("MarkActor 是服务端策略命令,外部不可投递");
+            }
+            return if session.entity_owner(*entity).is_some() {
+                Ok(())
+            } else {
+                Err("实体不存在或迁移窗口")
+            };
+        }
+        _ => {}
     }
     // 未注册分片:任何命令都不可投(Scheduler::submit panic = fail-stop)。
     // ensure(编排 ①)只对观察者所在分片惰性建片——命令目标分片不由驱动
@@ -151,20 +181,12 @@ pub fn validate_external_command(
             }
             Ok(())
         }
-        messaging::SimCommand::RemoveEntity { entity }
-        | messaging::SimCommand::TeleportEntity { entity, .. } => {
-            if session.entity_state(shard, *entity).is_some() {
-                Ok(())
-            } else {
-                Err("实体不存在(按路由分片)")
-            }
-        }
-        messaging::SimCommand::MarkActor { entity, .. } => {
-            if session.entity_state(shard, *entity).is_some() {
-                Ok(())
-            } else {
-                Err("实体不存在(按路由分片)")
-            }
+        // 实体命令已在函数顶部按 owner/权限处理并返回;此处不可达
+        // (match 穷举仍需覆盖)。
+        messaging::SimCommand::RemoveEntity { .. }
+        | messaging::SimCommand::TeleportEntity { .. }
+        | messaging::SimCommand::MarkActor { .. } => {
+            unreachable!("实体命令已在前置 owner/权限块返回")
         }
         messaging::SimCommand::SpawnDynamic { .. } => Ok(()),
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
@@ -222,6 +244,15 @@ fn dispatch_external(
                 .map(|entries| {
                     entries.iter().for_each(|entry| log.append(entry.clone()));
                 })
+        }
+        cmd @ messaging::SimCommand::RemoveEntity { entity }
+        | cmd @ messaging::SimCommand::TeleportEntity { entity, .. }
+        | cmd @ messaging::SimCommand::MarkActor { entity, .. } => {
+            // REQ-006 任务 01:实体命令的 `shard` 参数仅信息性;owner 由
+            // Session 的全局 ownership 解析,迁移后也不会投错片。
+            session
+                .send_to_entity(source, entity, cmd)
+                .map(|entry| log.append(entry))
         }
         _ => {
             // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
@@ -549,7 +580,9 @@ impl ObserveOrchestrator {
                     // 前置校验(评审修复①):网络上行的命令参数全部客户端可
                     // 构造,预检不过 = 丢弃不投——hostile 输入不得触发调度器/
                     // 模拟的 fail-stop panic(整机崩溃 DoS);计数不断链。
-                    if let Err(why) = validate_external_command(session, shard, &command) {
+                    if let Err(why) =
+                        validate_external_command(session, Some(player), shard, &command)
+                    {
                         eprintln!("[driver] 网络命令丢弃(前置校验):{why} ({command:?})");
                         *commands_rejected += 1;
                         return;
@@ -1085,7 +1118,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                         // 前置校验(评审修复①):预检不过 = 丢弃不投——hostile
                         // 输入不得触发调度器/模拟的 fail-stop panic(DoS);
                         // 只记录,不断链(与反压计数同型的外部输入降级)。
-                        if let Err(why) = validate_external_command(&session, shard, &command) {
+                        if let Err(why) =
+                            validate_external_command(&session, None, shard, &command)
+                        {
                             eprintln!("[driver] 外部命令丢弃(前置校验):{why} ({command:?})");
                             commands_rejected += 1;
                             continue;
@@ -1303,6 +1338,130 @@ mod tests {
         let mut session = sim_api::session::Session::new(config.session_config());
         session.register(sim(0, 0));
         session
+    }
+
+    /// REQ-006 任务 01:实体命令按 owner 校验/路由,不再看网络伪造分片。
+    #[test]
+    fn entity_commands_route_by_owner_and_permission() {
+        let config = Config::default();
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let e = EntityId::from_parts(1, 1);
+        session
+            .send_from(
+                messaging::InputSource(7),
+                shard_id(0, 0),
+                messaging::SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(120.0, 10.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("入箱");
+        session.tick();
+        assert_eq!(
+            session.entity_owner(e).map(|o| o.source),
+            Some(Some(messaging::InputSource(7)))
+        );
+        let remove = messaging::SimCommand::RemoveEntity { entity: e };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &remove
+            )
+            .is_ok(),
+            "owner 可删除自己的实体"
+        );
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(8)),
+                shard_id(0, 0),
+                &remove
+            )
+            .is_err(),
+            "其他玩家不能删"
+        );
+        // 伪造的 shard 参数被忽略:实体命令只看 owner。
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(1, 0),
+                &remove
+            )
+            .is_ok(),
+            "实体命令不再按 origin/网络分片校验"
+        );
+        // 未知实体。
+        let unknown = messaging::SimCommand::RemoveEntity {
+            entity: EntityId::from_parts(1, 99),
+        };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &unknown
+            )
+            .is_err()
+        );
+        // 服务端实体:外部拒绝,commands 通道(None)允许。
+        let server_owned = EntityId::from_parts(1, 2);
+        session
+            .send_from(
+                messaging::InputSource::SCHEDULER,
+                shard_id(0, 0),
+                messaging::SimCommand::SpawnDynamic {
+                    entity: server_owned,
+                    state: EntityState {
+                        translation: Vec3::new(8.0, 10.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("入箱");
+        session.tick();
+        let remove_server = messaging::SimCommand::RemoveEntity {
+            entity: server_owned,
+        };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &remove_server
+            )
+            .is_err(),
+            "服务端实体外部不可操作"
+        );
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &remove_server).is_ok(),
+            "commands 通道可操作服务端实体"
+        );
+        // MarkActor 外部拒绝。
+        let mark = messaging::SimCommand::MarkActor {
+            entity: e,
+            actor: true,
+        };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &mark
+            )
+            .is_err(),
+            "MarkActor 服务端专用"
+        );
+        session.shutdown();
     }
 
     /// 测试专用检查点存储:`Arc<Mutex<MemCheckpointStore>>` 共享句柄——驱动侧经

@@ -1,5 +1,7 @@
 # 任务 01:外部实体命令按 owner 路由与权限
 
+- 状态:**实现完成,门禁通过(2026-10-19)**。
+
 ## 目标
 
 外部 `RemoveEntity`/`TeleportEntity` 不再按 `origin_shard` 伪造路由；由
