@@ -14,8 +14,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::JoinHandle;
 
-use messaging::{AdmitError, InputPayload, InputSource, StampedInput};
-use physics_sim::{Outbox, ShardSim};
+use messaging::{AdmitError, CrossEvent, InputPayload, InputSource, StampedInput};
+use physics_sim::{BlockWriteKind, Outbox, ShardSim};
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
 use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, ShardId, Tick};
@@ -287,9 +287,10 @@ impl Scheduler {
     }
 
     /// 本拍 block write 的 owner 视角发布集(REQ-005 D11;取走即清,恰一次):
-    /// `(分片, 世界坐标方块格, 写入的方块 ID)`,只含 `shard == owner(pos.chunk_of())`
-    /// 的条目——广播时每个 holder 副本各产生一条同格写入,非 owner 的条目
-    /// 在此丢弃(网络/持久化看到恰一次;跨界涌现写入的任务 03 信封另接)。
+    /// `(分片, 世界坐标方块格, 写入的方块 ID)`。任务 03 起两类条目都进本集:
+    /// `External` 只发布 owner 的条目(广播下每个 holder 副本各产生一条同格
+    /// 写入,非 owner 的丢弃);`Emergent` 发布产生者的条目(网络在产生拍
+    /// 可见,owner 持久化前差一拍——任务书语义已接受)。
     pub fn take_block_updates(&mut self) -> Vec<(ShardId, BlockPos, BlockId)> {
         std::mem::take(&mut self.block_updates)
     }
@@ -322,6 +323,14 @@ impl Scheduler {
         self.router.pending_destinations()
     }
 
+    /// 待投递 `BlockWrite` 信封的目标格(REQ-005 任务 03 终审修复;两拍
+    /// 之间):`目的分片 → 仍有未应用涌现写入的 chunk 集`。驱动激活卸载
+    /// 决策处延迟命中 chunk 的卸载(信封 N+1 应用前接收方卸载目标 chunk
+    /// 是时序竞态,不该 fail-stop)。信封应用后查询自然清空。
+    pub fn pending_blockwrite_cells(&self) -> BTreeMap<ShardId, BTreeSet<ChunkPos>> {
+        self.router.pending_blockwrite_cells()
+    }
+
     /// 分片是否已加载某个 chunk(REQ-005 任务 01:外部 SetBlock 的未加载
     /// chunk 门卫透传;`VoxelWorld::set_block` 会自动建空气 chunk,hostile
     /// 输入必须在驱动侧拦下)。未注册分片 → false。
@@ -335,6 +344,85 @@ impl Scheduler {
     /// 断言用)。未注册分片或未加载 → None。
     pub fn voxel_chunk(&self, shard: ShardId, pos: ChunkPos) -> Option<&voxel::Chunk> {
         self.sims.get(&shard)?.voxel().get_chunk(pos)
+    }
+
+    /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
+    /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
+    /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内
+    /// 条目即"该分片已装载此 chunk")与事件 AABB(center ± radius,水平面)
+    /// 相交的**已注册**分片,ShardId 升序(`BTreeSet` 键序)。中心分片未注册
+    /// 不影响邻片命中(爆心可落在未注册区域)。
+    pub fn shards_covering(&self, center: Vec3, radius: f32) -> BTreeSet<ShardId> {
+        const SHARD_M: f32 = (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        const CHUNK_M: f32 = types::CHUNK_SIZE as f32;
+        // 事件 AABB(水平面;y 无界——柱状交集只看 x/z)。
+        let (ev_min_x, ev_max_x) = (center.x - radius, center.x + radius);
+        let (ev_min_z, ev_max_z) = (center.z - radius, center.z + radius);
+        // 轴向相交判定(闭区间:相切 = 相交,半径语义取含边界)。
+        let range_hits =
+            |a_min: f32, a_max: f32, b_min: f32, b_max: f32| a_min <= b_max && b_min <= a_max;
+        let mut covered: BTreeSet<ShardId> = BTreeSet::new();
+        for &shard in self.sims.keys() {
+            // ① core AABB(128m 方柱)与事件 AABB 相交。
+            let min = shard.pos.min_chunk();
+            let core_min_x = min.x as f32 * CHUNK_M;
+            let core_min_z = min.z as f32 * CHUNK_M;
+            let core_max_x = core_min_x + SHARD_M;
+            let core_max_z = core_min_z + SHARD_M;
+            if range_hits(core_min_x, core_max_x, ev_min_x, ev_max_x)
+                && range_hits(core_min_z, core_max_z, ev_min_z, ev_max_z)
+            {
+                covered.insert(shard);
+                continue;
+            }
+            // ② 该分片持有的任一 chunk 与事件 AABB 相交(holder 表登记即
+            //    已装载;chunk AABB = 16m 方柱)。
+            let hits = self.chunk_holders.chunks_of(shard).iter().any(|&cp| {
+                let c_min_x = cp.x as f32 * CHUNK_M;
+                let c_min_z = cp.z as f32 * CHUNK_M;
+                range_hits(c_min_x, c_min_x + CHUNK_M, ev_min_x, ev_max_x)
+                    && range_hits(c_min_z, c_min_z + CHUNK_M, ev_min_z, ev_max_z)
+            });
+            if hits {
+                covered.insert(shard);
+            }
+        }
+        covered
+    }
+
+    /// 涌现事件广播(REQ-005 §4.3.2/D10,任务书 03 签名固定):目标 =
+    /// `shards_covering(event 中心/半径) − {origin}`(origin 已在 step 内
+    /// 本地求值,不给自己发;空目标集 → `Ok`)。逐目标
+    /// `Intent { payload: Event }` 经 `Router::collect_intents` 盖章
+    /// (`apply_at = produced_at + 1`,per-source sequence 保证 canonical 序,
+    /// 每目标恰好一个信封)。队列满 → `Err(AdmitError::QueueFull)` 类型化
+    /// 反压(不静默丢;`tick()` 内调用方 fail-stop)。
+    pub fn broadcast_event(
+        &mut self,
+        origin: ShardId,
+        event: CrossEvent,
+        produced_at: Tick,
+    ) -> Result<(), AdmitError> {
+        let (center, radius) = match event {
+            CrossEvent::Detonate {
+                center,
+                power: _,
+                radius,
+            } => (center, radius),
+        };
+        let intents: Vec<messaging::Intent> = self
+            .shards_covering(center, radius)
+            .into_iter()
+            .filter(|&dest| dest != origin)
+            .map(|dest| messaging::Intent {
+                destination: dest,
+                payload: messaging::EnvelopePayload::Event(event),
+            })
+            .collect();
+        if intents.is_empty() {
+            return Ok(());
+        }
+        self.router.collect_intents(origin, &intents, produced_at)
     }
 
     pub fn apply_chunk_load(&mut self, shard: ShardId, pos: ChunkPos, chunk: voxel::Chunk) {
@@ -673,7 +761,8 @@ impl Scheduler {
         }
 
         // 6. sim 放回自有表;按 ShardId 升序处理 outbox(results 即 BTreeMap,
-        //    迭代天然升序):迁移意图盖章入队。
+        //    迭代天然升序):迁移意图盖章入队;涌现事件广播;凝固/涌现 block
+        //    write 分流(External 发布 / Emergent 发布+solidified 兼容+信封)。
         let mut migrations_admitted = 0usize;
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
@@ -692,18 +781,85 @@ impl Scheduler {
                 ),
                 Err(e) => panic!("迁移盖章被拒(编程错误,fail-stop):{e}"),
             }
-            // (shard, 格, 写入的方块):Outbox 只记 (实体, 格),写入值读自
-            // sim 体素世界(写入先于本处,凝固路径已落格)。
+            // 涌现事件(REQ-005 任务 03):`Outbox.events` 逐个广播(目标 =
+            // shards_covering − 自片;apply_at = N+1)。队列满 = fail-stop
+            // (反压策略待接入,同迁移盖章)。本任务 sim 不产事件,通道就绪。
+            for event in &outbox.events {
+                match self.broadcast_event(shard, *event, at) {
+                    Ok(()) => {}
+                    Err(AdmitError::QueueFull { capacity }) => panic!(
+                        "涌现事件队列满(capacity {capacity})于拍 {}:fail-stop,\
+                         反压策略待接入(REQ-005 任务书 03)",
+                        at.0
+                    ),
+                    Err(e) => panic!("涌现事件盖章被拒(编程错误,fail-stop):{e}"),
+                }
+            }
+            // (shard, 格, 写入的方块):凝固写入值读自 sim 体素世界(写入先于
+            // 本处,凝固路径已落格)。任务 03 起凝固桥产 `Emergent`——同一格
+            // 的条目在下方分流时一并写入本兼容字段(同格同值,take_solidified
+            // 语义不变,驱动/既有测试零改动)。
             for (_, cell) in &outbox.solidified {
                 self.solidified
                     .push((shard, *cell, sim.voxel().get_block(*cell)));
             }
-            // 方块写入(REQ-005 D11):广播下每个 holder 副本各记一条同格
-            // 写入;只发布 owner 的条目(非 owner 的丢弃——任务 03 的跨界
-            // BlockWrite 信封再接),网络/持久化由此看到恰一次。
+            // 方块写入分流(REQ-005 D11 + 任务 03):
+            // - `External`(外部 SetBlock 广播):只发布 owner 的条目(非 owner
+            //   副本的条目丢弃),不做信封——同拍广播已覆盖全部 holder。
+            // - `Emergent`(凝固桥等涌现写入):①发布产生者的条目(网络在产生
+            //   拍可见;owner 持久化前的可见性差一拍,任务书语义已接受);
+            //   ②同步进 `solidified` 兼容字段(take_solidified 语义不变);
+            //   ③对 owner + holders − {producer} 逐个盖 `EnvelopePayload::
+            //   BlockWrite`(apply_at = N+1,副本下一拍一致);producer 若自持
+            //   该 chunk(owner 或 holder)不发自己——已本地落格。
+            //   owner 未持有该 chunk → panic(任务 00 ensure 保证的不变量)。
             for write in &outbox.block_updates {
-                if shard == Self::owner_of(shard, write.pos.chunk_of()) {
-                    self.block_updates.push((shard, write.pos, write.block));
+                let chunk = write.pos.chunk_of();
+                let owner = Self::owner_of(shard, chunk);
+                match write.kind {
+                    BlockWriteKind::External => {
+                        if shard == owner {
+                            self.block_updates.push((shard, write.pos, write.block));
+                        }
+                    }
+                    BlockWriteKind::Emergent => {
+                        // ① 产生者发布(网络可见性在产生拍)。
+                        self.block_updates.push((shard, write.pos, write.block));
+                        // ② solidified 兼容字段(观察输出源②语义不变)。
+                        self.solidified.push((shard, write.pos, write.block));
+                        // ③ owner + holders − producer 的信封(下一拍副本一致)。
+                        let mut targets = self.chunk_holders.holders(owner, chunk);
+                        if !targets.contains(&owner) {
+                            panic!(
+                                "涌现 block write 的 owner {owner:?} 未持有 chunk {chunk:?}\
+                                 (任务 00 ensure 保证的不变量被破坏,fail-stop)"
+                            );
+                        }
+                        targets.remove(&shard); // producer 已本地落格,不发自己
+                        let intents: Vec<messaging::Intent> = targets
+                            .into_iter()
+                            .map(|dest| messaging::Intent {
+                                destination: dest,
+                                payload: messaging::EnvelopePayload::BlockWrite {
+                                    pos: write.pos,
+                                    block: write.block,
+                                },
+                            })
+                            .collect();
+                        if !intents.is_empty() {
+                            match self.router.collect_intents(shard, &intents, at) {
+                                Ok(()) => {}
+                                Err(AdmitError::QueueFull { capacity }) => panic!(
+                                    "涌现 block write 队列满(capacity {capacity})于拍 {}:\
+                                     fail-stop,反压策略待接入(REQ-005 任务书 03)",
+                                    at.0
+                                ),
+                                Err(e) => {
+                                    panic!("BlockWrite 盖章被拒(编程错误,fail-stop):{e}")
+                                }
+                            }
+                        }
+                    }
                 }
             }
             self.sims.insert(shard, sim);
@@ -2309,5 +2465,476 @@ mod tests {
             "SetObserverPosition 原语义保持"
         );
         sched.shutdown();
+    }
+
+    // ---- 任务书 req005-consistency/03:跨片事件广播与涌现 block write ----
+
+    /// Detonate 事件构造(center/radius 可控)。
+    fn blast(center: Vec3, power: f32, radius: f32) -> CrossEvent {
+        CrossEvent::Detonate {
+            center,
+            power,
+            radius,
+        }
+    }
+
+    /// 边界爆心(两片 core 交界 x=128 上;两片 core AABB 距爆心 0)。
+    const BOUNDARY: Vec3 = Vec3::new(128.0, 3.0, 64.0);
+
+    /// Emergent 写入的涌现路径驱动(测试用):给分片塞一个真静止实体
+    /// (零重力 + 位移门 0 = 直通凝固),走真实 `apply_prefix → step →
+    /// take_outbox` 产出 Emergent——凝固在 20 拍内必然发生(P2 计数达标)。
+    /// `entity` = 实体身份;返回前把实体塞进指定分片的 sim(仅测试模块,
+    /// 借 `Scheduler` 的 sims 直通——shard crate 测试与 sim 同依赖可构造,
+    /// 无新增公开面)。
+    fn spawn_resting_entity(sched: &mut Scheduler, shard: ShardId, entity: EntityId, pos: Vec3) {
+        let mut sim = {
+            let mut cfg = physics_sim::ShardSimConfig::new(shard);
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify.displacement_gate_m = 0.0;
+            ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+        };
+        sim.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity,
+                state: types::EntityState {
+                    translation: pos,
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        // 顶替注册表中的空壳 sim(保留其 lifecycle/ownership 登记)。
+        sched.sims.insert(shard, sim);
+    }
+
+    /// 跑到 producer 分片产出 Emergent 写入(≤40 拍;P2 计数 20 拍达标)。
+    fn run_until_emergent(sched: &mut Scheduler, shard: ShardId, entity: EntityId) {
+        for _ in 0..40 {
+            sched.tick();
+            if sched.entity_state(shard, entity).is_none() {
+                return; // 已凝固(实体移除 = Emergent 已产出并被分流)
+            }
+        }
+        panic!("40 拍内未凝固(场景退化)");
+    }
+
+    /// 任务书测试 `detonate_targets_all_covering_shards`:边界爆心两片都在
+    /// `shards_covering`(core AABB 相交);`broadcast_event` 后两片各自在
+    /// N+1 拍收到恰一封 Event 信封(origin 排除语义由 origin 自身不在目标集
+    /// 承担——本例 origin = 片 (0,0),它也在覆盖集但只作为 source 不收信)。
+    #[test]
+    fn detonate_targets_all_covering_shards() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let covering = sched.shards_covering(BOUNDARY, 1.0);
+        assert_eq!(
+            covering,
+            std::collections::BTreeSet::from([shard_id(0, 0), shard_id(1, 0)]),
+            "边界爆心:两片 core AABB 都与事件 AABB 相交"
+        );
+        sched
+            .broadcast_event(shard_id(0, 0), blast(BOUNDARY, 6.0, 1.0), Tick(0))
+            .expect("队列未满");
+        // 拍 0:apply_at(1) 未到;拍 1:目标 (1,0) 恰收一封(origin (0,0)
+        // 已在 step 内本地求值,不给自分片发——信封面;命令复制面每片一条
+        // LogEntry 由 sim-api detonate_from 覆盖)。
+        sched.tick();
+        let batch = sched.router.dispatch_prefix(shard_id(1, 0), Tick(1));
+        assert_eq!(batch.len(), 1, "目标 (1,0) 恰一封信封");
+        let InputPayload::Envelope(envelope) = &batch[0].payload else {
+            panic!("应为信封载荷,实为 {:?}", batch[0].payload)
+        };
+        assert!(
+            matches!(
+                envelope.payload,
+                messaging::EnvelopePayload::Event(CrossEvent::Detonate { .. })
+            ),
+            "收到的是 Event(Detonate) 信封"
+        );
+        assert_eq!(envelope.apply_at, Tick(1), "apply_at = N+1");
+        assert_eq!(envelope.source, shard_id(0, 0), "source = origin");
+        assert_eq!(batch[0].sequence, 0, "dispatch 侧 sequence = 信封序号");
+        // origin 自身同拍无信封;恰好一次:再取为空。
+        assert!(
+            sched
+                .router
+                .dispatch_prefix(shard_id(0, 0), Tick(1))
+                .is_empty(),
+            "origin 不收自己广播的事件"
+        );
+        assert!(
+            sched
+                .router
+                .dispatch_prefix(shard_id(1, 0), Tick(1))
+                .is_empty(),
+            "take 后桶清(恰好一次)"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `detonate_excludes_far_shards`:远离爆心的已注册分片不在
+    /// 目标集(core AABB 与事件 AABB 不相交、也不持有爆心附近 chunk)。
+    #[test]
+    fn detonate_excludes_far_shards() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        sched.register(sim(9, 9));
+        let covering = sched.shards_covering(BOUNDARY, 30.0);
+        assert!(
+            covering.contains(&shard_id(0, 0)) && covering.contains(&shard_id(1, 0)),
+            "两边界片在目标集:{covering:?}"
+        );
+        assert!(
+            !covering.contains(&shard_id(9, 9)),
+            "远片 (9,9)(core x≥1152)不在目标集:{covering:?}"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `detonate_center_in_empty_shard_hits_registered_neighbor`:
+    /// 爆心所在分片未注册,邻片已注册且持有爆心附近的扩张 chunk(holder 表
+    /// 命中)→ 目标集含邻片;不要求中心分片存在。几何:爆心 (150,·,8) 在
+    /// 未注册片 (1,0) core 深处;事件 AABB x∈[130,170] 与邻片 (0,0) 持有的
+    /// chunk (8,0)(AABB x∈[128,144])相交 → 邻片经 holder 命中(core AABB
+    /// x∈[0,128) 与事件 AABB 不相交,命中只能来自持有)。
+    #[test]
+    fn detonate_center_in_empty_shard_hits_registered_neighbor() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // 只注册片 (0,0);爆心落在未注册片 (1,0) 的 core 深处。
+        // 片 (0,0) 持有 chunk (8,0)(margin=2 才在其激活区域内;装载校验
+        // 按 activation_region 判,owner 片 (1,0) 未注册会被拦——装载前置
+        // 要求 owner 在位。绕开:注册 owner 片 (1,0) 后装载,再不参与判定
+        // ——不行,注册即在 sims 里。改用负向:爆心 (-150,·,8) 在未注册片
+        // (-1,0) core;邻片 (0,0) 注册且持 chunk (-1,0)(margin=1 即覆盖,
+        // owner = 片 (-1,0) 未注册仍会被 apply_chunk_load 拦)。
+        // 结论:装载前置要求 owner 在位,故"邻片持未注册 owner 的 chunk"
+        // 只能构造在 sims 直塞层(与装配期先 holder 后 owner 同型)。
+        let mut sim0 = sim(0, 0);
+        sim0.load_chunk(types::ChunkPos::new(8, 0), voxel::Chunk::air());
+        sched.register(sim0); // register 末尾 rebuild_holders 登记持有
+        let covering = sched.shards_covering(Vec3::new(150.0, 3.0, 8.0), 20.0);
+        assert!(
+            !covering.contains(&shard_id(1, 0)),
+            "未注册分片永不在目标集(遍历 sims):{covering:?}"
+        );
+        assert_eq!(
+            covering,
+            std::collections::BTreeSet::from([shard_id(0, 0)]),
+            "注册邻片经持有 chunk (8,0) 命中(core 不相交,holder 命中):{covering:?}"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `emergent_event_envelope_next_tick`(pure broadcast 面):
+    /// `broadcast_event` 后目标在 N+1 收到 Event;origin 不重复(同片场景见
+    /// `detonate_targets_all_covering_shards`,此处 origin 也在覆盖集)。
+    #[test]
+    fn emergent_event_envelope_next_tick() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // origin = (0,0);事件中心也落在 (0,0) 的 core 深处(两片都覆盖:
+        // 半径 80 跨过 x=128 边界)。
+        let center = Vec3::new(64.0, 3.0, 64.0);
+        sched
+            .broadcast_event(shard_id(0, 0), blast(center, 6.0, 80.0), Tick(0))
+            .expect("队列未满");
+        assert_eq!(
+            sched.router.pending_envelopes(),
+            1,
+            "origin 自己不发:只有远片 (1,0) 一封"
+        );
+        let batch = sched.router.dispatch_prefix(shard_id(1, 0), Tick(1));
+        assert_eq!(batch.len(), 1, "目标 N+1 收到恰一封");
+        assert_eq!(batch[0].apply_at, Tick(1));
+        // origin 自身同拍无信封。
+        assert!(
+            sched
+                .router
+                .dispatch_prefix(shard_id(0, 0), Tick(1))
+                .is_empty(),
+            "origin 不收自己广播的事件"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `emergent_event_canonical_and_once`:同拍多事件 → 同目标
+    /// 桶内按 (payload ordinal, source, source_sequence) canonical 序;
+    /// 每目标恰一次(不因多事件重复投同封)。
+    #[test]
+    fn emergent_event_canonical_and_once() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let dest = shard_id(1, 0);
+        // 同一 origin 连发两事件(同 apply_at):per-source sequence 0、1。
+        sched
+            .broadcast_event(
+                shard_id(0, 0),
+                blast(Vec3::new(64.0, 3.0, 64.0), 6.0, 80.0),
+                Tick(0),
+            )
+            .expect("第一发入队");
+        sched
+            .broadcast_event(
+                shard_id(0, 0),
+                blast(Vec3::new(60.0, 3.0, 64.0), 6.0, 80.0),
+                Tick(0),
+            )
+            .expect("第二发入队");
+        // 另一 origin 也发一封到同目标:source 序在 (0,0) 之后。
+        sched
+            .broadcast_event(
+                shard_id(0, 1),
+                blast(Vec3::new(64.0, 3.0, 64.0), 6.0, 80.0),
+                Tick(0),
+            )
+            .expect("第三发入队");
+        let batch = sched.router.dispatch_prefix(dest, Tick(1));
+        assert_eq!(batch.len(), 3, "同拍三封(每目标不去重事件,只去重信封)");
+        // canonical 序:source (0,0) 的 seq 0 → (0,0) 的 seq 1 → (0,1) 的 seq 0
+        // (dispatch 侧 sequence 字段 = 信封 source_sequence)。
+        // 序列语义:collect_intents 按 targets 升序盖章——第三发(origin
+        // (0,1))的目标 [(0,0), (1,0)] 中 (0,1) 自己排第一,故发往 (1,0)
+        // 的那封是该源的 seq 1(它给 (0,0) 的 seq 0 在另一个桶里)。
+        assert_eq!(batch[0].sequence, 0, "同源首事件 seq 0");
+        assert_eq!(batch[1].sequence, 1, "同源次事件 seq 1");
+        assert_eq!(batch[2].sequence, 1, "origin (0,1) 的第二目标 seq 1");
+        let src = |i: usize| match &batch[i].payload {
+            InputPayload::Envelope(e) => e.source,
+            other => panic!("应为信封载荷,实为 {other:?}"),
+        };
+        assert_eq!(src(0), shard_id(0, 0));
+        assert_eq!(src(1), shard_id(0, 0));
+        assert_eq!(src(2), shard_id(0, 1));
+        // 恰好一次。
+        assert!(sched.router.dispatch_prefix(dest, Tick(1)).is_empty());
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `event_queue_full_is_typed`:队列满 → `Err(AdmitError::
+    /// QueueFull)` 类型化返回,不 panic 不静默丢。
+    #[test]
+    fn event_queue_full_is_typed() {
+        let mut sched = Scheduler::new(SchedulerConfig {
+            router: crate::router::RouterConfig {
+                queue_capacity: 1,
+                ..crate::router::RouterConfig::default()
+            },
+            ..sched_cfg(2)
+        });
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        let event = blast(Vec3::new(64.0, 3.0, 64.0), 6.0, 80.0);
+        sched
+            .broadcast_event(shard_id(0, 0), event, Tick(0))
+            .expect("第一发入队(容量 1)");
+        // 目标只余 (1,0)(origin 排除后恰一封 → 已满)。
+        assert_eq!(
+            sched.broadcast_event(shard_id(0, 1), event, Tick(0)),
+            Err(AdmitError::QueueFull { capacity: 1 }),
+            "队列满 → 类型化 Err(不静默丢不 panic)"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `detonate_logs_one_entry_per_shard` 的 shard 级前置(信封
+    /// 侧):broadcast_event 的多目标信封 per-source sequence 连续、apply_at
+    /// 同拍;LogEntry 面由 sim-api `detonate_logs_one_entry_per_shard` 覆盖。
+    #[test]
+    fn broadcast_event_stamps_monotonic_sequences() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        sched.register(sim(2, 0));
+        // 事件覆盖三片(x∈[0,384) 全在半径内):origin (0,0) 发两事件。
+        let big = blast(Vec3::new(192.0, 3.0, 64.0), 6.0, 400.0);
+        sched
+            .broadcast_event(shard_id(0, 0), big, Tick(0))
+            .expect("第一发");
+        sched
+            .broadcast_event(shard_id(0, 0), big, Tick(1))
+            .expect("第二发");
+        // 拍 1 与拍 2 的目标桶:两目标各两封,sequence 依 (事件, 目标) 顺序
+        // 单调 collect_intents 盖章(事件序主导,同一事件内按目标序)。
+        let first = sched.router.dispatch_prefix(shard_id(1, 0), Tick(1));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].sequence, 0, "首事件→首目标 seq 0");
+        let at2 = sched.router.dispatch_prefix(shard_id(1, 0), Tick(2));
+        assert_eq!(at2.len(), 1);
+        assert_eq!(at2[0].sequence, 2, "次事件→同目标 seq 续 2");
+        let other = sched.router.dispatch_prefix(shard_id(2, 0), Tick(1));
+        assert_eq!(other[0].sequence, 1, "首事件→次目标 seq 1");
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `blockwrite_envelope_reaches_owner_and_holders`(shard 级,
+    /// 调度器分流面):producer(片 (1,0))上实体凝固(真路径:零重力 +
+    /// 位移门 0 → 首拍睡眠兜底凝固),凝固格落在其本体 chunk (8,0);
+    /// 邻片 (0,0) 持扩张副本 → ①发布集含 producer 条目、②solidified 兼容
+    /// 字段同步、③producer 不发自己、holder (0,0) 下一拍应用 BlockWrite
+    /// 信封(副本一致)。
+    #[test]
+    fn emergent_blockwrite_envelope_reaches_owner_and_holders() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // chunk (8,0):owner = 片 (1,0)= producer;片 (0,0) 持扩张副本。
+        let cp = types::ChunkPos::new(8, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        // producer 侧:真静止实体(130.5 ∈ 片 (1,0) core [128,256),chunk
+        // (8,0) 已装载 = holder 表有登记,owner 不变量成立)。
+        let e = types::EntityId::from_parts(1, 1);
+        spawn_resting_entity(&mut sched, shard_id(1, 0), e, Vec3::new(130.5, 5.5, 8.5));
+        run_until_emergent(&mut sched, shard_id(1, 0), e);
+        // ① 发布集:producer(1,0) 的条目(网络在产生拍可见)。
+        let updates = sched.take_block_updates();
+        assert_eq!(
+            updates,
+            vec![(shard_id(1, 0), BlockPos::new(130, 5, 8), types::BlockId(1))],
+            "Emergent → 发布产生者条目:{updates:?}"
+        );
+        // ② 兼容字段同步(take_solidified 语义不变)。
+        let solid = sched.take_solidified();
+        assert_eq!(
+            solid,
+            vec![(shard_id(1, 0), BlockPos::new(130, 5, 8), types::BlockId(1))],
+            "Emergent → solidified 兼容字段同步"
+        );
+        // ③ holder (0,0) 在下一拍应用 BlockWrite 信封(副本一致);
+        //    producer (1,0) 不收(已本地落格)。
+        sched.tick();
+        let owner_chunk = sched.voxel_chunk(shard_id(1, 0), cp).expect("已装载");
+        assert_eq!(
+            owner_chunk.get(2, 69, 8),
+            types::BlockId(1),
+            "producer 副本本地已写(凝固路径落格,局部 (2,69,8) = 世界 (130,5,8))"
+        );
+        let holder_chunk = sched.voxel_chunk(shard_id(0, 0), cp).expect("已装载");
+        assert_eq!(
+            holder_chunk.get(2, 69, 8),
+            types::BlockId(1),
+            "holder 副本经信封下一拍一致"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `blockwrite_does_not_rebroadcast`(调度器面):owner 应用
+    /// BlockWrite 信封后**不产新信封**(应用路径不推 outbox——无回环)。
+    #[test]
+    fn emergent_blockwrite_no_rebroadcast_loop() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // chunk (8,0):owner = 片 (1,0)= producer;片 (0,0) 持扩张副本。
+        let cp = types::ChunkPos::new(8, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        let e = types::EntityId::from_parts(1, 1);
+        spawn_resting_entity(&mut sched, shard_id(1, 0), e, Vec3::new(130.5, 5.5, 8.5));
+        run_until_emergent(&mut sched, shard_id(1, 0), e); // 拍 k:分流,信封待投
+        assert_eq!(sched.pending_shard_destinations().len(), 1, "一封待投");
+        let _ = sched.take_block_updates();
+        let _ = sched.take_solidified();
+        sched.tick(); // 拍 k+1:owner 应用信封
+        assert!(
+            sched.pending_shard_destinations().is_empty(),
+            "应用后零新增信封(无回环)"
+        );
+        // 再走一拍仍干净(环已结构性关闭)。
+        sched.tick();
+        assert!(sched.pending_shard_destinations().is_empty());
+        sched.shutdown();
+    }
+
+    /// 终审修复(REQ-005 任务 03):`pending_blockwrite_cells` 是驱动卸载
+    /// 保序的依据——信封 stamp 后(凝固拍末)命中接收方的目标 chunk,
+    /// 信封应用后查询自然清空。时序竞态(接收方在 N 与 N+1 之间卸载目标
+    /// chunk)由驱动延迟卸载消解,不再触发 dispatch 侧装载断言 fail-stop。
+    #[test]
+    fn pending_blockwrite_cells_defer_window() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // chunk (8,0):owner = 片 (1,0) = producer;片 (0,0) 持扩张副本
+        // → 信封只发 holder (0,0)(producer==owner 不发自己)。
+        let cp = types::ChunkPos::new(8, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        let e = types::EntityId::from_parts(1, 1);
+        spawn_resting_entity(&mut sched, shard_id(1, 0), e, Vec3::new(130.5, 5.5, 8.5));
+        run_until_emergent(&mut sched, shard_id(1, 0), e); // 拍 k:信封待投
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert(shard_id(0, 0), std::collections::BTreeSet::from([cp]));
+        assert_eq!(
+            sched.pending_blockwrite_cells(),
+            expected,
+            "stamp 后查询命中 holder 的目标 chunk(卸载保序窗口内)"
+        );
+        // 发布集/兼容字段取走不影响查询(查询面只看信封队列)。
+        let _ = sched.take_block_updates();
+        let _ = sched.take_solidified();
+        assert_eq!(sched.pending_blockwrite_cells(), expected);
+        sched.tick(); // 拍 k+1:信封应用
+        assert!(
+            sched.pending_blockwrite_cells().is_empty(),
+            "应用后查询清空(下一轮编排可正常卸载)"
+        );
+        sched.shutdown();
+    }
+
+    /// producer == owner 的 Emergent 写入:信封只发 holders − {owner}
+    /// (owner 本地已落格,不发自己);发布集/兼容字段照常。
+    #[test]
+    fn emergent_blockwrite_producer_equals_owner_skips_owner_envelope() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // chunk (7,0):owner = 片 (0,0) = producer;片 (1,0) 持扩张副本。
+        let cp = types::ChunkPos::new(7, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp, voxel::Chunk::air());
+        sched.apply_chunk_load(shard_id(1, 0), cp, voxel::Chunk::air());
+        let e = types::EntityId::from_parts(1, 1);
+        spawn_resting_entity(&mut sched, shard_id(0, 0), e, Vec3::new(120.5, 5.5, 8.5));
+        run_until_emergent(&mut sched, shard_id(0, 0), e); // 拍 k:信封只发 (1,0)
+        let _ = sched.take_block_updates();
+        let _ = sched.take_solidified();
+        assert_eq!(
+            sched.pending_shard_destinations(),
+            std::collections::BTreeSet::from([shard_id(1, 0)]),
+            "producer == owner:信封只发其余 holder"
+        );
+        sched.tick();
+        let holder_chunk = sched.voxel_chunk(shard_id(1, 0), cp).expect("已装载");
+        assert_eq!(
+            holder_chunk.get(8, 69, 8),
+            types::BlockId(1),
+            "holder 副本经信封一致"
+        );
+        sched.shutdown();
+    }
+
+    /// owner 未持有凝固格所在 chunk → panic(任务 00 ensure 保证的不变量;
+    /// fail-stop 面)。实体的凝固格落在 chunk (7,0),但两片都未装载它
+    /// (holder 表无条目)→ 分流时 fail-stop。
+    #[test]
+    #[should_panic(expected = "未持有 chunk")]
+    fn emergent_blockwrite_owner_not_holder_panics() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // 任何 chunk 都不装载:实体在虚空凝固(凝固写入不需要 chunk 预装,
+        // set_block 自动建),chunk (7,0) 的 owner = 片 (0,0) 但 holder 表
+        // 无登记 → 分流 fail-stop。
+        let e = types::EntityId::from_parts(1, 1);
+        spawn_resting_entity(&mut sched, shard_id(0, 0), e, Vec3::new(120.5, 5.5, 8.5));
+        run_until_emergent(&mut sched, shard_id(0, 0), e);
     }
 }

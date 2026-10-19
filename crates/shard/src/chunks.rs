@@ -49,6 +49,16 @@ impl ChunkHolders {
         self.holders.keys().map(|(owner, _)| *owner).collect()
     }
 
+    /// 某分片当前持有副本的全部 chunk(REQ-005 任务 03:覆盖判定按持有
+    /// chunk 枚举;表内条目即"该分片已装载此 chunk",ChunkPos 升序集合)。
+    pub fn chunks_of(&self, holder: ShardId) -> BTreeSet<ChunkPos> {
+        self.holders
+            .iter()
+            .filter(|(_, holders)| holders.contains(&holder))
+            .map(|((_, pos), _)| *pos)
+            .collect()
+    }
+
     /// 从"各分片 → 已加载 chunk"重建(恢复/回放用;先清空)。
     /// owner 由调用方按纯函数换算传入,本方法不做换算(保持纯登记)。
     pub fn rebuild<'a>(

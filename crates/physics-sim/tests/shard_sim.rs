@@ -219,7 +219,9 @@ fn entity_migrates_across_boundary() {
     );
     assert!(a.entity_state(entity(1)).is_none(), "源分片已删除");
 
-    let EnvelopePayload::MigrateEntity { entity: id, .. } = intent.payload;
+    let EnvelopePayload::MigrateEntity { entity: id, .. } = intent.payload else {
+        panic!("迁移意图载荷必为 MigrateEntity(变体穷举连带,任务 03)");
+    };
     let mut b = sim(1, 0);
     b.apply_prefix(&[input(
         1,
@@ -286,9 +288,13 @@ fn solidify_bridge_freezes_cube_into_voxels() {
     for _ in 0..1500 {
         s.step();
         let out = s.take_outbox();
-        if let Some((id, c)) = out.solidified.first() {
-            assert_eq!(*id, entity(1));
-            cell = Some(*c);
+        // 任务 03 适配:凝固写入迁 `block_updates` 的 `Emergent`(字段变,意图不变)。
+        if let Some(w) = out
+            .block_updates
+            .iter()
+            .find(|w| w.kind == physics_sim::BlockWriteKind::Emergent)
+        {
+            cell = Some(w.pos);
             break;
         }
     }
@@ -324,7 +330,12 @@ fn solidify_bridge_freezes_cube_into_voxels() {
     for _ in 0..300 {
         s.step();
         let out = s.take_outbox();
-        if out.solidified.iter().any(|(id, _)| *id == entity(2)) {
+        // 任务 03 适配:凝固检测读 `block_updates` 的 `Emergent`(同上)。
+        if out
+            .block_updates
+            .iter()
+            .any(|w| w.kind == physics_sim::BlockWriteKind::Emergent)
+        {
             settled = true; // 小方块自己也凝固了,用凝固前最后位置
             break;
         }

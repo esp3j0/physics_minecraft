@@ -178,6 +178,24 @@ impl Router {
         self.queue.restore(snap.envelopes);
         self.sequences = snap.sequences;
     }
+
+    /// 待投递 `BlockWrite` 信封的目标格(REQ-005 任务 03 终审修复):
+    /// `目的分片 → 其上仍有未应用涌现写入的 chunk 集`。驱动在激活卸载
+    /// 决策处用此延迟命中 chunk 的卸载——信封 `apply_at = N+1`,接收方
+    /// 在 N 与 N+1 之间卸载目标 chunk 会让 dispatch 侧的装载断言 fail-stop
+    /// (时序竞态,非装配 bug,不该 panic)。信封应用/取走后查询自然清空。
+    pub fn pending_blockwrite_cells(&self) -> BTreeMap<ShardId, BTreeSet<types::ChunkPos>> {
+        let mut cells: BTreeMap<ShardId, BTreeSet<types::ChunkPos>> = BTreeMap::new();
+        for envelope in self.queue.snapshot() {
+            if let messaging::EnvelopePayload::BlockWrite { pos, .. } = envelope.payload {
+                cells
+                    .entry(envelope.destination)
+                    .or_default()
+                    .insert(pos.chunk_of());
+            }
+        }
+        cells
+    }
 }
 
 #[cfg(test)]

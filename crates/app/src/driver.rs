@@ -102,12 +102,29 @@ type CommandGuard = Result<(), &'static str>;
 /// - `RemoveEntity` / `TeleportEntity` / `MarkActor` → 实体存在(按信息性
 ///   路由分片查 `entity_state`——`command_shard` 换算口径;迁移中的实体在
 ///   原 origin 分片表内,查询同键);
-/// - `SpawnDynamic` / `Detonate` → 分片在场即过(模拟侧无进一步 panic 路径)。
+/// - `SpawnDynamic` → 分片在场即过(模拟侧无进一步 panic 路径);
+/// - `Detonate` → **只做参数校验**且**先于**分片注册检查(REQ-005 任务 03)。
 pub fn validate_external_command(
     session: &sim_api::session::Session,
     shard: types::ShardId,
     command: &messaging::SimCommand,
 ) -> CommandGuard {
+    // Detonate(REQ-005 任务 03:**先于**分片注册检查):只做参数校验
+    // (有限值/半径>0);目标集合由 `Session::detonate_from` 的
+    // `shards_covering` 计算,爆心可在未注册区域(目标集可能为空 = 零条
+    // 日志,合法)。`shard` 参数对本变体仅信息性(不再用于投递判定)。
+    if let messaging::SimCommand::Detonate {
+        center: _,
+        power,
+        radius,
+    } = command
+    {
+        return if power.is_finite() && radius.is_finite() && *radius > 0.0 {
+            Ok(())
+        } else {
+            Err("Detonate 参数非法(需有限 power/radius 且 radius > 0)")
+        };
+    }
     // 未注册分片:任何命令都不可投(Scheduler::submit panic = fail-stop)。
     // ensure(编排 ①)只对观察者所在分片惰性建片——命令目标分片不由驱动
     // 造,hostile 序号路由(SpawnDynamic 中心/origin 远离一切观察者)不可达。
@@ -149,13 +166,17 @@ pub fn validate_external_command(
                 Err("实体不存在(按路由分片)")
             }
         }
-        messaging::SimCommand::SpawnDynamic { .. }
-        | messaging::SimCommand::Detonate { .. }
-        | messaging::SimCommand::SetObserverPosition { .. } => Ok(()),
-        // 观察者移除(REQ-005 D9):观察者收件箱专用命令,不可外部投递
-        // (客户端白名单拒绝;network translate 同口径)。经本缝到达 =
-        // 拒绝丢弃(hostile 路径不 panic)。
-        messaging::SimCommand::RemoveObserver => Err("观察者命令不可外部投递"),
+        messaging::SimCommand::SpawnDynamic { .. } => Ok(()),
+        // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
+        // Err 返回);此臂不可达,match 穷举仍需覆盖。
+        messaging::SimCommand::Detonate { .. } => Ok(()),
+        // 观察者命令(REQ-002 §4.2 / REQ-005 D9):SetObserverPosition 与
+        // RemoveObserver 同为调度器专用观察者收件箱的载荷,不可经外部缝投递
+        // (客户端白名单拒绝;network translate 同口径)。观察者移动的正路 =
+        // `DriverCommand::MoveObserver` 专用包 → `session.move_observer`。
+        // 经本缝到达 = 拒绝丢弃(hostile 路径不 panic)。
+        messaging::SimCommand::SetObserverPosition { .. }
+        | messaging::SimCommand::RemoveObserver => Err("观察者命令不可外部投递"),
     }
 }
 
@@ -163,13 +184,16 @@ pub fn validate_external_command(
 /// commands 通道与网络上行两条 Send 路径共用一处收口)。`source` 参数决定
 /// 日志 source:网络路径(有玩家)传玩家身份(REQ-005 D9:日志 source 必须
 /// 是玩家,不是会话 1),commands 通道(本地权威)传会话 source:
+/// - `Detonate` → `session.detonate_from`(REQ-005 任务 03:目标 =
+///   `shards_covering` 覆盖集;空目标集 = 零条日志合法)→ 全部入日志;
 /// - `SetBlock` → `session.send_broadcast_from`(同拍广播 owner + holders,
 ///   每个目标一条 [`LogEntry`],整批原子)→ 全部入日志;
 /// - 其余命令照旧单分片 `session.send_from` → 入日志;
 /// - `Err(Rejected)`(owner 不匹配/不支持的广播命令)→ eprintln + 计数,
 ///   不断链(hostile 路径丢弃;先经 [`validate_external_command`] 预检,
 ///   正常不可达,防御层兜底);
-/// - `Err(Route(InboxFull))` → 只计数,不断链(反压);
+/// - `Err(Route(InboxFull))` → 只计数,不断链(反压;Detonate 整批原子,
+///   任一目标满 = 全拒也走此计数);
 /// - 其它 Err → panic(非反压的会话层失败,fail-stop)。
 fn dispatch_external(
     session: &mut sim_api::session::Session,
@@ -179,18 +203,32 @@ fn dispatch_external(
     shard: types::ShardId,
     command: messaging::SimCommand,
 ) {
-    let result = if matches!(command, messaging::SimCommand::SetBlock { .. }) {
-        // 广播路径:返回全目标的 LogEntry(dest 升序,同盖章),逐条入日志。
-        session
-            .send_broadcast_from(source, shard, command)
+    let result = match command {
+        // 跨片爆炸(REQ-005 任务 03):目标集 = shards_covering;`shard`
+        // 参数仅信息性(网络 translate 的爆心分片,广播不再用它)。
+        messaging::SimCommand::Detonate {
+            center,
+            power,
+            radius,
+        } => session
+            .detonate_from(source, center, power, radius)
             .map(|entries| {
                 entries.iter().for_each(|entry| log.append(entry.clone()));
-            })
-    } else {
-        // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
-        session
-            .send_from(source, shard, command)
-            .map(|entry| log.append(entry))
+            }),
+        messaging::SimCommand::SetBlock { .. } => {
+            // 广播路径:返回全目标的 LogEntry(dest 升序,同盖章),逐条入日志。
+            session
+                .send_broadcast_from(source, shard, command)
+                .map(|entries| {
+                    entries.iter().for_each(|entry| log.append(entry.clone()));
+                })
+        }
+        _ => {
+            // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
+            session
+                .send_from(source, shard, command)
+                .map(|entry| log.append(entry))
+        }
     };
     match result {
         Ok(()) => {}
@@ -740,6 +778,11 @@ fn orchestrate(
     }
 
     // ② 激活请求 → provider 取数回填 / 卸载累积持久化批。
+    //    BlockWrite 卸载保序(REQ-005 任务 03 终审修复):Emergent 写入的信封
+    //    apply_at = N+1,接收方在 N 与 N+1 之间卸载目标 chunk 会让 dispatch
+    //    侧的装载断言 fail-stop——这是编排时序竞态,不是装配 bug。命中
+    //    pending 目标格的卸载延迟一轮(信封应用后下一轮编排正常卸载)。
+    let deferred_blockwrites = session.pending_blockwrite_cells();
     let mut put_batch: Vec<(ChunkKey, voxel::Chunk)> = Vec::new();
     for (shard, decisions) in session.take_activation_requests() {
         for pos in decisions.chunks_to_load {
@@ -749,13 +792,19 @@ fn orchestrate(
                 pos,
             };
             // 生成器兜底后不应 None——None = 生成器实现缺陷 → fail-stop(细则 1)。
-            let chunk = provider.get(key).unwrap_or_else(|| {
-                panic!("provider.get 返回 None(生成器实现缺陷,fail-stop):{key:?}")
-            });
+            let chunk = provider
+                .get(key)
+                .unwrap_or_else(|| panic!("provider.get 返回 None(生成器缺陷,fail-stop):{key:?}"));
             session.apply_chunk_load(shard, pos, chunk);
             counters.chunks_loaded += 1;
         }
         for pos in decisions.chunks_to_unload {
+            if deferred_blockwrites
+                .get(&shard)
+                .is_some_and(|chunks| chunks.contains(&pos))
+            {
+                continue;
+            }
             if let Some(chunk) = session.apply_chunk_unload(shard, pos) {
                 put_batch.push((
                     ChunkKey {
@@ -771,10 +820,16 @@ fn orchestrate(
     }
 
     // ③ despawn 候选 → unload_shard → chunks 并批 → 一次 flush 屏障。
+    //    在途信封目的分片不 despawn(防御:despawn 窗口远大于一拍,正常
+    //    不可达;若发生,下一拍信封黑洞校验会 fail-stop——先延迟更稳)。
+    let pending_destinations = session.pending_shard_destinations();
     let mut despawn_batch: Vec<(ChunkKey, voxel::Chunk)> = Vec::new();
     for shard in session.take_despawn_requests() {
         if !session.shard_ids().contains(&shard) {
             // 候选只记录不清,重复取会重复返回:已卸载的跳过(幂等)。
+            continue;
+        }
+        if pending_destinations.contains(&shard) {
             continue;
         }
         for (pos, chunk) in session.unload_shard(shard) {
@@ -1502,6 +1557,147 @@ mod tests {
             "三条 hostile 命令各自计数(丢弃不投)"
         );
         assert_eq!(outcome.ticks_run, 2, "循环仍活:hostile 输入不致命");
+    }
+
+    /// gate 修复(任务 03 先行项):`SetObserverPosition` 与 `RemoveObserver`
+    /// 同为观察者收件箱专用命令,经 commands 通道投递 → 前置校验拒绝
+    /// (commands_rejected 计数),不 panic、驱动存活、观察者表不变
+    /// (MoveObserver 专用包才是观察者移动的正路)。
+    #[tokio::test(start_paused = true)]
+    async fn setobserver_via_commands_rejected_counted() {
+        let config = test_config(600);
+        let session = session_with_one_shard(&config);
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        // 观察者专用命令经 Send 缝(commands 通道)注入:修复前落入 Ok 组,
+        // 直投分片收件箱 → 拍 0 应用时命中 ShardSim fail-stop panic(连坐)。
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SetObserverPosition {
+                position: Vec3::new(8.0, 3.0, 8.0),
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("观察者命令经 Send 缝不崩驱动");
+        assert_eq!(
+            outcome.commands_rejected, 1,
+            "SetObserverPosition 经 Send 缝被拒绝并计数"
+        );
+
+        // 观察者表不变:检查点快照的调度器观察者表为空(直投未发生)。
+        let bundle = latest_bundle(&checkpoints);
+        assert!(
+            bundle.world.scheduler.observers.is_empty(),
+            "观察者表不变(命令未进观察者收件箱)"
+        );
+    }
+
+    // ---- 任务书 req005-consistency/03:网络 Detonate 跨片广播(app 面)----
+
+    /// 任务书测试 `detonate_hostile_parameters_rejected`:NaN/±inf/radius≤0
+    /// 的 Detonate 被驱动丢弃(commands_rejected 计数),不 panic、不断链;
+    /// 合法参数的同型命令照常生效(对照)。合法版同时验证 Detonate 走
+    /// `detonate_from`(日志按覆盖集逐片一条)与"中心分片未注册不拒"
+    /// (爆心在未注册区域 → 空目标集 = 零条日志、零拒绝)。
+    #[tokio::test(start_paused = true)]
+    async fn detonate_hostile_parameters_rejected() {
+        let config = test_config(600);
+        let session = session_with_one_shard(&config);
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        let shard = shard_id(0, 0);
+        let blast = |power: f32, radius: f32| messaging::SimCommand::Detonate {
+            center: Vec3::new(8.0, 3.0, 8.0),
+            power,
+            radius,
+        };
+        // 四类 hostile 参数(路由分片已注册,预检只看参数)。
+        inject_send(&tx, shard, blast(f32::NAN, 5.0)).await;
+        inject_send(&tx, shard, blast(f32::INFINITY, 5.0)).await;
+        inject_send(&tx, shard, blast(6.0, f32::NEG_INFINITY)).await;
+        inject_send(&tx, shard, blast(6.0, 0.0)).await;
+        // 对照:爆心在远端未注册区域(分片 (999,9))——合法参数 → 空目标集,
+        // 零拒绝零日志(不因"爆心分片未注册"被丢)。
+        inject_send(
+            &tx,
+            shard_id(999, 9),
+            messaging::SimCommand::Detonate {
+                center: Vec3::new(500_000.0, 3.0, 500_000.0),
+                power: 6.0,
+                radius: 5.0,
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("hostile Detonate 不崩驱动");
+        assert_eq!(
+            outcome.commands_rejected, 4,
+            "四条 hostile 参数各自计数(丢弃不投),合法空目标集不计"
+        );
+
+        // 日志面:无 Detonate 入日志(四条被丢 + 空目标集零条)。
+        let bundle = latest_bundle(&checkpoints);
+        let entries = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
+            .expect("自有编码必可解码")
+            .take();
+        assert!(
+            !entries
+                .iter()
+                .any(|e| matches!(e.command, messaging::SimCommand::Detonate { .. })),
+            "hostile Detonate 不入日志:{entries:?}"
+        );
+    }
+
+    /// 任务书 03(app 面):合法 Detonate 经 commands 通道 → `detonate_from`
+    /// 广播——日志按覆盖集逐片一条(升序),分片行为 = 各自本地求值(范围内
+    /// 实体受冲量)。单分片场景目标 = 1(行为与旧单片 send 等价,回归面)。
+    #[tokio::test(start_paused = true)]
+    async fn detonate_via_commands_broadcasts_and_logs() {
+        let config = test_config(600);
+        let session = session_with_one_shard(&config);
+        let shard = shard_id(0, 0);
+        let e = EntityId::from_parts(1, 1);
+        let (args, tx, checkpoints) = test_args(config, session);
+        let driver = tokio::spawn(run(args));
+
+        // 先确保分片在(预注册),再注入实体(命令路径)与爆炸。
+        inject_send(&tx, shard, spawn_cmd(e)).await;
+        advance_ticks(1).await;
+        inject_send(
+            &tx,
+            shard,
+            messaging::SimCommand::Detonate {
+                center: Vec3::new(1.5, 3.0, 1.5),
+                power: 8.0,
+                radius: 5.0,
+            },
+        )
+        .await;
+        advance_ticks(2).await;
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert_eq!(outcome.commands_rejected, 0, "合法命令零拒绝");
+
+        // 日志:Spawn 1 条 + Detonate 1 条(单分片覆盖集 = 1 个目标)。
+        let bundle = latest_bundle(&checkpoints);
+        let entries = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
+            .expect("自有编码必可解码")
+            .take();
+        let blasts: Vec<_> = entries
+            .iter()
+            .filter(|e| matches!(e.command, messaging::SimCommand::Detonate { .. }))
+            .collect();
+        assert_eq!(blasts.len(), 1, "单分片 detonate = 一条日志(覆盖集 1 目标)");
+        assert_eq!(blasts[0].dest, shard, "dest = 覆盖分片");
     }
 
     /// 测试清单 5:(暂停时间下)跑 20 拍 tick 计数恰 20,无连跳(首枚已吃)。

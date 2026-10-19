@@ -113,15 +113,22 @@ pub struct Outbox {
     pub migrations: Vec<Intent>,
     /// 本 tick collider 重建过的 chunk(可见性/换装统计用)。
     pub dirty_chunks: BTreeSet<ChunkPos>,
-    /// 凝固完成记录:(实体, 写入的格)。
+    /// 凝固完成记录:(实体, 写入的格)。**任务 03 起恒空**(兼容字段,serde
+    /// 布局不变):凝固写入已迁 `block_updates` 的 `Emergent`,网络/广播面统一
+    /// 走该通道;`solidified` 仅保留字段形状供既有快照格式/兼容测试。
     pub solidified: Vec<(EntityId, BlockPos)>,
-    /// 本拍物理/命令产生的方块写入(REQ-005 D11;本任务只产生 `External`,
-    /// 凝固桥仍走 `solidified`——任务 03 迁 `Emergent` 并经信封)。快照格式
-    /// 随本字段变更:bincode 为非自描述定长格式,旧检查点(三字段 Outbox)
-    /// 用新二进制解码必报 UnexpectedEnd(bootstrap 显式 fail-stop,不静默
-    /// 错);`#[serde(default)]` 在此格式下对缺失尾字段不生效,不可用它声称
-    /// 旧快照兼容。格式版本化由任务 02 的 format_version 处理。
+    /// 本拍物理/命令产生的方块写入(REQ-005 D11):`External` = 外部 SetBlock,
+    /// `Emergent` = 凝固桥(任务 03 迁入)与未来的破坏语义。快照格式随本字段
+    /// 变更:bincode 为非自描述定长格式,旧检查点(三字段 Outbox)用新二进制
+    /// 解码必报 UnexpectedEnd(bootstrap 显式 fail-stop,不静默错);
+    /// `#[serde(default)]` 在此格式下对缺失尾字段不生效,不可用它声称旧快照
+    /// 兼容。格式版本化由任务 02 的 format_version 处理。
     pub block_updates: Vec<BlockWrite>,
+    /// 涌现事件生产口(REQ-005 任务 03):分片内部语义(撞击触发等)未来把
+    /// `CrossEvent` 推入此处,调度器 tick 末经 `broadcast_event` 广播(目标
+    /// 分片 apply_at = N+1 本地求值)。本任务模拟核不主动产事件,字段恒空,
+    /// 测试可直接调 `Scheduler::broadcast_event`。
+    pub events: Vec<CrossEvent>,
 }
 
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
@@ -251,6 +258,30 @@ impl ShardSim {
                         state,
                         desc,
                     } => self.spawn_entity(entity, state, desc),
+                    // 涌现事件(REQ-005 任务 03):共享参数本地求值,复用同一
+                    // 纯函数;冻结体免疫语义不变(§9.12)。CrossEvent 未来变体
+                    // 追加时本 match 穷举强制处理。
+                    EnvelopePayload::Event(CrossEvent::Detonate {
+                        center,
+                        power,
+                        radius,
+                    }) => self.detonate(center, power, radius),
+                    // 涌现 block write(REQ-005 任务 03):目标 chunk 必已装载
+                    // (owner/holder 才会被盖章为收件人;未装载 = 内部一致性
+                    // 违规 fail-stop),写体素 + 重建边界 collider;**不推
+                    // `outbox.block_updates`**(防广播回环)。
+                    EnvelopePayload::BlockWrite { pos, block } => {
+                        assert!(
+                            self.voxels.get_chunk(pos.chunk_of()).is_some(),
+                            "BlockWrite 信封落到未装载 chunk {pos:?}(owner/holder 必然\
+                             装载着该 chunk,内部一致性违规,fail-stop)"
+                        );
+                        if self.voxels.set_block(pos, block).is_ok() {
+                            for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
+                                self.rebuild_chunk_collider(cp);
+                            }
+                        }
+                    }
                 },
             }
         }
@@ -371,7 +402,15 @@ impl ShardSim {
                         }
                         self.entities.remove(&id).expect("存在");
                         self.phys.remove_body(handle);
-                        self.outbox.solidified.push((id, cell));
+                        // 涌现写入(REQ-005 任务 03):凝固桥经 block_updates 的
+                        // `Emergent` 出片——调度器 tick 末发布产生者 + 对
+                        // owner/holders 盖 `EnvelopePayload::BlockWrite`
+                        // (apply_at = N+1);`solidified` 兼容字段自本任务恒空。
+                        self.outbox.block_updates.push(BlockWrite {
+                            pos: cell,
+                            block: desc.block,
+                            kind: BlockWriteKind::Emergent,
+                        });
                         continue;
                     }
                 }
@@ -734,8 +773,7 @@ mod tests {
     #[test]
     fn frozen_body_ignores_detonate() {
         let mut s = sim(0, 0);
-        let (near, far) = (entity(1), entity(2));
-        // 近 (8,3,8)、远 (100,3,100)——爆炸中心取两者正中,几何对称。
+        let (near, far) = (entity(1), entity(2)); // 近 (8,3,8)、远 (100,3,100)——爆炸中心取两者正中,几何对称。
         s.apply_prefix(&[
             spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
             spawn_input(1, far, Vec3::new(100.0, 3.0, 100.0)),
@@ -783,18 +821,20 @@ mod tests {
         s.apply_prefix(&[spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0))]);
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(decisions.entities_to_freeze, vec![e], "远处实体被冻结");
-        let frozen_state = s.entity_state(e).expect("冻结后仍在表");
+        let far_state = s.entity_state(e).expect("冻结后仍在表");
         for _ in 0..200 {
             s.step();
         }
-        assert_eq!(
-            s.entity_state(e),
-            Some(frozen_state),
-            "冻结体 200 拍位级不变"
-        );
+        assert_eq!(s.entity_state(e), Some(far_state), "冻结体 200 拍位级不变");
         let outbox = s.take_outbox();
         assert!(outbox.migrations.is_empty(), "冻结体不迁移(防御性跳过)");
-        assert!(outbox.solidified.is_empty(), "冻结体不凝固");
+        assert!(
+            outbox
+                .block_updates
+                .iter()
+                .all(|w| w.kind != BlockWriteKind::Emergent),
+            "冻结体不凝固(凝固写入零条 Emergent)"
+        );
         assert_eq!(s.voxel().chunk_count(), 0, "凝固桥未写入任何体素");
     }
 
@@ -991,7 +1031,12 @@ mod tests {
         let mut solidified = 0;
         for _ in 0..600 {
             s.step();
-            solidified += s.take_outbox().solidified.len();
+            solidified += s
+                .take_outbox()
+                .block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent)
+                .count();
         }
         assert_eq!(solidified, 0, "位移门挡住慢漂:600 tick 零凝固");
         assert!(
@@ -1002,6 +1047,8 @@ mod tests {
 
     /// 测试清单 2 `gate_passes_true_rest`:真静止 20 tick 照常凝固
     /// (窗口位移 ≈0 ≤ 门);snap 正常(体素写入 = outbox 记录格)。
+    /// 任务 03 适配:凝固写入迁 `block_updates` 的 `Emergent`(断言字段变,
+    /// 测试意图不变——凝固仍被记录)。
     #[test]
     fn gate_passes_true_rest() {
         let mut s = zero_g_sim();
@@ -1011,9 +1058,13 @@ mod tests {
         for _ in 0..100 {
             s.step();
             let out = s.take_outbox();
-            if let Some((id, c)) = out.solidified.first() {
-                assert_eq!(*id, e);
-                cell = Some(*c);
+            if let Some(w) = out
+                .block_updates
+                .iter()
+                .find(|w| w.kind == BlockWriteKind::Emergent)
+            {
+                assert_eq!(w.pos, BlockPos::new(60, 3, 60), " Emergent 写入格");
+                cell = Some(w.pos);
                 break;
             }
         }
@@ -1026,7 +1077,8 @@ mod tests {
     /// 滑行体(demo 场景 C 语义):滑行中不截断——P2 计数 @20 被位移门挡
     /// (20 tick 位移 10mm > 3mm);引擎睡眠(30 tick 累积,@31)后速度冻结,
     /// 窗口随滚动衰减(首端逐步排空带位移样本)→ 凝固只发生在睡眠之后
-    /// (t > 31),即兜底不再抢在睡眠/衰减前凝固。
+    /// (t > 31),即兜底不再抢在睡眠/衰减前凝固。任务 03 适配:凝固检测改
+    /// 读 `block_updates` 的 `Emergent`(字段迁移,意图不变)。
     #[test]
     fn sleeping_body_freezes_only_after_stop() {
         let mut s = zero_g_sim();
@@ -1035,7 +1087,11 @@ mod tests {
         let mut freeze_tick = None;
         for tick in 1..=600u32 {
             s.step();
-            if !s.take_outbox().solidified.is_empty() {
+            if s.take_outbox()
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent)
+            {
                 freeze_tick = Some(tick);
                 break;
             }
@@ -1065,7 +1121,11 @@ mod tests {
             s.step();
         }
         assert_eq!(
-            s.take_outbox().solidified.len(),
+            s.take_outbox()
+                .block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent)
+                .count(),
             0,
             "演员实体 600 tick 真静止不凝固(完全豁免)"
         );
@@ -1075,7 +1135,11 @@ mod tests {
         let mut restored = false;
         for _ in 0..100 {
             s.step();
-            if !s.take_outbox().solidified.is_empty() {
+            if s.take_outbox()
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent)
+            {
                 restored = true;
                 break;
             }
@@ -1141,7 +1205,8 @@ mod tests {
     }
 
     /// 测试清单 7 `gate_disabled_when_zero`:displacement_gate_m=0 → 门关闭
-    /// (直通):同样的慢漂实体照旧凝固(兼容开关)。
+    /// (直通):同样的慢漂实体照旧凝固(兼容开关)。任务 03 适配:凝固计数
+    /// 读 `block_updates` 的 `Emergent`(字段迁移,意图不变)。
     #[test]
     fn gate_disabled_when_zero() {
         let mut s = zero_g_sim();
@@ -1151,7 +1216,12 @@ mod tests {
         let mut solidified = 0;
         for _ in 0..600 {
             s.step();
-            solidified += s.take_outbox().solidified.len();
+            solidified += s
+                .take_outbox()
+                .block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent)
+                .count();
         }
         assert_eq!(solidified, 1, "门关闭:慢漂实体照旧凝固一次(直通)");
         assert!(s.entity_state(e).is_none(), "实体已凝固移除");
@@ -1259,5 +1329,192 @@ mod tests {
             s.take_outbox().block_updates,
             "未消费的 block_updates 随快照往返"
         );
+    }
+
+    // ---- 任务书 req005-consistency/03:涌现 block write / 跨片事件信封 ----
+
+    /// 盖章信封输入(Envelope 载荷;apply_at/序列可控)。
+    fn envelope_input(seq: u64, source: ShardId, payload: EnvelopePayload) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Envelope(messaging::Envelope::stamp(
+                source,
+                Intent {
+                    destination: shard_id(0, 0),
+                    payload,
+                },
+                Tick(0),
+                seq,
+            )),
+        }
+    }
+
+    /// 任务书测试 `blockwrite_envelope_reaches_owner_and_holders`(sim 级,
+    /// 副本一致面):BlockWrite 信封进输入前缀 → 体素写入 + collider 重建
+    /// (重建 = 实体能停上去,不可直接观测 colliders,用驻留证明);
+    /// owner 持久化面由调度器 owner 发布/卸载写库承载(shard/app 级覆盖)。
+    #[test]
+    fn blockwrite_envelope_writes_voxel_and_rebuilds_collider() {
+        let mut s = zero_g_sim();
+        // 预装一个顶面在局部 y=64(world y=0)的地形 chunk。
+        let mut ground = voxel::Chunk::air();
+        for y in 0..64 {
+            for x in 0..16 {
+                for z in 0..16 {
+                    ground.set(x, y, z, types::BlockId(1));
+                }
+            }
+        }
+        s.load_chunk(types::ChunkPos::new(0, 0), ground);
+        let pos = BlockPos::new(3, 0, 3); // 地面上方一格
+        s.apply_prefix(&[envelope_input(
+            0,
+            shard_id(9, 9),
+            EnvelopePayload::BlockWrite {
+                pos,
+                block: types::BlockId(2),
+            },
+        )]);
+        // 体素已写入(信封直接应用)。
+        assert_eq!(s.voxel().get_block(pos), types::BlockId(2), "信封写体素");
+        // 防回环:信封应用不产 block_updates、不产事件(任务书细则 3)。
+        let outbox = s.take_outbox();
+        assert!(
+            outbox.block_updates.is_empty(),
+            "BlockWrite 信封不推 outbox(防广播回环)"
+        );
+        assert!(outbox.events.is_empty(), "信封应用不产事件");
+        // collider 已重建:新方块真实承托(有重力探针从上落下停在 (3,1,3)
+        // 顶面 ≈y1.5;探针也可能 P2′ 凝固落格——凝固同样证明"有真实碰撞
+        // 停住",两态皆证据)。
+        let probe = entity(1);
+        s.apply_prefix(&[spawn_input(1, probe, Vec3::new(3.5, 3.0, 3.5))]);
+        let mut y = None;
+        let mut solidified = false;
+        for _ in 0..200 {
+            s.step();
+            match s.entity_state(probe) {
+                Some(st) => y = Some(st.translation.y),
+                None => {
+                    solidified = true; // 凝固落格(承托成立)
+                    break;
+                }
+            }
+        }
+        assert!(
+            solidified || y.is_some_and(|y| (y - 1.5).abs() < 0.6),
+            "实体停在新写入的方块上(y≈1.5 或凝固,信封写入的 collider 生效):\
+             y={y:?} solidified={solidified}"
+        );
+    }
+
+    /// 任务书测试 `blockwrite_does_not_rebroadcast`(sim 级):凝固定格上
+    /// 重复投同一格 BlockWrite(空气→方块→同值再写)——每次应用都零产出
+    /// (不产 External/Emergent 写入,不产信封),广播环在应用侧结构性关闭。
+    #[test]
+    fn blockwrite_apply_never_produces_outbox_writes() {
+        let mut s = zero_g_sim();
+        s.load_chunk(types::ChunkPos::new(0, 0), voxel::Chunk::air());
+        let pos = BlockPos::new(2, 5, 2);
+        for seq in 0..3u64 {
+            s.apply_prefix(&[envelope_input(
+                seq,
+                shard_id(9, 9),
+                EnvelopePayload::BlockWrite {
+                    pos,
+                    block: types::BlockId(7),
+                },
+            )]);
+            let outbox = s.take_outbox();
+            assert!(
+                outbox.block_updates.is_empty() && outbox.events.is_empty(),
+                "第 {seq} 次应用:零 block_updates 零 events(无回环)"
+            );
+        }
+        assert_eq!(s.voxel().get_block(pos), types::BlockId(7));
+    }
+
+    /// 任务书测试 `emergent_event_envelope_next_tick` 的 sim 级前置:
+    /// `EnvelopePayload::Event(Detonate)` 进输入前缀 → 本地 detonate(复用
+    /// 同一函数):范围内实体受冲量,冻结体免疫(§9.12)。
+    #[test]
+    fn event_envelope_detonates_locally_frozen_immune() {
+        let mut s = zero_g_sim();
+        let (near, far) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
+            spawn_input(1, far, Vec3::new(100.0, 3.0, 100.0)),
+        ]);
+        let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(decisions.entities_to_freeze, vec![far], "非退化:far 冻结");
+        let far_before = s.entity_state(far).expect("冻结体仍在表");
+
+        s.apply_prefix(&[envelope_input(
+            2,
+            shard_id(1, 0),
+            EnvelopePayload::Event(CrossEvent::Detonate {
+                center: Vec3::new(54.0, 3.0, 54.0),
+                power: 30.0,
+                radius: 70.0,
+            }),
+        )]);
+        let far_after = s.entity_state(far).expect("冻结体未被移除");
+        assert_eq!(far_after, far_before, "冻结体对涌现事件免疫(位级不变)");
+        let near_after = s.entity_state(near).expect("近处实体仍在");
+        assert!(
+            near_after.linvel.length() > 2.0,
+            "近处实体受冲量(事件信封本地求值):{:?}",
+            near_after.linvel
+        );
+        // 事件信封应用不产任何 outbox 条目(事件是终端语义,非产出)。
+        let outbox = s.take_outbox();
+        assert!(outbox.block_updates.is_empty() && outbox.events.is_empty());
+    }
+
+    /// `Outbox.events` 生产口(任务 03 只留字段):sim 不主动推事件;字段落
+    /// outbox/take_outbox 往返(serde 布局连带)。语义面(撞击触发)非本任务。
+    #[test]
+    fn outbox_events_field_present_and_default_empty() {
+        let mut s = sim(0, 0);
+        s.outbox.events.push(CrossEvent::Detonate {
+            center: Vec3::ZERO,
+            power: 1.0,
+            radius: 1.0,
+        });
+        let out = s.take_outbox();
+        assert_eq!(out.events.len(), 1, "events 字段随 outbox 出片");
+        assert!(s.take_outbox().events.is_empty(), "取走即清");
+        // 快照往返(events 非空时随快照走,serde 布局不变量)。
+        s.outbox.events.push(CrossEvent::Detonate {
+            center: Vec3::ONE,
+            power: 2.0,
+            radius: 3.0,
+        });
+        let bytes = s.snapshot();
+        let mut restored = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        assert_eq!(
+            restored.take_outbox().events,
+            s.outbox.events,
+            "未消费 events 随快照往返"
+        );
+    }
+
+    /// 任务书细则 3(fail-stop 面):BlockWrite 信封落到未装载 chunk =
+    /// 内部一致性违规 → panic(owner/holder 必然装载着该 chunk)。
+    #[test]
+    #[should_panic(expected = "未装载 chunk")]
+    fn blockwrite_to_unloaded_chunk_panics() {
+        let mut s = zero_g_sim();
+        s.apply_prefix(&[envelope_input(
+            0,
+            shard_id(9, 9),
+            EnvelopePayload::BlockWrite {
+                pos: BlockPos::new(200, 5, 200),
+                block: types::BlockId(1),
+            },
+        )]);
     }
 }

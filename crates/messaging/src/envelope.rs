@@ -4,7 +4,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use types::{EntityDesc, EntityId, EntityState, ShardId, Tick};
+use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, ShardId, Tick};
+
+use crate::event::CrossEvent;
 
 /// 队列默认容量(REQ-001 §4.2 决议:1024)。
 pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
@@ -18,6 +20,11 @@ pub enum EnvelopePayload {
         state: EntityState,
         desc: EntityDesc,
     },
+    /// 涌现事件(REQ-005 §4.3.2/D10):共享参数,各片本地求值;apply_at = N+1。
+    Event(CrossEvent),
+    /// 涌现 block write(REQ-005 §4.3.3):owner + holders 应用;apply_at = N+1;
+    /// 应用后不再产 `block_updates`(防广播回环)。
+    BlockWrite { pos: BlockPos, block: BlockId },
 }
 
 impl EnvelopePayload {
@@ -25,6 +32,8 @@ impl EnvelopePayload {
     pub const fn ordinal(self) -> u16 {
         match self {
             Self::MigrateEntity { .. } => 0,
+            Self::Event(_) => 1,
+            Self::BlockWrite { .. } => 2,
         }
     }
 }
@@ -240,6 +249,30 @@ mod tests {
             desc: EntityDesc::default(),
         };
         assert_eq!(p.ordinal(), 0);
+    }
+
+    /// 任务书 03(messaging 连带):追加变体 Event/BlockWrite 的声明序 ——
+    /// MigrateEntity=0、Event=1、BlockWrite=2(枚举只许追加,REQ-001 §9.6)。
+    #[test]
+    fn event_blockwrite_ordinals_appended_in_declared_order() {
+        let event = EnvelopePayload::Event(CrossEvent::Detonate {
+            center: types::glam::Vec3::ZERO,
+            power: 1.0,
+            radius: 1.0,
+        });
+        let write = EnvelopePayload::BlockWrite {
+            pos: types::BlockPos::ZERO,
+            block: types::BlockId(1),
+        };
+        assert_eq!(event.ordinal(), 1, "Event = 追加序 1(任务 03)");
+        assert_eq!(write.ordinal(), 2, "BlockWrite = 追加序 2(任务 03)");
+        let migrate = EnvelopePayload::MigrateEntity {
+            entity: EntityId::from_parts(1, 1),
+            state: EntityState::default(),
+            desc: EntityDesc::default(),
+        };
+        assert!(migrate.ordinal() < event.ordinal());
+        assert!(event.ordinal() < write.ordinal(), "声明序 = 序号升序");
     }
 
     #[test]

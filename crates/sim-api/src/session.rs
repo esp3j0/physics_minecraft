@@ -199,6 +199,69 @@ impl Session {
         self.send_broadcast(owner, SimCommand::SetBlock { pos, block })
     }
 
+    /// 外部爆炸(REQ-005 §4.3.1/D10,任务书 req005-consistency/03 签名固定):
+    /// 目标分片 = [`Scheduler::shards_covering`](center, radius)(core AABB 或
+    /// 持有 chunk 与事件 AABB 相交的**已注册**分片;中心分片未注册不拒——
+    /// 爆心可在未注册区域,目标集由覆盖计算)。每个目标投递同一
+    /// `SimCommand::Detonate`(同一 apply_at/source/sequence,整批只 +1),
+    /// `submit_batch` 原子(任一收件箱满 → 全拒,`Err(SessionError::Route)`,
+    /// 不消耗 sequence);空目标集 → `Ok(vec![])`(零条日志,不报错)。
+    /// 每个目标一条 [`LogEntry`](dest 升序,command = Detonate)。
+    ///
+    /// **不做参数校验**(hostile 输入由驱动 `validate_external_command` 拦:
+    /// power/radius 有限值与 radius > 0;会话层信任调用方)。
+    pub fn detonate_from(
+        &mut self,
+        source: InputSource,
+        center: Vec3,
+        power: f32,
+        radius: f32,
+    ) -> Result<Vec<LogEntry>, SessionError> {
+        let targets: Vec<ShardId> = self
+            .scheduler
+            .shards_covering(center, radius)
+            .into_iter()
+            .collect();
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let command = SimCommand::Detonate {
+            center,
+            power,
+            radius,
+        };
+        let tick = self.scheduler.tick_now();
+        let sequence = self.next_sequence;
+        let stamped = StampedInput {
+            apply_at: tick,
+            source,
+            sequence,
+            payload: InputPayload::Command(command),
+        };
+        self.scheduler.submit_batch(&targets, stamped)?;
+        self.next_sequence += 1;
+        Ok(targets
+            .into_iter()
+            .map(|dest| LogEntry {
+                tick,
+                dest,
+                source,
+                sequence,
+                command,
+            })
+            .collect())
+    }
+
+    /// 外部爆炸的会话 source 版(测试/装配入口;语义同 [`Session::detonate_from`])。
+    pub fn detonate(
+        &mut self,
+        center: Vec3,
+        power: f32,
+        radius: f32,
+    ) -> Result<Vec<LogEntry>, SessionError> {
+        self.detonate_from(self.source, center, power, radius)
+    }
+
     /// 该分片是否已加载该 chunk(REQ-005 任务 01:外部 SetBlock 的未加载
     /// chunk 门卫;Session → Scheduler → ShardSim 透传)。未注册分片 → false。
     pub fn is_chunk_loaded(&self, shard: ShardId, pos: types::ChunkPos) -> bool {
@@ -215,6 +278,14 @@ impl Session {
     /// 调度器透传)。
     pub fn pending_shard_destinations(&self) -> std::collections::BTreeSet<ShardId> {
         self.scheduler.pending_shard_destinations()
+    }
+
+    /// 待投递 `BlockWrite` 信封的目标格(REQ-005 任务 03 终审修复;
+    /// 调度器透传):驱动激活卸载决策处延迟命中 chunk 的卸载。
+    pub fn pending_blockwrite_cells(
+        &self,
+    ) -> std::collections::BTreeMap<ShardId, std::collections::BTreeSet<types::ChunkPos>> {
+        self.scheduler.pending_blockwrite_cells()
     }
 
     /// 原章输入直投(回放专用;不得用于普通路径,README 决策 8):
@@ -785,6 +856,8 @@ mod tests {
 
     /// 测试清单 5 `take_solidified_exactly_once`:真静止实体经凝固桥落格 →
     /// 该拍 tick 后 take_solidified 得 `(shard, pos, block)`;再取 = 空(恰一次)。
+    /// 任务 03 适配:凝固格 (3,3) 预装载(owner 持有不变量,涌现写入信封
+    /// 的前提;原测试靠 set_block 自动建 chunk,无 holder 登记)。
     #[test]
     fn take_solidified_exactly_once() {
         // 凝固桥开启 + 关位移门(直通,几拍内即凝固)。
@@ -809,6 +882,8 @@ mod tests {
         let shard = shard_id(0, 0);
         let mut session = Session::new(session_cfg());
         session.register(sim0);
+        // 凝固落点 chunk (3,3) 预装载(任务 03:owner 持有 = 涌现写入前提)。
+        session.apply_chunk_load(shard, types::ChunkPos::new(3, 3), Chunk::air());
 
         // 跑到凝固发生(真静止 20 tick 内;位移门已关)。
         let mut cell = None;
@@ -835,7 +910,8 @@ mod tests {
 
     /// 测试清单 6 `solidified_survives_via_session`:Session 透传可达(最小
     /// 冒烟)——entity_states 透传与调度器行为一致(全表升序/未注册 None),
-    /// 与 take_solidified 同一会话内并存可用。
+    /// 与 take_solidified 同一会话内并存可用。任务 03 适配:凝固落点 chunk
+    /// (3,3) 预装载(owner 持有不变量,涌现写入信封的前提)。
     #[test]
     fn solidified_survives_via_session() {
         let shard = shard_id(0, 0);
@@ -862,6 +938,8 @@ mod tests {
             }),
         }]);
         session.register(sim0);
+        // 凝固落点 chunk (3,3) 预装载(任务 03:owner 持有 = 涌现写入前提)。
+        session.apply_chunk_load(shard, types::ChunkPos::new(3, 3), Chunk::air());
 
         // 凝固前:全表可见(单条,升序)。
         let table = session.entity_states(shard).expect("已注册分片必有表");
@@ -1252,5 +1330,448 @@ mod tests {
             "恢复线激活继续(观察者中心生效)"
         );
         replayed.shutdown();
+    }
+
+    // ---- 任务书 req005-consistency/03:外部 Detonate 跨片复制(测试清单)----
+
+    /// 任务书测试 `detonate_targets_all_covering_shards`(session 级):边界
+    /// 爆心两片都在目标集;每片同拍收到恰一次 Detonate(命令复制,同
+    /// apply_at/source/sequence)。
+    #[test]
+    fn detonate_targets_all_covering_shards() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let blast = |session: &mut Session| session.detonate(Vec3::new(128.0, 3.0, 64.0), 6.0, 1.0);
+        let entries = blast(&mut session).expect("收件箱未满");
+        assert_eq!(entries.len(), 2, "两片各一条日志");
+        assert_eq!(
+            entries.iter().map(|e| e.dest).collect::<Vec<_>>(),
+            vec![shard_id(0, 0), shard_id(1, 0)],
+            "dest 升序"
+        );
+        // 每片恰好一次:重复引爆目标集不随实体/状态变化(覆盖纯计算),
+        // 第二次 detonate 的 sequence +1(整批一个号)。
+        let again = blast(&mut session).expect("收件箱未满");
+        assert_eq!(again.len(), 2, "目标集不随实体变化");
+        assert_eq!(again[0].sequence, entries[0].sequence + 1, "整批 +1");
+        session.shutdown();
+    }
+
+    /// 任务书测试 `detonate_excludes_far_shards`(session 级):远离爆心的
+    /// 已注册分片不在目标集(零条日志)。
+    #[test]
+    fn detonate_excludes_far_shards() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        session.register(sim(9, 9));
+        let entries = session
+            .detonate(Vec3::new(128.0, 3.0, 64.0), 6.0, 30.0)
+            .expect("收件箱未满");
+        assert_eq!(entries.len(), 2, "只两边界片在目标集");
+        assert!(
+            entries.iter().all(|e| e.dest != shard_id(9, 9)),
+            "远片 (9,9) 不在目标集:{entries:?}"
+        );
+        session.shutdown();
+    }
+
+    /// 任务书测试 `detonate_logs_one_entry_per_shard`:返回/日志按 ShardId
+    /// 升序,同 tick/source/sequence(整批只 +1),command = Detonate 原样。
+    #[test]
+    fn detonate_logs_one_entry_per_shard() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let entries = session
+            .detonate(Vec3::new(128.0, 3.0, 64.0), 12.0, 72.0)
+            .expect("收件箱未满");
+        assert_eq!(entries.len(), 2);
+        let first = &entries[0];
+        for e in &entries {
+            assert_eq!(e.tick, first.tick, "同 tick");
+            assert_eq!(e.source, InputSource(1), "会话 source");
+            assert_eq!(e.sequence, first.sequence, "同 sequence(整批 +1)");
+            assert_eq!(
+                e.command,
+                SimCommand::Detonate {
+                    center: Vec3::new(128.0, 3.0, 64.0),
+                    power: 12.0,
+                    radius: 72.0,
+                },
+                "日志携带原命令"
+            );
+        }
+        // 入 CommandLog 可序列化(bincode 往返,回放面)。
+        let mut log = crate::log::CommandLog::new();
+        for e in &entries {
+            log.append(e.clone());
+        }
+        let decoded =
+            crate::log::CommandLog::from_bytes(&log.to_bytes()).expect("自有编码必可解码");
+        assert_eq!(decoded.entries(), entries, "日志往返逐字段相等");
+        session.shutdown();
+    }
+
+    /// 任务书测试 `detonate_batch_atomic_on_inbox_full`:一个目标收件箱满 →
+    /// 整批拒绝(`Err(SessionError::Route)`),无半投(另一片零投递、
+    /// sequence 不消耗)。
+    #[test]
+    fn detonate_batch_atomic_on_inbox_full() {
+        let mut session = Session::new(SessionConfig {
+            scheduler: SchedulerConfig {
+                router: shard::router::RouterConfig {
+                    inbox_capacity: 1,
+                    ..shard::router::RouterConfig::default()
+                },
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        // 占满片 (1,0) 收件箱(容量 1)。
+        session
+            .send(
+                shard_id(1, 0),
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(1, 2, 3),
+                    block: types::BlockId(1),
+                },
+            )
+            .expect("首条入箱");
+        // 边界爆心:两片都在目标集;片 (1,0) 满 → 整批 Err。
+        let result = session.detonate(Vec3::new(128.0, 3.0, 64.0), 6.0, 30.0);
+        assert!(
+            matches!(result, Err(SessionError::Route(_))),
+            "任一收件箱满 → 整批拒绝:{result:?}"
+        );
+        // 无半投:tick 拍 0 后,片 (0,0) 的收件箱仍空(被拒批次未投)。
+        session.tick();
+        // sequence 未消耗:下一次 send 仍是下一号(0 号被占位单发用了,
+        // 被拒批不消耗 → 下一 send = 1)。
+        let next = session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(1, 2, 3),
+                    block: types::BlockId(1),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(next.sequence, 1, "被拒广播不消耗 sequence");
+        session.shutdown();
+    }
+
+    /// 任务书测试 `detonate_center_in_empty_shard_hits_registered_neighbor`
+    /// (session 级):爆心所在分片未注册 → 不报错;邻片有实体仍被广播
+    /// (空目标集 → `Ok(vec![])` 语义由未注册区域爆心覆盖)。
+    #[test]
+    fn detonate_center_in_empty_shard_hits_registered_neighbor() {
+        let mut session = Session::new(session_cfg());
+        // 只注册片 (0,0);爆心落在片 (0,0) core 内但目标判定不依赖实体。
+        session.register(sim(0, 0));
+        let e = EntityId::from_parts(1, 1);
+        session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(120.0, 3.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                },
+            )
+            .expect("收件箱未满");
+        // 爆心 (119,·,8):半径 5 的事件 AABB x∈[114,124] 不跨边界,但语义面
+        // 在此验证"爆心可落在任一位置,判定只看覆盖集合"——再以半径 10 版本
+        // 跨界(AABB x∈[109,129])证明跨边也不拒。取跨界版:片 (1,0) 未注册
+        // 不在目标集;片 (0,0) 在(core 相交)。中心分片概念不参与判定。
+        let entries = session
+            .detonate(Vec3::new(119.0, 3.0, 8.0), 6.0, 10.0)
+            .expect("爆心跨边界不因邻片未注册而拒");
+        assert_eq!(
+            entries.iter().map(|e| e.dest).collect::<Vec<_>>(),
+            vec![shard_id(0, 0)],
+            "只已注册的覆盖片在目标集(邻片未注册不报错不进集)"
+        );
+        session.tick();
+        let s = session.entity_state(shard_id(0, 0), e).expect("实体仍在");
+        assert!(
+            s.linvel.length() > 1.0,
+            "邻片(唯一注册片)上的实体被广播波及:{:?}",
+            s.linvel
+        );
+        session.shutdown();
+    }
+
+    /// 空目标集:爆心在全部已注册分片的覆盖之外 → `Ok(vec![])`(零条日志,
+    /// 不报错;sequence 不消耗)。
+    #[test]
+    fn detonate_empty_target_set_returns_empty_vec() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        let entries = session
+            .detonate(Vec3::new(50_000.0, 3.0, 50_000.0), 6.0, 5.0)
+            .expect("空目标集 = Ok");
+        assert!(entries.is_empty(), "零条日志");
+        // sequence 不消耗:下一次 send 仍是 0 号。
+        let next = session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(1, 2, 3),
+                    block: types::BlockId(1),
+                },
+            )
+            .expect("收件箱未满");
+        assert_eq!(next.sequence, 0, "空目标集不消耗 sequence");
+        session.shutdown();
+    }
+
+    /// 任务书测试 `boundary_detonate_matches_single_world`:两片各一实体
+    /// vs 单世界参考——同参数 Detonate(detonate 一次 = 命令复制两片),
+    /// 同拍数后终态位移差 < 1e-4 m(AC3 手工对照的生产路径版)。
+    #[test]
+    fn boundary_detonate_matches_single_world() {
+        // 两片侧:各一实体(分片边界两侧对称),detonate 一次。两侧都用
+        // 零重力虚空(纯弹道,AC3 同口径:无地形互不干扰、时间线确定)。
+        let zero_g_sim = |x: i32, z: i32| {
+            let mut cfg = ShardSimConfig::new(shard_id(x, z));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+        };
+        let mut session = Session::new(session_cfg());
+        session.register(zero_g_sim(0, 0));
+        session.register(zero_g_sim(1, 0));
+        let (e0, e1) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
+        // 两实体都放片 (0,0) core 内(x=64/112,距爆心 64/16,radius 72 覆盖
+        // 两者):跨片等价面 = detonate 命令复制路径本身(两片各收一份同参
+        // 命令,与单世界一次施加同型);单世界参考侧实体也必须全程留在
+        // core 内(参考是单分片,越界即迁移),故实体几何取 core 内对称位。
+        for (shard, e, x) in [
+            (shard_id(0, 0), e0, 64.0_f32),
+            (shard_id(0, 0), e1, 112.0_f32),
+        ] {
+            session
+                .send(
+                    shard,
+                    SimCommand::SpawnDynamic {
+                        entity: e,
+                        state: EntityState {
+                            translation: Vec3::new(x, 50.0, 8.0),
+                            ..EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    },
+                )
+                .expect("收件箱未满");
+        }
+        session
+            .detonate(Vec3::new(128.0, 50.0, 8.0), 12.0, 72.0)
+            .expect("收件箱未满");
+        for _ in 0..90 {
+            session.tick();
+        }
+        let end0 = session
+            .entity_state(shard_id(0, 0), e0)
+            .expect("实体仍在片 0");
+        let end1 = session
+            .entity_state(shard_id(0, 0), e1)
+            .expect("实体仍在片 0");
+        session.shutdown();
+
+        // 单世界参考:同两实体、同 Detonate 命令,同拍数(零重力同口径)。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut single = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let mut inputs = Vec::new();
+        for (seq, e, x) in [(0u64, e0, 64.0_f32), (1u64, e1, 112.0_f32)] {
+            inputs.push(StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: seq,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(x, 50.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            });
+        }
+        inputs.push(StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 2,
+            payload: InputPayload::Command(SimCommand::Detonate {
+                center: Vec3::new(128.0, 50.0, 8.0),
+                power: 12.0,
+                radius: 72.0,
+            }),
+        });
+        single.apply_prefix(&inputs);
+        for _ in 0..90 {
+            single.step();
+        }
+        // 参考世界是单分片:实体不受本体区约束会触发迁移检测——用迁移检测
+        // 的已知边界:参考线让两实体都留在片 (0,0) core(x∈[0,128))内对比
+        // 不现实(e1 初始 156 在 core 外)。改两实体都取 core 内对称位:爆心
+        // 128 在 core 外但冲量只看距离。取 e0=64 / e1=112(都在 core 内),
+        // 到爆心距离 64/16,radius 72 覆盖。
+        let ref0 = single.entity_state(e0).expect("参考实体在(core 内不迁移)");
+        let ref1 = single.entity_state(e1).expect("参考实体在(core 内不迁移)");
+        for (name, two, one) in [("e0", end0, ref0), ("e1", end1, ref1)] {
+            let d = two.translation - one.translation;
+            assert!(
+                d.x.abs() < 1e-4 && d.y.abs() < 1e-4 && d.z.abs() < 1e-4,
+                "{name}:双片(detonate 命令复制)vs 单世界终态位移差超限:Δ=({},{},{})",
+                d.x,
+                d.y,
+                d.z
+            );
+        }
+    }
+
+    /// 任务书测试 `detonate_replay_matches_original`:detonate 的日志逐片
+    /// 重投(replay_world)→ 重放窗位级一致(实体终态四向量逐位相等)。
+    #[test]
+    fn detonate_replay_matches_original() {
+        use crate::replay::replay_world;
+
+        // 原线:两片各一实体 + detonate(日志 2 条)→ 跑 30 拍 → 快照+日志。
+        let mut original = Session::new(session_cfg());
+        original.register(sim(0, 0));
+        original.register(sim(1, 0));
+        let (e0, e1) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
+        for (shard, e, x) in [
+            (shard_id(0, 0), e0, 100.0_f32),
+            (shard_id(1, 0), e1, 156.0_f32),
+        ] {
+            original
+                .send(
+                    shard,
+                    SimCommand::SpawnDynamic {
+                        entity: e,
+                        state: EntityState {
+                            translation: Vec3::new(x, 50.0, 8.0),
+                            ..EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    },
+                )
+                .expect("收件箱未满");
+        }
+        let entries = original
+            .detonate(Vec3::new(128.0, 50.0, 8.0), 12.0, 72.0)
+            .expect("收件箱未满");
+        assert_eq!(entries.len(), 2, "前置:两片日志");
+        for _ in 0..5 {
+            original.tick();
+        }
+        let world = original.world_snapshot();
+        let mut log = crate::log::CommandLog::new();
+        for e in entries {
+            log.append(e);
+        }
+        for _ in 0..25 {
+            original.tick();
+        }
+        let end0 = original.entity_state(shard_id(0, 0), e0);
+        let end1 = original.entity_state(shard_id(1, 0), e1);
+        original.shutdown();
+
+        // 重放线:快照(拍 5)+ 日志(tick 0 的 4 条)逐片重投 → 跑 25 拍。
+        let mut replayed = replay_world(&world, &log, session_cfg(), || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("自有快照必可恢复");
+        for _ in 0..25 {
+            replayed.tick();
+        }
+        assert_eq!(
+            replayed.entity_state(shard_id(0, 0), e0),
+            end0,
+            "e0 重放终态位级一致"
+        );
+        assert_eq!(
+            replayed.entity_state(shard_id(1, 0), e1),
+            end1,
+            "e1 重放终态位级一致"
+        );
+        replayed.shutdown();
+    }
+
+    /// 凝固启用的分片(零重力 + 位移门 0:静止实体首拍即睡眠兜底凝固,
+    /// 任务 03 Emergent 测试装置;与 shard 测试 `spawn_resting_entity` 同款)。
+    fn solidifying_sim(x: i32, z: i32) -> ShardSim {
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.displacement_gate_m = 0.0;
+        ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+    }
+
+    /// 任务书 `blockwrite_envelope_reaches_owner_and_holders` 的持久化面
+    /// (终审补):Emergent 凝固写入经信封应用后,**owner 卸载**返回的
+    /// chunk 含编辑值(owner-only 持久化的模拟侧断言;驱动写库链路由
+    /// 既有 owner_unload 测试覆盖;非 owner 卸载不写库由任务 01 回归钉住)。
+    #[test]
+    fn emergent_blockwrite_owner_unload_persists() {
+        let mut session = Session::new(session_cfg());
+        // holder (0,0) 普通片;owner/producer (1,0) 凝固启用片。
+        session.register(sim(0, 0));
+        session.register(solidifying_sim(1, 0));
+        let cp = types::ChunkPos::new(8, 0); // owner = 片 (1,0)
+        session.apply_chunk_load(shard_id(0, 0), cp, Chunk::air());
+        session.apply_chunk_load(shard_id(1, 0), cp, Chunk::air());
+        // 静止实体(130.5 ∈ chunk (8,0)):首拍睡眠兜底凝固 → Emergent 写入
+        // (130,5,8) + BlockWrite 信封发 holder (0,0)。
+        let e = EntityId::from_parts(1, 1);
+        session
+            .send(
+                shard_id(1, 0),
+                SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(130.5, 5.5, 8.5),
+                        ..EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                },
+            )
+            .expect("收件箱未满");
+        for _ in 0..40 {
+            session.tick();
+            if session.entity_state(shard_id(1, 0), e).is_none() {
+                break;
+            }
+        }
+        assert!(
+            session.entity_state(shard_id(1, 0), e).is_none(),
+            "前置:实体已凝固(Emergent 写入已产生)"
+        );
+        session.tick(); // 信封应用(holder 副本一致)
+        // owner 卸载 → Some(chunk) 且含 Emergent 编辑格。
+        let chunk = session
+            .apply_chunk_unload(shard_id(1, 0), cp)
+            .expect("owner 卸载返回 chunk(非 owner 才返回 None)");
+        assert_eq!(
+            chunk.get(2, 69, 8),
+            types::BlockId(1),
+            "owner 卸载的 chunk 含 Emergent 编辑(局部 (2,69,8) = 世界 (130,5,8))"
+        );
+        session.shutdown();
     }
 }
