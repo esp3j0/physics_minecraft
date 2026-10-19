@@ -80,6 +80,58 @@ fn migrated_session() -> (Session, EntityId) {
     (session, e)
 }
 
+/// AC-E2:迁移窗口内实体命令必须被拒绝,不能投到旧片。
+#[test]
+fn ace2_commands_rejected_in_migration_window() {
+    let mut session = Session::new(session_cfg());
+    session.register(sim(0, 0));
+    session.register(sim(1, 0));
+    let e = EntityId::from_parts(0, 1);
+    session
+        .spawn_owned(
+            shard_id(0, 0),
+            e,
+            EntityState {
+                translation: Vec3::new(120.0, 10.0, 8.0),
+                ..EntityState::default()
+            },
+            EntityDesc::default(),
+            InputSource(7),
+        )
+        .expect("spawn");
+    session.tick();
+    session
+        .send_to_entity(
+            InputSource(7),
+            e,
+            SimCommand::TeleportEntity {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(136.0, 10.0, 8.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .expect("teleport");
+    session.tick();
+    assert!(session.entity_owner(e).is_none(), "迁移窗口 owner=None");
+    let remove = SimCommand::RemoveEntity { entity: e };
+    assert!(
+        session.send_to_entity(InputSource(7), e, remove).is_err(),
+        "迁移窗口 send_to_entity 必须拒绝"
+    );
+    assert!(
+        validate_external_command(&session, Some(InputSource(7)), shard_id(0, 0), &remove).is_err(),
+        "迁移窗口外部校验必须拒绝,不得投旧片"
+    );
+    session.tick(); // 目的片重建
+    assert_eq!(
+        session.entity_owner(e).map(|o| o.shard),
+        Some(shard_id(1, 0))
+    );
+    session.shutdown();
+}
+
 /// AC-E1:归属唯一、迁移后 owner=dest、source 保留。
 #[test]
 fn ace1_ownership_unique_after_spawn_and_migrate() {

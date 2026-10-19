@@ -308,4 +308,28 @@ mod tests {
         );
         let _ = WorldId(0); // 保序引用(纪律自证,可删)
     }
+
+    /// AC-E7(REQ-006 任务 04):追加 Spawn/Spawned 后,旧变体帧字节不变。
+    /// golden 由 REQ-006 前的 C2S/S2C 声明序与 bincode standard 固定。
+    #[test]
+    fn ace7_old_variant_golden_bytes() {
+        assert_eq!(
+            encode_c2s_frame(&C2S::Hello { client_id: 1 }),
+            vec![2, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            encode_c2s_frame(&C2S::Subscribe { view_distance: 4 }),
+            vec![2, 0, 0, 0, 1, 4]
+        );
+        assert_eq!(encode_c2s_frame(&C2S::Ping), vec![1, 0, 0, 0, 4]);
+        assert_eq!(encode_c2s_frame(&C2S::Goodbye), vec![1, 0, 0, 0, 5]);
+        assert_eq!(encode_frame(&S2C::Pong), vec![1, 0, 0, 0, 5]);
+        assert_eq!(
+            encode_frame(&S2C::Welcome {
+                player_id: InputSource(1),
+                tick: Tick(1),
+            }),
+            vec![3, 0, 0, 0, 0, 1, 1]
+        );
+    }
 }

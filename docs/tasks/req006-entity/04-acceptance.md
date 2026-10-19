@@ -1,6 +1,9 @@
 # 任务 04:AC-E1~E8 验收与独立评审
 
-- 状态:**验收套件完成,待独立评审/终审(2026-10-19)**。
+- 状态:**B1 已修 + 验收套件 7 条;待复审/终审(2026-10-20)**。
+- B1 修复:commands 通道 `SpawnDynamic` 以 `InputSource::SCHEDULER` 投递,
+  `owner.source=None`;新增 `commands_channel_spawn_is_server_owned` 生产路径测试。
+- 新增 `ace2_commands_rejected_in_migration_window`、`ace7_old_variant_golden_bytes`。
 
 ## 目标
 

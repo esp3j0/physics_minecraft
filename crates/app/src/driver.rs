@@ -206,7 +206,13 @@ pub fn validate_external_command(
         | messaging::SimCommand::MarkActor { .. } => {
             unreachable!("实体命令已在前置 owner/权限块返回")
         }
-        messaging::SimCommand::SpawnDynamic { .. } => Ok(()),
+        messaging::SimCommand::SpawnDynamic { .. } => {
+            if source.is_some() {
+                Err("外部 SpawnDynamic 已禁用(请用 C2S::Spawn)")
+            } else {
+                Ok(())
+            }
+        }
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
@@ -272,6 +278,13 @@ fn dispatch_external(
                 .send_to_entity(source, entity, cmd)
                 .map(|entry| log.append(entry))
         }
+        // REQ-006 评审 B1:commands 通道的 SpawnDynamic 是**服务端权威**
+        // 生成,必须用 SCHEDULER(0) 作 source;否则 source=会话 1 会让
+        // owner.source=Some(1),与网络玩家 1 命名空间混叠。网络外部 spawn
+        // 走 C2S::Spawn + session.spawn_owned(玩家 source),不经过本臂。
+        cmd @ messaging::SimCommand::SpawnDynamic { .. } => session
+            .send_from(messaging::InputSource::SCHEDULER, shard, cmd)
+            .map(|entry| log.append(entry)),
         _ => {
             // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
             session
@@ -1458,6 +1471,59 @@ mod tests {
         session
     }
 
+    /// REQ-006 评审 B1:commands 通道 spawn 必须是服务端实体(source=None),
+    /// 不能被网络玩家 1 误当成自己的实体。
+    #[test]
+    fn commands_channel_spawn_is_server_owned() {
+        let config = Config::default();
+        let mut session = session_with_one_shard(&config);
+        let mut log = sim_api::log::CommandLog::new();
+        let mut rejected = 0;
+        let e = EntityId::from_parts(1, 1);
+        dispatch_external(
+            &mut session,
+            &mut log,
+            &mut rejected,
+            messaging::InputSource(1), // 本地会话 source;不得泄漏为 owner.source
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(1.5, 3.0, 1.5),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            },
+        );
+        assert_eq!(rejected, 0);
+        assert_eq!(
+            log.entries().last().map(|entry| entry.source),
+            Some(messaging::InputSource::SCHEDULER),
+            "commands 通道 spawn 日志 source = 服务端调度器"
+        );
+        session.tick();
+        assert_eq!(
+            session.entity_owner(e).map(|owner| owner.source),
+            Some(None),
+            "命令通道 spawn 的 owner.source = None(服务端实体)"
+        );
+        let remove = messaging::SimCommand::RemoveEntity { entity: e };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(1)),
+                shard_id(0, 0),
+                &remove
+            )
+            .is_err(),
+            "网络玩家 1 不能操作服务端实体"
+        );
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &remove).is_ok(),
+            "commands 通道仍可操作服务端实体"
+        );
+        session.shutdown();
+    }
     /// REQ-006 任务 01:实体命令按 owner 校验/路由,不再看网络伪造分片。
     #[test]
     fn entity_commands_route_by_owner_and_permission() {
