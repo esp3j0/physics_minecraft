@@ -385,11 +385,13 @@ pub struct DriverOutcome {
     pub chunks_unloaded: u64,
 }
 
-/// 检查点格式版本(REQ-005 D8;任务书 02):预发布阶段不兼容旧格式——
-/// 升版即破格,磁盘上现存旧 checkpoint 从此不可用(bootstrap 显式报错,
-/// 不写迁移逻辑)。`format_version != CHECKPOINT_FORMAT_VERSION` →
+/// 检查点格式版本(REQ-005 D8;REQ-006 任务 03 升版):预发布阶段不兼容
+/// 旧格式——升版即破格,磁盘上现存旧 checkpoint 从此不可用(bootstrap 显式
+/// 报错,不写迁移逻辑)。`format_version != CHECKPOINT_FORMAT_VERSION` →
 /// `AppError::Decode`(明确、不静默降级)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 1;
+/// **v2**:REQ-006 的 `Outbox.spawned/despawned`、`EntityRecord.source`、
+/// `MigrateEntity.actor/source` 改变分片快照布局;v1 档必须清 `data_dir`。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -2115,6 +2117,23 @@ mod tests {
             log_bytes: Vec::new(),
         };
         assert!(decode(&encode(&zero)).is_err(), "版本 0 = 旧格式,拒绝");
+
+        // 1(REQ-005 的格式)→ 同样拒绝;REQ-006 任务 03 升档到 2。
+        let v1 = CheckpointBundle {
+            format_version: 1,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+        };
+        match decode(&encode(&v1)) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 1"),
+                    "v1 必须明确报版本错误:{msg}"
+                );
+            }
+            Err(other) => panic!("v1 旧档必须版本拒绝,实得 {other:?}"),
+            Ok(_) => panic!("v1 旧档必须拒绝"),
+        }
 
         // ② 任务 01 前旧布局:{snapshot: GlobalSnapshot, log_bytes}。手工
         //    bincode 编码(结构形状与新 bundle 不同,无 format_version 字段

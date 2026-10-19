@@ -1,5 +1,7 @@
 # 任务 03:ownership 重建、快照/回放与格式版本
 
+- 状态:**实现完成,门禁通过(2026-10-19)**。
+
 ## 目标
 
 checkpoint/restore/replay 时从各分片实体表重建 ownership 并校验全局唯一；

@@ -134,6 +134,11 @@ fn checkpoint_pending_migration_entity_survives() {
         replayed.entity_state(dst, e).is_some(),
         "拍 1:实体经存活的迁移信封在目的片重建"
     );
+    assert_eq!(
+        replayed.entity_owner(e).map(|o| o.shard),
+        Some(dst),
+        "REQ-006 任务 03:restore 后 ownership 重建,owner=目的片"
+    );
     replayed.tick(); // 拍 2:实体继续存活(不再迁回)
     let at_next = replayed
         .entity_state(dst, e)
