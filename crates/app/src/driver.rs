@@ -2188,14 +2188,23 @@ mod tests {
             "MoveObserver 已入命令日志"
         );
 
-        // 观察者表更新(任务书口径):编排 ① 读 observers() 视图 ensure 出分片
-        // ——表未更新则 shards_spawned 必为 0;≥1 即表已更新且驱动可见。
-        // (REQ-005 D5:观察者 (200,·,8) 距 z=0 分片界 8m ≤ 32m → 邻片
-        // (1,-1) 同拍 ensure,恰 2;断言取 ≥1 保持口径稳定。)
-        assert!(
-            outcome.shards_spawned >= 1,
-            "观察者表更新且驱动 ensure 出新分片(邻片 ensure 下 ≥1):{}",
+        // 观察者表更新(REQ-005 任务 04 补强:精确集合,不再取 ≥1)——
+        // 编排 ① 读 observers() 视图按 shards_within(ensure_radius=32)
+        // ensure:观察者 (200,·,8) 恰距 z=0 分片界 8m ≤ 32m → 恰 2 片
+        // {(1,0) 本体,(1,-1) 邻片};session 起动为空 → 两 ensure 皆新建。
+        assert_eq!(
+            outcome.shards_spawned, 2,
+            "观察者表更新且驱动恰 ensure 出本体片 + 邻片(不多不少):{}",
             outcome.shards_spawned
+        );
+        // 终末快照的分片键集 = 精确集合 {(1,-1),(1,0)}(BTreeMap 键序):
+        // 表更新落到分片存在性上,无第三片混入、无缺片。
+        let keys: Vec<types::ShardId> = bundle.world.shards.per_shard.keys().copied().collect();
+        assert_eq!(
+            keys,
+            vec![shard_id(1, -1), shard_id(1, 0)],
+            "观察者 ensure 的分片集合恰为 {{(1,-1),(1,0)}}(观察者 (200,0,8) \
+             距 z 界 8m ≤ 32m → 本体 + z 负邻片,不含其他)"
         );
     }
 

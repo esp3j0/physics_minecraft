@@ -1711,33 +1711,109 @@ mod tests {
         sched.shutdown();
     }
 
-    /// 任务书测试 3:两分片 + 一观察者——各自激活请求只落自己的
-    /// core ∪ margin;同一 chunk 的本体请求只来自 owner(扩张请求是
-    /// holder 副本,属设计语义,不算重复本体)。
+    /// 任务书测试 3(REQ-005 任务 04 补强):两分片 + 一观察者贴边界——
+    /// ① 各自激活请求只落自己的 core ∪ margin(D4);② **core 装载请求只
+    /// 来自 owner(精确集合)**:被请求 chunk 的「把它当 core 的请求者」
+    /// 集合恰 = {owner};非 owner 的请求必须落在请求者的 margin 环内
+    /// (扩张副本语义,D4/D5 设计,不算重复本体);③ 请求集与手算期望
+    /// 精确集合全等(观察者在两片边界 → x=7/x=8 相邻列双请求确实发生,
+    /// 深处 core chunk 恰单请求——「重复」只允许出现在 margin 列)。
+    ///
+    /// 拍数口径:预算 2/拍 + 冷却 180 拍(决策即簿记)。每片 ≤32m 装载候选
+    /// 各 6 个,2/拍 → 3 拍排空;400 拍覆盖 2 个冷却重火窗 → 每个区域够得着
+    /// 且距离够近的 chunk 必被记录到(重复请求经集合去重)。
     #[test]
     fn activation_two_shards_no_cross_core_duplicates() {
         let mut sched = Scheduler::new(sched_cfg(2));
         sched.register(sim(0, 0));
         sched.register(sim(1, 0));
-        // 观察者贴边界(x=126):两片的激活都会跑。
+        // 观察者贴边界(x=126 → chunk (7,4)):两片的激活都跑,且两片装载
+        // 候选区在 x=7/x=8 相邻列上重叠(测试的被测面)。
         sched.set_observers(vec![types::glam::Vec3::new(126.0, 0.0, 64.0)]);
-        sched.tick();
-        let reqs = sched.take_activation_requests();
-        for (shard, decisions) in &reqs {
-            let region = types::ChunkRegion::core(*shard).expanded(1);
-            for cp in decisions
-                .chunks_to_load
-                .iter()
-                .chain(decisions.chunks_to_unload.iter())
-            {
-                assert!(
-                    region.contains(*cp),
-                    "分片 {shard:?} 请求了区域外 chunk {cp:?}(D4 不变量)"
-                );
+
+        // 逐拍累计「chunk → 请求者集合」+ 区域不变量。
+        let mut requesters: BTreeMap<ChunkPos, BTreeSet<ShardId>> = BTreeMap::new();
+        let mut load_decisions = 0usize;
+        for _ in 0..400 {
+            sched.tick();
+            for (shard, decisions) in sched.take_activation_requests() {
+                let region = types::ChunkRegion::core(shard).expanded(1);
+                for cp in decisions
+                    .chunks_to_load
+                    .iter()
+                    .chain(decisions.chunks_to_unload.iter())
+                {
+                    assert!(
+                        region.contains(*cp),
+                        "分片 {shard:?} 请求了区域外 chunk {cp:?}(D4 不变量)"
+                    );
+                }
+                load_decisions += decisions.chunks_to_load.len();
+                for cp in decisions.chunks_to_load {
+                    requesters.entry(cp).or_default().insert(shard);
+                }
             }
         }
-        // 同一 chunk 的"本体装载"只应来自 owner:两片请求集合中,owner≠请求者
-        // 的 chunk 必须落在请求者的 margin 环内(即扩张副本语义)。
+
+        let (s0, s1) = (shard_id(0, 0), shard_id(1, 0));
+        let owner_of_chunk =
+            |cp: ChunkPos| ShardId::new(types::WorldId(0), types::DimensionId(0), cp.shard_of());
+        let both: BTreeSet<ShardId> = [s0, s1].into_iter().collect();
+
+        // —— ② core 装载请求只来自 owner(逐 chunk 精确集合)——
+        assert!(load_decisions > 0, "前置:激活装载请求确实发生");
+        for (cp, reqs) in &requesters {
+            let owner = owner_of_chunk(*cp);
+            // 把 cp 当自家 core chunk 装片的请求者,恰 = {owner}:
+            // 没有任何分片把别人的 core chunk 当本体装。
+            let core_requesters: BTreeSet<ShardId> = reqs
+                .iter()
+                .filter(|y| types::ChunkRegion::core(**y).contains(*cp))
+                .copied()
+                .collect();
+            assert_eq!(
+                core_requesters,
+                BTreeSet::from([owner]),
+                "chunk {cp:?} 的 core 装载请求必须恰来自 owner {owner:?},实得 {core_requesters:?}\
+                 (请求者全集 {reqs:?})"
+            );
+            // 非 owner 的请求 = margin 环扩张副本(设计语义),逐请求者验证
+            // 其确在「请求者区域 ∖ 请求者 core」内。
+            for y in reqs {
+                if *y != owner {
+                    assert!(
+                        types::ChunkRegion::core(*y).expanded(1).contains(*cp),
+                        "扩张副本请求 {y:?}←{cp:?} 越出请求者 margin 区"
+                    );
+                }
+            }
+        }
+
+        // —— ③ 精确集合全等:观察者 (126,0,64) 手算的 12 个够近 chunk
+        //   (片 0:x=6/7 列 × z∈{2..5} 中距 ≤32 者;片 1:x=8/9 列同理)。
+        //   距观察者水平距:chunk 中心 (16x+8, 16z+8)。
+        let mut expected: BTreeMap<ChunkPos, BTreeSet<ShardId>> = BTreeMap::new();
+        // x=7 列(片 0 core ∩ 片 1 margin ring,z∈2..=5 距 ≤32):双请求。
+        for z in 2..=5 {
+            expected.insert(ChunkPos::new(7, z), both.clone());
+        }
+        // x=8 列(片 1 core ∩ 片 0 margin ring,z∈2..=5 距 ≤32):双请求。
+        for z in 2..=5 {
+            expected.insert(ChunkPos::new(8, z), both.clone());
+        }
+        // x=6 列(片 0 core 深处,片 1 区域外):恰 owner 单请求。
+        for z in [3, 4] {
+            expected.insert(ChunkPos::new(6, z), [s0].into_iter().collect());
+        }
+        // x=9 列(片 1 core 深处,片 0 区域外):恰 owner 单请求。
+        for z in [3, 4] {
+            expected.insert(ChunkPos::new(9, z), [s1].into_iter().collect());
+        }
+        assert_eq!(
+            requesters, expected,
+            "请求集必须与手算精确集合全等:双请求只出现在 x=7/8 margin 重叠列,\
+             x=6/9 深处 core chunk 恰单请求(实测 {requesters:?})"
+        );
         sched.shutdown();
     }
 

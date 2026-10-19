@@ -1465,46 +1465,86 @@ mod tests {
     }
 
     /// 任务书测试 `detonate_center_in_empty_shard_hits_registered_neighbor`
-    /// (session 级):爆心所在分片未注册 → 不报错;邻片有实体仍被广播
-    /// (空目标集 → `Ok(vec![])` 语义由未注册区域爆心覆盖)。
+    /// (session 级;REQ-005 任务 04 重写):真跨片版——**只注册邻片 (1,0)**
+    /// 且实体在 (1,0),爆心落在**未注册**片 (0,0) 的 core 内。断言意图:
+    /// ① 目标集恰为 {shard(1,0)}(爆心所在片未注册 → 不报错、不进集);
+    /// ② (1,0) 实体真的获得冲量:零重力下速度位级 = `explosion_impulse`
+    ///    纯函数值(m=1,速度即冲量),方向背离爆心(+x);位移沿 +x 非零。
     #[test]
     fn detonate_center_in_empty_shard_hits_registered_neighbor() {
+        // 零重力虚空片:冲量后无其他力,终态速度 = 冲量/质量的位级证据。
+        let zero_g_sim = |x: i32, z: i32| {
+            let mut cfg = ShardSimConfig::new(shard_id(x, z));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+        };
         let mut session = Session::new(session_cfg());
-        // 只注册片 (0,0);爆心落在片 (0,0) core 内但目标判定不依赖实体。
-        session.register(sim(0, 0));
+        // 只注册邻片 (1,0);爆心所在片 (0,0) 全程不注册。
+        session.register(zero_g_sim(1, 0));
+        assert!(
+            !session.shard_ids().contains(&shard_id(0, 0)),
+            "前置:爆心所在片 (0,0) 必须未注册(名实相符)"
+        );
+
         let e = EntityId::from_parts(1, 1);
+        // 实体在 (1,0) core(x∈[128,256))内、边界外 16m,距爆心 24m。
+        let spawn = Vec3::new(144.0, 8.0, 8.0);
         session
             .send(
-                shard_id(0, 0),
+                shard_id(1, 0),
                 SimCommand::SpawnDynamic {
                     entity: e,
                     state: EntityState {
-                        translation: Vec3::new(120.0, 3.0, 8.0),
+                        translation: spawn,
                         ..EntityState::default()
                     },
                     desc: types::EntityDesc::default(),
                 },
             )
             .expect("收件箱未满");
-        // 爆心 (119,·,8):半径 5 的事件 AABB x∈[114,124] 不跨边界,但语义面
-        // 在此验证"爆心可落在任一位置,判定只看覆盖集合"——再以半径 10 版本
-        // 跨界(AABB x∈[109,129])证明跨边也不拒。取跨界版:片 (1,0) 未注册
-        // 不在目标集;片 (0,0) 在(core 相交)。中心分片概念不参与判定。
+
+        // 爆心 (120,8,8) 在未注册片 (0,0) core(x∈[0,128))内;半径 30 的
+        // 事件 AABB x∈[90,150] 与 (1,0) core 真重叠([128,150]),实体
+        // 距心 24 < 30 在覆盖内。
+        let center = Vec3::new(120.0, 8.0, 8.0);
+        let (power, radius) = (12.0_f32, 30.0_f32);
         let entries = session
-            .detonate(Vec3::new(119.0, 3.0, 8.0), 6.0, 10.0)
-            .expect("爆心跨边界不因邻片未注册而拒");
+            .detonate(center, power, radius)
+            .expect("爆心在未注册片 → 不报错,目标集由覆盖计算");
         assert_eq!(
             entries.iter().map(|e| e.dest).collect::<Vec<_>>(),
-            vec![shard_id(0, 0)],
-            "只已注册的覆盖片在目标集(邻片未注册不报错不进集)"
+            vec![shard_id(1, 0)],
+            "目标集恰 = {{已注册覆盖片 (1,0)}}:爆心所在未注册片不进集、不报错"
         );
-        session.tick();
-        let s = session.entity_state(shard_id(0, 0), e).expect("实体仍在");
+
+        for _ in 0..30 {
+            session.tick();
+        }
+        let s = session
+            .entity_state(shard_id(1, 0), e)
+            .expect("实体留在注册片 (1,0) 且未迁移");
+        // 方向与冲量一致(位级):零重力 + 零阻尼 → 速度自冲量起逐位不变,
+        // m = 密度 1 × 体积 1 = 1 → linvel == impulse(纯函数同参直算)。
+        let expected = physics_sim::explosion::explosion_impulse(center, power, radius, spawn)
+            .expect("前置:实体在半径内");
         assert!(
-            s.linvel.length() > 1.0,
-            "邻片(唯一注册片)上的实体被广播波及:{:?}",
-            s.linvel
+            expected.x > 0.0,
+            "前置:冲量方向应沿 +x 背离爆心:{expected:?}"
         );
+        assert_eq!(
+            s.linvel, expected,
+            "(1,0) 实体速度位级 = explosion_impulse(冲量真实生效,方向背离爆心)"
+        );
+        // 位移非零且与冲量同向:30 拍 ≈ 2.4 m/s × 0.5 s ≈ 1.2 m(取 0.5 m
+        // 强下界防退化);零重力下 y/z 分量逐位不动(位级 0)。
+        let disp = s.translation - spawn;
+        assert!(disp.x > 0.5, "位移必须沿 +x 非零(实测 {disp:?})");
+        assert_eq!(disp.y, 0.0, "零重力:位移 y 分量位级为 0");
+        assert_eq!(disp.z, 0.0, "冲量沿 x:位移 z 分量位级为 0");
         session.shutdown();
     }
 
@@ -1532,13 +1572,15 @@ mod tests {
         session.shutdown();
     }
 
-    /// 任务书测试 `boundary_detonate_matches_single_world`:两片各一实体
-    /// vs 单世界参考——同参数 Detonate(detonate 一次 = 命令复制两片),
-    /// 同拍数后终态位移差 < 1e-4 m(AC3 手工对照的生产路径版)。
+    /// 任务书测试 `boundary_detonate_matches_single_world`(REQ-005 任务 04
+    /// 重写):真跨片版——e0 在片 (0,0) core、e1 在片 (1,0) core,爆心恰在
+    /// 边界 x=128,一次 `detonate` 广播两片各收一份。逐实体对照"同位置单
+    /// 分片参考"(零重力纯弹道,两侧同初值同命令):位移差 < 1e-4 m(容差
+    /// 写进断言消息,任务书口径),速度位级 = `explosion_impulse`(零重力
+    /// m=1 → linvel 即冲量,方向背离爆心),非退化 |Δx| > 1 m。
     #[test]
     fn boundary_detonate_matches_single_world() {
-        // 两片侧:各一实体(分片边界两侧对称),detonate 一次。两侧都用
-        // 零重力虚空(纯弹道,AC3 同口径:无地形互不干扰、时间线确定)。
+        // 零重力虚空(纯弹道,AC3 同口径:无地形互触、每实体独立积分)。
         let zero_g_sim = |x: i32, z: i32| {
             let mut cfg = ShardSimConfig::new(shard_id(x, z));
             cfg.gravity = Vec3::ZERO;
@@ -1548,25 +1590,24 @@ mod tests {
             };
             ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
         };
+        // 固定几何:e0 在 (0,0) core 距边界 16m,e1 在 (1,0) core 距边界
+        // 16m,爆心恰在边界,三点同 y/z → 冲量纯 ±x,大小 12×(1−16/72)。
+        let (center, power, radius) = (Vec3::new(128.0, 8.0, 8.0), 12.0_f32, 72.0_f32);
+        let (p0, p1) = (Vec3::new(112.0, 8.0, 8.0), Vec3::new(144.0, 8.0, 8.0));
+        let (e0, e1) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
+        const STEPS: usize = 30;
+
         let mut session = Session::new(session_cfg());
         session.register(zero_g_sim(0, 0));
         session.register(zero_g_sim(1, 0));
-        let (e0, e1) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
-        // 两实体都放片 (0,0) core 内(x=64/112,距爆心 64/16,radius 72 覆盖
-        // 两者):跨片等价面 = detonate 命令复制路径本身(两片各收一份同参
-        // 命令,与单世界一次施加同型);单世界参考侧实体也必须全程留在
-        // core 内(参考是单分片,越界即迁移),故实体几何取 core 内对称位。
-        for (shard, e, x) in [
-            (shard_id(0, 0), e0, 64.0_f32),
-            (shard_id(0, 0), e1, 112.0_f32),
-        ] {
+        for (shard, e, p) in [(shard_id(0, 0), e0, p0), (shard_id(1, 0), e1, p1)] {
             session
                 .send(
                     shard,
                     SimCommand::SpawnDynamic {
                         entity: e,
                         state: EntityState {
-                            translation: Vec3::new(x, 50.0, 8.0),
+                            translation: p,
                             ..EntityState::default()
                         },
                         desc: types::EntityDesc::default(),
@@ -1574,74 +1615,101 @@ mod tests {
                 )
                 .expect("收件箱未满");
         }
-        session
-            .detonate(Vec3::new(128.0, 50.0, 8.0), 12.0, 72.0)
-            .expect("收件箱未满");
-        for _ in 0..90 {
+        let entries = session.detonate(center, power, radius).expect("收件箱未满");
+        // 前置(场景真实跨片):一次广播的日志恰 2 条,dest = 两分片升序。
+        assert_eq!(
+            entries.iter().map(|e| e.dest).collect::<Vec<_>>(),
+            vec![shard_id(0, 0), shard_id(1, 0)],
+            "前置:爆心在边界 → 两分片各收一份(真跨片广播)"
+        );
+        for _ in 0..STEPS {
             session.tick();
         }
+        // 零迁移证据:实体各自留在归属片(查非归属片必须为 None)。
         let end0 = session
             .entity_state(shard_id(0, 0), e0)
-            .expect("实体仍在片 0");
+            .expect("e0 留在 (0,0)(冲量背离边界,零迁移)");
         let end1 = session
-            .entity_state(shard_id(0, 0), e1)
-            .expect("实体仍在片 0");
+            .entity_state(shard_id(1, 0), e1)
+            .expect("e1 留在 (1,0)(冲量背离边界,零迁移)");
+        assert!(session.entity_state(shard_id(1, 0), e0).is_none());
+        assert!(session.entity_state(shard_id(0, 0), e1).is_none());
         session.shutdown();
 
-        // 单世界参考:同两实体、同 Detonate 命令,同拍数(零重力同口径)。
-        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
-        cfg.gravity = Vec3::ZERO;
-        cfg.solidify = SolidifyConfig {
-            enabled: false,
-            ..SolidifyConfig::default()
+        // 单分片参考:每实体一个"同位置单世界"(同 shard 身份、同零重力、
+        // 同前缀 [spawn, Detonate] apply_at=拍 0、同步数)。同位置同参数 →
+        // 逐位确定,差只可能来自跨片复制/投递路径。
+        let single_ref = |shard_x: i32, entity: EntityId, pos: Vec3, steps: usize| -> EntityState {
+            let mut single = zero_g_sim(shard_x, 0);
+            single.apply_prefix(&[
+                StampedInput {
+                    apply_at: Tick::ZERO,
+                    source: InputSource::SCHEDULER,
+                    sequence: 0,
+                    payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                        entity,
+                        state: EntityState {
+                            translation: pos,
+                            ..EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    }),
+                },
+                StampedInput {
+                    apply_at: Tick::ZERO,
+                    source: InputSource::SCHEDULER,
+                    sequence: 1,
+                    payload: InputPayload::Command(SimCommand::Detonate {
+                        center,
+                        power,
+                        radius,
+                    }),
+                },
+            ]);
+            for _ in 0..steps {
+                single.step();
+            }
+            single.entity_state(entity).expect("参考实体在自家单世界")
         };
-        let mut single = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
-        let mut inputs = Vec::new();
-        for (seq, e, x) in [(0u64, e0, 64.0_f32), (1u64, e1, 112.0_f32)] {
-            inputs.push(StampedInput {
-                apply_at: Tick::ZERO,
-                source: InputSource::SCHEDULER,
-                sequence: seq,
-                payload: InputPayload::Command(SimCommand::SpawnDynamic {
-                    entity: e,
-                    state: EntityState {
-                        translation: Vec3::new(x, 50.0, 8.0),
-                        ..EntityState::default()
-                    },
-                    desc: types::EntityDesc::default(),
-                }),
-            });
-        }
-        inputs.push(StampedInput {
-            apply_at: Tick::ZERO,
-            source: InputSource::SCHEDULER,
-            sequence: 2,
-            payload: InputPayload::Command(SimCommand::Detonate {
-                center: Vec3::new(128.0, 50.0, 8.0),
-                power: 12.0,
-                radius: 72.0,
-            }),
-        });
-        single.apply_prefix(&inputs);
-        for _ in 0..90 {
-            single.step();
-        }
-        // 参考世界是单分片:实体不受本体区约束会触发迁移检测——用迁移检测
-        // 的已知边界:参考线让两实体都留在片 (0,0) core(x∈[0,128))内对比
-        // 不现实(e1 初始 156 在 core 外)。改两实体都取 core 内对称位:爆心
-        // 128 在 core 外但冲量只看距离。取 e0=64 / e1=112(都在 core 内),
-        // 到爆心距离 64/16,radius 72 覆盖。
-        let ref0 = single.entity_state(e0).expect("参考实体在(core 内不迁移)");
-        let ref1 = single.entity_state(e1).expect("参考实体在(core 内不迁移)");
-        for (name, two, one) in [("e0", end0, ref0), ("e1", end1, ref1)] {
+        let ref0 = single_ref(0, e0, p0, STEPS);
+        let ref1 = single_ref(1, e1, p1, STEPS);
+
+        for (name, two, one, pos, expect_sign) in [
+            ("e0@(0,0)", end0, ref0, p0, -1.0_f32),
+            ("e1@(1,0)", end1, ref1, p1, 1.0),
+        ] {
             let d = two.translation - one.translation;
+            // 主断言(容差写进消息,任务书口径 < 1e-4 m):双片广播 vs 同位
+            // 置单世界参考,终态位移必须落在容差内。
             assert!(
                 d.x.abs() < 1e-4 && d.y.abs() < 1e-4 && d.z.abs() < 1e-4,
-                "{name}:双片(detonate 命令复制)vs 单世界终态位移差超限:Δ=({},{},{})",
+                "{name}:跨片广播 vs 单世界参考位移差超限(容差 1e-4 m):\
+                 Δ=({},{},{}) m,分片侧={:?} 参考={:?}",
                 d.x,
                 d.y,
-                d.z
+                d.z,
+                two.translation,
+                one.translation
             );
+            // 速度位级:零重力 + 单体无互触 → 终态 linvel 位级 = 冲量/质量
+            // (m=1),两侧同源;非零 + 方向背离爆心(expect_sign)。
+            let expected = physics_sim::explosion::explosion_impulse(center, power, radius, pos)
+                .expect("前置:实体在半径内");
+            assert!(
+                expected.x * expect_sign > 0.0,
+                "前置:{name} 冲量方向应沿 x 背离爆心:{expected:?}"
+            );
+            assert_eq!(two.linvel, expected, "{name}:分片侧 linvel 位级 = 冲量");
+            assert_eq!(one.linvel, expected, "{name}:参考侧 linvel 位级 = 冲量");
+            // 非退化:位移 |Δx| > 1 m(30 拍 ≈ 9.33m/s × 0.5s ≈ 4.7 m),
+            // y/z 逐位不动(位级 0)——场景确实被爆炸演化且仅沿 x。
+            let disp = two.translation - pos;
+            assert!(
+                disp.x * expect_sign > 1.0,
+                "{name}:位移必须沿冲量方向 > 1 m(实测 {disp:?})"
+            );
+            assert_eq!(disp.y, 0.0, "{name}:零重力位移 y 位级为 0");
+            assert_eq!(disp.z, 0.0, "{name}:冲量沿 x 位移 z 位级为 0");
         }
     }
 
