@@ -11,7 +11,7 @@
 | REQ-002 | ✅ 完成 | [#4](https://github.com/esp3j0/physics_minecraft/issues/4) | [REQ-002](REQ-002-world-loading.md) | [req002-world](../tasks/req002-world) | [df813c7](https://github.com/esp3j0/physics_minecraft/commit/df813c7) 定稿;[7019ff9](https://github.com/esp3j0/physics_minecraft/commit/7019ff9) 落地 |
 | REQ-003 | ✅ 完成 | [#5](https://github.com/esp3j0/physics_minecraft/issues/5) | [REQ-003](REQ-003-network.md) | [req003-net](../tasks/req003-net) | [f03230c](https://github.com/esp3j0/physics_minecraft/commit/f03230c) 定稿;[ea581df](https://github.com/esp3j0/physics_minecraft/commit/ea581df) 落地 |
 | REQ-004A | 🚧 代码侧完成 / ACV4 待实跑 | [#6](https://github.com/esp3j0/physics_minecraft/issues/6) | [REQ-004A](REQ-004A-visual-viewer.md) | [req004a-viewer](../tasks/req004a-viewer) | [ee857cc](https://github.com/esp3j0/physics_minecraft/commit/ee857cc) 定稿;[3299ef6](https://github.com/esp3j0/physics_minecraft/commit/3299ef6) 实现 |
-| REQ-005 | 🚧 任务 03 进行中 | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | [7050979](https://github.com/esp3j0/physics_minecraft/commit/7050979) 任务 02 通过;[bab6506](https://github.com/esp3j0/physics_minecraft/commit/bab6506) 任务 01;[cd4476d](https://github.com/esp3j0/physics_minecraft/commit/cd4476d) 任务 00 |
+| REQ-005 | 🚧 任务 04 验收中 | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | [c3c02df](https://github.com/esp3j0/physics_minecraft/commit/c3c02df) 任务 03(代码通过);[7050979](https://github.com/esp3j0/physics_minecraft/commit/7050979) 任务 02;[bab6506](https://github.com/esp3j0/physics_minecraft/commit/bab6506) 任务 01 |
 
 ## 说明
 
