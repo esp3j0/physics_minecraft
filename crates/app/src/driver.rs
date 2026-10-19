@@ -42,6 +42,12 @@ pub enum DriverCommand {
         unload: Vec<types::ChunkPos>,
         reply: tokio::sync::oneshot::Sender<Vec<(types::ChunkPos, voxel::Chunk)>>,
     },
+    /// 外部生成请求(REQ-006 任务 02):客户端不带 EntityId,由驱动分配并
+    /// 回执 `S2C::Spawned`。
+    Spawn {
+        state: types::EntityState,
+        desc: types::EntityDesc,
+    },
 }
 
 impl PartialEq for DriverCommand {
@@ -71,6 +77,16 @@ impl PartialEq for DriverCommand {
                     ..
                 },
             ) => la == lb && ua == ub,
+            (
+                Self::Spawn {
+                    state: sa,
+                    desc: da,
+                },
+                Self::Spawn {
+                    state: sb,
+                    desc: db,
+                },
+            ) => sa == sb && da == db,
             _ => false,
         }
     }
@@ -99,10 +115,12 @@ type CommandGuard = Result<(), &'static str>;
 ///   ③ chunk 已加载(REQ-005 任务 01,语义细则 7:`VoxelWorld::set_block`
 ///   会自动建空气 chunk,之后生成器/持久化会把地形覆盖成空气——未加载
 ///   chunk 的外部 SetBlock 必须丢弃,不自动建片);
-/// - `RemoveEntity` / `TeleportEntity` / `MarkActor` → 实体存在(按信息性
-///   路由分片查 `entity_state`——`command_shard` 换算口径;迁移中的实体在
-///   原 origin 分片表内,查询同键);
-/// - `SpawnDynamic` → 分片在场即过(模拟侧无进一步 panic 路径);
+/// - `RemoveEntity` / `TeleportEntity` → 全局 owner 存在 + 网络来源权限
+///   (`owner.source == Some(player)`;commands 通道 None 受信);**不再按
+///   `origin_shard`/路由分片查实体**;
+/// - `MarkActor` → 仅服务端(网络来源拒绝),owner 必须存在;
+/// - `SpawnDynamic` → 仅 commands 通道/内部受信路径;外部网络已由
+///   `C2S::Spawn` 取代(REQ-006 任务 02);
 /// - `Detonate` → **只做参数校验**且**先于**分片注册检查(REQ-005 任务 03)。
 pub fn validate_external_command(
     session: &sim_api::session::Session,
@@ -501,8 +519,17 @@ struct ObserveOrchestrator {
     pending_welcome: BTreeMap<messaging::InputSource, types::Tick>,
     /// 跨拍积压的方块变更源(格 → 写入值;后写覆盖先写)。
     pending_blocks: BTreeMap<types::BlockPos, types::BlockId>,
+    /// 外部 spawn 的服务端 ID 序号(REQ-006 任务 02;origin=0 保留)。
+    next_spawn_seq: u32,
     /// 节奏副本(输出点用)。
     _cadence: ObserveCadence,
+}
+
+/// 外部 spawn 请求(REQ-006 任务 02;降低 handler 参数)。
+struct SpawnRequest {
+    player: messaging::InputSource,
+    state: types::EntityState,
+    desc: types::EntityDesc,
 }
 
 impl ObserveOrchestrator {
@@ -513,7 +540,77 @@ impl ObserveOrchestrator {
             ticks_since_full: 0,
             pending_welcome: BTreeMap::new(),
             pending_blocks: BTreeMap::new(),
+            next_spawn_seq: 0,
             _cadence: cadence,
+        }
+    }
+
+    /// 外部生成(REQ-006 任务 02):服务端分配 ID、校验出生分片/chunk、
+    /// 投递 SpawnDynamic、回执 `S2C::Spawned`。失败只计数,不 panic。
+    fn handle_spawn(
+        &mut self,
+        req: SpawnRequest,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+        commands_rejected: &mut u64,
+    ) {
+        let SpawnRequest {
+            player,
+            state,
+            desc,
+        } = req;
+        if !state.translation.is_finite()
+            || !state.linvel.is_finite()
+            || !state.angvel.is_finite()
+            || !state.rotation.is_finite()
+            || !desc.half_size.is_finite()
+            || desc.half_size <= 0.0
+            || !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&(state.translation.y.floor() as i32))
+        {
+            *commands_rejected += 1;
+            return;
+        }
+        let cell = types::BlockPos::new(
+            state.translation.x.floor() as i32,
+            state.translation.y.floor() as i32,
+            state.translation.z.floor() as i32,
+        );
+        let chunk = cell.chunk_of();
+        let shard = types::ShardId::new(types::WorldId(0), types::DimensionId(0), chunk.shard_of());
+        if !session.shard_ids().contains(&shard) || !session.is_chunk_loaded(shard, chunk) {
+            // 外部 spawn 只允许已加载区域(不自动建空气 chunk)。
+            *commands_rejected += 1;
+            return;
+        }
+        let entity = self.allocate_spawn_id(session);
+        match session.spawn_owned(shard, entity, state, desc, player) {
+            Ok(entry) => {
+                log.append(entry);
+                hub.push_critical(player, S2C::Spawned { entity });
+            }
+            Err(sim_api::session::SessionError::Route(shard::router::RouteError::InboxFull {
+                ..
+            })) => *commands_rejected += 1,
+            Err(other) => {
+                eprintln!("[driver] 外部 spawn 拒绝:{other:?}");
+                *commands_rejected += 1;
+            }
+        }
+    }
+
+    /// 分配 server namespace(origin=0)内的空闲 ID;跳过当前已存在的 ID。
+    fn allocate_spawn_id(&mut self, session: &sim_api::session::Session) -> types::EntityId {
+        loop {
+            let seq = self.next_spawn_seq;
+            self.next_spawn_seq = self
+                .next_spawn_seq
+                .checked_add(1)
+                .expect("服务端 EntityId 序号耗尽(fail-stop)");
+            let entity = types::EntityId::from_parts(0, seq);
+            if session.entity_owner(entity).is_none() {
+                return entity;
+            }
         }
     }
 
@@ -528,6 +625,7 @@ impl ObserveOrchestrator {
     ///   position)` + `log.append`(D9:盖章 source = 玩家,sequence 沿会话
     ///   单调——删除了旧 `player_sequences` 表与手工 `StampedInput` 构造;
     ///   收件箱 unbounded,无失败路径);
+    /// - `DriverCommand::Spawn` → 服务端 ID 分配 + `session.spawn_owned`;
     /// - `DriverCommand::Send` → 前置校验后 `dispatch_external`(source =
     ///   玩家;SetBlock 走 `send_broadcast_from` 全部条目入日志,其余单发入
     ///   日志);SetBlock 成功镜像入 BlockUpdates 源(`record_block_changes`
@@ -538,6 +636,7 @@ impl ObserveOrchestrator {
         session: &mut sim_api::session::Session,
         log: &mut sim_api::log::CommandLog,
         commands_rejected: &mut u64,
+        hub: &OutboundHub,
     ) {
         match event {
             NetUp::Joined { player } => {
@@ -575,6 +674,19 @@ impl ObserveOrchestrator {
                         Ok(entry) => log.append(entry),
                         Err(other) => panic!("观察者移动失败(非预期):{other:?}"),
                     }
+                }
+                DriverCommand::Spawn { state, desc } => {
+                    self.handle_spawn(
+                        SpawnRequest {
+                            player,
+                            state,
+                            desc,
+                        },
+                        session,
+                        log,
+                        hub,
+                        commands_rejected,
+                    );
                 }
                 DriverCommand::Send { shard, command } => {
                     // 前置校验(评审修复①):网络上行的命令参数全部客户端可
@@ -1096,6 +1208,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                                 &mut session,
                                 &mut log,
                                 &mut commands_rejected,
+                                hub,
                             );
                         }
                     }
@@ -1114,6 +1227,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
             maybe_command = commands.recv() => {
                 match maybe_command {
                     Some(DriverCommand::Shutdown) | None => break,
+                    Some(DriverCommand::Spawn { .. }) => {
+                        panic!("commands 通道的 Spawn 变体仅网络上行使用;本地 spawn 用 Send/SpawnDynamic")
+                    }
                     Some(DriverCommand::Send { shard, command }) => {
                         // 前置校验(评审修复①):预检不过 = 丢弃不投——hostile
                         // 输入不得触发调度器/模拟的 fail-stop panic(DoS);
@@ -2967,6 +3083,140 @@ mod tests {
         driver.await.expect("驱动不 panic");
     }
 
+    /// REQ-006 任务 02:未加载区域的 Spawn 被拒绝(不建空气 chunk、不回执)。
+    #[tokio::test(start_paused = true)]
+    async fn spawn_rejected_in_unloaded_area() {
+        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _ = join_player(&mut c, 8).await;
+        c.send(&C2S::Spawn {
+            state: EntityState {
+                translation: Vec3::new(2000.0, 3.0, 0.0),
+                ..EntityState::default()
+            },
+            desc: types::EntityDesc::default(),
+        })
+        .await
+        .expect("Spawn 写入");
+        advance_ticks(2).await;
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert!(
+            outcome.commands_rejected >= 1,
+            "未加载区域 Spawn 计入拒绝:{}",
+            outcome.commands_rejected
+        );
+    }
+
+    /// REQ-006 任务 02:真 TCP 外部 Spawn → 服务端分配 ID + Spawned 回执,
+    /// 下一拍 EntityStates 出现该实体;客户端不带 ID。
+    #[tokio::test(start_paused = true)]
+    async fn network_spawn_gets_server_id_and_spawned_receipt() {
+        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let player = join_player(&mut c, 3).await;
+        c.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("观察者写入");
+        advance_ticks(3).await;
+
+        c.send(&C2S::Spawn {
+            state: EntityState {
+                translation: Vec3::new(8.0, 3.0, 8.0),
+                ..EntityState::default()
+            },
+            desc: types::EntityDesc::default(),
+        })
+        .await
+        .expect("Spawn 写入");
+
+        let mut spawned = None;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await {
+                Ok(Ok(S2C::Spawned { entity })) => {
+                    spawned = Some(entity);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let entity = spawned.expect("Spawned 回执必达(Critical)");
+        assert_eq!(entity.origin_shard(), 0, "服务端 namespace = origin 0");
+        advance_ticks(3).await;
+        let (_, states, _) = recv_entity_states(&mut c).await;
+        assert!(
+            states.iter().any(|(id, _)| *id == entity),
+            "Spawned ID 在下一轮 EntityStates 出现:{entity:?}"
+        );
+        assert!(
+            hub.subscribers().contains(&player),
+            "Spawn 不破坏观察流注册"
+        );
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-006 任务 02:两个真 TCP 客户端并发 Spawn → 服务端分配不同 ID。
+    #[tokio::test(start_paused = true)]
+    async fn two_clients_spawn_unique_server_ids() {
+        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let pa = join_player(&mut a, 6).await;
+        a.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("A 观察者写入");
+        let mut b = MiniClient::connect(addr).await.expect("B 连入");
+        let pb = join_player(&mut b, 7).await;
+        b.send(&C2S::MoveObserver {
+            position: Vec3::new(12.0, 3.0, 8.0),
+        })
+        .await
+        .expect("B 观察者写入");
+        advance_ticks(3).await;
+
+        for c in [&mut a, &mut b] {
+            c.send(&C2S::Spawn {
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 8.0),
+                    ..EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            })
+            .await
+            .expect("Spawn 写入");
+        }
+        let mut ids = Vec::new();
+        for c in [&mut a, &mut b] {
+            let mut got = None;
+            for _ in 0..64 {
+                match tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await {
+                    Ok(Ok(S2C::Spawned { entity })) => {
+                        got = Some(entity);
+                        break;
+                    }
+                    Ok(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            ids.push(got.expect("每个客户端都收到 Spawned"));
+        }
+        assert_ne!(ids[0], ids[1], "并发 Spawn 不得撞 ID:{ids:?}");
+        assert!(ids.iter().all(|id| id.origin_shard() == 0));
+        assert!(hub.subscribers().contains(&pa) && hub.subscribers().contains(&pb));
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+    }
+
     /// 测试清单 2 `entity_states_incremental_then_full`:拍 1 出生实体 →
     /// 首个输出点全量(removed 空);实体移动 → 增量只含变化;全量周期到 →
     /// 整表(removed 空)。周期 = observe 3 拍 / full 9 拍。
@@ -3354,16 +3604,12 @@ mod tests {
         }))
         .await
         .expect("hostile SetBlock 写入");
-        c.send(&C2S::Command(messaging::SimCommand::SpawnDynamic {
-            entity: EntityId::from_parts(1, 1),
-            state: EntityState {
-                translation: Vec3::new(2000.0, 3.0, 0.0), // 中心 → 分片 (15,0) 未注册
-                ..EntityState::default()
-            },
-            desc: types::EntityDesc::default(),
+        c.send(&C2S::Command(messaging::SimCommand::TeleportEntity {
+            entity: EntityId::from_parts(999, 1), // 未知实体:owner 查不到 → 丢弃
+            state: EntityState::default(),
         }))
         .await
-        .expect("hostile SpawnDynamic 写入");
+        .expect("hostile TeleportEntity 写入");
         advance_ticks(3).await;
 
         // 客户端连接不断(丢弃 ≠ 断连;断连面只属协议违规/keepalive)。

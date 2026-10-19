@@ -45,6 +45,8 @@ pub enum ViewEvent {
     },
     /// 方块增量(凝固/挖掘/放置的渲染面)。
     Blocks { updates: Vec<(BlockPos, BlockId)> },
+    /// 服务端分配的外部生成 ID(REQ-006 任务 02)。
+    Spawned { entity: EntityId },
     /// 断连(对端 Bye/EOF/IO 失败;reason = 尽力还原的说明)。
     Disconnected { reason: String },
 }
@@ -54,9 +56,15 @@ pub enum ViewEvent {
 pub(crate) enum Control {
     /// 观察者位姿(渲染节流后送达;连接循环原样发 `C2S::MoveObserver`)。
     Move(Vec3),
-    /// 白名单命令(生成/引爆等;连接循环发 `C2S::Command`,翻译层在服务器侧)。
+    /// 白名单命令(引爆等;连接循环发 `C2S::Command`,翻译层在服务器侧)。
     /// ACV4 ③④ 的交互入口(评审后补,Refs #6)。
     Command(messaging::SimCommand),
+    /// 外部生成请求(连接循环发 `C2S::Spawn`;服务端分配 ID 并回
+    /// [`ViewEvent::Spawned`])。
+    Spawn {
+        state: EntityState,
+        desc: types::EntityDesc,
+    },
     /// 主动离场(`C2S::Goodbye`)。
     Goodbye,
 }
@@ -76,9 +84,14 @@ impl ControlHandle {
         let _ = self.tx.try_send(Control::Move(position));
     }
 
-    /// 发白名单命令(生成/引爆;ACV4 ③④ 交互入口)。
+    /// 发白名单命令(引爆;ACV4 ③④ 交互入口)。
     pub fn command(&self, command: messaging::SimCommand) {
         let _ = self.tx.try_send(Control::Command(command));
+    }
+
+    /// 发外部生成请求(REQ-006 任务 02:服务端分配 ID,客户端不选 ID)。
+    pub fn spawn(&self, state: EntityState, desc: types::EntityDesc) {
+        let _ = self.tx.try_send(Control::Spawn { state, desc });
     }
 
     /// 主动离场(尽力而为;连接亡故时静默)。
@@ -121,6 +134,7 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
             full,
         }),
         S2C::BlockUpdates { updates } => Some(ViewEvent::Blocks { updates }),
+        S2C::Spawned { entity } => Some(ViewEvent::Spawned { entity }),
         S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
         S2C::Pong => None,
     }
@@ -274,6 +288,12 @@ async fn run_connection(
                         break 'read;
                     }
                 }
+                Some(Control::Spawn { state, desc }) => {
+                    let frame = encode_c2s_frame(&C2S::Spawn { state, desc });
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
                 Some(Control::Goodbye) => {
                     let frame = encode_c2s_frame(&C2S::Goodbye);
                     let _ = write_all(&mut stream, &frame).await; // 尽力;随后读 EOF
@@ -392,6 +412,9 @@ mod tests {
             S2C::Bye {
                 reason: "shutdown".to_owned(),
             },
+            S2C::Spawned {
+                entity: EntityId::from_parts(0, 3),
+            },
         ];
 
         for case in cases {
@@ -445,6 +468,9 @@ mod tests {
                 }
                 (S2C::Bye { reason }, Some(ViewEvent::Disconnected { reason: r })) => {
                     assert_eq!(r, reason, "Bye → Disconnected 携带原因");
+                }
+                (S2C::Spawned { entity }, Some(ViewEvent::Spawned { entity: e })) => {
+                    assert_eq!(e, entity, "Spawned 回执字段一致");
                 }
                 (S2C::Pong, None) => {}
                 (original, event) => panic!("变体 {original:?} 映射不符: {event:?}"),

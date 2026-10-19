@@ -61,12 +61,6 @@ fn eid(n: u32) -> EntityId {
     EntityId::from_parts(1, n)
 }
 
-/// 原点区(分片 (0,0))实体的身份:origin=0,与 command_shard 的信息性
-/// 路由口径一致(origin 0 → ShardPos(0,0))。
-fn eid0(n: u32) -> EntityId {
-    EntityId::from_parts(0, n)
-}
-
 /// 测试用分片身份(与 world_loading / driver 测试同风格)。
 fn shard_id(x: i32, z: i32) -> ShardId {
     ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
@@ -157,6 +151,32 @@ async fn join(c: &mut TestClient, rx: &mut mpsc::UnboundedReceiver<S2C>, view: u
         }
     }
     panic!("64 软窗内未收到 Welcome")
+}
+
+/// 外部生成(REQ-006 任务 02):发 `C2S::Spawn` → 等 `S2C::Spawned`,返回
+/// 服务端分配的 ID;其它观察帧跳过。
+async fn spawn_entity(
+    c: &mut TestClient,
+    rx: &mut mpsc::UnboundedReceiver<S2C>,
+    translation: Vec3,
+) -> EntityId {
+    c.send(&C2S::Spawn {
+        state: EntityState {
+            translation,
+            ..EntityState::default()
+        },
+        desc: EntityDesc::default(),
+    })
+    .await
+    .expect("Spawn 写入");
+    for _ in 0..300 {
+        match next_frame(rx).await {
+            Some(S2C::Spawned { entity }) => return entity,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    panic!("300 软窗内未收到 Spawned 回执");
 }
 
 /// 软窗收一帧(None = 窗口内无帧;虚拟时钟已推进 ~3 拍)。
@@ -578,20 +598,10 @@ async fn acn3_command_roundtrip() {
     .expect("MoveObserver 写入");
     advance_ticks(8).await;
 
-    // 生成经协议:SpawnDynamic(出生 y=-55,自由落体)。几何取 .0 位:实体盒
+    // 生成经协议:Spawn(出生 y=-55,自由落体)。几何取 .0 位:实体盒
     // [207.5,208.5]×[7.5,8.5] 整占格 x∈{207,208}, z∈{7,8}——挖/放必须覆盖
-    // 全部承托格,否则边列留活(几何口径在挖段注释)。
-    let e = eid(1);
-    a.send(&C2S::Command(SimCommand::SpawnDynamic {
-        entity: e,
-        state: EntityState {
-            translation: Vec3::new(208.0, -55.0, 8.0),
-            ..EntityState::default()
-        },
-        desc: EntityDesc::default(),
-    }))
-    .await
-    .expect("SpawnDynamic 写入");
+    // 全部承托格,否则边列留活(几何口径在挖段注释)。ID 由服务端分配。
+    let e = spawn_entity(&mut a, &mut rx, Vec3::new(208.0, -55.0, 8.0)).await;
     assert!(
         watch_entity(&mut rx, e, 300, |st| (st.translation
             - Vec3::new(208.0, -55.0, 8.0))
@@ -719,19 +729,8 @@ async fn acn4_incremental_matches_full() {
     .expect("MoveObserver 写入");
     advance_ticks(4).await; // 观察者应用 + ensure
 
-    // 原点区实体:origin=0(command_shard 信息性路由 origin 0 → ShardPos(0,0)
-    // = 已注册观察者分片;TeleportEntity 走该路由,身份必须与注册片一致)。
-    let e = eid0(1);
-    a.send(&C2S::Command(SimCommand::SpawnDynamic {
-        entity: e,
-        state: EntityState {
-            translation: Vec3::new(10.0, 3.0, 10.0),
-            ..EntityState::default()
-        },
-        desc: EntityDesc::default(),
-    }))
-    .await
-    .expect("SpawnDynamic 写入");
+    // 原点区实体:服务端分配 ID(REQ-006 任务 02;客户端不自选)。
+    let e = spawn_entity(&mut a, &mut rx, Vec3::new(10.0, 3.0, 10.0)).await;
     // 订阅后首见 = 全量打底(removed 恒空;增量不含未变化实体)。
     let first = watch_entity(&mut rx, e, 300, |_| true)
         .await
@@ -1013,20 +1012,11 @@ async fn acn6_disconnect_reconnect() {
         "重连后 chunk 流恢复且在新观察中心方形内: {:?}",
         loads.iter().map(|(p, _)| *p).collect::<Vec<_>>()
     );
-    // 实体观察恢复:重连者经协议生成新实体 → 可见。
-    a2b.send(&C2S::Command(SimCommand::SpawnDynamic {
-        entity: eid(7),
-        state: EntityState {
-            translation: Vec3::new(8.5, -55.0, 8.5),
-            ..EntityState::default()
-        },
-        desc: EntityDesc::default(),
-    }))
-    .await
-    .expect("SpawnDynamic 写入");
+    // 实体观察恢复:重连者经协议生成新实体 → 可见(ID 由服务端分配)。
+    let e = spawn_entity(&mut a2b, &mut rx_a2b, Vec3::new(8.5, -55.0, 8.5)).await;
     advance_ticks(4).await;
     assert!(
-        entity_appears(&mut rx_a2b, eid(7), 100).await,
+        entity_appears(&mut rx_a2b, e, 100).await,
         "重连后观察输出恢复(新实体可见)"
     );
 

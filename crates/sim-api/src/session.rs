@@ -477,6 +477,42 @@ impl Session {
         self.scheduler.shard_ids()
     }
 
+    /// 服务端分配 ID 后的外部 spawn(REQ-006 任务 02):目标分片由出生位置
+    /// 决定;调用方负责 chunk 已加载校验。ID 已存在 → Rejected。
+    pub fn spawn_owned(
+        &mut self,
+        shard: ShardId,
+        entity: EntityId,
+        state: EntityState,
+        desc: types::EntityDesc,
+        source: InputSource,
+    ) -> Result<LogEntry, SessionError> {
+        if !self.scheduler.shard_ids().contains(&shard) {
+            return Err(SessionError::Rejected("出生分片未注册"));
+        }
+        let cell = BlockPos::new(
+            state.translation.x.floor() as i32,
+            state.translation.y.floor() as i32,
+            state.translation.z.floor() as i32,
+        );
+        let expected = ShardId::new(shard.world, shard.dimension, cell.chunk_of().shard_of());
+        if expected != shard {
+            return Err(SessionError::Rejected("出生位置不在目标分片"));
+        }
+        if self.entity_owner(entity).is_some() {
+            return Err(SessionError::Rejected("实体 ID 已存在"));
+        }
+        self.send_from(
+            source,
+            shard,
+            SimCommand::SpawnDynamic {
+                entity,
+                state,
+                desc,
+            },
+        )
+    }
+
     /// 实体当前状态;未注册分片或实体不在该分片 → None。
     pub fn entity_state(&self, shard: ShardId, entity: EntityId) -> Option<EntityState> {
         self.scheduler.entity_state(shard, entity)
@@ -1868,6 +1904,53 @@ mod tests {
             types::BlockId(1),
             "owner 卸载的 chunk 含 Emergent 编辑(局部 (2,69,8) = 世界 (130,5,8))"
         );
+        session.shutdown();
+    }
+
+    /// REQ-006 任务 02:spawn_owned 校验分片/位置/ID 唯一。
+    #[test]
+    fn spawn_owned_rejects_wrong_shard_and_duplicate() {
+        let mut session = Session::new(session_cfg());
+        session.register(sim(0, 0));
+        session.register(sim(1, 0));
+        let e = EntityId::from_parts(0, 0);
+        let state = EntityState {
+            translation: Vec3::new(8.0, 10.0, 8.0),
+            ..EntityState::default()
+        };
+        session
+            .spawn_owned(
+                shard_id(0, 0),
+                e,
+                state,
+                types::EntityDesc::default(),
+                InputSource(7),
+            )
+            .expect("首次 spawn");
+        session.tick();
+        assert!(session.entity_owner(e).is_some());
+        // 目标分片与出生位置不符。
+        assert!(matches!(
+            session.spawn_owned(
+                shard_id(1, 0),
+                EntityId::from_parts(0, 1),
+                state,
+                types::EntityDesc::default(),
+                InputSource(7),
+            ),
+            Err(SessionError::Rejected(_))
+        ));
+        // ID 已存在。
+        assert!(matches!(
+            session.spawn_owned(
+                shard_id(0, 0),
+                e,
+                state,
+                types::EntityDesc::default(),
+                InputSource(7),
+            ),
+            Err(SessionError::Rejected(_))
+        ));
         session.shutdown();
     }
 

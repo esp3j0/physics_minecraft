@@ -11,7 +11,7 @@
 use messaging::{InputSource, SimCommand};
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, Tick};
+use types::{BlockId, BlockPos, ChunkPos, EntityDesc, EntityId, EntityState, Tick};
 use voxel::Chunk;
 
 /// 客户端 → 服务器(追加式枚举;帧 = 4B LE 长度 + bincode,上限见 [`FRAME_MAX`])。
@@ -26,14 +26,20 @@ pub enum C2S {
     MoveObserver {
         position: Vec3,
     },
-    /// 命令白名单:SetBlock/SpawnDynamic/RemoveEntity/TeleportEntity/Detonate
-    /// (SetObserverPosition 走 [`C2S::MoveObserver`] 专用包;MarkActor 为
-    /// 服务端策略,不对客户端开放,README 决策 1)。
-    /// **类型层面无运行时过滤**:白名单判定在翻译层(app::net `translate`,
-    /// 任务 01)——非白名单 `SimCommand` 到达 = 协议违规 → 断连,由翻译层执行。
+    /// 命令白名单:SetBlock/RemoveEntity/TeleportEntity/Detonate
+    /// (SpawnDynamic 已由 REQ-006 任务 02 的 [`C2S::Spawn`] 取代;SetObserverPosition
+    /// 走 [`C2S::MoveObserver`] 专用包;MarkActor 为服务端策略,不对客户端开放,
+    /// README 决策 1)。**类型层面无运行时过滤**:白名单判定在翻译层
+    /// (app::net `translate`,任务 01)。
     Command(SimCommand),
     Ping,
     Goodbye,
+    /// 外部生成请求(REQ-006 任务 02/D1=A/D2=A):客户端不提供 EntityId;
+    /// 服务端分配并通过 [`S2C::Spawned`] 回执。只能出生在已加载 chunk。
+    Spawn {
+        state: EntityState,
+        desc: EntityDesc,
+    },
 }
 
 /// 服务器 → 客户端(追加式)。
@@ -68,6 +74,10 @@ pub enum S2C {
     Pong,
     Bye {
         reason: String,
+    },
+    /// 服务端分配的外部生成回执(REQ-006 任务 02):客户端据此获得权威 ID。
+    Spawned {
+        entity: EntityId,
     },
 }
 
@@ -179,6 +189,9 @@ mod tests {
             S2C::Bye {
                 reason: "shutdown".to_string(),
             },
+            S2C::Spawned {
+                entity: EntityId::from_parts(0, 7),
+            },
         ]
     }
 
@@ -239,7 +252,7 @@ mod tests {
         assert_eq!(decode_frame(&encoded), Some(small), "≤ 上限正常往返");
     }
 
-    /// 测试清单 3 `c2s_command_whitelist_types`:白名单五命令可构造且命令包
+    /// 测试清单 3 `c2s_command_whitelist_types`:命令包形状可构造且
     /// 可经帧编解码完整复原;类型层面无运行时过滤(非白名单同样可编码),
     /// 断连判定在翻译层(app::net `translate`,任务 01,注释指向)。
     #[test]
@@ -282,6 +295,16 @@ mod tests {
             decode_c2s_frame(&encode_c2s_frame(&not_open)),
             Some(not_open),
             "类型层面无运行时过滤(判定在翻译层)"
+        );
+        // REQ-006 任务 02:外部 Spawn 请求只带 state/desc,不带 ID。
+        let spawn = C2S::Spawn {
+            state: EntityState::default(),
+            desc: EntityDesc::default(),
+        };
+        assert_eq!(
+            decode_c2s_frame(&encode_c2s_frame(&spawn)),
+            Some(spawn),
+            "Spawn 请求帧往返"
         );
         let _ = WorldId(0); // 保序引用(纪律自证,可删)
     }

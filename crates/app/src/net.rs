@@ -149,9 +149,9 @@ pub enum TranslateOutcome {
 
 /// 翻译层(纯函数;零 IO、零时钟,任务书细则 6):C2S → [`TranslateOutcome`]
 /// 映射一处收口(README 决策 4)。命令白名单(README 决策 1)在此执行:
-/// SetBlock/SpawnDynamic/RemoveEntity/TeleportEntity/Detonate 放行,
-/// MarkActor(服务端策略)与 SetObserverPosition(走 `C2S::MoveObserver`
-/// 专用包)到达 = 协议违规(`Reject`)。
+/// SetBlock/RemoveEntity/TeleportEntity/Detonate 放行;外部 Spawn 走
+/// [`C2S::Spawn`](服务端分配 ID);SpawnDynamic/MarkActor/SetObserverPosition
+/// 到达 = 协议违规(`Reject`)。
 pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
     let _ = player; // 身份由上报侧附带;翻译只定形状
     match c2s {
@@ -166,6 +166,7 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
             Some(shard) => TranslateOutcome::Send(DriverCommand::Send { shard, command }),
             None => TranslateOutcome::Reject("非白名单命令"),
         },
+        C2S::Spawn { state, desc } => TranslateOutcome::Send(DriverCommand::Spawn { state, desc }),
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
     }
@@ -173,17 +174,18 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
 
 /// 命令 → 作用分片(白名单判定与路由换算一体;白名单外 → `None`):
 /// - `SetBlock` → pos 所在分片(floor 语义,`BlockPos::chunk_of().shard_of()` 同式);
-/// - `SpawnDynamic` → 出生中心;`Detonate` → 爆心(与 `session.move_observer`
-///   的 dest 换算同口径:x/16 floor → chunk → shard);
+/// - `Detonate` → 爆心(与 `session.move_observer` 的 dest 换算同口径);
 /// - `RemoveEntity`/`TeleportEntity` → 实体 origin 序号(信息性路由:实体
 ///   归属分片由模拟侧权威判定;投递前的**前置校验**见
 ///   `driver::validate_external_command`——未知实体/越界目标在驱动侧丢弃
 ///   计数,不投模拟:hostile 输入不得触发 fail-stop panic,评审修复①)。
+/// - `SpawnDynamic` → `None`(REQ-006 任务 02:外部只能用 `C2S::Spawn`，
+///   由服务端分配 ID;内部/测试仍可直用 SimCommand);
 /// - `MarkActor`/`SetObserverPosition` → `None`(非白名单,README 决策 1)。
 pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
     let shard_pos = match command {
         SimCommand::SetBlock { pos, .. } => pos.chunk_of().shard_of(),
-        SimCommand::SpawnDynamic { state, .. } => point_shard_of(state.translation),
+        SimCommand::SpawnDynamic { .. } => return None,
         SimCommand::Detonate { center, .. } => point_shard_of(*center),
         SimCommand::RemoveEntity { entity } | SimCommand::TeleportEntity { entity, .. } => {
             // origin 是分片的 u32 序号(注册表分配),不是 x/z 坐标——没有
@@ -1378,11 +1380,6 @@ pub(crate) mod tests {
                 pos: BlockPos::new(1, 2, 3),
                 block: types::BlockId(1),
             },
-            SimCommand::SpawnDynamic {
-                entity: EntityId::from_parts(1, 1),
-                state: types::EntityState::default(),
-                desc: types::EntityDesc::default(),
-            },
             SimCommand::RemoveEntity {
                 entity: EntityId::from_parts(1, 1),
             },
@@ -1408,6 +1405,34 @@ pub(crate) mod tests {
                 "白名单命令 {cmd:?} 透传为 Send"
             );
         }
+        // 外部 Spawn 请求(REQ-006 任务 02)→ DriverCommand::Spawn,不带 ID。
+        let spawn = C2S::Spawn {
+            state: types::EntityState::default(),
+            desc: types::EntityDesc::default(),
+        };
+        assert_eq!(
+            translate(InputSource(3), spawn.clone()),
+            TranslateOutcome::Send(DriverCommand::Spawn {
+                state: types::EntityState::default(),
+                desc: types::EntityDesc::default(),
+            }),
+            "C2S::Spawn 透传为 DriverCommand::Spawn"
+        );
+        // 外部 SpawnDynamic 已禁用(客户端不能自选 ID)。
+        assert!(
+            matches!(
+                translate(
+                    InputSource(1),
+                    C2S::Command(SimCommand::SpawnDynamic {
+                        entity: EntityId::from_parts(1, 1),
+                        state: types::EntityState::default(),
+                        desc: types::EntityDesc::default(),
+                    })
+                ),
+                TranslateOutcome::Reject(_)
+            ),
+            "外部 SpawnDynamic → Reject"
+        );
         // 非白名单:MarkActor、SetObserverPosition(观察者走 MoveObserver 专用包)。
         assert!(
             matches!(
@@ -1684,7 +1709,7 @@ pub(crate) mod tests {
         assert_eq!(translate(player, C2S::Ping), TranslateOutcome::Ping);
         assert_eq!(translate(player, C2S::Goodbye), TranslateOutcome::Goodbye);
 
-        // Command 白名单(五变体,分片换算逐一核对):
+        // Command 白名单(四变体,分片换算逐一核对;SpawnDynamic 由 C2S::Spawn 取代):
         // SetBlock → pos 所在分片(块 (200,·,8) → chunk 12 → 分片 (1,0))。
         let set_block = SimCommand::SetBlock {
             pos: BlockPos::new(200, -60, 8),
@@ -1703,9 +1728,9 @@ pub(crate) mod tests {
             "SetBlock 分片 = 方块位置所在分片"
         );
 
-        // SpawnDynamic → 出生中心所在分片;Detonate → 爆心所在分片(floor 语义,
-        // 与 session.move_observer 的 dest 换算同口径)。
-        let spawn = SimCommand::SpawnDynamic {
+        // 外部 SpawnDynamic 已禁用(REQ-006 任务 02:ID 由服务端分配);
+        // C2S::Spawn 透传为 DriverCommand::Spawn,分片由驱动按出生位置解析。
+        let spawn_dynamic = SimCommand::SpawnDynamic {
             entity: EntityId::from_parts(1, 1),
             state: types::EntityState {
                 translation: Vec3::new(200.0, 0.0, 8.0),
@@ -1714,16 +1739,27 @@ pub(crate) mod tests {
             desc: types::EntityDesc::default(),
         };
         assert_eq!(
-            translate(player, C2S::Command(spawn)),
-            TranslateOutcome::Send(DriverCommand::Send {
-                shard: types::ShardId::new(
-                    types::WorldId(0),
-                    types::DimensionId(0),
-                    types::ShardPos::new(1, 0)
-                ),
-                command: spawn,
+            translate(player, C2S::Command(spawn_dynamic)),
+            TranslateOutcome::Reject("非白名单命令"),
+            "外部 SpawnDynamic 拒绝"
+        );
+        let spawn = C2S::Spawn {
+            state: types::EntityState {
+                translation: Vec3::new(200.0, 0.0, 8.0),
+                ..types::EntityState::default()
+            },
+            desc: types::EntityDesc::default(),
+        };
+        assert_eq!(
+            translate(player, spawn.clone()),
+            TranslateOutcome::Send(DriverCommand::Spawn {
+                state: types::EntityState {
+                    translation: Vec3::new(200.0, 0.0, 8.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
             }),
-            "SpawnDynamic 分片 = 出生中心所在分片"
+            "C2S::Spawn → DriverCommand::Spawn(不带分片)"
         );
         let detonate = SimCommand::Detonate {
             center: Vec3::new(-0.5, 0.0, -0.5),

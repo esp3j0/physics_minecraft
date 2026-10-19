@@ -1,5 +1,7 @@
 # 任务 02:服务端 ID 分配与 Spawn/Spawned 协议
 
+- 状态:**实现完成,门禁通过(2026-10-19)**。
+
 ## 目标
 
 外部 spawn 由服务端分配唯一 `EntityId`，客户端发 `C2S::Spawn { state, desc }`，

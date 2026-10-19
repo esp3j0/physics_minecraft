@@ -46,9 +46,6 @@ const BLAST_RADIUS: f32 = 8.0;
 const BLAST_Y: f32 = 4.7;
 /// X 爆心吸附范围(米):相机附近最近的活实体直接作爆心(见 X 键注释)。
 const BLAST_SNAP: f32 = 25.0;
-/// viewer 生成实体的 EntityId origin 段(服务器分片序号 <<32 打包;9999 远离
-/// 一切真实分片号,保证客户端生成 ID 不与服务器侧冲突——决议 7 单调不回收)。
-const SPAWN_ORIGIN: u32 = 9999;
 
 /// 自由飞行相机(欧拉:偏航绕 y,俯仰;WASD + 鼠标视角,Shift/Ctrl 升降)。
 struct FlyCamera {
@@ -238,6 +235,9 @@ impl WorldView {
                         .insert(cpos, chunk_mesh(chunk, Self::origin_of(cpos)));
                 }
             }
+            ViewEvent::Spawned { .. } => {
+                // 服务端分配 ID 的回执;demo 只渲染 EntityStates,无需本地句柄。
+            }
             ViewEvent::Disconnected { .. } => {}
         }
     }
@@ -258,8 +258,8 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
     let mut mouse_grabbed = true;
     set_cursor_grab(mouse_grabbed);
     show_mouse(!mouse_grabbed);
-    // viewer 生成实体的序号(SPAWN_ORIGIN 段内单调;断线重连从 0 重来,
-    // 与服务器侧实体永不冲突——服务器分片号远小于 9999)。
+    // viewer 生成实体的网格序号(仅用于出生点散开;ID 由服务端分配,
+    // REQ-006 任务 02)。
     let mut spawn_seq: u32 = 0;
     // 节流用墙钟(渲染节流不属确定性核;边缘 crate 局部 allow 并注明,
     // clippy.toml 纪律,driver.rs 同款手法)。
@@ -300,21 +300,20 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
         // 连按散布:同点重叠的刚体被求解器永久抖动、永不满足凝固判据
         // (实跑反馈的蓝方块存留根因之一)——按序号在 5×5 网格散开出生点。
         if is_key_pressed(KeyCode::B) && disconnected.is_none() {
-            let entity = EntityId::from_parts(SPAWN_ORIGIN, spawn_seq);
             let gx = (spawn_seq % 5) as f32 - 2.0;
             let gz = ((spawn_seq / 5) % 5) as f32 - 2.0;
             spawn_seq = spawn_seq.wrapping_add(1);
             let p = camera.position
                 + camera.forward() * SPAWN_AHEAD
                 + vec3(gx * 1.6, SPAWN_LIFT, gz * 1.6);
-            control.command(SimCommand::SpawnDynamic {
-                entity,
-                state: EntityState {
+            // REQ-006 任务 02:客户端不选 EntityId;服务端分配并回 Spawned。
+            control.spawn(
+                EntityState {
                     translation: types::glam::Vec3::new(p.x, p.y, p.z),
                     ..EntityState::default()
                 },
-                desc: EntityDesc::default(),
-            });
+                EntityDesc::default(),
+            );
         }
         // X:引爆(把立方体炸飞;ACV4 ③)。爆心吸附相机附近的**活实体**
         // (≤ BLAST_SNAP 取最近):"无法引爆"两个叠加根因(反馈 5)——
