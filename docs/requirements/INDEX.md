@@ -10,8 +10,9 @@
 | REQ-001 | ✅ 完成 | [#3](https://github.com/esp3j0/physics_minecraft/issues/3) | [REQ-001](REQ-001-architecture.md) | [codebase-layout](../design/codebase-layout.md) | [83bb15a](https://github.com/esp3j0/physics_minecraft/commit/83bb15a) 决议;[5cbe443](https://github.com/esp3j0/physics_minecraft/commit/5cbe443) AC1–AC8 |
 | REQ-002 | ✅ 完成 | [#4](https://github.com/esp3j0/physics_minecraft/issues/4) | [REQ-002](REQ-002-world-loading.md) | [req002-world](../tasks/req002-world) | [df813c7](https://github.com/esp3j0/physics_minecraft/commit/df813c7) 定稿;[7019ff9](https://github.com/esp3j0/physics_minecraft/commit/7019ff9) 落地 |
 | REQ-003 | ✅ 完成 | [#5](https://github.com/esp3j0/physics_minecraft/issues/5) | [REQ-003](REQ-003-network.md) | [req003-net](../tasks/req003-net) | [f03230c](https://github.com/esp3j0/physics_minecraft/commit/f03230c) 定稿;[ea581df](https://github.com/esp3j0/physics_minecraft/commit/ea581df) 落地 |
-| REQ-004A | 🚧 代码侧完成 / ACV4 待实跑 | [#6](https://github.com/esp3j0/physics_minecraft/issues/6) | [REQ-004A](REQ-004A-visual-viewer.md) | [req004a-viewer](../tasks/req004a-viewer) | [ee857cc](https://github.com/esp3j0/physics_minecraft/commit/ee857cc) 定稿;[3299ef6](https://github.com/esp3j0/physics_minecraft/commit/3299ef6) 实现 |
-| REQ-005 | ✅ 完成（终审通过，待关闭 #7） | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | [92fa4da](https://github.com/esp3j0/physics_minecraft/commit/92fa4da) 任务 04 验收;[c3c02df](https://github.com/esp3j0/physics_minecraft/commit/c3c02df) 任务 03;[7050979](https://github.com/esp3j0/physics_minecraft/commit/7050979) 任务 02 |
+| REQ-004A | ✅ 完成（ACV4 通过） | [#6](https://github.com/esp3j0/physics_minecraft/issues/6) | [REQ-004A](REQ-004A-visual-viewer.md) | [req004a-viewer](../tasks/req004a-viewer) | [3299ef6](https://github.com/esp3j0/physics_minecraft/commit/3299ef6) 实现;[e0918e2](https://github.com/esp3j0/physics_minecraft/commit/e0918e2)、[8dc911a](https://github.com/esp3j0/physics_minecraft/commit/8dc911a) ACV4 修复 |
+| REQ-005 | ✅ 完成 | [#7](https://github.com/esp3j0/physics_minecraft/issues/7) | [REQ-005](REQ-005-consistency.md) | [req005-consistency](../tasks/req005-consistency) | [92fa4da](https://github.com/esp3j0/physics_minecraft/commit/92fa4da) 任务 04 验收;[c3c02df](https://github.com/esp3j0/physics_minecraft/commit/c3c02df) 任务 03;[7050979](https://github.com/esp3j0/physics_minecraft/commit/7050979) 任务 02 |
+| REQ-006 | 📝 草案/设计待对齐 | [#10](https://github.com/esp3j0/physics_minecraft/issues/10) | 待写 | 待写 | 待审计 |
 
 ## 说明
 
@@ -22,9 +23,11 @@
 - **新提交**:commit message 末尾加 `Refs #<issue>`;PR 用 `Closes #<issue>`。
 - **完成**:REQ 文档状态改“已完成” → 关闭 issue(completed)→ 更新本表。
 
-## 设计讨论(未立项)
+## 设计讨论/草案
 
+- [#10 REQ-006 实体所有权与外部实体命令权威路由(草案)](https://github.com/esp3j0/physics_minecraft/issues/10)
+  —— 待 zcode read-only 审计 + 架构师写需求/任务书;未拍板前不实现。
 - [#9 未来客户端架构:服务器权威 / 复制 / 预测 / 客户端侧物理](https://github.com/esp3j0/physics_minecraft/issues/9)
   —— 讨论“客户端能否跑 sim 内核 / 只发碰撞事件 / 本地生成物体”;结论收敛后
-  再决定是否立 REQ-006。REQ-005 实现不受本讨论阻塞。
+  再决定是否立客户端 REQ。REQ-005/006 实现不受本讨论阻塞。
 
