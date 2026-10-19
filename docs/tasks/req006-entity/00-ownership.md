@@ -1,5 +1,7 @@
 # 任务 00:EntityOwnership 表与实体生命周期
 
+- 状态:**实现完成,门禁通过(2026-10-19)**;提交 `bd565ff`。
+
 ## 目标
 
 建立全局唯一的 `EntityId → (ShardId, source, actor)` 归属表，并在 spawn /
