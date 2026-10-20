@@ -135,6 +135,7 @@ async fn harness(config: Config, pump: PumpConfig, observe: (u64, u64), zero_g: 
             hub: hub.clone(),
             cadence,
         }),
+        spawn_next_seq: 0,
     }));
     Harness {
         tx,

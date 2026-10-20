@@ -276,6 +276,7 @@ async fn acg3_observer_walk_builds_playable_world() {
         provider,
         new_sim: new_sim_no_bridge(config.clone()),
         observe: None,
+        spawn_next_seq: 0,
     }));
 
     // 观察者进分片 (1,0) 新区(x=200 → chunk 12 → 分片 (1,0));y 取地面顶面
@@ -401,6 +402,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
 
     let shard = shard_id(1, 0);
@@ -874,7 +876,7 @@ async fn acg6_persisted_after_process_restart() {
 
     // —— 段 1:bootstrap(空目录)→ 驱动生命周期 → 完整退出(终末 flush +
     //    store.shutdown,redb 锁释放 = 进程重启的等价前置)——
-    let (session, log, store, resume_from) =
+    let (session, log, store, resume_from, _spawn_next_seq) =
         app::driver::bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "空目录全新会话");
     let (provider, new_sim) =
@@ -890,6 +892,7 @@ async fn acg6_persisted_after_process_restart() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
 
     let shard = shard_id(1, 0);

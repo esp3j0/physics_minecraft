@@ -14,7 +14,7 @@ fn main() {
         Config::load(config_path.as_deref().map(Path::new)).expect("配置加载失败(fail-stop)");
 
     // 装配:开库 → 查最新检查点 → replay 恢复或全新(registry 用 SimpleRegistry::builtin)。
-    let (session, log, store, resume_from) =
+    let (session, log, store, resume_from, spawn_next_seq) =
         bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("装配失败(fail-stop)");
 
     // 世界数据源 + 分片构造闭包(REQ-002 §4.3/§4.4):provider = worker 通道 +
@@ -55,6 +55,7 @@ fn main() {
             provider,
             new_sim,
             observe: Some(network.observe),
+            spawn_next_seq,
         }));
         handle.await.expect("驱动任务 panic(fail-stop)")
     });

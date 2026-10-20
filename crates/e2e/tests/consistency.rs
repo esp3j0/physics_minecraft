@@ -1205,6 +1205,7 @@ async fn acc6_network_observer_replay() {
             hub: hub.clone(),
             cadence,
         }),
+        spawn_next_seq: 0,
     }));
 
     // A 进区 (8,·,8),B 进区 (200,·,8);A 中途断开。
@@ -1741,6 +1742,7 @@ async fn acc8_workspace_regression_and_viewer_smoke() {
             hub: hub.clone(),
             cadence,
         }),
+        spawn_next_seq: 0,
     }));
 
     let (events, _control) = ViewerClient::spawn(addr, 2).expect("spawn 连真服务器");
@@ -1930,6 +1932,7 @@ fn acc9_no_duplicate_loads_or_fanout() {
         format_version: app::driver::CHECKPOINT_FORMAT_VERSION,
         world: session.world_snapshot(),
         log_bytes: CommandLog::new().to_bytes(),
+        spawn_next_seq: 0,
     };
     let bytes_a =
         bincode::serde::encode_to_vec(&bundle, bincode::config::standard()).expect("编码");
@@ -2003,6 +2006,7 @@ async fn pending_blockwrite_cells_defer_window() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
 
     // ① 观察者贴边界 (120,-58,8):(0,0) 本体 + (1,0) 邻片(8m < 32m)双 ensure,

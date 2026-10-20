@@ -328,6 +328,10 @@ pub struct DriverArgs {
     /// 端 + 出站注册表下行缝 + 观察节奏。`None` = 无网络(观察输出编排整体
     /// 关闭,既有行为不变;main 装配在任务 04 接线前恒 None)。
     pub observe: Option<ObserveLink>,
+    /// 服务端外部 spawn 高水位初值(#12):bootstrap 从 checkpoint 恢复产出;
+    /// ObserveOrchestrator 构造后注入(resume,取 max 防回退)。重启后新 ID
+    /// 严格大于重启前分配过的所有 ID(含已 despawn)。
+    pub spawn_next_seq: u32,
 }
 
 /// 观察输出缝(REQ-003 §4.4;任务书 03 装配件):网络层 `serve` 的 up 接收端
@@ -404,7 +408,9 @@ pub struct DriverOutcome {
 /// `AppError::Decode`(明确、不静默降级)。
 /// **v2**:REQ-006 的 `Outbox.spawned/despawned`、`EntityRecord.source`、
 /// `MigrateEntity.actor/source` 改变分片快照布局;v1 档必须清 `data_dir`。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 2;
+/// **v3**(#12):bundle 追加尾字段 `spawn_next_seq`——bincode 非自描述,
+/// v2 档解码必 UnexpectedEnd/版本拒绝;同样必须清 `data_dir`。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -413,6 +419,11 @@ pub struct CheckpointBundle {
     pub format_version: u32,
     pub world: sim_api::snapshot::WorldSnapshot,
     pub log_bytes: Vec<u8>,
+    /// 服务端外部 spawn 的下一个可用序号(#12 高水位;**含已 despawn 的**,
+    /// 重启后新 ID 严格大于重启前分配过的所有 ID)。语义是"下一次分配从
+    /// 这里开始",不是"最后用过的序号"。恢复时与增量日志中 server
+    /// namespace 已分配序号取 max(覆盖 checkpoint 后、崩溃前的窗口)。
+    pub spawn_next_seq: u32,
 }
 
 /// 驱动层可预期失败(类型化;蓝图 §4)。
@@ -467,13 +478,20 @@ fn write_checkpoint(
     log: &mut sim_api::log::CommandLog,
     store: &storage::worker::StoreWorker,
     checkpoints_written: &mut Vec<types::Tick>,
+    orchestrator_spawn_next_seq: u32,
 ) {
+    // spawn 高水位(#12):取 max(分配器当前值, 本日志窗口内 server spawn 扫描)
+    // ——commands 通道的 SpawnDynamic(受信服务端路径)不经分配器,但其
+    // ID 也在 server namespace,必须计入;链式 checkpoint 下每张 bundle 的
+    // 高水位都 ≥ 此前所有分配/使用过的序号。必须在 `log.take()` 之前算。
+    let spawn_next_seq = orchestrator_spawn_next_seq.max(log_server_next_seq(log));
     let world = session.world_snapshot();
     let taken = log.take();
     let bundle = CheckpointBundle {
         format_version: CHECKPOINT_FORMAT_VERSION,
         world,
         log_bytes: encode_log(taken),
+        spawn_next_seq,
     };
     let tick = bundle.world.shards.tick;
     store.append_checkpoint(tick, encode(&bundle));
@@ -627,6 +645,17 @@ impl ObserveOrchestrator {
                 return entity;
             }
         }
+    }
+
+    /// 当前 spawn 高水位(#12;checkpoint 写路径用)。
+    fn spawn_next_seq(&self) -> u32 {
+        self.next_spawn_seq
+    }
+
+    /// 从 checkpoint 恢复 spawn 高水位(#12):取 max 防回退,恢复值不得
+    /// 低于构造初值(0);重启后新 ID 严格大于重启前分配过的所有 ID。
+    fn resume_spawn_seq(&mut self, seq: u32) {
+        self.next_spawn_seq = self.next_spawn_seq.max(seq);
     }
 
     /// 网络上行事件消费(任务书 03 编排 ①②;REQ-005 D9 观察者命令入日志)。
@@ -1105,6 +1134,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         provider,
         mut new_sim,
         observe,
+        spawn_next_seq,
     } = args;
     // 会话 source(commands 通道本地权威命令的日志 source;网络路径用玩家,
     // REQ-005 D9)。
@@ -1138,12 +1168,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 观察输出编排(REQ-003 §4.4;任务书 03):observe 缝在场才建(tick 末端
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
-        (
-            ObserveOrchestrator::new(link.cadence),
-            link.up,
-            link.hub,
-            link.cadence,
-        )
+        let mut orchestrator = ObserveOrchestrator::new(link.cadence);
+        // spawn 高水位注入(#12):bootstrap 恢复值(取 max 防回退)。
+        orchestrator.resume_spawn_seq(spawn_next_seq);
+        (orchestrator, link.up, link.hub, link.cadence)
     });
 
     // ctrl_c 关机源(仅当 listen_ctrl_c;测试关掉,否则暂停时间测试被信号干扰)。
@@ -1233,7 +1261,18 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
 
                 // checkpoint 节奏:整间隔倍数拍到期(fire-and-forget,决策 5)。
                 if ticks_run.is_multiple_of(config.checkpoint_interval_ticks) {
-                    write_checkpoint(&session, &mut log, &store, &mut checkpoints_written);
+                    // spawn 高水位(#12):observe 缝不在场(无网络)恒 0。
+                    let spawn_next_seq = observe_state
+                        .as_ref()
+                        .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
+                        .unwrap_or(0);
+                    write_checkpoint(
+                        &session,
+                        &mut log,
+                        &store,
+                        &mut checkpoints_written,
+                        spawn_next_seq,
+                    );
                     ticks_at_last_checkpoint = ticks_run;
                 }
             }
@@ -1294,7 +1333,17 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     drop(pending_streams);
     // 有未落检查点的增量(日志非空或自上次 checkpoint 后有 tick)→ 终末 checkpoint。
     if !log.is_empty() || ticks_run > ticks_at_last_checkpoint {
-        write_checkpoint(&session, &mut log, &store, &mut checkpoints_written);
+        let spawn_next_seq = observe_state
+            .as_ref()
+            .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
+            .unwrap_or(0);
+        write_checkpoint(
+            &session,
+            &mut log,
+            &store,
+            &mut checkpoints_written,
+            spawn_next_seq,
+        );
     }
     // flush 只在关停:屏障 = 此前全部操作(期中 + 终末)已落库。
     let ack = store.flush();
@@ -1327,6 +1376,20 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
 ///
 /// chunks 库 = `data_dir/chunks.redb`、checkpoints 库 = `data_dir/checkpoints.redb`
 /// (目录不存在则创建);chunks 库为将来世界加载预留(本轮只开不用)。
+/// 增量日志中 server namespace(origin 0)已分配的最大序号 + 1(无 → 0)。
+/// 恢复高水位 = max(bundle.spawn_next_seq, 此值):bundle 覆盖 checkpoint 前,
+/// 日志覆盖 checkpoint 后、崩溃前的窗口(#12)。
+fn log_server_next_seq(log: &sim_api::log::CommandLog) -> u32 {
+    log.entries()
+        .iter()
+        .fold(0u32, |acc, entry| match entry.command {
+            messaging::SimCommand::SpawnDynamic { entity, .. } if entity.origin_shard() == 0 => {
+                acc.max(entity.local_seq().saturating_add(1))
+            }
+            _ => acc,
+        })
+}
+
 pub fn bootstrap(
     config: &Config,
     new_registry: impl Fn() -> Box<dyn voxel::BlockRegistry>,
@@ -1336,6 +1399,7 @@ pub fn bootstrap(
         sim_api::log::CommandLog,
         storage::worker::StoreWorker,
         Option<types::Tick>,
+        u32,
     ),
     AppError,
 > {
@@ -1350,7 +1414,7 @@ pub fn bootstrap(
 
     // read_latest 必须在移交 worker 之前(决策 6:移交后文件锁在手)。
     let latest = checkpoints.read_latest()?;
-    let (session, log, resume_from) = match latest {
+    let (session, log, resume_from, spawn_next_seq) = match latest {
         Some((at, blob)) => {
             // 有检查点:解码 bundle(replay_world 恢复 Session + scheduler
             // 状态 + log 续跑,拍号对齐)。旧格式/未知版本 → Err(AppError::
@@ -1371,17 +1435,22 @@ pub fn bootstrap(
                 config.session_config(),
                 new_registry,
             )?;
-            (session, log, Some(at))
+            // spawn 高水位(#12):bundle 字段与增量日志取 max——日志里的
+            // server spawn 发生在 checkpoint 之后(崩溃前窗口),其序号
+            // 可能已越过 bundle 值。
+            let spawn_next_seq = bundle.spawn_next_seq.max(log_server_next_seq(&log));
+            (session, log, Some(at), spawn_next_seq)
         }
         None => (
             sim_api::session::Session::new(config.session_config()),
             sim_api::log::CommandLog::new(),
             None,
+            0,
         ),
     };
 
     let store = storage::worker::StoreWorker::new(Box::new(chunks), Box::new(checkpoints));
-    Ok((session, log, store, resume_from))
+    Ok((session, log, store, resume_from, spawn_next_seq))
 }
 
 /// bootstrap 之外的第二步装配(REQ-002 §4.3/§4.4):按 world_kind 造生成器,
@@ -1697,6 +1766,7 @@ mod tests {
             provider,
             new_sim,
             observe: None,
+            spawn_next_seq: 0,
         };
         (args, tx, checkpoints)
     }
@@ -2122,6 +2192,7 @@ mod tests {
                 scheduler: empty_scheduler_snapshot(types::Tick(7)),
             },
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
+            spawn_next_seq: 0,
         };
         let decoded = decode(&encode(&bundle)).expect("自有编码必可解码");
         assert_eq!(
@@ -2129,6 +2200,7 @@ mod tests {
             "快照往返逐字段相等"
         );
         assert_eq!(decoded.log_bytes, bundle.log_bytes);
+        assert_eq!(decoded.spawn_next_seq, 0, "spawn 高水位随 bundle 往返");
 
         // 空快照(0 分片)+ 空日志:同样合法。
         let empty = CheckpointBundle {
@@ -2138,6 +2210,7 @@ mod tests {
                 scheduler: empty_scheduler_snapshot(types::Tick(0)),
             },
             log_bytes: Vec::new(),
+            spawn_next_seq: 0,
         };
         let decoded = decode(&encode(&empty)).expect("空 bundle 必可解码");
         assert!(decoded.world.shards.per_shard.is_empty(), "0 分片快照合法");
@@ -2161,6 +2234,7 @@ mod tests {
             format_version: 99,
             world: mk_world(types::Tick(7)),
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
+            spawn_next_seq: 0,
         };
         let bytes = encode(&future);
         match decode(&bytes) {
@@ -2181,6 +2255,7 @@ mod tests {
             format_version: 0,
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
+            spawn_next_seq: 0,
         };
         assert!(decode(&encode(&zero)).is_err(), "版本 0 = 旧格式,拒绝");
 
@@ -2189,6 +2264,7 @@ mod tests {
             format_version: 1,
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
+            spawn_next_seq: 0,
         };
         match decode(&encode(&v1)) {
             Err(AppError::Decode(msg)) => {
@@ -2226,6 +2302,114 @@ mod tests {
                 other.is_err()
             ),
         }
+
+        // ③ v2(REQ-006 任务 03 的格式;#12 加 spawn_next_seq 尾字段升 v3)
+        //    → 版本拒绝,同样要求清 data_dir。
+        let v2 = CheckpointBundle {
+            format_version: 2,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        match decode(&encode(&v2)) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 2"),
+                    "v2 必须明确报版本错误:{msg}"
+                );
+            }
+            other => panic!("v2 旧档必须版本拒绝,实为 {:?}", other.is_err()),
+        }
+    }
+
+    // ---- #12:服务端 spawn ID 高水位持久化 ----
+
+    /// 日志扫描:server namespace(origin 0)已分配最大序号 + 1;其它 origin
+    /// 的 spawn 不计入(server 命名空间外的 ID 不占高水位)。
+    #[test]
+    fn log_server_next_seq_scans_max() {
+        let log_of = |cmds: Vec<(u32, u32)>| {
+            let mut log = sim_api::log::CommandLog::new();
+            for (origin, seq) in cmds {
+                log.append(sim_api::log::LogEntry {
+                    tick: types::Tick(0),
+                    dest: shard_id(0, 0),
+                    source: messaging::InputSource::SCHEDULER,
+                    sequence: 0,
+                    command: messaging::SimCommand::SpawnDynamic {
+                        entity: types::EntityId::from_parts(origin, seq),
+                        state: types::EntityState::default(),
+                        desc: types::EntityDesc::default(),
+                    },
+                });
+            }
+            log
+        };
+        assert_eq!(
+            log_server_next_seq(&sim_api::log::CommandLog::new()),
+            0,
+            "空日志 → 0"
+        );
+        assert_eq!(log_server_next_seq(&log_of(vec![(0, 5)])), 6, "(0,5) → 6");
+        assert_eq!(
+            log_server_next_seq(&log_of(vec![(1, 9)])),
+            0,
+            "非 server origin 不计入"
+        );
+        assert_eq!(
+            log_server_next_seq(&log_of(vec![(0, 2), (0, 7), (3, 99)])),
+            8,
+            "取最大值"
+        );
+    }
+
+    /// 写路径:checkpoint 落盘的高水位 = max(分配器入参, 日志窗口扫描)。
+    /// commands 通道的 SpawnDynamic 不经分配器,由日志扫描兜住。
+    #[test]
+    fn write_checkpoint_persists_spawn_high_water() {
+        let checkpoints = SharedCheckpoints::default();
+        let store = storage::worker::StoreWorker::new(
+            Box::new(MemChunkStore::new()),
+            Box::new(checkpoints.clone()),
+        );
+        let mut session = sim_api::session::Session::new(Config::default().session_config());
+        session.register({
+            let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            physics_sim::ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+        });
+        let mut log = sim_api::log::CommandLog::new();
+        log.append(sim_api::log::LogEntry {
+            tick: types::Tick(0),
+            dest: shard_id(0, 0),
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            command: messaging::SimCommand::SpawnDynamic {
+                entity: types::EntityId::from_parts(0, 4),
+                state: types::EntityState::default(),
+                desc: types::EntityDesc::default(),
+            },
+        });
+        let mut written = Vec::new();
+        write_checkpoint(&session, &mut log, &store, &mut written, 3);
+        store.shutdown().expect("关停");
+        let bundle = latest_bundle(&checkpoints);
+        assert_eq!(
+            bundle.spawn_next_seq, 5,
+            "max(分配器 3, 日志 (0,4)+1=5) = 5——commands 通道 spawn 由日志兜住"
+        );
+    }
+
+    /// resume 语义:恢复值取 max 防回退,后续分配严格大于重启前所有已用序号。
+    #[test]
+    fn resume_spawn_seq_takes_max() {
+        let cadence = ObserveCadence::default();
+        let mut o = ObserveOrchestrator::new(cadence);
+        assert_eq!(o.spawn_next_seq(), 0);
+        o.resume_spawn_seq(7);
+        assert_eq!(o.spawn_next_seq(), 7, "注入恢复值");
+        o.resume_spawn_seq(3);
+        assert_eq!(o.spawn_next_seq(), 7, "回退注入不生效(取 max)");
     }
 
     // ---- 任务 04:驱动接线(测试清单)----
@@ -2391,6 +2575,7 @@ mod tests {
             provider,
             new_sim,
             observe: None,
+            spawn_next_seq: 0,
         }));
 
         // 进区(分片 (1,0))→ 等装载 → 瞬移远走(分片 (50,0),超卸载半径)。
@@ -2470,6 +2655,7 @@ mod tests {
             provider,
             new_sim,
             observe: None,
+            spawn_next_seq: 0,
         }));
 
         advance_ticks(3).await;
@@ -2864,6 +3050,7 @@ mod tests {
             provider,
             new_sim,
             observe: None,
+            spawn_next_seq: 0,
         }));
 
         // 编辑 chunk (8,0)(owner = 片 (1,0);两片各持一份 → 广播两片)。
@@ -3107,6 +3294,7 @@ mod tests {
                 hub: hub.clone(),
                 cadence,
             }),
+            spawn_next_seq: 0,
         };
         (args, tx, hub, addr)
     }

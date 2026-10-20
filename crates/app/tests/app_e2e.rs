@@ -121,6 +121,7 @@ async fn drive(
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -157,7 +158,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     let config = disk_config(dir.path(), 5);
 
     // —— 段 1:全新目录,resume_from 为 None,跑 7 拍 ——
-    let (session, log, store, resume_from) =
+    let (session, log, store, resume_from, _spawn_next_seq) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "空目录:无检查点,全新会话");
     let outcome1 = drive(config.clone(), session, log, store, 7).await;
@@ -169,7 +170,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     );
 
     // —— 段 2:同目录续跑,起始拍对齐段 1 终末快照;再跑 3 拍 ——
-    let (session2, log2, store2, resume_from2) =
+    let (session2, log2, store2, resume_from2, _spawn_next_seq2) =
         bootstrap(&config, new_registry()).expect("续跑装配");
     assert_eq!(resume_from2, Some(Tick(7)), "续跑起始拍 == 段 1 终末 7");
     let outcome2 = drive(config.clone(), session2, log2, store2, 3).await;
@@ -181,7 +182,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     );
 
     // —— 段 3:再续跑,起始拍 == 10(链式续跑)——
-    let (session3, _log3, store3, resume_from3) =
+    let (session3, _log3, store3, resume_from3, _spawn_next_seq3) =
         bootstrap(&config, new_registry()).expect("二次续跑装配");
     assert_eq!(resume_from3, Some(Tick(10)), "链式续跑:起始拍 == 10");
     assert_eq!(session3.tick_now(), Tick(10), "会话拍号与续跑起点一致");
@@ -200,7 +201,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
     let entity = EntityId::from_parts(1, 1);
 
     // —— 段 1:带地形分片 + SpawnDynamic,跑 7 拍关停 ——
-    let (mut session, log, store, resume_from) = bootstrap(&config, new_registry()).expect("装配");
+    let (mut session, log, store, resume_from, _spawn_next_seq) =
+        bootstrap(&config, new_registry()).expect("装配");
     assert_eq!(resume_from, None);
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
@@ -216,6 +218,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -230,7 +233,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
     assert_eq!(outcome1.checkpoints_written, vec![Tick(5), Tick(7)]);
 
     // —— 续跑:恢复的分片与实体在快照里可见 ——
-    let (session2, log2, store2, resume_from2) =
+    let (session2, log2, store2, resume_from2, _spawn_next_seq2) =
         bootstrap(&config, new_registry()).expect("续跑装配");
     assert_eq!(resume_from2, Some(Tick(7)));
     assert_eq!(session2.shard_ids(), vec![shard], "分片经快照恢复注册");
@@ -253,6 +256,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -326,7 +330,7 @@ fn fresh_bootstrap_without_store_starts_at_zero() {
     let dir = tempfile::tempdir().expect("创建临时目录");
     let config = disk_config(dir.path(), 5);
 
-    let (session, log, store, resume_from) =
+    let (session, log, store, resume_from, _spawn_next_seq) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "全新目录:无检查点可续");
     assert_eq!(session.tick_now(), Tick::ZERO, "拍号从 0 起");
@@ -370,6 +374,7 @@ async fn telemetry_wired_into_driver_outcome() {
         provider,
         new_sim,
         observe: None,
+        spawn_next_seq: 0,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -393,4 +398,59 @@ async fn telemetry_wired_into_driver_outcome() {
         outcome.alert_active_at_exit,
         "阈值 0.001ms × 满窗:退出时告警必激活(驱动在喂 telemetry)"
     );
+}
+
+/// #12:服务端 spawn ID 高水位跨重启持久化(真 redb)。
+/// 段 1:commands 通道两个 server spawn((0,1)/(0,2),SCHEDULER source)→
+/// 终末 checkpoint 的高水位 = 日志扫描 3;段 2:同目录 bootstrap 恢复,
+/// 返回的 spawn_next_seq == 3——重启后新分配从 3 起,严格大于重启前
+/// 已分配的所有序号(含已 despawn:扫描看日志不看实体表)。
+#[tokio::test(start_paused = true)]
+async fn spawn_high_water_survives_restart() {
+    let dir = tempfile::tempdir().expect("创建临时目录");
+    let config = disk_config(dir.path(), 600); // 期中不触发,只验终末
+
+    // —— 段 1:装配(带地形分片)→ 两个 server spawn → 关停(终末 checkpoint)——
+    let (session, log, store, resume_from, _seq0) =
+        bootstrap(&config, new_registry()).expect("装配空目录");
+    assert_eq!((resume_from, _seq0), (None, 0), "空目录:无高水位");
+    let mut session = session;
+    session.register(ground_sim());
+    let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+    let driver = tokio::spawn(app::driver::run(app::driver::DriverArgs {
+        config: config.clone(),
+        session,
+        store,
+        log,
+        commands: rx,
+        listen_ctrl_c: false,
+        provider,
+        new_sim,
+        observe: None,
+        spawn_next_seq: 0,
+    }));
+    for entity in [EntityId::from_parts(0, 1), EntityId::from_parts(0, 2)] {
+        tx.send(DriverCommand::Send {
+            shard: shard_id(0, 0),
+            command: spawn_cmd(entity),
+        })
+        .await
+        .expect("驱动仍存活");
+    }
+    advance_ticks(3).await;
+    tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+    let outcome1 = driver.await.expect("驱动不 panic");
+    assert_eq!(outcome1.checkpoints_written.len(), 1, "仅终末 checkpoint");
+
+    // —— 段 2:同目录恢复,高水位 = 3(日志 (0,2)+1)——
+    let (_session2, _log2, store2, resume_from2, spawn_next_seq2) =
+        bootstrap(&config, new_registry()).expect("续跑装配");
+    assert_eq!(resume_from2, outcome1.checkpoints_written.first().copied());
+    assert_eq!(
+        spawn_next_seq2, 3,
+        "高水位恢复:重启后首个分配 ID = (0,3),大于重启前所有已用序号"
+    );
+    store2.shutdown().expect("正常关停");
 }
