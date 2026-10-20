@@ -1,7 +1,7 @@
 # REQ-006:实体所有权与外部实体命令权威路由
 
 - 状态:**已完成**(2026-10-20 独立评审 APPROVE;B1 修复、验收 7 条、全仓门禁绿;
-  follow-up #12:spawn ID 高水位持久化,不阻塞本 REQ;viewer B/X 已实跑通过)
+  follow-up #12:spawn ID 高水位持久化已完成;viewer B/X 已实跑通过)
 - 上游:
   - [REQ-001](REQ-001-architecture.md) §4.1(实体唯一归属)、§9.7(EntityId)、
     §9.13(跨片实体接触限制)

@@ -2,7 +2,7 @@
 
 - 状态:**完成(2026-10-20;独立评审 APPROVE;B1 已修;7 条验收 + 全仓门禁)**。
 - 非阻塞 follow-up:[#12](https://github.com/esp3j0/physics_minecraft/issues/12)
-  (spawn ID 高水位持久化);viewer B/X 冒烟已由用户实跑通过(#11 关闭)。
+  (spawn ID 高水位持久化)已完成;viewer B/X 冒烟已由用户实跑通过(#11 关闭)。
 
 ## 目标
 

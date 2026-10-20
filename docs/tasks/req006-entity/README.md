@@ -1,13 +1,13 @@
 # REQ-006 实现任务书(总览)
 
-- 状态:**已确认(2026-10-19 用户确认 D1–D5 全 A);任务 00 实现中**。需求 [REQ-006](../../requirements/REQ-006-entity-authority.md)
+- 状态:**已完成(2026-10-20;任务 00–04 + follow-up #12 全部完成)**。需求 [REQ-006](../../requirements/REQ-006-entity-authority.md)
   与 [决策清单](../../requirements/REQ-006-decisions.md) 已拍板。
 - 上游:REQ-001/002/003/005;issue [#10](https://github.com/esp3j0/physics_minecraft/issues/10)。
 - 实现顺序:00 → 01 → 02 → 03 → 04,串行;每任务独立门禁。
 
 ## 任务表
 
-进度:**00 ✅ 完成;01 ✅ 完成;02 ✅ 完成;03 ✅ 完成;04 ✅ 完成(评审 APPROVE);非阻塞 follow-up #12**。
+进度:**00 ✅ 完成;01 ✅ 完成;02 ✅ 完成;03 ✅ 完成;04 ✅ 完成(评审 APPROVE);follow-up #12 ✅ 完成**。
 
 | # | 任务书 | 内容 | 门禁包 |
 | --- | --- | --- | --- |
