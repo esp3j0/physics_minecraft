@@ -1,8 +1,8 @@
 # 任务 04:AC-E1~E8 验收与独立评审
 
 - 状态:**完成(2026-10-20;独立评审 APPROVE;B1 已修;7 条验收 + 全仓门禁)**。
-- 非阻塞 follow-up:[#11](https://github.com/esp3j0/physics_minecraft/issues/11)
-  (spawn ID 高水位持久化、viewer B/X 冒烟、两条 Low)。
+- 非阻塞 follow-up:[#12](https://github.com/esp3j0/physics_minecraft/issues/12)
+  (spawn ID 高水位持久化);viewer B/X 冒烟已由用户实跑通过(#11 关闭)。
 
 ## 目标
 
