@@ -2494,6 +2494,17 @@ mod tests {
         );
         let session = sim_api::session::Session::new(Config::default().session_config());
         let mut written = Vec::new();
+        // write_checkpoint 是 fire-and-forget:读共享存储前必须 flush 屏障
+        // (复审指出:无屏障时 latest_bundle 与 worker 写入竞速,串行下
+        // 稳定红;每张 checkpoint 后都屏障,不在中途 shutdown——后续还要写)。
+        macro_rules! flush_barrier {
+            ($store:expr) => {{
+                let ack = $store.flush();
+                ack.recv()
+                    .expect("storage-writer 在 flush 前死亡(fail-stop)")
+                    .expect("flush 成功");
+            }};
+        }
         let high1 = write_checkpoint(
             &session,
             &mut mk_log_with(Some(100)),
@@ -2503,6 +2514,7 @@ mod tests {
             0,
         );
         assert_eq!(high1, 101, "第一张:max(0,0,101) = 101");
+        flush_barrier!(store);
         assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
 
         // 第二张:日志已被 take 清空,无新 spawn → 仍 101(不回退)。
@@ -2512,12 +2524,14 @@ mod tests {
             high2, 101,
             "第二张空窗口:max(101,0,0) = 101(评审 B1 失败序列)"
         );
+        flush_barrier!(store);
         assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
 
         // 第三张:再空 → 仍 101。
         let mut log_empty2 = mk_log_with(None);
         let high3 = write_checkpoint(&session, &mut log_empty2, &store, &mut written, high2, 0);
         assert_eq!(high3, 101);
+        flush_barrier!(store);
         assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
         store.shutdown().expect("关停");
         session.shutdown();
