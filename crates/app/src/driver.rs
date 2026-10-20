@@ -566,14 +566,17 @@ struct SpawnRequest {
 }
 
 impl ObserveOrchestrator {
-    fn new(cadence: ObserveCadence) -> Self {
+    /// `spawn_next_seq` = 服务端 spawn 高水位初值(#12:bootstrap 从
+    /// checkpoint 恢复产出;全新会话传 0)。分配从这里开始,保证重启后
+    /// 新 ID 严格大于重启前分配过的所有序号(含已 despawn)。
+    fn new(cadence: ObserveCadence, spawn_next_seq: u32) -> Self {
         Self {
             players: BTreeMap::new(),
             ticks_since_interval: 0,
             ticks_since_full: 0,
             pending_welcome: BTreeMap::new(),
             pending_blocks: BTreeMap::new(),
-            next_spawn_seq: 0,
+            next_spawn_seq: spawn_next_seq,
             _cadence: cadence,
         }
     }
@@ -650,12 +653,6 @@ impl ObserveOrchestrator {
     /// 当前 spawn 高水位(#12;checkpoint 写路径用)。
     fn spawn_next_seq(&self) -> u32 {
         self.next_spawn_seq
-    }
-
-    /// 从 checkpoint 恢复 spawn 高水位(#12):取 max 防回退,恢复值不得
-    /// 低于构造初值(0);重启后新 ID 严格大于重启前分配过的所有 ID。
-    fn resume_spawn_seq(&mut self, seq: u32) {
-        self.next_spawn_seq = self.next_spawn_seq.max(seq);
     }
 
     /// 网络上行事件消费(任务书 03 编排 ①②;REQ-005 D9 观察者命令入日志)。
@@ -1168,10 +1165,12 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 观察输出编排(REQ-003 §4.4;任务书 03):observe 缝在场才建(tick 末端
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
-        let mut orchestrator = ObserveOrchestrator::new(link.cadence);
-        // spawn 高水位注入(#12):bootstrap 恢复值(取 max 防回退)。
-        orchestrator.resume_spawn_seq(spawn_next_seq);
-        (orchestrator, link.up, link.hub, link.cadence)
+        (
+            ObserveOrchestrator::new(link.cadence, spawn_next_seq),
+            link.up,
+            link.hub,
+            link.cadence,
+        )
     });
 
     // ctrl_c 关机源(仅当 listen_ctrl_c;测试关掉,否则暂停时间测试被信号干扰)。
@@ -1376,9 +1375,11 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
 ///
 /// chunks 库 = `data_dir/chunks.redb`、checkpoints 库 = `data_dir/checkpoints.redb`
 /// (目录不存在则创建);chunks 库为将来世界加载预留(本轮只开不用)。
+///
+/// 恢复的 spawn 高水位(#12)随装配返回(5 元组末项)。
+///
 /// 增量日志中 server namespace(origin 0)已分配的最大序号 + 1(无 → 0)。
-/// 恢复高水位 = max(bundle.spawn_next_seq, 此值):bundle 覆盖 checkpoint 前,
-/// 日志覆盖 checkpoint 后、崩溃前的窗口(#12)。
+/// 恢复高水位输入之一:日志覆盖 checkpoint 后、崩溃前的窗口(#12)。
 fn log_server_next_seq(log: &sim_api::log::CommandLog) -> u32 {
     log.entries()
         .iter()
@@ -1387,6 +1388,23 @@ fn log_server_next_seq(log: &sim_api::log::CommandLog) -> u32 {
                 acc.max(entity.local_seq().saturating_add(1))
             }
             _ => acc,
+        })
+}
+
+/// 实体表中 server namespace(origin 0)现存实体的最大序号 + 1(无 → 0)。
+/// 防御式 restore(#12 约束 7):旧档/异常档的高水位落后于实体表时取
+/// 较大值,避免恢复后 allocate 撞现存 ID——正常路径不依赖运行时跳过。
+fn entities_server_next_seq(session: &sim_api::session::Session) -> u32 {
+    session
+        .shard_ids()
+        .into_iter()
+        .flat_map(|shard| session.entities_of(shard))
+        .fold(0u32, |acc, entity| {
+            if entity.origin_shard() == 0 {
+                acc.max(entity.local_seq().saturating_add(1))
+            } else {
+                acc
+            }
         })
 }
 
@@ -1435,10 +1453,13 @@ pub fn bootstrap(
                 config.session_config(),
                 new_registry,
             )?;
-            // spawn 高水位(#12):bundle 字段与增量日志取 max——日志里的
-            // server spawn 发生在 checkpoint 之后(崩溃前窗口),其序号
-            // 可能已越过 bundle 值。
-            let spawn_next_seq = bundle.spawn_next_seq.max(log_server_next_seq(&log));
+            // spawn 高水位(#12):三输入取 max——bundle 字段(checkpoint
+            // 前)、增量日志(checkpoint 后、崩溃前的窗口)、恢复后实体表
+            // (防御:旧档/异常档高水位落后于现存 server 实体)。
+            let spawn_next_seq = bundle
+                .spawn_next_seq
+                .max(log_server_next_seq(&log))
+                .max(entities_server_next_seq(&session));
             (session, log, Some(at), spawn_next_seq)
         }
         None => (
@@ -2192,7 +2213,7 @@ mod tests {
                 scheduler: empty_scheduler_snapshot(types::Tick(7)),
             },
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
-            spawn_next_seq: 0,
+            spawn_next_seq: 42,
         };
         let decoded = decode(&encode(&bundle)).expect("自有编码必可解码");
         assert_eq!(
@@ -2200,7 +2221,10 @@ mod tests {
             "快照往返逐字段相等"
         );
         assert_eq!(decoded.log_bytes, bundle.log_bytes);
-        assert_eq!(decoded.spawn_next_seq, 0, "spawn 高水位随 bundle 往返");
+        assert_eq!(
+            decoded.spawn_next_seq, 42,
+            "spawn 高水位随 bundle 原样往返(非 0 值)"
+        );
 
         // 空快照(0 分片)+ 空日志:同样合法。
         let empty = CheckpointBundle {
@@ -2320,6 +2344,28 @@ mod tests {
             }
             other => panic!("v2 旧档必须版本拒绝,实为 {:?}", other.is_err()),
         }
+
+        // ④ v2 时代的三字段字节(无 spawn_next_seq):bincode 非自描述,
+        //    新解码必 UnexpectedEnd——Decode 错误,不静默按 0 处理。
+        #[derive(serde::Serialize)]
+        struct V2Bundle {
+            format_version: u32,
+            world: sim_api::snapshot::WorldSnapshot,
+            log_bytes: Vec<u8>,
+        }
+        let v2_bytes = bincode::serde::encode_to_vec(
+            V2Bundle {
+                format_version: 2,
+                world: mk_world(types::Tick(7)),
+                log_bytes: Vec::new(),
+            },
+            bincode::config::standard(),
+        )
+        .expect("v2 三字段编码(测试构造)");
+        match decode(&v2_bytes) {
+            Err(AppError::Decode(_)) => {}
+            other => panic!("v2 三字段字节必须 Err(Decode),实为 {:?}", other.is_err()),
+        }
     }
 
     // ---- #12:服务端 spawn ID 高水位持久化 ----
@@ -2400,16 +2446,71 @@ mod tests {
         );
     }
 
-    /// resume 语义:恢复值取 max 防回退,后续分配严格大于重启前所有已用序号。
+    /// #12 `restored_high_water_continues`:构造时注入恢复高水位 →
+    /// 首个分配 = (0, saved),再分配单调递增(不依赖"跳过已存在"防御)。
     #[test]
-    fn resume_spawn_seq_takes_max() {
-        let cadence = ObserveCadence::default();
-        let mut o = ObserveOrchestrator::new(cadence);
-        assert_eq!(o.spawn_next_seq(), 0);
-        o.resume_spawn_seq(7);
-        assert_eq!(o.spawn_next_seq(), 7, "注入恢复值");
-        o.resume_spawn_seq(3);
-        assert_eq!(o.spawn_next_seq(), 7, "回退注入不生效(取 max)");
+    fn restored_high_water_continues() {
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 7);
+        assert_eq!(o.spawn_next_seq(), 7, "构造注入恢复值");
+        let session = sim_api::session::Session::new(Config::default().session_config());
+        let a = o.allocate_spawn_id(&session);
+        let b = o.allocate_spawn_id(&session);
+        assert_eq!(
+            (a.origin_shard(), a.local_seq()),
+            (0, 7),
+            "恢复后首个分配从高水位起"
+        );
+        assert_eq!(
+            (b.origin_shard(), b.local_seq()),
+            (0, 8),
+            "后续分配单调递增"
+        );
+        session.shutdown();
+    }
+
+    /// #12 防御输入:实体表扫描——server namespace 现存实体最大序号 + 1;
+    /// 非 server origin 不计入。落后档的高水位由此抬高,allocate 不撞现存 ID。
+    #[test]
+    fn entities_server_next_seq_scans_live_entities() {
+        let mut session = sim_api::session::Session::new(Config::default().session_config());
+        assert_eq!(entities_server_next_seq(&session), 0, "空会话 → 0");
+        session.register({
+            let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            physics_sim::ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
+        });
+        for (origin, seq) in [(0u32, 3u32), (0, 9), (1, 99)] {
+            session
+                .send_from(
+                    messaging::InputSource::SCHEDULER,
+                    shard_id(0, 0),
+                    messaging::SimCommand::SpawnDynamic {
+                        entity: types::EntityId::from_parts(origin, seq),
+                        state: types::EntityState {
+                            translation: Vec3::new(8.5, 10.0, 8.5),
+                            ..types::EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    },
+                )
+                .expect("入箱");
+        }
+        session.tick();
+        assert_eq!(
+            entities_server_next_seq(&session),
+            10,
+            "server 现存最大 (0,9) → 10;origin 1 不计入"
+        );
+        session.shutdown();
+    }
+
+    /// #12 u32 高水位耗尽:checked_add fail-stop(保留既有 panic 语义)。
+    #[test]
+    #[should_panic(expected = "服务端 EntityId 序号耗尽")]
+    fn spawn_seq_exhaustion_fail_stops() {
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), u32::MAX);
+        let session = sim_api::session::Session::new(Config::default().session_config());
+        let _ = o.allocate_spawn_id(&session);
     }
 
     // ---- 任务 04:驱动接线(测试清单)----
@@ -2893,7 +2994,7 @@ mod tests {
     /// 已加载,SetBlock 不被新门卫拦截)。
     #[tokio::test(start_paused = true)]
     async fn network_block_updates_from_outbox() {
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3241,6 +3342,7 @@ mod tests {
         tokio::sync::mpsc::Sender<DriverCommand>,
         std::sync::Arc<OutboundHub>,
         std::net::SocketAddr,
+        SharedCheckpoints,
     ) {
         let net_cfg = NetConfig {
             listen_addr: "127.0.0.1:0".to_string(),
@@ -3296,18 +3398,71 @@ mod tests {
             }),
             spawn_next_seq: 0,
         };
-        (args, tx, hub, addr)
+        (args, tx, hub, addr, checkpoints)
     }
 
     /// MiniClient 复用(net::tests 的内嵌客户端;crate 内可见)。
     use crate::net::tests::MiniClient;
+
+    /// #12 驱动级:经网络 spawn 一个实体(拿 `Spawned` 回执 ID)→ 关停(终末
+    /// checkpoint)→ 最新 bundle 的 `spawn_next_seq` 必须严格大于已分配序号。
+    /// 高水位是持久化值,不是扫描实体表的临时值(实体 despawn 后值仍在)。
+    #[tokio::test(start_paused = true)]
+    async fn spawned_id_below_checkpoint_high_water() {
+        let (args, tx, _hub, addr, checkpoints) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _ = join_player(&mut c, 3).await;
+        c.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("观察者写入");
+        advance_ticks(3).await;
+        c.send(&C2S::Spawn {
+            state: types::EntityState {
+                translation: Vec3::new(8.0, 3.0, 8.0),
+                ..types::EntityState::default()
+            },
+            desc: types::EntityDesc::default(),
+        })
+        .await
+        .expect("Spawn 写入");
+        let mut spawned = None;
+        for _ in 0..64 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await {
+                Ok(Ok(S2C::Spawned { entity })) => {
+                    spawned = Some(entity);
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        let entity = spawned.expect("Spawned 回执必达");
+        assert_eq!(entity.origin_shard(), 0, "server namespace");
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert!(
+            !outcome.checkpoints_written.is_empty(),
+            "终末 checkpoint 已写"
+        );
+        let bundle = latest_bundle(&checkpoints);
+        assert!(
+            bundle.spawn_next_seq > entity.local_seq(),
+            "checkpoint 高水位 {} 必须大于已分配序号 {}(下一个分配不撞它)",
+            bundle.spawn_next_seq,
+            entity.local_seq()
+        );
+    }
 
     /// 测试清单 1 `welcome_on_join_carries_player_and_tick`:真客户端入会 →
     /// Welcome{player_id, tick} 到达该连接的 Critical 通道并被冲刷出网;
     /// tick = 驱动当前拍(Welcome 拍号接线)。
     #[tokio::test(start_paused = true)]
     async fn welcome_on_join_carries_player_and_tick() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3359,7 +3514,7 @@ mod tests {
     /// REQ-006 任务 02:未加载区域的 Spawn 被拒绝(不建空气 chunk、不回执)。
     #[tokio::test(start_paused = true)]
     async fn spawn_rejected_in_unloaded_area() {
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
         let _ = join_player(&mut c, 8).await;
@@ -3386,7 +3541,7 @@ mod tests {
     /// 下一拍 EntityStates 出现该实体;客户端不带 ID。
     #[tokio::test(start_paused = true)]
     async fn network_spawn_gets_server_id_and_spawned_receipt() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3438,7 +3593,7 @@ mod tests {
     /// REQ-006 任务 02:两个真 TCP 客户端并发 Spawn → 服务端分配不同 ID。
     #[tokio::test(start_paused = true)]
     async fn two_clients_spawn_unique_server_ids() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut a = MiniClient::connect(addr).await.expect("A 连入");
@@ -3495,7 +3650,7 @@ mod tests {
     /// 整表(removed 空)。周期 = observe 3 拍 / full 9 拍。
     #[tokio::test(start_paused = true)]
     async fn entity_states_incremental_then_full() {
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3568,7 +3723,7 @@ mod tests {
     async fn removed_reported_on_solidify_and_removal() {
         // 无重力出生 → 真静止 → 凝固(session.rs 测试清单 5 同款场景;
         // 位移门默认 0.1m,真静止即可满足,40 拍上限留裕度)。
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3666,7 +3821,7 @@ mod tests {
     /// 传送近处(x=10)后入包。
     #[tokio::test(start_paused = true)]
     async fn distance_filter_respects_view_distance() {
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3728,7 +3883,7 @@ mod tests {
     /// 同一格位 SetBlock:只 A 收到 BlockUpdates。
     #[tokio::test(start_paused = true)]
     async fn block_updates_broadcast_by_proximity() {
-        let (args, tx, _hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut a = MiniClient::connect(addr).await.expect("客户端 A 连入");
@@ -3807,7 +3962,7 @@ mod tests {
     /// 可 despawn(despawn_after_secs = 0 缩短验证;评审修复②回填)。
     #[tokio::test(start_paused = true)]
     async fn left_removes_observer_and_stream() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3856,7 +4011,7 @@ mod tests {
     /// 补的正是五放行命令的**路由安全**面。
     #[tokio::test(start_paused = true)]
     async fn hostile_net_commands_dropped_not_fatal() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         let mut c = MiniClient::connect(addr).await.expect("客户端连入");
@@ -3906,7 +4061,7 @@ mod tests {
     /// tick 计数不受拖累(暂停时间下拍数精确)。
     #[tokio::test(start_paused = true)]
     async fn slow_client_degrades_not_blocks() {
-        let (args, tx, hub, addr) = observe_harness(observe_config()).await;
+        let (args, tx, hub, addr, _checkpoints) = observe_harness(observe_config()).await;
         let driver = tokio::spawn(run(args));
 
         // 慢客户端:订阅大视距(32 → 4225 chunk 请求)后不再读 socket。

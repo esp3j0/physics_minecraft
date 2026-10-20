@@ -477,6 +477,12 @@ impl Session {
         self.scheduler.shard_ids()
     }
 
+    /// 某分片当前持有的实体集合(升序;调度器透传)。#12 防御式 restore
+    /// 扫描实体表里的 server namespace 序号用。
+    pub fn entities_of(&self, shard: ShardId) -> std::collections::BTreeSet<types::EntityId> {
+        self.scheduler.entities_of(shard)
+    }
+
     /// 服务端分配 ID 后的外部 spawn(REQ-006 任务 02):目标分片由出生位置
     /// 决定;调用方负责 chunk 已加载校验。ID 已存在 → Rejected。
     pub fn spawn_owned(
