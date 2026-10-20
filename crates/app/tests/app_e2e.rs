@@ -408,9 +408,11 @@ async fn telemetry_wired_into_driver_outcome() {
 #[tokio::test(start_paused = true)]
 async fn spawn_high_water_survives_restart() {
     let dir = tempfile::tempdir().expect("创建临时目录");
-    let config = disk_config(dir.path(), 600); // 期中不触发,只验终末
+    // 小 interval:段 1 强制跨两个 checkpoint(评审返修测试 B 的链式场景)。
+    let config = disk_config(dir.path(), 2);
 
-    // —— 段 1:装配(带地形分片)→ 两个 server spawn → 关停(终末 checkpoint)——
+    // —— 段 1:spawn (0,77) → despawn(Remove)→ 跨两次 checkpoint(第二次
+    //    无 spawn 日志)→ 关停。验证高水位不因空日志窗口回退(评审 B1)。——
     let (session, log, store, resume_from, _seq0) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!((resume_from, _seq0), (None, 0), "空目录:无高水位");
@@ -431,26 +433,49 @@ async fn spawn_high_water_survives_restart() {
         observe: None,
         spawn_next_seq: 0,
     }));
-    for entity in [EntityId::from_parts(0, 1), EntityId::from_parts(0, 2)] {
-        tx.send(DriverCommand::Send {
-            shard: shard_id(0, 0),
-            command: spawn_cmd(entity),
-        })
-        .await
-        .expect("驱动仍存活");
-    }
-    advance_ticks(3).await;
+    let old = EntityId::from_parts(0, 77);
+    tx.send(DriverCommand::Send {
+        shard: shard_id(0, 0),
+        command: spawn_cmd(old),
+    })
+    .await
+    .expect("驱动仍存活");
+    advance_ticks(2).await; // checkpoint ①:日志含 (0,77) → 高水位 78
+    tx.send(DriverCommand::Send {
+        shard: shard_id(0, 0),
+        command: SimCommand::RemoveEntity { entity: old },
+    })
+    .await
+    .expect("驱动仍存活");
+    advance_ticks(4).await; // checkpoint ②③:空 spawn 日志窗口,实体已 despawn
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
     let outcome1 = driver.await.expect("驱动不 panic");
-    assert_eq!(outcome1.checkpoints_written.len(), 1, "仅终末 checkpoint");
-
-    // —— 段 2:同目录恢复,高水位 = 3(日志 (0,2)+1)——
-    let (_session2, _log2, store2, resume_from2, spawn_next_seq2) =
-        bootstrap(&config, new_registry()).expect("续跑装配");
-    assert_eq!(resume_from2, outcome1.checkpoints_written.first().copied());
-    assert_eq!(
-        spawn_next_seq2, 3,
-        "高水位恢复:重启后首个分配 ID = (0,3),大于重启前所有已用序号"
+    assert!(
+        outcome1.checkpoints_written.len() >= 3,
+        "interval=2:强制跨多次 checkpoint,实 {:?}",
+        outcome1.checkpoints_written
     );
+
+    // —— 段 2:同目录恢复——实体已 despawn、最后一次 checkpoint 无 spawn
+    //    日志,高水位仍 ≥ 78(不回退到 0);新分配首 ID 严格大于旧 ID。——
+    let (session2, _log2, store2, resume_from2, spawn_next_seq2) =
+        bootstrap(&config, new_registry()).expect("续跑装配");
+    assert_eq!(resume_from2, outcome1.checkpoints_written.last().copied());
+    assert!(
+        spawn_next_seq2 >= 78,
+        "高水位 ≥ 78(旧 (0,77) 已 despawn 也不得回退),实 {spawn_next_seq2}"
+    );
+
+    // 段 3:恢复高水位注入 orchestrator → 首个分配 (0, ≥78),不撞已消失旧 ID。
+    let mut orchestrator = app::driver::ObserveOrchestrator::new(
+        app::driver::ObserveCadence::default(),
+        spawn_next_seq2,
+    );
+    let first = orchestrator.allocate_spawn_id(&session2);
+    assert!(
+        first.local_seq() >= 78 && first.origin_shard() == 0,
+        "重启后首个分配 = {first:?},必须 (0, ≥78)——不复用已 despawn 的 (0,77)"
+    );
+    session2.shutdown();
     store2.shutdown().expect("正常关停");
 }

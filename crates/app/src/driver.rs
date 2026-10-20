@@ -478,13 +478,19 @@ fn write_checkpoint(
     log: &mut sim_api::log::CommandLog,
     store: &storage::worker::StoreWorker,
     checkpoints_written: &mut Vec<types::Tick>,
+    previous_spawn_high: u32,
     orchestrator_spawn_next_seq: u32,
-) {
-    // spawn 高水位(#12):取 max(分配器当前值, 本日志窗口内 server spawn 扫描)
-    // ——commands 通道的 SpawnDynamic(受信服务端路径)不经分配器,但其
-    // ID 也在 server namespace,必须计入;链式 checkpoint 下每张 bundle 的
-    // 高水位都 ≥ 此前所有分配/使用过的序号。必须在 `log.take()` 之前算。
-    let spawn_next_seq = orchestrator_spawn_next_seq.max(log_server_next_seq(log));
+) -> u32 {
+    // spawn 高水位(#12;返修 B1):单调不回退——
+    // next = max(上一次落盘值, 分配器当前值, 本日志窗口扫描)。
+    // 日志扫描只看当前窗口(`log.take()` 即清空),没有 previous 一项时,
+    // "commands 通道 spawn → checkpoint → 之后空日志再 checkpoint"会把
+    // 高水位写回 0(评审 B1 失败序列);上一次落盘值跨 checkpoint 保持。
+    // commands 通道的 SpawnDynamic(受信服务端路径)不经分配器,由日志
+    // 扫描计入。扫描必须在 `log.take()` 之前。
+    let spawn_next_seq = previous_spawn_high
+        .max(orchestrator_spawn_next_seq)
+        .max(log_server_next_seq(log));
     let world = session.world_snapshot();
     let taken = log.take();
     let bundle = CheckpointBundle {
@@ -496,6 +502,7 @@ fn write_checkpoint(
     let tick = bundle.world.shards.tick;
     store.append_checkpoint(tick, encode(&bundle));
     checkpoints_written.push(tick);
+    spawn_next_seq
 }
 
 /// 日志条目集 → bincode 字节(与 `CommandLog::to_bytes` 同构:重建临时日志整体
@@ -541,7 +548,7 @@ impl PendingStreams {
 /// 每订阅玩家的观察流状态 + 增量/全量两周期计数 + 跨拍积压(Welcome 拍号、
 /// 方块变更源)。玩家生命周期(Join/Leave/换视距)由网络上行事件驱动。
 #[derive(Default)]
-struct ObserveOrchestrator {
+pub struct ObserveOrchestrator {
     /// 订阅玩家 → 观察流状态(断连即弃,任务书细则 3)。
     players: BTreeMap<messaging::InputSource, PlayerStream>,
     /// 增量周期计数(拍;周期到即输出并清零——两周期独立,细则 5)。
@@ -569,7 +576,7 @@ impl ObserveOrchestrator {
     /// `spawn_next_seq` = 服务端 spawn 高水位初值(#12:bootstrap 从
     /// checkpoint 恢复产出;全新会话传 0)。分配从这里开始,保证重启后
     /// 新 ID 严格大于重启前分配过的所有序号(含已 despawn)。
-    fn new(cadence: ObserveCadence, spawn_next_seq: u32) -> Self {
+    pub fn new(cadence: ObserveCadence, spawn_next_seq: u32) -> Self {
         Self {
             players: BTreeMap::new(),
             ticks_since_interval: 0,
@@ -636,7 +643,7 @@ impl ObserveOrchestrator {
     }
 
     /// 分配 server namespace(origin=0)内的空闲 ID;跳过当前已存在的 ID。
-    fn allocate_spawn_id(&mut self, session: &sim_api::session::Session) -> types::EntityId {
+    pub fn allocate_spawn_id(&mut self, session: &sim_api::session::Session) -> types::EntityId {
         loop {
             let seq = self.next_spawn_seq;
             self.next_spawn_seq = self
@@ -651,7 +658,7 @@ impl ObserveOrchestrator {
     }
 
     /// 当前 spawn 高水位(#12;checkpoint 写路径用)。
-    fn spawn_next_seq(&self) -> u32 {
+    pub fn spawn_next_seq(&self) -> u32 {
         self.next_spawn_seq
     }
 
@@ -1157,6 +1164,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 上次 checkpoint 时的 ticks_run(相对本次运行;bootstrap 的检查点在起点之前,
     // 故初值 0——起跑后任何 tick 都是"自上次 checkpoint 后的增量")。
     let mut ticks_at_last_checkpoint: u64 = 0;
+    // spawn 高水位(#12 返修 B1):跨 checkpoint 单调状态,bootstrap 恢复值
+    // 起步;每次 checkpoint 后由 write_checkpoint 返回值推进(max 语义,
+    // 空日志窗口不回退——评审 B1 失败序列的修复)。
+    let mut spawn_high_water = spawn_next_seq;
     // 挂起 chunk 流请求(REQ-003 §4.4:命令分支收下、tick 末端编排第 ④ 步
     // 处理——同拍或下一拍,永不阻塞 tick)。
     let mut pending_streams = PendingStreams::default();
@@ -1260,17 +1271,20 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
 
                 // checkpoint 节奏:整间隔倍数拍到期(fire-and-forget,决策 5)。
                 if ticks_run.is_multiple_of(config.checkpoint_interval_ticks) {
-                    // spawn 高水位(#12):observe 缝不在场(无网络)恒 0。
-                    let spawn_next_seq = observe_state
+                    // spawn 高水位(#12 返修 B1):跨 checkpoint 单调——
+                    // max(上一次落盘值, 分配器当前值, 本日志窗口扫描)。
+                    // 第二项 observe 缝不在场(无网络)恒 0。
+                    let orchestrator_seq = observe_state
                         .as_ref()
                         .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
                         .unwrap_or(0);
-                    write_checkpoint(
+                    spawn_high_water = write_checkpoint(
                         &session,
                         &mut log,
                         &store,
                         &mut checkpoints_written,
-                        spawn_next_seq,
+                        spawn_high_water,
+                        orchestrator_seq,
                     );
                     ticks_at_last_checkpoint = ticks_run;
                 }
@@ -1332,16 +1346,19 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     drop(pending_streams);
     // 有未落检查点的增量(日志非空或自上次 checkpoint 后有 tick)→ 终末 checkpoint。
     if !log.is_empty() || ticks_run > ticks_at_last_checkpoint {
-        let spawn_next_seq = observe_state
+        let orchestrator_seq = observe_state
             .as_ref()
             .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
             .unwrap_or(0);
-        write_checkpoint(
+        // 终末后驱动即退出:单调状态不再续用,返回值显式弃(落盘值以
+        // bundle 为准,bootstrap 读回)。
+        let _final_high_water = write_checkpoint(
             &session,
             &mut log,
             &store,
             &mut checkpoints_written,
-            spawn_next_seq,
+            spawn_high_water,
+            orchestrator_seq,
         );
     }
     // flush 只在关停:屏障 = 此前全部操作(期中 + 终末)已落库。
@@ -2437,13 +2454,73 @@ mod tests {
             },
         });
         let mut written = Vec::new();
-        write_checkpoint(&session, &mut log, &store, &mut written, 3);
+        let high = write_checkpoint(&session, &mut log, &store, &mut written, 0, 3);
         store.shutdown().expect("关停");
         let bundle = latest_bundle(&checkpoints);
         assert_eq!(
             bundle.spawn_next_seq, 5,
-            "max(分配器 3, 日志 (0,4)+1=5) = 5——commands 通道 spawn 由日志兜住"
+            "max(上次 0, 分配器 3, 日志 (0,4)+1=5) = 5——commands 通道 spawn 由日志兜住"
         );
+        assert_eq!(high, 5, "返回值 = 落盘值(run 据此推进单调状态)");
+    }
+
+    /// #12 返修 B1 测试 A:纯写路径链式单调——第一次 checkpoint 计入日志
+    /// 窗口,之后日志被 take 清空,空窗口的后续 checkpoint **不回退**
+    /// (previous 单调保持;无此状态时第二张 bundle 会写回 0)。
+    #[test]
+    fn chained_checkpoints_keep_high_water_monotonic() {
+        let mk_log_with = |seq: Option<u32>| {
+            let mut log = sim_api::log::CommandLog::new();
+            if let Some(seq) = seq {
+                log.append(sim_api::log::LogEntry {
+                    tick: types::Tick(0),
+                    dest: shard_id(0, 0),
+                    source: messaging::InputSource::SCHEDULER,
+                    sequence: 0,
+                    command: messaging::SimCommand::SpawnDynamic {
+                        entity: types::EntityId::from_parts(0, seq),
+                        state: types::EntityState::default(),
+                        desc: types::EntityDesc::default(),
+                    },
+                });
+            }
+            log
+        };
+        // 第一张:prev=0,分配器 0,日志含 (0,100) → 101。
+        let checkpoints = SharedCheckpoints::default();
+        let store = storage::worker::StoreWorker::new(
+            Box::new(MemChunkStore::new()),
+            Box::new(checkpoints.clone()),
+        );
+        let session = sim_api::session::Session::new(Config::default().session_config());
+        let mut written = Vec::new();
+        let high1 = write_checkpoint(
+            &session,
+            &mut mk_log_with(Some(100)),
+            &store,
+            &mut written,
+            0,
+            0,
+        );
+        assert_eq!(high1, 101, "第一张:max(0,0,101) = 101");
+        assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
+
+        // 第二张:日志已被 take 清空,无新 spawn → 仍 101(不回退)。
+        let mut log_empty = mk_log_with(None);
+        let high2 = write_checkpoint(&session, &mut log_empty, &store, &mut written, high1, 0);
+        assert_eq!(
+            high2, 101,
+            "第二张空窗口:max(101,0,0) = 101(评审 B1 失败序列)"
+        );
+        assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
+
+        // 第三张:再空 → 仍 101。
+        let mut log_empty2 = mk_log_with(None);
+        let high3 = write_checkpoint(&session, &mut log_empty2, &store, &mut written, high2, 0);
+        assert_eq!(high3, 101);
+        assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
+        store.shutdown().expect("关停");
+        session.shutdown();
     }
 
     /// #12 `restored_high_water_continues`:构造时注入恢复高水位 →
