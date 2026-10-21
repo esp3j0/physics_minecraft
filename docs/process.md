@@ -33,6 +33,7 @@
 | 目录 | 用途 | 语言 |
 | --- | --- | --- |
 | `docs/requirements/` | 需求文档(单一事实来源) | Markdown |
+| `docs/ideas/` | 设想池:未立项的想法,不承诺,成熟后转 REQ | Markdown |
 | `demos/` | 验证性 demo,一个主题一个子目录 | Python(辅助) |
 | `crates/` | 正式项目代码 | Rust |
 
