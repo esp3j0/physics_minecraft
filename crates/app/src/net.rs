@@ -1116,14 +1116,23 @@ pub(crate) mod tests {
     /// (encode_c2s_frame / 手工读长度前缀;README 决策 10)。
     pub(crate) struct MiniClient {
         stream: TcpStream,
+        /// std 侧副本(#15 半关读端用;与 stream 共享同一 socket)。
+        std_stream: std::net::TcpStream,
         buf: Vec<u8>,
     }
 
     impl MiniClient {
         pub(crate) async fn connect(addr: std::net::SocketAddr) -> io::Result<Self> {
-            let stream = TcpStream::connect(addr).await?;
+            // std 建连后转 tokio:留一份 std 副本供半关读端(#15);
+            // tokio TcpStream 无 try_clone,into_std 会摘走注册的 fd。
+            // from_std 前必须设非阻塞(tokio 文档要求,否则注册到 reactor
+            // 的是阻塞 fd,读写事件永不唤醒)。
+            let std_stream = std::net::TcpStream::connect(addr)?;
+            std_stream.set_nonblocking(true)?;
+            let tokio_stream = TcpStream::from_std(std_stream.try_clone()?)?;
             Ok(Self {
-                stream,
+                stream: tokio_stream,
+                std_stream,
                 buf: Vec::new(),
             })
         }
@@ -1141,6 +1150,17 @@ pub(crate) mod tests {
         /// 原始字节写(半帧/粘包测试用)。
         pub(crate) async fn send_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.stream.write_all(bytes).await
+        }
+
+        /// 半关读端(#15):表达"客户端从此不再消费 socket"——平台无关的
+        /// 慢客户端构造。后续到达的数据触发 RST(Linux/Windows),服务端
+        /// 读得 ECONNRESET、写得 ECONNRESET/EPIPE → SocketClosed 断连支路;
+        /// 若平台对 SHUT_RD 只丢弃不回 RST,则由调用方的连发循环走原
+        /// 写超时路径兜底(Windows 小缓冲可触发)。两者同属 README 决策 6
+        /// 的 send 失败支路,断连原因断言不变。
+        pub(crate) fn shutdown_read(&self) -> io::Result<()> {
+            // std 副本与 tokio stream 共享同一 socket fd,半关对两端生效。
+            self.std_stream.shutdown(std::net::Shutdown::Read)
         }
 
         /// 读一帧 S2C(凑 4B 前缀 + 载荷)。
@@ -1648,7 +1668,15 @@ pub(crate) mod tests {
         let id = join(&mut c, 2).await;
         assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id });
 
-        // 不读 socket,连发 Ping 直到写侧超时(远超客户端 TCP 缓冲的量)。
+        // 客户端从此不读:半关读端(#15)。"客户端不读"的平台无关构造——
+        // 原实现依赖"写满客户端接收缓冲 → 服务端写超时",但 Linux 的 TCP
+        // 自动调优缓冲(rcvbuf/sndbuf,MB 级)能把 20 万个 Pong 帧(~1.4MB)
+        // 全部吸收,写永不阻塞,测试在 ubuntu 稳定失败(Windows 小缓冲才
+        // 触发)。SHUT_RD 后服务端继续收 Ping 回 Pong → 客户端内核回 RST
+        // → 服务端读/写失败 → SocketClosed 断连(README 决策 6 send 失败
+        // 支路,断连原因断言不变);不支持 RST 的平台由下方连发循环的写
+        // 超时路径兜底。
+        c.shutdown_read().expect("半关读端");
         for _ in 0..200_000 {
             if c.send(&C2S::Ping).await.is_err() {
                 break; // 对端已断(或写超时)

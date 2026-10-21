@@ -63,7 +63,8 @@ fn shards_within(p: Vec3, radius: f32) -> Vec<ShardId> {
 // ---- golden 格式(B4.3:纯文本,每拍一行;空列表留空字段;A1:装载集按分片)----
 // <tick>|load=<sx:sz[x,z;x,z]/sx:sz[...]>
 //       |frozen=<w:s;...>|woke=<w:s;...>|shards=<wx:dim:sx:sz;...>
-// load:分片按 ShardId 升序,片内 chunk 按 (x,z) 升序;空分片(无装载)省略;
+// load:分片按 ShardId 升序,片内 chunk 按 (x,z) 升序;已注册但零装载的
+// 分片**仍记录**(空方括号),与未注册(整片不出现)显式区分;
 // 扫描范围 = 该分片 activation_region(core + margin 环,REQ-005 D4)。
 
 /// 逐分片装载观测:每分片 (ShardId, 已装载 chunk 有序集),分片键序。
