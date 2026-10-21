@@ -634,11 +634,11 @@ fn swap_budget_respected_over_time() {
 
         let swaps = d.chunks_to_load.len() + d.chunks_to_unload.len();
         assert!(
-            swaps <= cfg.swap_budget_chunks_per_tick,
+            swaps <= cfg.data_budget_per_tick,
             "拍 {k}:换装合计 {swaps} 超预算 {}",
-            cfg.swap_budget_chunks_per_tick
+            cfg.data_budget_per_tick
         );
-        if swaps == cfg.swap_budget_chunks_per_tick {
+        if swaps == cfg.data_budget_per_tick {
             budget_hit += 1;
         }
         // 本测试无实体:实体档不得掺入。
@@ -647,9 +647,9 @@ fn swap_budget_respected_over_time() {
         for &cp in &d.chunks_to_load {
             let dist = dist_xz(chunk_center(cp), observer);
             assert!(
-                dist <= cfg.chunk_load_radius,
+                dist <= cfg.data_load_radius,
                 "拍 {k}:装载 {cp:?} 中心距 {dist:.2} 超近半径 {}(装载集 ⊆ 观察者足迹)",
-                cfg.chunk_load_radius
+                cfg.data_load_radius
             );
             assert!(loaded.insert(cp), "重复装载已载 chunk {cp:?}");
             planned_load.insert(cp, k);
@@ -668,9 +668,9 @@ fn swap_budget_respected_over_time() {
             }
             let dist = dist_xz(chunk_center(cp), observer);
             assert!(
-                dist > cfg.chunk_unload_radius,
+                dist > cfg.data_unload_radius,
                 "拍 {k}:卸载 {cp:?} 中心距 {dist:.2} 未出远半径 {}",
-                cfg.chunk_unload_radius
+                cfg.data_unload_radius
             );
             assert!(loaded.remove(&cp), "卸载未载 chunk {cp:?}");
             sim.unload_chunk(cp);

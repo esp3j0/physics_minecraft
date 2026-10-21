@@ -8,7 +8,8 @@
 //! 语义(README 决策 5/7 + §4.3):
 //! - 滞回:近半径装载/唤醒、远半径卸载/冻结,中间带保持;
 //! - 冷却:同一 chunk/实体两次换装/翻转至少隔 `cooldown_ticks` 拍(首见视为可换);
-//! - 预算:装卸**合计** ≤ `swap_budget_chunks_per_tick`;醒数超过
+//! - 预算:① 装卸**合计** ≤ `data_budget_per_tick`,② 构建 ≤
+//!   `collider_budget_per_tick`(拆除不计);醒数超过
 //!   `max_awake_dynamic` 时按到最近演员距离降序**立即**冻结超出者(§9.4,不受冷却);
 //! - 决策即簿记:被采纳的换装/翻转记入冷却表——同输入连续两次 `plan`,
 //!   第二次输出空(有意语义,见 [`ActivationController::plan`] 文档)。
@@ -20,23 +21,30 @@ use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
 use types::{CHUNK_SIZE, ChunkPos, ChunkRegion, EntityId, Tick};
 
-/// 激活配置(§4.3 三档;核内独立结构,app::Config 注入,无全局单例)。
+/// 激活配置(REQ-007 任务 01:①② 拆分;核内独立结构,app::Config 注入,
+/// 无全局单例)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ActivationConfig {
-    /// tier①② 加载半径(m)。
-    pub chunk_load_radius: f32,
-    /// tier①② 卸载半径(m)。
-    pub chunk_unload_radius: f32,
+    /// ① 数据加载半径(m;REQ-007 任务 01,原 chunk_load_radius)。
+    pub data_load_radius: f32,
+    /// ① 数据卸载半径(m)。
+    pub data_unload_radius: f32,
+    /// ② collider 加载半径(m;校验 ≤ data_load_radius,app 配置层)。
+    pub collider_load_radius: f32,
+    /// ② collider 卸载半径(m)。
+    pub collider_unload_radius: f32,
     /// tier③ 唤醒半径(m)。
     pub awake_load_radius: f32,
     /// tier③ 冻结半径(m)。
     pub awake_unload_radius: f32,
-    /// 换装/翻转冷却(拍;3s × 60Hz)。
+    /// 换装/翻转冷却(拍;3s × 60Hz;①② ③ 分档簿记用同值,REQ-007 §4.15)。
     pub cooldown_ticks: u64,
     /// 醒着动态体上限(§9.4)。
     pub max_awake_dynamic: usize,
-    /// 每拍换装预算(装+卸合计)。
-    pub swap_budget_chunks_per_tick: usize,
+    /// ① 每拍装+卸合计预算(REQ-007 任务 01,原 swap_budget_chunks_per_tick)。
+    pub data_budget_per_tick: usize,
+    /// ② 每拍构建预算(拆除不计;REQ-007 任务 01)。
+    pub collider_budget_per_tick: usize,
     /// 激活/扩张区外扩 chunk 数(REQ-005 D4):装载候选必须落在
     /// `core ∪ margin_ring`;由 app::Config.margin_meters 换算
     /// (ceil(m/16),默认 16m → 1)。0 显式允许(测试/实验;边界 collider
@@ -47,25 +55,39 @@ pub struct ActivationConfig {
 impl Default for ActivationConfig {
     fn default() -> Self {
         Self {
-            chunk_load_radius: 32.0,
-            chunk_unload_radius: 48.0,
+            data_load_radius: 32.0,
+            data_unload_radius: 48.0,
+            collider_load_radius: 32.0,
+            collider_unload_radius: 48.0,
             awake_load_radius: 24.0,
             awake_unload_radius: 32.0,
             cooldown_ticks: 180,
             max_awake_dynamic: 512,
-            swap_budget_chunks_per_tick: 2,
+            data_budget_per_tick: 2,
+            collider_budget_per_tick: 2,
             region_margin_chunks: 1,
         }
     }
 }
 
 /// 一轮激活决策(策略纯输出;执行方 = ShardSim / 调用方)。
+///
+/// REQ-007 任务 01(①② 拆分):`chunks_to_load/unload` 保留原名(B2,语义
+/// = ①);② 由 `plan` 决策(唯一决策者,B3)、`ShardSim::apply_activation`
+/// 执行;驱动层不执行 ②。
 #[derive(Debug, Default, PartialEq)]
 pub struct ActivationDecisions {
-    /// 请求装载的 chunk(按到最近演员距离升序;与卸载合计已截断到预算)。
+    /// 请求装载的 chunk(① 体素;按到最近演员距离升序;与卸载合计已截断
+    /// 到 ① 预算)。
     pub chunks_to_load: Vec<ChunkPos>,
-    /// 请求卸载的 chunk(同上)。
+    /// 请求卸载的 chunk(① 体素;含"① 卸载时同步拆 ②"的 chunk)。
     pub chunks_to_unload: Vec<ChunkPos>,
+    /// 请求构建 ② 的 chunk(距最近演员 ≤ collider_load_radius、① 已载、
+    /// 冷却已过;ChunkPos 升序,预算内)。
+    pub colliders_to_build: Vec<ChunkPos>,
+    /// 请求拆除 ② 的 chunk(距最近演员 > collider_unload_radius 且 ① 仍在;
+    /// 与 `chunks_to_unload` 不相交——同 chunk 的 ② 随 ① 卸载同点拆,I1)。
+    pub colliders_to_drop: Vec<ChunkPos>,
     /// 请求唤醒的实体(到最近演员距离升序,近者先)。
     pub entities_to_wake: Vec<EntityId>,
     /// 请求冻结的实体(到最近演员距离降序,远者先;§9.4 超预算淘汰亦在此)。
@@ -73,10 +95,15 @@ pub struct ActivationDecisions {
 }
 
 /// 激活策略机:滞回/冷却/预算的簿记与决策(纯内存,serde 可快照)。
+///
+/// REQ-007 任务 01(①② 拆分):①/② 各一套冷却簿记表,互不影响。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivationController {
     cfg: ActivationConfig,
+    /// ① 冷却簿记(装/卸共用)。
     chunk_last_swap: BTreeMap<ChunkPos, Tick>,
+    /// ② 冷却簿记(构建;重建不进此表)。
+    collider_last_build: BTreeMap<ChunkPos, Tick>,
     entity_last_flip: BTreeMap<EntityId, Tick>,
 }
 
@@ -133,50 +160,54 @@ impl ActivationController {
         Self {
             cfg,
             chunk_last_swap: BTreeMap::new(),
+            collider_last_build: BTreeMap::new(),
             entity_last_flip: BTreeMap::new(),
         }
     }
 
-    /// 一轮决策(README 决策 5/7):
-    /// - chunk:未载 && 最近距离 ≤ load → 装载;已载 && > unload → 卸载;
-    ///   两者均需冷却(该 chunk 上次换装 ≥ cooldown_ticks 拍;首见视为可换);
-    ///   装载候选 = 各观察者周围 ceil(unload/16)+2 chunk 网格内未载者;
-    ///   装卸合并按距离排序后截断到 swap_budget 合计;
+    /// 一轮决策(README 决策 5/7;REQ-007 任务 01:①② 拆分):
+    /// - ① chunk 数据:未载 && 最近距离 ≤ data_load → 装载;已载 && > data_unload
+    ///   → 卸载;冷却门控;装载候选 = 各锚点周围 ceil(data_unload/16)+2 网格;
+    ///   装卸合计截断到 data_budget;
+    /// - ② collider(B3:plan 是唯一决策者;半径/滞回/预算/冷却全在此):
+    ///   未建(输入 collider_loaded 之外)&& ≤ collider_load && ① 已载 && 冷却 →
+    ///   构建(ChunkPos 升序截 collider_budget);已建 && > collider_unload →
+    ///   拆除(**与 chunks_to_unload 不相交**——同 chunk 的 ② 随 ① 卸载同点拆,
+    ///   N2:apply_activation 拆 ② 会让碰撞体比旧行为早消失一个 step;拆除
+    ///   不占预算、不受冷却);
     /// - 实体:醒 && > awake_unload && 冷却 → 冻结;冻 && ≤ awake_load && 冷却 → 唤醒;
     /// - 超预算(醒数 > max_awake_dynamic):按到最近演员距离降序立即冻结
     ///   超出者(不受冷却,§9.4)。
     ///
     /// **决策即簿记**:被采纳的换装/翻转记入冷却表——同一输入两次调用,
-    /// 第二次因冷却簿记已更新而输出空(有意语义)。因此超预算淘汰只排除
-    /// 「本拍已翻转」的实体:调用方落实决策后不再重复冻结;调用方不落实时
-    /// (醒数仍超限)下一拍会继续淘汰——强制语义按拍持续生效。
+    /// 第二次输出空(有意语义)。② 构建记 ② 冷却表(重建不受它约束)。
     ///
-    /// **纯决策**:不改施体、不做 IO。无观察者 = 无激活中心(§4.3):
-    /// 距离视为 +∞ → 不唤醒任何实体,全体醒着的实体进入(冷却门控的)冻结。
-    /// 几何口径:chunk 水平 (x, z) 距离 / 实体 3D 欧氏,均取最近演员。
+    /// **纯决策**:不改施体、不做 IO。无锚点 = 无激活中心:距离视为 +∞ →
+    /// 不唤醒任何实体,全体醒着的实体进入(冷却门控的)冻结。
+    /// 几何口径:chunk 水平 (x, z) 距离 / 实体 3D 欧氏,均取最近锚点。
     ///
-    /// 超预算口径:「醒数」= **输入当前醒着的实体数**(冻结体不计;任务书
-    /// 测试 `over_budget_freezes_farthest_immediately` 锚定:拍 0 全冻 → 唤醒
-    /// 全体不触发预算)。由此「近处全体唤醒」理论上可瞬时越过预算;预算的
-    /// 持续强制由后续各拍的淘汰路径保证。
+    /// 超预算口径:「醒数」= **输入当前醒着的实体数**(冻结体不计;测试
+    /// `over_budget_freezes_farthest_immediately` 锚定:拍 0 全冻 → 唤醒
+    /// 全体不触发预算)。
     pub fn plan(
         &mut self,
-        observers: &[Vec3],
+        anchors: &[Vec3],
         loaded: &[ChunkPos],
+        collider_loaded: &[ChunkPos],
         entities: &[(EntityId, Vec3, bool)],
         now: Tick,
         region: ChunkRegion,
     ) -> ActivationDecisions {
         let mut d = ActivationDecisions::default();
 
-        // ---- tier①② chunk 档(决策返回给调用方执行,数据源属 REQ-002)----
-        // 装载候选网格:各观察者周围 ceil(unload/16)+2;再按区域过滤
-        // (REQ-005 D4):区域外(即使距观察者很近)一律不请求——分片不
+        // ---- tier① chunk 数据档(决策返回给调用方执行,数据源属 REQ-002)----
+        // 装载候选网格:各锚点周围 ceil(data_unload/16)+2;再按区域过滤
+        // (REQ-005 D4):区域外(即使距锚点很近)一律不请求——分片不
         // 装载自己 core ∪ margin_ring 之外的 chunk。
         let chunk_f = CHUNK_SIZE as f32;
-        let reach = (self.cfg.chunk_unload_radius / chunk_f).ceil() as i32 + 2;
+        let reach = (self.cfg.data_unload_radius / chunk_f).ceil() as i32 + 2;
         let mut grid: BTreeSet<ChunkPos> = BTreeSet::new();
-        for o in observers {
+        for o in anchors {
             let cx = (o.x / chunk_f).floor() as i32;
             let cz = (o.z / chunk_f).floor() as i32;
             for dx in -reach..=reach {
@@ -197,25 +228,23 @@ impl ActivationController {
             if !region.contains(cp) {
                 continue;
             }
-            let dist = chunk_distance(cp, observers);
+            let dist = chunk_distance(cp, anchors);
             // 装载同样受冷却门控(任务书:「两者均需冷却」)——换装决策
             // 采纳即记簿记,冷却窗内重复候选不再产出。
-            if dist <= self.cfg.chunk_load_radius && self.chunk_cooled(&cp, now) {
+            if dist <= self.cfg.data_load_radius && self.chunk_cooled(&cp, now) {
                 cands.push((cp, dist, true));
             }
         }
         for &cp in loaded {
-            let dist = chunk_distance(cp, observers);
-            if dist > self.cfg.chunk_unload_radius && self.chunk_cooled(&cp, now) {
+            let dist = chunk_distance(cp, anchors);
+            if dist > self.cfg.data_unload_radius && self.chunk_cooled(&cp, now) {
                 cands.push((cp, dist, false));
             }
         }
-        // 距离升序、同距 (x, z) 字典序(确定性);装卸合计截断到预算。
+        // 距离升序、同距 (x, z) 字典序(确定性);装卸合计截断到 ① 预算。
         cands.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
         for (cp, _dist, is_load) in cands {
-            if d.chunks_to_load.len() + d.chunks_to_unload.len()
-                >= self.cfg.swap_budget_chunks_per_tick
-            {
+            if d.chunks_to_load.len() + d.chunks_to_unload.len() >= self.cfg.data_budget_per_tick {
                 break;
             }
             // 决策即簿记:被采纳的换装记入冷却表。
@@ -227,12 +256,47 @@ impl ActivationController {
             }
         }
 
+        // ---- tier② collider 档(REQ-007 任务 01/B3:决策唯一出处)----
+        let collider_loaded_set: BTreeSet<ChunkPos> = collider_loaded.iter().copied().collect();
+        // 构建:① 已载 ∧ 未建 ② ∧ ≤ collider_load ∧ 冷却已过(ChunkPos 升序
+        // = BTreeSet 键序;截 collider_budget)。
+        for &cp in &loaded_set {
+            if collider_loaded_set.contains(&cp) || !region.contains(cp) {
+                continue;
+            }
+            let dist = chunk_distance(cp, anchors);
+            if dist <= self.cfg.collider_load_radius && self.collider_cooled(&cp, now) {
+                if d.colliders_to_build.len() >= self.cfg.collider_budget_per_tick {
+                    break;
+                }
+                // 决策即簿记:构建记 ② 冷却表。
+                self.collider_last_build.insert(cp, now);
+                d.colliders_to_build.push(cp);
+            }
+        }
+        // 拆除:已建 ② ∧ > collider_unload ∧ ② 冷却已过(拆除记 ② 簿记 =
+        // "决策即簿记"的对称要求:同输入两次 plan 第二次拆除为空;重建是
+        // sim 侧直接执行不经 plan,不受此约束)。与 chunks_to_unload 不相交
+        // (N2:同 chunk 的 ② 随 ① 卸载同点拆,apply_activation 不重复处理);
+        // 拆除不计 ② 构建预算。
+        let to_unload_set: BTreeSet<ChunkPos> = d.chunks_to_unload.iter().copied().collect();
+        for &cp in collider_loaded {
+            if to_unload_set.contains(&cp) {
+                continue;
+            }
+            let dist = chunk_distance(cp, anchors);
+            if dist > self.cfg.collider_unload_radius && self.collider_cooled(&cp, now) {
+                self.collider_last_build.insert(cp, now);
+                d.colliders_to_drop.push(cp);
+            }
+        }
+
         // ---- tier③ 实体档 ----
         let mut wake: Vec<(EntityId, f32)> = Vec::new();
         let mut freeze: Vec<(EntityId, f32)> = Vec::new();
         let mut awake: Vec<(EntityId, f32)> = Vec::new();
         for &(id, pos, frozen) in entities {
-            let dist = nearest_observer_distance(observers, pos, false).unwrap_or(f32::INFINITY);
+            let dist = nearest_observer_distance(anchors, pos, false).unwrap_or(f32::INFINITY);
             if !frozen {
                 awake.push((id, dist));
             }
@@ -309,6 +373,14 @@ impl ActivationController {
         }
     }
 
+    /// ② 构建冷却是否已过(首见视为可建;重建不进 ② 冷却表,不受此约束)。
+    fn collider_cooled(&self, cp: &ChunkPos, now: Tick) -> bool {
+        match self.collider_last_build.get(cp) {
+            Some(&last) => cooldown_elapsed(last, now, self.cfg.cooldown_ticks),
+            None => true,
+        }
+    }
+
     /// 实体翻转冷却是否已过(首见视为可换)。
     fn entity_cooled(&self, id: &EntityId, now: Tick) -> bool {
         match self.entity_last_flip.get(id) {
@@ -347,7 +419,7 @@ mod tests {
         // 观察者贴东界(x=120):chunk 7(区域内)与 chunk 8(区域外,中心
         // x=136)都在装载半径内。
         let obs = [Vec3::new(120.0, 0.0, 8.0)];
-        let d = c.plan(&obs, &[], &[], Tick::ZERO, core);
+        let d = c.plan(&obs, &[], &[], &[], Tick::ZERO, core);
         assert!(
             d.chunks_to_load.contains(&types::ChunkPos::new(7, 0)),
             "区域内且近 → 请求装载:{:?}",
@@ -364,7 +436,7 @@ mod tests {
         let mut c2 = ActivationController::new(cfg);
         let outside = [Vec3::new(200.0, 0.0, 8.0)];
         let far_loaded = [types::ChunkPos::new(30, 0)];
-        let d2 = c2.plan(&outside, &far_loaded, &[], Tick::ZERO, core);
+        let d2 = c2.plan(&outside, &far_loaded, &[], &[], Tick::ZERO, core);
         assert!(
             d2.chunks_to_unload.contains(&types::ChunkPos::new(30, 0)),
             "卸载候选不强制在区域内:{:?}",
@@ -395,7 +467,7 @@ mod tests {
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mid = [ChunkPos::new(3, 0)];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d = c.plan(&obs, &mid, &[], Tick::ZERO, wide_region());
+        let d = c.plan(&obs, &mid, &[], &[], Tick::ZERO, wide_region());
         assert!(
             !d.chunks_to_load.contains(&ChunkPos::new(3, 0))
                 && !d.chunks_to_unload.contains(&ChunkPos::new(3, 0)),
@@ -404,6 +476,7 @@ mod tests {
         // 实体 25(24 < 25 ≤ 32)中带:醒不冻、冻不醒。
         let d = c.plan(
             &obs,
+            &[],
             &[],
             &[
                 (eid(1), Vec3::new(33.0, 0.0, 8.0), false),
@@ -419,7 +492,7 @@ mod tests {
         // 非退化对照:同拍近距离 chunk 会被装载((0,0) 距 0;次近 16m 组按
         // (x, z) 字典序取 (-1,0)),预算 2 截断。
         let mut c2 = ActivationController::new(ActivationConfig::default());
-        let d2 = c2.plan(&obs, &[], &[], Tick::ZERO, wide_region());
+        let d2 = c2.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d2.chunks_to_load,
             vec![ChunkPos::new(0, 0), ChunkPos::new(-1, 0)]
@@ -435,7 +508,7 @@ mod tests {
         let far = [Vec3::new(1000.0, 0.0, 0.0)];
         let mut c = ActivationController::new(ActivationConfig::default());
         // 拍 0:近 → 装载(簿记 swap@0);(1,0) 距 0,(0,0) 距 16。
-        let d0 = c.plan(&obs, &[], &[], Tick::ZERO, wide_region());
+        let d0 = c.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d0.chunks_to_load,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -463,18 +536,18 @@ mod tests {
         let loaded_far: Vec<ChunkPos> = d0.chunks_to_load.iter().copied().chain(far_ring).collect();
         // 拍 1 / 179:卸载候选但冷却未过 → 不卸。
         assert!(
-            c.plan(&far, &loaded_far, &[], Tick(1), wide_region())
+            c.plan(&far, &loaded_far, &[], &[], Tick(1), wide_region())
                 .chunks_to_unload
                 .is_empty()
         );
         assert!(
-            c.plan(&far, &loaded_far, &[], Tick(179), wide_region())
+            c.plan(&far, &loaded_far, &[], &[], Tick(179), wide_region())
                 .chunks_to_unload
                 .is_empty(),
             "179 拍仍在冷却窗内"
         );
         // 第 180 拍:冷却已过 → 卸载,按距离升序((1,0)@≈976 先于 (0,0)@≈992)。
-        let d = c.plan(&far, &loaded_far, &[], Tick(180), wide_region());
+        let d = c.plan(&far, &loaded_far, &[], &[], Tick(180), wide_region());
         assert_eq!(
             d.chunks_to_unload,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -522,7 +595,7 @@ mod tests {
             })
             .chain(far)
             .collect();
-        let d = c.plan(&obs, &loaded1, &[], Tick::ZERO, wide_region());
+        let d = c.plan(&obs, &loaded1, &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d.chunks_to_load.len() + d.chunks_to_unload.len(),
             2,
@@ -543,7 +616,7 @@ mod tests {
             .filter(|cp| *cp != ChunkPos::new(0, 0))
             .chain(far)
             .collect();
-        let d2 = c2.plan(&obs, &loaded2, &[], Tick::ZERO, wide_region());
+        let d2 = c2.plan(&obs, &loaded2, &[], &[], Tick::ZERO, wide_region());
         assert_eq!(d2.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(
             d2.chunks_to_unload,
@@ -566,6 +639,7 @@ mod tests {
         let d0 = c.plan(
             &obs,
             &[],
+            &[],
             &[
                 (e1, Vec3::new(5.0, 0.0, 0.0), true),
                 (e2, Vec3::new(15.0, 0.0, 0.0), true),
@@ -578,6 +652,7 @@ mod tests {
         // 拍 1:3 醒 > 2 → 最远者(e3,距 20)立即冻结,不受冷却(flip@0 才过 1 拍)。
         let d1 = c.plan(
             &obs,
+            &[],
             &[],
             &[
                 (e1, Vec3::new(5.0, 0.0, 0.0), false),
@@ -609,6 +684,7 @@ mod tests {
         let d = c.plan(
             &obs,
             &[],
+            &[],
             &[
                 (near, Vec3::new(5.0, 0.0, 0.0), false),
                 (far, Vec3::new(100.0, 0.0, 0.0), false),
@@ -631,6 +707,7 @@ mod tests {
         let d2 = c2.plan(
             &obs,
             &[],
+            &[],
             &[(near, Vec3::new(5.0, 0.0, 0.0), false)],
             Tick::ZERO,
             wide_region(),
@@ -648,6 +725,7 @@ mod tests {
         });
         let d3 = c3.plan(
             &obs,
+            &[],
             &[],
             &[
                 (near, Vec3::new(5.0, 0.0, 0.0), false),
@@ -674,6 +752,7 @@ mod tests {
         let d = c.plan(
             &obs,
             &[],
+            &[],
             &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true)],
             Tick::ZERO,
             wide_region(),
@@ -681,6 +760,7 @@ mod tests {
         assert_eq!(d.entities_to_wake, vec![eid(3)], "≤ 24 → 唤醒");
         let d = c.plan(
             &obs,
+            &[],
             &[],
             &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false)],
             Tick::ZERO,
@@ -693,37 +773,37 @@ mod tests {
         let e = eid(1);
         let near = (e, Vec3::new(20.0, 0.0, 0.0), true);
         let far = (e, Vec3::new(40.0, 0.0, 0.0), false);
-        let d = c.plan(&obs, &[], &[near], Tick::ZERO, wide_region());
+        let d = c.plan(&obs, &[], &[], &[near], Tick::ZERO, wide_region());
         assert_eq!(d.entities_to_wake, vec![e], "冻 @20(≤ 24)→ 唤醒(flip@0)");
         assert!(
-            c.plan(&obs, &[], &[far], Tick(1), wide_region())
+            c.plan(&obs, &[], &[], &[far], Tick(1), wide_region())
                 .entities_to_freeze
                 .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[far], Tick(179), wide_region())
+            c.plan(&obs, &[], &[], &[far], Tick(179), wide_region())
                 .entities_to_freeze
                 .is_empty(),
             "> 32 但 179 拍仍在冷却 → 不冻"
         );
-        let d = c.plan(&obs, &[], &[far], Tick(180), wide_region());
+        let d = c.plan(&obs, &[], &[], &[far], Tick(180), wide_region());
         assert_eq!(
             d.entities_to_freeze,
             vec![e],
             "> 32 且冷却已过 → 冻结(flip@180)"
         );
         assert!(
-            c.plan(&obs, &[], &[near], Tick(181), wide_region())
+            c.plan(&obs, &[], &[], &[near], Tick(181), wide_region())
                 .entities_to_wake
                 .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[near], Tick(359), wide_region())
+            c.plan(&obs, &[], &[], &[near], Tick(359), wide_region())
                 .entities_to_wake
                 .is_empty(),
             "回 ≤ 24 但 179 拍仍在冷却 → 不醒"
         );
-        let d = c.plan(&obs, &[], &[near], Tick(360), wide_region());
+        let d = c.plan(&obs, &[], &[], &[near], Tick(360), wide_region());
         assert_eq!(d.entities_to_wake, vec![e], "≤ 24 且冷却已过 → 唤醒");
     }
 
@@ -753,17 +833,38 @@ mod tests {
             (e2, Vec3::new(100.0, 0.0, 0.0), false), // 醒、距 100 > 32 → 冻
         ];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d1 = c.plan(&obs, &loaded, &ents, Tick::ZERO, wide_region());
+        // REQ-007 任务 01:plan 需要 ①/② 两档状态输入;调用方执行决策后把
+        // 产出并入状态(① 由驱动装载、② 由 apply_activation 构建)。
+        let mut collider_loaded: Vec<ChunkPos> = Vec::new();
+        let d1 = c.plan(
+            &obs,
+            &loaded,
+            &collider_loaded,
+            &ents,
+            Tick::ZERO,
+            wide_region(),
+        );
         assert_eq!(d1.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(d1.chunks_to_unload, vec![ChunkPos::new(3, 1)]);
         assert_eq!(d1.entities_to_wake, vec![e1]);
         assert_eq!(d1.entities_to_freeze, vec![e2]);
-        // 同输入第二次:全部被冷却簿记挡下 → 空。
-        let d2 = c.plan(&obs, &loaded, &ents, Tick::ZERO, wide_region());
-        assert_eq!(
-            d2,
-            ActivationDecisions::default(),
-            "决策即簿记:第二次输出空"
+        collider_loaded = d1.colliders_to_build.clone();
+        // 同输入(状态随第一次决策前移)第二次:①③ 被冷却簿记挡下 → 空;
+        // ② 构建有积压(半径内未建 ① 多于 ② 预算)→ 逐拍续取(REQ-007 任务
+        // 01 新语义:② 预算截断的候选下拍重提,直到建满/冷却)。
+        let d2 = c.plan(
+            &obs,
+            &loaded,
+            &collider_loaded,
+            &ents,
+            Tick::ZERO,
+            wide_region(),
+        );
+        assert!(d2.chunks_to_load.is_empty() && d2.chunks_to_unload.is_empty());
+        assert!(d2.entities_to_wake.is_empty() && d2.entities_to_freeze.is_empty());
+        assert!(
+            !d2.colliders_to_build.is_empty() && d2.colliders_to_build != d1.colliders_to_build,
+            "② 积压续取:不与第一拍重复(已建集合已前移)"
         );
     }
 
@@ -790,5 +891,193 @@ mod tests {
             c.enforce_budget(&[Vec3::ZERO], &awake[..2]).is_empty(),
             "预算内 → 不淘汰"
         );
+    }
+
+    // ==== REQ-007 任务 01 新增(①② 拆分;任务书测试清单)====
+
+    /// I1:卸 ① 必同步拆 ②(执行点 = unload_chunk;此处锚定 plan 决策侧:
+    /// ① 卸载决策与 ② 拆除决策不相交——同 chunk 的 ② 随 ① 卸载同点拆,N2)。
+    #[test]
+    fn i1_unload_data_and_collider_drop_disjoint() {
+        let obs = [Vec3::new(200.0, 0.0, 8.0)]; // 远锚点:(3,1) ①② 双超半径
+        let mut c = ActivationController::new(ActivationConfig {
+            // 关 ① 装载候选:锚点邻域的近距装载候选会按距离升序占满 ① 预算,
+            // 卸载候选 (3,1)(距 144.9)永远轮空。半径归零后仅锚点所在 chunk
+            // (12,0)(距 0)仍是候选,预算 2 内装 1 卸 1,卸载决策可达。
+            data_load_radius: 0.0,
+            ..ActivationConfig::default()
+        });
+        let loaded = [ChunkPos::new(3, 1)];
+        let collider = [ChunkPos::new(3, 1)];
+        let d = c.plan(&obs, &loaded, &collider, &[], Tick::ZERO, wide_region());
+        assert_eq!(
+            d.chunks_to_unload,
+            vec![ChunkPos::new(3, 1)],
+            "① 超半径 → 卸"
+        );
+        assert!(
+            !d.colliders_to_drop.contains(&ChunkPos::new(3, 1)),
+            "N2:同 chunk 的 ② 不重复产出拆除(随 ① 卸载同点拆,I1)"
+        );
+    }
+
+    /// ② 先拆:两档半径不同(② 卸 32 < ① 卸 48),32–48 m 环带 ② 拆、① 保留
+    /// (B3 补漏路径:有 ① 无 ② 状态)。
+    #[test]
+    fn collider_drop_before_data_drop() {
+        let cfg = ActivationConfig {
+            collider_unload_radius: 32.0,
+            ..ActivationConfig::default()
+        };
+        // 中心 (72,8):距 12.7 ≤ 32。取 (3,0) 中心 (56,8):距 4。
+        // 需要一个 ① 在 32–48 带内:chunk (4,0) 中心 (72,8) 距锚 (40,8) = 32.x?
+        // 直接构造:锚点 (8,8);(4,0) 中心 (72,8) 距 64.06 > 48 → ①② 双拆,
+        // 不合用。改锚 (56,8):与 (4,0) 中心 (72,8) 距 16 ∈ (32 带外?)
+        // 16 < 32 → ② 不拆。需精确 32<dist≤48 对 (4,0):锚 x = 72-40 = 32 → (32,8)。
+        let obs2 = [Vec3::new(32.0, 0.0, 8.0)];
+        let mut c = ActivationController::new(cfg);
+        let loaded = [ChunkPos::new(4, 0)];
+        let collider = [ChunkPos::new(4, 0)];
+        let d = c.plan(&obs2, &loaded, &collider, &[], Tick::ZERO, wide_region());
+        let center_dist = {
+            let dx = 72.0_f32 - 32.0;
+            (dx * dx).sqrt()
+        };
+        assert!(
+            center_dist > 32.0 && center_dist <= 48.0,
+            "前置:(4,0) 中心距锚应在 (32,48] 带:实测 {center_dist}"
+        );
+        assert!(
+            d.chunks_to_unload.is_empty(),
+            "① 在 48 卸载半径内 → 保留:{:?}",
+            d.chunks_to_unload
+        );
+        assert_eq!(
+            d.colliders_to_drop,
+            vec![ChunkPos::new(4, 0)],
+            "② 超 32 卸载半径且 ① 保留 → 单独拆 ②(有①无②状态)"
+        );
+    }
+
+    /// ② 构建前提:① 未载不候选(即使半径内);预算独立:① 预算 0 不建 ②,
+    /// ② 预算 1 时 ①② 各自推进。
+    #[test]
+    fn collider_budget_independent_of_data() {
+        // ① 预算 0:无装载 → loaded 恒空 → ② 候选为空(前提:① 已载)。
+        let cfg0 = ActivationConfig {
+            data_budget_per_tick: 0,
+            ..ActivationConfig::default()
+        };
+        let obs = [Vec3::new(8.0, 0.0, 8.0)];
+        let mut c0 = ActivationController::new(cfg0);
+        let d = c0.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        assert!(d.chunks_to_load.is_empty(), "① 预算 0");
+        assert!(d.colliders_to_build.is_empty(), "① 未载 → ② 不候选(前提)");
+
+        // ①② 预算各 1:loaded=近 chunk 已载未建 → ② 建一个;① 另自装一个。
+        let cfg1 = ActivationConfig {
+            data_budget_per_tick: 1,
+            collider_budget_per_tick: 1,
+            ..ActivationConfig::default()
+        };
+        let mut c1 = ActivationController::new(cfg1);
+        let d = c1.plan(
+            &obs,
+            &[ChunkPos::new(-1, 0)],
+            &[],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(0, 0)],
+            "① 按预算 1 装载"
+        );
+        assert_eq!(
+            d.colliders_to_build,
+            vec![ChunkPos::new(-1, 0)],
+            "② 按预算 1 构建(① 已载;ChunkPos 升序取首个满足者)"
+        );
+    }
+
+    /// ② 冷却独立:构建后立即 SetBlock 重建不受 ② 冷却(重建不进簿记,
+    /// sim 侧直执行);此处锚定 plan 侧——已建(输入 collider_loaded)不再候选,
+    /// 重建是 sim 内部行为不经 plan。
+    #[test]
+    fn collider_cooldown_separate_from_data() {
+        let obs = [Vec3::new(8.0, 0.0, 8.0)];
+        let mut c = ActivationController::new(ActivationConfig::default());
+        // 拍 0:已载 (-1,0) 未建 → 构建(簿记 @0)。
+        let d = c.plan(
+            &obs,
+            &[ChunkPos::new(-1, 0)],
+            &[],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
+        assert_eq!(d.colliders_to_build, vec![ChunkPos::new(-1, 0)]);
+        // 拍 1(冷却未过):已建(输入前移)→ 不候选;同拍 SetBlock 重建是
+        // sim 内部行为(不经 plan),无"重建决策"通道可断言——非退化由
+        // sim::setblock_on_data_without_collider 覆盖重建路径。
+        let d = c.plan(
+            &obs,
+            &[ChunkPos::new(-1, 0)],
+            &[ChunkPos::new(-1, 0)],
+            &[],
+            Tick(1),
+            wide_region(),
+        );
+        assert!(d.colliders_to_build.is_empty(), "已建不重复构建");
+    }
+
+    /// 有 ① 无 ② 的 chunk 收 SetBlock:体素生效、本 chunk 不建 ②、已有 ② 的
+    /// 邻居照常重建(sim 侧;plan 不建 ② 的路径)。
+    #[test]
+    fn setblock_on_data_without_collider() {
+        use crate::sim::{ShardSim, ShardSimConfig};
+        use messaging::{InputPayload, SimCommand, StampedInput};
+        use types::{BlockPos, DimensionId, ShardPos, WorldId};
+        use voxel::SimpleRegistry;
+
+        let shard = types::ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0));
+        let mut s = ShardSim::new(
+            ShardSimConfig::new(shard),
+            Box::new(SimpleRegistry::builtin()),
+        );
+        // 实心 chunk(每格 stone):面剔除后至少一个 collider。
+        let solid = {
+            let mut ch = voxel::Chunk::air();
+            for x in 0..types::CHUNK_SIZE {
+                for y in 0..4 {
+                    for z in 0..types::CHUNK_SIZE {
+                        ch.set(x as usize, y as usize, z as usize, voxel::BlockId(1));
+                    }
+                }
+            }
+            ch
+        };
+        // 只装 ①(启用模式驱动路径):chunk (0,0) 有 ① 无 ②。
+        s.load_data_only(ChunkPos::new(0, 0), solid.clone());
+        assert!(!s.has_collider(ChunkPos::new(0, 0)), "① 在 ② 不在");
+        // SetBlock 写入该 chunk:体素生效;本 chunk 不建 ②(有①无② 路径)。
+        let input = StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource(1),
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SetBlock {
+                pos: BlockPos::new(0, types::WORLD_Y_MIN + 1, 0),
+                block: voxel::BlockId(1),
+            }),
+        };
+        s.apply_prefix(&[input]);
+        assert!(
+            !s.has_collider(ChunkPos::new(0, 0)),
+            "有①无② chunk 写块不建 ②"
+        );
+        // 邻居照常:给邻居先建 ②(合一装载),再写邻居 → ② 重建(非退化)。
+        s.load_chunk(ChunkPos::new(1, 0), solid);
+        assert!(s.has_collider(ChunkPos::new(1, 0)), "合一装载建 ②(对照)");
     }
 }

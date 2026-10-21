@@ -379,7 +379,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
     // 冷却关(瞬移装卸立即生效)+ 预算给足(卸载候选与远邻域装载候选同队竞争,
     // 照 driver.rs chunk_unload 测试同款)。
     config.activation.cooldown_secs = 0;
-    config.swap_budget_chunks_per_tick = 14;
+    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config)
 
     let session = Session::new(config.session_config());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
@@ -512,7 +512,8 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
 fn acg5_activation_config() -> SimActivationConfig {
     SimActivationConfig {
         cooldown_ticks: 0,
-        swap_budget_chunks_per_tick: 14,
+        data_budget_per_tick: 14,
+        collider_budget_per_tick: 14,
         ..SimActivationConfig::default()
     }
 }
@@ -872,7 +873,7 @@ async fn acg6_persisted_after_process_restart() {
         ..Config::default()
     };
     config.activation.cooldown_secs = 0;
-    config.swap_budget_chunks_per_tick = 14;
+    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config)
 
     // —— 段 1:bootstrap(空目录)→ 驱动生命周期 → 完整退出(终末 flush +
     //    store.shutdown,redb 锁释放 = 进程重启的等价前置)——

@@ -366,4 +366,90 @@ mod tests {
         assert_eq!(last.entities_to_wake, vec![e], "180 拍冷却满 → 唤醒");
         assert!(last.entities_to_freeze.is_empty());
     }
+
+    /// 任务书测试 `snapshot_roundtrips_collider_set_and_cooldowns`(REQ-007
+    /// 任务 01/细则 10):② 集合 + 两套冷却簿记随快照往返;恢复**不"凡 ①
+    /// 皆建 ②"**;恢复后策略照常(状态 ≠ 策略冻结)。
+    /// 判别器(② 簿记):远锚拍 0 拆 (0,0) ②、建 (1,0) ②(apply_activation
+    /// 当场执行,簿记均 @0)→ 快照 → 恢复 → 回近锚:(0,0) 有①无② 且半径内
+    /// 本应立即成为构建候选,被 ② 簿记 @0 挡下 → 全空;簿记丢失则决策立即
+    /// 重现。满 180 拍后决策重现(冷却窗口随档)。
+    #[test]
+    fn snapshot_roundtrips_collider_set_and_cooldowns() {
+        // ---- 场景 A:② 侧(② 集合 + ② 冷却簿记)----
+        let cfg_a = ShardSimConfig {
+            activation: crate::ActivationConfig {
+                collider_unload_radius: 32.0,
+                ..crate::ActivationConfig::default()
+            },
+            ..cfg()
+        };
+        let mut a = ShardSim::new(cfg_a, Box::new(SimpleRegistry::builtin()));
+        let solid = {
+            let mut ch = voxel::Chunk::air();
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    ch.set(x, 64, z, types::BlockId(1));
+                }
+            }
+            ch
+        };
+        a.load_chunk(types::ChunkPos::new(0, 0), solid.clone());
+        a.load_data_only(types::ChunkPos::new(1, 0), solid.clone());
+        // 拍 0 远锚 (48,·,8):(0,0) 中心距 40 > 32 且 ① 留 → 拆 ②;
+        // (1,0) 中心距 24 ≤ 32 且 ① 在未建 → 建 ②。两者当场执行。
+        let far = [Vec3::new(48.0, 0.0, 8.0)];
+        let d = a.apply_activation(&far);
+        assert_eq!(d.colliders_to_drop, vec![types::ChunkPos::new(0, 0)]);
+        assert_eq!(d.colliders_to_build, vec![types::ChunkPos::new(1, 0)]);
+        assert!(!a.has_collider(types::ChunkPos::new(0, 0)), "拆除已执行");
+        assert!(a.has_collider(types::ChunkPos::new(1, 0)), "构建已执行");
+
+        let bytes = a.snapshot();
+        let mut b = ShardSim::restore(&bytes, Box::new(SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        // ② 集合逐位往返;恢复不"凡 ① 皆建 ②"((0,0) 有①无② 原样)。
+        assert_eq!(b.collider_loaded_chunks(), a.collider_loaded_chunks());
+        assert_eq!(
+            b.collider_loaded_chunks(),
+            std::iter::once(types::ChunkPos::new(1, 0)).collect(),
+            "② 集合 = {{(1,0)}};(0,0) 不被恢复补建"
+        );
+
+        // 回近锚 (8,·,8)(激活拍 1):(0,0) ① 在无 ② 距 0 ≤ 32 → 构建候选,
+        // 被 ② 簿记 @0(拆除记的)挡下 → 全空;簿记丢失 → 立即重现构建决策。
+        let near = [Vec3::new(8.0, 0.0, 8.0)];
+        let d = b.apply_activation(&near);
+        assert!(
+            d.colliders_to_build.is_empty() && d.colliders_to_drop.is_empty(),
+            "② 簿记随快照往返:回锚重刷全空(实得 build={:?} drop={:?})",
+            d.colliders_to_build,
+            d.colliders_to_drop
+        );
+        // 满 180 拍(激活拍 180,now-last ≥ cooldown)→ 构建决策重现。
+        let mut last = crate::ActivationDecisions::default();
+        for _ in 0..179 {
+            last = b.apply_activation(&near);
+        }
+        assert_eq!(
+            last.colliders_to_build,
+            vec![types::ChunkPos::new(0, 0)],
+            "冷却满 → 构建决策重现(策略未随快照冻结)"
+        );
+
+        // ---- 场景 B:① 侧簿记(同法)----
+        let mut c = ShardSim::new(cfg(), Box::new(SimpleRegistry::builtin()));
+        c.load_data_only(types::ChunkPos::new(1, 0), solid);
+        let distant = [Vec3::new(200.0, 0.0, 8.0)]; // (1,0) 距 176 > 48 → ① 卸
+        let d = c.apply_activation(&distant);
+        assert_eq!(d.chunks_to_unload, vec![types::ChunkPos::new(1, 0)]);
+        let bytes = c.snapshot();
+        let d2 = ShardSim::restore(&bytes, Box::new(SimpleRegistry::builtin()))
+            .expect("自有快照必可解码")
+            .apply_activation(&distant);
+        assert!(
+            d2.chunks_to_unload.is_empty() && d2.chunks_to_load.is_empty(),
+            "① 簿记随快照往返:立即重刷全空"
+        );
+    }
 }

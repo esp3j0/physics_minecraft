@@ -414,8 +414,17 @@ impl Session {
     }
 
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
+    /// REQ-007 任务 01(①② 拆分/D17):激活已启用 → 只装 ①(体素),② 由
+    /// 下一拍激活决策构建(细则 11);未启用 → 合一装 ①②(现状,§14-9)。
+    /// 签名不变;分档在调度器 `apply_chunk_load_tiered`。
     pub fn apply_chunk_load(&mut self, shard: ShardId, pos: types::ChunkPos, chunk: voxel::Chunk) {
         self.scheduler.apply_chunk_load(shard, pos, chunk)
+    }
+
+    /// 调度器透传(REQ-007 任务 01):某分片某 chunk 的 ② 是否已建
+    /// (基线比对/断言观测用)。分片未注册 → false。
+    pub fn has_collider(&self, shard: ShardId, pos: types::ChunkPos) -> bool {
+        self.scheduler.has_collider(shard, pos)
     }
 
     /// 调度器透传(REQ-002 §4.4):卸载一个 chunk(返回供持久化;未装载 → None)。

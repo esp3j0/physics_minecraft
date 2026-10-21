@@ -948,7 +948,8 @@ fn acc5_checkpoint_observers_and_lifecycle() {
     // 冷却关 + 预算大(两线激活时钟在快照后一致;acg5 同款口径)。
     let act = SimActivationConfig {
         cooldown_ticks: 0,
-        swap_budget_chunks_per_tick: 14,
+        data_budget_per_tick: 14,
+        collider_budget_per_tick: 14,
         ..SimActivationConfig::default()
     };
     let mk = |x: i32, z: i32| {
@@ -1985,7 +1986,7 @@ async fn pending_blockwrite_cells_defer_window() {
         despawn_after_secs: 2, // 加速回收(工程细节,acg4 同款授权)
         ..Config::default()
     };
-    config.swap_budget_chunks_per_tick = 14; // 邻域一拍装齐(预算 2 会拖拍序)
+    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config) // 邻域一拍装齐(预算 2 会拖拍序)
     let session = Session::new(config.session_config());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let checkpoints = SharedCheckpoints::default();

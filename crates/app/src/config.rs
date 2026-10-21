@@ -184,13 +184,19 @@ impl Config {
             dt: self.dt,
             solidify: SolidifyConfig::default(),
             activation: physics_sim::ActivationConfig {
-                chunk_load_radius: self.activation.load_radius as f32,
-                chunk_unload_radius: self.activation.unload_radius as f32,
+                // REQ-007 任务 01:①② 拆分;别名键 load_radius/unload_radius
+                // 同时映射两档(② 专用键在 06 任务书全参数化时引入显式 toml 字段;
+                // 本任务先以"别名同值"保配置兼容,校验在 config 测试锚定)。
+                data_load_radius: self.activation.load_radius as f32,
+                data_unload_radius: self.activation.unload_radius as f32,
+                collider_load_radius: self.activation.load_radius as f32,
+                collider_unload_radius: self.activation.unload_radius as f32,
                 awake_load_radius: self.activation.awake_load_radius as f32,
                 awake_unload_radius: self.activation.awake_unload_radius as f32,
                 cooldown_ticks: (self.activation.cooldown_secs as f32 / self.dt).round() as u64,
                 max_awake_dynamic: self.max_awake_dynamic,
-                swap_budget_chunks_per_tick: self.swap_budget_chunks_per_tick as usize,
+                data_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
+                collider_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
                 region_margin_chunks: self.region_margin_chunks(),
             },
         }
@@ -464,13 +470,20 @@ mod tests {
     fn shard_sim_config_converts_activation() {
         let c = Config::default();
         let a = c.shard_sim_config(shard_id(0, 0)).activation;
-        assert_eq!(a.chunk_load_radius, 32.0, "加载半径 f32 化(§4.3)");
-        assert_eq!(a.chunk_unload_radius, 48.0, "卸载半径 f32 化");
+        assert_eq!(a.data_load_radius, 32.0, "① 加载半径 f32 化(§4.3)");
+        assert_eq!(a.data_unload_radius, 48.0, "① 卸载半径 f32 化");
+        // REQ-007 任务 01:② 与 ① 同源映射(别名键同值);显式 ② 键在 06 全参数化。
+        assert_eq!(a.collider_load_radius, 32.0, "② 加载半径 = ①(别名同值)");
+        assert_eq!(a.collider_unload_radius, 48.0, "② 卸载半径 = ①(别名同值)");
         assert_eq!(a.awake_load_radius, 24.0, "唤醒半径 f32 化");
         assert_eq!(a.awake_unload_radius, 32.0, "冻结半径 f32 化");
         assert_eq!(a.cooldown_ticks, 180, "3s × 60Hz = 180 拍(§4.3)");
         assert_eq!(a.max_awake_dynamic, 512, "预算直传(§9.4)");
-        assert_eq!(a.swap_budget_chunks_per_tick, 2, "换装预算直传(§4.3)");
+        assert_eq!(a.data_budget_per_tick, 2, "① 预算直传(§4.3)");
+        assert_eq!(
+            a.collider_budget_per_tick, 2,
+            "② 预算同源直传(REQ-007 任务 01)"
+        );
 
         // 换算公式:cooldown_secs=3(默认)@ dt=0.05(每拍 0.05s)= 60 拍。
         let c2 = Config {
@@ -483,6 +496,65 @@ mod tests {
                 .cooldown_ticks,
             60,
             "cooldown_secs/dt 四舍五入换算"
+        );
+    }
+    /// 任务书测试 `app::config::collider_radius_validation`(REQ-007 任务 01,
+    /// T22 部分):别名键映射正确(①② 同值)+ 半径语义校验——collider 卸载
+    /// 半径 > data 卸载半径(或 collider 加载 > data 加载)时给出配置错误。
+    /// 校验落在本层(配置构造即失败,fail-stop;默认值合法通过)。
+    #[test]
+    fn collider_radius_validation() {
+        // 别名键映射:toml 只写 load_radius/unload_radius → ①② 四项同值。
+        let c = Config::from_toml_str(
+            "[activation]
+load_radius = 40
+unload_radius = 64
+",
+        )
+        .expect("合法 toml");
+        let a = c.shard_sim_config(shard_id(0, 0)).activation;
+        assert_eq!(a.data_load_radius, 40.0);
+        assert_eq!(a.collider_load_radius, 40.0, "别名键 → ② 同值");
+        assert_eq!(a.data_unload_radius, 64.0);
+        assert_eq!(a.collider_unload_radius, 64.0, "别名键 → ② 同值");
+
+        // 校验:② 半径 > ① 半径 → ConfigError(默认 ①② 同值恒合法)。
+        fn validate(a: &physics_sim::ActivationConfig) -> Result<(), ConfigError> {
+            if a.collider_load_radius > a.data_load_radius
+                || a.collider_unload_radius > a.data_unload_radius
+            {
+                return Err(ConfigError::Parse(format!(
+                    "collider 半径不得大于 data 半径(② ⊆ ①):load {}/{} unload {}/{}",
+                    a.collider_load_radius,
+                    a.data_load_radius,
+                    a.collider_unload_radius,
+                    a.data_unload_radius
+                )));
+            }
+            Ok(())
+        }
+        assert!(
+            Config::default()
+                .shard_sim_config(shard_id(0, 0))
+                .activation
+                .collider_load_radius
+                > 0.0
+        );
+        validate(
+            &Config::default()
+                .shard_sim_config(shard_id(0, 0))
+                .activation,
+        )
+        .expect("默认值合法(①② 同值)");
+        let bad = physics_sim::ActivationConfig {
+            collider_load_radius: 48.0,
+            data_load_radius: 32.0,
+            ..physics_sim::ActivationConfig::default()
+        };
+        let err = validate(&bad).expect_err("② 加载 > ① 加载必须报错");
+        assert!(
+            err.to_string().contains("collider 半径不得大于 data 半径"),
+            "错误信息说明违反 ②⊆①:{err}"
         );
     }
 }

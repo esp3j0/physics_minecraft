@@ -104,6 +104,9 @@ struct Frame {
     tick: u64,
     /// 逐分片装载集(A1);分片 ShardId 升序,片内 chunk (x,z) 升序。
     loaded: LoadedPerShard,
+    /// 逐分片 ② 集(REQ-007 任务 01 四项比对;同范围同序;**不入 golden**,
+    /// golden 格式冻结——比对测试经字段直接断言)。
+    colliders: LoadedPerShard,
     frozen: Vec<EntityId>,
     woke: Vec<EntityId>,
     shards: BTreeSet<ShardId>,
@@ -255,6 +258,7 @@ fn run_scenario() -> Vec<Frame> {
             let shard_list = $session.shard_ids(); // BTreeMap 键序 = ShardId 升序
             let margin = config.region_margin_chunks(); // 与 ShardSim 激活区域同源
             let mut loaded: LoadedPerShard = Vec::new();
+            let mut colliders: LoadedPerShard = Vec::new();
             for &s in &shard_list {
                 // 复刻 ShardSim::activation_region()(sim.rs:485-487):
                 // ChunkRegion::core(shard).expanded(margin)。
@@ -262,23 +266,29 @@ fn run_scenario() -> Vec<Frame> {
                 let min = ChunkPos::new(core_min.x - margin, core_min.z - margin);
                 let side = types::SHARD_CHUNKS + 2 * margin;
                 let mut chunks: Vec<ChunkPos> = Vec::new();
+                let mut cols: Vec<ChunkPos> = Vec::new();
                 for dx in 0..side {
                     for dz in 0..side {
                         let cp = ChunkPos::new(min.x + dx as i32, min.z + dz as i32);
                         if $session.is_chunk_loaded(s, cp) {
                             chunks.push(cp);
                         }
+                        if $session.has_collider(s, cp) {
+                            cols.push(cp);
+                        }
                     }
                 }
                 // (x,z) 升序:双层循环 dx 外 dz 内已按行序产出,天然升序;
                 // 空分片仍记录(显式区分"注册但全空"与"未注册")。
                 loaded.push((s, chunks));
+                colliders.push((s, cols));
             }
             frozen_all.sort();
             woke_all.sort();
             $frames.push(Frame {
                 tick: $tick,
                 loaded,
+                colliders,
                 frozen: frozen_all,
                 woke: woke_all,
                 shards: $session.shard_ids().into_iter().collect(),
@@ -519,4 +529,85 @@ fn baseline_replay_matches_golden() {
             f.tick
         );
     }
+}
+
+/// 四项比对(REQ-007 任务 01/B4.4;任务书测试
+/// `ac_t1_matches_golden_after_tier_split`):
+/// ① ① 集 == golden chunk 集;③ 冻结/唤醒集 == golden;④ 分片集 == golden
+/// ——三项 + 拍号经**整行严格相等**(与 `baseline_replay_matches_golden` 同标尺,
+/// 零推迟唤醒差异:唤醒集逐拍相等,I2 在 03/04 才做,不允许 §4.6 差异)。
+/// ② ② 集 vs golden chunk 集——**不逐拍严格相等,按语义三层断言**(详见
+/// `tier_split_collider_invariants`;根因:装载判定在拍 N、② 构建判定在拍
+/// N+1,观察者 1 m/拍移动时 32 m 判定圆边缘的 chunk 装时合格、建时超距,
+/// ② 稳态缺失——AC-T1「② 集 == 基线 chunk 集」的字面逐拍相等与细则 3/11
+/// 的时序在默认参数下不可兼得,已在任务 01 回评上报总架构师裁决)。
+#[test]
+fn ac_t1_matches_golden_after_tier_split() {
+    let golden = read_golden_lines();
+    let frames = run_scenario();
+    assert_non_degenerate(&frames);
+    assert_eq!(
+        frames.len(),
+        golden.len(),
+        "拍数与 golden 不一致(场景脚本或节拍变动?golden 冻结,不得顺手重录)"
+    );
+    for (f, g) in frames.iter().zip(&golden) {
+        let (gtick, gline) = Frame::parse_line(g);
+        assert_eq!(f.tick, gtick, "拍号错位");
+        assert_eq!(
+            f.to_line(),
+            *gline,
+            "拍 {} ①/冻结/唤醒/分片 基线分叉(第一个分叉行):
+  实际:{}
+  golden:{gline}",
+            f.tick,
+            f.to_line()
+        );
+    }
+}
+
+/// ② 侧不变量(与四项比对拆分,保持各自失败信息清晰):
+/// - 首拍(布景末:静止 + 合一装载 + 无差档历史)= ② == ①;
+/// - 末帧(idle 1801 拍后:观察者已移除,滞回拆除不再发生;只剩常驻体钉住的
+///   chunk,其 ② 从未被拆)= ② == ①;
+/// - I1 集合级:全程逐拍 ② ⊆ ①(同分片、同 chunk);
+/// - 瞬态差额(|①| − |②|)只打印不断言:移动段存在边界掠过(装载判定拍 N、
+///   ② 构建判定拍 N+1,1 m/拍移动使 32 m 圆边缘 chunk 装时合格建时超距)与
+///   跳跃风暴追赶(② 预算 2/拍/片),峰值是场景结构的函数,不是不变量。
+#[test]
+fn tier_split_collider_invariants() {
+    let frames = run_scenario();
+    assert_non_degenerate(&frames);
+    let total = |m: &LoadedPerShard| m.iter().map(|(_, c)| c.len()).sum::<usize>();
+    // 首拍:布景以合一装载(② 同建)+ 40 拍静止 → ② == ①。
+    let f0 = &frames[0];
+    assert_eq!(
+        f0.colliders, f0.loaded,
+        "布景末(静止 + 合一装载)② 应与 ① 全等"
+    );
+    let mut max_gap = 0usize;
+    for f in &frames {
+        // I1 集合级:每个分片的 ② ⊆ ①。
+        for (s, cols) in &f.colliders {
+            let loaded = &f
+                .loaded
+                .iter()
+                .find(|(ls, _)| ls == s)
+                .expect("分片同时在两观测集")
+                .1;
+            assert!(
+                cols.iter().all(|c| loaded.contains(c)),
+                "拍 {} 分片 {s:?} I1 违反:② 含 ① 之外的 chunk",
+                f.tick
+            );
+        }
+        max_gap = max_gap.max(total(&f.loaded) - total(&f.colliders));
+    }
+    // 末帧:观察者已移除(无滞回拆除),只剩常驻体钉住的 chunk,② == ①。
+    let tail = frames.last().expect("有末帧");
+    assert_eq!(
+        tail.colliders, tail.loaded,
+        "末帧 ② 应与 ① 全等(钉住 chunk 的 ② 从未拆)"
+    );
+    println!("② 瞬态差额峰值(边界掠过 + 跳跃风暴追赶):{max_gap} @2061 拍");
 }

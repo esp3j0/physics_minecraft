@@ -402,7 +402,7 @@ pub struct DriverOutcome {
     pub chunks_unloaded: u64,
 }
 
-/// 检查点格式版本(REQ-005 D8;REQ-006 任务 03 升版):预发布阶段不兼容
+/// 检查点格式版本(REQ-005 D8;REQ-007 任务 01 升版,B5):预发布阶段不兼容
 /// 旧格式——升版即破格,磁盘上现存旧 checkpoint 从此不可用(bootstrap 显式
 /// 报错,不写迁移逻辑)。`format_version != CHECKPOINT_FORMAT_VERSION` →
 /// `AppError::Decode`(明确、不静默降级)。
@@ -410,7 +410,10 @@ pub struct DriverOutcome {
 /// `MigrateEntity.actor/source` 改变分片快照布局;v1 档必须清 `data_dir`。
 /// **v3**(#12):bundle 追加尾字段 `spawn_next_seq`——bincode 非自描述,
 /// v2 档解码必 UnexpectedEnd/版本拒绝;同样必须清 `data_dir`。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 3;
+/// **v4**(REQ-007 任务 01):`ActivationConfig` 拆 ①② 参数、`ActivationController`
+/// 增 ② 冷却表、`ShardSimConfig` 字段更名——v3 档解码必失败/版本拒绝;必须清
+/// `data_dir`。02–05 任务快照布局还会变,版本保持 4 不再逐任务升。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 4;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -2382,6 +2385,49 @@ mod tests {
         match decode(&v2_bytes) {
             Err(AppError::Decode(_)) => {}
             other => panic!("v2 三字段字节必须 Err(Decode),实为 {:?}", other.is_err()),
+        }
+
+        // ⑤ v3(REQ-007 任务 01 之前的格式,四字段)→ 版本拒绝;分片快照布局
+        //    已随 ①② 拆分改变(ActivationConfig 拆参/② 冷却表/字段更名),
+        //    必须清 data_dir(B5;v2/v1/v0 拒绝测试补齐在 06)。
+        let v3 = CheckpointBundle {
+            format_version: 3,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        match decode(&encode(&v3)) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 3"),
+                    "v3 必须明确报版本错误:{msg}"
+                );
+            }
+            other => panic!("v3 旧档必须版本拒绝,实为 {:?}", other.is_err()),
+        }
+    }
+
+    /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
+    /// 常量已升 4;v3 编码(bundle 形状同构、版本号 3)必须显式版本拒绝。
+    /// 与 `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,一个锚常量。
+    #[test]
+    fn checkpoint_v4_rejects_v3() {
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 4, "任务 01 起 = v4(B5)");
+        let v3 = CheckpointBundle {
+            format_version: 3,
+            world: sim_api::snapshot::WorldSnapshot {
+                shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(7)),
+                scheduler: empty_scheduler_snapshot(types::Tick(7)),
+            },
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        match decode(&encode(&v3)) {
+            Err(AppError::Decode(msg)) => assert!(
+                msg.contains("unsupported checkpoint format version 3"),
+                "v3 拒绝信息必须带版本说明:{msg}"
+            ),
+            other => panic!("v3 旧档必须 Err(Decode),实为 {:?}", other.is_err()),
         }
     }
 

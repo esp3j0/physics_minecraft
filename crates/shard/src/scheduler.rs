@@ -236,6 +236,14 @@ impl Scheduler {
         Some(self.observer_table.values().copied().collect())
     }
 
+    /// D17 激活启用开关(REQ-007 §4.0,任务 01):曾设置过观察者(区域票
+    /// 在任务 02 并入)即启用。单向,随快照(沿用 `observers_ever_set` 的
+    /// 快照位置)。未启用时:装载合一(① + ② 同建,`apply_chunk_load` 走
+    /// 旧路径)、激活完全不生效——行为与 `8702670` 一致。
+    pub fn activation_enabled(&self) -> bool {
+        self.observers_ever_set
+    }
+
     /// 观察者只读视图(REQ-002 §4.2;驱动 ensure_shard/票判定用):
     /// `(source, position)`,按 InputSource 升序(BTreeMap 键序)。
     pub fn observers(&self) -> Vec<(InputSource, types::glam::Vec3)> {
@@ -351,6 +359,14 @@ impl Scheduler {
         self.sims.get(&shard)?.voxel().get_chunk(pos)
     }
 
+    /// ② 是否已建(REQ-007 任务 01;基线比对/断言观测用)。
+    /// 分片未注册 → false。
+    pub fn has_collider(&self, shard: ShardId, pos: ChunkPos) -> bool {
+        self.sims
+            .get(&shard)
+            .is_some_and(|sim| sim.has_collider(pos))
+    }
+
     /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
     /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
     /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内
@@ -451,10 +467,13 @@ impl Scheduler {
                  驱动 ensure 必须先建 owner,REQ-005 D5,fail-stop)"
             );
         }
+        // D17 装载分支(REQ-007 §4.0/任务 01):启用 → 只装 ①(② 由激活
+        // 决策构建);未启用 → 合一装载(① + ② 同建,行为与 8702670 一致)。
+        let enabled = self.activation_enabled();
         self.sims
             .get_mut(&shard)
             .expect("上方已校验注册")
-            .load_chunk(pos, chunk);
+            .apply_chunk_load_tiered(pos, chunk, enabled);
         self.chunk_holders.register(owner, pos, shard);
     }
 
@@ -994,7 +1013,7 @@ impl Scheduler {
             .sims
             .values()
             .next()
-            .map(|s| s.activation_config().chunk_unload_radius)
+            .map(|s| s.activation_config().data_unload_radius)
             .unwrap_or(48.0);
         let radius_sq = radius * radius;
         let min = shard.pos.min_chunk();
@@ -1571,6 +1590,74 @@ mod tests {
             "第二次取为空(恰一次:取走即清)"
         );
         sched.shutdown();
+    }
+
+    // ---- REQ-007 任务 01(D17 激活启用开关;任务书测试
+    // `activation_enabled_flag_semantics`,语义载体 = 调度器) ----
+
+    /// 未设观察者 → false;设置一次 → 永久 true(单向,remove_observer 不回退);
+    /// 快照往返保持(`observers_ever_set` 沿用原快照位置)。另锚定装载分档:
+    /// 未启用时合一(①② 同建),启用后装载只 ①、② 待激活决策。
+    #[test]
+    fn activation_enabled_flag_semantics() {
+        use types::glam::Vec3;
+        // 实心 chunk(空气 chunk 贪心切分为 0 盒 → 不插 chunk_bodies,
+        // has_collider 恒 false,无法作判别器)。
+        let solid = {
+            let mut ch = voxel::Chunk::air();
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    ch.set(x, 64, z, types::BlockId(1));
+                }
+            }
+            ch
+        };
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        assert!(
+            !sched.activation_enabled(),
+            "未设观察者 → 未启用(D17:激活完全不生效)"
+        );
+
+        // 未启用装载 = 合一(①② 同建;§14-9 现状行为)。
+        let cp = types::ChunkPos::new(0, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp, solid.clone());
+        assert!(
+            sched.sims[&shard_id(0, 0)].has_collider(cp),
+            "未启用:合一装载建 ②(行为与 8702670 一致)"
+        );
+
+        // 设置一次 → 永久启用;remove_observer 不回退(单向)。
+        sched.submit_observer(observer_input(1, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 8.0)));
+        sched.tick();
+        assert!(sched.activation_enabled(), "曾设观察者 → 启用");
+        sched.remove_observer(InputSource(1));
+        assert!(
+            sched.activation_enabled(),
+            "单向开关:移除观察者不回退(表空不清 observers_ever_set)"
+        );
+
+        // 启用后装载 = 只 ①(② 由激活决策构建,细则 11)。
+        let cp2 = types::ChunkPos::new(1, 0);
+        sched.apply_chunk_load(shard_id(0, 0), cp2, solid);
+        let s = &sched.sims[&shard_id(0, 0)];
+        assert!(!s.has_collider(cp2), "启用:装载只 ①,② 待激活决策");
+        assert!(s.has_collider(cp), "旧 chunk 的 ② 不受影响");
+
+        // 快照往返保持:开关 + 观察者表沿原快照位置走。
+        let snap = sched.snapshot_state();
+        let mut sched2 = Scheduler::new(SchedulerConfig {
+            start_tick: snap.tick,
+            ..sched_cfg(2)
+        });
+        sched2.register(sim(0, 0));
+        sched2.restore_state(snap);
+        assert!(
+            sched2.activation_enabled(),
+            "observers_ever_set 随 SchedulerSnapshot 往返"
+        );
+        sched.shutdown();
+        sched2.shutdown();
     }
 
     // ---- REQ-005 任务 00(归属/持有/owner-only 持久化/信封黑洞) ----

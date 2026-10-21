@@ -235,23 +235,88 @@ impl ShardSim {
     }
 
     /// 加载一个体素 chunk 并(与已加载邻居一起)重建边界 collider。
+    ///
+    /// REQ-007 任务 01(①② 拆分/D17):本方法 = **合一装载**(① + ② 同建),
+    /// 供激活未启用模式(§4.0:行为与 `8702670` 一致)与既有测试。启用模式
+    /// 的驱动路径 = [`Self::load_data_only`](只装 ①),② 由激活决策构建。
     pub fn load_chunk(&mut self, cp: ChunkPos, chunk: Chunk) {
+        self.load_data_only(cp, chunk);
+        for ncp in expand_boundary([cp], &self.voxels) {
+            self.rebuild_chunk_collider(ncp);
+        }
+    }
+
+    /// 只装 ①(体素),不建本 chunk ②;已有 ② 的邻居照常重建(REQ-007
+    /// 任务 01 细则 5)。启用模式的驱动装载路径。
+    pub fn load_data_only(&mut self, cp: ChunkPos, chunk: Chunk) {
         self.voxels.insert_chunk(cp, chunk);
-        for cp in expand_boundary([cp], &self.voxels) {
-            self.rebuild_chunk_collider(cp);
+        for ncp in expand_boundary([cp], &self.voxels) {
+            // 只重建**已有 ②** 的邻居(无 ② 的邻居不因邻居 ① 到达而新建)。
+            if self.chunk_bodies.contains_key(&ncp) {
+                self.rebuild_chunk_collider(ncp);
+            }
+        }
+    }
+
+    /// 装载的 D17 开关臂(调度器 `apply_chunk_load` 调用;REQ-007 §4.0):
+    /// enabled → 只 ①;未启用 → 合一(① + ② 同建,行为与 8702670 一致)。
+    pub fn apply_chunk_load_tiered(&mut self, cp: ChunkPos, chunk: Chunk, enabled: bool) {
+        if enabled {
+            self.load_data_only(cp, chunk);
+        } else {
+            self.load_chunk(cp, chunk);
         }
     }
 
     /// 卸载一个 chunk(返回它供持久化屏障),重建邻居边界 collider。
+    ///
+    /// REQ-007 任务 01(I1):卸 ① 必同步拆 ②(同一执行点;debug 断言
+    /// "有 ② 必有 ①" 的对称操作)。
     pub fn unload_chunk(&mut self, cp: ChunkPos) -> Option<Chunk> {
         let removed = self.voxels.remove_chunk(cp);
         if let Some(handle) = self.chunk_bodies.remove(&cp) {
             self.phys.remove_body(handle);
         }
+        // 边界重建同样只动已建 ②:邻居 ① 卸载不给无 ② 的邻居新建 ②(细则 4;
+        // 未启用模式所有 ① 皆有 ②,守卫恒真,行为不变)。
         for ncp in expand_boundary([cp], &self.voxels) {
-            self.rebuild_chunk_collider(ncp);
+            if self.chunk_bodies.contains_key(&ncp) {
+                self.rebuild_chunk_collider(ncp);
+            }
         }
         removed
+    }
+
+    /// ② 是否已建(测试/I1 断言/观测用;REQ-007 任务 01)。
+    pub fn has_collider(&self, cp: ChunkPos) -> bool {
+        self.chunk_bodies.contains_key(&cp)
+    }
+
+    /// ② 已建集合(快照重建/观测用;BTreeMap 键序 = ChunkPos 升序)。
+    pub fn collider_loaded_chunks(&self) -> BTreeSet<ChunkPos> {
+        self.chunk_bodies.keys().copied().collect()
+    }
+
+    /// 只建 ②(体素在手;plan 的 colliders_to_build 执行点,B3)。
+    /// 无 ① → panic(② 构建前提:① 已载;plan 候选已过滤,违反 = bug)。
+    fn build_chunk_collider(&mut self, cp: ChunkPos) {
+        assert!(
+            self.voxels.get_chunk(cp).is_some(),
+            "构建 ② 时 ① 未装(I1 违反,fail-stop):{cp:?}"
+        );
+        debug_assert!(
+            !self.chunk_bodies.contains_key(&cp),
+            "重复构建 ②(plan 决策应过滤已建;fail-stop):{cp:?}"
+        );
+        self.rebuild_chunk_collider(cp);
+    }
+
+    /// 只拆 ②(① 保留;plan 的 colliders_to_drop 执行点,B3/N2)。
+    /// 无 ② → 无操作(幂等;防御)。
+    fn drop_chunk_collider(&mut self, cp: ChunkPos) {
+        if let Some(handle) = self.chunk_bodies.remove(&cp) {
+            self.phys.remove_body(handle);
+        }
     }
 
     /// 应用一个 tick 的输入前缀(命令/事件/信封,按 canonical 序)。
@@ -299,8 +364,11 @@ impl ShardSim {
                              装载着该 chunk,内部一致性违规,fail-stop)"
                         );
                         if self.voxels.set_block(pos, block).is_ok() {
+                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                             for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
-                                self.rebuild_chunk_collider(cp);
+                                if self.chunk_bodies.contains_key(&cp) {
+                                    self.rebuild_chunk_collider(cp);
+                                }
                             }
                         }
                     }
@@ -420,8 +488,11 @@ impl ShardSim {
                 if !too_far || is_sleeping {
                     // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
                     if self.voxels.set_block(cell, desc.block).is_ok() {
+                        // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                         for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
-                            self.rebuild_chunk_collider(cp);
+                            if self.chunk_bodies.contains_key(&cp) {
+                                self.rebuild_chunk_collider(cp);
+                            }
                         }
                         self.entities.remove(&id).expect("存在");
                         self.phys.remove_body(handle);
@@ -492,6 +563,8 @@ impl ShardSim {
         self.observed = Some(observers.to_vec());
         let region = self.activation_region();
         let loaded: Vec<ChunkPos> = self.voxels.chunk_positions().collect();
+        // ② 已建集合(REQ-007 任务 01:plan 的 ② 决策输入;= chunk_bodies 键)。
+        let collider_loaded: Vec<ChunkPos> = self.chunk_bodies.keys().copied().collect();
         let entities: Vec<(EntityId, Vec3, bool)> = self
             .entities
             .iter()
@@ -500,9 +573,23 @@ impl ShardSim {
                 (*id, conv::rapier_to_vec3(b.translation()), b.is_kinematic())
             })
             .collect();
-        let decisions = self
-            .activation
-            .plan(observers, &loaded, &entities, now, region);
+        let decisions =
+            self.activation
+                .plan(observers, &loaded, &collider_loaded, &entities, now, region);
+
+        // tier② 落实(REQ-007 任务 01/B3:N3——决策在 plan,执行在此,与
+        // ③ 冻结/唤醒同方式;驱动层不执行 ②):
+        // - build:同 load_chunk 的 collider 语义(体素在手,greedy + compound);
+        // - drop:同 unload_chunk 的 collider 拆除部分(① 保留,I1 由 unload_chunk
+        //   的同步拆除另行保证;此处只拆"① 仍在、② 超半径"的);
+        // - 与 chunks_to_unload 相交的 chunk 不在此处理(N2:其 ② 随 ① 卸载
+        //   同点拆,碰撞体不早消失一个 step)。
+        for &cp in &decisions.colliders_to_build {
+            self.build_chunk_collider(cp);
+        }
+        for &cp in &decisions.colliders_to_drop {
+            self.drop_chunk_collider(cp);
+        }
 
         // tier③ 落实:施体类型切换。
         for id in &decisions.entities_to_freeze {
@@ -532,8 +619,12 @@ impl ShardSim {
                 let edit = VoxelEdit::new().set(pos, block);
                 match edit.apply(&mut self.voxels) {
                     Ok(dirty) => {
+                        // 细则 4/5:只重建已建 ②;有①无② 的 chunk 写块不新建
+                        // ②(未启用模式 ②⊆① 恒真,行为不变,§14-9)。
                         for cp in expand_boundary(dirty, &self.voxels) {
-                            self.rebuild_chunk_collider(cp);
+                            if self.chunk_bodies.contains_key(&cp) {
+                                self.rebuild_chunk_collider(cp);
+                            }
                         }
                         // 方块写入统一出口(REQ-005 D11):外部命令成功写体素
                         // 后记 `External`;调度器 `take_block_updates` 只发布
@@ -1723,5 +1814,78 @@ mod tests {
                 block: types::BlockId(1),
             },
         )]);
+    }
+    // ==== REQ-007 任务 01(任务书测试清单 sim 侧)====
+
+    /// 实心平板 chunk(层 64 全石;与既有测试同风格)。
+    fn solid_chunk() -> Chunk {
+        let mut ch = Chunk::air();
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                ch.set(x, 64, z, types::BlockId(1));
+            }
+        }
+        ch
+    }
+
+    /// 任务书测试 `sim::apply_activation_executes_collider_decisions`(B3:
+    /// 决策进、collider 出,当场生效,单点执行无二次派生)。
+    /// cfg:② 卸 32 < ① 卸 48。合一载 (0,0)、只装 ① (1,0);锚 (48,·,8):
+    /// (0,0) 距 40 → 拆 ②、① 留;(1,0) 距 24 → 建 ②。返回的 decisions 与
+    /// sim 状态一致,且拆/建都是**单点**执行(没有"凡 ① 皆 ②"的二次派生:
+    /// (0,0) 拆后不会因 ① 仍在被自动重建)。
+    #[test]
+    fn apply_activation_executes_collider_decisions() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.collider_unload_radius = 32.0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        s.load_data_only(ChunkPos::new(1, 0), solid_chunk());
+        assert!(s.has_collider(ChunkPos::new(0, 0)));
+        assert!(!s.has_collider(ChunkPos::new(1, 0)));
+
+        let d = s.apply_activation(&[Vec3::new(48.0, 0.0, 8.0)]);
+        assert_eq!(d.colliders_to_drop, vec![ChunkPos::new(0, 0)]);
+        assert_eq!(d.colliders_to_build, vec![ChunkPos::new(1, 0)]);
+        // 执行落实:决策进、collider 出(当场生效)。
+        assert!(!s.has_collider(ChunkPos::new(0, 0)), "拆除当场执行(① 保留)");
+        assert!(s.has_collider(ChunkPos::new(1, 0)), "构建当场执行");
+        assert!(s.voxel().get_chunk(ChunkPos::new(0, 0)).is_some(), "① 未动");
+        // 单点执行:同拍再刷(决策即簿记)→ 全空,无二次派生重建 (0,0)。
+        let d2 = s.apply_activation(&[Vec3::new(48.0, 0.0, 8.0)]);
+        assert!(d2.colliders_to_build.is_empty() && d2.colliders_to_drop.is_empty());
+        assert!(!s.has_collider(ChunkPos::new(0, 0)), "无 '凡①皆②' 二次派生");
+    }
+
+    /// 任务书测试 `sim::load_chunk_legacy_mode_unified`(§9-7 锚):未启用
+    /// 模式(从未激活刷新)下 `load_chunk` 合一装 ①②,与旧行为一致;
+    /// `apply_chunk_load_tiered(enabled=false)` 同款。
+    #[test]
+    fn load_chunk_legacy_mode_unified() {
+        let mut s = sim(0, 0);
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        assert!(s.voxel().get_chunk(ChunkPos::new(0, 0)).is_some(), "① 已装");
+        assert!(s.has_collider(ChunkPos::new(0, 0)), "② 同建(合一)");
+        // 卸载同步拆 ②(I1;未启用模式的对称行为)。
+        s.unload_chunk(ChunkPos::new(0, 0));
+        assert!(
+            s.voxel().get_chunk(ChunkPos::new(0, 0)).is_none()
+                && !s.has_collider(ChunkPos::new(0, 0)),
+            "① 卸 ② 同拆"
+        );
+        // 开关臂:enabled=false 走合一,enabled=true 走只 ①。
+        let mut s = sim(0, 0);
+        s.apply_chunk_load_tiered(ChunkPos::new(0, 0), solid_chunk(), false);
+        assert!(s.has_collider(ChunkPos::new(0, 0)), "false → 合一");
+        s.apply_chunk_load_tiered(ChunkPos::new(1, 0), solid_chunk(), true);
+        assert!(
+            s.voxel().get_chunk(ChunkPos::new(1, 0)).is_some()
+                && !s.has_collider(ChunkPos::new(1, 0)),
+            "true → 只 ①"
+        );
     }
 }
