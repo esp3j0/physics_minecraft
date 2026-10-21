@@ -1657,30 +1657,26 @@ pub(crate) mod tests {
         }
         assert_eq!(last, Some(sentinel), "新值保留在队尾(丢最旧,非拒绝)");
 
-        // socket 级:真实连接上灌满 Critical → 服务端断连(不读 socket 的客户端)。
-        // 机制如实说明:本任务 Pong 是"入队 + 同步冲刷"——冲刷总是把队列清空,
-        // 队列积压到 64 的前提是冲刷被慢客户端堵死(写超时)。故慢客户端在
-        // socket 层的断连路径 = 写超时(README 决策 6「Critical 满或 send 失败 →
-        // 断连」的 send 失败支路;Task 03 异步写泵接入后,「Critical 满队列」
-        // 支路才会在 socket 层自然出现)。断连原因按实测如实断言。
+        // socket 级:客户端关闭连接 → 服务端断连,不养僵尸连接(#15 修正后
+        // 的实际覆盖)。本测试现走 EOF 支路:客户端 shutdown(Both) → 服务端
+        // read 得 EOF(Ok(0))→ SocketClosed 断连。**慢客户端"不读 → 服务端
+        // 写超时"路径不再由本测试覆盖**——Linux 自动调优缓冲会吸收全部
+        // Pong 帧,平台相关;该路径由 e2e `acn5_slow_client_backpressure`
+        // 覆盖(4225 个 chunk 灌满缓冲,ubuntu 真实触发写超时)。
         let (addr, mut up, shutdown) = spawn_server(10).await;
         let mut c = MiniClient::connect(addr).await.expect("连入");
         let id = join(&mut c, 2).await;
         assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id });
 
-        // 客户端从此不再消费:关闭读写两端(#15)。"客户端不读"的平台无关
-        // 构造——原实现依赖"写满客户端接收缓冲 → 服务端写超时",但 Linux 的
-        // TCP 自动调优缓冲(rcvbuf/sndbuf,MB 级)能把 20 万个 Pong 帧
-        // (~1.4MB)全部吸收,写永不阻塞,测试在 ubuntu 稳定失败(Windows
-        // 小缓冲才触发)。Both 关闭后服务端下一次读得 EOF → SocketClosed
-        // 断连 → Left 上报(纯 EOF 路径,不依赖缓冲/平台;第一版 SHUT_RD
-        // 在 Linux 下只被 ACK 丢弃、不回 RST,仍平台相关,已废弃)。
+        // 客户端从此不再消费:关闭读写两端(#15)。平台无关的断连构造
+        // (第一版 SHUT_RD 在 Linux 下到达数据只被 ACK 丢弃、不回 RST,
+        // 仍平台相关,已废弃)。
         c.shutdown_both().expect("关闭读写两端");
         assert!(
             c.is_disconnected().await,
-            "Critical 溢出/写失败(客户端不读)→ 服务端断连,不养僵尸连接"
+            "客户端关闭(EOF)→ 服务端断连,不养僵尸连接"
         );
-        // Left 必达(up 通道容量 256,事件不会丢);原因 = send 失败支路。
+        // Left 必达(up 通道容量 256,事件不会丢);原因 = 对端关闭支路。
         let mut saw_left = false;
         for _ in 0..3 {
             if let NetUp::Left { player, reason } = next_up(&mut up).await {
@@ -1688,7 +1684,8 @@ pub(crate) mod tests {
                 assert_eq!(
                     reason,
                     DisconnectReason::SocketClosed,
-                    "断连原因 = send 失败支路(写超时;Critical 满队列支路属任务 03)"
+                    "断连原因 = 对端关闭(EOF;慢客户端写超时路径由 e2e \
+                     acn5_slow_client_backpressure 覆盖)"
                 );
                 saw_left = true;
                 break;
