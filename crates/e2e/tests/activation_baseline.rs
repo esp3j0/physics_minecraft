@@ -60,14 +60,28 @@ fn shards_within(p: Vec3, radius: f32) -> Vec<ShardId> {
     out
 }
 
-// ---- golden 格式(B4.3:纯文本,每拍一行;空列表留空字段)----
-// <tick>|load=<x,z;...>|frozen=<w:s;...>|woke=<w:s;...>|shards=<wx:dim:sx:sz;...>
+// ---- golden 格式(B4.3:纯文本,每拍一行;空列表留空字段;A1:装载集按分片)----
+// <tick>|load=<sx:sz[x,z;x,z]/sx:sz[...]>
+//       |frozen=<w:s;...>|woke=<w:s;...>|shards=<wx:dim:sx:sz;...>
+// load:分片按 ShardId 升序,片内 chunk 按 (x,z) 升序;空分片(无装载)省略;
+// 扫描范围 = 该分片 activation_region(core + margin 环,REQ-005 D4)。
 
-fn fmt_chunk_set(set: &BTreeSet<ChunkPos>) -> String {
-    set.iter()
-        .map(|cp| format!("{},{}", cp.x, cp.z))
+/// 逐分片装载观测:每分片 (ShardId, 已装载 chunk 有序集),分片键序。
+type LoadedPerShard = Vec<(ShardId, Vec<ChunkPos>)>;
+
+fn fmt_loaded_per_shard(per_shard: &LoadedPerShard) -> String {
+    per_shard
+        .iter()
+        .map(|(s, chunks)| {
+            let inner = chunks
+                .iter()
+                .map(|cp| format!("{},{}", cp.x, cp.z))
+                .collect::<Vec<_>>()
+                .join(";");
+            format!("{}:{}[{}]", s.pos.x, s.pos.z, inner)
+        })
         .collect::<Vec<_>>()
-        .join(";")
+        .join("/")
 }
 
 fn fmt_entities(list: &[EntityId]) -> String {
@@ -87,7 +101,8 @@ fn fmt_shards(set: &BTreeSet<ShardId>) -> String {
 /// 一拍的观测快照。
 struct Frame {
     tick: u64,
-    loaded: BTreeSet<ChunkPos>,
+    /// 逐分片装载集(A1);分片 ShardId 升序,片内 chunk (x,z) 升序。
+    loaded: LoadedPerShard,
     frozen: Vec<EntityId>,
     woke: Vec<EntityId>,
     shards: BTreeSet<ShardId>,
@@ -103,7 +118,7 @@ impl Frame {
         format!(
             "{}|load={}|frozen={}|woke={}|shards={}",
             self.tick,
-            fmt_chunk_set(&self.loaded),
+            fmt_loaded_per_shard(&self.loaded),
             fmt_entities(&frozen),
             fmt_entities(&woke),
             fmt_shards(&self.shards),
@@ -235,24 +250,29 @@ fn run_scenario() -> Vec<Frame> {
                 let _ = $session.unload_shard(shard);
             }
 
-            // —— 观测 ——
-            let shard_list = $session.shard_ids();
-            let loaded: BTreeSet<ChunkPos> = shard_list
-                .iter()
-                .flat_map(|&s| {
-                    // 逐分片扫 8×8 chunk 柱(core);is_chunk_loaded 判定。
-                    let core = s.pos;
-                    (0..types::SHARD_CHUNKS).flat_map(move |dx| {
-                        (0..types::SHARD_CHUNKS).map(move |dz| {
-                            ChunkPos::new(
-                                core.x * types::SHARD_CHUNKS as i32 + dx as i32,
-                                core.z * types::SHARD_CHUNKS as i32 + dz as i32,
-                            )
-                        })
-                    })
-                })
-                .filter(|&cp| shard_list.iter().any(|&s| $session.is_chunk_loaded(s, cp)))
-                .collect();
+            // —— 观测(A1:逐分片,范围 = activation_region core+margin)——
+            let shard_list = $session.shard_ids(); // BTreeMap 键序 = ShardId 升序
+            let margin = config.region_margin_chunks(); // 与 ShardSim 激活区域同源
+            let mut loaded: LoadedPerShard = Vec::new();
+            for &s in &shard_list {
+                // 复刻 ShardSim::activation_region()(sim.rs:485-487):
+                // ChunkRegion::core(shard).expanded(margin)。
+                let core_min = s.pos.min_chunk();
+                let min = ChunkPos::new(core_min.x - margin, core_min.z - margin);
+                let side = types::SHARD_CHUNKS + 2 * margin;
+                let mut chunks: Vec<ChunkPos> = Vec::new();
+                for dx in 0..side {
+                    for dz in 0..side {
+                        let cp = ChunkPos::new(min.x + dx as i32, min.z + dz as i32);
+                        if $session.is_chunk_loaded(s, cp) {
+                            chunks.push(cp);
+                        }
+                    }
+                }
+                // (x,z) 升序:双层循环 dx 外 dz 内已按行序产出,天然升序;
+                // 空分片仍记录(显式区分"注册但全空"与"未注册")。
+                loaded.push((s, chunks));
+            }
             frozen_all.sort();
             woke_all.sort();
             $frames.push(Frame {
@@ -276,8 +296,6 @@ fn run_scenario() -> Vec<Frame> {
     for _ in 0..70 {
         step_and_observe!(pre_frames, tick, session);
     }
-    pre_frames.clear(); // 布景帧不进 golden(编排副作用已发生)。
-    tick = 0; // golden 行号从记录起点计。
     assert!(
         session.is_chunk_loaded(shard_id(0, 0), ChunkPos::new(0, 0)),
         "布景:观察者 24 m 内 chunk (0,0) 应已装载"
@@ -327,16 +345,18 @@ fn run_scenario() -> Vec<Frame> {
         )
         .expect("mark actor_b");
     // 场景前提(AC-T1):常驻体已静止(≥ 20 拍位移 < 3 mm)——断言,否则
-    // panic(前提本身被锚定)。 SETTLE_TICKS=40 拍足够落定(0.5 m 落差)。
+    // panic(前提本身被锚定)。SETTLE_TICKS=40 拍足够落定(0.5 m 落差)。
+    // A2:布景全程走同一套编排(step_and_observe! + 丢弃帧),落定与静止
+    // 核验期间的激活请求/ensure/despawn 与生产循环一致,不丢拍。
     for _ in 0..SETTLE_TICKS {
-        session.tick();
+        step_and_observe!(pre_frames, tick, session);
     }
     for e in [actor_a, actor_b] {
         let s1 = session
             .entity_state(shard_id(0, 0), e)
             .expect("常驻体应仍在表");
         for _ in 0..25 {
-            session.tick();
+            step_and_observe!(pre_frames, tick, session);
         }
         let s2 = session.entity_state(shard_id(0, 0), e).expect("仍在表");
         assert!(
@@ -348,6 +368,8 @@ fn run_scenario() -> Vec<Frame> {
     }
     // —— 基线记录自此开始(航点逐拍记录;布景段的装载不进 golden,
     // 移动/折返/远离/跳跃段的装载变化才是 AC-T1 标尺内容)。
+    pre_frames.clear(); // 布景帧不进 golden(编排副作用已发生)。
+    tick = 0; // golden 行号从记录起点计(布景全部结束后重置)。
     // 段 A:(8,8) → (72,8),60 拍(跨 chunk 4,触发装载)。
     for k in 0..LEG_A_TICKS {
         let t = (k + 1) as f32 / LEG_A_TICKS as f32;
@@ -413,15 +435,13 @@ fn run_scenario() -> Vec<Frame> {
 
 /// 抽样非退化断言(录制与比对都跑):场景必须真的产生装载/卸载/风暴/despawn。
 fn assert_non_degenerate(frames: &[Frame]) {
-    let ever_loaded = frames.iter().any(|f| !f.loaded.is_empty());
+    // A1:loaded 逐分片;总量 = 各片装载之和。
+    let total = |f: &Frame| f.loaded.iter().map(|(_, c)| c.len()).sum::<usize>();
+    let ever_loaded = frames.iter().any(|f| total(f) > 0);
     assert!(ever_loaded, "非退化:场景应发生 chunk 装载");
-    let load_grew = frames
-        .windows(2)
-        .any(|w| w[1].loaded.len() > w[0].loaded.len());
+    let load_grew = frames.windows(2).any(|w| total(&w[1]) > total(&w[0]));
     assert!(load_grew, "非退化:装载集应增长过(观察者移动触发)");
-    let shrank = frames
-        .windows(2)
-        .any(|w| w[1].loaded.len() < w[0].loaded.len());
+    let shrank = frames.windows(2).any(|w| total(&w[1]) < total(&w[0]));
     assert!(shrank, "非退化:远离段应发生 chunk 卸载");
     // 跳跃拍(D16):单拍内注册分片数显著增加(≥ 2:目的分片 + 邻片)。
     // 记录起点 = 段 A 第一拍(布景不记录),跳跃发生在段 C 末的下一拍。
