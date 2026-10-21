@@ -1152,15 +1152,15 @@ pub(crate) mod tests {
             self.stream.write_all(bytes).await
         }
 
-        /// 半关读端(#15):表达"客户端从此不再消费 socket"——平台无关的
-        /// 慢客户端构造。后续到达的数据触发 RST(Linux/Windows),服务端
-        /// 读得 ECONNRESET、写得 ECONNRESET/EPIPE → SocketClosed 断连支路;
-        /// 若平台对 SHUT_RD 只丢弃不回 RST,则由调用方的连发循环走原
-        /// 写超时路径兜底(Windows 小缓冲可触发)。两者同属 README 决策 6
-        /// 的 send 失败支路,断连原因断言不变。
-        pub(crate) fn shutdown_read(&self) -> io::Result<()> {
-            // std 副本与 tokio stream 共享同一 socket fd,半关对两端生效。
-            self.std_stream.shutdown(std::net::Shutdown::Read)
+        /// 关闭读写两端(#15):表达"客户端从此不再消费 socket"——平台
+        /// 无关的僵尸连接构造。服务端下一次读得 EOF(Ok(0))→ SocketClosed
+        /// 断连(README 决策 6 send 失败/连接关闭支路,断连原因断言不变)。
+        /// 纯 EOF 路径不依赖任何平台缓冲语义——这是对第一版(SHUT_RD)的
+        /// 修正:Linux 对 SHUT_RD 后到达的数据只 ACK 丢弃、不回 RST,服务端
+        /// 永不断连(Windows 才回 RST),仍是平台相关。
+        pub(crate) fn shutdown_both(&self) -> io::Result<()> {
+            // std 副本与 tokio stream 共享同一 socket fd,关闭对两端生效。
+            self.std_stream.shutdown(std::net::Shutdown::Both)
         }
 
         /// 读一帧 S2C(凑 4B 前缀 + 载荷)。
@@ -1668,20 +1668,14 @@ pub(crate) mod tests {
         let id = join(&mut c, 2).await;
         assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id });
 
-        // 客户端从此不读:半关读端(#15)。"客户端不读"的平台无关构造——
-        // 原实现依赖"写满客户端接收缓冲 → 服务端写超时",但 Linux 的 TCP
-        // 自动调优缓冲(rcvbuf/sndbuf,MB 级)能把 20 万个 Pong 帧(~1.4MB)
-        // 全部吸收,写永不阻塞,测试在 ubuntu 稳定失败(Windows 小缓冲才
-        // 触发)。SHUT_RD 后服务端继续收 Ping 回 Pong → 客户端内核回 RST
-        // → 服务端读/写失败 → SocketClosed 断连(README 决策 6 send 失败
-        // 支路,断连原因断言不变);不支持 RST 的平台由下方连发循环的写
-        // 超时路径兜底。
-        c.shutdown_read().expect("半关读端");
-        for _ in 0..200_000 {
-            if c.send(&C2S::Ping).await.is_err() {
-                break; // 对端已断(或写超时)
-            }
-        }
+        // 客户端从此不再消费:关闭读写两端(#15)。"客户端不读"的平台无关
+        // 构造——原实现依赖"写满客户端接收缓冲 → 服务端写超时",但 Linux 的
+        // TCP 自动调优缓冲(rcvbuf/sndbuf,MB 级)能把 20 万个 Pong 帧
+        // (~1.4MB)全部吸收,写永不阻塞,测试在 ubuntu 稳定失败(Windows
+        // 小缓冲才触发)。Both 关闭后服务端下一次读得 EOF → SocketClosed
+        // 断连 → Left 上报(纯 EOF 路径,不依赖缓冲/平台;第一版 SHUT_RD
+        // 在 Linux 下只被 ACK 丢弃、不回 RST,仍平台相关,已废弃)。
+        c.shutdown_both().expect("关闭读写两端");
         assert!(
             c.is_disconnected().await,
             "Critical 溢出/写失败(客户端不读)→ 服务端断连,不养僵尸连接"
