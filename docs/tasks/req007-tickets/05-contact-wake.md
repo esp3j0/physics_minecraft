@@ -104,8 +104,8 @@ pub fn propagate_momentum(
 
 1. 预测种子只考虑 `linvel` 扫掠、不含角速度包络膨胀(需求示意"旋转包络 AABB 沿 v
    扫掠");高速旋转的慢移实体可能漏预测 → 由补偿路径兜底,符合 §4.10.4 设计意图。
-2. `contact_wake_seeds` 需要质量 `mass`:从 EntityDesc 体积 × 密度(既有常数)派生,
-   不新增配置。
+2. `contact_wake_seeds` 的质量 `mass`:**直接取 rapier 刚体的 `mass()`**(physics-sim
+   内读取,S7),单一来源;不做"体积 × 常数密度"二次计算。
 
 ## 门禁包
 
@@ -114,7 +114,8 @@ pub fn propagate_momentum(
 ## 完成定义
 
 - 测试清单全绿;T14 对照组锚定"关掉新能力 = 旧行为";示例数值(p=5 醒 3)被测试
-  锚定,防参数漂移。
+  锚定,防参数漂移;
+- **回评提醒:checkpoint 布局再变(补偿种子入快照),旧存档不可用,需清 data_dir**(B5)。
 
 ## 风险
 

@@ -1,9 +1,10 @@
-# 任务 06:快照收口 format v4、I3 不变量、幂等收口、全参数配置、遥测
+# 任务 06:快照收口终稿、I3 不变量、幂等收口、全参数配置、遥测
 
-- 状态:待放行。
-- 对应 AC:AC-T19(I3 与幂等全项)、T21(快照/回放)、T22(配置)。
-- 涉及 §9 白名单:**第 4 条**(快照格式与 format_version 用例更新到 v4)。
-- 涉及 §14 检查项:7(I3 每拍末校验)、1/2/3/4(复核 02 起的落地)、5、6、8(全量自查)。
+- 状态:待放行(修订 2:按审核 B5 与 D17 修订)。
+- 对应 AC:AC-T19(I3 与幂等全项)、T21(快照/回放)、T22(配置)、AC-T24(开关快照)。
+- 涉及 §9 白名单:**第 4 条**(快照格式与 format_version 用例更新到 v4)、
+  **第 7 条**(未启用模式用例零改动)。
+- 涉及 §14 检查项:7(I3 每拍末校验)、1/2/3/4(复核 02 起的落地)、5、6、8、9(全量自查)。
 
 ## 目标与范围
 
@@ -16,9 +17,11 @@
 
 1. `shard`:I3 校验器(每拍末,ticket_ops 与终结判定之后);测试钩子
    (`#[cfg(test)]` 或 `pub(crate)` 可见性,制造缺票/错种票/冻结持票);
-2. 快照:SchedulerSnapshot/ShardSim 快照字段终稿(票据表、收件箱、② 集合、两套
-   冷却、待地形、静止窗口、pending_terrain_wakes、补偿种子、未消费 ticket_ops);
-   `CHECKPOINT_FORMAT_VERSION = 4`;
+2. 快照:SchedulerSnapshot/ShardSim 快照字段终稿(**含 D17 开关**——沿用
+   `observers_ever_set` 快照位置推广为"曾观察者或区域票";票据表、收件箱、② 集合、
+   两套冷却、待地形、静止窗口、pending_terrain_wakes、补偿种子、未消费 ticket_ops);
+   `app/driver.rs` 的 `CHECKPOINT_FORMAT_VERSION` 保持 4(**01 已升,B5**);本任务
+   收口布局终稿并补齐 v3/v2/v1/v0 拒绝测试;
 3. `app::Config`:§4.15 全部参数;默认值锚定测试;配置校验(collider ≤ data、
    `area_ticket_max_*`);别名映射测试;
 4. 遥测:TickSummary 扩展(按 §4.16,计数全整数、逐拍重算);
@@ -80,9 +83,11 @@ pub struct TickSummary {
 2. **幂等收口**:全部操作(Issue/End/Pause/Unpause/Suspend/Resume)在 TicketTable
    层面幂等;02 的单测补齐 Resume/Unpause 分支;同拍同票多操作(不同路径)结果 =
    单次操作。
-3. **format v4**:版本常量 4;v3/v2/v1/v0 拒绝测试(含"v2 三字段旧字节 Decode
-   UnexpectedEnd"的显式验证,防静默);**回评必须提醒用户清 data_dir**。
-4. **快照终稿**:逐字段核对 §4.14 清单;恢复后"票据表 + ② 集合 + 待地形 + 静止窗口
+3. **format v4(B5 收口)**:版本常量已在 01 升 4;本任务收口布局终稿,v3/v2/v1/v0
+   拒绝测试补齐(含"v2 三字段旧字节 Decode UnexpectedEnd"的显式验证,防静默);
+   01–05 各任务回评均已逐次提醒清 data_dir,本任务回评再汇总提醒一次。
+4. **快照终稿**:逐字段核对 §4.14 清单 + **D17 开关**(沿用 `observers_ever_set`
+   快照位置;恢复后开关状态保持单向);恢复后"票据表 + ② 集合 + 待地形 + 静止窗口
    + 补偿种子 + 未消费 ticket_ops"与快照前位级一致;回放:区域票命令走日志重放,
    派生票/内部指令/唤醒全部由状态再生;**AC-T21 场景**:四种票 + 全状态 + 600 拍
    中途 checkpoint,恢复重放终态位级一致。
@@ -111,6 +116,7 @@ pub struct TickSummary {
 | `app::config::legacy_keys_alias_mapping` | 别名键读入映射正确;新旧键同给时新键优先 | T22/§4.15 |
 | `app::config::validation_rules` | collider > data 报错等全部校验 | T22 |
 | `shard::tick_summary_counts` | 构造场景逐字段核对计数(票据四态、实体四态、落地/虚空、唤醒四源) | §4.16 |
+| `shard::activation_enabled_survives_snapshot` | 开关随快照往返:启用前快照恢复后仍未启用;启用后快照恢复后仍启用(单向不回退) | T24 |
 
 ## §9 白名单对应
 
@@ -134,8 +140,8 @@ pub struct TickSummary {
 
 ## 完成定义
 
-- 测试清单全绿;v4 落地;I3 钩子可制造全部四类违反;AC-T21 位级一致;
-- **回评醒目位置提醒:旧 checkpoint(≤ v3)不可用,需清理 data_dir**。
+- 测试清单全绿;布局终稿收口(v4);I3 钩子可制造全部四类违反;AC-T21 位级一致;
+- **回评醒目位置汇总提醒:01 起旧 checkpoint(≤ v3)即不可用,需清理 data_dir**。
 
 ## 风险
 

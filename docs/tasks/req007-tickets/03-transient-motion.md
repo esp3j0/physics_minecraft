@@ -1,28 +1,33 @@
 # 任务 03:瞬态运动票、待地形、强制落地、承载、阻塞请求
 
-- 状态:待放行。
-- 对应 AC:AC-T3、T4、T5(含阻塞优先)、T6、T7、T8(瞬态半边)、T9、T20;
-  AC-T2 的 I2 升级为完整足迹口径。
-- 涉及 §9 白名单:**第 1 条(瞬态半边)**(远冻结瞬态用例改期望:不冻结/强制落地/凝固,
-  另补常驻对照在 04)、**第 2 条(瞬态半边)**(超预算瞬态 → 强制落地)。
-- 涉及 §14 检查项:6(ticket_ops 键序、N 拍产生 N+1 生效)、8(阻塞请求只依实体状态)、
-  7(I2 完整口径断言)。
+- 状态:待放行(修订 2:按审核 S4/S5/S6 与 D17 启用补签修订)。
+- 对应 AC:AC-T3、T4、T5(含阻塞优先)、T6、T7、T8(瞬态半边)、T9、T20、
+  AC-T24(启用当拍补签);I2 完整口径(S4:从 01 移入)。
+- 涉及 §9 白名单:**第 1 条(瞬态半边)**(远冻结瞬态用例改期望:不冻结/强制落地/凝固)、
+  **第 2 条(瞬态半边)**(超预算瞬态 → 强制落地)、**第 6 条**(零重力凝固断言不改动)、
+  **第 7 条**(未启用模式用例零改动;新测试凡"无观察者"场景一律先启用激活,S6)。
+- 涉及 §14 检查项:6(ticket_ops 键序、N 拍产生 N+1 生效)、7(I2 完整口径断言)、
+  8(阻塞请求只依实体状态)、9(未启用一致)。
 
 ## 目标与范围
 
 落地瞬态体(actor=false)的运动票生命周期:签发/承载暂停挂起/终结;当前/预载两种足迹
-(D13);待地形状态(I2 完整执行);强制落地与虚空移除(§4.8);凝固前提修订(§4.7);
-阻塞请求优先(D15)。**不含常驻票**(04)、**不含接触唤醒**(05)。
+(D13);待地形状态(**I2 完整执行**,S4);强制落地与虚空移除(§4.8);凝固前提修订
+(§4.7);阻塞请求优先(D15);**启用当拍补签**(D17)。**不含常驻票**(04)、
+**不含接触唤醒**(05)、**常驻体推迟唤醒在 04**(S4)。
 
 ## 交付物
 
 1. `physics-sim`:
-   - 足迹计算(当前/预载)、支撑判定(接触法向)、待地形状态机、强制落地(纯体素)、
-     虚空移除、凝固前提(无实体支撑)、`Outbox.ticket_ops`;
+   - 足迹计算(当前/预载)、支撑判定(接触法向)、待地形状态机、I2 断言、强制落地
+     (纯体素)、虚空移除、凝固前提(无实体支撑)、`Outbox.ticket_ops`(分片侧只产出
+     依赖实体状态的操作,S5);
    - `plan` 的实体档改造:瞬态不再按距离冻结;超预算瞬态 → 强制落地候选;
-2. `shard`:ticket_ops 应用(键序,N+1 生效)、实体票到期内部指令
-   (`InputSource::SCHEDULER`,不入外部日志)、承载事件的 Pause/Unpause/Suspend;
-3. `app`:到期内部指令的投递接线(不盖日志章);`transient_settle_deadline_ticks` 等新配置;
+2. `shard`:**ownership claim 时签发 TransientMotion**(S5:票据表和 claim 都在调度器,
+   表中无该实体票才签,幂等);ticket_ops 应用(键序,N+1 生效);实体票到期内部指令
+   (`InputSource::SCHEDULER`,不入外部日志);承载事件的 Pause/Unpause/Suspend;
+   **激活启用当拍为全部存活或在途瞬态体补签**(D17);
+3. `app`:到期内部指令的投递接线(不盖日志章);新配置键;
 4. 快照:待地形速度、未消费 ticket_ops、强制落地/虚空移除簿记。
 
 ## 授权改动
@@ -31,12 +36,14 @@
   `crates/physics-sim/src/activation.rs`(实体档)、
   `crates/physics-sim/src/settle.rs`(新,强制落地 + 足迹,纯函数)、
   `crates/physics-sim/src/snapshot.rs`;
-- `crates/shard/src/scheduler.rs`(ticket_ops/内部指令/承载)、`crates/shard/src/tickets.rs`;
+- `crates/shard/src/scheduler.rs`(claim 签发/ticket_ops/内部指令/承载/补签)、
+  `crates/shard/src/tickets.rs`;
 - `crates/messaging/src/envelope.rs`(内部指令信封或 outbox 直通,实现定,语义不变);
 - `crates/app/src/config.rs` + `driver.rs`(配置、接线);
+- 测试各 crate + e2e(**新增测试凡"无观察者"场景,先设一张远处区域票或设后移除
+  观察者以启用激活**,S6);
 - `crates/types/src/state.rs`(**仅当**待地形标记需要进 `EntityState` 的旁路结构时;
-  默认放 physics-sim 内部记录 + 快照,types 不动);
-- 测试各 crate + e2e。
+  默认放 physics-sim 内部记录 + 快照,types 不动)。
 
 ## 接口设计(签名固定)
 
@@ -62,67 +69,85 @@ pub fn forced_landing_cell(
 // sim.rs / Outbox(只追加)
 pub struct Outbox {
     // ...
-    pub ticket_ops: Vec<TicketOp>,        // 分片判定,调度器应用
-    pub forced_landings: Vec<(EntityId, BlockPos)>, // 与凝固同型:Emergent BlockWrite + despawn
+    pub ticket_ops: Vec<TicketOpRecord>,     // 分片判定的实体状态依赖操作(S5)
+    pub forced_landings: Vec<(EntityId, BlockPos)>, // Emergent BlockWrite + despawn
     pub void_removed: Vec<EntityId>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum TicketOp {   // 只追加;操作幂等由 TicketTable 保证
-    IssueTransient,
+pub enum TicketOp {   // 只追加;幂等由 TicketTable 保证;**不含 Issue**(S5:claim 签发)
     End,
     Pause,
     Unpause,
     Suspend,
     Resume,
 }
-// TicketOp 不带实体号:调度器按 (ShardId, EntityId) 归属;struct 装载:
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TicketOpRecord { pub entity: EntityId, pub op: TicketOp }
 
 // 实体状态标记(sim 内部 + 快照;不进 EntityState)
 pub enum LocomotionState { Awake, AwaitingTerrain { saved_linvel: Vec3, saved_angvel: Vec3 } }
+
+// shard/src/scheduler.rs(S5 + D17)
+impl Scheduler {
+    /// ownership claim(spawned 处理)时:实体 actor == false 且表中无其
+    /// TransientMotion → issue(issued_at = 当前拍)。幂等,重复 claim 不会重签。
+    /// (actor == true 不签;常驻票 04。)
+    fn issue_transient_on_claim(&mut self, entity: EntityId, actor: bool, now: Tick);
+    /// D17:激活启用当拍(bootstrap)——为全部存活或在途的瞬态体补签
+    /// TransientMotion(时钟从该拍起算);已建碰撞体的 chunk 即初始 ② 集合(01 已落)。
+    fn backfill_transient_tickets_on_enable(&mut self, now: Tick);
+}
 ```
 
 ## 语义细则
 
-1. **瞬态票签发**:新实体 claim(spawn/迁移重建/传送重建)时表中无其票 → 分片产出
-   `IssueTransient`(N 拍)→ 调度器 N+1 生效。迁移/传送不产生新票(键不变,时钟继续)。
-2. **足迹**:`half_size·√3` 旋转包络 + `terrain_guard_m`(默认 1.0)外扩,水平投影
+1. **瞬态票签发(S5,调度器单点)**:ownership claim 时(actor=false、表中无票)签发;
+   迁移/传送不产生新票(键不变,时钟继续;迁移在途 = "在途"集合,补签与 I3 都算
+   存活)。分片不产出 `Issue`(表中被误删时由 06 的 I3 fail-stop 兜底,不是分片重签)。
+2. **启用补签(D17)**:启用当拍(第一次 Set 观察者/区域票)为全部存活或在途瞬态体
+   补签;时钟从该拍起算。启用当拍起 I3 成立(06 校验;03 起语义上成立)。
+3. **足迹**:`half_size·√3` 旋转包络 + `terrain_guard_m`(默认 1.0)外扩,水平投影
    chunk 柱。I2 口径:**当前足迹 ∩ 本分片区域(core ∪ margin_ring)内每个 chunk 都有 ②**。
-3. **待地形**:
+4. **待地形**:
    - 进入:醒着 Dynamic 的当前足迹缺 ②(判定点:apply_activation 与 spawn_entity);
    - 期间:Kinematic、速度保存(位级)、不计醒数、不凝固不迁移、事件免疫、不参与
      接触唤醒(05 落地时同口径)、票据时钟**照常计时**(§4.6);
-   - 恢复:足迹 ② 全就绪 → 切回 Dynamic、原样写回速度;恢复属于唤醒语义 → 重置静止判据
-     (§4.4.1),但**不产生** Issue(票已存在);
+   - 恢复:足迹 ② 全就绪 → 切回 Dynamic、原样写回速度;恢复属于唤醒语义 → 重置
+     静止判据(§4.4.1),不产生 Issue(票已存在);
    - 阻塞请求:缺的 ①/② 以阻塞身份请求(免冷却、排序最前、仍占预算)。
-4. **支撑判定**:step 后检查接触对;`n·û ≥ support_normal_min`(默认 0.7,û = 重力
-   反向);对方静态体 = 地形支撑、实体 = 实体支撑;零重力不判定(既有零重力用例不变,
-   §9-6)。被承载 = 有实体支撑。
-5. **凝固前提**:现有两路(低速计数 / 睡眠兜底)追加"本拍无实体支撑";零重力场景
-   不判定支撑 → 前提恒真(行为不变)。
-6. **承载规则**(§4.4.2 表):瞬态被承载:运动票 Pause;静止且不在唤醒范围 → 冻结 +
+   **未启用模式(D17)无待地形**:实体照旧,§9-7 用例零改动。
+5. **支撑判定**:step 后检查接触对;`n·û ≥ support_normal_min`(默认 0.7,û = 重力
+   反向);对方静态体 = 地形支撑、实体 = 实体支撑;零重力不判定(既有零重力用例
+   不变,§9-6)。被承载 = 有实体支撑。
+6. **凝固前提**:现有两路(低速计数 / 睡眠兜底)追加"本拍无实体支撑";零重力场景
+   不判定支撑 → 前提恒真(行为不变)。未启用模式无此修订。
+7. **承载规则**(§4.4.2 表):瞬态被承载:票 Pause;静止且不在唤醒范围 → 冻结 +
    Suspend;承载结束 → Unpause;冻结被唤醒 → Resume(仍被承载则 Paused)。
-   Suspend 后票不占区域(锚点消失风险:被承载体无独立装载需求,挂靠承载者的票)。
-7. **强制落地**:触发 = 票到期(`active_ticks ≥ transient_settle_deadline_ticks`)
+   Suspend 后票不占区域。
+8. **强制落地**:触发 = 票到期(`active_ticks ≥ transient_settle_deadline_ticks`)
    与超预算淘汰(§4.12);前置 = 中心柱 ① 在内存,缺 → 阻塞请求 + 推迟;
-   落点算法按 §4.8 五步;产出 = `Emergent BlockWrite + despawned`(复用 REQ-005 广播
-   持久化)+ `End`(调度器终结判定自然 End)。
-8. **虚空移除**:所有实体 `y < WORLD_Y_MIN − void_despawn_depth_m`(默认 16)→ 删除
-   (无 BlockWrite);每拍 step 末判定。
-9. **超预算淘汰**(本任务瞬态半边):醒数超限 → 距离降序;瞬态 → 强制落地候选
-   (产出同上);§9-2。常驻半边 04。
-10. **到期内部指令**:调度器发现实体票到期 → 投 `SCHEDULER` 来源内部指令
+   落点算法按 §4.8 五步;产出 = `Emergent BlockWrite + despawned`(复用 REQ-005
+   广播持久化)+ `End`(幂等,调度器终结判定再 End 无副作用)。未启用模式无强制
+   落地。
+9. **虚空移除**:所有实体 `y < WORLD_Y_MIN − void_despawn_depth_m`(默认 16)→ 删除
+   (无 BlockWrite);每拍 step 末判定。**未启用模式无虚空移除**(§4.0;既有虚空
+   下落用例不受影响)。
+10. **超预算淘汰**(本任务瞬态半边):醒数超限 → 距离降序;瞬态 → 强制落地候选
+    (产出同上);§9-2。常驻半边 04。
+11. **到期内部指令**:调度器发现实体票到期 → 投 `SCHEDULER` 来源内部指令
     (`apply_at = N+1`,**不进外部命令日志**,回放再生)→ 分片执行强制落地。
-11. **阻塞请求(D15)**:三来源(待地形足迹缺 ②;推迟唤醒足迹缺 ①/②——本任务含
-    待地形恢复与 I2 窄化唤醒;强制落地柱缺 ①)。请求属性 `(ChunkPos, is_blocked)` 进
-    决策输出;排序键 `(is_blocked, priority, dist, ChunkPos)`;卸载候选不得卸任何
-    阻塞请求需要的 chunk。
-12. **新实体免冷却保护**:翻转簿记不再需要为"新实体"设防——冻结要求静止(§4.4.2),
-    新碎片运动中不冻(蓝方块修复)。现状"实体冷却 180 拍"仅约束翻转频率(③ 滞回),
-    冻结判定新增"静止 ∧ 常驻/被承载"前置(常驻判定 04 完整落地;本任务瞬态体从
-    滞回冻结路径整体移除)。
-13. **快照**:LocomotionState(待地形速度)、未消费 ticket_ops、强制落地/虚空计数;
+12. **阻塞请求(D15)**:三来源(待地形足迹缺 ②;推迟唤醒足迹缺 ①/②——本任务含
+    待地形恢复;强制落地柱缺 ①)。请求属性 `(ChunkPos, is_blocked)` 进决策输出;
+    排序键 `(is_blocked, priority, dist, ChunkPos)`;卸载候选不得卸任何阻塞请求
+    需要的 chunk。判定只依实体状态(LocomotionState/强制落地待执行集),不依票种
+    (§14-8)。
+13. **新实体免冷却保护**:翻转簿记保留为滞回频率约束(③);冻结判定新增"静止 ∧
+    常驻/被承载"前置(常驻判定 04 完整落地;本任务瞬态体从滞回冻结路径整体移除)。
+    未启用模式冻结规则不变(§9-7)。
+14. **快照**:LocomotionState(待地形速度)、未消费 ticket_ops、强制落地/虚空计数;
     待处理的"阻塞中的柱"不入快照(每拍由状态重算)。
+15. **S6 自查**:新增 e2e/单测中凡场景写"无观察者",必须已启用(远处区域票,或
+    设置后移除观察者);测试注释注明启用方式。既有未启用用例零改动。
 
 ## 测试清单
 
@@ -131,18 +156,21 @@ pub enum LocomotionState { Awake, AwaitingTerrain { saved_linvel: Vec3, saved_an
 | `settle::footprint_current_and_preload` | 包络/guard/前视的 chunk 集正确;前视截断按距离;前视不进 I2 | T6 |
 | `settle::forced_landing_column_scan` | 实心向上/悬空向下/到 WORLD_Y_MIN 虚空/重叠让位 | T7 |
 | `settle::forced_landing_requires_column_data` | 柱 ① 缺 → 返回"推迟"(调用方产阻塞请求) | D15 |
-| `sim::transient_keeps_ticket_while_moving` | 抛出瞬态体(落点 > 60 m,无观察者):全程醒着、票 Active、active_ticks 递增 | T3 |
-| `sim::transient_lands_solidifies_ticket_ends` | 落地凝固:Emergent BlockWrite + despawned + 票 End;分片可 despawn | T3 |
-| `sim::transient_not_frozen_when_far`(§9-1 迁移) | 远处运动瞬态体不被滞回冻结(原 frozen_body_excluded... 类用例翻转期望或改常驻) | T3/§9-1 |
+| `shard/tickets::issue_on_claim_idempotent`(S5) | claim 签发;重复 claim/迁移重建/传送重建不重签、时钟不变 | D14/S5 |
+| `shard/tickets::backfill_on_enable`(D17) | 启用前 spawn 的瞬态体,启用当拍获票(时钟 = 启用拍);在途瞬态体同样补签;常驻体不补签 | T24 |
+| `sim::transient_keeps_ticket_while_moving` | 抛出瞬态体(落点 > 60 m;场景以远处区域票启用):全程醒着、票 Active、active_ticks 递增 | T3/S6 |
+| `sim::transient_lands_solidifies_ticket_ends` | 落地凝固:Emergent BlockWrite + despawned + 票 End | T3 |
+| `sim::transient_not_frozen_when_far`(§9-1 迁移) | 远处运动瞬态体不被滞回冻结(原远冻结瞬态用例翻转期望) | T3/§9-1 |
 | `sim::awaiting_terrain_enters_and_recovers` | ② 预算 0 → 待地形(Kinematic、位置不变、事件免疫);② 就绪 → 醒、速度位级写回 | T5 |
+| `sim::i2_footprint_assertion` | I2 完整口径 debug 断言:足迹内 ② 缺失而实体醒着 → panic(钩子制造) | I2/§14-7 |
 | `sim::support_detection_normal_and_entity` | 法向 0.7 边界;静态体/实体支撑区分;零重力恒无支撑 | T9/§9-6 |
-| `sim::solidify_requires_no_entity_support` | 压在常驻体上的瞬态不凝固(常驻走开前);落地后凝固(常驻对照 04 补) | T9/§4.7 |
+| `sim::solidify_requires_no_entity_support` | 压在常驻体上的瞬态不凝固(常驻走开前);落地后凝固 | T9/§4.7 |
 | `sim::carried_ticket_pause_suspend_resume` | 承载:Pause → 静止冻结 Suspend → 唤醒 Resume | T9 |
 | `sim::carried_clock_paused_no_forced_landing` | 被承载超 deadline 不强制落地(active_ticks 不增) | T9 |
 | `sim::over_budget_transient_forced_landing` | 预算超限瞬态 → 强制落地(非冻结);顺序距离降序 | T8/§9-2 |
-| `sim::void_removal_all_entities` | y < 阈值删除;常驻同样生效 | T7 |
+| `sim::void_removal_enabled_mode_only` | 启用:y < 阈值删除;未启用:不删(§9-7 对照) | T7/T24 |
 | `sim::ticket_deadline_forced_landing` | 关凝固零重力漂移 → 到期强制落地 | T7 |
-| `shard/tickets::ticket_ops_applied_in_key_order_n_plus_1` | 同拍多 ops 按键序;N 产生 N+1 生效(中间拍查询可见时序) | §14-6 |
+| `shard/tickets::ticket_ops_applied_in_key_order_n_plus_1` | 同拍多 ops 按键序;N 产生 N+1 生效 | §14-6 |
 | `shard/scheduler::deadline_internal_command_not_logged` | 到期指令 SCHEDULER 来源、apply_at N+1、外部命令日志无记录;回放再生一致 | §4.3.2 |
 | `shard/scheduler::migration_keeps_ticket_clock` | 迁移在途票保留、active_ticks 连续;目的 claim 后不重签(幂等) | T4 |
 | `shard/scheduler::solidify_end_vs_migrate_keep` | 同拍凝固 despawn → End;迁移 despawn → 保留 | T19(前半,提前落地) |
@@ -153,6 +181,7 @@ pub enum LocomotionState { Awake, AwaitingTerrain { saved_linvel: Vec3, saved_an
 | `e2e/activation_tickets::ac_t7_deadline_and_void` | 截止拍强制落点正确;无支撑柱 → 虚空;坠落越线 → 立即移除 | T7 |
 | `e2e/activation_tickets::ac_t9_carry_full_arc` | 方块落冻结常驻体:不凝固 → 冻结 Suspended → 唤醒同组 → 推走 → 下落凝固;重叠让位 | T9 |
 | `e2e/activation_tickets::ac_t20_lifecycle` | 运动票/区域票保活;Suspended 不保活;票清实体终 → idle despawn | T20 |
+| `e2e/activation_tickets::ac_t24_enable_backfill` | 未启用模式手动装载跑既有路径(零断言改动的既有用例即证据);启用当拍补签 + 当拍起 I3 前置成立 | T24 |
 
 ## §9 白名单对应
 
@@ -160,22 +189,22 @@ pub enum LocomotionState { Awake, AwaitingTerrain { saved_linvel: Vec3, saved_an
   `event_envelope_detonates_locally_frozen_immune`、`e2e/activation.rs` 远冻结瞬态用例
   → 改期望为"不冻结 / 到期落地";常驻对照保留到 04 迁移;
 - 第 2 条(瞬态半边):超预算瞬态用例改强制落地;
-- 第 6 条:零重力凝固用例断言**不改动**(支撑前提在零重力下恒真,作为回归锚)。
+- 第 6 条:零重力凝固用例断言**不改动**(支撑前提在零重力下恒真,作为回归锚);
+- 第 7 条:未启用模式用例零改动(全部新行为只在启用模式生效)。
 
 ## §14 检查项自查范围
 
-- 6:ticket_ops 键序 + N+1 生效(测试见清单);
-- 7:I2 完整口径 debug 断言;
-- 8:阻塞请求只依实体状态(`settle::` 纯函数无票种参数)。
+- 6:ticket_ops 键序 + N+1 生效;7:I2 完整口径 debug 断言;
+- 8:阻塞请求只依实体状态(`settle::` 纯函数无票种参数);
+- 9:未启用行为(虚空移除/待地形/凝固前提均有未启用对照)。
 
-## 偏离需求示意之处
+## 偏离需求示意之处(修订后余留;均已获同意)
 
-1. `TicketOp` 不带实体号、由 `TicketOpRecord` 包装:调度器需 (ShardId, EntityId) 路由,
-   比需求"Outbox.ticket_ops"示意多一层归属结构,语义一致;
-2. 蓝方块修复在 12 条细化了"新实体免冷却"的机制口径:现状的实体翻转冷却保留为
-   滞回频率约束,冻结新增静止前置——需求 §5 修订行"冻结只在静止时"的直接落实,
-   需求未明说旧簿记去留;
-3. 虚空移除放在本任务(需求 §4.8 末段"对所有实体生效",实现上与强制落地同文件同拍点)。
+1. `TicketOp` 不带实体号、由 `TicketOpRecord` 包装(路由需要 (ShardId, EntityId));
+2. **`TicketOp` 不含 `Issue`**(S5 裁定:签发单点在调度器 claim/补签;分片只产出
+   状态依赖操作)——需求 §4.3.4"新实体 claim 时表中无其票 → Issue TransientMotion"
+   的落点从分片移到调度器,语义一致(claim 判定本就在调度器);
+3. 翻转冷却保留为滞回频率约束;虚空移除放在本任务。
 
 ## 门禁包
 
@@ -183,12 +212,15 @@ pub enum LocomotionState { Awake, AwaitingTerrain { saved_linvel: Vec3, saved_an
 
 ## 完成定义
 
-- 测试清单全绿;蓝方块场景(T3)在 e2e 可复现修复;既有零重力用例零改动通过;
-- 提交说明含 §9-1/2(瞬态半边)迁移明细。
+- 测试清单全绿;蓝方块场景(T3)在 e2e 可复现修复;既有零重力与未启用用例零改动通过;
+- 提交说明含 §9-1/2 迁移明细;
+- **回评提醒:checkpoint 布局再变,旧存档不可用,需清 data_dir**。
 
 ## 风险
 
 - 支撑判定依赖 rapier 接触对查询(kinematic–static 也有接触对;实现时验证,不足则用
   `contact_wake_skin_m` 外扩 AABB 的几何兜底);
 - 强制落地与迁移窗口的交互(实体在途时到期):在途时钟继续、落地指令按 owner 分片
-  投递——claim 后到达才执行,测试覆盖。
+  投递——claim 后到达才执行,测试覆盖;
+- 启用补签与"启用瞬间的 ② 集合"(01)同拍协调:补签在调度器、② 集合在分片快照
+  字段——启用当拍的时序测试覆盖。
