@@ -98,6 +98,14 @@ fn registry_factory() -> Box<dyn BlockRegistry> {
     Box::new(SimpleRegistry::builtin())
 }
 
+/// MarkActor 命令(常驻化;与 spawn 同拍,重放再生)。
+fn mark_actor_command(id: EntityId) -> SimCommand {
+    SimCommand::MarkActor {
+        entity: id,
+        actor: true,
+    }
+}
+
 fn spawn_command(id: EntityId, translation: Vec3, linvel: Vec3) -> SimCommand {
     SimCommand::SpawnDynamic {
         entity: id,
@@ -230,6 +238,10 @@ fn run_original_line(snapshot_at: Option<Tick>) -> (Line, Option<GlobalSnapshot>
                     Vec3::new(24.0, 0.0, 0.0),
                 ),
             );
+            // §9-1(瞬态半边)迁移:常驻化(REQ-007 任务 03;瞬态足迹缺 ②
+            // 进待地形、不参与迁移检测,e1 的跨片剧情依赖迁移)。重放线由
+            // 日志再生同命令,位级一致。
+            send_log(&mut session, &mut log, src, mark_actor_command(entity(1)));
         }
         if at.0 == SPAWN_E2_TICK {
             send_log(
@@ -238,6 +250,7 @@ fn run_original_line(snapshot_at: Option<Tick>) -> (Line, Option<GlobalSnapshot>
                 src,
                 spawn_command(entity(2), Vec3::new(100.0, 146.0, 10.0), Vec3::ZERO),
             );
+            send_log(&mut session, &mut log, src, mark_actor_command(entity(2)));
         }
         if at.0 == DETONATE_TICK {
             // 爆心 = 采样位置中点(两线位级一致 → 重放中同值,radius 同理)。
@@ -321,7 +334,11 @@ fn ac8_long_replay_600_ticks_bitwise() {
     let (orig, snapshot) = run_original_line(Some(Tick(SNAPSHOT_TICK)));
     let snapshot = snapshot.expect("拍 300 必已截取快照");
     assert_eq!(snapshot.tick, Tick(SNAPSHOT_TICK));
-    assert_eq!(orig.log.len(), 4, "固定时间线:2 出生 + 2 广播 Detonate");
+    assert_eq!(
+        orig.log.len(),
+        6,
+        "固定时间线:2 出生 + 2 常驻化 MarkActor + 2 广播 Detonate"
+    );
     assert_eq!(orig.tick_now, FINAL_TICK);
 
     // 非退化①:迁移恰好一次,先于快照拍(快照完整携带迁移后态)。
@@ -494,22 +511,29 @@ fn run_world_original(snapshot_at: Option<Tick>) -> (WorldLine, Option<WorldSnap
             snapshot = Some(session.world_snapshot());
         }
         match at.0 {
-            W_SPAWN_E1_TICK => send_log(
-                &mut session,
-                &mut log,
-                src,
-                spawn_command(
-                    entity(1),
-                    Vec3::new(110.0, 146.0, 10.0),
-                    Vec3::new(24.0, 0.0, 0.0),
-                ),
-            ),
-            W_SPAWN_E2_TICK => send_log(
-                &mut session,
-                &mut log,
-                src,
-                spawn_command(entity(2), Vec3::new(100.0, 146.0, 10.0), Vec3::ZERO),
-            ),
+            W_SPAWN_E1_TICK => {
+                send_log(
+                    &mut session,
+                    &mut log,
+                    src,
+                    spawn_command(
+                        entity(1),
+                        Vec3::new(110.0, 146.0, 10.0),
+                        Vec3::new(24.0, 0.0, 0.0),
+                    ),
+                );
+                // §9-1 迁移:常驻化(e1 跨片剧情依赖迁移;瞬态会进待地形)。
+                send_log(&mut session, &mut log, src, mark_actor_command(entity(1)));
+            }
+            W_SPAWN_E2_TICK => {
+                send_log(
+                    &mut session,
+                    &mut log,
+                    src,
+                    spawn_command(entity(2), Vec3::new(100.0, 146.0, 10.0), Vec3::ZERO),
+                );
+                send_log(&mut session, &mut log, src, mark_actor_command(entity(2)));
+            }
             W_OBS_A_ENTER_TICK | W_OBS_A_MOVE_TICK | W_OBS_A_FINAL_TICK => {
                 let position = match at.0 {
                     W_OBS_A_MOVE_TICK => PB,
@@ -566,7 +590,7 @@ fn replay_world_600_ticks_matches() {
     assert_eq!(snapshot.shards.tick, Tick(W_SNAPSHOT_TICK));
     assert_eq!(snapshot.scheduler.tick, snapshot.shards.tick);
     // 非退化:时间线日志齐全(2 出生 + 3 甲移动 + 乙入表 + 乙移除 + 2 爆炸)。
-    assert_eq!(orig.log.len(), 9, "固定时间线 9 条:{:?}", orig.log.len());
+    assert_eq!(orig.log.len(), 11, "固定时间线 11 条:{:?}", orig.log.len());
 
     // 重放线:WorldSnapshot + 日志 → 续跑到 600。
     let mut replayed = replay_world(&snapshot, &orig.log, session_cfg(), registry_factory)

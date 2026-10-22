@@ -48,6 +48,8 @@ struct ShardSimSnapshot {
     /// 下次 apply_activation 作废)。随快照走:恢复后驱动继续送 ①,集合在场
     /// 即兑现——不进快照会有"有①无②"一拍窗口,违反 D18 逐拍相等。
     pending_collider_builds: BTreeSet<ChunkPos>,
+    /// 待地形状态(REQ-007 任务 03/R10:保存的速度必须存,恢复后原样写回)。
+    locomotion: BTreeMap<EntityId, crate::sim::LocomotionState>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -120,6 +122,7 @@ impl ShardSim {
             chunk_bodies: self.chunk_bodies.clone(),
             built_colliders: self.built_colliders.clone(),
             pending_collider_builds: self.pending_collider_builds.clone(),
+            locomotion: self.locomotion.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -165,6 +168,7 @@ impl ShardSim {
             chunk_bodies: snap.chunk_bodies,
             built_colliders: snap.built_colliders,
             pending_collider_builds: snap.pending_collider_builds,
+            locomotion: snap.locomotion,
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,

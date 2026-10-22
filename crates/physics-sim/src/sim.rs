@@ -60,6 +60,17 @@ impl Default for SolidifyConfig {
     }
 }
 
+/// 实体运动状态(REQ-007 §4.6;任务 03):醒着 或 待地形(保存速度)。
+/// sim 内部记录 + 快照;不进 `EntityState`(任务书授权:types 不动)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum LocomotionState {
+    Awake,
+    AwaitingTerrain {
+        saved_linvel: Vec3,
+        saved_angvel: Vec3,
+    },
+}
+
 /// 位移门滚动窗口的样本数:最近 20 tick 位移 = 21 个 translation
 /// (每 tick step 后采一个点,首尾相距 20 tick;任务书 01 接口设计)。
 pub(crate) const DISPLACEMENT_WINDOW_LEN: usize = 21;
@@ -177,6 +188,9 @@ pub struct ShardSim {
     /// 驱动继续送 ①,集合在场即兑现——不进快照会有"有①无②"一拍窗口,
     /// 违反 D18 默认配置逐拍相等)。
     pub(crate) pending_collider_builds: BTreeSet<ChunkPos>,
+    /// 待地形实体(REQ-007 §4.6;任务 03/提交 B):LocomotionState 保存的
+    /// 速度随档;恢复时原样写回(位级)。未启用模式(D17)恒空。
+    pub(crate) locomotion: BTreeMap<EntityId, LocomotionState>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -205,6 +219,7 @@ impl ShardSim {
             chunk_bodies: BTreeMap::new(),
             built_colliders: BTreeSet::new(),
             pending_collider_builds: BTreeSet::new(),
+            locomotion: BTreeMap::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -641,9 +656,18 @@ impl ShardSim {
                 (*id, conv::rapier_to_vec3(b.translation()), b.is_kinematic())
             })
             .collect();
-        let decisions =
-            self.activation
-                .plan(tickets, &loaded, &collider_loaded, &entities, now, region);
+        // 阻塞请求(D15;判定只依实体状态,§14-8):待地形实体的足迹缺 ② +
+        // 缺 ①(§4.12 三来源的前两个;强制落地柱缺 ① 在后续提交接)。
+        let blocked = self.awaiting_terrain_blocked();
+        let decisions = self.activation.plan(
+            tickets,
+            &loaded,
+            &collider_loaded,
+            &entities,
+            now,
+            region,
+            &blocked,
+        );
 
         // tier② 落实(REQ-007 任务 01/B3:N3——决策在 plan,执行在此,与
         // ③ 冻结/唤醒同方式;驱动层不执行 ②):
@@ -682,7 +706,156 @@ impl ShardSim {
             let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
             body.set_body_type(RigidBodyType::Dynamic, true);
         }
+
+        // ---- 待地形(REQ-007 §4.6;任务 03/提交 B;S4 I2 完整执行)----
+        // 判定点 = apply_activation(step 之前);判定只对**瞬态体**(actor
+        // == false;常驻体 04)。I2:当前足迹 ∩ 本分片区域内每 chunk 都有 ②;
+        // 缺 → Kinematic + 保存速度(位级);齐 → 恢复(原样写回 + 重置静止
+        // 判据)。期间不计醒数(plan 实体档的 frozen 输入 = kinematic 已含)、
+        // 不凝固不迁移(step 的 is_frozen 跳过)、事件免疫(step 前缀 detonate
+        // 对 kinematic 无效=既有免疫)。
+        self.update_awaiting_terrain();
         decisions
+    }
+
+    /// 待地形进入/恢复(§4.6;瞬态体;调用点 = apply_activation 末与
+    /// spawn_entity)。返回本拍阻塞请求(足迹 ∩ 区域内缺 ② 的 chunk + 待地形
+    /// 实体的当前足迹缺 ①;D15:免冷却、排序最前、仍占预算)。
+    /// 待地形阻塞请求(纯读;§4.6/§4.12):待地形实体足迹 ∩ 区域内缺 ②/缺 ①。
+    fn awaiting_terrain_blocked(&self) -> BTreeSet<ChunkPos> {
+        let mut blocked = BTreeSet::new();
+        let region = self.activation_region();
+        for (id, st) in &self.locomotion {
+            if !matches!(st, LocomotionState::AwaitingTerrain { .. }) {
+                continue;
+            }
+            let Some(rec) = self.entities.get(id) else {
+                continue;
+            };
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            let pos = conv::rapier_to_vec3(body.translation());
+            for cp in crate::settle::current_footprint(
+                pos,
+                rec.desc.half_size,
+                self.cfg.activation.terrain_guard_m,
+            ) {
+                if !region.contains(cp) {
+                    continue;
+                }
+                if !self.built_colliders.contains(&cp) || !self.voxels.get_chunk(cp).is_some() {
+                    blocked.insert(cp);
+                }
+            }
+        }
+        blocked
+    }
+
+    fn update_awaiting_terrain(&mut self) -> BTreeSet<ChunkPos> {
+        let mut blocked: BTreeSet<ChunkPos> = BTreeSet::new();
+        let region = self.activation_region();
+        let ids: Vec<EntityId> = self.entities.keys().copied().collect();
+        for id in ids {
+            let Some(rec) = self.entities.get(&id) else {
+                continue;
+            };
+            if rec.actor {
+                continue; // 常驻体 04
+            }
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            let pos = conv::rapier_to_vec3(body.translation());
+            let is_kinematic = body.is_kinematic();
+            let footprint = crate::settle::current_footprint(
+                pos,
+                rec.desc.half_size,
+                self.cfg.activation.terrain_guard_m,
+            );
+            let missing_collider: BTreeSet<ChunkPos> = footprint
+                .iter()
+                .filter(|cp| region.contains(**cp) && !self.built_colliders.contains(*cp))
+                .copied()
+                .collect();
+            let missing_data: BTreeSet<ChunkPos> = footprint
+                .iter()
+                .filter(|cp| region.contains(**cp) && !self.voxels.get_chunk(**cp).is_some())
+                .copied()
+                .collect();
+            let awaiting = matches!(
+                self.locomotion.get(&id),
+                Some(LocomotionState::AwaitingTerrain { .. })
+            );
+            if missing_collider.is_empty() && missing_data.is_empty() {
+                // 足迹齐:若在待地形 → 恢复(切回 Dynamic + 原样写回速度;
+                // 重置静止判据 = 恢复属唤醒语义)。
+                if let Some(LocomotionState::AwaitingTerrain {
+                    saved_linvel,
+                    saved_angvel,
+                }) = self.locomotion.remove(&id)
+                {
+                    let rec = self.entities.get_mut(&id).expect("存在");
+                    rec.slow_ticks = 0;
+                    rec.window.clear();
+                    rec.window.push_back(pos);
+                    let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+                    body.set_linvel(conv::vec3_to_rapier(saved_linvel), true);
+                    body.set_angvel(conv::vec3_to_rapier(saved_angvel), true);
+                    body.set_body_type(RigidBodyType::Dynamic, true);
+                } else if !awaiting {
+                    self.locomotion.entry(id).or_insert(LocomotionState::Awake);
+                }
+            } else {
+                // 缺 ②(或缺 ①):进入待地形(醒着 Dynamic 才切;已在待地形
+                // 保持)。速度保存位级;已 Kinematic(被滞回冻结)的瞬态不再
+                // 存在(03 实体档移除瞬态冻结;防御:不覆盖)。
+                blocked.extend(missing_collider.iter().copied());
+                blocked.extend(missing_data.iter().copied());
+                if !is_kinematic {
+                    let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+                    let lv = conv::rapier_to_vec3(body.linvel());
+                    let av = conv::rapier_to_vec3(body.angvel());
+                    body.set_linvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+                    body.set_angvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+                    body.set_body_type(RigidBodyType::KinematicPositionBased, true);
+                    self.locomotion.insert(
+                        id,
+                        LocomotionState::AwaitingTerrain {
+                            saved_linvel: lv,
+                            saved_angvel: av,
+                        },
+                    );
+                } else if !awaiting {
+                    // kinematic 但非待地形(异常:防御性按醒着待处理?不——
+                    // 瞬态无滞回冻结路径;此分支 = 未知来源 kinematic,保持)。
+                    self.locomotion.entry(id).or_insert(LocomotionState::Awake);
+                }
+            }
+        }
+        blocked
+    }
+
+    /// I2 断言(§14-7;debug):醒着的瞬态体当前足迹 ∩ 区域内缺 ② → panic。
+    /// 钩子:测试以"醒着 + 缺 ②"状态直接调用。
+    #[cfg(debug_assertions)]
+    pub fn i2_assert_awake_footprint_ready(&self) {
+        let region = self.activation_region();
+        for (id, rec) in &self.entities {
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            if body.is_kinematic() {
+                continue; // 待地形/冻结体不算"醒着"
+            }
+            let pos = conv::rapier_to_vec3(body.translation());
+            for cp in crate::settle::current_footprint(
+                pos,
+                rec.desc.half_size,
+                self.cfg.activation.terrain_guard_m,
+            ) {
+                if region.contains(cp) {
+                    assert!(
+                        self.built_colliders.contains(&cp),
+                        "I2 违反:醒着瞬态体 {id:?} 的足迹 chunk {cp:?} 缺 ②(待地形应已进入,fail-stop)"
+                    );
+                }
+            }
+        }
     }
 
     /// 激活配置(测试/注入用)。
@@ -1007,6 +1180,10 @@ mod tests {
         s.apply_prefix(&[
             spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
             spawn_input(1, far, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1(瞬态半边)迁移:被测实体改 actor = true(REQ-007 任务 03;
+            // 瞬态不再滞回冻结且足迹缺 ② 进待地形,会吞掉爆炸冲量断言)。
+            mark_actor_input(2, near, true),
+            mark_actor_input(3, far, true),
         ]);
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert!(
@@ -1148,6 +1325,9 @@ mod tests {
         s.apply_prefix(&[
             spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
             spawn_input(1, e2, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1 迁移(同上):常驻化(瞬态会进待地形,吞掉"正常下落"断言)。
+            mark_actor_input(2, e1, true),
+            mark_actor_input(3, e2, true),
         ]);
         // 注册观察者(e2 远 → 冻结);醒数 {e1} = 1 ≤ 预算 2。
         let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
@@ -1183,6 +1363,9 @@ mod tests {
         s.apply_prefix(&[
             spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
             spawn_input(1, e2, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1 迁移(同上):常驻化(瞬态会进待地形,吞掉"正常下落"断言)。
+            mark_actor_input(2, e1, true),
+            mark_actor_input(3, e2, true),
         ]);
         let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(d.entities_to_freeze, vec![e2], "e2 远 → 冻结(观察者已注册)");
@@ -1831,6 +2014,9 @@ mod tests {
         s.apply_prefix(&[
             spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
             spawn_input(1, far, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1 迁移(同上):常驻化,保留冻结/免疫语义锚。
+            mark_actor_input(2, near, true),
+            mark_actor_input(3, far, true),
         ]);
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(decisions.entities_to_freeze, vec![far], "非退化:far 冻结");

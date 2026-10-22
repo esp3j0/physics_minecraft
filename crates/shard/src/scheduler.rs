@@ -1871,22 +1871,41 @@ mod tests {
         for (seq, id, pos) in [
             (0, near, Vec3::new(8.0, 3.0, 8.0)),
             (1, far, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1(瞬态半边)迁移:被测实体改 actor = true(REQ-007 任务 03;
+            // 瞬态不再滞回冻结,足迹缺 ② 会进待地形而非醒落下落)。
+            (2, near, Vec3::ZERO),
         ] {
             sim0.apply_prefix(&[StampedInput {
                 apply_at: Tick::ZERO,
                 source: messaging::InputSource::SCHEDULER,
                 sequence: seq,
-                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
-                    entity: id,
-                    state: types::EntityState {
-                        translation: pos,
-                        ..types::EntityState::default()
-                    },
-                    desc: types::EntityDesc::default(),
-                }),
+                payload: if seq == 2 {
+                    messaging::InputPayload::Command(messaging::SimCommand::MarkActor {
+                        entity: near,
+                        actor: true,
+                    })
+                } else {
+                    messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                        entity: id,
+                        state: types::EntityState {
+                            translation: pos,
+                            ..types::EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    })
+                },
             }]);
         }
 
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 3,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::MarkActor {
+                entity: far,
+                actor: true,
+            }),
+        }]);
         let mut sched = Scheduler::new(sched_cfg(2));
         sched.register(sim0);
         sched.set_observers(vec![Vec3::new(8.0, 3.0, 8.0)]);
