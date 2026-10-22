@@ -73,7 +73,7 @@ fn run_area_ticket_scenario() -> (usize, usize) {
     macro_rules! orchestrate_min {
         () => {{
             // ①″ 区域票 ensure(任务书细则 7)。
-            for shard in session.area_ticket_shards() {
+            for shard in session.ticket_ensure_shards() {
                 if !session.shard_ids().contains(&shard) {
                     session.register(new_sim(shard));
                 }

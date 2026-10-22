@@ -985,10 +985,10 @@ fn orchestrate(
             }
         }
     }
-    // ①″ 区域票 ensure(REQ-007 任务 02 细则 7):每张 Active/Paused 区域票
-    // ① "进"区域覆盖的分片(owner 分片 = 核心区含该分片覆盖 chunk 的)注册。
-    // Radius 票:中心所在分片 + 半径圆覆盖的分片(shards_within 同口径)。
-    for shard in session.area_ticket_shards() {
+    // ①″ 票据 ensure(REQ-007 任务 02 细则 7;F2):所有 Active/Paused 票
+    // ① "进"区域覆盖的分片注册(无票种分支;观察者票求出的分片 ⊆ 下方
+    // 32m 邻片 ensure,行为不变,邻片 ensure 照旧保留 = §4.13)。
+    for shard in session.ticket_ensure_shards() {
         if ensured.insert(shard) && !session.shard_ids().contains(&shard) {
             session.register(new_sim(shard));
             counters.shards_spawned += 1;
@@ -1540,6 +1540,7 @@ pub fn bootstrap(
             (session, log, Some(at), spawn_next_seq)
         }
         None => {
+            // session_config 内已注入激活配置(F3:观察者票规格唯一来源)。
             let mut session = sim_api::session::Session::new(config.session_config());
             // 区域票上限注入(REQ-007 任务 02 细则 10;config 两键)。
             let (max_r, max_c) = config.area_ticket_caps();

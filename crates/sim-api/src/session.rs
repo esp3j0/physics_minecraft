@@ -524,10 +524,10 @@ impl Session {
         self.scheduler.has_collider(shard, pos)
     }
 
-    /// 调度器透传(REQ-007 任务 02 细则 7):区域票 ① "进"区域覆盖的分片集
-    /// (驱动 ensure 用;键序)。
-    pub fn area_ticket_shards(&self) -> std::collections::BTreeSet<ShardId> {
-        self.scheduler.area_ticket_shards()
+    /// 调度器透传(REQ-007 任务 02 细则 7;F2 改名):所有 Active/Paused 票
+    /// ① "进"区域覆盖的分片集(驱动 ensure 用;键序;无票种分支)。
+    pub fn ticket_ensure_shards(&self) -> std::collections::BTreeSet<ShardId> {
+        self.scheduler.ticket_ensure_shards()
     }
 
     /// 调度器透传(REQ-007 任务 02 细则 10):区域票上限注入(bootstrap

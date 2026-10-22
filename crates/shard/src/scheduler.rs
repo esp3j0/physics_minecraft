@@ -68,6 +68,10 @@ pub struct SchedulerConfig {
     /// 起始拍(README 决策 6):回放从快照拍对齐续跑;默认 `Tick::ZERO`,
     /// tick 语义不变(第 k 次 `tick()` 执行第 k-1 拍)。
     pub start_tick: Tick,
+    /// 激活配置(REQ-007 任务 02 F3 返修:观察者票规格的**唯一来源**——半径
+    /// 只在配置里出现一次(需求 §4.2);app 装配从 `app::Config` 传入。替换
+    /// 旧"取 `self.sims` 第一个分片配置"的写法:分片未注册时旧写法用错半径。
+    pub activation: physics_sim::ActivationConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -77,6 +81,7 @@ impl Default for SchedulerConfig {
             router: RouterConfig::default(),
             despawn_after_ticks: 1800,
             start_tick: Tick::ZERO,
+            activation: physics_sim::ActivationConfig::default(),
         }
     }
 }
@@ -157,6 +162,9 @@ pub struct Scheduler {
     /// 区域票上限(app::Config 注入;默认 128 m / 64 张,§4.2.3)。
     area_ticket_max_radius_m: f32,
     area_ticket_max_count: usize,
+    /// 激活配置(观察者票规格唯一来源;F3:自 SchedulerConfig 注入,替换
+    /// "取第一个分片配置")。
+    activation_cfg: physics_sim::ActivationConfig,
     /// 本拍激活决策(tick 步骤 1.5 收集,两拍之间经 take_activation_requests
     /// 取走;恰一次语义)。
     activation_requests: BTreeMap<ShardId, physics_sim::ActivationDecisions>,
@@ -215,6 +223,7 @@ impl Scheduler {
             tickets: crate::tickets::TicketTable::new(),
             area_ticket_max_radius_m: 128.0,
             area_ticket_max_count: 64,
+            activation_cfg: cfg.activation,
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
             block_updates: Vec::new(),
@@ -253,12 +262,7 @@ impl Scheduler {
         }
         self.observer_table.clear();
         let len = observers.len();
-        let cfg_r = self
-            .sims
-            .values()
-            .next()
-            .map(|s| *s.activation_config())
-            .unwrap_or_default();
+        let now = self.coordinator.tick();
         for (j, pos) in observers.into_iter().enumerate() {
             let key = if j + 1 == len {
                 InputSource::SCHEDULER
@@ -266,37 +270,13 @@ impl Scheduler {
                 InputSource(u32::MAX - (len - 2 - j) as u32)
             };
             self.observer_table.insert(key, pos);
-            // 观察者票双写(REQ-007 任务 02;直通路径同语义,续期)。
-            self.tickets.issue(
-                (
-                    physics_sim::tickets::TicketHolder::Observer(key),
-                    physics_sim::tickets::TicketKind::Observer,
-                ),
-                crate::tickets::StoredTicket {
-                    priority: 0,
-                    data: physics_sim::tickets::RegionSpec::Radius {
-                        load_m: cfg_r.data_load_radius,
-                        unload_m: cfg_r.data_unload_radius,
-                    },
-                    collider: physics_sim::tickets::RegionSpec::Radius {
-                        load_m: cfg_r.collider_load_radius,
-                        unload_m: cfg_r.collider_unload_radius,
-                    },
-                    wake: physics_sim::tickets::WakeSpec::Radius {
-                        load_m: cfg_r.awake_load_radius,
-                        unload_m: cfg_r.awake_unload_radius,
-                    },
-                    clock: physics_sim::tickets::TicketClock {
-                        issued_at: self.coordinator.tick(),
-                        active_ticks: 0,
-                        limit: None,
-                        starts_at: None,
-                    },
-                    state: physics_sim::tickets::TicketState::Active,
-                    center: None,
-                },
-                self.coordinator.tick(),
+            // 观察者票双写(REQ-007 任务 02;直通路径同语义,续期;F3:规格
+            // 从注入配置构造)。
+            let tkey = (
+                physics_sim::tickets::TicketHolder::Observer(key),
+                physics_sim::tickets::TicketKind::Observer,
             );
+            self.tickets.issue(tkey, self.observer_ticket(now), now);
         }
         self.observers_ever_set = true;
     }
@@ -326,33 +306,36 @@ impl Scheduler {
 
     /// 区域票 ① "进"区域覆盖的分片集(REQ-007 任务 02 细则 7:驱动 ensure
     /// 用)。Radius 票:锚点圆覆盖(水平)的分片,键序。Suspended 不 ensure。
-    pub fn area_ticket_shards(&self) -> BTreeSet<ShardId> {
-        use physics_sim::tickets::{TicketHolder, TicketState};
+    pub fn ticket_ensure_shards(&self) -> BTreeSet<ShardId> {
+        use physics_sim::tickets::{RegionSpec, TicketState};
         const SHARD_M: f32 = (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
         let mut out = BTreeSet::new();
+        // F2(验收返修):对**所有** Active/Paused 票按 ① 规格的"进"区域求
+        // owner 分片(§14-1,无票种分支;观察者票也走这里)。Radius 票 =
+        // 锚点到分片核心 AABB 水平距离 ≤ load_m;Chunks/Footprint(03)跳过。
+        // 观察者票由此求出的分片 ⊆ 现有"32 m 邻片 ensure"(load 32 < 32m
+        // 邻片半径),行为不变;现有邻片 ensure 照旧保留(§4.13)。
         for (holder, t) in self.tickets.iter() {
             if t.state == TicketState::Suspended {
                 continue;
             }
-            let TicketHolder::Area(id) = holder.0 else {
-                continue; // 观察者票走 ① 观察者邻片 ensure;实体票 03
-            };
-            let Some(center) = t.center else { continue };
-            let physics_sim::tickets::RegionSpec::Radius { load_m, .. } = t.data else {
+            let RegionSpec::Radius { load_m, .. } = t.data else {
                 continue;
             };
-            let min_x = ((center.x - load_m) / SHARD_M).floor() as i32;
-            let max_x = ((center.x + load_m) / SHARD_M).floor() as i32;
-            let min_z = ((center.z - load_m) / SHARD_M).floor() as i32;
-            let max_z = ((center.z + load_m) / SHARD_M).floor() as i32;
+            let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
+                continue; // 无锚票(03 语义)
+            };
+            let min_x = ((anchor.x - load_m) / SHARD_M).floor() as i32;
+            let max_x = ((anchor.x + load_m) / SHARD_M).floor() as i32;
+            let min_z = ((anchor.z - load_m) / SHARD_M).floor() as i32;
+            let max_z = ((anchor.z + load_m) / SHARD_M).floor() as i32;
             for sx in min_x..=max_x {
                 for sz in min_z..=max_z {
                     // 分片核心 AABB 水平距离 ≤ load_m(与 shards_within 同口径)。
                     let (cx, cz) = (sx as f32 * SHARD_M, sz as f32 * SHARD_M);
-                    let dx = (cx - center.x).max(0.0).max(center.x - (cx + SHARD_M));
-                    let dz = (cz - center.z).max(0.0).max(center.z - (cz + SHARD_M));
+                    let dx = (cx - anchor.x).max(0.0).max(anchor.x - (cx + SHARD_M));
+                    let dz = (cz - anchor.z).max(0.0).max(anchor.z - (cz + SHARD_M));
                     if dx * dx + dz * dz <= load_m * load_m {
-                        let _ = id;
                         out.insert(ShardId::new(
                             types::WorldId(0),
                             types::DimensionId(0),
@@ -386,11 +369,14 @@ impl Scheduler {
             RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
         };
         // 同 id 已在 → 计数不变(覆盖);否则占新名额(Session 层已校验上限)。
+        // F4(验收返修):区域票 load = unload = radius——锚点固定不动,滞回
+        // 无意义;1.5× 会让保活/唤醒保持范围超 `area_ticket_max_radius_m` 本意
+        // (需求 §4.2.3:"Radius(中心 + 半径)")。
         let tiers_mask = tiers & 0b111;
         let data = if tiers_mask & 0b001 != 0 {
             RegionSpec::Radius {
                 load_m: radius_m,
-                unload_m: radius_m * 1.5,
+                unload_m: radius_m,
             }
         } else {
             RegionSpec::None
@@ -398,7 +384,7 @@ impl Scheduler {
         let collider = if tiers_mask & 0b010 != 0 {
             RegionSpec::Radius {
                 load_m: radius_m,
-                unload_m: radius_m * 1.5,
+                unload_m: radius_m,
             }
         } else {
             RegionSpec::None
@@ -406,7 +392,7 @@ impl Scheduler {
         let wake = if tiers_mask & 0b100 != 0 {
             WakeSpec::Radius {
                 load_m: radius_m,
-                unload_m: radius_m * 1.5,
+                unload_m: radius_m,
             }
         } else {
             WakeSpec::None
@@ -447,6 +433,37 @@ impl Scheduler {
     /// 实体票 = 实体位置(03 接;当前无实体票,`None` → views 跳过/panic
     /// 语义由 TicketTable::views 决定)。观察者不在表(已删)而票在 = 一致
     /// 违规(views 内 panic;此处观察者票锚点直接查表)。
+    /// 观察者票 StoredTicket(规格唯一来源 = `SchedulerConfig.activation`
+    /// 注入的激活配置;F3 返修:删"取第一个分片配置"写法——自定义配置下
+    /// 观察者先于分片注册时旧写法会用错半径)。priority 0,无 center。
+    fn observer_ticket(&self, at: Tick) -> crate::tickets::StoredTicket {
+        use physics_sim::tickets::{RegionSpec, TicketClock, TicketState, WakeSpec};
+        let c = &self.activation_cfg;
+        crate::tickets::StoredTicket {
+            priority: 0,
+            data: RegionSpec::Radius {
+                load_m: c.data_load_radius,
+                unload_m: c.data_unload_radius,
+            },
+            collider: RegionSpec::Radius {
+                load_m: c.collider_load_radius,
+                unload_m: c.collider_unload_radius,
+            },
+            wake: WakeSpec::Radius {
+                load_m: c.awake_load_radius,
+                unload_m: c.awake_unload_radius,
+            },
+            clock: TicketClock {
+                issued_at: at,
+                active_ticks: 0,
+                limit: None,
+                starts_at: None,
+            },
+            state: TicketState::Active,
+            center: None,
+        }
+    }
+
     fn ticket_anchor_of(&self, holder: &physics_sim::tickets::TicketHolder) -> Option<Vec3> {
         use physics_sim::tickets::TicketHolder;
         match holder {
@@ -1023,42 +1040,11 @@ impl Scheduler {
                         // 来源,票据表 = 决策输入;覆盖 = 续期,规格与任务 01
                         // 等价路径同源)。半径取激活配置(任一 sim 同源;无 sim
                         // 时默认——与 shard_is_ticketed 同口径)。
-                        let cfg_r = self
-                            .sims
-                            .values()
-                            .next()
-                            .map(|s| *s.activation_config())
-                            .unwrap_or_default();
-                        self.tickets.issue(
-                            (
-                                physics_sim::tickets::TicketHolder::Observer(input.source),
-                                physics_sim::tickets::TicketKind::Observer,
-                            ),
-                            crate::tickets::StoredTicket {
-                                priority: 0,
-                                data: physics_sim::tickets::RegionSpec::Radius {
-                                    load_m: cfg_r.data_load_radius,
-                                    unload_m: cfg_r.data_unload_radius,
-                                },
-                                collider: physics_sim::tickets::RegionSpec::Radius {
-                                    load_m: cfg_r.collider_load_radius,
-                                    unload_m: cfg_r.collider_unload_radius,
-                                },
-                                wake: physics_sim::tickets::WakeSpec::Radius {
-                                    load_m: cfg_r.awake_load_radius,
-                                    unload_m: cfg_r.awake_unload_radius,
-                                },
-                                clock: physics_sim::tickets::TicketClock {
-                                    issued_at: at,
-                                    active_ticks: 0,
-                                    limit: None,
-                                    starts_at: None,
-                                },
-                                state: physics_sim::tickets::TicketState::Active,
-                                center: None,
-                            },
-                            at,
+                        let key = (
+                            physics_sim::tickets::TicketHolder::Observer(input.source),
+                            physics_sim::tickets::TicketKind::Observer,
                         );
+                        self.tickets.issue(key, self.observer_ticket(at), at);
                     }
                     InputPayload::Command(messaging::SimCommand::RemoveObserver) => {
                         // 幂等:不在表 = 无动作(断线竞先/重复移除无害,票撤
@@ -1319,18 +1305,14 @@ impl Scheduler {
         if !self.activation_enabled() {
             return false;
         }
-        // 半径回退:无 sim(全卸后)时取默认 48(与旧实现同口径)。
-        let fallback = self
-            .sims
-            .values()
-            .next()
-            .map(|s| s.activation_config().data_unload_radius)
-            .unwrap_or(48.0);
         let min = shard.pos.min_chunk();
         let min_x = (min.x * types::CHUNK_SIZE) as f32;
         let min_z = (min.z * types::CHUNK_SIZE) as f32;
         let max_x = min_x + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
         let max_z = min_z + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        // F1(验收返修):保活**只读票据规格**(§14-1,无票种分支)——统一用
+        // `RegionSpec::Radius.unload_m`。观察者票的规格本就按 ① 卸载半径签发
+        // (F3:从 SchedulerConfig 注入的激活配置构造),去分支后行为不变。
         self.tickets.iter().any(|(holder, t)| {
             if t.state == physics_sim::tickets::TicketState::Suspended {
                 return false;
@@ -1341,12 +1323,7 @@ impl Scheduler {
             let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
                 return false; // 无锚票(03 语义);保活忽略
             };
-            let radius = if matches!(holder.0, physics_sim::tickets::TicketHolder::Observer(_)) {
-                fallback // 观察者票半径与 ① 配置同源(现状口径)
-            } else {
-                unload_m
-            };
-            let radius_sq = radius * radius;
+            let radius_sq = unload_m * unload_m;
             let dx = (anchor.x.clamp(min_x, max_x) - anchor.x).abs();
             let dz = (anchor.z.clamp(min_z, max_z) - anchor.z).abs();
             dx * dx + dz * dz <= radius_sq
@@ -1986,6 +1963,76 @@ mod tests {
         assert!(
             sched2.activation_enabled(),
             "observers_ever_set 随 SchedulerSnapshot 往返"
+        );
+        sched.shutdown();
+        sched2.shutdown();
+    }
+
+    /// F3 返修测试 `observer_ticket_spec_from_injected_config`:自定义半径在
+    /// SchedulerConfig.activation 注入;**注册分片之前**先设观察者(直通与
+    /// 收件箱两路径),断言观察者票规格 == 注入配置(旧"取第一个分片配置"
+    /// 写法在无分片时会错用默认 32/48)。
+    #[test]
+    fn observer_ticket_spec_from_injected_config() {
+        use types::glam::Vec3;
+        let injected = physics_sim::ActivationConfig {
+            data_load_radius: 20.0,
+            data_unload_radius: 40.0,
+            collider_load_radius: 20.0,
+            collider_unload_radius: 40.0,
+            awake_load_radius: 12.0,
+            awake_unload_radius: 25.0,
+            ..physics_sim::ActivationConfig::default()
+        };
+        let cfg = SchedulerConfig {
+            activation: injected,
+            ..sched_cfg(2)
+        };
+        // 路径 1:直通 set_observers(注册分片之前)。
+        let mut sched = Scheduler::new(cfg);
+        sched.set_observers(vec![Vec3::new(8.0, 0.0, 8.0)]);
+        let key = (
+            physics_sim::tickets::TicketHolder::Observer(messaging::InputSource::SCHEDULER),
+            physics_sim::tickets::TicketKind::Observer,
+        );
+        let t = sched.ticket_table().get(key).expect("直通路径已落票");
+        assert_eq!(
+            t.data,
+            physics_sim::tickets::RegionSpec::Radius {
+                load_m: 20.0,
+                unload_m: 40.0
+            },
+            "① 规格 == 注入配置(非默认 32/48)"
+        );
+        assert_eq!(
+            t.wake,
+            physics_sim::tickets::WakeSpec::Radius {
+                load_m: 12.0,
+                unload_m: 25.0
+            },
+            "③ 规格 == 注入配置"
+        );
+        // 路径 2:收件箱(先注册分片——收件箱应用在 tick 内,规格仍只从注入)。
+        let cfg2 = SchedulerConfig {
+            activation: injected,
+            ..sched_cfg(2)
+        };
+        let mut sched2 = Scheduler::new(cfg2);
+        sched2.register(sim(0, 0));
+        sched2.submit_observer(observer_input(9, 0, Tick::ZERO, Vec3::new(8.0, 0.0, 8.0)));
+        sched2.tick();
+        let key2 = (
+            physics_sim::tickets::TicketHolder::Observer(messaging::InputSource(9)),
+            physics_sim::tickets::TicketKind::Observer,
+        );
+        let t2 = sched2.ticket_table().get(key2).expect("收件箱路径已落票");
+        assert_eq!(
+            t2.data,
+            physics_sim::tickets::RegionSpec::Radius {
+                load_m: 20.0,
+                unload_m: 40.0
+            },
+            "收件箱路径规格同源注入配置"
         );
         sched.shutdown();
         sched2.shutdown();

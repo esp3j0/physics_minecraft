@@ -168,6 +168,15 @@ impl Config {
             },
             despawn_after_ticks: (self.despawn_after_secs as f32 / self.dt).round() as u64,
             start_tick: Tick::ZERO,
+            // 激活配置注入(F3 返修:观察者票规格唯一来源——半径只在配置
+            // 出现一次;换算与 shard_sim_config 完全同式)。
+            activation: self
+                .shard_sim_config(types::ShardId::new(
+                    types::WorldId(0),
+                    types::DimensionId(0),
+                    types::ShardPos::new(0, 0),
+                ))
+                .activation,
         }
     }
 
