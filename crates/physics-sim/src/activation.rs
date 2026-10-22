@@ -50,6 +50,18 @@ pub struct ActivationConfig {
     /// (ceil(m/16),默认 16m → 1)。0 显式允许(测试/实验;边界 collider
     /// 可能缺失),生产默认 1。
     pub region_margin_chunks: i32,
+    /// 足迹外扩 m(REQ-007 §4.5.2;默认 1.0)。
+    pub terrain_guard_m: f32,
+    /// 预载足迹前视拍(默认 30 = 0.5s)。
+    pub motion_lookahead_ticks: u64,
+    /// 前视 chunk 上限(默认 4)。
+    pub motion_max_lookahead_chunks: usize,
+    /// 瞬态票上限 active_ticks(默认 1200 = 20s)。
+    pub transient_settle_deadline_ticks: u64,
+    /// 支撑判定法向阈值(默认 0.7)。
+    pub support_normal_min: f32,
+    /// 虚空移除深度 m(默认 16;y < WORLD_Y_MIN − 深度 即删)。
+    pub void_despawn_depth_m: f32,
 }
 
 impl Default for ActivationConfig {
@@ -66,6 +78,12 @@ impl Default for ActivationConfig {
             data_budget_per_tick: 2,
             collider_budget_per_tick: 2,
             region_margin_chunks: 1,
+            terrain_guard_m: 1.0,
+            motion_lookahead_ticks: 30,
+            motion_max_lookahead_chunks: 4,
+            transient_settle_deadline_ticks: 1200,
+            support_normal_min: 0.7,
+            void_despawn_depth_m: 16.0,
         }
     }
 }
@@ -144,6 +162,18 @@ fn nearest_observer_distance(observers: &[Vec3], p: Vec3, horizontal: bool) -> O
             }
         })
         .min_by(|a, b| a.total_cmp(b))
+}
+
+/// 票的 ② 规格是否覆盖 chunk(Radius 圆 / Chunks 集合;§14-1:无票种分支,
+/// plan 只见 RegionSpec)。
+fn collider_covers(t: &crate::tickets::TicketView, cp: &ChunkPos) -> bool {
+    match &t.collider {
+        crate::tickets::RegionSpec::Radius { load_m, .. } => {
+            horizontal_chunk_distance(*cp, t.anchor) <= *load_m
+        }
+        crate::tickets::RegionSpec::Chunks(chunks) => chunks.contains(cp),
+        _ => false,
+    }
 }
 
 /// chunk 中心(局部 8,8)到锚点的水平距离(票据口径;单票时与
@@ -293,6 +323,15 @@ impl ActivationController {
                 }
             }
         }
+        // Chunks 规格(REQ-007 任务 03/R1:实体票的足迹由调度器解析成 chunk 集
+        // 交给 plan;进=出,无滞回)。通用地并入覆盖(§14-1:无票种分支——
+        // plan 只见 RegionSpec)。
+        for t in &occupying {
+            if let crate::tickets::RegionSpec::Chunks(chunks) = &t.data {
+                in_cover.extend(chunks.iter().copied());
+                out_cover.extend(chunks.iter().copied());
+            }
+        }
         let loaded_set: BTreeSet<ChunkPos> = loaded.iter().copied().collect();
         // 候选集:(chunk, best(priority, dist, order), 是否装载)。多票覆盖
         // 同一 chunk 取最优 = 最小 (priority, 距锚点距离, order)(任务书细则 4:
@@ -310,16 +349,30 @@ impl ActivationController {
             // 最优覆盖票(必存在:in_cover 的条目由某票"进"区域产生)。
             let mut key: Option<(u8, f32, u32)> = None;
             for t in &occupying {
-                let crate::tickets::RegionSpec::Radius { load_m, .. } = t.data else {
-                    continue;
-                };
-                let dist = horizontal_chunk_distance(cp, t.anchor);
-                if dist > load_m {
-                    continue;
-                }
-                let k = (t.priority, dist, t.order);
-                if key.is_none_or(|cur| k < cur) {
-                    key = Some(k);
+                match &t.data {
+                    crate::tickets::RegionSpec::Radius { load_m, .. } => {
+                        let dist = horizontal_chunk_distance(cp, t.anchor);
+                        if dist > *load_m {
+                            continue;
+                        }
+                        let k = (t.priority, dist, t.order);
+                        if key.is_none_or(|cur| k < cur) {
+                            key = Some(k);
+                        }
+                    }
+                    // Chunks(实体票足迹解析结果):锚点距离 = 到票锚点水平距离
+                    // (被卡实体位置,§4.12 阻塞排序同源;无滞回,在集即覆盖)。
+                    crate::tickets::RegionSpec::Chunks(chunks) => {
+                        if !chunks.contains(&cp) {
+                            continue;
+                        }
+                        let dist = horizontal_chunk_distance(cp, t.anchor);
+                        let k = (t.priority, dist, t.order);
+                        if key.is_none_or(|cur| k < cur) {
+                            key = Some(k);
+                        }
+                    }
+                    _ => {}
                 }
             }
             let key = key.expect("in_cover 条目必有覆盖票(构造保证)");
@@ -376,12 +429,7 @@ impl ActivationController {
                 // 装载候选已保证 ≤ data_load;若两档半径不同,② 条件更严,
                 // 需单独判定。
                 // ② 条件(D18 情况 1):任一票的 collider "进"区域覆盖。
-                let collider_covered = occupying.iter().any(|t| {
-                    let crate::tickets::RegionSpec::Radius { load_m, .. } = t.collider else {
-                        return false;
-                    };
-                    horizontal_chunk_distance(cp, t.anchor) <= load_m
-                });
+                let collider_covered = occupying.iter().any(|t| collider_covers(t, &cp));
                 if collider_budget_left > 0 && collider_covered && self.collider_cooled(&cp, now) {
                     collider_budget_left -= 1;
                     self.collider_last_build.insert(cp, now);
@@ -401,12 +449,7 @@ impl ActivationController {
                 continue;
             }
             // ② 覆盖 = 任一票 collider "进"区域。
-            let collider_covered = occupying.iter().any(|t| {
-                let crate::tickets::RegionSpec::Radius { load_m, .. } = t.collider else {
-                    return false;
-                };
-                horizontal_chunk_distance(cp, t.anchor) <= load_m
-            });
+            let collider_covered = occupying.iter().any(|t| collider_covers(t, &cp));
             if collider_covered && self.collider_cooled(&cp, now) {
                 if collider_budget_left == 0 {
                     break;
@@ -430,11 +473,14 @@ impl ActivationController {
             // ② 超出**所有**占区域票的 collider "出"区域,且 ① 仍被保留
             // (任一票 ① "出"区域覆盖 = out_cover)→ 单独拆 ②(R2/D18 情况 3:
             // 排队待卸的 chunk 不在 out_cover 卸载候选之外时,② 不动)。
-            let collider_out = occupying.iter().all(|t| {
-                let crate::tickets::RegionSpec::Radius { unload_m, .. } = t.collider else {
-                    return true; // 无 ② 规格 → 不覆盖 → 视为出
-                };
-                horizontal_chunk_distance(cp, t.anchor) > unload_m
+            // "出"= 距所有票锚点 > collider_unload_m(非"进"判定——滞回带
+            // (load, unload] 内 ② 保持)。
+            let collider_out = occupying.iter().all(|t| match &t.collider {
+                crate::tickets::RegionSpec::Radius { unload_m, .. } => {
+                    horizontal_chunk_distance(cp, t.anchor) > *unload_m
+                }
+                crate::tickets::RegionSpec::Chunks(chunks) => !chunks.contains(&cp),
+                _ => true,
             });
             if collider_out && out_cover.contains(&cp) && self.collider_cooled(&cp, now) {
                 self.collider_last_build.insert(cp, now);

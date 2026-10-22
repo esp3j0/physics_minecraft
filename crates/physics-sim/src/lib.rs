@@ -12,6 +12,7 @@
 pub mod activation;
 pub mod collider_build;
 pub mod explosion;
+pub mod settle;
 pub mod sim;
 pub mod snapshot;
 pub mod tickets;

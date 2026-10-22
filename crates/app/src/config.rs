@@ -219,6 +219,14 @@ impl Config {
                 data_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
                 collider_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
                 region_margin_chunks: self.region_margin_chunks(),
+                // REQ-007 任务 03 配置键(§4.15 默认表;Config 顶层键在 06 全
+                // 参数化时引入,先以默认落)。
+                terrain_guard_m: 1.0,
+                motion_lookahead_ticks: 30,
+                motion_max_lookahead_chunks: 4,
+                transient_settle_deadline_ticks: 1200,
+                support_normal_min: 0.7,
+                void_despawn_depth_m: 16.0,
             },
         }
     }

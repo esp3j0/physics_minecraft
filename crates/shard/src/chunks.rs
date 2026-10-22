@@ -45,6 +45,17 @@ impl ChunkHolders {
     }
 
     /// 出现过的 owner 去重集合(校验"owner 必须已注册"用)。
+    /// 某 owner 名下的全部 (chunk, holder) 登记(despawn 登记泄漏收口用;
+    /// 键序)。
+    pub fn iter_owned_by(&self, owner: ShardId) -> impl Iterator<Item = (ChunkPos, ShardId)> + '_ {
+        self.holders
+            .range((
+                std::ops::Bound::Included((owner, ChunkPos::new(i32::MIN, i32::MIN))),
+                std::ops::Bound::Included((owner, ChunkPos::new(i32::MAX, i32::MAX))),
+            ))
+            .flat_map(|((_, pos), holders)| holders.iter().map(move |h| (*pos, *h)))
+    }
+
     pub fn owners(&self) -> BTreeSet<ShardId> {
         self.holders.keys().map(|(owner, _)| *owner).collect()
     }

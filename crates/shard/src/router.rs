@@ -156,6 +156,21 @@ impl Router {
         self.cfg.inbox_capacity
     }
 
+    /// 在途迁移信封(REQ-007 任务 03/R2:实体票锚点在途取迁移载荷状态)。
+    /// 桶序 = (destination, apply_at) 升序,桶内 canonical 序(确定性)。
+    pub fn in_transit_migrations(&self) -> Vec<Envelope> {
+        self.queue
+            .snapshot()
+            .into_iter()
+            .filter(|env| {
+                matches!(
+                    env.payload,
+                    messaging::EnvelopePayload::MigrateEntity { .. }
+                )
+            })
+            .collect()
+    }
+
     pub fn pending_envelopes(&self) -> usize {
         self.queue.len()
     }

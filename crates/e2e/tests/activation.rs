@@ -346,6 +346,27 @@ fn wake_by_teleport_command() {
             spawn_at(Tick(4), 2, e2, Vec3::new(38.0, 0.0, 8.0), Vec3::ZERO),
         )
         .expect("收件箱未满");
+    // §9-1(瞬态半边)迁移:REQ-007 任务 03 起瞬态体不再滞回冻结/醒落下落
+    // (持瞬态运动票、足迹缺 ② 进待地形)——本用例锚"命令唤醒 + 预算淘汰"
+    // 语义,被测实体改 actor = true(常驻;常驻票在 04,本任务常驻无票行为
+    // 与历史一致)。瞬态新语义由 activation_tickets 新套件覆盖。
+    // MarkActor 与各 spawn 同拍前缀(canonical 序 = seq,紧跟对应 spawn)。
+    for (at, seq, id) in [(Tick(1), 3u64, e1), (Tick(1), 4, e3), (Tick(4), 5, e2)] {
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: at,
+                    source: InputSource(7),
+                    sequence: seq,
+                    payload: InputPayload::Command(SimCommand::MarkActor {
+                        entity: id,
+                        actor: true,
+                    }),
+                },
+            )
+            .expect("收件箱未满");
+    }
     sched.set_observers(vec![obs]);
     macro_rules! st {
         ($id:expr) => {

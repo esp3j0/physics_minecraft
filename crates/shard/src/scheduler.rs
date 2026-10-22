@@ -289,6 +289,54 @@ impl Scheduler {
         self.observers_ever_set || self.tickets_ever_set
     }
 
+    /// 实体锚点(位置):存活 = 所在分片实体状态;迁移在途 = Router 待投递
+    /// 信封的载荷状态(§4.3.3"迁移在途期间票据保持,锚点取在途载荷状态")。
+    fn entity_anchor(&self, entity: EntityId) -> Option<Vec3> {
+        // 在途信封(任意 apply_at > 当前拍的 MigrateEntity 载荷)。
+        for env in self.router.in_transit_migrations() {
+            if let messaging::EnvelopePayload::MigrateEntity {
+                entity: e, state, ..
+            } = &env.payload
+                && *e == entity
+            {
+                return Some(state.translation);
+            }
+        }
+        // 存活:扫分片(注册分片数小;每拍仅在票视图派生时发生)。
+        for shard in self.sims.keys() {
+            if let Some(st) = self.entity_state(*shard, entity) {
+                return Some(st.translation);
+            }
+        }
+        None
+    }
+
+    /// 实体状态(位置 + 速度 + half_size;足迹解析输入;R1)。
+    fn entity_motion_of(&self, entity: EntityId) -> Option<(Vec3, Vec3, f32)> {
+        for env in self.router.in_transit_migrations() {
+            if let messaging::EnvelopePayload::MigrateEntity {
+                entity: e,
+                state,
+                desc,
+                ..
+            } = &env.payload
+                && *e == entity
+            {
+                return Some((state.translation, state.linvel, desc.half_size));
+            }
+        }
+        for shard in self.sims.keys() {
+            if let Some(st) = self.entity_state(*shard, entity) {
+                // half_size 从实体 desc 无法直读(sim 未暴露);用默认 0.5
+                // (当前全部实体为半格立方体,EntityDesc::default;03 限度内)。
+                let _ = st;
+                let st = self.entity_state(*shard, entity)?;
+                return Some((st.translation, st.linvel, 0.5));
+            }
+        }
+        None
+    }
+
     /// 票据表只读访问(测试/断言用)。
     pub fn ticket_table(&self) -> &crate::tickets::TicketTable {
         &self.tickets
@@ -317,6 +365,22 @@ impl Scheduler {
         // 邻片半径),行为不变;现有邻片 ensure 照旧保留(§4.13)。
         for (holder, t) in self.tickets.iter() {
             if t.state == TicketState::Suspended {
+                continue;
+            }
+            // Chunks(实体票足迹;任务 03/R1):覆盖 chunk 的 owner 分片直接注册
+            // (无票种分支——按 RegionSpec 求覆盖)。
+            if let RegionSpec::Chunks(chunks) = &t.data {
+                // owner = 锚点所在分片(实体票锚点 = 实体/载荷位置;单世界既有
+                // 假设下 world/dim 恒 0——与 ticket_ensure_shards 现状一致,
+                // 多维度立项时随锚点带 world/dim 一并处理)。
+                let base = ShardId::new(
+                    types::WorldId(0),
+                    types::DimensionId(0),
+                    types::ShardPos::new(0, 0),
+                );
+                for cp in chunks {
+                    out.insert(Scheduler::owner_of(base, *cp));
+                }
                 continue;
             }
             let RegionSpec::Radius { load_m, .. } = t.data else {
@@ -468,8 +532,10 @@ impl Scheduler {
         use physics_sim::tickets::TicketHolder;
         match holder {
             TicketHolder::Observer(src) => self.observer_table.get(src).copied(),
+            // 实体票(R2):各分片实体状态上报;在途期间取 Router 迁移信封载荷
+            // (§4.2.1"锚点每拍由持有者派生";确保足迹覆盖目的侧 → ensure 覆盖)。
+            TicketHolder::Entity(id) => self.entity_anchor(*id),
             TicketHolder::Area(_) => None, // 由调用方走 center(见 ticket_views)
-            TicketHolder::Entity(_) => None, // 03 接
         }
     }
 
@@ -487,11 +553,44 @@ impl Scheduler {
                 _ => None,
             })
             .collect();
-        self.tickets.views(|holder| match holder {
+        let mut views = self.tickets.views(|holder| match holder {
             TicketHolder::Observer(src) => self.observer_table.get(src).copied(),
             TicketHolder::Area(id) => area_centers.get(id).copied(),
-            TicketHolder::Entity(_) => None,
-        })
+            // 实体票(R2):位置在 = 分片状态;在途 = 迁移载荷(§4.3.3)。
+            // 无锚(实体已终结而票未 End)→ views 内 panic(fail-stop)。
+            TicketHolder::Entity(id) => self.entity_anchor(*id),
+        });
+        // R1(任务 03):实体票的 Footprint 规格由调度器解析成 Chunks(预载足迹
+        // = 当前 ∪ 前视)交给 plan;表内仍存 Footprint。plan/保活/ensure 只通用
+        // 支持 Chunks(§14-1)。
+        for (k, view) in self.tickets.iter().zip(views.iter_mut()) {
+            let TicketHolder::Entity(id) = k.0.0 else {
+                continue;
+            };
+            let physics_sim::tickets::RegionSpec::Footprint {
+                lookahead_ticks,
+                max_lookahead_chunks,
+            } = &view.data
+            else {
+                continue;
+            };
+            if let Some((pos, linvel, half)) = self.entity_motion_of(id) {
+                view.data = physics_sim::tickets::RegionSpec::Chunks(
+                    physics_sim::settle::preload_footprint(
+                        pos,
+                        half,
+                        self.activation_cfg.terrain_guard_m,
+                        linvel,
+                        *lookahead_ticks,
+                        *max_lookahead_chunks,
+                    ),
+                );
+                // ② 覆盖 = ① 足迹同集(足迹票 ② 无独立半径;∅ 会让 I2 判缺,
+                // 用 Chunks 同集保证装载与 ② 判定一致)。
+                view.collider = view.data.clone();
+            }
+        }
+        views
     }
 
     /// 观察者只读视图(REQ-002 §4.2;驱动 ensure_shard/票判定用):
@@ -810,6 +909,18 @@ impl Scheduler {
                 }
             }
         }
+        // 登记泄漏收口(REQ-007 任务 03 发现的既有缺口):本分片曾在某拍装载
+        // 过、之后已从内存卸掉的 chunk,其扩张副本(holder=他人)的登记不在这
+        // 次 positions 里——despawn 后 owner 缺席而登记残留,下一拍 holder 校验
+        // fail-stop(acn6 的赛跑路径:卸载预算滚动把自有 chunk 先卸完,despawn
+        // 时 positions 已缺)。按 holder 表中 owner==本片的全部键兜底撤销。
+        let stale: Vec<(ChunkPos, ShardId)> = self.chunk_holders.iter_owned_by(shard).collect();
+        for (cp, holder) in stale {
+            if let Some(sim) = self.sims.get_mut(&holder) {
+                let _ = sim.unload_chunk(cp);
+            }
+            self.chunk_holders.unregister(shard, cp, holder);
+        }
         out
     }
 
@@ -879,7 +990,13 @@ impl Scheduler {
                 actor,
             };
             match self.entity_ownership.owner_of(id) {
-                None => self.entity_ownership.claim(id, owner),
+                None => {
+                    self.entity_ownership.claim(id, owner);
+                    // S5(REQ-007 任务 03):claim 单点签发瞬态票(actor=false、
+                    // 表中无票才签;迁移/传送重建的重复 claim 幂等不重签,时钟
+                    // 继续)。常驻体不签(04)。
+                    self.issue_transient_on_claim(id, actor);
+                }
                 Some(prev) if prev.shard == shard => self.entity_ownership.update(id, owner),
                 Some(prev) => panic!(
                     "实体 {id:?} 同时出现在分片 {shard:?} 与 {:?}(全局唯一性 fail-stop)",
@@ -887,6 +1004,84 @@ impl Scheduler {
                 ),
             }
         }
+    }
+
+    /// D17 启用补签(任务书交付 2/R8):为全部**存活或在途**的瞬态体补签
+    /// TransientMotion(时钟从该拍起算;幂等——已有票不动)。常驻体不补签(04)。
+    /// 存活集 = ownership 表;在途集 = Router 待投递迁移信封载荷。
+    fn backfill_transient_tickets_on_enable(&mut self, _now: Tick) {
+        let mut transient: Vec<EntityId> = Vec::new();
+        for (id, owner) in self.entity_ownership.iter() {
+            if !owner.actor {
+                transient.push(*id);
+            }
+        }
+        // 在途:迁移信封载荷里的实体(ownership 在源片保留,已覆盖;显式再扫
+        // 防"claim 未落但信封已在"的窗口)。
+        for env in self.router.in_transit_migrations() {
+            if let messaging::EnvelopePayload::MigrateEntity { entity, actor, .. } = &env.payload
+                && !*actor
+                && !transient.contains(entity)
+            {
+                transient.push(*entity);
+            }
+        }
+        for id in transient {
+            self.issue_transient_on_claim(id, false);
+        }
+    }
+
+    /// End 一个实体的全部实体票(终结判定路径;§4.3.1 End 幂等——已不在无操作)。
+    fn end_entity_tickets(&mut self, entity: EntityId) {
+        use physics_sim::tickets::TicketHolder;
+        let keys: Vec<_> = self
+            .tickets
+            .iter()
+            .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == entity))
+            .map(|(k, _)| k)
+            .collect();
+        for k in keys {
+            self.tickets.end(k);
+        }
+    }
+
+    /// 瞬态运动票签发(S5;claim 单点):actor == false 且表中无其
+    /// TransientMotion → issue(issued_at = 当前拍)。幂等,重复 claim 不重签。
+    /// (激活未启用时同样落票——票只入表,决策/待地形等一切行为仍由开关门控;
+    /// 表条目是状态记录,符合 D17"未启用无新行为"。)
+    fn issue_transient_on_claim(&mut self, entity: EntityId, actor: bool) {
+        use physics_sim::tickets::{
+            RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
+        };
+        if actor {
+            return; // 常驻票 04
+        }
+        let key = (TicketHolder::Entity(entity), TicketKind::TransientMotion);
+        if self.ticket_table().get(key).is_some() {
+            return; // 已在 → 无操作(D14;迁移/传送重建不重签)
+        }
+        let c = &self.activation_cfg;
+        self.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1, // §4.2.3:实体票 priority 1
+                data: RegionSpec::Footprint {
+                    lookahead_ticks: c.motion_lookahead_ticks,
+                    max_lookahead_chunks: c.motion_max_lookahead_chunks,
+                },
+                collider: RegionSpec::None, // ② 足迹由解析后的 Chunks 承载(views)
+                wake: WakeSpec::SelfOnly,   // ③ 只保证自身清醒(05 接触唤醒)
+                clock: TicketClock {
+                    issued_at: self.coordinator.tick(),
+                    active_ticks: 0,
+                    limit: Some(c.transient_settle_deadline_ticks),
+                    starts_at: None,
+                },
+                state: TicketState::Active,
+                center: None,
+            },
+            self.coordinator.tick(),
+        );
     }
 
     /// 实体当前归属(REQ-006);不存在/迁移窗口 → None。
@@ -1011,6 +1206,7 @@ impl Scheduler {
             }
         }
 
+        let enabled_before_apply = self.activation_enabled();
         // 1.2(REQ-002 §4.2):应用观察者收件箱中 apply_at == at 的全部条目
         //     (按 canonical 序;未来拍留存——与 router inbox 同语义;过期拍
         //     在 submit 时已被拒,不会出现)。分片输入前缀永不出现该变体。
@@ -1076,6 +1272,12 @@ impl Scheduler {
                          (收到其它载荷,调用方 bug,fail-stop)"
                     ),
                 }
+            }
+            // D17 启用补签(R8/任务书交付 2):启用当拍为全部存活或在途的瞬态体
+            // 补签(时钟 = 启用拍;幂等)。与 01 的"启用瞬间已建 ② 即初始 ② 集合"
+            // 同拍:补签在调度器、② 集合在分片快照字段,均由本拍激活刷新消费。
+            if !enabled_before_apply && self.activation_enabled() {
+                self.backfill_transient_tickets_on_enable(at);
             }
         }
 
@@ -1243,6 +1445,24 @@ impl Scheduler {
             // 本拍实体生命周期:以分片实体表(真相)同步全局 ownership
             // (REQ-006 任务 00:spawn/migrate/remove/solidify/teleport 都覆盖)。
             self.sync_entity_ownership(shard, &sim);
+            // 终结判定(REQ-007 §4.3.3/R7;任务 03):despawned ∧ ¬本拍迁移意图
+            // ∧ ¬同拍重新 spawned(传送)→ End 全部实体票。凝固/强制落地/虚空
+            // 移除/RemoveEntity 都走这里;迁移 despawn 保留票(键不变时钟继续)。
+            let migrated: BTreeSet<EntityId> = outbox
+                .migrations
+                .iter()
+                .filter_map(|i| match &i.payload {
+                    messaging::EnvelopePayload::MigrateEntity { entity, .. } => Some(*entity),
+                    _ => None,
+                })
+                .collect();
+            let respawned: BTreeSet<EntityId> = outbox.spawned.iter().copied().collect();
+            for id in &outbox.despawned {
+                if migrated.contains(id) || respawned.contains(id) {
+                    continue; // 迁移/传送:票保留(时钟继续)
+                }
+                self.end_entity_tickets(*id);
+            }
             self.sims.insert(shard, sim);
         }
 
@@ -1317,16 +1537,30 @@ impl Scheduler {
             if t.state == physics_sim::tickets::TicketState::Suspended {
                 return false;
             }
-            let physics_sim::tickets::RegionSpec::Radius { unload_m, .. } = t.data else {
-                return false; // None/Chunks(03)不保活;Footprint 03 接
-            };
-            let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
-                return false; // 无锚票(03 语义);保活忽略
-            };
-            let radius_sq = unload_m * unload_m;
-            let dx = (anchor.x.clamp(min_x, max_x) - anchor.x).abs();
-            let dz = (anchor.z.clamp(min_z, max_z) - anchor.z).abs();
-            dx * dx + dz * dz <= radius_sq
+            match &t.data {
+                // Radius:锚点到核心 AABB 水平距离 ≤ unload_m。
+                physics_sim::tickets::RegionSpec::Radius { unload_m, .. } => {
+                    let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
+                        return false; // 无锚票(03 语义);保活忽略
+                    };
+                    let radius_sq = unload_m * unload_m;
+                    let dx = (anchor.x.clamp(min_x, max_x) - anchor.x).abs();
+                    let dz = (anchor.z.clamp(min_z, max_z) - anchor.z).abs();
+                    dx * dx + dz * dz <= radius_sq
+                }
+                // Chunks(实体票足迹解析结果;任务 03/R1):任一覆盖 chunk 落在
+                // 分片核心区(core 8×8)内 → 保活(进=出,无滞回)。
+                physics_sim::tickets::RegionSpec::Chunks(chunks) => {
+                    let cmin = shard.pos.min_chunk();
+                    chunks.iter().any(|cp| {
+                        cp.x >= cmin.x
+                            && cp.x < cmin.x + types::SHARD_CHUNKS
+                            && cp.z >= cmin.z
+                            && cp.z < cmin.z + types::SHARD_CHUNKS
+                    })
+                }
+                _ => false,
+            }
         })
     }
 
