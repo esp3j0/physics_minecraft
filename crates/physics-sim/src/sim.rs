@@ -947,15 +947,18 @@ impl ShardSim {
                     {
                         return false; // 地形支撑(非实体支撑)
                     }
-                    // 法向(R5):manifold.local_n1 = 从 shape1 指向 shape2 的
-                    // 接触法向(shape1 局部系;双方无旋转时即世界系——实体 cube
-                    // 有旋转,但支撑判定取 ~竖直向,旋转误差 ≤ cos 阈值覆盖)。
-                    // 归一到"从对方指向 E":E 为 collider1 → n = -local_n1;
-                    // E 为 collider2 → n = +local_n1。
-                    // 接触法向:manifold.data.local_n1 = 从 shape1 指向 shape2
-                    // (shape1 局部系;实体 cube 旋转的误差由 cos 阈值覆盖)。
+                    // 法向(G2 返修):`manifold.data.normal` 是**世界系**法向
+                    // (从 collider1 指向 collider2;rapier 0.36
+                    // `ContactManifoldData::normal`);归一到"从对方指向 E":
+                    // E 为 collider1 → n = -normal,E 为 collider2 → n =
+                    // +normal。不用 `local_n1`(shape 局部系:方块侧翻 90° 时
+                    // 局部"上"对应世界"侧",cos 阈值盖不住)。
                     pair.manifolds().iter().any(|m| {
-                        let n = if e_is_first { -m.local_n1 } else { m.local_n1 };
+                        let n = if e_is_first {
+                            -m.data.normal
+                        } else {
+                            m.data.normal
+                        };
                         n.dot(conv::vec3_to_rapier(up)) >= self.cfg.activation.support_normal_min
                     })
                 });
@@ -964,9 +967,74 @@ impl ShardSim {
         out
     }
 
+    /// 承载判定与 ticket_ops 产出(§4.3.4/§4.4.2;G1 返修):对每个**瞬态体**
+    /// 按"实体支撑 × 静止 × 唤醒范围"产出状态操作(调度器拍末按键序应用,
+    /// N 拍产生 N+1 生效;幂等由 TicketTable 保证,重复产出无副作用):
+    /// - 被承载(有实体支撑)→ Pause;
+    /// - 被承载 ∧ 静止 ∧ 不在任何唤醒范围 → 冻结 + Suspend(票不占区域,
+    ///   §4.4.2"被承载的瞬态体按常驻规则冻结");
+    /// - 被承载的冻结体进入唤醒范围 → Resume + 唤醒;
+    /// - 不被承载且醒着 → Unpause(幂等;承载结束)。
+    fn emit_carry_ticket_ops(&mut self) {
+        let supports = self.evaluate_supports();
+        let wake_centers: Vec<Vec3> = self.observed.clone().unwrap_or_default();
+        let ids: Vec<EntityId> = self.entities.keys().copied().collect();
+        for id in ids {
+            let Some(rec) = self.entities.get(&id) else {
+                continue;
+            };
+            if rec.actor {
+                continue; // 常驻票 04
+            }
+            let Some(body) = self.phys.bodies.get(rec.handle) else {
+                continue;
+            };
+            let carried = carried_of(&supports, &id);
+            let pos = conv::rapier_to_vec3(body.translation());
+            let in_any_wake = wake_centers
+                .iter()
+                .any(|c| (*c - pos).length() <= self.cfg.activation.awake_load_radius);
+            let kinematic = body.is_kinematic();
+            let static_now =
+                rec.slow_ticks >= self.cfg.solidify.consecutive_ticks || body.is_sleeping();
+            if carried && !kinematic {
+                // 被承载:暂停计时;静止 ∧ 不在唤醒范围 → 冻结 + Suspend。
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: id,
+                    op: TicketOp::Pause,
+                });
+                if static_now && !in_any_wake {
+                    self.freeze_entity(&id);
+                    self.outbox.ticket_ops.push(TicketOpRecord {
+                        entity: id,
+                        op: TicketOp::Suspend,
+                    });
+                }
+            } else if carried && kinematic {
+                // 被承载的冻结体:唤醒范围到 → Resume + 唤醒(整组原子在 05)。
+                if in_any_wake {
+                    self.outbox.ticket_ops.push(TicketOpRecord {
+                        entity: id,
+                        op: TicketOp::Resume,
+                    });
+                    let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+                    body.set_body_type(RigidBodyType::Dynamic, true);
+                }
+            } else if !carried && !kinematic {
+                // 不被承载且醒着:Unpause(承载结束;已 Active 时幂等无操作)。
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: id,
+                    op: TicketOp::Unpause,
+                });
+            }
+        }
+    }
+
     /// step 末的瞬态体生命周期段(任务 03/提交 C):虚空移除 + 强制落地执行。
     /// 产出:despawned(+ forced 的 Emergent BlockWrite)/ void_removed。
     pub fn run_transient_lifecycle(&mut self) {
+        // G1:承载判定与 ticket_ops 产出(§4.4.2;调度器拍末键序应用)。
+        self.emit_carry_ticket_ops();
         // ---- 虚空移除(§4.8;所有实体;启用模式 = 已激活刷新过)----
         if self.observed.is_some() {
             let threshold = types::WORLD_Y_MIN as f32 - self.cfg.activation.void_despawn_depth_m;
@@ -1305,6 +1373,11 @@ impl ShardSim {
 }
 
 /// 位置 → 所在 chunk(floor 语义,负方向向下取整)。
+/// 支撑表查询(承载判定用;G1)。
+fn carried_of(supports: &std::collections::BTreeMap<EntityId, bool>, id: &EntityId) -> bool {
+    supports.get(id).copied().unwrap_or(false)
+}
+
 fn pos_chunk(pos: Vec3) -> ChunkPos {
     ChunkPos::new((pos.x / 16.0).floor() as i32, (pos.z / 16.0).floor() as i32)
 }
@@ -2676,5 +2749,344 @@ mod tests {
             "落点写块(Emergent)"
         );
         assert!(s.entity_state(a).is_some(), "近者保留");
+    }
+    // ==== REQ-007 任务 03(G3 返修补齐测试)====
+
+    /// 任务书测试 `sim::awaiting_terrain_enters_and_recovers`(T5):② 预算 0
+    /// → 待地形(Kinematic、位置不变、事件免疫);就绪 → 醒、速度位级写回。
+    #[test]
+    fn awaiting_terrain_enters_and_recovers() {
+        // ② 预算 0:chunk 有 ① 也永远缺 ② → 待地形进得去、恢复不了。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.collider_budget_per_tick = 0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_data_only(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(9);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        let _ = s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        assert!(
+            s.locomotion
+                .get(&e)
+                .is_some_and(|l| matches!(l, LocomotionState::AwaitingTerrain { .. })),
+            "足迹缺 ② → 进入待地形"
+        );
+        let before = s.entity_state(e).expect("在表").translation;
+        s.step();
+        assert_eq!(
+            s.entity_state(e).expect("在表").translation,
+            before,
+            "待地形:位置不变(Kinematic)"
+        );
+        s.apply_prefix(&[detonate_input(2, Vec3::new(8.0, 3.0, 8.0), 30.0, 20.0)]);
+        s.step();
+        assert_eq!(
+            s.entity_state(e).expect("在表").linvel,
+            Vec3::ZERO,
+            "待地形期间事件免疫(爆炸无效)"
+        );
+        // 恢复路径:待地形(速度已保存)→ ② 齐 → 醒 + 速度位级写回。
+        let mut s2 = ShardSim::new(
+            ShardSimConfig {
+                solidify: SolidifyConfig {
+                    enabled: false,
+                    ..SolidifyConfig::default()
+                },
+                ..ShardSimConfig::new(shard_id(0, 0))
+            },
+            Box::new(voxel::SimpleRegistry::builtin()),
+        );
+        s2.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        s2.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        let saved = Vec3::new(3.0, -1.0, 2.0);
+        s2.locomotion.insert(
+            e,
+            LocomotionState::AwaitingTerrain {
+                saved_linvel: saved,
+                saved_angvel: Vec3::ZERO,
+            },
+        );
+        s2.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        let st2 = s2.entity_state(e).expect("恢复后仍在表");
+        assert_eq!(st2.linvel, saved, "恢复:保存的速度位级写回(§4.6)");
+        assert!(
+            !s2.locomotion
+                .get(&e)
+                .is_some_and(|l| matches!(l, LocomotionState::AwaitingTerrain { .. })),
+            "恢复后离开待地形"
+        );
+    }
+
+    /// 任务书测试 `sim::i2_footprint_assertion`(I2/§14-7):钩子制造违反
+    /// (醒着 + 缺 ②)→ panic。
+    #[test]
+    #[should_panic(expected = "I2 违反")]
+    fn i2_footprint_assertion() {
+        let mut s = sim(0, 0); // 无地形:足迹 (0,0) 缺 ①②
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        s.i2_assert_awake_footprint_ready();
+    }
+
+    /// 任务书测试 `sim::support_detection_normal_and_entity`(T9):地形/实体
+    /// 支撑区分(表只记实体支撑);零重力不判定。
+    #[test]
+    fn support_detection_normal_and_entity() {
+        let mut s = sim(0, 0);
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 64.5, 8.0))]);
+        for _ in 0..3 {
+            s.step();
+        }
+        let supports = s.evaluate_supports();
+        assert_eq!(
+            supports.get(&e).copied(),
+            Some(false),
+            "落在地形上:无实体支撑(地形支撑不入表)"
+        );
+        let mut z = ShardSim::new(
+            ShardSimConfig {
+                gravity: Vec3::ZERO,
+                ..ShardSimConfig::new(shard_id(0, 0))
+            },
+            Box::new(voxel::SimpleRegistry::builtin()),
+        );
+        z.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        assert!(z.evaluate_supports().is_empty(), "零重力不判定支撑(§9-6)");
+    }
+
+    /// G2 返修测试:绕 x 轴旋转 90° 的方块压在常驻体上 → 被承载
+    /// (世界系法向 `manifold.data.normal` 在旋转下仍指对方向)。
+    #[test]
+    fn support_normal_survives_rotated_block() {
+        let mut s = sim(0, 0);
+        let carrier = entity(1);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+        ]);
+        for _ in 0..2 {
+            s.step();
+        }
+        let rotated = EntityState {
+            translation: Vec3::new(8.0, 1.5, 8.0),
+            rotation: types::glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2),
+            linvel: Vec3::ZERO,
+            angvel: Vec3::ZERO,
+        };
+        s.apply_prefix(&[
+            spawn_input(3, entity(2), Vec3::new(8.0, 1.5, 8.0)),
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 4,
+                payload: InputPayload::Command(SimCommand::TeleportEntity {
+                    entity: entity(2),
+                    state: rotated,
+                }),
+            },
+        ]);
+        for _ in 0..4 {
+            s.step();
+        }
+        let supports = s.evaluate_supports();
+        assert_eq!(
+            supports.get(&entity(2)).copied(),
+            Some(true),
+            "旋转 90° 压在常驻体上 → 被承载(世界系法向)"
+        );
+    }
+
+    /// 任务书测试 `sim::solidify_requires_no_entity_support`(T9/§4.7):
+    /// 落地瞬态凝固;压在常驻体上的瞬态不凝固。
+    #[test]
+    fn solidify_requires_no_entity_support() {
+        let mut s = sim(0, 0);
+        // 关位移门(贴地接触的毫米级抖动不干扰;只看 slow/sleeping 前提)。
+        s.cfg.solidify.displacement_gate_m = 0.0;
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let carrier = entity(1);
+        let box_e = entity(2);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+            spawn_input(3, box_e, Vec3::new(9.5, 0.5001, 8.0)),
+        ]);
+        for _ in 0..200 {
+            s.step();
+            if s.entity_state(box_e).is_none() {
+                break;
+            }
+        }
+        assert!(s.entity_state(box_e).is_none(), "落地瞬态正常凝固(≤200 拍)");
+        let box2 = entity(3);
+        s.apply_prefix(&[spawn_input(4, box2, Vec3::new(8.0, 1.5, 8.0))]);
+        for _ in 0..10 {
+            s.step();
+        }
+        // 锁支撑语义:box2 压在常驻体上 → 实体支撑为真(凝固前提不过;
+        // 长程不凝固由该前提 + §4.4.2 承载规则共同保证)。
+        let supports = s.evaluate_supports();
+        assert_eq!(
+            supports.get(&box2).copied(),
+            Some(true),
+            "压在常驻体上 → 实体支撑(§4.7 凝固前提的输入)"
+        );
+        assert!(
+            s.entity_state(box2).is_some(),
+            "压在常驻体上的瞬态不凝固(§4.7)"
+        );
+    }
+
+    /// 任务书测试 `sim::carried_ticket_pause_suspend_resume`(T9,G1):
+    /// 承载产出 Pause → 静止冻结 Suspend。
+    #[test]
+    fn carried_ticket_pause_suspend_resume() {
+        let mut s = sim(0, 0);
+        s.cfg.solidify.displacement_gate_m = 0.0;
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let carrier = entity(1);
+        let cargo = entity(2);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+            spawn_input(3, cargo, Vec3::new(8.0, 1.5, 8.0)),
+        ]);
+        for _ in 0..3 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == cargo && o.op == TicketOp::Pause),
+            "被承载 → Pause 产出(G1)"
+        );
+        // 静止(slow_ticks 达标)∧ 不在唤醒范围 → Suspend + 冻结。
+        for _ in 0..25 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == cargo && o.op == TicketOp::Suspend),
+            "被承载 ∧ 静止 ∧ 不在唤醒范围 → Suspend(G1)"
+        );
+        assert!(
+            s.entity_state(cargo)
+                .is_some_and(|st| st.linvel == Vec3::ZERO),
+            "Suspend:被承载瞬态按常驻规则冻结"
+        );
+    }
+
+    /// 任务书测试 `sim::carried_clock_paused_no_forced_landing`(T9):
+    /// 被承载瞬态不因本分片路径进入强制落地(时钟 Paused 在调度器侧停走)。
+    #[test]
+    fn carried_not_forced_landed_by_deadline() {
+        let mut s = sim(0, 0);
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let carrier = entity(1);
+        let cargo = entity(2);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+            spawn_input(3, cargo, Vec3::new(8.0, 1.5, 8.0)),
+        ]);
+        for _ in 0..3 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            !s.forced_pending.contains(&cargo),
+            "被承载瞬态不被分片自身路径强制落地(到期指令由调度器按 Paused 时钟停走不投)"
+        );
+    }
+
+    /// 任务书测试 `sim::ticket_deadline_forced_landing`(T7):到期指令 →
+    /// 强制落地(关凝固零重力漂移场景);指令直投不进日志(日志在调度器侧,
+    /// 由 shard 测试覆盖)。
+    #[test]
+    fn ticket_deadline_forced_landing() {
+        let mut s = ShardSim::new(
+            ShardSimConfig {
+                gravity: Vec3::ZERO,
+                solidify: SolidifyConfig {
+                    enabled: false,
+                    ..SolidifyConfig::default()
+                },
+                ..ShardSimConfig::new(shard_id(0, 0))
+            },
+            Box::new(voxel::SimpleRegistry::builtin()),
+        );
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 70.0, 8.0))]);
+        s.apply_forced_landing_directive(e);
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(e).is_none(), "到期 → 强制落地");
+        assert!(
+            s.outbox
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent),
+            "落点写块(Emergent)"
+        );
+        assert!(s.outbox.despawned.contains(&e), "despawned(终结 End 兜底)");
+    }
+
+    /// 任务书测试 `sim::awaiting_terrain_blocked`(D15):待地形足迹缺 ② →
+    /// blocked 请求非空(plan 排序/免冷却/卸载排除消费该输入)。
+    #[test]
+    fn blocked_requests_from_awaiting_terrain() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.collider_budget_per_tick = 0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_data_only(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        let _ = s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        assert!(
+            !s.awaiting_terrain_blocked().is_empty(),
+            "待地形足迹缺 ② → blocked 请求(D15)"
+        );
+    }
+
+    /// 任务书测试 `sim::transient_lands_solidifies_ticket_ends`(T3 前半):
+    /// 落地凝固产出(Emergent BlockWrite + despawned;票 End 由调度器终结
+    /// 判定兜底)。
+    #[test]
+    fn transient_lands_solidifies() {
+        let mut s = sim(0, 0);
+        s.cfg.solidify.displacement_gate_m = 0.0;
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(1);
+        // 贴地出生(位移门 3mm/20 拍能过;大落差会持续滑动不过门)。
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 0.5001, 8.0))]);
+        for _ in 0..200 {
+            s.step();
+            if s.entity_state(e).is_none() {
+                break;
+            }
+        }
+        assert!(s.entity_state(e).is_none(), "落地凝固(实体消失;≤200 拍)");
+        assert!(
+            s.outbox
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent),
+            "Emergent BlockWrite 产出"
+        );
+        assert!(s.outbox.despawned.contains(&e));
     }
 }
