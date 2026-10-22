@@ -694,7 +694,9 @@ impl ShardSim {
         // ② 已建集合(REQ-007 任务 01;修订 5 D18:独立状态,非 chunk_bodies 键
         // ——全空气 chunk 无碰撞盒但 ② 已建)。
         let collider_loaded: Vec<ChunkPos> = self.built_colliders.iter().copied().collect();
-        let entities: Vec<(EntityId, Vec3, bool, bool)> = self
+        // H2:carried = 有实体支撑(§4.4.1)——被承载瞬态按常驻规则参与滞回。
+        let supports = self.evaluate_supports();
+        let entities: Vec<(EntityId, Vec3, bool, bool, bool)> = self
             .entities
             .iter()
             .map(|(id, rec)| {
@@ -704,6 +706,7 @@ impl ShardSim {
                     conv::rapier_to_vec3(b.translation()),
                     b.is_kinematic(),
                     rec.actor,
+                    supports.get(id).copied().unwrap_or(false),
                 )
             })
             .collect();
@@ -745,15 +748,49 @@ impl ShardSim {
             self.drop_chunk_collider(cp);
         }
 
-        // tier③ 落实:施体类型切换。
+        // tier③ 落实:施体类型切换。H2:被承载瞬态的冻结条目加**静止前置**
+        // (§4.4.2:静止 ∧ 被承载才冻结;运动中的被承载瞬态不冻结);唤醒
+        // 条目加**当前足迹 ② 前置**(缺 → 不唤醒,交由待地形状态机处理
+        // ——kinematic 待地形体在 ② 齐时由 apply_awaiting_terrain 恢复,
+        // 速度原样写回,语义等价"推迟唤醒"而非丢弃)。
         for id in &decisions.entities_to_freeze {
+            let (is_transient_carried, static_now) = {
+                let Some(rec) = self.entities.get(id) else {
+                    continue;
+                };
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let carried = supports.get(id).copied().unwrap_or(false);
+                let static_now =
+                    rec.slow_ticks >= self.cfg.solidify.consecutive_ticks || b.is_sleeping();
+                (!rec.actor && carried, static_now)
+            };
+            if is_transient_carried && !static_now {
+                continue; // 被承载但仍在运动:不冻结(§4.4.2 静止前置)
+            }
             self.freeze_entity(id);
         }
         for id in &decisions.entities_to_wake {
-            let rec = self
-                .entities
-                .get(id)
-                .expect("决策实体必在实体表(输入即来源)");
+            let Some(rec) = self.entities.get(id) else {
+                continue;
+            };
+            // 唤醒前置:当前足迹 ∩ 区域 ② 齐(§4.9 共同规则 1;瞬态体)。
+            if !rec.actor {
+                let pos = {
+                    let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                    conv::rapier_to_vec3(b.translation())
+                };
+                let region = self.activation_region();
+                let ready = crate::settle::current_footprint(
+                    pos,
+                    rec.desc.half_size,
+                    self.cfg.activation.terrain_guard_m,
+                )
+                .iter()
+                .all(|cp| !region.contains(*cp) || self.built_colliders.contains(cp));
+                if !ready {
+                    continue; // 推迟唤醒(待地形状态机接管)
+                }
+            }
             let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
             body.set_body_type(RigidBodyType::Dynamic, true);
         }
@@ -1202,7 +1239,13 @@ impl ShardSim {
                 self.spawn_entity(entity, state, desc, owner_source, false);
             }
             SimCommand::RemoveEntity { entity } => {
-                self.despawn_entity(entity);
+                // 幂等(REQ-007 任务 03 生产接入后):实体可能已在本拍前的
+                // 生命周期段合法终结(凝固/强制落地/虚空)——不存在 = 无操作,
+                // 不再 fail-stop(回评请求追认;网络路径本就经
+                // validate_external_command 前置挡未知实体)。
+                if self.entities.contains_key(&entity) {
+                    self.despawn_entity(entity);
+                }
             }
             SimCommand::TeleportEntity { entity, state } => {
                 // 一切位姿变更 = 删除 + 重建(REQ-001 §5 行 10);actor/source

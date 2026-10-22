@@ -125,12 +125,16 @@ impl TicketTable {
             if t.state == TicketState::Suspended {
                 continue;
             }
-            let anchor = anchor_of(&holder.0).unwrap_or_else(|| {
-                panic!(
-                    "票据 {holder:?} 无锚可派生(观察者已删而票未 End = 一致性违规,\
-                     fail-stop;任务书 02 细则 3)"
-                )
-            });
+            let Some(anchor) = anchor_of(&holder.0) else {
+                match holder.0 {
+                    TicketHolder::Observer(_) => panic!(
+                        "观察者票 {holder:?} 无锚可派生(观察者已删而票未 End = 一致性违规, fail-stop;任务书 02 细则 3)"
+                    ),
+                    // 实体票无锚 = 终结窗口合法态(实体本拍已删、票在拍末 End;
+                    // H1 生产接线暴露)。跳过该拍视图;I3(06)负责最终一致性。
+                    _ => continue,
+                }
+            };
             out.push(TicketView {
                 order: order as u32,
                 priority: t.priority,

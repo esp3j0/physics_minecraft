@@ -44,6 +44,11 @@ fn worker_main(job_rx: Receiver<WorkerJob>, result_tx: SyncSender<WorkerResult>)
             .map(|(shard, mut sim, prefix)| {
                 sim.apply_prefix(&prefix);
                 sim.step();
+                // H1(REQ-007 任务 03 返修):瞬态体生命周期段并入生产 tick——
+                // 承载判定/ticket_ops 产出、虚空移除、强制落地执行(§4.4.2/
+                // §4.8)。step 之后、take_outbox 之前:生命周期产出并入本拍
+                // outbox(despawned/Emergent BlockWrite/ticket_ops)。
+                sim.run_transient_lifecycle();
                 let outbox = sim.take_outbox();
                 (shard, sim, outbox)
             })
@@ -1029,6 +1034,11 @@ impl Scheduler {
                 transient.push(*entity);
             }
         }
+        eprintln!(
+            "DBGBF transient={:?} ownership={:?}",
+            transient,
+            self.entity_ownership.iter().collect::<Vec<_>>()
+        );
         for id in transient {
             self.issue_transient_on_claim(id, false);
         }
@@ -1043,6 +1053,7 @@ impl Scheduler {
             .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == entity))
             .map(|(k, _)| k)
             .collect();
+        eprintln!("DBGEND entity={:?} keys={:?}", entity, keys);
         for k in keys {
             self.tickets.end(k);
         }
@@ -1474,7 +1485,24 @@ impl Scheduler {
             let respawned: BTreeSet<EntityId> = outbox.spawned.iter().copied().collect();
             for id in &outbox.despawned {
                 if migrated.contains(id) || respawned.contains(id) {
-                    continue; // 迁移/传送:票保留(时钟继续)
+                    // §4.3.3 迁移/传送:票保留(时钟继续)——但**实体已真消失**
+                    // 时(陈旧 outbox.spawned 残留:布景期 spawn 的 outbox 随
+                    // 首拍一起到达;实体已被虚空/强制落地移除)不豁免,否则
+                    // 票泄漏(H1 void 测试暴露)。
+                    let alive = self
+                        .sims
+                        .values()
+                        .any(|sim| sim.entity_state(*id).is_some());
+                    let in_transit = self.router.in_transit_migrations().iter().any(|env| {
+                        matches!(
+                            &env.payload,
+                            messaging::EnvelopePayload::MigrateEntity { entity, .. }
+                                if entity == id
+                        )
+                    });
+                    if alive || in_transit {
+                        continue; // 真迁移/传送:票保留
+                    }
                 }
                 self.end_entity_tickets(*id);
             }
@@ -1539,13 +1567,33 @@ impl Scheduler {
             }
         }
 
-        // 7.5 票据时钟(REQ-007 §4.3.2,任务 02):Active 票 +1;TTL 到期的
-        //     区域票直接 End(键序;实体票内部指令 03 接)。激活未启用时无票,
-        //     零动作。
+        // 7.5 票据时钟(REQ-007 §4.3.2):Active 票 +1;到期键集:
+        // - 区域票 → 直接 End;
+        // - 实体票(瞬态,limit = settle deadline)→ **内部指令**(§4.3.2:
+        //   SCHEDULER 来源、apply_at = N+1、不入外部命令日志)——H1 接线:
+        //   向实体当前 owner 分片投强制落地指令(分片 API 直投;在途实体由
+        //   ownership 切换后目的分片在下一拍到期扫描中重收,claim 前不执行)。
+        //   Paused/Suspended 时钟停走(承载豁免:被承载不强制落地)。
         self.tickets.advance_clocks();
         for key in self.tickets.expired() {
-            if matches!(key.0, physics_sim::tickets::TicketHolder::Area(_)) {
-                self.tickets.end(key);
+            match key.0 {
+                physics_sim::tickets::TicketHolder::Area(_) => self.tickets.end(key),
+                physics_sim::tickets::TicketHolder::Entity(e) => {
+                    if let Some(owner) = self.entity_ownership.owner_of(e) {
+                        if let Some(sim) = self.sims.get_mut(&owner.shard) {
+                            sim.apply_forced_landing_directive(e);
+                        }
+                        // End(到期票终结;幂等,若分片未注册由下拍到齐后重投?
+                        // —— 票已 End 不再出现在 expired,指令在分片快照
+                        // forced_pending 中随档;分片 despawn 前必空片 = 实体
+                        // 不在 = 指令随实体终结作废。)
+                        self.tickets.end(key);
+                    } else {
+                        // 在途(ownership 悬空):不 End、不投——下一拍到齐
+                        // 后重扫 expired 再投(active_ticks 已 ≥ limit 恒真)。
+                    }
+                }
+                physics_sim::tickets::TicketHolder::Observer(_) => {}
             }
         }
 
@@ -2659,6 +2707,264 @@ mod tests {
         // migration 分支覆盖)。
         sched.end_entity_tickets(e);
         assert!(sched.ticket_table().get(key).is_none(), "凝固 → End");
+        sched.shutdown();
+    }
+
+    // ==== REQ-007 任务 03 第二轮返修(H1/H2:经生产 tick 的测试)====
+
+    /// 带 actor 的实体 + 观察者启用(生产路径测试公共布景)。
+    fn spawn_sim_with_obs(
+        sched: &mut Scheduler,
+        x: i32,
+        z: i32,
+        id: EntityId,
+        pos: types::glam::Vec3,
+        actor: bool,
+    ) {
+        spawn_sim_with_obs_ground(sched, x, z, id, pos, actor, false)
+    }
+
+    /// 同上,可选:预载一块地面(层 64 全石;承载/落地测试用)。
+    fn spawn_sim_with_obs_ground(
+        sched: &mut Scheduler,
+        x: i32,
+        z: i32,
+        id: EntityId,
+        pos: types::glam::Vec3,
+        actor: bool,
+        ground: bool,
+    ) {
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        if ground {
+            let mut ch = voxel::Chunk::air();
+            for gx in 0..voxel::CHUNK_X {
+                for gz in 0..voxel::CHUNK_Z {
+                    ch.set(gx, 64, gz, types::BlockId(1));
+                }
+            }
+            sim0.load_chunk(types::ChunkPos::new(0, 0), ch);
+        }
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: types::EntityState {
+                    translation: pos,
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        if actor {
+            sim0.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::MarkActor {
+                    entity: id,
+                    actor: true,
+                }),
+            }]);
+        }
+        sched.register(sim0);
+    }
+
+    /// H1(纪律 11):强制落地经生产 tick——瞬态票到期(ttl 缩短)→ 调度器
+    /// 投指令 → worker 的 run_transient_lifecycle 执行 → 实体消失 + Emergent
+    /// 落块,票 End。全程 Scheduler::tick 驱动。
+    #[test]
+    fn h1_forced_landing_via_production_tick() {
+        use physics_sim::tickets::{
+            RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
+        };
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with_obs_ground(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            false,
+            true,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+        ));
+        sched.tick(); // 启用 + 签发
+        let key = (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        // 缩短 deadline:换 limit=3 的票(生产路径走配置;此处锚到期链路)。
+        sched.tickets.end(key);
+        sched.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1,
+                data: RegionSpec::Footprint {
+                    lookahead_ticks: 30,
+                    max_lookahead_chunks: 4,
+                },
+                collider: RegionSpec::None,
+                wake: WakeSpec::SelfOnly,
+                clock: TicketClock {
+                    issued_at: Tick(1),
+                    active_ticks: 0,
+                    limit: Some(3),
+                    starts_at: None,
+                },
+                state: TicketState::Active,
+                center: None,
+            },
+            Tick(1),
+        );
+        // 推进:拍 2-4 活动时钟到 3 → expired → 投指令 → 拍 5 worker 执行。
+        for _ in 0..8 {
+            sched.tick();
+        }
+        assert!(
+            sched.ticket_table().get(key).is_none(),
+            "到期 → 指令投递 + 票 End(生产 tick 链路)"
+        );
+        // 实体经 worker 的 run_transient_lifecycle 强制落地(虚空 sim 无地形
+        // → 落点虚空移除,同路径);断言实体已从分片消失(经 entity_state)。
+        assert!(
+            sched.entity_state(shard_id(0, 0), e).is_none(),
+            "强制落地经生产 tick 执行(H1)"
+        );
+        sched.shutdown();
+    }
+
+    /// H1(纪律 11):虚空移除经生产 tick——实体坠入 y < WORLD_Y_MIN − 深度 →
+    /// worker 的 lifecycle 移除,票随终结 End。Scheduler::tick 驱动。
+    #[test]
+    fn h1_void_removal_via_production_tick() {
+        use physics_sim::tickets::TicketHolder;
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with_obs(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, -200.0, 8.0),
+            false,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(8.0, 0.0, 8.0),
+        ));
+        sched.tick();
+        sched.tick();
+        eprintln!(
+            "DBGV entity={:?} tickets={:?}",
+            sched.entity_state(shard_id(0, 0), e),
+            sched.ticket_table().iter().collect::<Vec<_>>()
+        );
+        assert!(
+            sched.entity_state(shard_id(0, 0), e).is_none(),
+            "y < −64−16 → worker lifecycle 移除(生产 tick,H1)"
+        );
+        assert!(
+            !sched
+                .ticket_table()
+                .iter()
+                .any(|(k, _)| k.0 == TicketHolder::Entity(e)),
+            "终结判定 → 票 End"
+        );
+        sched.shutdown();
+    }
+
+    /// H1(纪律 11):承载 ticket_ops 经生产 tick——瞬态压在常驻体上 →
+    /// worker 的 emit_carry_ticket_ops 产出 Pause/Suspend → 调度器拍末应用
+    /// (Paused 时钟停走 = 承载豁免强制落地的表侧条件)。Scheduler::tick 驱动。
+    #[test]
+    fn h1_carry_ticket_ops_via_production_tick() {
+        use physics_sim::tickets::{TicketHolder, TicketKind, TicketState};
+        let (carrier, cargo) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // 单分片双实体:一个 sim 内 spawn carrier(常驻)+ cargo(瞬态)。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        {
+            let mut ch = voxel::Chunk::air();
+            for gx in 0..voxel::CHUNK_X {
+                for gz in 0..voxel::CHUNK_Z {
+                    ch.set(gx, 64, gz, types::BlockId(1));
+                }
+            }
+            sim0.load_chunk(types::ChunkPos::new(0, 0), ch);
+        }
+        sim0.apply_prefix(&[
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: carrier,
+                    state: types::EntityState {
+                        translation: types::glam::Vec3::new(8.0, 0.5, 8.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::MarkActor {
+                    entity: carrier,
+                    actor: true,
+                }),
+            },
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 3,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: cargo,
+                    state: types::EntityState {
+                        translation: types::glam::Vec3::new(8.0, 1.5, 8.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+        ]);
+        sched.register(sim0);
+        sched.submit_observer(observer_input(
+            9,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(500.0, 0.0, 500.0),
+        ));
+        for _ in 0..12 {
+            sched.tick();
+        }
+        let key = (TicketHolder::Entity(cargo), TicketKind::TransientMotion);
+        let state = sched.ticket_table().get(key).map(|t| t.state);
+        assert!(
+            matches!(
+                state,
+                Some(TicketState::Paused) | Some(TicketState::Suspended)
+            ),
+            "被承载瞬态的票经生产 tick 进入 Paused/Suspend:{state:?}(H1)"
+        );
         sched.shutdown();
     }
 
