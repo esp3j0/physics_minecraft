@@ -65,6 +65,10 @@ pub struct Config {
     pub max_awake_dynamic: usize,
     /// 每拍 chunk 换装预算,2(§4.3)。
     pub swap_budget_chunks_per_tick: u32,
+    /// 区域票半径上限 m(REQ-007 §4.2.3;默认 128)。
+    pub area_ticket_max_radius_m: f32,
+    /// 区域票数量上限(默认 64)。
+    pub area_ticket_max_count: usize,
     /// 空片 despawn 阈值(秒),30(§9.3)。
     pub despawn_after_secs: u64,
     /// 跨片信封队列容量,1024(§4.2)。
@@ -96,6 +100,8 @@ impl Default for Config {
             activation: ActivationConfig::default(),
             max_awake_dynamic: 512,
             swap_budget_chunks_per_tick: 2,
+            area_ticket_max_radius_m: 128.0,
+            area_ticket_max_count: 64,
             despawn_after_secs: 30,
             envelope_queue_capacity: 1024,
             inbox_capacity: 256,
@@ -163,6 +169,12 @@ impl Config {
             despawn_after_ticks: (self.despawn_after_secs as f32 / self.dt).round() as u64,
             start_tick: Tick::ZERO,
         }
+    }
+
+    /// 区域票上限注入到调度器配置(REQ-007 任务 02;bootstrap 装配用)。
+    /// SchedulerConfig 透传两值(app → scheduler)。
+    pub fn area_ticket_caps(&self) -> (f32, usize) {
+        (self.area_ticket_max_radius_m, self.area_ticket_max_count)
     }
 
     /// → SessionConfig(source = InputSource(1))。

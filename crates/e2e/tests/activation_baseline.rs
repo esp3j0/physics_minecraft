@@ -621,3 +621,35 @@ fn tier_split_collider_invariants() {
     );
     println!("② 差额峰值:{max_gap}(D18 后恒 0)");
 }
+
+/// AC-T1 再比对(REQ-007 任务 02/B4.4;任务书测试
+/// `ac_t1_matches_golden_after_tickets`):票据化后(观察者命令双写观察者票,
+/// plan 走票据视图)重跑 00 场景,四项**严格相等**——① 集 == golden chunk 集、
+/// ② 集 == golden chunk 集、冻结/唤醒集 == golden、分片集 == golden;
+/// 零"推迟唤醒"差异(本任务无待地形,出现差异即 bug)。
+/// 断言结构 == `baseline_replay_matches_golden`(整行)+ ② 分片结构比对。
+#[test]
+fn ac_t1_matches_golden_after_tickets() {
+    let golden = read_golden_lines();
+    let frames = run_scenario();
+    assert_non_degenerate(&frames);
+    assert_eq!(frames.len(), golden.len(), "拍数与 golden 不一致");
+    for (f, g) in frames.iter().zip(&golden) {
+        let (gtick, gline) = Frame::parse_line(g);
+        assert_eq!(f.tick, gtick, "拍号错位");
+        assert_eq!(
+            f.to_line(),
+            *gline,
+            "拍 {} ①/冻结/唤醒/分片 基线分叉(第一个分叉行):
+  实际:{}
+  golden:{gline}",
+            f.tick,
+            f.to_line()
+        );
+        assert_eq!(
+            f.colliders, f.loaded,
+            "拍 {} ② 集 ≠ golden chunk 集(任务 02:观察者票路径应逐拍相等)",
+            f.tick
+        );
+    }
+}

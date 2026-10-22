@@ -41,6 +41,17 @@ pub enum SessionError {
     Snapshot(#[from] SimSnapshotError),
     #[error("命令被拒绝:{0}")]
     Rejected(&'static str),
+    #[error(transparent)]
+    AreaTicket(#[from] AreaTicketError),
+}
+
+/// 区域票签发可预期失败(REQ-007 任务 02 细则 10:类型化拒绝,不 panic)。
+#[derive(Debug, thiserror::Error, PartialEq)]
+pub enum AreaTicketError {
+    #[error("区域票半径超上限:{radius_m} > {max}")]
+    RadiusTooLarge { radius_m: f32, max: f32 },
+    #[error("区域票数量超上限:{max}")]
+    TooManyTickets { max: usize },
 }
 
 /// headless 会话:命令进/快照出(蓝图 §3 session;网络形状后置 REQ-003)。
@@ -413,6 +424,92 @@ impl Session {
         self.scheduler.entity_states(shard)
     }
 
+    /// 区域票签发(REQ-007 §4.2.3/D10,任务 02):盖章入日志(回放再生)+
+    /// 调度器级票据收件箱(当拍生效)。同 id 覆盖 = 续期(S3,时钟重置),
+    /// 计数不变。上限:半径 ≤ max、同存区域票 ≤ max_count —— 超限类型化拒绝
+    /// (不 panic)。tiers 位集:0b001 = ①、0b011 = ①②、0b111 = ①②③。
+    /// `source` = 会话 source(本地受信通道;C2S 无入口)。
+    pub fn set_area_ticket(
+        &mut self,
+        id: u64,
+        center: Vec3,
+        radius_m: f32,
+        tiers: u8,
+        ttl_ticks: Option<u64>,
+    ) -> Result<LogEntry, SessionError> {
+        // 上限校验(先半径后数量;T18)。
+        if radius_m > self.scheduler.area_ticket_max_radius() {
+            return Err(SessionError::AreaTicket(AreaTicketError::RadiusTooLarge {
+                radius_m,
+                max: self.scheduler.area_ticket_max_radius(),
+            }));
+        }
+        let key_exists = self.scheduler.ticket_table().iter().any(|(k, _)| {
+            matches!(k.0, physics_sim::tickets::TicketHolder::Area(a) if a == id)
+                && k.1 == physics_sim::tickets::TicketKind::Area
+        });
+        if !key_exists
+            && self.scheduler.ticket_table().area_count() >= self.scheduler.area_ticket_max_count()
+        {
+            return Err(SessionError::AreaTicket(AreaTicketError::TooManyTickets {
+                max: self.scheduler.area_ticket_max_count(),
+            }));
+        }
+        let tick = self.scheduler.tick_now();
+        let sequence = self.next_sequence;
+        self.scheduler.submit_observer(StampedInput {
+            apply_at: tick,
+            source: self.source,
+            sequence,
+            payload: InputPayload::Command(SimCommand::SetAreaTicket {
+                id,
+                center,
+                radius_m,
+                tiers,
+                ttl_ticks,
+            }),
+        });
+        self.next_sequence += 1;
+        Ok(LogEntry {
+            tick,
+            dest: Self::observer_dest_of(center),
+            source: self.source,
+            sequence,
+            command: SimCommand::SetAreaTicket {
+                id,
+                center,
+                radius_m,
+                tiers,
+                ttl_ticks,
+            },
+        })
+    }
+
+    /// 区域票移除(REQ-007 §4.2.3/D10):不存在 = 幂等;照常盖章入日志。
+    pub fn remove_area_ticket(&mut self, id: u64) -> Result<LogEntry, SessionError> {
+        let tick = self.scheduler.tick_now();
+        let sequence = self.next_sequence;
+        self.scheduler.submit_observer(StampedInput {
+            apply_at: tick,
+            source: self.source,
+            sequence,
+            payload: InputPayload::Command(SimCommand::RemoveAreaTicket { id }),
+        });
+        self.next_sequence += 1;
+        // dest 信息性(id 无坐标;原点分片占位,不用于投递)。
+        Ok(LogEntry {
+            tick,
+            dest: types::ShardId::new(
+                types::WorldId(0),
+                types::DimensionId(0),
+                types::ShardPos::new(0, 0),
+            ),
+            source: self.source,
+            sequence,
+            command: SimCommand::RemoveAreaTicket { id },
+        })
+    }
+
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
     /// REQ-007 任务 01(①② 拆分/D17):激活已启用 → 只装 ①(体素),② 由
     /// 下一拍激活决策构建(细则 11);未启用 → 合一装 ①②(现状,§14-9)。
@@ -425,6 +522,28 @@ impl Session {
     /// (基线比对/断言观测用)。分片未注册 → false。
     pub fn has_collider(&self, shard: ShardId, pos: types::ChunkPos) -> bool {
         self.scheduler.has_collider(shard, pos)
+    }
+
+    /// 调度器透传(REQ-007 任务 02 细则 7):区域票 ① "进"区域覆盖的分片集
+    /// (驱动 ensure 用;键序)。
+    pub fn area_ticket_shards(&self) -> std::collections::BTreeSet<ShardId> {
+        self.scheduler.area_ticket_shards()
+    }
+
+    /// 调度器透传(REQ-007 任务 02 细则 10):区域票上限注入(bootstrap
+    /// 装配期一次性;Session::new 后立即调)。
+    pub fn set_area_ticket_caps(&mut self, max_radius_m: f32, max_count: usize) {
+        self.scheduler.set_area_ticket_caps(max_radius_m, max_count);
+    }
+
+    /// 调度器透传(REQ-007 任务 02):票据表只读视图(测试/断言用)。
+    pub fn ticket_table(&self) -> &shard::tickets::TicketTable {
+        self.scheduler.ticket_table()
+    }
+
+    /// 调度器透传(REQ-007 D17):激活启用开关(曾设观察者或区域票;单向)。
+    pub fn activation_enabled(&self) -> bool {
+        self.scheduler.activation_enabled()
     }
 
     /// 调度器透传(REQ-002 §4.4):卸载一个 chunk(返回供持久化;未装载 → None)。
@@ -2041,5 +2160,54 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SessionError::Rejected(_)));
         session.shutdown();
+    }
+    #[cfg(test)]
+    mod area_ticket_tests {
+        use super::*;
+
+        /// 测试清单(session,任务书 02):区域票 Set/Remove 盖章入日志;回放后
+        /// 票据表一致(命令在收件箱应用 = 表变化,回放重投同命令)。
+        #[test]
+        fn set_area_ticket_logs_command() {
+            let mut session = Session::new(SessionConfig::default());
+            // 签发:入日志 + 票据表(下一 tick 生效)。
+            let entry = session
+                .set_area_ticket(7, Vec3::new(64.0, 0.0, 64.0), 32.0, 0b111, Some(600))
+                .expect("合法签发");
+            assert_eq!(
+                entry.command,
+                SimCommand::SetAreaTicket {
+                    id: 7,
+                    center: Vec3::new(64.0, 0.0, 64.0),
+                    radius_m: 32.0,
+                    tiers: 0b111,
+                    ttl_ticks: Some(600),
+                }
+            );
+            let entry_rm = session.remove_area_ticket(7).expect("移除幂等照常入日志");
+            assert_eq!(entry_rm.command, SimCommand::RemoveAreaTicket { id: 7 });
+            // 推进一拍:收件箱应用 → Set + Remove(幂等终态:不在表)。
+            session.tick();
+            assert_eq!(
+                session.ticket_table().area_count(),
+                0,
+                "Set 后 Remove = 不在表"
+            );
+            // 超上限类型化拒绝:半径超默认 128。
+            let err = session
+                .set_area_ticket(8, Vec3::ZERO, 256.0, 0b001, None)
+                .expect_err("超半径拒绝");
+            assert!(
+                matches!(
+                    err,
+                    SessionError::AreaTicket(AreaTicketError::RadiusTooLarge { radius_m, max })
+                        if radius_m == 256.0 && max == 128.0
+                ),
+                "类型化拒绝(RadiusTooLarge):{err}"
+            );
+            // 表访问确认:未生效的票不在。
+            assert_eq!(session.ticket_table().area_count(), 0);
+            session.shutdown();
+        }
     }
 }

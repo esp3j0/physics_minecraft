@@ -198,6 +198,9 @@ pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
         // 无上行映射(客户端白名单拒绝;driver::validate_external_command
         // 同口径防御层)。
         SimCommand::RemoveObserver => return None,
+        // 区域票命令(REQ-007 任务 02):票据收件箱专用命令,不走分片前缀;
+        // C2S translate 白名单拒绝(Reject),本函数同口径返回 None(防御层)。
+        SimCommand::SetAreaTicket { .. } | SimCommand::RemoveAreaTicket { .. } => return None,
     };
     Some(types::ShardId::new(
         types::WorldId(0),
@@ -1392,6 +1395,42 @@ pub(crate) mod tests {
     }
 
     // ---- 测试清单 4:白名单透传;SetObserverPosition 命令 → Reject+断连 ----
+    /// 测试清单(app::net,任务书 02):C2S 承载区域票命令 → Reject(类型化
+    /// 文案);`command_shard` 返回 None(不走分片前缀)。
+    #[test]
+    fn translate_rejects_area_ticket() {
+        let outcome = translate(
+            InputSource(1),
+            C2S::Command(SimCommand::SetAreaTicket {
+                id: 1,
+                center: Vec3::ZERO,
+                radius_m: 32.0,
+                tiers: 0b111,
+                ttl_ticks: None,
+            }),
+        );
+        assert!(
+            matches!(outcome, TranslateOutcome::Reject(why) if why.contains("非白名单")),
+            "SetAreaTicket → Reject:{outcome:?}"
+        );
+        let outcome = translate(
+            InputSource(1),
+            C2S::Command(SimCommand::RemoveAreaTicket { id: 1 }),
+        );
+        assert!(matches!(outcome, TranslateOutcome::Reject(_)));
+        assert_eq!(
+            command_shard(&SimCommand::SetAreaTicket {
+                id: 1,
+                center: Vec3::ZERO,
+                radius_m: 32.0,
+                tiers: 0b111,
+                ttl_ticks: None,
+            }),
+            None
+        );
+        assert_eq!(command_shard(&SimCommand::RemoveAreaTicket { id: 1 }), None);
+    }
+
     #[tokio::test]
     async fn command_whitelist_enforced() {
         // 纯函数层:白名单命令 → Send(分片换算);非白名单 → Reject。
@@ -1478,6 +1517,40 @@ pub(crate) mod tests {
                 TranslateOutcome::Reject(_)
             ),
             "SetObserverPosition 命令 → Reject(走 C2S::MoveObserver 专用包)"
+        );
+        // 区域票命令(REQ-007 任务 02):C2S 无入口 → Reject(类型化文案);
+        // command_shard 返回 None(不走分片前缀的防御层)。
+        assert!(
+            matches!(
+                translate(
+                    InputSource(1),
+                    C2S::Command(SimCommand::SetAreaTicket {
+                        id: 1,
+                        center: Vec3::ZERO,
+                        radius_m: 32.0,
+                        tiers: 0b111,
+                        ttl_ticks: None,
+                    })
+                ),
+                TranslateOutcome::Reject(_)
+            ),
+            "SetAreaTicket → Reject(C2S 无区域票入口)"
+        );
+        assert_eq!(
+            command_shard(&SimCommand::SetAreaTicket {
+                id: 1,
+                center: Vec3::ZERO,
+                radius_m: 32.0,
+                tiers: 0b111,
+                ttl_ticks: None,
+            }),
+            None,
+            "SetAreaTicket → command_shard None"
+        );
+        assert_eq!(
+            command_shard(&SimCommand::RemoveAreaTicket { id: 1 }),
+            None,
+            "RemoveAreaTicket → command_shard None"
         );
 
         // socket 层:发 SetObserverPosition 命令 → 断连 + Left(协议违规)。

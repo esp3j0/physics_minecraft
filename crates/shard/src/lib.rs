@@ -18,6 +18,7 @@ pub mod lifecycle;
 pub mod ownership;
 pub mod router;
 pub mod scheduler;
+pub mod tickets;
 
 pub use entities::{EntityOwner, EntityOwnership};
 pub use lifecycle::LifecycleSnapshot;

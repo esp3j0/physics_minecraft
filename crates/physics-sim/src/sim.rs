@@ -586,9 +586,44 @@ impl ShardSim {
     }
 
     pub fn apply_activation(&mut self, observers: &[Vec3]) -> ActivationDecisions {
+        // 观察者 → 一张 Observer 票(REQ-007 任务 02:观察者票等价改造;
+        // 半径取本 sim 激活配置,order 0/priority 0 与 01 逐位一致)。
+        let cfg = self.cfg.activation;
+        let tickets: Vec<crate::tickets::TicketView> = observers
+            .iter()
+            .map(|&pos| crate::tickets::TicketView {
+                order: 0,
+                priority: 0,
+                data: crate::tickets::RegionSpec::Radius {
+                    load_m: cfg.data_load_radius,
+                    unload_m: cfg.data_unload_radius,
+                },
+                collider: crate::tickets::RegionSpec::Radius {
+                    load_m: cfg.collider_load_radius,
+                    unload_m: cfg.collider_unload_radius,
+                },
+                wake: crate::tickets::WakeSpec::Radius {
+                    load_m: cfg.awake_load_radius,
+                    unload_m: cfg.awake_unload_radius,
+                },
+                state: crate::tickets::TicketState::Active,
+                anchor: pos,
+            })
+            .collect();
+        self.apply_activation_tickets(&tickets, observers)
+    }
+
+    /// 票据视图入口(REQ-007 任务 02:调度器的生产路径)。`observed_centers`
+    /// = 命令唤醒预算强制的距离中心(唤醒中心锚点;调度器传全部占区域票锚点
+    /// ——与 01 的观察者表同语义)。
+    pub fn apply_activation_tickets(
+        &mut self,
+        tickets: &[crate::tickets::TicketView],
+        observed_centers: &[Vec3],
+    ) -> ActivationDecisions {
         let now = self.activation_now;
         self.activation_now = now.next();
-        self.observed = Some(observers.to_vec());
+        self.observed = Some(observed_centers.to_vec());
         // R1(D18 情况 1):上一拍 pending 未兑现的条目(驱动未执行该装载,
         // 例如观察者已移走致请求作废)就地作废——本拍 plan 重新决策。兑现过
         // 的条目已被 load_data_only 移除。
@@ -608,7 +643,7 @@ impl ShardSim {
             .collect();
         let decisions =
             self.activation
-                .plan(observers, &loaded, &collider_loaded, &entities, now, region);
+                .plan(tickets, &loaded, &collider_loaded, &entities, now, region);
 
         // tier② 落实(REQ-007 任务 01/B3:N3——决策在 plan,执行在此,与
         // ③ 冻结/唤醒同方式;驱动层不执行 ②):
@@ -726,6 +761,14 @@ impl ShardSim {
             // → 出现即一致性违规 fail-stop(match 穷举强制)。
             SimCommand::RemoveObserver => {
                 panic!("RemoveObserver 不得进入分片输入前缀(观察者收件箱专用,fail-stop)");
+            }
+            // 区域票命令永不走本路径(REQ-007 任务 02:调度器级票据收件箱,
+            // 与观察者命令同语义);出现 = 一致性违规 fail-stop。
+            SimCommand::SetAreaTicket { .. } => {
+                panic!("SetAreaTicket 不得进入分片输入前缀(票据收件箱专用,fail-stop)");
+            }
+            SimCommand::RemoveAreaTicket { .. } => {
+                panic!("RemoveAreaTicket 不得进入分片输入前缀(票据收件箱专用,fail-stop)");
             }
         }
     }
@@ -1935,6 +1978,107 @@ mod tests {
         // (1,0) 单独构建要等 pending 不占预算的拍(此处 ① 候选继续占预算);
         // 锚定执行链:pending 兑现 → ② 与 ① 同点。
         assert!(!s.has_collider(ChunkPos::new(0, 0)), "无 '凡①皆②' 二次派生");
+    }
+
+    /// 测试清单(sim,任务书 02):plan 输入票视图;观察者票 == 旧 observers
+    /// 路径(对拍:同坐标票同输出——apply_activation 内部即此转换,此处显式
+    /// 构造票走 apply_activation_tickets 对拍)。
+    #[test]
+    fn apply_activation_reads_ticket_views() {
+        let obs = [Vec3::new(8.0, 0.0, 8.0)];
+        let mut a = sim(0, 0);
+        let d_obs = a.apply_activation(&obs);
+        let mut b = sim(0, 0);
+        let cfg = b.activation_config();
+        let tickets = vec![crate::tickets::TicketView {
+            order: 0,
+            priority: 0,
+            data: crate::tickets::RegionSpec::Radius {
+                load_m: cfg.data_load_radius,
+                unload_m: cfg.data_unload_radius,
+            },
+            collider: crate::tickets::RegionSpec::Radius {
+                load_m: cfg.collider_load_radius,
+                unload_m: cfg.collider_unload_radius,
+            },
+            wake: crate::tickets::WakeSpec::Radius {
+                load_m: cfg.awake_load_radius,
+                unload_m: cfg.awake_unload_radius,
+            },
+            state: crate::tickets::TicketState::Active,
+            anchor: obs[0],
+        }];
+        let d_tix = b.apply_activation_tickets(&tickets, &obs);
+        assert_eq!(
+            d_obs, d_tix,
+            "同坐标观察者票 == 旧 observers 路径(逐字段相等)"
+        );
+    }
+
+    /// 测试清单(sim,S1 对拍/§14-1):Observer 与 Area 两票同 RegionSpec/
+    /// WakeSpec/priority/anchor → 决策逐字段相等(决策层无票种分支的结构
+    /// 证据:plan 只见视图)。
+    #[test]
+    fn observer_and_area_same_spec_same_decision() {
+        let anchor = Vec3::new(64.0, 0.0, 64.0);
+        let mk = |order: u32| crate::tickets::TicketView {
+            order,
+            priority: 1,
+            data: crate::tickets::RegionSpec::Radius {
+                load_m: 32.0,
+                unload_m: 48.0,
+            },
+            collider: crate::tickets::RegionSpec::Radius {
+                load_m: 32.0,
+                unload_m: 48.0,
+            },
+            wake: crate::tickets::WakeSpec::Radius {
+                load_m: 24.0,
+                unload_m: 32.0,
+            },
+            state: crate::tickets::TicketState::Active,
+            anchor,
+        };
+        let as_observer = [mk(0)];
+        let as_area = [mk(0)];
+        let mut a = sim(2, 2); // 锚点在分片 (0,0) 区域外?分片 (2,2) core 含 64m 处
+        let d1 = a.apply_activation_tickets(
+            &as_observer,
+            &as_observer.iter().map(|t| t.anchor).collect::<Vec<_>>(),
+        );
+        let mut b = sim(2, 2);
+        let d2 = b.apply_activation_tickets(
+            &as_area,
+            &as_area.iter().map(|t| t.anchor).collect::<Vec<_>>(),
+        );
+        assert_eq!(d1, d2, "同规格不同票种 → 决策逐字段相等(S1)");
+    }
+
+    /// 测试清单(sim,结构检查):TicketView 无 holder/kind 字段——编译期
+    /// 保证;测试断言字段集(反射式字段清单锚定:新增字段必须显式更新本测)。
+    #[test]
+    fn ticket_view_has_no_kind() {
+        // 构造成功即无 holder/kind 字段(若存在同名公共字段,此初始化仍编译;
+        // 用字段名清单比对防静默加字段)。
+        let v = crate::tickets::TicketView {
+            order: 0,
+            priority: 0,
+            data: crate::tickets::RegionSpec::None,
+            collider: crate::tickets::RegionSpec::None,
+            wake: crate::tickets::WakeSpec::None,
+            state: crate::tickets::TicketState::Active,
+            anchor: Vec3::ZERO,
+        };
+        // 结构性自检:仅允许的字段集(通过解构编译保证)。
+        let crate::tickets::TicketView {
+            order: _,
+            priority: _,
+            data: _,
+            collider: _,
+            wake: _,
+            state: _,
+            anchor: _,
+        } = v;
     }
 
     /// D18:pending 未兑现(驱动未执行装载)→ 下一次 apply_activation 开头

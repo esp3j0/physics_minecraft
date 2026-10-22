@@ -48,6 +48,20 @@ pub enum DriverCommand {
         state: types::EntityState,
         desc: types::EntityDesc,
     },
+    /// 区域票签发(REQ-007 任务 02):本地受信通道(commands/未来管理面)
+    /// 的正路;经 Session 盖章入日志 + 票据收件箱。网络 C2S 无入口
+    /// (translate 拒绝)。
+    SetAreaTicket {
+        id: u64,
+        center: types::glam::Vec3,
+        radius_m: f32,
+        tiers: u8,
+        ttl_ticks: Option<u64>,
+    },
+    /// 区域票移除(不存在 = 幂等)。
+    RemoveAreaTicket {
+        id: u64,
+    },
 }
 
 impl PartialEq for DriverCommand {
@@ -223,6 +237,11 @@ pub fn validate_external_command(
         // 经本缝到达 = 拒绝丢弃(hostile 路径不 panic)。
         messaging::SimCommand::SetObserverPosition { .. }
         | messaging::SimCommand::RemoveObserver => Err("观察者命令不可外部投递"),
+        // 区域票命令(REQ-007 任务 02):调度器级票据收件箱专用载荷,不可经
+        // 外部缝投递(正路 = DriverCommand 专用包 → Session 区域票 API;
+        // translate 同口径拒绝)。经本缝到达 = 拒绝丢弃(hostile 路径不 panic)。
+        messaging::SimCommand::SetAreaTicket { .. }
+        | messaging::SimCommand::RemoveAreaTicket { .. } => Err("区域票命令不可外部投递"),
     }
 }
 
@@ -755,6 +774,11 @@ impl ObserveOrchestrator {
                     // 反压/拒绝计数不断链。
                     dispatch_external(session, log, commands_rejected, player, shard, command);
                 }
+                DriverCommand::SetAreaTicket { .. } | DriverCommand::RemoveAreaTicket { .. } => {
+                    // 区域票不经网络上行的 DriverCommand(translate 已拒绝
+                    // C2S 路径;此载体仅本地受信通道使用)——出现即编程错误。
+                    panic!("区域票命令不得经网络上行 DriverCommand 载体(编程错误,fail-stop)")
+                }
                 DriverCommand::Shutdown | DriverCommand::StreamChunks { .. } => {
                     // 网络上行不含这两类(关机走 commands 通道;chunk 流回执
                     // 由驱动直接持有 oneshot)——出现即编程错误,fail-stop。
@@ -959,6 +983,15 @@ fn orchestrate(
                 session.register(new_sim(shard));
                 counters.shards_spawned += 1;
             }
+        }
+    }
+    // ①″ 区域票 ensure(REQ-007 任务 02 细则 7):每张 Active/Paused 区域票
+    // ① "进"区域覆盖的分片(owner 分片 = 核心区含该分片覆盖 chunk 的)注册。
+    // Radius 票:中心所在分片 + 半径圆覆盖的分片(shards_within 同口径)。
+    for shard in session.area_ticket_shards() {
+        if ensured.insert(shard) && !session.shard_ids().contains(&shard) {
+            session.register(new_sim(shard));
+            counters.shards_spawned += 1;
         }
     }
 
@@ -1338,6 +1371,30 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                         // tick 末端编排第 ④ 步处理——永不阻塞 tick(README 决策 7)。
                         pending_streams.push(cmd);
                     }
+                    Some(DriverCommand::SetAreaTicket {
+                        id,
+                        center,
+                        radius_m,
+                        tiers,
+                        ttl_ticks,
+                    }) => {
+                        // 区域票签发(REQ-007 任务 02):本地受信通道正路——
+                        // Session 盖章入日志 + 票据收件箱;超限类型化拒绝计数。
+                        match session.set_area_ticket(id, center, radius_m, tiers, ttl_ticks) {
+                            Ok(entry) => log.append(entry),
+                            Err(err) => {
+                                eprintln!("[driver] 区域票拒绝:{err:?} (id={id})");
+                                commands_rejected += 1;
+                            }
+                        }
+                    }
+                    Some(DriverCommand::RemoveAreaTicket { id }) => {
+                        // 区域票移除(幂等;照常入日志回放)。
+                        match session.remove_area_ticket(id) {
+                            Ok(entry) => log.append(entry),
+                            Err(err) => panic!("区域票移除失败(非预期):{err:?}"),
+                        }
+                    }
                 }
             }
         }
@@ -1482,12 +1539,13 @@ pub fn bootstrap(
                 .max(entities_server_next_seq(&session));
             (session, log, Some(at), spawn_next_seq)
         }
-        None => (
-            sim_api::session::Session::new(config.session_config()),
-            sim_api::log::CommandLog::new(),
-            None,
-            0,
-        ),
+        None => {
+            let mut session = sim_api::session::Session::new(config.session_config());
+            // 区域票上限注入(REQ-007 任务 02 细则 10;config 两键)。
+            let (max_r, max_c) = config.area_ticket_caps();
+            session.set_area_ticket_caps(max_r, max_c);
+            (session, sim_api::log::CommandLog::new(), None, 0)
+        }
     };
 
     let store = storage::worker::StoreWorker::new(Box::new(chunks), Box::new(checkpoints));
@@ -1547,6 +1605,8 @@ mod tests {
             tick,
             observers: std::collections::BTreeMap::new(),
             observers_ever_set: false,
+            tickets: shard::tickets::TicketTable::new(),
+            tickets_ever_set: false,
             router: shard::RouterSnapshot {
                 envelopes: Vec::new(),
                 sequences: std::collections::BTreeMap::new(),
@@ -1579,6 +1639,53 @@ mod tests {
         let mut session = sim_api::session::Session::new(config.session_config());
         session.register(sim(0, 0));
         session
+    }
+
+    /// 测试清单(app::driver,任务书 02):区域票 Set/Remove 经本地受信通道
+    /// (Session API 正路)生效——入日志、票据表变化(下一拍);外部缝
+    /// (validate_external_command)拒绝;网络路径无入口(translate 拒绝,
+    /// net::translate_rejects_area_ticket 覆盖)。
+    #[test]
+    fn area_ticket_via_local_channel_only() {
+        let config = Config::default();
+        let mut session = session_with_one_shard(&config);
+        let (max_r, max_c) = config.area_ticket_caps();
+        session.set_area_ticket_caps(max_r, max_c);
+        let mut log = sim_api::log::CommandLog::new();
+        // 本地正路:Session 盖章入日志。
+        let entry = session
+            .set_area_ticket(1, Vec3::new(64.0, 0.0, 64.0), 32.0, 0b001, None)
+            .expect("本地签发");
+        log.append(entry);
+        assert_eq!(log.entries().len(), 1, "入日志");
+        session.tick();
+        assert_eq!(
+            session.ticket_table().area_count(),
+            1,
+            "收件箱应用 → 表变化"
+        );
+        assert!(session.activation_enabled(), "D17 推广:区域票启用");
+        // 外部缝:validate_external_command 拒绝区域票命令(hostile 不 panic)。
+        let err = validate_external_command(
+            &session,
+            None,
+            shard_id(0, 0),
+            &messaging::SimCommand::SetAreaTicket {
+                id: 2,
+                center: Vec3::ZERO,
+                radius_m: 32.0,
+                tiers: 0b001,
+                ttl_ticks: None,
+            },
+        );
+        assert!(err.is_err(), "外部缝拒绝区域票命令");
+        // 移除(幂等)照常入日志;下一拍表清;开关保持单向。
+        let entry = session.remove_area_ticket(1).expect("移除");
+        log.append(entry);
+        session.tick();
+        assert_eq!(session.ticket_table().area_count(), 0);
+        assert!(session.activation_enabled(), "单向不回退");
+        session.shutdown();
     }
 
     /// REQ-006 评审 B1:commands 通道 spawn 必须是服务端实体(source=None),

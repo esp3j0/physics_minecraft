@@ -105,8 +105,17 @@ pub struct SchedulerSnapshot {
     pub tick: Tick,
     pub observers: BTreeMap<InputSource, Vec3>,
     pub observers_ever_set: bool,
+    /// 票据表(REQ-007 任务 02 交付 7;票据收件箱未来条目不入——由日志回放)。
+    pub tickets: crate::tickets::TicketTable,
+    /// 曾存在区域票(开关推广的第二来源;单向)。
+    pub tickets_ever_set: bool,
     pub router: RouterSnapshot,
     pub lifecycles: BTreeMap<ShardId, LifecycleSnapshot>,
+}
+
+/// 票视图锚点列表(命令唤醒预算强制的距离中心;order 序,确定性)。
+fn views_anchors(views: &[physics_sim::tickets::TicketView]) -> Vec<Vec3> {
+    views.iter().map(|t| t.anchor).collect()
 }
 
 /// 固定 worker 池调度器(OS 线程 + capacity-one 通道 + 每拍全员汇合屏障)。
@@ -133,9 +142,21 @@ pub struct Scheduler {
     /// 观察者(直通或命令化)→ true;从未设置 → tick 完全跳过激活刷新,
     /// 行为与历史一致(表为空但设置过 = "无激活中心"语义,不等同跳过)。
     observers_ever_set: bool,
+    /// 曾存在区域票(REQ-007 任务 02:开关推广的第二来源;单向,随
+    /// `observers_ever_set` 同语义;区域票移除不回退)。
+    tickets_ever_set: bool,
     /// 调度器级观察者专用收件箱(REQ-002 §4.2;unbounded——任务书语义
     /// 细则 1:观察者频率低,有界语义复杂度不值得,REQ-003 网络层再收口)。
+    /// REQ-007 任务 02:推广为**票据收件箱**(§9-5,观察者 Set/Remove +
+    /// 区域票 Set/Remove 同箱同语义;观察者命令语义不变)。
     observer_inbox: VecDeque<StampedInput>,
+    /// 票据表(REQ-007 §4.2:调度器级全局唯一一张;键序遍历)。观察者票
+    /// 与 observer_table 同步(命令化条目双写:表 = 锚点来源,票 = 决策输入);
+    /// 区域票/实体票(03)只在此表。
+    tickets: crate::tickets::TicketTable,
+    /// 区域票上限(app::Config 注入;默认 128 m / 64 张,§4.2.3)。
+    area_ticket_max_radius_m: f32,
+    area_ticket_max_count: usize,
     /// 本拍激活决策(tick 步骤 1.5 收集,两拍之间经 take_activation_requests
     /// 取走;恰一次语义)。
     activation_requests: BTreeMap<ShardId, physics_sim::ActivationDecisions>,
@@ -189,7 +210,11 @@ impl Scheduler {
             next_slot: 0,
             observer_table: BTreeMap::new(),
             observers_ever_set: false,
+            tickets_ever_set: false,
             observer_inbox: VecDeque::new(),
+            tickets: crate::tickets::TicketTable::new(),
+            area_ticket_max_radius_m: 128.0,
+            area_ticket_max_count: 64,
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
             block_updates: Vec::new(),
@@ -212,8 +237,28 @@ impl Scheduler {
     /// ——同键覆盖的静默截断(评审回归)不可能重现;observers() 键升序
     /// 视图因此为 [末位, 首位, …] 的确定性逆序(顺序无语义,仅确定性)。
     pub fn set_observers(&mut self, observers: Vec<types::glam::Vec3>) {
+        // 旧表全部撤票(直通 = 整表替换)。
+        let old_keys: Vec<_> = self
+            .observer_table
+            .keys()
+            .map(|src| {
+                (
+                    physics_sim::tickets::TicketHolder::Observer(*src),
+                    physics_sim::tickets::TicketKind::Observer,
+                )
+            })
+            .collect();
+        for key in old_keys {
+            self.tickets.end(key);
+        }
         self.observer_table.clear();
         let len = observers.len();
+        let cfg_r = self
+            .sims
+            .values()
+            .next()
+            .map(|s| *s.activation_config())
+            .unwrap_or_default();
         for (j, pos) in observers.into_iter().enumerate() {
             let key = if j + 1 == len {
                 InputSource::SCHEDULER
@@ -221,27 +266,215 @@ impl Scheduler {
                 InputSource(u32::MAX - (len - 2 - j) as u32)
             };
             self.observer_table.insert(key, pos);
+            // 观察者票双写(REQ-007 任务 02;直通路径同语义,续期)。
+            self.tickets.issue(
+                (
+                    physics_sim::tickets::TicketHolder::Observer(key),
+                    physics_sim::tickets::TicketKind::Observer,
+                ),
+                crate::tickets::StoredTicket {
+                    priority: 0,
+                    data: physics_sim::tickets::RegionSpec::Radius {
+                        load_m: cfg_r.data_load_radius,
+                        unload_m: cfg_r.data_unload_radius,
+                    },
+                    collider: physics_sim::tickets::RegionSpec::Radius {
+                        load_m: cfg_r.collider_load_radius,
+                        unload_m: cfg_r.collider_unload_radius,
+                    },
+                    wake: physics_sim::tickets::WakeSpec::Radius {
+                        load_m: cfg_r.awake_load_radius,
+                        unload_m: cfg_r.awake_unload_radius,
+                    },
+                    clock: physics_sim::tickets::TicketClock {
+                        issued_at: self.coordinator.tick(),
+                        active_ticks: 0,
+                        limit: None,
+                        starts_at: None,
+                    },
+                    state: physics_sim::tickets::TicketState::Active,
+                    center: None,
+                },
+                self.coordinator.tick(),
+            );
         }
         self.observers_ever_set = true;
     }
 
-    /// 激活/票判定的观察者位置集(表值;确定性:InputSource 升序)。
-    /// `None` = 从未设置过任一路径 → tick 完全不做激活刷新、无票
-    /// (向后兼容开关);`Some(空)` = 设置过但表空 → 无激活中心语义
-    /// (§4.3:距离 +∞,不唤醒任何实体)。
-    fn activation_centers(&self) -> Option<Vec<types::glam::Vec3>> {
-        if !self.observers_ever_set {
-            return None;
-        }
-        Some(self.observer_table.values().copied().collect())
+    /// D17 激活启用开关(REQ-007 §4.0,任务 02 推广):曾设置过观察者**或**
+    /// 曾存在区域票即启用。单向,随快照(`observers_ever_set` 位置;区域票
+    /// 曾在亦置位——移除后不回退)。未启用时:装载合一(① + ② 同建,
+    /// `apply_chunk_load` 走旧路径)、激活完全不生效——行为与 `8702670` 一致。
+    pub fn activation_enabled(&self) -> bool {
+        self.observers_ever_set || self.tickets_ever_set
     }
 
-    /// D17 激活启用开关(REQ-007 §4.0,任务 01):曾设置过观察者(区域票
-    /// 在任务 02 并入)即启用。单向,随快照(沿用 `observers_ever_set` 的
-    /// 快照位置)。未启用时:装载合一(① + ② 同建,`apply_chunk_load` 走
-    /// 旧路径)、激活完全不生效——行为与 `8702670` 一致。
-    pub fn activation_enabled(&self) -> bool {
-        self.observers_ever_set
+    /// 票据表只读访问(测试/断言用)。
+    pub fn ticket_table(&self) -> &crate::tickets::TicketTable {
+        &self.tickets
+    }
+
+    /// 区域票半径上限(校验用;config 注入的默认 128)。
+    pub fn area_ticket_max_radius(&self) -> f32 {
+        self.area_ticket_max_radius_m
+    }
+
+    /// 区域票数量上限。
+    pub fn area_ticket_max_count(&self) -> usize {
+        self.area_ticket_max_count
+    }
+
+    /// 区域票 ① "进"区域覆盖的分片集(REQ-007 任务 02 细则 7:驱动 ensure
+    /// 用)。Radius 票:锚点圆覆盖(水平)的分片,键序。Suspended 不 ensure。
+    pub fn area_ticket_shards(&self) -> BTreeSet<ShardId> {
+        use physics_sim::tickets::{TicketHolder, TicketState};
+        const SHARD_M: f32 = (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        let mut out = BTreeSet::new();
+        for (holder, t) in self.tickets.iter() {
+            if t.state == TicketState::Suspended {
+                continue;
+            }
+            let TicketHolder::Area(id) = holder.0 else {
+                continue; // 观察者票走 ① 观察者邻片 ensure;实体票 03
+            };
+            let Some(center) = t.center else { continue };
+            let physics_sim::tickets::RegionSpec::Radius { load_m, .. } = t.data else {
+                continue;
+            };
+            let min_x = ((center.x - load_m) / SHARD_M).floor() as i32;
+            let max_x = ((center.x + load_m) / SHARD_M).floor() as i32;
+            let min_z = ((center.z - load_m) / SHARD_M).floor() as i32;
+            let max_z = ((center.z + load_m) / SHARD_M).floor() as i32;
+            for sx in min_x..=max_x {
+                for sz in min_z..=max_z {
+                    // 分片核心 AABB 水平距离 ≤ load_m(与 shards_within 同口径)。
+                    let (cx, cz) = (sx as f32 * SHARD_M, sz as f32 * SHARD_M);
+                    let dx = (cx - center.x).max(0.0).max(center.x - (cx + SHARD_M));
+                    let dz = (cz - center.z).max(0.0).max(center.z - (cz + SHARD_M));
+                    if dx * dx + dz * dz <= load_m * load_m {
+                        let _ = id;
+                        out.insert(ShardId::new(
+                            types::WorldId(0),
+                            types::DimensionId(0),
+                            types::ShardPos::new(sx, sz),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 区域票上限注入(bootstrap/测试;装配期一次性)。
+    pub fn set_area_ticket_caps(&mut self, max_radius_m: f32, max_count: usize) {
+        self.area_ticket_max_radius_m = max_radius_m;
+        self.area_ticket_max_count = max_count;
+    }
+
+    /// 区域票签发(生产入口;Session 经此入表)。幂等语义在
+    /// `TicketTable::issue`(同 id 覆盖 = 续期 S3)。上限校验在 Session 层
+    /// (类型化拒绝);本入口假设已校验。
+    pub fn apply_area_ticket(
+        &mut self,
+        id: physics_sim::tickets::AreaId,
+        center: types::glam::Vec3,
+        radius_m: f32,
+        tiers: u8,
+        ttl_ticks: Option<u64>,
+    ) {
+        use physics_sim::tickets::{
+            RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
+        };
+        // 同 id 已在 → 计数不变(覆盖);否则占新名额(Session 层已校验上限)。
+        let tiers_mask = tiers & 0b111;
+        let data = if tiers_mask & 0b001 != 0 {
+            RegionSpec::Radius {
+                load_m: radius_m,
+                unload_m: radius_m * 1.5,
+            }
+        } else {
+            RegionSpec::None
+        };
+        let collider = if tiers_mask & 0b010 != 0 {
+            RegionSpec::Radius {
+                load_m: radius_m,
+                unload_m: radius_m * 1.5,
+            }
+        } else {
+            RegionSpec::None
+        };
+        let wake = if tiers_mask & 0b100 != 0 {
+            WakeSpec::Radius {
+                load_m: radius_m,
+                unload_m: radius_m * 1.5,
+            }
+        } else {
+            WakeSpec::None
+        };
+        let key = (TicketHolder::Area(id), TicketKind::Area);
+        let is_new = self.ticket_table().get(key).is_none();
+        self.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1, // §4.2.3:区域票 priority 1(观察者 0)
+                data,
+                collider,
+                wake,
+                clock: TicketClock {
+                    issued_at: self.coordinator.tick(),
+                    active_ticks: 0,
+                    limit: ttl_ticks,
+                    starts_at: None,
+                },
+                state: TicketState::Active,
+                center: Some(center),
+            },
+            self.coordinator.tick(),
+        );
+        if is_new {
+            // 曾有区域票 → 启用激活(单向;§4.0/D17 推广)。
+            self.tickets_ever_set = true;
+        }
+    }
+
+    /// 区域票移除(幂等;§4.3.1 `End`)。
+    pub fn apply_remove_area_ticket(&mut self, id: physics_sim::tickets::AreaId) {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        self.tickets.end((TicketHolder::Area(id), TicketKind::Area));
+    }
+
+    /// 锚点派生(任务书细则 3):观察者票 = 观察者坐标;区域票 = center;
+    /// 实体票 = 实体位置(03 接;当前无实体票,`None` → views 跳过/panic
+    /// 语义由 TicketTable::views 决定)。观察者不在表(已删)而票在 = 一致
+    /// 违规(views 内 panic;此处观察者票锚点直接查表)。
+    fn ticket_anchor_of(&self, holder: &physics_sim::tickets::TicketHolder) -> Option<Vec3> {
+        use physics_sim::tickets::TicketHolder;
+        match holder {
+            TicketHolder::Observer(src) => self.observer_table.get(src).copied(),
+            TicketHolder::Area(_) => None, // 由调用方走 center(见 ticket_views)
+            TicketHolder::Entity(_) => None, // 03 接
+        }
+    }
+
+    /// 决策用票视图(键序;区域票锚点取 center)。观察者票无锚(已删而票在)
+    /// → 一致性违规 panic(TicketTable::views)。注意:观察者票与 observer_table
+    /// 双写同步(Set 应用时同时落表),此处派生顺序:观察者票锚点查表,区域票
+    /// 锚点查 center。
+    fn ticket_views(&self) -> Vec<physics_sim::tickets::TicketView> {
+        use physics_sim::tickets::TicketHolder;
+        let area_centers: std::collections::BTreeMap<physics_sim::tickets::AreaId, Vec3> = self
+            .tickets
+            .iter()
+            .filter_map(|(k, t)| match k.0 {
+                TicketHolder::Area(id) => t.center.map(|c| (id, c)),
+                _ => None,
+            })
+            .collect();
+        self.tickets.views(|holder| match holder {
+            TicketHolder::Observer(src) => self.observer_table.get(src).copied(),
+            TicketHolder::Area(id) => area_centers.get(id).copied(),
+            TicketHolder::Entity(_) => None,
+        })
     }
 
     /// 观察者只读视图(REQ-002 §4.2;驱动 ensure_shard/票判定用):
@@ -259,6 +492,11 @@ impl Scheduler {
         let removed = self.observer_table.remove(&source);
         if removed.is_some() {
             eprintln!("[scheduler] 观察者移除:source={source:?}");
+            // 观察者票随锚点消失(REQ-007 任务 02;与收件箱 Remove 分支同语义)。
+            self.tickets.end((
+                physics_sim::tickets::TicketHolder::Observer(source),
+                physics_sim::tickets::TicketKind::Observer,
+            ));
         }
         removed
     }
@@ -781,15 +1019,74 @@ impl Scheduler {
                     }) => {
                         self.observer_table.insert(input.source, position);
                         self.observers_ever_set = true;
+                        // 观察者票双写(REQ-007 任务 02:observer_table = 锚点
+                        // 来源,票据表 = 决策输入;覆盖 = 续期,规格与任务 01
+                        // 等价路径同源)。半径取激活配置(任一 sim 同源;无 sim
+                        // 时默认——与 shard_is_ticketed 同口径)。
+                        let cfg_r = self
+                            .sims
+                            .values()
+                            .next()
+                            .map(|s| *s.activation_config())
+                            .unwrap_or_default();
+                        self.tickets.issue(
+                            (
+                                physics_sim::tickets::TicketHolder::Observer(input.source),
+                                physics_sim::tickets::TicketKind::Observer,
+                            ),
+                            crate::tickets::StoredTicket {
+                                priority: 0,
+                                data: physics_sim::tickets::RegionSpec::Radius {
+                                    load_m: cfg_r.data_load_radius,
+                                    unload_m: cfg_r.data_unload_radius,
+                                },
+                                collider: physics_sim::tickets::RegionSpec::Radius {
+                                    load_m: cfg_r.collider_load_radius,
+                                    unload_m: cfg_r.collider_unload_radius,
+                                },
+                                wake: physics_sim::tickets::WakeSpec::Radius {
+                                    load_m: cfg_r.awake_load_radius,
+                                    unload_m: cfg_r.awake_unload_radius,
+                                },
+                                clock: physics_sim::tickets::TicketClock {
+                                    issued_at: at,
+                                    active_ticks: 0,
+                                    limit: None,
+                                    starts_at: None,
+                                },
+                                state: physics_sim::tickets::TicketState::Active,
+                                center: None,
+                            },
+                            at,
+                        );
                     }
                     InputPayload::Command(messaging::SimCommand::RemoveObserver) => {
                         // 幂等:不在表 = 无动作(断线竞先/重复移除无害,票撤
                         // 语义与 `remove_observer` 一致);表空不清
                         // `observers_ever_set`(同 `remove_observer`)。
+                        let okey = (
+                            physics_sim::tickets::TicketHolder::Observer(input.source),
+                            physics_sim::tickets::TicketKind::Observer,
+                        );
                         self.observer_table.remove(&input.source);
+                        self.tickets.end(okey); // 观察者票随锚点消失(§4.3.4)
+                    }
+                    // 区域票命令(REQ-007 任务 02):票据收件箱同语义——当拍
+                    // 生效;签发/移除幂等语义在 TicketTable(S3 续期/End 幂等)。
+                    InputPayload::Command(messaging::SimCommand::SetAreaTicket {
+                        id,
+                        center,
+                        radius_m,
+                        tiers,
+                        ttl_ticks,
+                    }) => {
+                        self.apply_area_ticket(id, center, radius_m, tiers, ttl_ticks);
+                    }
+                    InputPayload::Command(messaging::SimCommand::RemoveAreaTicket { id }) => {
+                        self.apply_remove_area_ticket(id);
                     }
                     _ => panic!(
-                        "观察者收件箱只收 SetObserverPosition/RemoveObserver\
+                        "票据收件箱只收 Set/RemoveObserver/Set/RemoveAreaTicket\
                          (收到其它载荷,调用方 bug,fail-stop)"
                     ),
                 }
@@ -802,9 +1099,12 @@ impl Scheduler {
         //     观察者中心集 = 命令化表 + 直通列表(两条写入路径,一张语义表);
         //     两者皆从未设置 → 完全跳过,行为与历史一致(向后兼容开关)。
         self.activation_requests.clear();
-        if let Some(observers) = self.activation_centers() {
+        if self.activation_enabled() {
+            // 票据视图派生(REQ-007 任务 02:锚点 = 票持有者;plan 消费视图,
+            // 无票种分支)。仅观察者票时与任务 01 等价(票规格同源半径)。
+            let views = self.ticket_views();
             for (shard, sim) in self.sims.iter_mut() {
-                let decisions = sim.apply_activation(&observers);
+                let decisions = sim.apply_activation_tickets(&views, &views_anchors(&views));
                 self.activation_requests.insert(*shard, decisions);
             }
         }
@@ -987,6 +1287,16 @@ impl Scheduler {
             }
         }
 
+        // 7.5 票据时钟(REQ-007 §4.3.2,任务 02):Active 票 +1;TTL 到期的
+        //     区域票直接 End(键序;实体票内部指令 03 接)。激活未启用时无票,
+        //     零动作。
+        self.tickets.advance_clocks();
+        for key in self.tickets.expired() {
+            if matches!(key.0, physics_sim::tickets::TicketHolder::Area(_)) {
+                self.tickets.end(key);
+            }
+        }
+
         // 8. 推进恰好一拍并汇报(决策 7:第 k 次调用执行第 k-1 拍)。
         self.coordinator.advance();
         TickSummary {
@@ -1001,30 +1311,44 @@ impl Scheduler {
         self.sims.get(&shard)?.entity_state(entity)
     }
 
-    /// 票判定(REQ-002 §4.5):任一观察者到分片核心 AABB(8×8 chunk 立柱,
-    /// 水平投影为 `shard.pos.min_chunk()..+8` chunk 的方块区)的水平距离
-    /// ≤ chunk_unload_radius(48m)→ 有票。观察者从未设置(两路径皆未)→ 无票。
+    /// 票判定(REQ-002 §4.5;REQ-007 任务 02 改读票据表):任一 Active/Paused
+    /// 票 ① "出"区域与分片核心 AABB(8×8 chunk 立柱)相交 → 有票。
+    /// Radius 票 = 锚点到 AABB 水平距离 ≤ unload_m(观察者票 unload = 48m,
+    /// 与现状逐位一致);Suspended 不保活(§4.2.1)。
     fn shard_is_ticketed(&self, shard: ShardId) -> bool {
-        let Some(observers) = self.activation_centers() else {
+        if !self.activation_enabled() {
             return false;
-        };
-        // 取激活配置的卸载半径(票半径与 tier①② 卸载半径同源,REQ-002 §4.5)。
-        let radius = self
+        }
+        // 半径回退:无 sim(全卸后)时取默认 48(与旧实现同口径)。
+        let fallback = self
             .sims
             .values()
             .next()
             .map(|s| s.activation_config().data_unload_radius)
             .unwrap_or(48.0);
-        let radius_sq = radius * radius;
         let min = shard.pos.min_chunk();
         let min_x = (min.x * types::CHUNK_SIZE) as f32;
         let min_z = (min.z * types::CHUNK_SIZE) as f32;
         let max_x = min_x + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
         let max_z = min_z + (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
-        observers.iter().any(|o| {
-            // 水平点到 AABB 距离(立方体外取分量差,内含取 0)。
-            let dx = (o.x.clamp(min_x, max_x) - o.x).abs();
-            let dz = (o.z.clamp(min_z, max_z) - o.z).abs();
+        self.tickets.iter().any(|(holder, t)| {
+            if t.state == physics_sim::tickets::TicketState::Suspended {
+                return false;
+            }
+            let physics_sim::tickets::RegionSpec::Radius { unload_m, .. } = t.data else {
+                return false; // None/Chunks(03)不保活;Footprint 03 接
+            };
+            let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
+                return false; // 无锚票(03 语义);保活忽略
+            };
+            let radius = if matches!(holder.0, physics_sim::tickets::TicketHolder::Observer(_)) {
+                fallback // 观察者票半径与 ① 配置同源(现状口径)
+            } else {
+                unload_m
+            };
+            let radius_sq = radius * radius;
+            let dx = (anchor.x.clamp(min_x, max_x) - anchor.x).abs();
+            let dz = (anchor.z.clamp(min_z, max_z) - anchor.z).abs();
             dx * dx + dz * dz <= radius_sq
         })
     }
@@ -1049,6 +1373,8 @@ impl Scheduler {
             tick: self.coordinator.tick(),
             observers: self.observer_table.clone(),
             observers_ever_set: self.observers_ever_set,
+            tickets: self.tickets.clone(),
+            tickets_ever_set: self.tickets_ever_set,
             router: self.router.snapshot(),
             lifecycles: self
                 .lifecycles
@@ -1099,6 +1425,10 @@ impl Scheduler {
         // 观察者表整表替换(快照是 checkpoint 时刻兜底;日志是其后权威)。
         self.observer_table = snap.observers;
         self.observers_ever_set = snap.observers_ever_set;
+        // 票据表整表替换(REQ-007 任务 02;区域票 Set/Remove 照常入日志回放,
+        // 快照是兜底)。
+        self.tickets = snap.tickets;
+        self.tickets_ever_set = snap.tickets_ever_set;
         // Router:envelopes 校验 + 放桶,sequences 原样。
         self.router.restore(snap.router);
         // lifecycles:逐片恢复(cfg 用当前配置);键集已校验一致。
@@ -1659,6 +1989,50 @@ mod tests {
         );
         sched.shutdown();
         sched2.shutdown();
+    }
+
+    /// 测试清单(shard,任务书 02):despawn 读票据表——有 Active/Paused 票
+    /// (① 出区域与分片核心相交)的分片不进候选;票清 + 空 + idle → 候选出现。
+    #[test]
+    fn despawn_reads_ticket_table() {
+        use types::glam::Vec3;
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        // 区域票(中心在分片核心内,unload = 1.5×32 = 48 > 0 → 保活)。
+        sched.apply_area_ticket(1, Vec3::new(64.0, 0.0, 64.0), 32.0, 0b001, None);
+        sched.tick();
+        // 空片 + 有票 + idle 短:不进候选。
+        assert!(
+            !sched.take_despawn_requests().contains(&shard),
+            "有 Active 区域票 → 不 despawn"
+        );
+        // 移除票 → 下一拍候选出现(idle_after_ticks 默认 ?——直接推进足够拍)。
+        sched.apply_remove_area_ticket(1);
+        let idle = SchedulerConfig::default().despawn_after_ticks;
+        for _ in 0..=idle {
+            sched.tick();
+        }
+        assert!(
+            sched.take_despawn_requests().contains(&shard),
+            "票清 + 空 + idle 满 → 候选出现"
+        );
+        sched.shutdown();
+    }
+
+    /// 测试清单(shard,任务书 02/T24):未设观察者、SetAreaTicket → 启用
+    /// (激活开始生效);Remove 后仍启用(单向)。
+    #[test]
+    fn activation_enabled_by_area_ticket() {
+        use types::glam::Vec3;
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim(0, 0));
+        assert!(!sched.activation_enabled(), "未启用(无观察者无票)");
+        sched.apply_area_ticket(1, Vec3::new(64.0, 0.0, 64.0), 32.0, 0b001, None);
+        assert!(sched.activation_enabled(), "区域票 → 启用(D17 推广)");
+        sched.apply_remove_area_ticket(1);
+        assert!(sched.activation_enabled(), "单向:移除不回退");
+        sched.shutdown();
     }
 
     // ---- REQ-005 任务 00(归属/持有/owner-only 持久化/信封黑洞) ----

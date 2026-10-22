@@ -14,6 +14,7 @@ pub mod collider_build;
 pub mod explosion;
 pub mod sim;
 pub mod snapshot;
+pub mod tickets;
 
 mod conv;
 mod solidify;
@@ -21,3 +22,6 @@ mod solidify;
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
 pub use sim::{BlockWrite, BlockWriteKind, Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
 pub use snapshot::SimSnapshotError;
+pub use tickets::{
+    AreaId, RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, TicketView, WakeSpec,
+};

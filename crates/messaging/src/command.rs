@@ -60,6 +60,24 @@ pub enum SimCommand {
     /// 级观察者收件箱(观察者收件箱专用);分片输入前缀出现本变体 = 一致性
     /// 违规 fail-stop。客户端白名单拒绝(C2S translate 无上行映射)。
     RemoveObserver,
+    /// 区域票签发(REQ-007 §4.2.3/D10,任务 02):同 id 覆盖 = 续期(S3,
+    /// 时钟重置);超上限由 Session 类型化拒绝(`AreaTicketError`,不 panic)。
+    /// **不走分片前缀**——与观察者命令同走调度器级票据收件箱(当拍生效);
+    /// **不进 C2S 白名单**(仅本地受信通道:driver commands / Session);
+    /// 照常盖章入外部命令日志(回放再生)。
+    SetAreaTicket {
+        id: u64,
+        center: Vec3,
+        radius_m: f32,
+        /// 层级:① = 0b001,①② = 0b011,①②③ = 0b111(位集;其余 = 拒绝)。
+        tiers: u8,
+        ttl_ticks: Option<u64>,
+    },
+    /// 区域票移除(REQ-007 §4.2.3/D10):不存在 = 幂等;同走票据收件箱,
+    /// 不进 C2S。
+    RemoveAreaTicket {
+        id: u64,
+    },
 }
 
 impl SimCommand {
@@ -74,6 +92,8 @@ impl SimCommand {
             Self::MarkActor { .. } => 5,
             Self::SetObserverPosition { .. } => 6,
             Self::RemoveObserver => 7,
+            Self::SetAreaTicket { .. } => 8,
+            Self::RemoveAreaTicket { .. } => 9,
         }
     }
 }
@@ -180,5 +200,28 @@ mod tests {
     fn scheduler_source_is_zero() {
         assert_eq!(InputSource::SCHEDULER, InputSource(0));
         assert!(InputSource::SCHEDULER < InputSource(1), "调度器来源排最前");
+    }
+    /// 测试清单(messaging,任务书 02):区域票两变体 ordinal = 8/9;旧 0–7
+    /// 不变;旧编码可解(只追加枚举:新变体追加在尾,反序列化旧字节不受影响)。
+    #[test]
+    fn area_ticket_ordinals_appended() {
+        assert_eq!(SimCommand::RemoveObserver.ordinal(), 7);
+        assert_eq!(
+            SimCommand::SetAreaTicket {
+                id: 1,
+                center: Vec3::ZERO,
+                radius_m: 32.0,
+                tiers: 0b111,
+                ttl_ticks: None,
+            }
+            .ordinal(),
+            8
+        );
+        assert_eq!(SimCommand::RemoveAreaTicket { id: 1 }.ordinal(), 9);
+        assert_eq!(cmd_set().ordinal(), 0, "旧 0 不变");
+        assert_eq!(cmd_detonate().ordinal(), 4, "旧 4 不变");
+        // 旧编码可解:bincode 依赖不在本 crate(日志层 sim-api 覆盖);此处
+        // 锚"只追加"的结构前提——新变体只追加在尾、ordinal 单调,旧字节解码
+        // 不受影响(旧 0–7 断言已在上方)。
     }
 }

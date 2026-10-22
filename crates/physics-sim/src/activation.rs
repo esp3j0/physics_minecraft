@@ -146,15 +146,17 @@ fn nearest_observer_distance(observers: &[Vec3], p: Vec3, horizontal: bool) -> O
         .min_by(|a, b| a.total_cmp(b))
 }
 
-/// chunk 中心(局部 8,8)到最近观察者的水平距离;无观察者 → +∞。
-fn chunk_distance(cp: ChunkPos, observers: &[Vec3]) -> f32 {
+/// chunk 中心(局部 8,8)到锚点的水平距离(票据口径;单票时与
+/// `chunk_distance` 同值)。
+fn horizontal_chunk_distance(cp: ChunkPos, anchor: Vec3) -> f32 {
     let half = CHUNK_SIZE as f32 * 0.5;
     let center = Vec3::new(
         (cp.x * CHUNK_SIZE) as f32 + half,
         0.0,
         (cp.z * CHUNK_SIZE) as f32 + half,
     );
-    nearest_observer_distance(observers, center, true).unwrap_or(f32::INFINITY)
+    let (dx, dz) = (anchor.x - center.x, anchor.z - center.z);
+    (dx * dx + dz * dz).sqrt()
 }
 
 /// 冷却是否已过:`now - last ≥ cooldown`。tick 回退 = 一致性违规 → panic。
@@ -211,7 +213,7 @@ impl ActivationController {
     /// 全体不触发预算)。
     pub fn plan(
         &mut self,
-        anchors: &[Vec3],
+        tickets: &[crate::tickets::TicketView],
         loaded: &[ChunkPos],
         collider_loaded: &[ChunkPos],
         entities: &[(EntityId, Vec3, bool)],
@@ -220,26 +222,83 @@ impl ActivationController {
     ) -> ActivationDecisions {
         let mut d = ActivationDecisions::default();
 
+        // ---- 票据预处理(REQ-007 任务 02;§14-1:只消费 RegionSpec/WakeSpec/
+        // priority/state,无票种分支)----
+        // 占区域票(Active/Paused;Suspended 不占);锚点 = view.anchor。
+        // 唤醒中心 = WakeSpec::Radius 的占区域票(③ 语义)。
+        // ①② 覆盖 = 各票 Radius 的 (进, 出) 区间;无 Radius 规格 → 无覆盖。
+        let occupying: Vec<&crate::tickets::TicketView> =
+            tickets.iter().filter(|t| t.occupies()).collect();
+        // 决策用锚点(所有占区域票的锚点;③ 距离中心 = WakeSpec::Radius 票锚点)。
+        let wake_centers: Vec<Vec3> = occupying
+            .iter()
+            .filter(|t| matches!(t.wake, crate::tickets::WakeSpec::Radius { .. }))
+            .map(|t| t.anchor)
+            .collect();
+        // ① 出区域判定用:任一票的 unload 半径覆盖(chunk 到该票锚点 ≤ unload_m)。
+        // 仅观察者票(任务 01 等价路径)时 == 现状 data_unload_radius。
+        // ③ 淘汰/滞回半径:仅当存在 WakeSpec::Radius 票;取该票半径(本任务
+        // 观察者票 = cfg.awake_*,区域票自带)。多票时……任务书细则 5:按
+        // "到最近唤醒中心距离"判定,每中心带自己的半径。
+        let wake_specs: Vec<(Vec3, f32, f32)> = occupying
+            .iter()
+            .filter_map(|t| match t.wake {
+                crate::tickets::WakeSpec::Radius { load_m, unload_m } => {
+                    Some((t.anchor, load_m, unload_m))
+                }
+                _ => None,
+            })
+            .collect();
+        // 无任何占区域票 → 与"无观察者"同:不唤醒任何实体,全体醒着的
+        // 进入(冷却门控的)冻结;①② 无候选。直接走实体档(距离 +∞)。
+
         // ---- tier① chunk 数据档(决策返回给调用方执行,数据源属 REQ-002)----
-        // 装载候选网格:各锚点周围 ceil(data_unload/16)+2;再按区域过滤
-        // (REQ-005 D4):区域外(即使距锚点很近)一律不请求——分片不
-        // 装载自己 core ∪ margin_ring 之外的 chunk。
+        // ① 覆盖 = Σ 占区域票 RegionSpec::Radius(进/出);无 Radius → 无覆盖
+        // (任务书细则 4:装载候选 = Σ 票"进"区域 − 已载;卸载候选 = 已载 ∧
+        // 不在任何票"出"区域)。
         let chunk_f = CHUNK_SIZE as f32;
-        let reach = (self.cfg.data_unload_radius / chunk_f).ceil() as i32 + 2;
-        let mut grid: BTreeSet<ChunkPos> = BTreeSet::new();
-        for o in anchors {
+        let data_specs: Vec<(Vec3, f32, f32)> = occupying
+            .iter()
+            .filter_map(|t| match t.data {
+                crate::tickets::RegionSpec::Radius { load_m, unload_m } => {
+                    Some((t.anchor, load_m, unload_m))
+                }
+                _ => None,
+            })
+            .collect();
+        // 覆盖集合:任一 Radius 票锚点水平距离 ≤ 半径的 chunk(网格半径 =
+        // ceil(半径/16)+1,同旧 reach 形状的保守覆盖)。仅观察者票时
+        // (load/unload = cfg 同源半径)与任务 01 行为逐位一致。
+        let mut in_cover: BTreeSet<ChunkPos> = BTreeSet::new();
+        let mut out_cover: BTreeSet<ChunkPos> = BTreeSet::new();
+        for (o, load_m, unload_m) in &data_specs {
             let cx = (o.x / chunk_f).floor() as i32;
             let cz = (o.z / chunk_f).floor() as i32;
-            for dx in -reach..=reach {
-                for dz in -reach..=reach {
-                    grid.insert(ChunkPos::new(cx + dx, cz + dz));
+            let r_in = (*load_m / chunk_f).ceil() as i32 + 1;
+            for dx in -r_in..=r_in {
+                for dz in -r_in..=r_in {
+                    let cp = ChunkPos::new(cx + dx, cz + dz);
+                    if horizontal_chunk_distance(cp, *o) <= *load_m {
+                        in_cover.insert(cp);
+                    }
+                }
+            }
+            let r_out = (*unload_m / chunk_f).ceil() as i32 + 1;
+            for dx in -r_out..=r_out {
+                for dz in -r_out..=r_out {
+                    let cp = ChunkPos::new(cx + dx, cz + dz);
+                    if horizontal_chunk_distance(cp, *o) <= *unload_m {
+                        out_cover.insert(cp);
+                    }
                 }
             }
         }
         let loaded_set: BTreeSet<ChunkPos> = loaded.iter().copied().collect();
-        // 候选集:(chunk, 最近距离, 是否装载);装载候选限网格 ∩ 区域内未载者。
-        let mut cands: Vec<(ChunkPos, f32, bool)> = Vec::new();
-        for &cp in &grid {
+        // 候选集:(chunk, best(priority, dist, order), 是否装载)。多票覆盖
+        // 同一 chunk 取最优 = 最小 (priority, 距锚点距离, order)(任务书细则 4:
+        // 最小 priority、其次最近距离;order 为确定性平局决胜)。
+        let mut cands: Vec<(ChunkPos, (u8, f32, u32), bool)> = Vec::new();
+        for &cp in &in_cover {
             if loaded_set.contains(&cp) {
                 continue;
             }
@@ -248,21 +307,59 @@ impl ActivationController {
             if !region.contains(cp) {
                 continue;
             }
-            let dist = chunk_distance(cp, anchors);
+            // 最优覆盖票(必存在:in_cover 的条目由某票"进"区域产生)。
+            let mut key: Option<(u8, f32, u32)> = None;
+            for t in &occupying {
+                let crate::tickets::RegionSpec::Radius { load_m, .. } = t.data else {
+                    continue;
+                };
+                let dist = horizontal_chunk_distance(cp, t.anchor);
+                if dist > load_m {
+                    continue;
+                }
+                let k = (t.priority, dist, t.order);
+                if key.is_none_or(|cur| k < cur) {
+                    key = Some(k);
+                }
+            }
+            let key = key.expect("in_cover 条目必有覆盖票(构造保证)");
             // 装载同样受冷却门控(任务书:「两者均需冷却」)——换装决策
             // 采纳即记簿记,冷却窗内重复候选不再产出。
-            if dist <= self.cfg.data_load_radius && self.chunk_cooled(&cp, now) {
-                cands.push((cp, dist, true));
+            if self.chunk_cooled(&cp, now) {
+                cands.push((cp, key, true));
             }
         }
+        // 卸载候选:已载 ∧ 不在任何 Active/Paused 票 ① "出"区域 ∧ 冷却。
+        // 排序键:priority = 现存占区域票的最小 priority(卸载是装载的对偶,
+        // 与装载同权竞争预算;单票场景 = 该票 priority,与任务 01 纯距离序
+        // 一致——AC-T1 golden 依赖此序);dist = 到最近占区域票锚点的水平
+        // 距离(无票 → +∞)。
+        let min_priority = occupying
+            .iter()
+            .map(|t| t.priority)
+            .min()
+            .unwrap_or(u8::MAX);
+        let nearest_anchor = |cp: ChunkPos| -> f32 {
+            occupying
+                .iter()
+                .map(|t| horizontal_chunk_distance(cp, t.anchor))
+                .fold(f32::INFINITY, f32::min)
+        };
         for &cp in loaded {
-            let dist = chunk_distance(cp, anchors);
-            if dist > self.cfg.data_unload_radius && self.chunk_cooled(&cp, now) {
-                cands.push((cp, dist, false));
+            if out_cover.contains(&cp) {
+                continue;
+            }
+            if self.chunk_cooled(&cp, now) {
+                cands.push((cp, (min_priority, nearest_anchor(cp), 0), false));
             }
         }
-        // 距离升序、同距 (x, z) 字典序(确定性);装卸合计截断到 ① 预算。
-        cands.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        // (priority, dist, ChunkPos) 升序(任务书细则 4);装卸合计截断 ① 预算。
+        cands.sort_by(|a, b| {
+            a.1.0
+                .cmp(&b.1.0)
+                .then_with(|| a.1.1.total_cmp(&b.1.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
         // ② 预算余量(修订 5 D18 情况 1:随 ① 同点构建与单独构建共享预算;
         // 单独构建段扣减同一余量)。
         let mut collider_budget_left = self.cfg.collider_budget_per_tick;
@@ -278,11 +375,14 @@ impl ActivationController {
                 // ② 冷却已过、② 预算有余)→ ② 同拍决定,随 ① 装载完成点构建。
                 // 装载候选已保证 ≤ data_load;若两档半径不同,② 条件更严,
                 // 需单独判定。
-                let dist = chunk_distance(cp, anchors);
-                if collider_budget_left > 0
-                    && dist <= self.cfg.collider_load_radius
-                    && self.collider_cooled(&cp, now)
-                {
+                // ② 条件(D18 情况 1):任一票的 collider "进"区域覆盖。
+                let collider_covered = occupying.iter().any(|t| {
+                    let crate::tickets::RegionSpec::Radius { load_m, .. } = t.collider else {
+                        return false;
+                    };
+                    horizontal_chunk_distance(cp, t.anchor) <= load_m
+                });
+                if collider_budget_left > 0 && collider_covered && self.collider_cooled(&cp, now) {
                     collider_budget_left -= 1;
                     self.collider_last_build.insert(cp, now);
                     d.colliders_pending_build.push(cp);
@@ -300,8 +400,14 @@ impl ActivationController {
             if collider_loaded_set.contains(&cp) || !region.contains(cp) {
                 continue;
             }
-            let dist = chunk_distance(cp, anchors);
-            if dist <= self.cfg.collider_load_radius && self.collider_cooled(&cp, now) {
+            // ② 覆盖 = 任一票 collider "进"区域。
+            let collider_covered = occupying.iter().any(|t| {
+                let crate::tickets::RegionSpec::Radius { load_m, .. } = t.collider else {
+                    return false;
+                };
+                horizontal_chunk_distance(cp, t.anchor) <= load_m
+            });
+            if collider_covered && self.collider_cooled(&cp, now) {
                 if collider_budget_left == 0 {
                     break;
                 }
@@ -321,29 +427,49 @@ impl ActivationController {
             if to_unload_set.contains(&cp) {
                 continue;
             }
-            let dist = chunk_distance(cp, anchors);
-            if dist > self.cfg.collider_unload_radius
-                && dist <= self.cfg.data_unload_radius
-                && self.collider_cooled(&cp, now)
-            {
+            // ② 超出**所有**占区域票的 collider "出"区域,且 ① 仍被保留
+            // (任一票 ① "出"区域覆盖 = out_cover)→ 单独拆 ②(R2/D18 情况 3:
+            // 排队待卸的 chunk 不在 out_cover 卸载候选之外时,② 不动)。
+            let collider_out = occupying.iter().all(|t| {
+                let crate::tickets::RegionSpec::Radius { unload_m, .. } = t.collider else {
+                    return true; // 无 ② 规格 → 不覆盖 → 视为出
+                };
+                horizontal_chunk_distance(cp, t.anchor) > unload_m
+            });
+            if collider_out && out_cover.contains(&cp) && self.collider_cooled(&cp, now) {
                 self.collider_last_build.insert(cp, now);
                 d.colliders_to_drop.push(cp);
             }
         }
 
-        // ---- tier③ 实体档 ----
+        // ---- tier③ 实体档(任务书细则 5:唤醒中心 = WakeSpec::Radius 的
+        // 占区域票;每中心带自己的半径;无中心 = 距离 +∞,全体冻结)----
         let mut wake: Vec<(EntityId, f32)> = Vec::new();
         let mut freeze: Vec<(EntityId, f32)> = Vec::new();
         let mut awake: Vec<(EntityId, f32)> = Vec::new();
+        // 判定口径:任一中心 ≤ 该中心 load → 进;所有中心 > 各自 unload → 出;
+        // 混合滞回带(多中心带宽重叠才出现)保持。仅观察者票时
+        // (load/unload = cfg.awake_* 同源)与任务 01 数值等价。
         for &(id, pos, frozen) in entities {
-            let dist = nearest_observer_distance(anchors, pos, false).unwrap_or(f32::INFINITY);
+            let dist =
+                nearest_observer_distance(&wake_centers, pos, false).unwrap_or(f32::INFINITY);
+            let inside = wake_specs
+                .iter()
+                .any(|(c, load_m, _)| (*c - pos).length() <= *load_m);
+            let outside = wake_specs
+                .iter()
+                .all(|(c, _, unload_m)| (*c - pos).length() > *unload_m);
+            let (wake_it, freeze_it) = match (inside, outside) {
+                (true, _) => (frozen, false),
+                (false, true) => (false, !frozen),
+                (false, false) => (false, false), // 滞回带:保持
+            };
             if !frozen {
                 awake.push((id, dist));
             }
-            if frozen && dist <= self.cfg.awake_load_radius && self.entity_cooled(&id, now) {
+            if wake_it && self.entity_cooled(&id, now) {
                 wake.push((id, dist));
-            } else if !frozen && dist > self.cfg.awake_unload_radius && self.entity_cooled(&id, now)
-            {
+            } else if freeze_it && self.entity_cooled(&id, now) {
                 freeze.push((id, dist));
             }
         }
@@ -459,7 +585,7 @@ mod tests {
         // 观察者贴东界(x=120):chunk 7(区域内)与 chunk 8(区域外,中心
         // x=136)都在装载半径内。
         let obs = [Vec3::new(120.0, 0.0, 8.0)];
-        let d = c.plan(&obs, &[], &[], &[], Tick::ZERO, core);
+        let d = c.plan(&obs_tickets(&obs), &[], &[], &[], Tick::ZERO, core);
         assert!(
             d.chunks_to_load.contains(&types::ChunkPos::new(7, 0)),
             "区域内且近 → 请求装载:{:?}",
@@ -476,7 +602,14 @@ mod tests {
         let mut c2 = ActivationController::new(cfg);
         let outside = [Vec3::new(200.0, 0.0, 8.0)];
         let far_loaded = [types::ChunkPos::new(30, 0)];
-        let d2 = c2.plan(&outside, &far_loaded, &[], &[], Tick::ZERO, core);
+        let d2 = c2.plan(
+            &obs_tickets(&outside),
+            &far_loaded,
+            &[],
+            &[],
+            Tick::ZERO,
+            core,
+        );
         assert!(
             d2.chunks_to_unload.contains(&types::ChunkPos::new(30, 0)),
             "卸载候选不强制在区域内:{:?}",
@@ -500,6 +633,39 @@ mod tests {
         EntityId::from_parts(1, n)
     }
 
+    /// 构造一张观察者票(§9-5 既有测试适配辅助):半径取默认激活配置
+    /// (32/48、24/32),与任务 01 的 observers 入口逐位一致;order 0 /
+    /// priority 0。多观察者 = order 按入参序。
+    fn obs_tickets(obs: &[Vec3]) -> Vec<crate::tickets::TicketView> {
+        cfg_tickets(&ActivationConfig::default(), obs)
+    }
+
+    /// 同上,但半径取测试自定的激活配置(凡 controller 用了非默认 cfg 的
+    /// 测试必须用它——票规格与 controller cfg 同源,否则 ①② 覆盖判定与
+    /// 旧 observers 语义错位)。
+    fn cfg_tickets(cfg: &ActivationConfig, obs: &[Vec3]) -> Vec<crate::tickets::TicketView> {
+        obs.iter()
+            .map(|&pos| crate::tickets::TicketView {
+                order: 0,
+                priority: 0,
+                data: crate::tickets::RegionSpec::Radius {
+                    load_m: cfg.data_load_radius,
+                    unload_m: cfg.data_unload_radius,
+                },
+                collider: crate::tickets::RegionSpec::Radius {
+                    load_m: cfg.collider_load_radius,
+                    unload_m: cfg.collider_unload_radius,
+                },
+                wake: crate::tickets::WakeSpec::Radius {
+                    load_m: cfg.awake_load_radius,
+                    unload_m: cfg.awake_unload_radius,
+                },
+                state: crate::tickets::TicketState::Active,
+                anchor: pos,
+            })
+            .collect()
+    }
+
     /// 测试清单 1:距离 35(32 < 35 < 48)中带:已载不卸、未载不装。
     /// 观察者取 chunk (0,0) 中心 (8,8);中带 chunk (3,0) 中心 (56,8) 水平距恰 48。
     #[test]
@@ -507,7 +673,14 @@ mod tests {
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mid = [ChunkPos::new(3, 0)];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d = c.plan(&obs, &mid, &[], &[], Tick::ZERO, wide_region());
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &mid,
+            &[],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
         assert!(
             !d.chunks_to_load.contains(&ChunkPos::new(3, 0))
                 && !d.chunks_to_unload.contains(&ChunkPos::new(3, 0)),
@@ -515,7 +688,7 @@ mod tests {
         );
         // 实体 25(24 < 25 ≤ 32)中带:醒不冻、冻不醒。
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[
@@ -532,7 +705,7 @@ mod tests {
         // 非退化对照:同拍近距离 chunk 会被装载((0,0) 距 0;次近 16m 组按
         // (x, z) 字典序取 (-1,0)),预算 2 截断。
         let mut c2 = ActivationController::new(ActivationConfig::default());
-        let d2 = c2.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        let d2 = c2.plan(&obs_tickets(&obs), &[], &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d2.chunks_to_load,
             vec![ChunkPos::new(0, 0), ChunkPos::new(-1, 0)]
@@ -548,7 +721,7 @@ mod tests {
         let far = [Vec3::new(1000.0, 0.0, 0.0)];
         let mut c = ActivationController::new(ActivationConfig::default());
         // 拍 0:近 → 装载(簿记 swap@0);(1,0) 距 0,(0,0) 距 16。
-        let d0 = c.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        let d0 = c.plan(&obs_tickets(&obs), &[], &[], &[], Tick::ZERO, wide_region());
         assert_eq!(
             d0.chunks_to_load,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -576,18 +749,39 @@ mod tests {
         let loaded_far: Vec<ChunkPos> = d0.chunks_to_load.iter().copied().chain(far_ring).collect();
         // 拍 1 / 179:卸载候选但冷却未过 → 不卸。
         assert!(
-            c.plan(&far, &loaded_far, &[], &[], Tick(1), wide_region())
-                .chunks_to_unload
-                .is_empty()
+            c.plan(
+                &obs_tickets(&far),
+                &loaded_far,
+                &[],
+                &[],
+                Tick(1),
+                wide_region()
+            )
+            .chunks_to_unload
+            .is_empty()
         );
         assert!(
-            c.plan(&far, &loaded_far, &[], &[], Tick(179), wide_region())
-                .chunks_to_unload
-                .is_empty(),
+            c.plan(
+                &obs_tickets(&far),
+                &loaded_far,
+                &[],
+                &[],
+                Tick(179),
+                wide_region()
+            )
+            .chunks_to_unload
+            .is_empty(),
             "179 拍仍在冷却窗内"
         );
         // 第 180 拍:冷却已过 → 卸载,按距离升序((1,0)@≈976 先于 (0,0)@≈992)。
-        let d = c.plan(&far, &loaded_far, &[], &[], Tick(180), wide_region());
+        let d = c.plan(
+            &obs_tickets(&far),
+            &loaded_far,
+            &[],
+            &[],
+            Tick(180),
+            wide_region(),
+        );
         assert_eq!(
             d.chunks_to_unload,
             vec![ChunkPos::new(1, 0), ChunkPos::new(0, 0)]
@@ -635,7 +829,14 @@ mod tests {
             })
             .chain(far)
             .collect();
-        let d = c.plan(&obs, &loaded1, &[], &[], Tick::ZERO, wide_region());
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &loaded1,
+            &[],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
         assert_eq!(
             d.chunks_to_load.len() + d.chunks_to_unload.len(),
             2,
@@ -656,7 +857,14 @@ mod tests {
             .filter(|cp| *cp != ChunkPos::new(0, 0))
             .chain(far)
             .collect();
-        let d2 = c2.plan(&obs, &loaded2, &[], &[], Tick::ZERO, wide_region());
+        let d2 = c2.plan(
+            &obs_tickets(&obs),
+            &loaded2,
+            &[],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
         assert_eq!(d2.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(
             d2.chunks_to_unload,
@@ -677,7 +885,7 @@ mod tests {
         let (e1, e2, e3) = (eid(1), eid(2), eid(3));
         // 拍 0:三只冻结、全部 ≤ 24 → 全醒(簿记 flip@0)。
         let d0 = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[
@@ -691,7 +899,7 @@ mod tests {
         assert_eq!(d0.entities_to_wake, vec![e1, e2, e3]);
         // 拍 1:3 醒 > 2 → 最远者(e3,距 20)立即冻结,不受冷却(flip@0 才过 1 拍)。
         let d1 = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[
@@ -722,7 +930,7 @@ mod tests {
         // `entity_last_flip` 驱动,首见即可冻;直接构造同拍双候选:
         // far(距 100 > 32)走滞回冻结,near(距 5,醒)留在醒表。
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[
@@ -745,7 +953,7 @@ mod tests {
             ..ActivationConfig::default()
         });
         let d2 = c2.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[(near, Vec3::new(5.0, 0.0, 0.0), false)],
@@ -764,7 +972,7 @@ mod tests {
             ..ActivationConfig::default()
         });
         let d3 = c3.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[
@@ -790,7 +998,7 @@ mod tests {
         // 边界:冻 @24 → 醒;醒 @32 → 不冻。
         let mut c = ActivationController::new(ActivationConfig::default());
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true)],
@@ -799,7 +1007,7 @@ mod tests {
         );
         assert_eq!(d.entities_to_wake, vec![eid(3)], "≤ 24 → 唤醒");
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[],
             &[],
             &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false)],
@@ -813,37 +1021,79 @@ mod tests {
         let e = eid(1);
         let near = (e, Vec3::new(20.0, 0.0, 0.0), true);
         let far = (e, Vec3::new(40.0, 0.0, 0.0), false);
-        let d = c.plan(&obs, &[], &[], &[near], Tick::ZERO, wide_region());
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[near],
+            Tick::ZERO,
+            wide_region(),
+        );
         assert_eq!(d.entities_to_wake, vec![e], "冻 @20(≤ 24)→ 唤醒(flip@0)");
         assert!(
-            c.plan(&obs, &[], &[], &[far], Tick(1), wide_region())
+            c.plan(&obs_tickets(&obs), &[], &[], &[far], Tick(1), wide_region())
                 .entities_to_freeze
                 .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[], &[far], Tick(179), wide_region())
-                .entities_to_freeze
-                .is_empty(),
+            c.plan(
+                &obs_tickets(&obs),
+                &[],
+                &[],
+                &[far],
+                Tick(179),
+                wide_region()
+            )
+            .entities_to_freeze
+            .is_empty(),
             "> 32 但 179 拍仍在冷却 → 不冻"
         );
-        let d = c.plan(&obs, &[], &[], &[far], Tick(180), wide_region());
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[far],
+            Tick(180),
+            wide_region(),
+        );
         assert_eq!(
             d.entities_to_freeze,
             vec![e],
             "> 32 且冷却已过 → 冻结(flip@180)"
         );
         assert!(
-            c.plan(&obs, &[], &[], &[near], Tick(181), wide_region())
-                .entities_to_wake
-                .is_empty()
+            c.plan(
+                &obs_tickets(&obs),
+                &[],
+                &[],
+                &[near],
+                Tick(181),
+                wide_region()
+            )
+            .entities_to_wake
+            .is_empty()
         );
         assert!(
-            c.plan(&obs, &[], &[], &[near], Tick(359), wide_region())
-                .entities_to_wake
-                .is_empty(),
+            c.plan(
+                &obs_tickets(&obs),
+                &[],
+                &[],
+                &[near],
+                Tick(359),
+                wide_region()
+            )
+            .entities_to_wake
+            .is_empty(),
             "回 ≤ 24 但 179 拍仍在冷却 → 不醒"
         );
-        let d = c.plan(&obs, &[], &[], &[near], Tick(360), wide_region());
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[near],
+            Tick(360),
+            wide_region(),
+        );
         assert_eq!(d.entities_to_wake, vec![e], "≤ 24 且冷却已过 → 唤醒");
     }
 
@@ -877,7 +1127,7 @@ mod tests {
         // 产出并入状态(① 由驱动装载、② 由 apply_activation 构建)。
         let mut collider_loaded: Vec<ChunkPos> = Vec::new();
         let d1 = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &loaded,
             &collider_loaded,
             &ents,
@@ -893,7 +1143,7 @@ mod tests {
         // ② 构建有积压(半径内未建 ① 多于 ② 预算)→ 逐拍续取(REQ-007 任务
         // 01 新语义:② 预算截断的候选下拍重提,直到建满/冷却)。
         let d2 = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &loaded,
             &collider_loaded,
             &ents,
@@ -910,50 +1160,82 @@ mod tests {
 
     /// R2:① 已该卸(> data_unload)但因冷却排队 → ② 不单独拆(随 ① 卸载
     /// 点同点拆,不提前);单独拆 ② 仅当 ① 仍被保留(data_unload ≥ 距离 >
-    /// collider_unload)。对照组:半径分层时环带 chunk 的 ② 照常单独拆。
+    /// R2(架构师验收指示:真实预算排队场景):① 预算 1 下多个卸载候选排队,
+    /// 排队者的 ② 不提前拆(随 ① 卸载点同点拆);合法单独拆路径照常工作。
+    /// 场景(② 卸 32 < ① 卸 48,① 预算 1、② 预算 2):
+    /// - A = (4,0) 距 40 ∈ (32,48]:② 单独拆、① 保留(合法路径);
+    /// - B = (6,0) 距 72 > 48:① 该卸(拍 0 采纳,预算 1);② 不单独拆
+    ///   (> 48,R2);
+    /// - C = (8,0) 距 104 > 48:① 该卸但预算尽 → 排队(不记簿记,下拍重提);
+    ///   ② 同样不提前拆。
+    ///
+    /// 拍 1(状态前移:A ② 已拆,B/C 仍载已建):B ① 卸载被冷却挡(采纳过
+    /// 即簿记,@0)→ C 重提(未采纳过,无簿记)——真实排队的续取语义;
+    /// B/C ② 依旧不单独拆。
     #[test]
     fn queued_unload_keeps_collider_intact() {
-        // (3,1) 距锚 (200,8) 为 144.9 > data_unload 48 → ① 该卸;
-        // ② 簿记 @0(刚拆过)未满冷却 → 卸载排队 → ② 不得进单独拆。
-        let obs = [Vec3::new(200.0, 0.0, 8.0)];
-        let mut c = ActivationController::new(ActivationConfig {
+        let cfg = ActivationConfig {
+            collider_unload_radius: 32.0,
             data_load_radius: 0.0,
+            data_budget_per_tick: 1,
+            collider_budget_per_tick: 2,
             ..ActivationConfig::default()
-        });
-        // 预热:拍 0 记 ① ② 簿记 @0(采纳卸载决策)。
+        };
+        let obs = [Vec3::new(32.0, 0.0, 8.0)];
+        let mut c = ActivationController::new(cfg);
+        let a = ChunkPos::new(4, 0); // 中心 (72,8) 距 40
+        let b = ChunkPos::new(6, 0); // 中心 (104,8) 距 72
+        let cc = ChunkPos::new(8, 0); // 中心 (136,8) 距 104
+        let loaded = [a, b, cc];
+        let collider = [a, b, cc];
+        // 拍 0。
         let d0 = c.plan(
-            &obs,
-            &[ChunkPos::new(3, 1)],
-            &[ChunkPos::new(3, 1)],
+            &cfg_tickets(&cfg, &obs),
+            &loaded,
+            &collider,
             &[],
             Tick::ZERO,
             wide_region(),
         );
-        assert_eq!(d0.chunks_to_unload, vec![ChunkPos::new(3, 1)]);
-        // 模拟"驱动未执行卸载"(决策被 ① 预算/冷却卡住的等价状态):拍 1
-        // 同输入重 plan——① 卸载被冷却挡下(排队),② 也被 ② 冷却挡下;
-        // 关键断言:**即便 ② 冷却已过**(拍 180),只要 ① 还在排队,② 不单独拆。
-        let mut c2 = ActivationController::new(ActivationConfig {
-            data_load_radius: 0.0,
-            ..ActivationConfig::default()
-        });
-        // 直接构造排队态:① 簿记 @0(c2.plan 拍 0 采纳卸载),② 簿记抹掉
-        // (不经控制器公开面,借 clone 后清理不可行——改为验证决策交集:
-        // 拍 180 时 ① 仍冷却(180 拍整 = 冷却恰好已过,会再产出)……
-        // 简化:用不同冷却窗的可观测行为锚定——单独拆条件现在含
-        // dist <= data_unload_radius,(3,1) 距 144.9 违反,任何拍都不可能
-        // 进 colliders_to_drop(除非同时进 chunks_to_unload)。
-        let d = c2.plan(
-            &obs,
-            &[ChunkPos::new(3, 1)],
-            &[ChunkPos::new(3, 1)],
+        assert_eq!(
+            d0.chunks_to_unload,
+            vec![b],
+            "① 预算 1:距 96 的 B 被采纳(卸载键 = 最近锚点距离升序);C 排队"
+        );
+        assert_eq!(
+            d0.colliders_to_drop,
+            vec![a],
+            "A 距 40 ∈ (32,48]:② 单独拆(合法路径,R2)"
+        );
+        assert!(
+            !d0.colliders_to_drop.contains(&b) && !d0.colliders_to_drop.contains(&cc),
+            "排队/该卸者的 ② 不提前拆(随 ① 卸载点同点拆)"
+        );
+        assert!(
+            d0.colliders_to_build.is_empty() && d0.colliders_pending_build.is_empty(),
+            "全部已建,无构建"
+        );
+        // 拍 1:状态前移(A 的 ② 已拆);驱动未执行 B 卸载(B 仍载)。
+        let d1 = c.plan(
+            &cfg_tickets(&cfg, &obs),
+            &loaded,
+            &[b, cc],
             &[],
-            Tick(180),
+            Tick(1),
             wide_region(),
         );
         assert!(
-            !d.colliders_to_drop.contains(&ChunkPos::new(3, 1)),
-            "距离 > data_unload 的 chunk 的 ② 永不单独拆(随 ① 卸载点拆,R2)"
+            !d1.chunks_to_unload.contains(&b),
+            "B ① 卸载冷却 @0(拍 0 采纳即簿记)→ 排队"
+        );
+        assert_eq!(
+            d1.chunks_to_unload,
+            vec![cc],
+            "C 未采纳过(无簿记)→ 真实排队续取"
+        );
+        assert!(
+            !d1.colliders_to_drop.contains(&b) && !d1.colliders_to_drop.contains(&cc),
+            "排队者的 ② 不提前拆(任何拍)"
         );
     }
 
@@ -989,16 +1271,30 @@ mod tests {
     #[test]
     fn i1_unload_data_and_collider_drop_disjoint() {
         let obs = [Vec3::new(200.0, 0.0, 8.0)]; // 远锚点:(3,1) ①② 双超半径
-        let mut c = ActivationController::new(ActivationConfig {
-            // 关 ① 装载候选:锚点邻域的近距装载候选会按距离升序占满 ① 预算,
-            // 卸载候选 (3,1)(距 144.9)永远轮空。半径归零后仅锚点所在 chunk
-            // (12,0)(距 0)仍是候选,预算 2 内装 1 卸 1,卸载决策可达。
+        // 关 ① 装载候选:锚点邻域的近距装载候选会按距离升序占满 ① 预算,
+        // 卸载候选 (3,1)(距 144.9)永远轮空。半径归零后仅锚点所在 chunk
+        // (12,0)(距 0)仍是候选,预算 2 内装 1 卸 1,卸载决策可达。
+        let cfg = ActivationConfig {
             data_load_radius: 0.0,
             ..ActivationConfig::default()
-        });
+        };
+        let mut c = ActivationController::new(cfg);
         let loaded = [ChunkPos::new(3, 1)];
         let collider = [ChunkPos::new(3, 1)];
-        let d = c.plan(&obs, &loaded, &collider, &[], Tick::ZERO, wide_region());
+        let d = c.plan(
+            &cfg_tickets(
+                &ActivationConfig {
+                    data_load_radius: 0.0,
+                    ..ActivationConfig::default()
+                },
+                &obs,
+            ),
+            &loaded,
+            &collider,
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
         assert_eq!(
             d.chunks_to_unload,
             vec![ChunkPos::new(3, 1)],
@@ -1027,7 +1323,14 @@ mod tests {
         let mut c = ActivationController::new(cfg);
         let loaded = [ChunkPos::new(4, 0)];
         let collider = [ChunkPos::new(4, 0)];
-        let d = c.plan(&obs2, &loaded, &collider, &[], Tick::ZERO, wide_region());
+        let d = c.plan(
+            &cfg_tickets(&cfg, &obs2),
+            &loaded,
+            &collider,
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
         let center_dist = {
             let dx = 72.0_f32 - 32.0;
             (dx * dx).sqrt()
@@ -1060,7 +1363,7 @@ mod tests {
         };
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mut c0 = ActivationController::new(cfg0);
-        let d = c0.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        let d = c0.plan(&obs_tickets(&obs), &[], &[], &[], Tick::ZERO, wide_region());
         assert!(d.chunks_to_load.is_empty(), "① 预算 0");
         assert!(d.colliders_to_build.is_empty(), "① 未载 → ② 不候选(前提)");
         assert!(d.colliders_pending_build.is_empty());
@@ -1074,7 +1377,7 @@ mod tests {
         };
         let mut c1 = ActivationController::new(cfg1);
         let d = c1.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[ChunkPos::new(-1, 0)],
             &[],
             &[],
@@ -1100,13 +1403,13 @@ mod tests {
         // 下拍:状态前移((0,0) 已载已建、(-1,0) 已载未建;关 ① 装载消额外
         // 候选);(-1,0) 首见 ② 可建(① 簿记与 ② 簿记独立)→ 单独构建产出
         // (被饿的单独构建下拍续取,机制同 ① 预算截断)。
-        let c2 = ActivationController::new(ActivationConfig {
+        let cfg2 = ActivationConfig {
             data_load_radius: 0.0,
             ..cfg1
-        });
-        let mut c2 = c2;
+        };
+        let mut c2 = ActivationController::new(cfg2);
         let d2 = c2.plan(
-            &obs,
+            &cfg_tickets(&cfg2, &obs),
             &[ChunkPos::new(-1, 0), ChunkPos::new(0, 0)],
             &[ChunkPos::new(0, 0)],
             &[],
@@ -1128,7 +1431,7 @@ mod tests {
     fn collider_pending_build_with_data_load() {
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mut c = ActivationController::new(ActivationConfig::default());
-        let d = c.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        let d = c.plan(&obs_tickets(&obs), &[], &[], &[], Tick::ZERO, wide_region());
         // ① 预算 2:距 0 的 (0,0) + 距 16 的 (-1,0)(候选排序距离升序)。
         assert_eq!(
             d.chunks_to_load,
@@ -1151,7 +1454,7 @@ mod tests {
         let mut c = ActivationController::new(ActivationConfig::default());
         // 拍 0:装载 (0,0)(pending)与已载 (-1,0) 单独构建,双双记 ② 簿记 @0。
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[ChunkPos::new(-1, 0)],
             &[],
             &[],
@@ -1180,7 +1483,7 @@ mod tests {
         // 装载+pending(首见 ② 可建,合法);**已决策过的 (0,0)/(0,-1) 不重复
         // 出现**(① ② 簿记 @0 双重挡下)——这就是"决策即簿记"的分档证据。
         let d = c.plan(
-            &obs,
+            &obs_tickets(&obs),
             &[
                 ChunkPos::new(-1, 0),
                 ChunkPos::new(0, 0),
