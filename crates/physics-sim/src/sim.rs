@@ -194,6 +194,11 @@ pub(crate) struct EntityRecord {
     /// 位移门滚动窗口:最近 21 个 translation(首尾距离 = 窗口位移)。
     /// 实体存在期间持续滚动;凝固/迁移重建后随实体重置为单点(细则 1)。
     pub(crate) window: VecDeque<Vec3>,
+    /// 被承载(§4.4.1:有实体支撑;K1 返修:分片只**记录**,冻结/唤醒决策
+    /// 单点在 plan)。生命周期段每拍刷新;随快照走。
+    pub(crate) carried: bool,
+    /// 静止(§4.4.2:slow_ticks 达标或睡眠;K1:plan 冻结前置的记录侧镜像)。
+    pub(crate) at_rest: bool,
 }
 
 /// 单分片模拟器(字段 crate 内可见:snapshot.rs 读写快照结构)。
@@ -748,11 +753,15 @@ impl ShardSim {
             self.drop_chunk_collider(cp);
         }
 
-        // tier③ 落实:施体类型切换。H2:被承载瞬态的冻结条目加**静止前置**
-        // (§4.4.2:静止 ∧ 被承载才冻结;运动中的被承载瞬态不冻结);唤醒
-        // 条目加**当前足迹 ② 前置**(缺 → 不唤醒,交由待地形状态机处理
-        // ——kinematic 待地形体在 ② 齐时由 apply_awaiting_terrain 恢复,
-        // 速度原样写回,语义等价"推迟唤醒"而非丢弃)。
+        // tier③ 落实:施体类型切换。H2/K1:被承载瞬态的冻结/唤醒**只来自
+        // plan 决策**(实体档按常驻规则滞回+冷却),落实在此:
+        // - 冻结条目:静止前置(§4.4.2:被承载但仍在运动不冻结);被承载
+        //   瞬态被冻结 → 产 Suspend(票不占区域);
+        // - 唤醒条目:当前足迹 ② 前置(缺 → 不唤醒,交由待地形状态机处理
+        //   ——kinematic 待地形体在 ② 齐时由 apply_awaiting_terrain 恢复,
+        //   速度原样写回,语义等价"推迟唤醒"而非丢弃);被承载瞬态被唤醒
+        //   → 仍被承载 → Paused(产 Pause;§4.4.2"唤醒仍被承载则 Paused"),
+        //   已脱离承载 → 产 Resume。
         for id in &decisions.entities_to_freeze {
             let (is_transient_carried, static_now) = {
                 let Some(rec) = self.entities.get(id) else {
@@ -768,11 +777,22 @@ impl ShardSim {
                 continue; // 被承载但仍在运动:不冻结(§4.4.2 静止前置)
             }
             self.freeze_entity(id);
+            if is_transient_carried {
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: *id,
+                    op: TicketOp::Suspend,
+                });
+            }
         }
         for id in &decisions.entities_to_wake {
             let Some(rec) = self.entities.get(id) else {
                 continue;
             };
+            let is_actor = rec.actor;
+            // K1:被承载瞬态的唤醒 ops 随 plan 决策产出。承载真值取**记录侧**
+            // (kinematic 体不在支撑判定输出里;冻结期间记录不刷新,冻结前的
+            // 承载状态即"仍被承载"的真值)。
+            let carried_now = !is_actor && rec.carried;
             // 唤醒前置:当前足迹 ∩ 区域 ② 齐(§4.9 共同规则 1;瞬态体)。
             if !rec.actor {
                 let pos = {
@@ -793,6 +813,18 @@ impl ShardSim {
             }
             let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
             body.set_body_type(RigidBodyType::Dynamic, true);
+            if !is_actor {
+                // K1:被承载瞬态的唤醒 ops 随 plan 决策产出(§4.4.2:唤醒
+                // 仍被承载 → Paused;脱离承载 → Resume)。
+                let op = if carried_now {
+                    TicketOp::Pause
+                } else {
+                    TicketOp::Resume
+                };
+                self.outbox
+                    .ticket_ops
+                    .push(TicketOpRecord { entity: *id, op });
+            }
         }
 
         // ---- 待地形(REQ-007 §4.6;任务 03/提交 B;S4 I2 完整执行)----
@@ -1004,17 +1036,22 @@ impl ShardSim {
         out
     }
 
-    /// 承载判定与 ticket_ops 产出(§4.3.4/§4.4.2;G1 返修):对每个**瞬态体**
-    /// 按"实体支撑 × 静止 × 唤醒范围"产出状态操作(调度器拍末按键序应用,
-    /// N 拍产生 N+1 生效;幂等由 TicketTable 保证,重复产出无副作用):
-    /// - 被承载(有实体支撑)→ Pause;
-    /// - 被承载 ∧ 静止 ∧ 不在任何唤醒范围 → 冻结 + Suspend(票不占区域,
-    ///   §4.4.2"被承载的瞬态体按常驻规则冻结");
-    /// - 被承载的冻结体进入唤醒范围 → Resume + 唤醒;
-    /// - 不被承载且醒着 → Unpause(幂等;承载结束)。
+    /// 承载判定与记录(K1 返修):分片只做两件事——
+    /// 1. **记录**每个瞬态体的 `carried`(有实体支撑,§4.4.1)与 `at_rest`
+    ///    (slow_ticks 达标或睡眠)到实体档;
+    /// 2. 在 `carried` **发生变化**时产出 Pause(进入承载)/ Unpause(脱离
+    ///    承载)。幂等由 TicketTable 保证;变化沿才产出(无每拍重发)。
+    ///
+    /// 冻结 + Suspend、唤醒 + Resume **只能来自 plan 的决策**(§14-1 单点;
+    /// `apply_activation` 落实时产出对应 ops,受 D17 开关约束——本函数不判
+    /// 唤醒范围、不切刚体类型)。
     fn emit_carry_ticket_ops(&mut self) {
+        // D17:未启用 → 不记录、不产出(§9-7:未启用行为与 8702670 一致;
+        // 叠放场景不得发生任何冻结/票操作)。
+        if self.observed.is_none() {
+            return;
+        }
         let supports = self.evaluate_supports();
-        let wake_centers: Vec<Vec3> = self.observed.clone().unwrap_or_default();
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         for id in ids {
             let Some(rec) = self.entities.get(&id) else {
@@ -1023,42 +1060,30 @@ impl ShardSim {
             if rec.actor {
                 continue; // 常驻票 04
             }
-            let Some(body) = self.phys.bodies.get(rec.handle) else {
+            let body = self.phys.bodies.get(rec.handle);
+            let Some(body) = body else {
                 continue;
             };
+            // kinematic(冻结/待地形)不重判承载:支撑判定只覆盖醒着体,
+            // 冻结体的物理状态不变(决策面只有 plan 的唤醒),记录保持——
+            // 否则冻结被承载体会被误判"脱离承载"而错误 Unpause(票应保持
+            // Suspended 直到 plan 唤醒落实)。
+            if body.is_kinematic() {
+                continue;
+            }
             let carried = carried_of(&supports, &id);
-            let pos = conv::rapier_to_vec3(body.translation());
-            let in_any_wake = wake_centers
-                .iter()
-                .any(|c| (*c - pos).length() <= self.cfg.activation.awake_load_radius);
-            let kinematic = body.is_kinematic();
-            let static_now =
+            let at_rest =
                 rec.slow_ticks >= self.cfg.solidify.consecutive_ticks || body.is_sleeping();
-            if carried && !kinematic {
-                // 被承载:暂停计时;静止 ∧ 不在唤醒范围 → 冻结 + Suspend。
+            let was_carried = rec.carried;
+            let rec = self.entities.get_mut(&id).expect("存在");
+            rec.carried = carried;
+            rec.at_rest = at_rest;
+            if carried && !was_carried {
                 self.outbox.ticket_ops.push(TicketOpRecord {
                     entity: id,
                     op: TicketOp::Pause,
                 });
-                if static_now && !in_any_wake {
-                    self.freeze_entity(&id);
-                    self.outbox.ticket_ops.push(TicketOpRecord {
-                        entity: id,
-                        op: TicketOp::Suspend,
-                    });
-                }
-            } else if carried && kinematic {
-                // 被承载的冻结体:唤醒范围到 → Resume + 唤醒(整组原子在 05)。
-                if in_any_wake {
-                    self.outbox.ticket_ops.push(TicketOpRecord {
-                        entity: id,
-                        op: TicketOp::Resume,
-                    });
-                    let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
-                    body.set_body_type(RigidBodyType::Dynamic, true);
-                }
-            } else if !carried && !kinematic {
-                // 不被承载且醒着:Unpause(承载结束;已 Active 时幂等无操作)。
+            } else if !carried && was_carried {
                 self.outbox.ticket_ops.push(TicketOpRecord {
                     entity: id,
                     op: TicketOp::Unpause,
@@ -1195,6 +1220,26 @@ impl ShardSim {
     /// 激活配置(测试/注入用)。
     pub fn activation_config(&self) -> &ActivationConfig {
         &self.cfg.activation
+    }
+
+    /// 实体是否处于待地形(K3 只读观测面:ac_t6 断言"前视缺失不进待地形"
+    /// 用;快照/遥测同源判据)。
+    pub fn is_awaiting_terrain(&self, id: EntityId) -> bool {
+        matches!(
+            self.locomotion.get(&id),
+            Some(LocomotionState::AwaitingTerrain { .. })
+        )
+    }
+
+    /// 实体是否被冻结(K3 只读观测面:kinematic = 滞回冻结或待地形;与
+    /// `is_awaiting_terrain` 联用区分两者)。
+    pub fn is_frozen(&self, id: EntityId) -> bool {
+        self.entities.get(&id).is_some_and(|rec| {
+            self.phys
+                .bodies
+                .get(rec.handle)
+                .is_some_and(|b| b.is_kinematic())
+        })
     }
 
     // ---- 内部 ----
@@ -1352,6 +1397,8 @@ impl ShardSim {
                 actor,
                 source,
                 window: VecDeque::new(),
+                carried: false,
+                at_rest: false,
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
@@ -2762,6 +2809,109 @@ mod tests {
         );
     }
 
+    /// K1:承载/静止记录——lifecycle 把 carried/at_rest 写进实体档;变化沿
+    /// 才产 Pause(无每拍重发)。Unpause 沿 = 脱离承载(carrier 移除)。
+    #[test]
+    fn carry_record_and_edge_only_ops() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.displacement_gate_m = 0.0;
+        cfg.activation.cooldown_ticks = 0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let carrier = entity(1);
+        let cargo = entity(2);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+            spawn_input(3, cargo, Vec3::new(8.0, 1.5, 8.0)),
+        ]);
+        s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        let _ = s.take_outbox();
+        for _ in 0..5 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        let rec = s.entities.get(&cargo).expect("存在");
+        assert!(rec.carried, "被承载记录(实体档)");
+        // 变化沿只发一次:再跑数拍无新 Pause(记录未变化)。
+        let first_ops = s.take_outbox().ticket_ops;
+        assert_eq!(
+            first_ops
+                .iter()
+                .filter(|o| o.entity == cargo && o.op == TicketOp::Pause)
+                .count(),
+            1,
+            "首拍恰一个 Pause 沿"
+        );
+        s.run_transient_lifecycle();
+        let pause_count = s
+            .outbox
+            .ticket_ops
+            .iter()
+            .filter(|o| o.entity == cargo && o.op == TicketOp::Pause)
+            .count();
+        assert_eq!(pause_count, 0, "无变化沿 → 无重复 Pause(边沿触发)");
+        // 脱离承载:carrier 移除 → cargo 下落 → carried 翻 false → Unpause 沿。
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 4,
+            payload: InputPayload::Command(SimCommand::RemoveEntity { entity: carrier }),
+        }]);
+        for _ in 0..5 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == cargo && o.op == TicketOp::Unpause),
+            "脱离承载变化沿 → Unpause"
+        );
+        assert!(!s.entities.get(&cargo).expect("存在").carried);
+    }
+
+    /// K1(纪律 12):**未启用模式(D17)叠放用例**——瞬态体静止压在另一
+    /// 实体上,从未激活刷新(无观察者):不冻结、不产任何票操作(§9-7:
+    /// 未启用行为与 8702670 一致;旧实现在 lifecycle 里自做冻结决策,未启用
+    /// 也会把叠放瞬态冻结,本用例即红)。
+    #[test]
+    fn disabled_mode_stacked_transient_never_frozen() {
+        let mut s = sim(0, 0);
+        s.cfg.solidify.displacement_gate_m = 0.0;
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let carrier = entity(1);
+        let cargo = entity(2);
+        s.apply_prefix(&[
+            spawn_input(1, carrier, Vec3::new(8.0, 0.5, 8.0)),
+            mark_actor_input(2, carrier, true),
+            spawn_input(3, cargo, Vec3::new(8.0, 1.5, 8.0)),
+        ]);
+        // 未启用:绝不调 apply_activation(从未注册观察者)。长程静止:
+        for _ in 0..60 {
+            s.step();
+            s.run_transient_lifecycle();
+        }
+        let kine = {
+            let rec = s
+                .entities
+                .get(&cargo)
+                .expect("叠放瞬态存活(未启用无虚空/落地)");
+            s.phys
+                .bodies
+                .get(rec.handle)
+                .expect("handle 有效")
+                .is_kinematic()
+        };
+        assert!(!kine, "未启用模式:被承载静止瞬态不被冻结(§9-7/D17)");
+        assert!(
+            s.outbox.ticket_ops.is_empty(),
+            "未启用模式:无任何票操作产出(D17;实得 {:?})",
+            s.outbox.ticket_ops
+        );
+    }
+
     /// 任务书测试 `sim::over_budget_transient_forced_landing`(T8/§9-2):
     /// 预算超限瞬态 → 强制落地(非冻结)。
     #[test]
@@ -2985,12 +3135,17 @@ mod tests {
         );
     }
 
-    /// 任务书测试 `sim::carried_ticket_pause_suspend_resume`(T9,G1):
-    /// 承载产出 Pause → 静止冻结 Suspend。
+    /// 任务书测试 `sim::carried_ticket_pause_suspend_resume`(T9,G1/K1):
+    /// 承载变化沿产出 Pause → plan 决策(常驻规则滞回)落实 → 静止被承载
+    /// 冻结 + Suspend。走 `apply_activation` 生产入口(冻结决策单点在 plan)。
     #[test]
     fn carried_ticket_pause_suspend_resume() {
-        let mut s = sim(0, 0);
-        s.cfg.solidify.displacement_gate_m = 0.0;
+        // 冷却 0:滞回翻转当拍落实(测试焦点 = 决策点归属,非冷却语义——
+        // 冷却由滞回专项测试覆盖)。配置必须在控制器构造前注入(new 克隆)。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.displacement_gate_m = 0.0;
+        cfg.activation.cooldown_ticks = 0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
         let carrier = entity(1);
         let cargo = entity(2);
@@ -2999,6 +3154,12 @@ mod tests {
             mark_actor_input(2, carrier, true),
             spawn_input(3, cargo, Vec3::new(8.0, 1.5, 8.0)),
         ]);
+        // 启用(D17):一次激活刷新注册观察者(远锚:唤醒范围外;承载记录
+        // 与 ops 产出都在启用模式才发生)。首个激活拍里实体刚 spawn 不满
+        // 静止判据,carrier(常驻)先冻结;cargo 被承载不满足滞回冻结条件
+        // (记录 carried 尚未建立?——emit 在 step 末,此拍 fresh)。
+        s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        let _ = s.take_outbox();
         for _ in 0..3 {
             s.step();
         }
@@ -3008,24 +3169,60 @@ mod tests {
                 .ticket_ops
                 .iter()
                 .any(|o| o.entity == cargo && o.op == TicketOp::Pause),
-            "被承载 → Pause 产出(G1)"
+            "被承载变化沿 → Pause 产出(K1)"
         );
-        // 静止(slow_ticks 达标)∧ 不在唤醒范围 → Suspend + 冻结。
-        for _ in 0..25 {
+        // 静止达标(慢速计数 20 拍;窗口继续滚动)后**远锚**激活刷新:cargo
+        // (被承载瞬态,实体档按常驻规则)在所有唤醒中心之外 → 滞回出区冻结
+        // 条目 + 静止前置通过 → plan 冻结落实 + Suspend(决策单点在 plan)。
+        let _ = s.take_outbox();
+        for _ in 0..40 {
             s.step();
         }
         s.run_transient_lifecycle();
+        let _ = s.take_outbox();
+        s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        let frozen = {
+            let rec = s.entities.get(&cargo).expect("存在");
+            s.phys
+                .bodies
+                .get(rec.handle)
+                .expect("handle 有效")
+                .is_kinematic()
+        };
+        assert!(frozen, "被承载 ∧ 静止 ∧ 出唤醒范围 → plan 冻结落实");
         assert!(
             s.outbox
                 .ticket_ops
                 .iter()
                 .any(|o| o.entity == cargo && o.op == TicketOp::Suspend),
-            "被承载 ∧ 静止 ∧ 不在唤醒范围 → Suspend(G1)"
+            "冻结落实 → Suspend 产出(K1:决策单点在 plan)"
         );
         assert!(
             s.entity_state(cargo)
                 .is_some_and(|st| st.linvel == Vec3::ZERO),
             "Suspend:被承载瞬态按常驻规则冻结"
+        );
+        // 唤醒段(K1):观察者移近唤醒范围 → plan 唤醒条目 → 足迹 ② 齐 →
+        // 切回 Dynamic;仍被承载 → 产 Pause(§4.4.2"唤醒仍被承载则 Paused"
+        // ——单 op 直达终态:同拍 Resume+Pause 会被 §14-6 键序
+        // (Pause < Resume)翻成 Active,等价终态必须单 op)。
+        let _ = s.take_outbox();
+        s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        let awake = {
+            let rec = s.entities.get(&cargo).expect("存在");
+            !s.phys
+                .bodies
+                .get(rec.handle)
+                .expect("handle 有效")
+                .is_kinematic()
+        };
+        assert!(awake, "入唤醒范围 → plan 唤醒落实(冷却 0)");
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == cargo && o.op == TicketOp::Pause),
+            "唤醒仍被承载 → Pause(终态 Paused,§4.4.2)"
         );
     }
 

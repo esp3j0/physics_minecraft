@@ -95,6 +95,9 @@ struct SnapshotEntityRecord {
     /// REQ-006:外部 spawn 来源(玩家) / 服务端 None。
     source: Option<messaging::InputSource>,
     window: std::collections::VecDeque<types::glam::Vec3>,
+    /// 被承载/静止标志(K1:分片记录侧;随快照走)。
+    carried: bool,
+    at_rest: bool,
 }
 
 impl ShardSim {
@@ -119,6 +122,8 @@ impl ShardSim {
                             actor: rec.actor,
                             source: rec.source,
                             window: rec.window.clone(),
+                            carried: rec.carried,
+                            at_rest: rec.at_rest,
                         },
                     )
                 })
@@ -161,6 +166,8 @@ impl ShardSim {
                         actor: rec.actor,
                         source: rec.source,
                         window: rec.window,
+                        carried: rec.carried,
+                        at_rest: rec.at_rest,
                     },
                 )
             })

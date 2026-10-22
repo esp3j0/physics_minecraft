@@ -739,6 +739,20 @@ impl Scheduler {
             .is_some_and(|sim| sim.has_collider(pos))
     }
 
+    /// 实体是否处于待地形(K3 只读观测面;分片未注册/实体不在 → false)。
+    pub fn is_awaiting_terrain(&self, shard: ShardId, entity: EntityId) -> bool {
+        self.sims
+            .get(&shard)
+            .is_some_and(|sim| sim.is_awaiting_terrain(entity))
+    }
+
+    /// 实体是否被冻结(K3 只读观测面;与 is_awaiting_terrain 联用区分)。
+    pub fn is_frozen(&self, shard: ShardId, entity: EntityId) -> bool {
+        self.sims
+            .get(&shard)
+            .is_some_and(|sim| sim.is_frozen(entity))
+    }
+
     /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
     /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
     /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内
@@ -1584,6 +1598,11 @@ impl Scheduler {
         //   向实体当前 owner 分片投强制落地指令(分片 API 直投;在途实体由
         //   ownership 切换后目的分片在下一拍到期扫描中重收,claim 前不执行)。
         //   Paused/Suspended 时钟停走(承载豁免:被承载不强制落地)。
+        //   **不 End**(K2 返修):强制落地在下一拍生命周期段才执行,中心柱
+        //   ① 缺时继续推迟;这段窗口里实体活着,必须仍持票(足迹装载请求
+        //   不断、I3"每个存活瞬态体恰持一票"不破)。到期后每拍重复投指令
+        //   无害(分片侧 forced_pending 幂等);票据由终结判定在实体真正
+        //   消失时 End。
         self.tickets.advance_clocks();
         for key in self.tickets.expired() {
             match key.0 {
@@ -1593,14 +1612,11 @@ impl Scheduler {
                         if let Some(sim) = self.sims.get_mut(&owner.shard) {
                             sim.apply_forced_landing_directive(e);
                         }
-                        // End(到期票终结;幂等,若分片未注册由下拍到齐后重投?
-                        // —— 票已 End 不再出现在 expired,指令在分片快照
-                        // forced_pending 中随档;分片 despawn 前必空片 = 实体
-                        // 不在 = 指令随实体终结作废。)
-                        self.tickets.end(key);
+                        // owner 分片未注册(卸载中):指令下一拍重投
+                        // (expired() 恒真,直到实体终结或分片回来)。
                     } else {
-                        // 在途(ownership 悬空):不 End、不投——下一拍到齐
-                        // 后重扫 expired 再投(active_ticks 已 ≥ limit 恒真)。
+                        // 在途(ownership 悬空):不投——claim 后下一拍
+                        // 到期扫描再投(active_ticks 已 ≥ limit 恒真)。
                     }
                 }
                 physics_sim::tickets::TicketHolder::Observer(_) => {}
@@ -2685,41 +2701,6 @@ mod tests {
         sched.shutdown();
     }
 
-    /// 任务书测试 `shard/scheduler::solidify_end_vs_migrate_keep`
-    /// (AC-T19 前半,提前落地):同拍凝固 despawn → End;迁移 despawn → 保留。
-    #[test]
-    fn solidify_end_vs_migrate_keep() {
-        use physics_sim::tickets::{TicketHolder, TicketKind};
-        let e = EntityId::from_parts(1, 1);
-        let mut sched = Scheduler::new(sched_cfg(2));
-        // 凝固 despawn:despawned ∧ ¬迁移 ∧ ¬respawn → End。
-        spawn_sim_with(
-            &mut sched,
-            0,
-            0,
-            e,
-            types::glam::Vec3::new(8.0, 3.0, 8.0),
-            false,
-        );
-        sched.submit_observer(observer_input(
-            1,
-            0,
-            Tick(0),
-            types::glam::Vec3::new(8.0, 3.0, 8.0),
-        ));
-        sched.tick();
-        let key = (TicketHolder::Entity(e), TicketKind::TransientMotion);
-        assert!(sched.ticket_table().get(key).is_some());
-        // 模拟凝固 despawn(直接构造 outbox 语义:实体消失且无迁移信封)——
-        // 由 sim 凝固路径产出;此处验证调度器终结判定函数:从 sim 表移除实体
-        // (模拟已凝固),下一拍 sync 后 despawned 判定 → End。
-        // 简化实证:直接 End + 断言幂等(路径被 sim 凝固测试 +
-        // migration 分支覆盖)。
-        sched.end_entity_tickets(e);
-        assert!(sched.ticket_table().get(key).is_none(), "凝固 → End");
-        sched.shutdown();
-    }
-
     // ==== REQ-007 任务 03 第二轮返修(H1/H2:经生产 tick 的测试)====
 
     /// 带 actor 的实体 + 观察者启用(生产路径测试公共布景)。
@@ -2849,6 +2830,295 @@ mod tests {
         assert!(
             sched.entity_state(shard_id(0, 0), e).is_none(),
             "强制落地经生产 tick 执行(H1)"
+        );
+        sched.shutdown();
+    }
+
+    /// K3-1(纪律 11/12):**阻塞优先真断言**(D15/AC-T5 排序面)——② 预算 1:
+    /// 同拍有"待地形实体的阻塞请求 chunk X(距观察者远)"与"观察者普通装载
+    /// 候选 Y(更近)";断言本拍 ① 决策选 X 而非 Y(排序键阻塞在前;旧空壳
+    /// 在"不选 X"时不会红,本断言会)。Scheduler::tick 生产路径驱动。
+    #[test]
+    fn k3_blocked_request_beats_nearer_candidate() {
+        use types::glam::Vec3;
+        let e = EntityId::from_parts(1, 1);
+        // ① 预算 1(本拍只够装一个);冷却 0:候选每拍重现(非退化)。
+        let mut cfg = sched_cfg(2);
+        cfg.activation.data_budget_per_tick = 1;
+        cfg.activation.collider_budget_per_tick = 1;
+        cfg.activation.cooldown_ticks = 0;
+        let mut sched = Scheduler::new(cfg);
+        // 分片 (0,0):预载 chunk (0,0);观察者锚 (24,·,8) = chunk (1,0) 中心
+        // → Y = (1,0) 距锚 0(普通候选,最近);X = (2,0) 距锚 16 m(亦在
+        // 32 m 装载覆盖内;实体在 X 柱上,足迹缺 → 待地形 → 阻塞请求)。
+        let mut sim0 = {
+            let mut c = ShardSimConfig::new(shard_id(0, 0));
+            c.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            ShardSim::new(c, Box::new(SimpleRegistry::builtin()))
+        };
+        let mut ground = voxel::Chunk::air();
+        for gx in 0..voxel::CHUNK_X {
+            for gz in 0..voxel::CHUNK_Z {
+                ground.set(gx, 64, gz, types::BlockId(1));
+            }
+        }
+        sim0.load_chunk(types::ChunkPos::new(0, 0), ground);
+        sim0.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: types::EntityState {
+                    translation: Vec3::new(40.0, 3.0, 8.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }]);
+        sched.register(sim0);
+        sched.submit_observer(observer_input(1, 0, Tick(0), Vec3::new(24.0, 0.0, 8.0)));
+        // 拍 1:激活刷新(X 不在 blocked——实体本拍才进待地形)→ 观察者候选
+        // {Y=(1,0) 近,(0,1) 等} 抢预算 → 实体进待地形(update_awaiting_terrain
+        // 在 apply_activation 末)。此拍喂 Y(若被决策)。
+        sched.tick();
+        let decisions = sched.take_activation_requests();
+        if let Some((shard, d)) = decisions.iter().find(|(s, _)| *s == shard_id(0, 0)) {
+            let _ = shard;
+            for pos in &d.chunks_to_load {
+                if *pos == types::ChunkPos::new(1, 0) {
+                    let mut ch = voxel::Chunk::air();
+                    for gx in 0..voxel::CHUNK_X {
+                        for gz in 0..voxel::CHUNK_Z {
+                            ch.set(gx, 64, gz, types::BlockId(1));
+                        }
+                    }
+                    sched.apply_chunk_load(shard_id(0, 0), types::ChunkPos::new(1, 0), ch);
+                }
+            }
+        }
+        // 拍 2 起blocked 含 X(待地形已建立):预算 1 下阻塞 X 必胜近处候选。
+        sched.tick();
+        let decisions = sched.take_activation_requests();
+        let d2 = decisions
+            .iter()
+            .find(|(shard, _)| *shard == shard_id(0, 0))
+            .map(|(_, d)| d)
+            .expect("分片 (0,0) 有激活决策");
+        assert!(
+            !sched.is_awaiting_terrain(shard_id(0, 0), e) || {
+                // 待地形确已建立(前置非退化)。
+                sched.is_awaiting_terrain(shard_id(0, 0), e)
+            },
+            "前置:实体待地形(阻塞来源)"
+        );
+        assert!(
+            sched.is_awaiting_terrain(shard_id(0, 0), e),
+            "前置非退化:实体已进待地形(足迹缺)"
+        );
+        assert!(
+            d2.chunks_to_load.contains(&types::ChunkPos::new(2, 0)),
+            "阻塞请求 X(2,0) 必在本拍决策(排序键阻塞在前,免冷却;实得 load={:?})",
+            d2.chunks_to_load
+        );
+        assert!(
+            !d2.chunks_to_load.contains(&types::ChunkPos::new(1, 0)),
+            "预算 1:更近的普通候选 Y 落选(阻塞优先,D15;实得 load={:?})",
+            d2.chunks_to_load
+        );
+        sched.shutdown();
+    }
+
+    /// K3-3(纪律 11/12):**凝固 vs 迁移同拍对照**(AC-T19 前半)——同一拍
+    /// 内一个瞬态体凝固 despawn、另一个跨片迁移 despawn;tick 后断言前者的
+    /// 票被终结判定 End、后者的票保留且时钟连续。生产路径(sim 真凝固桥/真
+    /// 迁移检测产出,调度器 tick 消费);旧写法直接调 end_entity_tickets 是
+    /// 同义反复,功能失效时不变红——本测试在"终结判定误伤迁移票"或"漏
+    /// End 凝固票"时都会红。
+    #[test]
+    fn solidify_end_vs_migrate_keep() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        use types::glam::Vec3;
+        let (e_solid, e_mig) = (EntityId::from_parts(1, 1), EntityId::from_parts(1, 2));
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // 单分片:实心地面(凝固桥开);位移门关(与
+        // `transient_lands_solidifies` 同款可行布景:静止计数直通凝固);
+        // e_solid 地面上方 1mm 出生(落稳 → 凝固),e_mig 高速东移出本体区
+        // → 迁移。飞行走廊(chunk 6/7)预载 ①②(否则启用模式待地形把横移
+        // 实体悬停——待地形语义正确,非本测试考察面);margin 关(区域 =
+        // 仅 core):足迹伸进邻片 chunk (8,0)(未载)不判缺,出界即迁移。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.displacement_gate_m = 0.0;
+        cfg.activation.region_margin_chunks = 0;
+        let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let mut ground = voxel::Chunk::air();
+        for gx in 0..voxel::CHUNK_X {
+            for gz in 0..voxel::CHUNK_Z {
+                ground.set(gx, 64, gz, types::BlockId(1));
+            }
+        }
+        for cpx in [0, 6, 7] {
+            sim0.load_chunk(types::ChunkPos::new(cpx, 0), ground.clone());
+        }
+        sim0.apply_prefix(&[
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: e_solid,
+                    state: types::EntityState {
+                        translation: Vec3::new(8.0, 0.5001, 8.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: InputSource::SCHEDULER,
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: e_mig,
+                    state: types::EntityState {
+                        translation: Vec3::new(100.0, 3.0, 8.0),
+                        linvel: Vec3::new(60.0, 0.0, 0.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+        ]);
+        sched.register(sim0);
+        sched.register(sim(1, 0)); // 迁移目的分片
+        sched.submit_observer(observer_input(1, 0, Tick(0), Vec3::new(8.0, 0.0, 8.0)));
+        sched.tick(); // 启用 + 双票签发
+        let key_s = (TicketHolder::Entity(e_solid), TicketKind::TransientMotion);
+        let key_m = (TicketHolder::Entity(e_mig), TicketKind::TransientMotion);
+        assert!(
+            sched.ticket_table().get(key_s).is_some() && sched.ticket_table().get(key_m).is_some()
+        );
+        // 推进 45 拍:e_mig(x=100 距本体区边界 36 m,60 m/s → 1 m/拍)在
+        // ~36 拍出本体区 → 迁移;e_solid 落稳后 20 拍凝固(位移门关,静止
+        // 计数直通)。两事件近拍发生,despawned 逐实体判定(migrated 集合含
+        // e_mig → 豁免;e_solid 无豁免 → End)。
+        for _ in 0..45 {
+            sched.tick();
+        }
+        // 凝固:实体消失 + 落块;票 End(终结判定)。
+        assert!(
+            sched.entity_state(shard_id(0, 0), e_solid).is_none(),
+            "前置非退化:e_solid 已凝固(实体消失)"
+        );
+        assert!(
+            sched.ticket_table().get(key_s).is_none(),
+            "凝固 despawn → 终结判定 End(生产路径)"
+        );
+        // 迁移:实体到了目的分片(或信封在途);票保留、时钟连续。
+        let migrated_seen = sched.entity_state(shard_id(1, 0), e_mig).is_some();
+        let key_m_now = sched.ticket_table().get(key_m);
+        assert!(migrated_seen, "前置非退化:e_mig 已跨片迁移(目的分片可见)");
+        let clock = key_m_now
+            .map(|t| t.clock.active_ticks)
+            .expect("迁移 despawn → 票保留(终结判定豁免在途迁移)");
+        assert!(
+            clock > 0,
+            "迁移票时钟连续(active_ticks = {clock},签发起持续计数)"
+        );
+        sched.shutdown();
+    }
+
+    /// K2(纪律 11/12):到期**只投指令不 End**——落地被推迟期间(中心柱
+    /// ① 缺)实体仍持票(足迹装载请求不断、I3 不破);票据由终结判定在实体
+    /// 真正消失时 End。生产 tick 驱动;断言在"不投指令/到期即 End"的旧行为
+    /// 下变红(旧行为票没了 = 红线 1;实体被落走 = 红线 2)。
+    #[test]
+    fn k2_expired_ticket_held_while_landing_deferred() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // sim 只有 (0,0) 一块实心地面;实体放到 chunk (2,0) 的柱上(① 缺,
+        // 分片未载该 chunk)。注意:启用的调度器会按票足迹签发装载请求,而
+        // 本测试不经 worker 编排(不喂 chunk)→ 柱持续缺 → 落地持续推迟。
+        spawn_sim_with_obs(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(40.0, 3.0, 8.0), // chunk (2,0):无 ①
+            false,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(500.0, 0.0, 500.0), // 远观察者:启用但不保活碰撞
+        ));
+        sched.tick(); // 启用 + claim 签发
+        let key = (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        // 换 limit=2 的票(锚到期链路;生产 deadline 走配置)。
+        sched.tickets.end(key);
+        sched.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1,
+                data: physics_sim::tickets::RegionSpec::Footprint {
+                    lookahead_ticks: 30,
+                    max_lookahead_chunks: 4,
+                },
+                collider: physics_sim::tickets::RegionSpec::None,
+                wake: physics_sim::tickets::WakeSpec::SelfOnly,
+                clock: physics_sim::tickets::TicketClock {
+                    issued_at: Tick(1),
+                    active_ticks: 0,
+                    limit: Some(2),
+                    starts_at: None,
+                },
+                state: physics_sim::tickets::TicketState::Active,
+                center: None,
+            },
+            Tick(1),
+        );
+        // 推进 6 拍:时钟早已 ≥ limit;柱 ① 缺 → 分片落不了地。
+        for _ in 0..6 {
+            sched.tick();
+        }
+        // 实体仍活着(落地被推迟,非旧"到期即落/虚空移除")。
+        assert!(
+            sched.entity_state(shard_id(0, 0), e).is_some(),
+            "K2:落地推迟期间实体仍存活(柱 ① 缺,推迟不执行)"
+        );
+        // 票仍在(K2 核心:到期只投指令不 End;旧行为 = 到期即 End,此处红)。
+        let held = sched
+            .ticket_table()
+            .get(key)
+            .expect("K2:落地推迟期间仍持票(I3/足迹装载请求不断)");
+        assert!(
+            held.clock.active_ticks >= 2,
+            "到期后时钟继续计数(每拍重复投指令;active_ticks = {})",
+            held.clock.active_ticks
+        );
+        // 收口:喂上柱 ①(模拟编排装载)→ 下拍落地执行 → 终结判定 End。
+        let mut ch = voxel::Chunk::air();
+        for gx in 0..voxel::CHUNK_X {
+            for gz in 0..voxel::CHUNK_Z {
+                ch.set(gx, 64, gz, types::BlockId(1));
+            }
+        }
+        sched.apply_chunk_load(shard_id(0, 0), types::ChunkPos::new(2, 0), ch);
+        for _ in 0..3 {
+            sched.tick();
+        }
+        assert!(
+            sched.entity_state(shard_id(0, 0), e).is_none(),
+            "柱 ① 到场 → 强制落地执行(实体消失)"
+        );
+        assert!(
+            sched.ticket_table().get(key).is_none(),
+            "落地执行 → 终结判定 End(K2:End 单点在终结判定)"
         );
         sched.shutdown();
     }

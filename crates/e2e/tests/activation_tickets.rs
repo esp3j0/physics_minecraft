@@ -472,7 +472,9 @@ fn ac_t5_awaiting_terrain_and_block_priority() {
 }
 
 /// 任务书测试 `e2e::ac_t6_lookahead_not_awaiting`(T6):前视 chunk 缺失、
-/// 当前足迹就绪 → 不待地形(前视只影响装载,不参与 I2)。
+/// 当前足迹就绪 → **始终不进入待地形**(K3 真断言:逐拍查
+/// `is_awaiting_terrain`;旧空壳断言 `!snapshots.is_empty()` 在实体被错误
+/// 待地形悬停时不会变红,本断言会)。前视只影响装载请求,不参与 I2。
 #[test]
 fn ac_t6_lookahead_not_awaiting() {
     let config = Config::default();
@@ -484,7 +486,8 @@ fn ac_t6_lookahead_not_awaiting() {
     let (provider, mut new_sim) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
     session.register(new_sim(shard_id(0, 0)));
-    // 区域票盖住出发点(当前足迹就绪);高速东移 → 前视 chunk 在票外/未载。
+    // 区域票盖住出发点(当前足迹就绪);高速东移 → 前视 chunk 跨出票覆盖
+    // (未载)。实体出生在地面上方 1 格,水平 40 m/s。
     session
         .set_area_ticket(1, Vec3::new(8.0, -60.0, 8.0), 48.0, 0b111, None)
         .expect("区域票");
@@ -503,23 +506,20 @@ fn ac_t6_lookahead_not_awaiting() {
             },
         )
         .expect("spawn");
-    // 推进若干拍:实体保持醒着(可能被票区域内的滞回冻结——区域票 ③ 覆盖
-    // 起点;前视缺失**不导致**待地形的判据 = 实体在当前足迹就绪期间始终
-    // 醒着或因票 ③ 冻结,而非 Kinematic 待地形悬停在中途)。观测:前 3 拍内
-    // 实体不进入待地形(位置持续演化或被票③冻结,而不是卡在原地速度清零
-    // 且票区域外)。
-    let mut snapshots = Vec::new();
+    // 逐拍断言(K3/纪律 12):实体存活期间**从不**进入待地形(前视缺失
+    // 不触发 I2);迁移到别的分片后实体不在本片 → entity_state None,循环
+    // 自然结束。若实现错误地把前视缺口当 I2 违反,实体会在中途待地形悬停
+    // (is_awaiting_terrain = true)→ 本断言变红。
     for _ in 0..6 {
         session.tick();
         step_orchestrate!(session, provider, new_sim);
-        if let Some(st) = session.entity_state(shard_id(0, 0), p) {
-            snapshots.push(st);
+        if let Some(_st) = session.entity_state(shard_id(0, 0), p) {
+            assert!(
+                !session.is_awaiting_terrain(shard_id(0, 0), p),
+                "T6:当前足迹就绪期间不进入待地形(前视只影响装载,不参与 I2)"
+            );
         }
     }
-    assert!(
-        !snapshots.is_empty(),
-        "T6:实体存活(当前足迹就绪,未因前视缺失进待地形卡死)"
-    );
     session.shutdown();
     let _ = store.shutdown();
 }
@@ -565,6 +565,129 @@ fn ac_t7_deadline_and_void() {
     );
     session.shutdown();
     let _ = store.shutdown();
+}
+
+/// #34(K3-4,纪律 11/12):**回放后强制落地可复现**——瞬态体漂移途中做
+/// world checkpoint,恢复线从快照续跑(内部指令不经日志,票据表/时钟/
+/// forced_pending 随快照再生);断言两线的落地拍号与落点格一致。
+/// 断言面:两线不一致或原线不落地 → 红。
+#[test]
+fn k3_forced_landing_reproducible_after_replay() {
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::replay::replay_world;
+    use sim_api::session::SessionConfig;
+    use sim_api::snapshot::WorldSnapshot;
+    use types::Tick;
+
+    let ground_chunk = || {
+        let mut ch = voxel::Chunk::air();
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                ch.set(x, 64, z, types::BlockId(1));
+            }
+        }
+        ch
+    };
+    // deadline 30:到期落在快照(拍 10)之后;落点体素在手(关凝固零重力
+    // 漂移,同 sim::ticket_deadline_forced_landing 场景)。
+    let sched_cfg = || SchedulerConfig {
+        worker_count: 2,
+        activation: physics_sim::ActivationConfig {
+            transient_settle_deadline_ticks: 30,
+            ..physics_sim::ActivationConfig::default()
+        },
+        ..SchedulerConfig::default()
+    };
+    let session_cfg = || SessionConfig {
+        scheduler: sched_cfg(),
+        source: InputSource(1),
+    };
+
+    // ---- 原线:区域票启用 → 瞬态体恒速漂移(+x,1 m/s)→ 拍 10 快照 →
+    // 跑到落地;记录 (落地拍, 落点格)。----
+    let flier = EntityId::from_parts(1, 1);
+    let (land_tick_orig, land_cell_orig, snapshot) = {
+        let mut session = Session::new(session_cfg());
+        session.register({
+            let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify.enabled = false;
+            physics_sim::ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+        });
+        session.apply_chunk_load(shard_id(0, 0), types::ChunkPos::new(0, 0), ground_chunk());
+        session
+            .set_area_ticket(1, Vec3::new(8.0, 3.0, 8.0), 48.0, 0b111, None)
+            .expect("区域票");
+        session
+            .send(
+                shard_id(0, 0),
+                SimCommand::SpawnDynamic {
+                    entity: flier,
+                    state: EntityState {
+                        translation: Vec3::new(8.0, 3.0, 8.0),
+                        linvel: Vec3::new(1.0, 0.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("spawn flier");
+        let mut snap: Option<WorldSnapshot> = None;
+        let mut landed: Option<(u64, types::BlockPos)> = None;
+        for k in 0..80u64 {
+            // 拍 10 末截快照(world_snapshot.tick = 下一待执行拍 11)。
+            if k == 10 {
+                snap = Some(session.world_snapshot());
+            }
+            session.tick();
+            if landed.is_none() && session.entity_state(shard_id(0, 0), flier).is_none() {
+                let writes = session.take_block_updates();
+                if let Some((_, cell, _)) = writes.first() {
+                    landed = Some((session.tick_now().0, *cell));
+                }
+            }
+        }
+        session.shutdown();
+        let (lt, cell) = landed.expect("原线:deadline 到 → 强制落地(实体消失 + 写块)");
+        (lt, cell, snap.expect("拍 10 快照"))
+    };
+    // 非退化:落地发生在快照拍之后(重放线要跑过截止拍才落地)。
+    assert!(
+        land_tick_orig > snapshot.shards.tick.0,
+        "前置:落地拍 {land_tick_orig} 在快照拍 {} 之后",
+        snapshot.shards.tick.0
+    );
+
+    // ---- 恢复线:replay_world(快照 + 空日志;内部指令由快照票据表时钟
+    // 再生)→ 续跑到同窗;断言落地拍号/落点格与原线一致。----
+    let mut restored = replay_world(&snapshot, &CommandLog::new(), session_cfg(), new_registry())
+        .expect("自有快照必可恢复");
+    assert_eq!(
+        restored.tick_now(),
+        Tick(snapshot.shards.tick.0),
+        "恢复线自快照拍对齐"
+    );
+    let mut landed_r: Option<(u64, types::BlockPos)> = None;
+    for _ in 0..80 {
+        restored.tick();
+        if landed_r.is_none() && restored.entity_state(shard_id(0, 0), flier).is_none() {
+            let writes = restored.take_block_updates();
+            if let Some((_, cell, _)) = writes.first() {
+                landed_r = Some((restored.tick_now().0, *cell));
+            }
+        }
+    }
+    restored.shutdown();
+    let (lt_r, cell_r) = landed_r.expect("恢复线:同样到期 → 强制落地");
+    assert_eq!(
+        lt_r, land_tick_orig,
+        "#34:落地拍号与原线一致(票据时钟/指令再生逐拍一致)"
+    );
+    assert_eq!(
+        cell_r, land_cell_orig,
+        "#34:落点格与原线一致(漂移轨迹/柱扫逐位一致)"
+    );
 }
 
 /// 任务书测试 `e2e::ac_t20_lifecycle`(T20 核心;支撑闭包同组唤醒移 04b):

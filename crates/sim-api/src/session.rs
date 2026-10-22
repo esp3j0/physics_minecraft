@@ -524,6 +524,18 @@ impl Session {
         self.scheduler.has_collider(shard, pos)
     }
 
+    /// 调度器透传(K3 只读观测面):实体是否处于待地形。分片未注册/实体
+    /// 不在 → false。
+    pub fn is_awaiting_terrain(&self, shard: ShardId, entity: types::EntityId) -> bool {
+        self.scheduler.is_awaiting_terrain(shard, entity)
+    }
+
+    /// 调度器透传(K3 只读观测面):实体是否被冻结(kinematic;与
+    /// `is_awaiting_terrain` 联用区分滞回冻结与待地形)。
+    pub fn is_frozen(&self, shard: ShardId, entity: types::EntityId) -> bool {
+        self.scheduler.is_frozen(shard, entity)
+    }
+
     /// 调度器透传(REQ-007 任务 02 细则 7;F2 改名):所有 Active/Paused 票
     /// ① "进"区域覆盖的分片集(驱动 ensure 用;键序;无票种分支)。
     pub fn ticket_ensure_shards(&self) -> std::collections::BTreeSet<ShardId> {
