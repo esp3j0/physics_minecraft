@@ -363,24 +363,15 @@ impl Scheduler {
     /// 区域票 ① "进"区域覆盖的分片集(REQ-007 任务 02 细则 7:驱动 ensure
     /// 用)。Radius 票:锚点圆覆盖(水平)的分片,键序。Suspended 不 ensure。
     pub fn ticket_ensure_shards(&self) -> BTreeSet<ShardId> {
-        use physics_sim::tickets::{RegionSpec, TicketState};
-        const SHARD_M: f32 = (types::SHARD_CHUNKS * types::CHUNK_SIZE) as f32;
+        use physics_sim::tickets::RegionSpec;
         let mut out = BTreeSet::new();
-        // F2(验收返修):对**所有** Active/Paused 票按 ① 规格的"进"区域求
-        // owner 分片(§14-1,无票种分支;观察者票也走这里)。Radius 票 =
-        // 锚点到分片核心 AABB 水平距离 ≤ load_m;Chunks/Footprint(03)跳过。
-        // 观察者票由此求出的分片 ⊆ 现有"32 m 邻片 ensure"(load 32 < 32m
-        // 邻片半径),行为不变;现有邻片 ensure 照旧保留(§4.13)。
-        for (holder, t) in self.tickets.iter() {
-            if t.state == TicketState::Suspended {
+        // H3(纪律 8 根因收口):实体票的表内规格是 Footprint——ensure 与
+        // plan/保活同源,走**解析后的视图**(Footprint → Chunks;锚点含在途)。
+        for view in self.ticket_views() {
+            if !view.occupies() {
                 continue;
             }
-            // Chunks(实体票足迹;任务 03/R1):覆盖 chunk 的 owner 分片直接注册
-            // (无票种分支——按 RegionSpec 求覆盖)。
-            if let RegionSpec::Chunks(chunks) = &t.data {
-                // owner = 锚点所在分片(实体票锚点 = 实体/载荷位置;单世界既有
-                // 假设下 world/dim 恒 0——与 ticket_ensure_shards 现状一致,
-                // 多维度立项时随锚点带 world/dim 一并处理)。
+            if let RegionSpec::Chunks(chunks) = &view.data {
                 let base = ShardId::new(
                     types::WorldId(0),
                     types::DimensionId(0),
@@ -389,33 +380,52 @@ impl Scheduler {
                 for cp in chunks {
                     out.insert(Scheduler::owner_of(base, *cp));
                 }
+            }
+        }
+        // F2(验收返修)+ H3:对**所有** Active/Paused 票按 ① 规格的"进"
+        // 区域求 owner 分片(§14-1,无票种分支;观察者票也走这里)。走
+        // **解析后的视图**(与 plan/保活同源):Radius = 锚点圆覆盖;
+        // Footprint 已解析成 Chunks(实体票;锚点含在途);Chunks 直用。
+        // 观察者票由此求出的分片 ⊆ 现有"32 m 邻片 ensure",行为不变;邻片
+        // ensure 照旧保留(§4.13)。
+        let mut cover: BTreeSet<ChunkPos> = BTreeSet::new();
+        const CHUNK_M: f32 = types::CHUNK_SIZE as f32;
+        for view in self.ticket_views() {
+            if !view.occupies() {
                 continue;
             }
-            let RegionSpec::Radius { load_m, .. } = t.data else {
-                continue;
-            };
-            let Some(anchor) = self.ticket_anchor_of(&holder.0).or(t.center) else {
-                continue; // 无锚票(03 语义)
-            };
-            let min_x = ((anchor.x - load_m) / SHARD_M).floor() as i32;
-            let max_x = ((anchor.x + load_m) / SHARD_M).floor() as i32;
-            let min_z = ((anchor.z - load_m) / SHARD_M).floor() as i32;
-            let max_z = ((anchor.z + load_m) / SHARD_M).floor() as i32;
-            for sx in min_x..=max_x {
-                for sz in min_z..=max_z {
-                    // 分片核心 AABB 水平距离 ≤ load_m(与 shards_within 同口径)。
-                    let (cx, cz) = (sx as f32 * SHARD_M, sz as f32 * SHARD_M);
-                    let dx = (cx - anchor.x).max(0.0).max(anchor.x - (cx + SHARD_M));
-                    let dz = (cz - anchor.z).max(0.0).max(anchor.z - (cz + SHARD_M));
-                    if dx * dx + dz * dz <= load_m * load_m {
-                        out.insert(ShardId::new(
-                            types::WorldId(0),
-                            types::DimensionId(0),
-                            types::ShardPos::new(sx, sz),
-                        ));
+            match &view.data {
+                RegionSpec::Radius { load_m, .. } => {
+                    let r = (*load_m / CHUNK_M).ceil() as i32 + 1;
+                    let cx = (view.anchor.x / CHUNK_M).floor() as i32;
+                    let cz = (view.anchor.z / CHUNK_M).floor() as i32;
+                    for dx in -r..=r {
+                        for dz in -r..=r {
+                            let cp = types::ChunkPos::new(cx + dx, cz + dz);
+                            // 水平 chunk 中心距(与 plan 同口径)。
+                            let half = CHUNK_M * 0.5;
+                            let ccx = (cp.x * types::CHUNK_SIZE) as f32 + half;
+                            let ccz = (cp.z * types::CHUNK_SIZE) as f32 + half;
+                            let (ddx, ddz) = (ccx - view.anchor.x, ccz - view.anchor.z);
+                            if (ddx * ddx + ddz * ddz).sqrt() <= *load_m {
+                                cover.insert(cp);
+                            }
+                        }
                     }
                 }
+                RegionSpec::Chunks(chunks) => {
+                    cover.extend(chunks.iter().copied());
+                }
+                _ => {}
             }
+        }
+        let base = ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        );
+        for cp in cover {
+            out.insert(Scheduler::owner_of(base, cp));
         }
         out
     }
