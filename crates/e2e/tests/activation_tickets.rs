@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 
 use app::config::Config;
-use messaging::SimCommand;
+use messaging::{InputSource, SimCommand};
 use sim_api::session::Session;
 use storage::traits::ChunkKey;
 use types::glam::Vec3;
@@ -179,4 +179,160 @@ fn area_ticket_keeps_region_alive() {
     assert_eq!(ticket_cmds, 2, "Set/Remove 各一条入日志(盖章可回放)");
     assert!(total >= 2);
     let _ = PathBuf::new(); // (保持 import 最小;路径无关)
+}
+
+// ==== REQ-007 任务 03(G3 返修补齐 e2e;S6:无观察者场景先启用激活)====
+
+/// e2e 公共布景:注册首分片 + 区域票启用激活 + 编排宏(ensure/装载/despawn)。
+macro_rules! step_orchestrate {
+    ($session:expr, $provider:expr, $new_sim:expr) => {{
+        for shard in $session.ticket_ensure_shards() {
+            if !$session.shard_ids().contains(&shard) {
+                $session.register($new_sim(shard));
+            }
+        }
+        for (shard, decisions) in $session.take_activation_requests() {
+            for pos in decisions.chunks_to_load {
+                let key = ChunkKey {
+                    world: shard.world,
+                    dim: shard.dimension,
+                    pos,
+                };
+                let chunk = $provider
+                    .get(key)
+                    .unwrap_or_else(|| panic!("provider.get None:{key:?}"));
+                $session.apply_chunk_load(shard, pos, chunk);
+            }
+        }
+        for shard in $session.take_despawn_requests() {
+            if $session.shard_ids().contains(&shard) {
+                let _ = $session.unload_shard(shard);
+            }
+        }
+    }};
+}
+
+/// 任务书测试 `e2e/activation_tickets::ac_t3_no_hanging_blue_blocks`(T3,
+/// 核心断言面):瞬态体抛出后不悬空——落地凝固成块、实体表清空;票随终结
+/// End;区域票移除 + 空片 + idle → despawn。
+#[test]
+fn ac_t3_no_hanging_blue_blocks() {
+    let config = Config::default();
+    let store = storage::worker::StoreWorker::new(
+        Box::new(storage::mem::MemChunkStore::new()),
+        Box::new(storage::mem::MemCheckpointStore::new()),
+    );
+    let mut session = Session::new(config.session_config());
+    let (provider, mut new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+    session.register(new_sim(shard_id(0, 0)));
+    let projectile = EntityId::from_parts(1, 1);
+
+    // 区域票启用(③ 半径覆盖抛体路径起点;①② 保持地形)。
+    session
+        .set_area_ticket(1, Vec3::new(64.0, -60.0, 64.0), 48.0, 0b111, None)
+        .expect("区域票");
+    session
+        .send(
+            shard_id(0, 0),
+            SimCommand::SpawnDynamic {
+                entity: projectile,
+                state: EntityState {
+                    translation: Vec3::new(64.0, -50.0, 64.0),
+                    linvel: Vec3::new(6.0, 0.0, 6.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            },
+        )
+        .expect("spawn 抛体");
+
+    // 推进至凝固(瞬态不悬空:实体消失 + Emergent 写块;≤ 1200 拍 deadline)。
+    let mut landed = false;
+    for _ in 0..600 {
+        session.tick();
+        step_orchestrate!(session, provider, new_sim);
+        if session.entity_state(shard_id(0, 0), projectile).is_none() {
+            landed = true;
+            break;
+        }
+    }
+    assert!(landed, "T3:抛体 ≤ 600 拍落地凝固(不悬空蓝方块)");
+    // 票随实体终结 End(§4.3.3;调度器终结判定,凝固 despawn 路径)。
+    use physics_sim::tickets::TicketHolder;
+    assert!(
+        !session
+            .ticket_table()
+            .iter()
+            .any(|(k, _)| k.0 == TicketHolder::Entity(projectile)),
+        "终结 → 票 End"
+    );
+    // 移除区域票 → 空片 + idle → despawn。
+    let idle = (config.despawn_after_secs as f32 / config.dt).round() as u64;
+    session.remove_area_ticket(1).expect("移除");
+    for _ in 0..=idle + 2 {
+        session.tick();
+        step_orchestrate!(session, provider, new_sim);
+    }
+    assert!(
+        !session.shard_ids().contains(&shard_id(0, 0)),
+        "票清 + 空片 + idle → despawn(T3 收尾)"
+    );
+    session.shutdown();
+    let _ = store.shutdown();
+}
+
+/// 任务书测试 `e2e/activation_tickets::ac_t24_enable_backfill`(T24 核心):
+/// 未启用模式手动装载跑既有路径(对照);启用当拍补签(瞬态体获票)。
+#[test]
+fn ac_t24_enable_backfill() {
+    let config = Config::default();
+    let store = storage::worker::StoreWorker::new(
+        Box::new(storage::mem::MemChunkStore::new()),
+        Box::new(storage::mem::MemCheckpointStore::new()),
+    );
+    let mut session = Session::new(config.session_config());
+    let (provider, mut new_sim) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+    let transient = EntityId::from_parts(1, 1);
+    // 未启用:注册 + spawn(手动装载等价既有路径;不签票)。
+    session.register(new_sim(shard_id(0, 0)));
+    session
+        .send(
+            shard_id(0, 0),
+            SimCommand::SpawnDynamic {
+                entity: transient,
+                state: EntityState {
+                    translation: Vec3::new(8.0, -55.0, 8.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            },
+        )
+        .expect("spawn");
+    session.tick();
+    assert!(!session.activation_enabled(), "未启用(无观察者无票)");
+    assert!(
+        !session
+            .ticket_table()
+            .iter()
+            .any(|(k, _)| k.0 == physics_sim::tickets::TicketHolder::Entity(transient)),
+        "未启用不签票(D17)"
+    );
+    // 启用(Set 观察者)→ 启用当拍补签。
+    session
+        .move_observer_from(InputSource(1), Vec3::new(8.0, -55.0, 8.0))
+        .expect("启用");
+    session.tick();
+    step_orchestrate!(session, provider, new_sim);
+    assert!(session.activation_enabled());
+    assert!(
+        session
+            .ticket_table()
+            .iter()
+            .any(|(k, _)| k.0 == physics_sim::tickets::TicketHolder::Entity(transient)),
+        "启用当拍补签(D17/T24)"
+    );
+    session.shutdown();
+    let _ = store.shutdown();
 }
