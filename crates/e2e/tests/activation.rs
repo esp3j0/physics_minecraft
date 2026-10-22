@@ -178,6 +178,25 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     sched
         .submit(shard, spawn_at(Tick(1), 1, far, p_far, Vec3::ZERO))
         .expect("收件箱未满");
+    // §9-1(瞬态半边)迁移:被测实体常驻化(REQ-007 任务 03;瞬态不滞回冻结,
+    // 且落地凝固会移除实体,吞掉"位级悬停"断言)。贴地出生即静止,满足
+    // §9-1"先让它静止"口径。
+    for (seq, id) in [(2u64, near), (3, far)] {
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: Tick(1),
+                    source: InputSource(7),
+                    sequence: seq,
+                    payload: InputPayload::Command(SimCommand::MarkActor {
+                        entity: id,
+                        actor: true,
+                    }),
+                },
+            )
+            .expect("收件箱未满");
+    }
     sched.set_observers(vec![obs1]);
 
     // 查询宏:调用点即时借用 sched(闭包会长期占用不可变借用,与 tick 冲突)。

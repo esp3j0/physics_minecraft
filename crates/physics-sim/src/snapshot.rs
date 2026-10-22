@@ -50,6 +50,8 @@ struct ShardSimSnapshot {
     pending_collider_builds: BTreeSet<ChunkPos>,
     /// 待地形状态(REQ-007 任务 03/R10:保存的速度必须存,恢复后原样写回)。
     locomotion: BTreeMap<EntityId, crate::sim::LocomotionState>,
+    /// 待执行强制落地(R10:到期/超预算簿记)。
+    forced_pending: BTreeSet<EntityId>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -86,6 +88,7 @@ fn clone_world(w: &PhysicsWorld) -> PhysicsWorld {
 #[derive(Serialize, Deserialize)]
 struct SnapshotEntityRecord {
     handle: RigidBodyHandle,
+    collider: ColliderHandle,
     desc: EntityDesc,
     slow_ticks: u32,
     actor: bool,
@@ -110,6 +113,7 @@ impl ShardSim {
                         *id,
                         SnapshotEntityRecord {
                             handle: rec.handle,
+                            collider: rec.collider,
                             desc: rec.desc,
                             slow_ticks: rec.slow_ticks,
                             actor: rec.actor,
@@ -123,6 +127,7 @@ impl ShardSim {
             built_colliders: self.built_colliders.clone(),
             pending_collider_builds: self.pending_collider_builds.clone(),
             locomotion: self.locomotion.clone(),
+            forced_pending: self.forced_pending.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -150,6 +155,7 @@ impl ShardSim {
                     id,
                     crate::sim::EntityRecord {
                         handle: rec.handle,
+                        collider: rec.collider,
                         desc: rec.desc,
                         slow_ticks: rec.slow_ticks,
                         actor: rec.actor,
@@ -169,6 +175,7 @@ impl ShardSim {
             built_colliders: snap.built_colliders,
             pending_collider_builds: snap.pending_collider_builds,
             locomotion: snap.locomotion,
+            forced_pending: snap.forced_pending,
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,
@@ -338,19 +345,31 @@ mod tests {
     fn snapshot_roundtrip_keeps_activation_state() {
         let e = types::EntityId::from_parts(1, 1);
         let mut a = ShardSim::new(cfg(), Box::new(SimpleRegistry::builtin()));
-        a.apply_prefix(&[StampedInput {
-            apply_at: types::Tick::ZERO,
-            source: InputSource(1),
-            sequence: 1,
-            payload: InputPayload::Command(SimCommand::SpawnDynamic {
-                entity: e,
-                state: EntityState {
-                    translation: Vec3::new(100.0, 3.0, 100.0),
-                    ..EntityState::default()
-                },
-                desc: EntityDesc::default(),
-            }),
-        }]);
+        a.apply_prefix(&[
+            StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: InputSource(1),
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(100.0, 3.0, 100.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                }),
+            },
+            // §9-1 迁移:常驻化(瞬态不滞回冻结,任务 03)。
+            StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: InputSource(1),
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::MarkActor {
+                    entity: e,
+                    actor: true,
+                }),
+            },
+        ]);
         // 拍 0(远观察者):实体冻结,簿记 flip@0,激活拍 → 1。
         let d = a.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(d.entities_to_freeze, vec![e], "远处实体被冻结");

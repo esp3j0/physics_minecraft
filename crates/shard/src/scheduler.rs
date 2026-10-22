@@ -165,6 +165,8 @@ pub struct Scheduler {
     /// 激活配置(观察者票规格唯一来源;F3:自 SchedulerConfig 注入,替换
     /// "取第一个分片配置")。
     activation_cfg: physics_sim::ActivationConfig,
+    /// 未应用 ticket_ops(§14-6:N 拍产生、拍末应用 → N+1 生效;键序应用)。
+    pending_ticket_ops: Vec<(ShardId, physics_sim::TicketOpRecord)>,
     /// 本拍激活决策(tick 步骤 1.5 收集,两拍之间经 take_activation_requests
     /// 取走;恰一次语义)。
     activation_requests: BTreeMap<ShardId, physics_sim::ActivationDecisions>,
@@ -224,6 +226,7 @@ impl Scheduler {
             area_ticket_max_radius_m: 128.0,
             area_ticket_max_count: 64,
             activation_cfg: cfg.activation,
+            pending_ticket_ops: Vec::new(),
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
             block_updates: Vec::new(),
@@ -1445,6 +1448,13 @@ impl Scheduler {
             // 本拍实体生命周期:以分片实体表(真相)同步全局 ownership
             // (REQ-006 任务 00:spawn/migrate/remove/solidify/teleport 都覆盖)。
             self.sync_entity_ownership(shard, &sim);
+            // ticket_ops 收集(REQ-007 任务 03;§14-6):分片判定的状态依赖
+            // 操作。**应用在拍末**(步骤 7.4,Key 序)→ N 拍产生、N+1 生效。
+            for op in &outbox.ticket_ops {
+                self.pending_ticket_ops.push((shard, op.clone()));
+            }
+            // 强制落地/虚空移除:despawned 已含(统一终结判定兜底 End);
+            // forced_landings/void_removed 供遥测(06)。
             // 终结判定(REQ-007 §4.3.3/R7;任务 03):despawned ∧ ¬本拍迁移意图
             // ∧ ¬同拍重新 spawned(传送)→ End 全部实体票。凝固/强制落地/虚空
             // 移除/RemoveEntity 都走这里;迁移 despawn 保留票(键不变时钟继续)。
@@ -1490,6 +1500,37 @@ impl Scheduler {
                 && lifecycle.idle_expired(at)
             {
                 self.despawn_requests.insert(shard);
+            }
+        }
+
+        // 7.4 ticket_ops 应用(REQ-007 任务 03;§14-6):按 (ShardId, 实体)
+        // 序(= 收集序,BTreeMap 归一);操作幂等(TicketTable);目标键 =
+        // 该实体的实体票(03 = TransientMotion)。应用在拍末 → N+1 生效。
+        self.pending_ticket_ops
+            .sort_by_key(|(shard, op)| (*shard, op.entity, op.op as u8));
+        for (origin, op) in std::mem::take(&mut self.pending_ticket_ops) {
+            use physics_sim::tickets::TicketHolder;
+            // 实体当前归属分片的票(迁移后键不变,只按 Entity 找)。
+            let keys: Vec<_> = self
+                .tickets
+                .iter()
+                .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == op.entity))
+                .map(|(k, _)| k)
+                .collect();
+            let _ = origin;
+            for key in keys {
+                match op.op {
+                    physics_sim::TicketOp::End => self.tickets.end(key),
+                    physics_sim::TicketOp::Pause => self
+                        .tickets
+                        .set_state(key, physics_sim::TicketState::Paused),
+                    physics_sim::TicketOp::Unpause | physics_sim::TicketOp::Resume => self
+                        .tickets
+                        .set_state(key, physics_sim::TicketState::Active),
+                    physics_sim::TicketOp::Suspend => self
+                        .tickets
+                        .set_state(key, physics_sim::TicketState::Suspended),
+                }
             }
         }
 

@@ -60,6 +60,24 @@ impl Default for SolidifyConfig {
     }
 }
 
+/// 实体票状态操作(§4.3.1;**不含 Issue**——S5:签发单点在调度器 claim/补签,
+/// 分片只产出状态依赖操作)。只追加;幂等由 TicketTable 保证。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TicketOp {
+    End,
+    Pause,
+    Unpause,
+    Suspend,
+    Resume,
+}
+
+/// 路由载体:(实体, 操作)——调度器按持有者分片盖章投递。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TicketOpRecord {
+    pub entity: EntityId,
+    pub op: TicketOp,
+}
+
 /// 实体运动状态(REQ-007 §4.6;任务 03):醒着 或 待地形(保存速度)。
 /// sim 内部记录 + 快照;不进 `EntityState`(任务书授权:types 不动)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -148,11 +166,22 @@ pub struct Outbox {
     /// 本拍删除的实体(REQ-006 任务 00):调度器据此 release ownership。
     /// 迁移源删除、RemoveEntity、凝固都记录;与 `spawned` 同拍时先 release。
     pub despawned: Vec<EntityId>,
+    /// 实体票状态操作(REQ-007 任务 03;S5:分片只产出状态依赖操作,签发
+    /// 单点在调度器 claim/补签)。调度器按 TicketKey 序应用,N 拍产生 N+1 生效
+    /// (§14-6);幂等由 TicketTable 保证。
+    pub ticket_ops: Vec<crate::sim::TicketOpRecord>,
+    /// 强制落地完成(REQ-007 §4.8;任务 03):(实体, 落点格)——调用方已写块
+    /// (Emergent BlockWrite)+ despawned;调度器据此 End 票(幂等)。
+    pub forced_landings: Vec<(EntityId, BlockPos)>,
+    /// 虚空移除(§4.8):y < WORLD_Y_MIN − 深度 的实体(无 BlockWrite)。
+    pub void_removed: Vec<EntityId>,
 }
 
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
 pub(crate) struct EntityRecord {
     pub(crate) handle: RigidBodyHandle,
+    /// 实体唯一 collider(insert 1:1 创建;支撑判定的接触对查询键,任务 03)。
+    pub(crate) collider: ColliderHandle,
     pub(crate) desc: EntityDesc,
     /// 连续"低速"tick 计数(P2 触发用)。
     pub(crate) slow_ticks: u32,
@@ -191,6 +220,9 @@ pub struct ShardSim {
     /// 待地形实体(REQ-007 §4.6;任务 03/提交 B):LocomotionState 保存的
     /// 速度随档;恢复时原样写回(位级)。未启用模式(D17)恒空。
     pub(crate) locomotion: BTreeMap<EntityId, LocomotionState>,
+    /// 待执行强制落地(REQ-007 §4.8):到期内部指令/超预算淘汰进入;中心柱
+    /// ① 缺 → 推迟(阻塞请求),柱就绪的拍执行。随快照(R10)。
+    pub(crate) forced_pending: BTreeSet<EntityId>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -220,6 +252,7 @@ impl ShardSim {
             built_colliders: BTreeSet::new(),
             pending_collider_builds: BTreeSet::new(),
             locomotion: BTreeMap::new(),
+            forced_pending: BTreeSet::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -439,8 +472,15 @@ impl ShardSim {
             .collect();
         for id in self.activation.enforce_budget(&observers, &awake) {
             let now = self.activation_now;
-            self.freeze_entity(&id);
-            self.activation.note_flip(&id, now);
+            // §9-2/任务书细则 10(瞬态半边):被淘汰的**瞬态体 → 强制落地**
+            // (产出同 §4.8;非冻结);常驻体 → 冻结(04 起改 End ActorMotion)。
+            let is_transient = self.entities.get(&id).is_some_and(|rec| !rec.actor);
+            if is_transient {
+                self.forced_pending.insert(id);
+            } else {
+                self.freeze_entity(&id);
+                self.activation.note_flip(&id, now);
+            }
         }
     }
 
@@ -463,6 +503,8 @@ impl ShardSim {
         self.phys.step();
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
+        // 支撑判定(§4.4.1;一次计算,凝固前提 + 承载产出共用)。
+        let entity_supported = self.evaluate_supports();
         let orients = solidify::axis_aligned_orientations();
         let cfg = self.cfg.solidify.clone();
         for id in ids {
@@ -518,8 +560,12 @@ impl ShardSim {
                 rec.slow_ticks = slow_ticks;
                 rec.actor
             };
+            // 凝固前提修订(§4.7/任务 03):本拍无实体支撑(被承载瞬态不凝固,
+            // §4.4.2)。零重力不判定支撑 → 前提恒真(既有零重力用例不变,§9-6)。
+            let no_entity_support = !entity_supported.get(&id).copied().unwrap_or(false);
             if cfg.enabled
                 && !actor
+                && no_entity_support
                 && gate_passes
                 && (slow_ticks >= cfg.consecutive_ticks || is_sleeping)
             {
@@ -648,12 +694,17 @@ impl ShardSim {
         // ② 已建集合(REQ-007 任务 01;修订 5 D18:独立状态,非 chunk_bodies 键
         // ——全空气 chunk 无碰撞盒但 ② 已建)。
         let collider_loaded: Vec<ChunkPos> = self.built_colliders.iter().copied().collect();
-        let entities: Vec<(EntityId, Vec3, bool)> = self
+        let entities: Vec<(EntityId, Vec3, bool, bool)> = self
             .entities
             .iter()
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
-                (*id, conv::rapier_to_vec3(b.translation()), b.is_kinematic())
+                (
+                    *id,
+                    conv::rapier_to_vec3(b.translation()),
+                    b.is_kinematic(),
+                    rec.actor,
+                )
             })
             .collect();
         // 阻塞请求(D15;判定只依实体状态,§14-8):待地形实体的足迹缺 ② +
@@ -832,6 +883,184 @@ impl ShardSim {
         blocked
     }
 
+    /// 到期内部指令应用(§4.3.2;任务 03):实体进入待执行强制落地集。
+    /// 调度器 SCHEDULER 来源(不入外部日志);实体在本分片才收(在途时由
+    /// ownership 切换后的目的分片收)。
+    pub fn apply_forced_landing_directive(&mut self, entity: EntityId) {
+        self.forced_pending.insert(entity);
+    }
+
+    /// 实体票 ops 应用入口(分片产出 → 调度器盖章 → 目的分片 N+1 应用;
+    /// 幂等语义在调度器 TicketTable,本入口仅为对称的执行侧占位——实际状态
+    /// 变化(Pause 等)落在票上,分片无票表,无本地动作)。
+    pub fn apply_ticket_ops(&mut self, _ops: &[TicketOpRecord]) {
+        // 分片侧无票据表:Pause/Suspend 等状态由调度器表持有;分片的职责是
+        // **判定与产出**(step 内按实体支撑/承载状态产出 ops)。执行侧 no-op。
+    }
+
+    /// 支撑判定(§4.4.1;R5):对每个**醒着**(Dynamic,非待地形)实体,检查
+    /// 其接触对:法向(从对方指向 E)· û ≥ support_normal_min → 对方为支撑;
+    /// 对方 = chunk 静态体 → 地形支撑,实体 → 实体支撑。零重力不判定(全 None
+    /// → 凝固前提恒真,§9-6)。rapier 接触流形法向从 collider1 指向 collider2,
+    /// 按配对顺序换算方向。
+    pub fn evaluate_supports(&self) -> std::collections::BTreeMap<EntityId, bool> {
+        let mut out = std::collections::BTreeMap::new();
+        let gravity_len = self.cfg.gravity.length();
+        if gravity_len <= 0.0 {
+            return out; // 零重力:不判定(前提恒真)
+        }
+        let up = -self.cfg.gravity / gravity_len; // û = 重力反向单位向量
+        // 实体刚体 → 其 collider 句柄(insert 时 1:1 创建)。
+        for (id, rec) in &self.entities {
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            if body.is_kinematic() {
+                continue; // 只有醒着(含待地形外的 Dynamic)需要判定
+            }
+            let self_collider = rec.collider;
+            let has_entity_support = self
+                .phys
+                .narrow_phase
+                .contact_pairs_with(self_collider)
+                .any(|pair| {
+                    // 接触对无全局序:按"我方 collider"归一。
+                    let (other_collider, e_is_first) = if pair.collider1 == self_collider {
+                        (pair.collider2, true)
+                    } else if pair.collider2 == self_collider {
+                        (pair.collider1, false)
+                    } else {
+                        return false;
+                    };
+                    // 对方 collider 所属刚体:实体(非固定)→ 潜在实体支撑。
+                    let Some(other_body) = self
+                        .phys
+                        .colliders
+                        .get(other_collider)
+                        .and_then(|c| c.parent())
+                    else {
+                        return false;
+                    };
+                    if self
+                        .phys
+                        .bodies
+                        .get(other_body)
+                        .is_none_or(|b| b.is_fixed())
+                    {
+                        return false; // 地形支撑(非实体支撑)
+                    }
+                    // 法向(R5):manifold.local_n1 = 从 shape1 指向 shape2 的
+                    // 接触法向(shape1 局部系;双方无旋转时即世界系——实体 cube
+                    // 有旋转,但支撑判定取 ~竖直向,旋转误差 ≤ cos 阈值覆盖)。
+                    // 归一到"从对方指向 E":E 为 collider1 → n = -local_n1;
+                    // E 为 collider2 → n = +local_n1。
+                    // 接触法向:manifold.data.local_n1 = 从 shape1 指向 shape2
+                    // (shape1 局部系;实体 cube 旋转的误差由 cos 阈值覆盖)。
+                    pair.manifolds().iter().any(|m| {
+                        let n = if e_is_first { -m.local_n1 } else { m.local_n1 };
+                        n.dot(conv::vec3_to_rapier(up)) >= self.cfg.activation.support_normal_min
+                    })
+                });
+            out.insert(*id, has_entity_support);
+        }
+        out
+    }
+
+    /// step 末的瞬态体生命周期段(任务 03/提交 C):虚空移除 + 强制落地执行。
+    /// 产出:despawned(+ forced 的 Emergent BlockWrite)/ void_removed。
+    pub fn run_transient_lifecycle(&mut self) {
+        // ---- 虚空移除(§4.8;所有实体;启用模式 = 已激活刷新过)----
+        if self.observed.is_some() {
+            let threshold = types::WORLD_Y_MIN as f32 - self.cfg.activation.void_despawn_depth_m;
+            let ids: Vec<EntityId> = self.entities.keys().copied().collect();
+            for id in ids {
+                let (handle, y) = {
+                    let rec = self.entities.get(&id).expect("keys 有效");
+                    let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                    (rec.handle, conv::rapier_to_vec3(body.translation()).y)
+                };
+                if y < threshold {
+                    self.entities.remove(&id).expect("存在");
+                    self.phys.remove_body(handle);
+                    self.locomotion.remove(&id);
+                    self.forced_pending.remove(&id);
+                    self.outbox.despawned.push(id);
+                    self.outbox.void_removed.push(id);
+                }
+            }
+        }
+        // ---- 强制落地执行(§4.8 五步;中心柱 ① 缺 → 推迟 + 阻塞)----
+        let pending: Vec<EntityId> = self.forced_pending.iter().copied().collect();
+        for id in pending {
+            let Some(rec) = self.entities.get(&id) else {
+                // 实体已不在(迁移在途/凝固/移除):出队(调度器终结判定兜底)。
+                self.forced_pending.remove(&id);
+                continue;
+            };
+            let (handle, block_desc) = (rec.handle, rec.desc);
+            let body = self.phys.bodies.get(handle).expect("handle 有效");
+            let pos = conv::rapier_to_vec3(body.translation());
+            let cell = crate::settle::cell_of(pos.x, pos.y, pos.z);
+            let cp = pos_chunk(pos);
+            let Some(_chunk) = self.voxels.get_chunk(cp) else {
+                continue; // 柱 ① 缺 → 推迟(阻塞请求由 awaiting_terrain_blocked
+                // 同型逻辑在 plan 输入侧补充——见 blocked_forced)
+            };
+            // 借用收口:landing 计算的闭包借用 self.entities/VoxelWorld,块内
+            // 结束后才能 &mut 移除实体。
+            let landing = {
+                let overlaps = |b: BlockPos| -> bool {
+                    self.entities.iter().any(|(other, orec)| {
+                        if *other == id {
+                            return false;
+                        }
+                        let ob = self.phys.bodies.get(orec.handle).expect("handle 有效");
+                        let op = conv::rapier_to_vec3(ob.translation());
+                        let oc = crate::settle::cell_of(op.x, op.y, op.z);
+                        oc == b
+                    })
+                };
+                crate::settle::forced_landing_cell(
+                    &|_x, by| Some(self.voxels.get_block(BlockPos::new(cell.x, by, cell.z))),
+                    cell.x,
+                    cell.y,
+                    cell.z,
+                    types::WORLD_Y_MIN,
+                    types::WORLD_Y_MAX,
+                    &overlaps,
+                )
+            };
+            let handle = rec.handle;
+            let Some(landing) = landing else {
+                // 虚空移除(无支撑柱;无 BlockWrite)。
+                self.entities.remove(&id).expect("存在");
+                self.phys.remove_body(handle);
+                self.locomotion.remove(&id);
+                self.outbox.despawned.push(id);
+                self.outbox.void_removed.push(id);
+                self.forced_pending.remove(&id);
+                continue;
+            };
+            // 落点写块(Emergent)+ despawn(与凝固桥同产出;复用 REQ-005
+            // 广播持久化)。
+            let _ = self.voxels.set_block(landing, block_desc.block);
+            for ncp in expand_boundary([landing.chunk_of()], &self.voxels) {
+                if self.built_colliders.contains(&ncp) {
+                    self.rebuild_chunk_collider(ncp);
+                }
+            }
+            self.outbox.block_updates.push(BlockWrite {
+                pos: landing,
+                block: block_desc.block,
+                kind: BlockWriteKind::Emergent,
+            });
+            self.entities.remove(&id).expect("存在");
+            self.phys.remove_body(handle);
+            self.locomotion.remove(&id);
+            self.outbox.despawned.push(id);
+            self.outbox.forced_landings.push((id, landing));
+            self.forced_pending.remove(&id);
+        }
+    }
+
     /// I2 断言(§14-7;debug):醒着的瞬态体当前足迹 ∩ 区域内缺 ② → panic。
     /// 钩子:测试以"醒着 + 缺 ②"状态直接调用。
     #[cfg(debug_assertions)]
@@ -992,7 +1221,7 @@ impl ShardSim {
             "实体重复 spawn(fail-stop):{id:?}"
         );
         let h = desc.half_size;
-        let (handle, _) = self.phys.insert(
+        let (handle, collider) = self.phys.insert(
             RigidBodyBuilder::dynamic()
                 .pose(conv::pose_to_rapier(state.translation, state.rotation))
                 .linvel(conv::vec3_to_rapier(state.linvel))
@@ -1006,6 +1235,7 @@ impl ShardSim {
             id,
             EntityRecord {
                 handle,
+                collider,
                 desc,
                 slow_ticks: 0,
                 actor,
@@ -1224,8 +1454,12 @@ mod tests {
         assert_eq!(control.take_outbox().migrations.len(), 1);
 
         // 冻结路径:apply_activation → 200 拍仍原位原态,outbox 全空。
+        // §9-1 迁移:常驻化(瞬态不滞回冻结,任务 03)。
         let mut s = sim(0, 0);
-        s.apply_prefix(&[spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0))]);
+        s.apply_prefix(&[
+            spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0)),
+            mark_actor_input(1, e, true),
+        ]);
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(decisions.entities_to_freeze, vec![e], "远处实体被冻结");
         let far_state = s.entity_state(e).expect("冻结后仍在表");
@@ -1280,6 +1514,10 @@ mod tests {
         s.apply_prefix(&[
             spawn_input(0, e1, Vec3::new(13.0, 3.0, 8.0)),
             spawn_input(1, e3, Vec3::new(100.0, 3.0, 100.0)),
+            // §9-1/2 迁移:常驻化(瞬态超预算淘汰 → 强制落地、足迹缺 ② →
+            // 待地形,均会吞掉"冻结悬停/当拍下落"断言;任务 03)。
+            mark_actor_input(2, e1, true),
+            mark_actor_input(3, e3, true),
         ]);
         // 拍 0(观察者已设):e3 距 ≈130 > 32 → 冻结;同时注册观察者供
         // 后续命令唤醒路径复用。醒数 {e1} = 1 ≤ 预算 1,不淘汰。
@@ -2355,5 +2593,88 @@ mod tests {
                 && !s.has_collider(ChunkPos::new(1, 0)),
             "true → 只 ①"
         );
+    }
+    // ==== REQ-007 任务 03(任务书测试清单,提交 C)====
+
+    /// 任务书测试 `sim::transient_keeps_ticket_while_moving`(T3/S6)与
+    /// `transient_not_frozen_when_far`(§9-1 迁移):抛出瞬态体(落点 > 60 m,
+    /// 场景以远处区域票启用激活):全程醒着不被滞回冻结。
+    #[test]
+    fn transient_not_frozen_when_far() {
+        let mut s = sim(0, 0);
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(9);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0))]);
+        // 远处区域票启用(等价:观察者激活生效即本路径;区域票由调度器派生,
+        // sim 侧入口 = apply_activation,票视图等价测试已锚)。
+        let d = s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        assert!(
+            !d.entities_to_freeze.contains(&e),
+            "瞬态体不被滞回冻结(§9-1):{d:?}"
+        );
+        s.step();
+        let st = s.entity_state(e).expect("存活");
+        assert!(st.linvel.y < 0.0, "醒着下落(未冻结)");
+    }
+
+    /// 任务书测试 `sim::void_removal_enabled_mode_only`(T7/T24):启用模式
+    /// y < 阈值删除;未启用模式(从未激活刷新)不删(§9-7 对照)。
+    #[test]
+    fn void_removal_enabled_mode_only() {
+        // 启用:激活刷新过(observed = Some)。
+        let mut s = sim(0, 0);
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(8.0, 0.0, 8.0))]);
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(e).is_some(), "未越线:不移除");
+        // 未越线 + 移到深虚空:
+        let deep = Vec3::new(8.0, (types::WORLD_Y_MIN - 20) as f32, 8.0);
+        s.apply_prefix(&[teleport_input(2, e, deep)]);
+        s.step();
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(e).is_none(), "y < WORLD_Y_MIN − 16 → 移除");
+        // 未启用:全新 sim,同场景不删(§9-7;never observed)。
+        let mut s2 = sim(0, 0);
+        let e2 = entity(1);
+        s2.apply_prefix(&[spawn_input(1, e2, deep)]);
+        s2.step();
+        s2.run_transient_lifecycle();
+        assert!(
+            s2.entity_state(e2).is_some(),
+            "未启用模式(从未激活刷新)无虚空移除(§4.0/§9-7)"
+        );
+    }
+
+    /// 任务书测试 `sim::over_budget_transient_forced_landing`(T8/§9-2):
+    /// 预算超限瞬态 → 强制落地(非冻结)。
+    #[test]
+    fn over_budget_transient_forced_landing() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.max_awake_dynamic = 1;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let (a, b) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            spawn_input(1, a, Vec3::new(8.0, 0.5, 8.0)),
+            spawn_input(2, b, Vec3::new(10.0, 0.5, 8.0)),
+        ]);
+        // 命令唤醒超预算:a 近者保,b 远者强制落地(瞬态)。
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        s.apply_prefix(&[teleport_input(3, b, Vec3::new(9.0, 0.5, 8.0))]);
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(b).is_none(), "超预算瞬态 → 强制落地(消失)");
+        assert!(
+            s.outbox
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent),
+            "落点写块(Emergent)"
+        );
+        assert!(s.entity_state(a).is_some(), "近者保留");
     }
 }

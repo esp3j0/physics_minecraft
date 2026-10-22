@@ -253,7 +253,7 @@ impl ActivationController {
         tickets: &[crate::tickets::TicketView],
         loaded: &[ChunkPos],
         collider_loaded: &[ChunkPos],
-        entities: &[(EntityId, Vec3, bool)],
+        entities: &[(EntityId, Vec3, bool, bool)],
         now: Tick,
         region: ChunkRegion,
         blocked: &BTreeSet<ChunkPos>,
@@ -507,7 +507,7 @@ impl ActivationController {
         // 判定口径:任一中心 ≤ 该中心 load → 进;所有中心 > 各自 unload → 出;
         // 混合滞回带(多中心带宽重叠才出现)保持。仅观察者票时
         // (load/unload = cfg.awake_* 同源)与任务 01 数值等价。
-        for &(id, pos, frozen) in entities {
+        for &(id, pos, frozen, actor) in entities {
             let dist =
                 nearest_observer_distance(&wake_centers, pos, false).unwrap_or(f32::INFINITY);
             let inside = wake_specs
@@ -516,10 +516,16 @@ impl ActivationController {
             let outside = wake_specs
                 .iter()
                 .all(|(c, _, unload_m)| (*c - pos).length() > *unload_m);
-            let (wake_it, freeze_it) = match (inside, outside) {
-                (true, _) => (frozen, false),
-                (false, true) => (false, !frozen),
-                (false, false) => (false, false), // 滞回带:保持
+            // 任务 03/细则 13:瞬态体从滞回冻结路径整体移除(持瞬态运动票,
+            // 到期/超预算走强制落地);常驻滞回冻结(04 完整:静止前置)。
+            let (wake_it, freeze_it) = if !actor {
+                (frozen && inside, false)
+            } else {
+                match (inside, outside) {
+                    (true, _) => (frozen, false),
+                    (false, true) => (false, !frozen),
+                    (false, false) => (false, false), // 滞回带:保持
+                }
             };
             if !frozen {
                 awake.push((id, dist));
@@ -759,8 +765,8 @@ mod tests {
             &[],
             &[],
             &[
-                (eid(1), Vec3::new(33.0, 0.0, 8.0), false),
-                (eid(2), Vec3::new(33.0, 0.0, 8.0), true),
+                (eid(1), Vec3::new(33.0, 0.0, 8.0), false, true),
+                (eid(2), Vec3::new(33.0, 0.0, 8.0), true, true),
             ],
             Tick::ZERO,
             wide_region(),
@@ -978,9 +984,9 @@ mod tests {
             &[],
             &[],
             &[
-                (e1, Vec3::new(5.0, 0.0, 0.0), true),
-                (e2, Vec3::new(15.0, 0.0, 0.0), true),
-                (e3, Vec3::new(20.0, 0.0, 0.0), true),
+                (e1, Vec3::new(5.0, 0.0, 0.0), true, true),
+                (e2, Vec3::new(15.0, 0.0, 0.0), true, true),
+                (e3, Vec3::new(20.0, 0.0, 0.0), true, true),
             ],
             Tick::ZERO,
             wide_region(),
@@ -993,9 +999,9 @@ mod tests {
             &[],
             &[],
             &[
-                (e1, Vec3::new(5.0, 0.0, 0.0), false),
-                (e2, Vec3::new(15.0, 0.0, 0.0), false),
-                (e3, Vec3::new(20.0, 0.0, 0.0), false),
+                (e1, Vec3::new(5.0, 0.0, 0.0), false, true),
+                (e2, Vec3::new(15.0, 0.0, 0.0), false, true),
+                (e3, Vec3::new(20.0, 0.0, 0.0), false, true),
             ],
             Tick(1),
             wide_region(),
@@ -1025,8 +1031,8 @@ mod tests {
             &[],
             &[],
             &[
-                (near, Vec3::new(5.0, 0.0, 0.0), false),
-                (far, Vec3::new(100.0, 0.0, 0.0), false),
+                (near, Vec3::new(5.0, 0.0, 0.0), false, true),
+                (far, Vec3::new(100.0, 0.0, 0.0), false, true),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1048,7 +1054,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(near, Vec3::new(5.0, 0.0, 0.0), false)],
+            &[(near, Vec3::new(5.0, 0.0, 0.0), false, true)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1069,9 +1075,9 @@ mod tests {
             &[],
             &[],
             &[
-                (near, Vec3::new(5.0, 0.0, 0.0), false),
-                (eid(3), Vec3::new(15.0, 0.0, 0.0), false),
-                (eid(4), Vec3::new(20.0, 0.0, 0.0), false),
+                (near, Vec3::new(5.0, 0.0, 0.0), false, true),
+                (eid(3), Vec3::new(15.0, 0.0, 0.0), false, true),
+                (eid(4), Vec3::new(20.0, 0.0, 0.0), false, true),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1095,7 +1101,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true)],
+            &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true, true)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1105,7 +1111,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false)],
+            &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false, true)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1115,8 +1121,8 @@ mod tests {
         // 完整滞回弧。
         let mut c = ActivationController::new(ActivationConfig::default());
         let e = eid(1);
-        let near = (e, Vec3::new(20.0, 0.0, 0.0), true);
-        let far = (e, Vec3::new(40.0, 0.0, 0.0), false);
+        let near = (e, Vec3::new(20.0, 0.0, 0.0), true, true);
+        let far = (e, Vec3::new(40.0, 0.0, 0.0), false, true);
         let d = c.plan(
             &obs_tickets(&obs),
             &[],
@@ -1229,8 +1235,8 @@ mod tests {
             ChunkPos::new(3, 1),
         ];
         let ents = [
-            (e1, Vec3::new(8.0, 0.0, 8.0), true), // 冻、距 ≈11.3 ≤ 24 → 唤
-            (e2, Vec3::new(100.0, 0.0, 0.0), false), // 醒、距 100 > 32 → 冻
+            (e1, Vec3::new(8.0, 0.0, 8.0), true, true), // 冻、距 ≈11.3 ≤ 24 → 唤
+            (e2, Vec3::new(100.0, 0.0, 0.0), false, true), // 醒、距 100 > 32 → 冻
         ];
         let mut c = ActivationController::new(ActivationConfig::default());
         // REQ-007 任务 01:plan 需要 ①/② 两档状态输入;调用方执行决策后把

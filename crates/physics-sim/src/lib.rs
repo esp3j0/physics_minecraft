@@ -21,7 +21,10 @@ mod conv;
 mod solidify;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
-pub use sim::{BlockWrite, BlockWriteKind, Outbox, ShardSim, ShardSimConfig, SolidifyConfig};
+pub use sim::{
+    BlockWrite, BlockWriteKind, LocomotionState, Outbox, ShardSim, ShardSimConfig, SolidifyConfig,
+    TicketOp, TicketOpRecord,
+};
 pub use snapshot::SimSnapshotError;
 pub use tickets::{
     AreaId, RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, TicketView, WakeSpec,
