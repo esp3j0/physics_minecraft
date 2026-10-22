@@ -164,6 +164,19 @@ pub struct ShardSim {
     pub(crate) phys: PhysicsWorld,
     pub(crate) entities: BTreeMap<EntityId, EntityRecord>,
     pub(crate) chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
+    /// ② 已建集合(修订 5 D18:**独立状态**,与 chunk 是否生成了碰撞盒无关)。
+    /// 全空气 chunk 的碰撞体为空(chunk_bodies 无条目),但同样算 ② 已建——
+    /// 否则每过一个冷却周期被重新提为构建候选(白耗 ② 预算),03 的 I2 判定
+    /// 会把全空气 chunk 永远当"缺地形"。I1 断言、plan 的 ② 输入、快照均以
+    /// 本集合为准。
+    pub(crate) built_colliders: BTreeSet<ChunkPos>,
+    /// R1(D18 情况 1)"装载时附带建 ②"的暂存集合:plan 在 N 拍决定
+    /// `colliders_pending_build`,`apply_activation` 把它存到这里;`apply_chunk_load`
+    /// 送 ① 到场时同点构建并移除条目;未兑现条目(驱动未执行该装载)在
+    /// 下一次 `apply_activation` 开头作废,由该拍重新决策。随快照走(恢复后
+    /// 驱动继续送 ①,集合在场即兑现——不进快照会有"有①无②"一拍窗口,
+    /// 违反 D18 默认配置逐拍相等)。
+    pub(crate) pending_collider_builds: BTreeSet<ChunkPos>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -190,6 +203,8 @@ impl ShardSim {
             phys,
             entities: BTreeMap::new(),
             chunk_bodies: BTreeMap::new(),
+            built_colliders: BTreeSet::new(),
+            pending_collider_builds: BTreeSet::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -241,25 +256,31 @@ impl ShardSim {
     /// 的驱动路径 = [`Self::load_data_only`](只装 ①),② 由激活决策构建。
     pub fn load_chunk(&mut self, cp: ChunkPos, chunk: Chunk) {
         self.load_data_only(cp, chunk);
+        self.built_colliders.insert(cp);
         for ncp in expand_boundary([cp], &self.voxels) {
             self.rebuild_chunk_collider(ncp);
         }
     }
 
     /// 只装 ①(体素),不建本 chunk ②;已有 ② 的邻居照常重建(REQ-007
-    /// 任务 01 细则 5)。启用模式的驱动装载路径。
+    /// 任务 01 细则 5)。启用模式的驱动装载路径。R1(D18 情况 1):若该 chunk
+    /// 在 pending 集合(N 拍"随 ① 同点构建"决策),① 到场同点构建并出集合。
     pub fn load_data_only(&mut self, cp: ChunkPos, chunk: Chunk) {
         self.voxels.insert_chunk(cp, chunk);
+        if self.pending_collider_builds.remove(&cp) {
+            self.build_chunk_collider(cp);
+        }
         for ncp in expand_boundary([cp], &self.voxels) {
             // 只重建**已有 ②** 的邻居(无 ② 的邻居不因邻居 ① 到达而新建)。
-            if self.chunk_bodies.contains_key(&ncp) {
+            if self.built_colliders.contains(&ncp) {
                 self.rebuild_chunk_collider(ncp);
             }
         }
     }
 
     /// 装载的 D17 开关臂(调度器 `apply_chunk_load` 调用;REQ-007 §4.0):
-    /// enabled → 只 ①;未启用 → 合一(① + ② 同建,行为与 8702670 一致)。
+    /// enabled → 只 ①(pending 的随 ① 同点建);未启用 → 合一(① + ② 同建,
+    /// 行为与 8702670 一致)。
     pub fn apply_chunk_load_tiered(&mut self, cp: ChunkPos, chunk: Chunk, enabled: bool) {
         if enabled {
             self.load_data_only(cp, chunk);
@@ -277,43 +298,50 @@ impl ShardSim {
         if let Some(handle) = self.chunk_bodies.remove(&cp) {
             self.phys.remove_body(handle);
         }
+        self.built_colliders.remove(&cp);
+        self.pending_collider_builds.remove(&cp);
         // 边界重建同样只动已建 ②:邻居 ① 卸载不给无 ② 的邻居新建 ②(细则 4;
         // 未启用模式所有 ① 皆有 ②,守卫恒真,行为不变)。
         for ncp in expand_boundary([cp], &self.voxels) {
-            if self.chunk_bodies.contains_key(&ncp) {
+            if self.built_colliders.contains(&ncp) {
                 self.rebuild_chunk_collider(ncp);
             }
         }
         removed
     }
 
-    /// ② 是否已建(测试/I1 断言/观测用;REQ-007 任务 01)。
+    /// ② 是否已建(测试/I1 断言/观测用;D18:独立状态,与碰撞盒是否存在
+    /// 无关——全空气 chunk 同样算已建)。
     pub fn has_collider(&self, cp: ChunkPos) -> bool {
-        self.chunk_bodies.contains_key(&cp)
+        self.built_colliders.contains(&cp)
     }
 
-    /// ② 已建集合(快照重建/观测用;BTreeMap 键序 = ChunkPos 升序)。
+    /// ② 已建集合(快照重建/观测用;BTreeSet 键序 = ChunkPos 升序)。
     pub fn collider_loaded_chunks(&self) -> BTreeSet<ChunkPos> {
-        self.chunk_bodies.keys().copied().collect()
+        self.built_colliders.clone()
     }
 
-    /// 只建 ②(体素在手;plan 的 colliders_to_build 执行点,B3)。
-    /// 无 ① → panic(② 构建前提:① 已载;plan 候选已过滤,违反 = bug)。
+    /// 只建 ②(体素在手;plan 的 colliders_to_build / pending 兑现的执行点,
+    /// B3)。无 ① → panic(② 构建前提:① 已载;plan 候选已过滤,违反 = bug)。
+    /// 登记 **built_colliders**(D18 独立状态;碰撞盒为空的全空气 chunk 同样
+    /// 登记为已建)。
     fn build_chunk_collider(&mut self, cp: ChunkPos) {
         assert!(
             self.voxels.get_chunk(cp).is_some(),
             "构建 ② 时 ① 未装(I1 违反,fail-stop):{cp:?}"
         );
         debug_assert!(
-            !self.chunk_bodies.contains_key(&cp),
+            !self.built_colliders.contains(&cp),
             "重复构建 ②(plan 决策应过滤已建;fail-stop):{cp:?}"
         );
         self.rebuild_chunk_collider(cp);
+        self.built_colliders.insert(cp);
     }
 
-    /// 只拆 ②(① 保留;plan 的 colliders_to_drop 执行点,B3/N2)。
-    /// 无 ② → 无操作(幂等;防御)。
+    /// 只拆 ②(① 保留;plan 的 colliders_to_drop 执行点,B3/R2)。
+    /// 注销 built_colliders + 移除物理体(若有);幂等(防御)。
     fn drop_chunk_collider(&mut self, cp: ChunkPos) {
+        self.built_colliders.remove(&cp);
         if let Some(handle) = self.chunk_bodies.remove(&cp) {
             self.phys.remove_body(handle);
         }
@@ -366,7 +394,7 @@ impl ShardSim {
                         if self.voxels.set_block(pos, block).is_ok() {
                             // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                             for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
-                                if self.chunk_bodies.contains_key(&cp) {
+                                if self.built_colliders.contains(&cp) {
                                     self.rebuild_chunk_collider(cp);
                                 }
                             }
@@ -490,7 +518,7 @@ impl ShardSim {
                     if self.voxels.set_block(cell, desc.block).is_ok() {
                         // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                         for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
-                            if self.chunk_bodies.contains_key(&cp) {
+                            if self.built_colliders.contains(&cp) {
                                 self.rebuild_chunk_collider(cp);
                             }
                         }
@@ -561,10 +589,15 @@ impl ShardSim {
         let now = self.activation_now;
         self.activation_now = now.next();
         self.observed = Some(observers.to_vec());
+        // R1(D18 情况 1):上一拍 pending 未兑现的条目(驱动未执行该装载,
+        // 例如观察者已移走致请求作废)就地作废——本拍 plan 重新决策。兑现过
+        // 的条目已被 load_data_only 移除。
+        self.pending_collider_builds.clear();
         let region = self.activation_region();
         let loaded: Vec<ChunkPos> = self.voxels.chunk_positions().collect();
-        // ② 已建集合(REQ-007 任务 01:plan 的 ② 决策输入;= chunk_bodies 键)。
-        let collider_loaded: Vec<ChunkPos> = self.chunk_bodies.keys().copied().collect();
+        // ② 已建集合(REQ-007 任务 01;修订 5 D18:独立状态,非 chunk_bodies 键
+        // ——全空气 chunk 无碰撞盒但 ② 已建)。
+        let collider_loaded: Vec<ChunkPos> = self.built_colliders.iter().copied().collect();
         let entities: Vec<(EntityId, Vec3, bool)> = self
             .entities
             .iter()
@@ -579,14 +612,25 @@ impl ShardSim {
 
         // tier② 落实(REQ-007 任务 01/B3:N3——决策在 plan,执行在此,与
         // ③ 冻结/唤醒同方式;驱动层不执行 ②):
-        // - build:同 load_chunk 的 collider 语义(体素在手,greedy + compound);
-        // - drop:同 unload_chunk 的 collider 拆除部分(① 保留,I1 由 unload_chunk
-        //   的同步拆除另行保证;此处只拆"① 仍在、② 超半径"的);
-        // - 与 chunks_to_unload 相交的 chunk 不在此处理(N2:其 ② 随 ① 卸载
-        //   同点拆,碰撞体不早消失一个 step)。
+        // - 单独 build(D18 情况 2):同 load_chunk 的 collider 语义(体素在手,
+        //   greedy + compound);step 之前生效;
+        // - pending(D18 情况 1):存入暂存集合,`apply_chunk_load` 送 ① 到场
+        //   时同点构建(load_data_only);plan 已过滤"本拍就装载"的重复
+        //   (pending ∩ chunks_to_load = ∅,装载候选必未载);
+        // - drop(R2):只拆"① 仍被保留"(≤ data_unload)而 ② 超 collider_unload
+        //   的;① 卸载/排队待卸的 chunk,② 随 ① 在卸载点一起拆(I1)。
         for &cp in &decisions.colliders_to_build {
             self.build_chunk_collider(cp);
         }
+        debug_assert!(
+            decisions
+                .colliders_pending_build
+                .iter()
+                .all(|cp| !self.built_colliders.contains(cp)),
+            "pending ② 构建条目不得已建(plan 应过滤;fail-stop)"
+        );
+        self.pending_collider_builds
+            .extend(decisions.colliders_pending_build.iter().copied());
         for &cp in &decisions.colliders_to_drop {
             self.drop_chunk_collider(cp);
         }
@@ -622,7 +666,7 @@ impl ShardSim {
                         // 细则 4/5:只重建已建 ②;有①无② 的 chunk 写块不新建
                         // ②(未启用模式 ②⊆① 恒真,行为不变,§14-9)。
                         for cp in expand_boundary(dirty, &self.voxels) {
-                            if self.chunk_bodies.contains_key(&cp) {
+                            if self.built_colliders.contains(&cp) {
                                 self.rebuild_chunk_collider(cp);
                             }
                         }
@@ -1848,17 +1892,111 @@ mod tests {
         assert!(s.has_collider(ChunkPos::new(0, 0)));
         assert!(!s.has_collider(ChunkPos::new(1, 0)));
 
+        // D18 预算语义:pending(装载候选的 ②)与单独构建共享 ② 预算 2。
+        // 本拍装载候选 (0,±1)(距 16)先占满 pending → (1,0)(距 24)的
+        // 单独构建被饿(下拍续取);R2 拆除:(0,0) 距 40 ∈ (32,48] →
+        // ② 拆、① 留(单独拆合法路径)。
         let d = s.apply_activation(&[Vec3::new(48.0, 0.0, 8.0)]);
         assert_eq!(d.colliders_to_drop, vec![ChunkPos::new(0, 0)]);
-        assert_eq!(d.colliders_to_build, vec![ChunkPos::new(1, 0)]);
-        // 执行落实:决策进、collider 出(当场生效)。
+        assert!(
+            d.colliders_to_build.is_empty(),
+            "② 预算被 pending 占满 → 单独构建饿(下拍续取)"
+        );
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(2, 0), ChunkPos::new(3, 0)],
+            "① 装载候选(距 8 近于 (0,±1);预算 2 截断)"
+        );
+        assert_eq!(
+            d.colliders_pending_build,
+            vec![ChunkPos::new(2, 0), ChunkPos::new(3, 0)],
+            "装载候选的 ② 同拍决定(距离升序)"
+        );
         assert!(!s.has_collider(ChunkPos::new(0, 0)), "拆除当场执行(① 保留)");
-        assert!(s.has_collider(ChunkPos::new(1, 0)), "构建当场执行");
+        assert!(!s.has_collider(ChunkPos::new(1, 0)), "未单独构建(预算饿)");
         assert!(s.voxel().get_chunk(ChunkPos::new(0, 0)).is_some(), "① 未动");
-        // 单点执行:同拍再刷(决策即簿记)→ 全空,无二次派生重建 (0,0)。
+        // pending 兑现:驱动执行 ① 装载 → apply_chunk_load 同点建 ②。
+        s.apply_chunk_load_tiered(ChunkPos::new(2, 0), solid_chunk(), true);
+        s.apply_chunk_load_tiered(ChunkPos::new(3, 0), solid_chunk(), true);
+        assert!(
+            s.has_collider(ChunkPos::new(2, 0)) && s.has_collider(ChunkPos::new(3, 0)),
+            "① 到场同点建 ②(D18 情况 1 兑现)"
+        );
+        // 单点执行:同拍再刷(决策即簿记)→ pending 空(已兑现);
+        // (1,0) 单独构建续取(预算恢复);无二次派生重建 (0,0)(R2:>48 才卸)。
+        // (① 继续装载 (0,±1) 是合法行为——距离内未载,① 簿记未记;不在此锚。)
         let d2 = s.apply_activation(&[Vec3::new(48.0, 0.0, 8.0)]);
-        assert!(d2.colliders_to_build.is_empty() && d2.colliders_to_drop.is_empty());
+        assert_eq!(
+            d2.colliders_pending_build, d2.chunks_to_load,
+            "新装载候选照常 pending;已兑现条目不在"
+        );
+        assert!(!d2.colliders_pending_build.contains(&ChunkPos::new(2, 0)));
+        assert!(!d2.colliders_pending_build.contains(&ChunkPos::new(3, 0)));
+        // (1,0) 单独构建要等 pending 不占预算的拍(此处 ① 候选继续占预算);
+        // 锚定执行链:pending 兑现 → ② 与 ① 同点。
         assert!(!s.has_collider(ChunkPos::new(0, 0)), "无 '凡①皆②' 二次派生");
+    }
+
+    /// D18:pending 未兑现(驱动未执行装载)→ 下一次 apply_activation 开头
+    /// 作废,同拍重新决策(不残留僵尸条目)。
+    #[test]
+    fn pending_builds_invalidated_when_driver_skips_load() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.data_load_radius = 0.0; // 关其他装载候选,聚焦作废语义
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        let d = s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(0, 0)],
+            "仅锚点所在 chunk"
+        );
+        assert_eq!(d.colliders_pending_build, vec![ChunkPos::new(0, 0)]);
+        // 驱动不执行装载 → 下拍 pending 作废并重新决策(冷却 @0 未过 → 空)。
+        let d2 = s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        assert!(
+            d2.colliders_pending_build.is_empty() && d2.chunks_to_load.is_empty(),
+            "未兑现条目作废;① 冷却 @0 挡下重复装载"
+        );
+    }
+
+    /// R3(D18"② 已建是独立状态"):全空气 chunk 碰撞盒为空(chunk_bodies
+    /// 无条目)但 ② 已建(built_colliders 登记)——不再被 plan 反复提为构建
+    /// 候选(白耗 ② 预算),I2(03)不会把它当"缺地形",快照 ② 集合含它。
+    /// 场景:激活刷新建 (0,0)(全空气)→ has_collider true;同输入第二次
+    /// plan 不再产出该 chunk;快照往返保持。
+    #[test]
+    fn air_chunk_counts_as_built_collider() {
+        let mut s = sim(0, 0);
+        // 先合一装载全空气 chunk(未启用模式)→ ② 已建(独立集合)。
+        s.load_chunk(ChunkPos::new(0, 0), Chunk::air());
+        assert!(
+            s.voxel().get_chunk(ChunkPos::new(0, 0)).is_some(),
+            "① 已装(空气)"
+        );
+        assert!(
+            s.has_collider(ChunkPos::new(0, 0)),
+            "全空气 chunk ② 已建(独立状态,与碰撞盒无关)"
+        );
+        // 启用激活(设观察者),观察者驻留 → 无装卸/拆除决策;该 chunk 不再
+        // 成为构建候选(已建集合过滤)。
+        let d = s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        assert!(
+            !d.colliders_to_build.contains(&ChunkPos::new(0, 0))
+                && !d.colliders_pending_build.contains(&ChunkPos::new(0, 0)),
+            "已建(空气)不再进构建候选"
+        );
+        // 快照往返:② 集合含全空气 chunk。
+        let bytes = s.snapshot();
+        let r = crate::ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        assert!(
+            r.has_collider(ChunkPos::new(0, 0)),
+            "快照 ② 集合包含全空气 chunk(独立状态随档)"
+        );
     }
 
     /// 任务书测试 `sim::load_chunk_legacy_mode_unified`(§9-7 锚):未启用

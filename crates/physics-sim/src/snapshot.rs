@@ -18,6 +18,8 @@ use voxel::BlockRegistry;
 use crate::activation::ActivationController;
 use crate::sim::{Outbox, ShardSim, ShardSimConfig};
 use rapier3d::prelude::*;
+use std::collections::BTreeSet;
+
 use types::{ChunkPos, EntityDesc, EntityId, Tick};
 
 /// 快照层可预期失败:残缺/错误字节(一致性违规仍走 panic,蓝图 §4)。
@@ -39,6 +41,13 @@ struct ShardSimSnapshot {
     phys: PhysicsWorld,
     entities: BTreeMap<EntityId, SnapshotEntityRecord>,
     chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
+    /// ② 已建集合(修订 5 D18 独立状态;与 chunk_bodies 分离——全空气 chunk
+    /// 无碰撞盒但 ② 已建)。
+    built_colliders: BTreeSet<ChunkPos>,
+    /// R1"装载时附带建 ②"暂存集合(N 拍决策、apply_chunk_load 兑现;未兑现
+    /// 下次 apply_activation 作废)。随快照走:恢复后驱动继续送 ①,集合在场
+    /// 即兑现——不进快照会有"有①无②"一拍窗口,违反 D18 逐拍相等。
+    pending_collider_builds: BTreeSet<ChunkPos>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -109,6 +118,8 @@ impl ShardSim {
                 })
                 .collect(),
             chunk_bodies: self.chunk_bodies.clone(),
+            built_colliders: self.built_colliders.clone(),
+            pending_collider_builds: self.pending_collider_builds.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -152,6 +163,8 @@ impl ShardSim {
             phys,
             entities,
             chunk_bodies: snap.chunk_bodies,
+            built_colliders: snap.built_colliders,
+            pending_collider_builds: snap.pending_collider_builds,
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,
@@ -380,6 +393,7 @@ mod tests {
         let cfg_a = ShardSimConfig {
             activation: crate::ActivationConfig {
                 collider_unload_radius: 32.0,
+                data_load_radius: 0.0, // 关装载候选 → pending 恒空,聚焦单独构建/拆除
                 ..crate::ActivationConfig::default()
             },
             ..cfg()
@@ -435,6 +449,33 @@ mod tests {
             last.colliders_to_build,
             vec![types::ChunkPos::new(0, 0)],
             "冷却满 → 构建决策重现(策略未随快照冻结)"
+        );
+
+        // ---- 场景 A′:R1 pending 集合随档(恢复后驱动送 ① 当场兑现)----
+        let cfg_p = ShardSimConfig {
+            activation: crate::ActivationConfig {
+                data_load_radius: 0.0, // 只有锚点所在 chunk 是装载候选
+                ..crate::ActivationConfig::default()
+            },
+            ..cfg()
+        };
+        let mut c = ShardSim::new(cfg_p, Box::new(SimpleRegistry::builtin()));
+        let dp = c.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        assert_eq!(dp.chunks_to_load, vec![types::ChunkPos::new(0, 0)]);
+        assert_eq!(
+            dp.colliders_pending_build,
+            vec![types::ChunkPos::new(0, 0)],
+            "N 拍 pending 决策"
+        );
+        let bytes_p = c.snapshot();
+        let mut r = ShardSim::restore(&bytes_p, Box::new(SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        // 恢复实例上驱动送 ① → pending 兑现(同点建 ②)。若 pending 不入快照,
+        // 这里 has_collider 为 false = "有①无②"一拍窗口,违反 D18。
+        r.load_data_only(types::ChunkPos::new(0, 0), solid.clone());
+        assert!(
+            r.has_collider(types::ChunkPos::new(0, 0)),
+            "pending 随快照:恢复后 ① 到场当场兑现 ②(D18 逐拍相等)"
         );
 
         // ---- 场景 B:① 侧簿记(同法)----

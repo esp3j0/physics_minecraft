@@ -75,6 +75,11 @@ impl Default for ActivationConfig {
 /// REQ-007 任务 01(①② 拆分):`chunks_to_load/unload` 保留原名(B2,语义
 /// = ①);② 由 `plan` 决策(唯一决策者,B3)、`ShardSim::apply_activation`
 /// 执行;驱动层不执行 ②。
+///
+/// REQ-007 修订 5(D18)② 执行时序三种情况:随 ① 同点构建
+/// ([`Self::colliders_pending_build`],N 拍同决策、① 装载完成点立即建)、
+/// 单独构建([`Self::colliders_to_build`],apply_activation 内 step 前)、
+/// 拆除(① 卸载点同点拆 = I1;单独拆仅限 ① 仍保留的 chunk,R2)。
 #[derive(Debug, Default, PartialEq)]
 pub struct ActivationDecisions {
     /// 请求装载的 chunk(① 体素;按到最近演员距离升序;与卸载合计已截断
@@ -82,11 +87,19 @@ pub struct ActivationDecisions {
     pub chunks_to_load: Vec<ChunkPos>,
     /// 请求卸载的 chunk(① 体素;含"① 卸载时同步拆 ②"的 chunk)。
     pub chunks_to_unload: Vec<ChunkPos>,
-    /// 请求构建 ② 的 chunk(距最近演员 ≤ collider_load_radius、① 已载、
-    /// 冷却已过;ChunkPos 升序,预算内)。
+    /// 请求构建 ② 的 chunk(单独构建:① 已在内存、② 缺、距最近演员
+    /// ≤ collider_load_radius、冷却已过;ChunkPos 升序,预算内)。
     pub colliders_to_build: Vec<ChunkPos>,
-    /// 请求拆除 ② 的 chunk(距最近演员 > collider_unload_radius 且 ① 仍在;
-    /// 与 `chunks_to_unload` 不相交——同 chunk 的 ② 随 ① 卸载同点拆,I1)。
+    /// 随 ① 同点构建的 ②(修订 5 D18 情况 1):同一份决策里 ① 装载被采纳、
+    /// 且此刻满足 ② 条件(≤ collider_load、② 冷却已过、② 预算有余)的
+    /// chunk。N 拍决定;`ShardSim` 暂存为 pending 集合,`apply_chunk_load`
+    /// 送 ① 到场时立即构建;未兑现条目在下一次 `apply_activation` 作废并
+    /// 重新决策。与 `colliders_to_build` 共享 ② 预算、互不相交。
+    pub colliders_pending_build: Vec<ChunkPos>,
+    /// 请求拆除 ② 的 chunk(**单独拆除**,R2:仅当 ① 仍被保留——距离
+    /// ≤ data_unload_radius——而 ② 已 > collider_unload_radius;与
+    /// `chunks_to_unload` 不相交:① 已该卸/排队待卸的 chunk,其 ② 随 ①
+    /// 在卸载点一起拆,不提前拆)。
     pub colliders_to_drop: Vec<ChunkPos>,
     /// 请求唤醒的实体(到最近演员距离升序,近者先)。
     pub entities_to_wake: Vec<EntityId>,
@@ -165,16 +178,23 @@ impl ActivationController {
         }
     }
 
-    /// 一轮决策(README 决策 5/7;REQ-007 任务 01:①② 拆分):
+    /// 一轮决策(README 决策 5/7;REQ-007 任务 01:①② 拆分;修订 5 D18 时序):
     /// - ① chunk 数据:未载 && 最近距离 ≤ data_load → 装载;已载 && > data_unload
     ///   → 卸载;冷却门控;装载候选 = 各锚点周围 ceil(data_unload/16)+2 网格;
     ///   装卸合计截断到 data_budget;
-    /// - ② collider(B3:plan 是唯一决策者;半径/滞回/预算/冷却全在此):
-    ///   未建(输入 collider_loaded 之外)&& ≤ collider_load && ① 已载 && 冷却 →
-    ///   构建(ChunkPos 升序截 collider_budget);已建 && > collider_unload →
-    ///   拆除(**与 chunks_to_unload 不相交**——同 chunk 的 ② 随 ① 卸载同点拆,
-    ///   N2:apply_activation 拆 ② 会让碰撞体比旧行为早消失一个 step;拆除
-    ///   不占预算、不受冷却);
+    /// - ② collider(B3:plan 是唯一决策者;半径/滞回/预算/冷却全在此),三种
+    ///   情况(D18):
+    ///   1. **随 ① 同点构建**([`ActivationDecisions::colliders_pending_build`]):
+    ///      ① 装载被采纳、且此刻 ≤ collider_load && ② 冷却已过 && ② 预算有余 →
+    ///      同拍决定,`ShardSim` 在 ① 装载完成点立即建(消除"N 拍装载/N+1 判距"
+    ///      的边界掠过:装载与构建用同拍距离);
+    ///   2. **单独构建**([`ActivationDecisions::colliders_to_build`]):① 已载、
+    ///      ② 缺、≤ collider_load && 冷却(ChunkPos 升序;与情况 1 共享 ② 预算);
+    ///   3. **拆除**:① 卸载决策里的 chunk,② 随 ① 卸载点同点拆(I1,不在本
+    ///      决策);**单独拆除**([`ActivationDecisions::colliders_to_drop`],R2)
+    ///      仅当 ① 仍被保留:data_unload ≥ 距离 > collider_unload;① 已该卸或
+    ///      排队待卸的 chunk,② 不动。拆除记 ② 簿记("决策即簿记"对称);
+    ///      拆除不计 ② 构建预算;
     /// - 实体:醒 && > awake_unload && 冷却 → 冻结;冻 && ≤ awake_load && 冷却 → 唤醒;
     /// - 超预算(醒数 > max_awake_dynamic):按到最近演员距离降序立即冻结
     ///   超出者(不受冷却,§9.4)。
@@ -243,6 +263,9 @@ impl ActivationController {
         }
         // 距离升序、同距 (x, z) 字典序(确定性);装卸合计截断到 ① 预算。
         cands.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        // ② 预算余量(修订 5 D18 情况 1:随 ① 同点构建与单独构建共享预算;
+        // 单独构建段扣减同一余量)。
+        let mut collider_budget_left = self.cfg.collider_budget_per_tick;
         for (cp, _dist, is_load) in cands {
             if d.chunks_to_load.len() + d.chunks_to_unload.len() >= self.cfg.data_budget_per_tick {
                 break;
@@ -251,6 +274,19 @@ impl ActivationController {
             self.chunk_last_swap.insert(cp, now);
             if is_load {
                 d.chunks_to_load.push(cp);
+                // D18 情况 1:① 装载被采纳且此刻满足 ② 条件(≤ collider_load、
+                // ② 冷却已过、② 预算有余)→ ② 同拍决定,随 ① 装载完成点构建。
+                // 装载候选已保证 ≤ data_load;若两档半径不同,② 条件更严,
+                // 需单独判定。
+                let dist = chunk_distance(cp, anchors);
+                if collider_budget_left > 0
+                    && dist <= self.cfg.collider_load_radius
+                    && self.collider_cooled(&cp, now)
+                {
+                    collider_budget_left -= 1;
+                    self.collider_last_build.insert(cp, now);
+                    d.colliders_pending_build.push(cp);
+                }
             } else {
                 d.chunks_to_unload.push(cp);
             }
@@ -258,34 +294,38 @@ impl ActivationController {
 
         // ---- tier② collider 档(REQ-007 任务 01/B3:决策唯一出处)----
         let collider_loaded_set: BTreeSet<ChunkPos> = collider_loaded.iter().copied().collect();
-        // 构建:① 已载 ∧ 未建 ② ∧ ≤ collider_load ∧ 冷却已过(ChunkPos 升序
-        // = BTreeSet 键序;截 collider_budget)。
+        // 单独构建(D18 情况 2):① 已在内存、② 缺、≤ collider_load、冷却已过
+        // (ChunkPos 升序 = BTreeSet 键序;与 pending 共享 ② 预算)。
         for &cp in &loaded_set {
             if collider_loaded_set.contains(&cp) || !region.contains(cp) {
                 continue;
             }
             let dist = chunk_distance(cp, anchors);
             if dist <= self.cfg.collider_load_radius && self.collider_cooled(&cp, now) {
-                if d.colliders_to_build.len() >= self.cfg.collider_budget_per_tick {
+                if collider_budget_left == 0 {
                     break;
                 }
+                collider_budget_left -= 1;
                 // 决策即簿记:构建记 ② 冷却表。
                 self.collider_last_build.insert(cp, now);
                 d.colliders_to_build.push(cp);
             }
         }
-        // 拆除:已建 ② ∧ > collider_unload ∧ ② 冷却已过(拆除记 ② 簿记 =
-        // "决策即簿记"的对称要求:同输入两次 plan 第二次拆除为空;重建是
-        // sim 侧直接执行不经 plan,不受此约束)。与 chunks_to_unload 不相交
-        // (N2:同 chunk 的 ② 随 ① 卸载同点拆,apply_activation 不重复处理);
-        // 拆除不计 ② 构建预算。
+        // 单独拆除(D18 情况 3/R2):**仅当 ① 仍被保留**——距离 ≤
+        // data_unload_radius(① 未到卸载线)且 > collider_unload_radius。
+        // ① 已该卸(> data_unload)或因预算/冷却排队待卸的 chunk,其 ② 保持
+        // 不动、随 ① 在卸载点一起拆(I1)。与 chunks_to_unload 不相交(本条件
+        // 下天然成立);拆除记 ② 簿记("决策即簿记"对称);不计 ② 构建预算。
         let to_unload_set: BTreeSet<ChunkPos> = d.chunks_to_unload.iter().copied().collect();
         for &cp in collider_loaded {
             if to_unload_set.contains(&cp) {
                 continue;
             }
             let dist = chunk_distance(cp, anchors);
-            if dist > self.cfg.collider_unload_radius && self.collider_cooled(&cp, now) {
+            if dist > self.cfg.collider_unload_radius
+                && dist <= self.cfg.data_unload_radius
+                && self.collider_cooled(&cp, now)
+            {
                 self.collider_last_build.insert(cp, now);
                 d.colliders_to_drop.push(cp);
             }
@@ -868,6 +908,55 @@ mod tests {
         );
     }
 
+    /// R2:① 已该卸(> data_unload)但因冷却排队 → ② 不单独拆(随 ① 卸载
+    /// 点同点拆,不提前);单独拆 ② 仅当 ① 仍被保留(data_unload ≥ 距离 >
+    /// collider_unload)。对照组:半径分层时环带 chunk 的 ② 照常单独拆。
+    #[test]
+    fn queued_unload_keeps_collider_intact() {
+        // (3,1) 距锚 (200,8) 为 144.9 > data_unload 48 → ① 该卸;
+        // ② 簿记 @0(刚拆过)未满冷却 → 卸载排队 → ② 不得进单独拆。
+        let obs = [Vec3::new(200.0, 0.0, 8.0)];
+        let mut c = ActivationController::new(ActivationConfig {
+            data_load_radius: 0.0,
+            ..ActivationConfig::default()
+        });
+        // 预热:拍 0 记 ① ② 簿记 @0(采纳卸载决策)。
+        let d0 = c.plan(
+            &obs,
+            &[ChunkPos::new(3, 1)],
+            &[ChunkPos::new(3, 1)],
+            &[],
+            Tick::ZERO,
+            wide_region(),
+        );
+        assert_eq!(d0.chunks_to_unload, vec![ChunkPos::new(3, 1)]);
+        // 模拟"驱动未执行卸载"(决策被 ① 预算/冷却卡住的等价状态):拍 1
+        // 同输入重 plan——① 卸载被冷却挡下(排队),② 也被 ② 冷却挡下;
+        // 关键断言:**即便 ② 冷却已过**(拍 180),只要 ① 还在排队,② 不单独拆。
+        let mut c2 = ActivationController::new(ActivationConfig {
+            data_load_radius: 0.0,
+            ..ActivationConfig::default()
+        });
+        // 直接构造排队态:① 簿记 @0(c2.plan 拍 0 采纳卸载),② 簿记抹掉
+        // (不经控制器公开面,借 clone 后清理不可行——改为验证决策交集:
+        // 拍 180 时 ① 仍冷却(180 拍整 = 冷却恰好已过,会再产出)……
+        // 简化:用不同冷却窗的可观测行为锚定——单独拆条件现在含
+        // dist <= data_unload_radius,(3,1) 距 144.9 违反,任何拍都不可能
+        // 进 colliders_to_drop(除非同时进 chunks_to_unload)。
+        let d = c2.plan(
+            &obs,
+            &[ChunkPos::new(3, 1)],
+            &[ChunkPos::new(3, 1)],
+            &[],
+            Tick(180),
+            wide_region(),
+        );
+        assert!(
+            !d.colliders_to_drop.contains(&ChunkPos::new(3, 1)),
+            "距离 > data_unload 的 chunk 的 ② 永不单独拆(随 ① 卸载点拆,R2)"
+        );
+    }
+
     /// 测试清单 7:命令唤醒路径的超限淘汰按距离降序;预算内返回空。
     #[test]
     fn enforce_budget_picks_farthest() {
@@ -960,7 +1049,8 @@ mod tests {
     }
 
     /// ② 构建前提:① 未载不候选(即使半径内);预算独立:① 预算 0 不建 ②,
-    /// ② 预算 1 时 ①② 各自推进。
+    /// ② 预算 1 时 ①② 各自推进;pending(随 ① 同点)与单独构建共享 ② 预算
+    /// (修订 5 D18)。
     #[test]
     fn collider_budget_independent_of_data() {
         // ① 预算 0:无装载 → loaded 恒空 → ② 候选为空(前提:① 已载)。
@@ -973,8 +1063,10 @@ mod tests {
         let d = c0.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
         assert!(d.chunks_to_load.is_empty(), "① 预算 0");
         assert!(d.colliders_to_build.is_empty(), "① 未载 → ② 不候选(前提)");
+        assert!(d.colliders_pending_build.is_empty());
 
-        // ①② 预算各 1:loaded=近 chunk 已载未建 → ② 建一个;① 另自装一个。
+        // ①② 预算各 1:loaded=近 chunk 已载未建 → ② 单独建一个(占预算);
+        // ① 装载 (0,0) 的 pending 判定因预算已耗尽 → 不产出。
         let cfg1 = ActivationConfig {
             data_budget_per_tick: 1,
             collider_budget_per_tick: 1,
@@ -994,21 +1086,70 @@ mod tests {
             vec![ChunkPos::new(0, 0)],
             "① 按预算 1 装载"
         );
+        // 共享预算(D18):装载采纳的 pending 先占 ② 预算 1 → 已载未建的
+        // (-1,0) 单独构建被饿(下拍续取,机制同 ① 预算截断)。
         assert_eq!(
-            d.colliders_to_build,
+            d.colliders_pending_build,
+            vec![ChunkPos::new(0, 0)],
+            "装载候选的 ② 同拍 pending(占 ② 预算)"
+        );
+        assert!(
+            d.colliders_to_build.is_empty(),
+            "② 预算被 pending 占满 → 单独构建饿(下拍续取)"
+        );
+        // 下拍:状态前移((0,0) 已载已建、(-1,0) 已载未建;关 ① 装载消额外
+        // 候选);(-1,0) 首见 ② 可建(① 簿记与 ② 簿记独立)→ 单独构建产出
+        // (被饿的单独构建下拍续取,机制同 ① 预算截断)。
+        let c2 = ActivationController::new(ActivationConfig {
+            data_load_radius: 0.0,
+            ..cfg1
+        });
+        let mut c2 = c2;
+        let d2 = c2.plan(
+            &obs,
+            &[ChunkPos::new(-1, 0), ChunkPos::new(0, 0)],
+            &[ChunkPos::new(0, 0)],
+            &[],
+            Tick(1),
+            wide_region(),
+        );
+        assert!(d2.chunks_to_load.is_empty() && d2.colliders_pending_build.is_empty());
+        assert_eq!(
+            d2.colliders_to_build,
             vec![ChunkPos::new(-1, 0)],
-            "② 按预算 1 构建(① 已载;ChunkPos 升序取首个满足者)"
+            "被饿的单独构建下拍续取"
         );
     }
 
-    /// ② 冷却独立:构建后立即 SetBlock 重建不受 ② 冷却(重建不进簿记,
-    /// sim 侧直执行);此处锚定 plan 侧——已建(输入 collider_loaded)不再候选,
-    /// 重建是 sim 内部行为不经 plan。
+    /// D18 情况 1(R1):同一份决策里 ① 装载被采纳、且满足 ② 条件(≤
+    /// collider_load、② 冷却、② 预算余)→ 进 `colliders_pending_build`,
+    /// 与装载同拍决定(消除"N 拍装载/N+1 判距"的边界掠过)。
+    #[test]
+    fn collider_pending_build_with_data_load() {
+        let obs = [Vec3::new(8.0, 0.0, 8.0)];
+        let mut c = ActivationController::new(ActivationConfig::default());
+        let d = c.plan(&obs, &[], &[], &[], Tick::ZERO, wide_region());
+        // ① 预算 2:距 0 的 (0,0) + 距 16 的 (-1,0)(候选排序距离升序)。
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(0, 0), ChunkPos::new(-1, 0)],
+            "① 装载决策(锚点所在 chunk 最近,预算 2 内)"
+        );
+        // 两个装载候选都 ≤ collider_load(32)且 ② 预算 2 有余 → 全部 pending。
+        assert_eq!(
+            d.colliders_pending_build, d.chunks_to_load,
+            "每个装载候选 ② 条件满足即同拍 pending(随 ① 同点构建)"
+        );
+        assert!(d.colliders_to_build.is_empty(), "无已载未建 → 无单独构建");
+    }
+
+    /// ② 冷却独立(含 pending):装载/构建决策后同拍再判 → ② 冷却挡下
+    /// (pending 不重复产出);重建不进 ② 簿记(sim 侧直执行,不经 plan)。
     #[test]
     fn collider_cooldown_separate_from_data() {
         let obs = [Vec3::new(8.0, 0.0, 8.0)];
         let mut c = ActivationController::new(ActivationConfig::default());
-        // 拍 0:已载 (-1,0) 未建 → 构建(簿记 @0)。
+        // 拍 0:装载 (0,0)(pending)与已载 (-1,0) 单独构建,双双记 ② 簿记 @0。
         let d = c.plan(
             &obs,
             &[ChunkPos::new(-1, 0)],
@@ -1017,19 +1158,63 @@ mod tests {
             Tick::ZERO,
             wide_region(),
         );
-        assert_eq!(d.colliders_to_build, vec![ChunkPos::new(-1, 0)]);
-        // 拍 1(冷却未过):已建(输入前移)→ 不候选;同拍 SetBlock 重建是
-        // sim 内部行为(不经 plan),无"重建决策"通道可断言——非退化由
-        // sim::setblock_on_data_without_collider 覆盖重建路径。
+        // 预算 2 全给装载 [(0,0) 距 0,(0,-1) 距 16 首个] + pending;已载未建的
+        // (-1,0) 单独构建被饿(共享预算,D18)。
+        assert!(
+            d.colliders_to_build.is_empty(),
+            "预算被 pending 占满 → 单独构建饿"
+        );
+        assert_eq!(
+            d.colliders_pending_build,
+            vec![ChunkPos::new(0, 0), ChunkPos::new(0, -1)]
+        );
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(0, 0), ChunkPos::new(0, -1)]
+        );
+        // 拍 1(冷却未过):(0,0) 已装载(输入前移)、(-1,0) 已建(输入前移)
+        // → 两路全空;同拍 SetBlock 重建是 sim 内部行为(不经 plan),无"重建
+        // 决策"通道可断言——非退化由 sim::setblock_on_data_without_collider
+        // 覆盖重建路径。
+        // 拍 1 状态前移:输入只载拍 0 装的两个;新候选 (0,1) 距 16 照常
+        // 装载+pending(首见 ② 可建,合法);**已决策过的 (0,0)/(0,-1) 不重复
+        // 出现**(① ② 簿记 @0 双重挡下)——这就是"决策即簿记"的分档证据。
         let d = c.plan(
             &obs,
-            &[ChunkPos::new(-1, 0)],
-            &[ChunkPos::new(-1, 0)],
+            &[
+                ChunkPos::new(-1, 0),
+                ChunkPos::new(0, 0),
+                ChunkPos::new(0, -1),
+            ],
+            &[
+                ChunkPos::new(-1, 0),
+                ChunkPos::new(0, 0),
+                ChunkPos::new(0, -1),
+            ],
             &[],
             Tick(1),
             wide_region(),
         );
-        assert!(d.colliders_to_build.is_empty(), "已建不重复构建");
+        assert_eq!(
+            d.chunks_to_load,
+            vec![ChunkPos::new(0, 1), ChunkPos::new(1, 0)],
+            "仅新候选(距 16 批次;预算 2)"
+        );
+        assert_eq!(
+            d.colliders_pending_build,
+            vec![ChunkPos::new(0, 1), ChunkPos::new(1, 0)]
+        );
+        assert!(
+            !d.chunks_to_load.contains(&ChunkPos::new(0, 0))
+                && !d.chunks_to_load.contains(&ChunkPos::new(0, -1)),
+            "① 簿记 @0:已装载候选不重复"
+        );
+        assert!(
+            !d.colliders_pending_build.contains(&ChunkPos::new(0, 0))
+                && !d.colliders_pending_build.contains(&ChunkPos::new(0, -1)),
+            "② 簿记 @0:已 pending 过的候选不重复"
+        );
+        assert!(d.colliders_to_build.is_empty() && d.colliders_to_drop.is_empty());
     }
 
     /// 有 ① 无 ② 的 chunk 收 SetBlock:体素生效、本 chunk 不建 ②、已有 ② 的

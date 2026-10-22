@@ -1601,8 +1601,9 @@ mod tests {
     #[test]
     fn activation_enabled_flag_semantics() {
         use types::glam::Vec3;
-        // 实心 chunk(空气 chunk 贪心切分为 0 盒 → 不插 chunk_bodies,
-        // has_collider 恒 false,无法作判别器)。
+        // 实心 chunk(有碰撞盒:has_collider 与"生成了碰撞盒"在 D18 独立集
+        // 语义下解耦,实心者两侧都真,判别更直观;空气 chunk 现在也算已建,
+        // 见 physics-sim air_chunk_counts_as_built_collider)。
         let solid = {
             let mut ch = voxel::Chunk::air();
             for x in 0..voxel::CHUNK_X {

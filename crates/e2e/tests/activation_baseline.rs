@@ -531,16 +531,13 @@ fn baseline_replay_matches_golden() {
     }
 }
 
-/// 四项比对(REQ-007 任务 01/B4.4;任务书测试
+/// 四项严格相等比对(REQ-007 任务 01/B4.4;修订 5 D18;任务书测试
 /// `ac_t1_matches_golden_after_tier_split`):
-/// ① ① 集 == golden chunk 集;③ 冻结/唤醒集 == golden;④ 分片集 == golden
-/// ——三项 + 拍号经**整行严格相等**(与 `baseline_replay_matches_golden` 同标尺,
-/// 零推迟唤醒差异:唤醒集逐拍相等,I2 在 03/04 才做,不允许 §4.6 差异)。
-/// ② ② 集 vs golden chunk 集——**不逐拍严格相等,按语义三层断言**(详见
-/// `tier_split_collider_invariants`;根因:装载判定在拍 N、② 构建判定在拍
-/// N+1,观察者 1 m/拍移动时 32 m 判定圆边缘的 chunk 装时合格、建时超距,
-/// ② 稳态缺失——AC-T1「② 集 == 基线 chunk 集」的字面逐拍相等与细则 3/11
-/// 的时序在默认参数下不可兼得,已在任务 01 回评上报总架构师裁决)。
+/// ① ① 集 == golden chunk 集;② ② 集 == golden chunk 集(逐拍严格相等:
+/// 随 ① 同点构建 + 卸载点同点拆,装载/建造用同拍距离);③ 冻结/唤醒集 ==
+/// golden;④ 分片集 == golden。①③④ + 拍号经整行严格相等;② 按分片结构
+/// 再比一次(失败信息更直接)。零推迟唤醒差异(唤醒集逐拍相等,I2 在
+/// 03/04 才做,不允许 §4.6 差异)。
 #[test]
 fn ac_t1_matches_golden_after_tier_split() {
     let golden = read_golden_lines();
@@ -563,17 +560,26 @@ fn ac_t1_matches_golden_after_tier_split() {
             f.tick,
             f.to_line()
         );
+        // ② 严格相等(B4.4/修订 5 D18:默认配置下 ② 集合与 ① 集合逐拍相等):
+        // 随 ① 同点构建(pending)+ 卸载点同点拆,装载/建造用同拍距离,无
+        // 边界掠过、无滞后窗。逐拍 == golden chunk 集(golden 的 load 字段
+        // 与 ① 同一观测,整行已比;此处按分片结构再比一次,失败信息更直接)。
+        assert_eq!(
+            f.colliders, f.loaded,
+            "拍 {} ② 集 ≠ golden chunk 集(D18:默认配置应逐拍相等)",
+            f.tick
+        );
     }
 }
 
-/// ② 侧不变量(与四项比对拆分,保持各自失败信息清晰):
+/// ② 侧不变量(与四项比对拆分;修订 5 D18 后主牙齿在
+/// `ac_t1_matches_golden_after_tier_split` 的四项严格相等,本测试保留为语义自述):
 /// - 首拍(布景末:静止 + 合一装载 + 无差档历史)= ② == ①;
 /// - 末帧(idle 1801 拍后:观察者已移除,滞回拆除不再发生;只剩常驻体钉住的
 ///   chunk,其 ② 从未被拆)= ② == ①;
 /// - I1 集合级:全程逐拍 ② ⊆ ①(同分片、同 chunk);
-/// - 瞬态差额(|①| − |②|)只打印不断言:移动段存在边界掠过(装载判定拍 N、
-///   ② 构建判定拍 N+1,1 m/拍移动使 32 m 圆边缘 chunk 装时合格建时超距)与
-///   跳跃风暴追赶(② 预算 2/拍/片),峰值是场景结构的函数,不是不变量。
+/// - 差额峰值断言恒 0(D18 随 ① 同点构建后无边界掠过、无滞后窗;非 0 =
+///   时序回归信号)。
 #[test]
 fn tier_split_collider_invariants() {
     let frames = run_scenario();
@@ -609,5 +615,9 @@ fn tier_split_collider_invariants() {
         tail.colliders, tail.loaded,
         "末帧 ② 应与 ① 全等(钉住 chunk 的 ② 从未拆)"
     );
-    println!("② 瞬态差额峰值(边界掠过 + 跳跃风暴追赶):{max_gap} @2061 拍");
+    assert_eq!(
+        max_gap, 0,
+        "D18(随 ① 同点构建)后 ①② 差额应恒 0;非 0 = 时序回归"
+    );
+    println!("② 差额峰值:{max_gap}(D18 后恒 0)");
 }
