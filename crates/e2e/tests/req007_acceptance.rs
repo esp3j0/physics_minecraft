@@ -806,12 +806,19 @@ fn acc_04c_removed_support_wakes_frozen_actor() {
     let mut h = Harness::new(|_| {});
     let e = freshly_frozen_actor(&mut h);
     // 脚下的地表方块:SPOT 中心 y = -59.5,脚底 -60,正下方的格是 (72,-61,72)。
+    // 挖 3×3,而不是只挖正下方一格:1 m 立方体与 1 m 坑尺寸相同,边缘恰与四周
+    // 顶面重合,接触会把它托住,测不出"落下"。只有正下方那格与实体 AABB 相交,
+    // 外圈 8 格只为让坑足够大。
     assert_ne!(
         h.block_at(72, -61, 72),
         Some(BlockId::AIR),
         "前置:脚下有方块"
     );
-    h.set_block(72, -61, 72, BlockId::AIR);
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            h.set_block(72 + dx, -61, 72 + dz, BlockId::AIR);
+        }
+    }
 
     let mut woke_at = None;
     for k in 0..3 {
