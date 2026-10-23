@@ -129,10 +129,26 @@ impl Frame {
         )
     }
 
-    fn parse_line(line: &str) -> (u64, String) {
-        // 比对按整行全等;tick 单独提出供分叉报告。
-        let (head, _) = line.split_once('|').expect("golden 行必有 tick 前缀");
-        (head.parse().expect("golden tick 数字"), line.to_string())
+    /// golden 行 → (tick, 逐字段):load / frozen / woke / shards 原文。
+    fn parse_fields(line: &str) -> (u64, &str, &str, &str, &str) {
+        let (head, rest) = line.split_once('|').expect("golden 行必有 tick 前缀");
+        let tick: u64 = head.parse().expect("golden tick 数字");
+        let mut load = "";
+        let mut frozen = "";
+        let mut woke = "";
+        let mut shards = "";
+        for f in rest.split('|') {
+            if let Some(v) = f.strip_prefix("load=") {
+                load = v;
+            } else if let Some(v) = f.strip_prefix("frozen=") {
+                frozen = v;
+            } else if let Some(v) = f.strip_prefix("woke=") {
+                woke = v;
+            } else if let Some(v) = f.strip_prefix("shards=") {
+                shards = v;
+            }
+        }
+        (tick, load, frozen, woke, shards)
     }
 }
 
@@ -147,6 +163,103 @@ fn read_golden_lines() -> Vec<String> {
         .filter(|l| !l.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+// ---- AC-T1 允许偏差窗口(REQ-007 §8 AC-T1"唯一允许的差异:§4.6 推迟唤醒,
+// 须在测试中显式列出拍号与原因";总架构师 04b 验收裁定 2,不重录 golden)----
+//
+// 成因(跳回腿,记录拍 420 起):跳回 (8,8) 时常驻体脚下 chunk 已在远离段
+// 被卸载,§4.9 共同规则 1 的唤醒前置(当前足迹 ② 齐)不满足 → 唤醒**推迟**
+// 到 ② 就绪;所缺 ①/② 属 §4.12 阻塞请求(D15:免冷却、排所有票据请求之前),
+// ① 的装载顺序因此与基线(无待地形/推迟唤醒的旧行为)不同。
+// 收敛点:第 417 拍起与 golden 完全一致(实测;阻塞装载完成、实体唤醒)。
+// 连带:frozen 晚 2–3 拍——翻转冷却从**实际唤醒**那一拍起算(§4.3.2/翻转
+// 簿记),唤醒推迟 → 再次冻结(远离段)同步推迟,golden 在第 400 拍冻结
+// 1:1、1:2,现行为第 402、403 拍。
+//
+// 窗口内的比对规则(裁定原文):
+// - shards / woke:严格相等(实测与 golden 全程一致,收紧为硬断言);
+// - load:允许不同(D15 阻塞请求改变装载顺序;D18 默认配置下 ② 与 ① 仍逐拍
+//   相等,`ac_t1_matches_golden_after_tier_split` 的 ②==① 断言全程适用);
+// - frozen:只允许 1:1、1:2 各恰好出现一次,且都在第 400–405 拍之间
+//   (golden 第 400 拍 + 推迟 2–3 拍 + 裕度);窗口内不允许出现其他冻结事件。
+const DEVIATION_WINDOW: std::ops::RangeInclusive<u64> = 221..=416;
+const FROZEN_ALLOWED_ENTITIES: [&str; 2] = ["1:1", "1:2"];
+const FROZEN_ALLOWED_TICKS: std::ops::RangeInclusive<u64> = 400..=405;
+
+/// 共用比对(三处 AC-T1 比对测试同款):拍号对齐 + 逐拍 golden 比对,
+/// 窗口外整行严格相等,窗口内按 `DEVIATION_WINDOW` 注释的规则放行。
+fn assert_frames_match_golden(frames: &[Frame], golden: &[String], context: &str) {
+    assert_eq!(
+        frames.len(),
+        golden.len(),
+        "[{context}] 拍数与 golden 不一致(场景脚本或节拍变动?golden 冻结,不得顺手重录)"
+    );
+    // 窗口内的冻结事件推迟发生(拍号错位),逐拍比 frozen 必然假阳性;
+    // 按事件汇总收集,窗口扫描完后统一校验(实体白名单 + 拍窗 + 各恰好一次)。
+    let mut actual_frozen_events: Vec<(u64, String)> = Vec::new();
+    let mut golden_frozen_events: Vec<(u64, String)> = Vec::new();
+    for (f, g) in frames.iter().zip(golden) {
+        let (gtick, _gload, gfrozen, gwoke, gshards) = Frame::parse_fields(g);
+        assert_eq!(f.tick, gtick, "[{context}] 拍号错位");
+        let line = f.to_line();
+        if !DEVIATION_WINDOW.contains(&f.tick) {
+            // 窗口外(第 0–220 与 417–2060 拍):整行严格相等。
+            assert_eq!(
+                line, *g,
+                "[{context}] 拍 {} 基线分叉(窗口外应与 golden 全等):\n  实际:{line}\n  golden:{g}",
+                f.tick
+            );
+            continue;
+        }
+        // 窗口内(第 221–416 拍):shards / woke 严格相等;load 允许不同
+        // (D15 阻塞请求改变装载顺序);frozen 收集后统一校验。
+        assert_eq!(
+            fmt_shards(&f.shards),
+            gshards,
+            "[{context}] 拍 {} 分片集分叉(shards 全程应与 golden 相等)\n  实际:{line}\n  golden:{g}",
+            f.tick
+        );
+        assert_eq!(
+            fmt_entities(&f.woke),
+            gwoke,
+            "[{context}] 拍 {} 唤醒集分叉(woke 应与 golden 相等)\n  实际:{line}\n  golden:{g}",
+            f.tick
+        );
+        let collect = |src: &[EntityId], out: &mut Vec<(u64, String)>| {
+            for e in fmt_entities(src).split(';').filter(|s| !s.is_empty()) {
+                out.push((f.tick, e.to_string()));
+            }
+        };
+        collect(&f.frozen, &mut actual_frozen_events);
+        for e in gfrozen.split(';').filter(|s| !s.is_empty()) {
+            golden_frozen_events.push((f.tick, e.to_string()));
+        }
+    }
+    // frozen 事件规则:只允许 1:1、1:2,都在第 400–405 拍之间,各恰好一次
+    // (golden 与实际两侧同规则;任何其他冻结事件 = 窗口内不允许的新事件)。
+    for (side, events) in [
+        ("golden", &golden_frozen_events),
+        ("实际", &actual_frozen_events),
+    ] {
+        for (tick, e) in events {
+            assert!(
+                FROZEN_ALLOWED_ENTITIES.contains(&e.as_str()),
+                "[{context}] {side} 侧拍 {tick} 出现窗口白名单之外的冻结事件 {e:?}(只允许 1:1、1:2)"
+            );
+            assert!(
+                FROZEN_ALLOWED_TICKS.contains(tick),
+                "[{context}] {side} 侧拍 {tick} 冻结事件 {e} 不在允许拍窗(400–405)内"
+            );
+        }
+        for allowed in FROZEN_ALLOWED_ENTITIES {
+            let n = events.iter().filter(|(_, e)| e == allowed).count();
+            assert_eq!(
+                n, 1,
+                "[{context}] {side} 侧窗口内冻结事件 {allowed} 应恰好一次,实得 {n}(0 = 推迟后丢失,≥2 = 反复冻结)"
+            );
+        }
+    }
 }
 
 // ---- 场景脚本(拍数与观察者坐标写死;确定性由 AC1 位级纪律保证)----
@@ -508,59 +621,31 @@ fn record_baseline_golden() {
     );
 }
 
-/// 比对(默认运行):同场景重跑,逐拍与入库 golden 全等;
-/// 失败信息给出第一个分叉行与两侧差异。
+/// 比对(默认运行):同场景重跑,逐拍与入库 golden 比对(共用比对函数,
+/// 含 AC-T1 推迟唤醒偏差窗口规则);失败信息给出第一个分叉行与两侧差异。
 #[test]
 fn baseline_replay_matches_golden() {
     let golden = read_golden_lines();
     let frames = run_scenario();
     assert_non_degenerate(&frames);
-    assert_eq!(
-        frames.len(),
-        golden.len(),
-        "拍数与 golden 不一致(场景脚本或节拍变动?golden 冻结,不得顺手重录)"
-    );
-    for (f, g) in frames.iter().zip(&golden) {
-        let (gtick, gline) = Frame::parse_line(g);
-        let line = f.to_line();
-        assert_eq!(f.tick, gtick, "拍号错位");
-        assert_eq!(
-            line, *gline,
-            "拍 {} 基线分叉(第一个分叉行):\n  实际:{line}\n  golden:{gline}",
-            f.tick
-        );
-    }
+    assert_frames_match_golden(&frames, &golden, "baseline_replay");
 }
 
 /// 四项严格相等比对(REQ-007 任务 01/B4.4;修订 5 D18;任务书测试
 /// `ac_t1_matches_golden_after_tier_split`):
 /// ① ① 集 == golden chunk 集;② ② 集 == golden chunk 集(逐拍严格相等:
 /// 随 ① 同点构建 + 卸载点同点拆,装载/建造用同拍距离);③ 冻结/唤醒集 ==
-/// golden;④ 分片集 == golden。①③④ + 拍号经整行严格相等;② 按分片结构
-/// 再比一次(失败信息更直接)。零推迟唤醒差异(唤醒集逐拍相等,I2 在
-/// 03/04 才做,不允许 §4.6 差异)。
+/// golden;④ 分片集 == golden。①③④ + 拍号经共用比对函数(窗口外整行严格
+/// 相等;窗口内 = §8 AC-T1 唯一允许的 §4.6 推迟唤醒偏差,见
+/// `DEVIATION_WINDOW` 注释);② 按分片结构再比一次(失败信息更直接),
+/// 该断言**全程适用、无窗口**(D18:默认配置下 ② 与 ① 逐拍相等)。
 #[test]
 fn ac_t1_matches_golden_after_tier_split() {
     let golden = read_golden_lines();
     let frames = run_scenario();
     assert_non_degenerate(&frames);
-    assert_eq!(
-        frames.len(),
-        golden.len(),
-        "拍数与 golden 不一致(场景脚本或节拍变动?golden 冻结,不得顺手重录)"
-    );
-    for (f, g) in frames.iter().zip(&golden) {
-        let (gtick, gline) = Frame::parse_line(g);
-        assert_eq!(f.tick, gtick, "拍号错位");
-        assert_eq!(
-            f.to_line(),
-            *gline,
-            "拍 {} ①/冻结/唤醒/分片 基线分叉(第一个分叉行):
-  实际:{}
-  golden:{gline}",
-            f.tick,
-            f.to_line()
-        );
+    assert_frames_match_golden(&frames, &golden, "after_tier_split");
+    for f in &frames {
         // ② 严格相等(B4.4/修订 5 D18:默认配置下 ② 集合与 ① 集合逐拍相等):
         // 随 ① 同点构建(pending)+ 卸载点同点拆,装载/建造用同拍距离,无
         // 边界掠过、无滞后窗。逐拍 == golden chunk 集(golden 的 load 字段
@@ -626,31 +711,140 @@ fn tier_split_collider_invariants() {
 /// AC-T1 再比对(REQ-007 任务 02/B4.4;任务书测试
 /// `ac_t1_matches_golden_after_tickets`):票据化后(观察者命令双写观察者票,
 /// plan 走票据视图)重跑 00 场景,四项**严格相等**——① 集 == golden chunk 集、
-/// ② 集 == golden chunk 集、冻结/唤醒集 == golden、分片集 == golden;
-/// 零"推迟唤醒"差异(本任务无待地形,出现差异即 bug)。
-/// 断言结构 == `baseline_replay_matches_golden`(整行)+ ② 分片结构比对。
+/// ② 集 == golden chunk 集、冻结/唤醒集 == golden、分片集 == golden。
+/// ①③④ + 拍号经共用比对函数(窗口外整行严格相等;窗口内 = §8 AC-T1
+/// 唯一允许的 §4.6 推迟唤醒偏差,见 `DEVIATION_WINDOW` 注释);② 按分片
+/// 结构再比一次,**全程适用、无窗口**。
 #[test]
 fn ac_t1_matches_golden_after_tickets() {
     let golden = read_golden_lines();
     let frames = run_scenario();
     assert_non_degenerate(&frames);
-    assert_eq!(frames.len(), golden.len(), "拍数与 golden 不一致");
-    for (f, g) in frames.iter().zip(&golden) {
-        let (gtick, gline) = Frame::parse_line(g);
-        assert_eq!(f.tick, gtick, "拍号错位");
-        assert_eq!(
-            f.to_line(),
-            *gline,
-            "拍 {} ①/冻结/唤醒/分片 基线分叉(第一个分叉行):
-  实际:{}
-  golden:{gline}",
-            f.tick,
-            f.to_line()
-        );
+    assert_frames_match_golden(&frames, &golden, "after_tickets");
+    for f in &frames {
         assert_eq!(
             f.colliders, f.loaded,
             "拍 {} ② 集 ≠ golden chunk 集(任务 02:观察者票路径应逐拍相等)",
             f.tick
         );
     }
+}
+
+// ---- 纪律 12(测试必须能失败):共用比对函数的自检 ----
+//
+// 合成帧直接驱动 `assert_frames_match_golden`,不跑场景(场景 4 s+/次,
+// 自检必须快)。正例 = 总架构师 04b 裁定 2 事实的缩影:golden 第 400 拍
+// 冻结 1:1、1:2,实际推迟到 402/403(§4.6 推迟唤醒),窗口内 load 不同
+// (D15 阻塞请求),其余全等。负例逐条断言 panic 并锚定失败原因:
+// 窗口外任一拍整行改动 / 窗口内 shards 或 woke 改动 / frozen 白名单外
+// 实体、拍窗外、缺失、反复,都必须报错。
+
+/// 合成帧对:拍 100(窗外)/ 300(窗内)/ 400(窗内,golden 冻结拍)/
+/// 402、403(窗内,实际冻结拍)/ 500(窗外),单分片、零装载。
+/// golden 侧 = 第 400 拍 frozen=1:1;1:2;实际侧 = 402/403 各冻结一个、
+/// 拍 300 装载一个 golden 没有的 chunk(窗口内 load 允许不同)。
+fn synth_deviated_pair() -> (Vec<Frame>, Vec<String>) {
+    let shard0 = shard_id(0, 0);
+    let mk_frame = |tick: u64| Frame {
+        tick,
+        loaded: vec![(shard0, vec![])],
+        colliders: vec![(shard0, vec![])],
+        frozen: vec![],
+        woke: vec![],
+        shards: [shard0].into_iter().collect(),
+    };
+    let mut frames = vec![
+        mk_frame(100),
+        mk_frame(300),
+        mk_frame(400),
+        mk_frame(402),
+        mk_frame(403),
+        mk_frame(500),
+    ];
+    // 窗口内 load 偏差(允许):实际拍 300 多装一个 chunk。
+    frames[1].loaded[0].1.push(ChunkPos::new(3, 4));
+    // 窗口内 frozen 推迟(允许):golden 400 → 实际 402/403。
+    frames[3].frozen.push(EntityId::from_parts(1, 1));
+    frames[4].frozen.push(EntityId::from_parts(1, 2));
+    let golden = {
+        let mut g = frames.iter().map(Frame::to_line).collect::<Vec<_>>();
+        // 撤销实际侧的偏差,得到"基线行为"的 golden:
+        g[1] = mk_frame(300).to_line();
+        g[3] = mk_frame(402).to_line();
+        g[4] = mk_frame(403).to_line();
+        g[3] = g[3].replacen("frozen=", "frozen=1:1;1:2", 1);
+        g
+    };
+    (frames, golden)
+}
+
+#[test]
+fn baseline_compare_accepts_adjudicated_deviation_window() {
+    let (frames, golden) = synth_deviated_pair();
+    // 正例:裁定放行的全部偏差同时出现,比对必须通过(不 panic)。
+    assert_frames_match_golden(&frames, &golden, "synth_positive");
+}
+
+#[test]
+#[should_panic(expected = "窗口外应与 golden 全等")]
+fn baseline_compare_rejects_outside_window_change() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 窗口外(拍 500)整行任何字段改动 → 必须报错。
+    frames[5].loaded[0].1.push(ChunkPos::new(1, 1));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_outside");
+}
+
+#[test]
+#[should_panic(expected = "分片集分叉")]
+fn baseline_compare_rejects_inside_window_shards_change() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 窗口内(拍 300)shards 改动一处 → 必须报错(shards 无窗口)。
+    frames[1].shards.insert(shard_id(1, 1));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_shards");
+}
+
+#[test]
+#[should_panic(expected = "唤醒集分叉")]
+fn baseline_compare_rejects_inside_window_woke_change() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 窗口内(拍 300)woke 改动一处 → 必须报错(woke 无窗口)。
+    frames[1].woke.push(EntityId::from_parts(1, 1));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_woke");
+}
+
+#[test]
+#[should_panic(expected = "不在允许拍窗")]
+fn baseline_compare_rejects_frozen_outside_tick_window() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 冻结事件出现在拍窗(400–405)之外(拍 300)→ 必须报错。
+    frames[1].frozen.push(EntityId::from_parts(1, 1));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_frozen_tick");
+}
+
+#[test]
+#[should_panic(expected = "白名单之外的冻结事件")]
+fn baseline_compare_rejects_frozen_non_whitelisted_entity() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 白名单(1:1、1:2)之外的实体被冻结 → 必须报错。
+    frames[3].frozen.push(EntityId::from_parts(1, 3));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_frozen_entity");
+}
+
+#[test]
+#[should_panic(expected = "应恰好一次,实得 0")]
+fn baseline_compare_rejects_frozen_event_lost() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 推迟后丢失一次冻结(1:2 没了)→ 必须报错。
+    frames[4].frozen.clear();
+    assert_frames_match_golden(&frames, &golden, "synth_neg_frozen_lost");
+}
+
+#[test]
+#[should_panic(expected = "应恰好一次,实得 2")]
+fn baseline_compare_rejects_frozen_entity_twice() {
+    let (mut frames, golden) = synth_deviated_pair();
+    // 同一实体反复冻结(1:1 出现两次)→ 必须报错。
+    frames[4].frozen.clear();
+    frames[4].frozen.push(EntityId::from_parts(1, 1));
+    assert_frames_match_golden(&frames, &golden, "synth_neg_frozen_twice");
 }
