@@ -1052,3 +1052,136 @@ fn acc_05a_resting_contact_never_wakes() {
     }
     h.finish();
 }
+
+// ===========================================================================
+// 05b:冻结邻接图上的动量传播、成组截断(AC-T15;需求 §4.10.3)
+// ===========================================================================
+
+/// 零重力下一排 5 个相互贴靠的冻结常驻体(间隙 0.02 m < skin 0.05 m),沿 +x
+/// 排列,B1 在最左。只有"仅装载"的区域票,没有唤醒范围。返回 (B1..B5)。
+fn frozen_row_of_five(h: &mut Harness, center: Vec3) -> [EntityId; 5] {
+    h.terrain_only_area(center, 32.0);
+    h.steps(40);
+    let row = [actor(11), actor(12), actor(13), actor(14), actor(15)];
+    for (i, e) in row.iter().enumerate() {
+        let x = (i as f32 - 2.0) * 1.02;
+        h.spawn_actor(*e, center + Vec3::new(x, 0.0, 0.0), Vec3::ZERO);
+    }
+    let mut all = false;
+    for _ in 0..40 {
+        h.step();
+        if row.iter().all(|e| h.frozen(*e)) {
+            all = true;
+            break;
+        }
+    }
+    assert!(all, "前置:一排 5 个静止常驻体在唤醒范围外都应冻结");
+    row
+}
+
+/// 推进直到 `first` 醒来,返回醒来那一拍各成员是否冻结。
+fn frozen_flags_when_first_wakes(h: &mut Harness, first: EntityId, row: &[EntityId]) -> Vec<bool> {
+    for _ in 0..120 {
+        h.step();
+        if !h.frozen(first) {
+            return row.iter().map(|e| h.frozen(*e)).collect();
+        }
+    }
+    panic!("前置:被直接撞到的 {first:?} 应在撞击前被唤醒(05a 撞前预测)");
+}
+
+/// AC-T15 主体(需求 §4.10.3 的示例):1 kg 以 5 m/s 撞进一排 5 个贴靠的冻结体。
+/// 种子 B1 的冲击动量 5,沿冻结邻接图每跳 ×0.5:B2 2.5、B3 1.25、B4 0.625
+/// (< 门槛 1.0)。默认参数下**恰好唤醒 B1–B3**,而且在同一拍;B4、B5 保持冻结。
+///
+/// 会变红的实现:只唤醒直接撞到的 B1(没有传播);不衰减或衰减系数不对(醒得
+/// 太多);传播分多拍生效。
+#[test]
+#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05b_row_of_five_wakes_exactly_three() {
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
+    let row = frozen_row_of_five(&mut h, center);
+    // A 从 B1 左侧 5 m 处以 5 m/s 撞来。
+    let a = actor(1);
+    let b1_x = center.x - 2.0 * 1.02;
+    h.spawn_actor(
+        a,
+        Vec3::new(b1_x - 6.0, center.y, center.z),
+        Vec3::new(5.0, 0.0, 0.0),
+    );
+    let flags = frozen_flags_when_first_wakes(&mut h, row[0], &row);
+    assert_eq!(
+        flags,
+        vec![false, false, false, true, true],
+        "p0 = 5、衰减 0.5、门槛 1.0:应在同一拍唤醒 B1–B3,B4、B5 保持冻结(冻结标志 = {flags:?})"
+    );
+    h.finish();
+}
+
+/// AC-T15:接触唤醒只占空闲预算,按组内最大 p 降序纳入,放不下的组跳过,
+/// **不淘汰任何已醒实体**。预算 3,撞击者 A 已占 1,空闲 2:只唤醒 B1(p=5)
+/// 和 B2(p=2.5),B3(p=1.25)被截断;A 不被淘汰。
+///
+/// 会变红的实现:接触唤醒越过预算(唤醒 3 个);为腾预算而淘汰 A;截断顺序不按
+/// 动量大小。
+#[test]
+#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05b_contact_wake_uses_only_idle_budget() {
+    let mut h = Harness::new(|cfg| {
+        cfg.gravity = Vec3::ZERO;
+        cfg.activation.max_awake_dynamic = 3;
+    });
+    let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
+    let row = frozen_row_of_five(&mut h, center);
+    let a = actor(1);
+    let b1_x = center.x - 2.0 * 1.02;
+    h.spawn_actor(
+        a,
+        Vec3::new(b1_x - 6.0, center.y, center.z),
+        Vec3::new(5.0, 0.0, 0.0),
+    );
+    let flags = frozen_flags_when_first_wakes(&mut h, row[0], &row);
+    assert_eq!(
+        flags,
+        vec![false, false, true, true, true],
+        "空闲预算 2:只唤醒动量最大的 B1、B2(冻结标志 = {flags:?})"
+    );
+    assert!(!h.frozen(a), "接触唤醒不得为腾出预算而淘汰已醒的 A");
+    h.finish();
+}
+
+/// AC-T15:多个种子同拍时,每个节点取所有路径中的最大动量,结果与处理顺序无关。
+/// 两侧各有一个 5 m/s 的撞击者同拍撞向 B1 与 B5:B1、B5 为 5,B2、B4 为 2.5,
+/// B3 为 1.25(两条路径都是 1.25),5 个全部在同一拍醒来。只从一侧撞时 B4、B5
+/// 不醒(见 `acc_05b_row_of_five_wakes_exactly_three`),说明这里的结果来自两侧
+/// 传播的合并。
+///
+/// 会变红的实现:只处理第一个种子;按路径求和而非取最大(仍会全醒,但由
+/// 其他两条用例约束);多源传播分多拍生效。
+#[test]
+#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05b_two_sided_impact_merges_by_max() {
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
+    let row = frozen_row_of_five(&mut h, center);
+    let (a, c) = (actor(1), actor(2));
+    let half = 2.0 * 1.02;
+    h.spawn_actor(
+        a,
+        Vec3::new(center.x - half - 6.0, center.y, center.z),
+        Vec3::new(5.0, 0.0, 0.0),
+    );
+    h.spawn_actor(
+        c,
+        Vec3::new(center.x + half + 6.0, center.y, center.z),
+        Vec3::new(-5.0, 0.0, 0.0),
+    );
+    let flags = frozen_flags_when_first_wakes(&mut h, row[0], &row);
+    assert_eq!(
+        flags,
+        vec![false; 5],
+        "两侧同拍撞击:5 个应在同一拍全部醒来(冻结标志 = {flags:?})"
+    );
+    h.finish();
+}
