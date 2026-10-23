@@ -63,6 +63,10 @@ struct ShardSimSnapshot {
     pending_terrain_wakes: BTreeSet<types::BlockPos>,
     /// 地形变更唤醒的推迟种子(04c;带 D20 预算豁免标记的推迟)。随快照走。
     deferred_terrain_wake: BTreeSet<EntityId>,
+    /// 待处理的补偿种子(05c;§4.10.4):step 后收集、下一拍预测消费;
+    /// checkpoint 落在撞击与唤醒之间时,恢复线同样在下一拍唤醒(AC-T17)。
+    /// 随快照走。**布局变化**:旧存档(无本字段)解码失败——需清 data_dir。
+    pending_contact_wakes: BTreeMap<EntityId, f32>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -154,6 +158,7 @@ impl ShardSim {
             deferred_wake: self.deferred_wake.clone(),
             pending_terrain_wakes: self.pending_terrain_wakes.clone(),
             deferred_terrain_wake: self.deferred_terrain_wake.clone(),
+            pending_contact_wakes: self.pending_contact_wakes.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -211,6 +216,7 @@ impl ShardSim {
             deferred_wake: snap.deferred_wake,
             pending_terrain_wakes: snap.pending_terrain_wakes,
             deferred_terrain_wake: snap.deferred_terrain_wake,
+            pending_contact_wakes: snap.pending_contact_wakes,
             terrain_woken_this_tick: BTreeSet::new(),
             outbox: snap.outbox,
             activation: snap.activation,

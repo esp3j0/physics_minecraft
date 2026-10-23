@@ -269,6 +269,13 @@ pub struct ShardSim {
     /// 淘汰)读它排除地形唤醒者。不进快照(只活一拍,checkpoint 落在拍间时
     /// 必为空)。
     pub(crate) terrain_woken_this_tick: BTreeSet<EntityId>,
+    /// 待处理的补偿种子(05c;§4.10.4 补偿路径):step 后从 rapier 接触对
+    /// 收集的"Dynamic ↔ 冻结"冲量过门槛者(同一 B 多对取最大);**下一拍**
+    /// 预测阶段(`prestep_contact_wake`)取出并入传播,取出即清——不跨拍
+    /// 重试(撞击持续则下一步产生新种子)。消费时实体可能已迁出/已醒着/
+    /// 已消失,一律静默跳过(风险 1)。随快照走(checkpoint 落在撞击与
+    /// 唤醒之间时,恢复线同样在下一拍唤醒——AC-T17)。
+    pub(crate) pending_contact_wakes: BTreeMap<EntityId, f32>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -308,6 +315,7 @@ impl ShardSim {
             pending_terrain_wakes: BTreeSet::new(),
             deferred_terrain_wake: BTreeSet::new(),
             terrain_woken_this_tick: BTreeSet::new(),
+            pending_contact_wakes: BTreeMap::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -658,13 +666,16 @@ impl ShardSim {
         body.set_body_type(RigidBodyType::KinematicPositionBased, true);
     }
 
-    /// 推进一拍:撞前预测接触唤醒 → 物理步进 → 凝固桥检测 → 迁移检测
+    /// 推进一拍:撞前预测接触唤醒 → 物理步进 → 补偿收集(05c)→ 凝固桥
+    /// 检测 → 迁移检测
     /// (demo A/C 时序;05a:预测在 `apply_prefix` 之后[生产路径 worker 的
     /// `apply_prefix → step`]、`phys.step()` 之前——命令与爆炸冲量已施加,
-    /// 用的是更新后的速度,放行评论风险 1)。
+    /// 用的是更新后的速度,放行评论风险 1;05c:补偿紧接 `phys.step()`
+    /// 之后——凝固桥会删实体、迁移检测会移出实体,先收集再处理,风险 1)。
     pub fn step(&mut self) {
         self.prestep_contact_wake();
         self.phys.step();
+        self.collect_contact_wake_compensation();
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         // 支撑判定(§4.4.1;一次计算,凝固前提 + 承载产出共用)。
@@ -1256,14 +1267,19 @@ impl ShardSim {
         BTreeSet::new()
     }
 
-    /// 撞前预测接触唤醒(任务 05a/05b;需求 §4.10.1–4.10.3、§4.10.5;调用
-    /// 点 = `step` 开头、`phys.step()` 之前):醒着实体(升序)的扫掠体命中
-    /// 的**冻结**实体(常驻体 + 承载静止冻结的瞬态体;待地形体不算——其
-    /// kinematic 但恢复有自己的路径)为候选;冲击动量过门槛者为种子,在
-    /// 冻结邻接图上做最大动量传播,传播结果与种子在**同一拍、同一预测阶段**
-    /// 经统一入口 `wake_group` 当拍唤醒(② 前置、向上闭包、整组原子、静止
-    /// 重置、票据)。落实后被唤醒者切 Dynamic 零速度起步,rapier 在同一步里
-    /// 按两个动态体解算动量交换(§4.10.1)。
+    /// 撞前预测接触唤醒 + 补偿消费(任务 05a/05b/05c;需求
+    /// §4.10.1–4.10.4、§4.10.5;调用点 = `step` 开头、`phys.step()` 之前):
+    /// 醒着实体(升序)的扫掠体命中的**冻结**实体(常驻体 + 承载静止冻结
+    /// 的瞬态体;待地形体不算——其 kinematic 但恢复有自己的路径)为候选;
+    /// 冲击动量过门槛者为种子,与**上一拍**收集的补偿种子(§4.10.4;取出
+    /// 即清)按 B 取最大值合并,在冻结邻接图上做最大动量传播,传播结果与
+    /// 种子在同一拍、同一预测阶段经统一入口 `wake_group` 当拍唤醒(② 前置、
+    /// 向上闭包、整组原子、静止重置、票据)。落实后被唤醒者切 Dynamic 零
+    /// 速度起步,rapier 在同一步里按两个动态体解算动量交换(§4.10.1)。
+    ///
+    /// 补偿种子(05c,风险 1):消费时实体可能已迁出、已消失或已醒着(当拍
+    /// 被预测唤醒者在收集时已是 Dynamic,不进补偿),一律静默跳过——不在
+    /// 种子表(`frozen` 候选)即自然过滤。
     ///
     /// 传播与截断(05b,§4.10.3):种子(第 0 跳)出发 `p(子) = decay·p(父)`
     /// 每节点取最大(优先队列 p 降序、同 p EntityId 升序;低于门槛或跳数超
@@ -1282,13 +1298,19 @@ impl ShardSim {
     /// 非物理实体;`wake_group` 内部滤待地形体;其他分片实体不在本表——
     /// 四类天然不参与。
     ///
-    /// D17(风险 8):`observed = None`(激活从未刷新)不预测——与地形变更
-    /// 唤醒同款门控。`wake_group` 恒返回空缺集语义下无阻塞请求通道:② 缺时
-    /// 种子保持冻结,几何继续命中,下一拍自然重试。
+    /// D17(风险 8):`observed = None`(激活从未刷新)不预测、不消费补偿
+    /// ——与地形变更唤醒同款门控(补偿种子保留待启用后消费)。`wake_group`
+    /// 恒返回空缺集语义下无阻塞请求通道:② 缺时种子保持冻结,几何继续
+    /// 命中,下一拍自然重试。
     fn prestep_contact_wake(&mut self) {
         if self.observed.is_none() {
             return;
         }
+        // 补偿种子(05c):取出即清——无论本拍是否被纳入,不跨拍重试;
+        // 撞击持续则下一步收集产生新种子(§4.10.4)。D17 关闭时保留。
+        let compensated: Vec<(EntityId, f32)> = std::mem::take(&mut self.pending_contact_wakes)
+            .into_iter()
+            .collect();
         let lookahead = self.cfg.activation.contact_wake_lookahead_ticks;
         let skin = self.cfg.activation.contact_wake_skin_m;
         let min_p = self.cfg.activation.contact_wake_min_momentum;
@@ -1314,9 +1336,9 @@ impl ShardSim {
                 )
             })
             .collect();
-        if awake.is_empty() {
-            return;
-        }
+        // 注:awake/frozen 为空不提前返回——补偿种子(已取出)可能仍需消费
+        // (撞击者已睡/停下不进 awake,B 仍该醒;§4.10.4 补偿的立足点正是
+        // 预测漏判)。合并后无任何种子才返回(`merged.is_empty()`)。
         let frozen: Vec<(EntityId, Vec3, Vec3)> = self
             .entities
             .iter()
@@ -1337,15 +1359,21 @@ impl ShardSim {
             })
             .collect();
         if frozen.is_empty() {
+            // 冻结表为空:预测必无种子,补偿种子也全部无处安放(B 不在冻结
+            // 表 = 静默跳过),等价于 merged 必空——提前返回。
             return;
         }
         // 种子(wake::contact_wake_seeds 返回按 B 升序)= 确定性遍历序;
-        // 同一 B 恰一条(风险 5:同 B 多 A 已在纯函数内取最大)。
+        // 同一 B 恰一条(风险 5:同 B 多 A 已在纯函数内取最大)。补偿种子
+        // (05c)与预测种子按 B 取最大值合并(BTreeMap entry 语义);补偿
+        // 指向的 B 不在冻结表(已醒/迁出/消失/待地形)时自然丢弃——合并
+        // 键只保留在 frozen 表内的预测种子 B(风险 1:静默跳过)。
         //
         // 05b(§4.10.3;放行评论 8 条风险):
         // 1) 冻结邻接图(风险 3:只含冻结体——frozen 表即常驻体 + 承载
         //    静止冻结的瞬态体,醒着体/待地形体已被过滤;几何保守 = 包络
-        //    AABB + skin);
+        //    AABB + skin)。**按需构建**(05b 验收修正:无种子的拍不花
+        //    O(n²) 两两比较);
         // 2) 最大动量传播(风险 1:优先队列取最大,非先到先得 BFS;风险 2:
         //    种子第 0 跳,超过 max_hops 不纳入);
         // 3) 成组截断(风险 4、6):传播结果每节点按 §4.9 向上支撑闭包成组,
@@ -1361,15 +1389,34 @@ impl ShardSim {
         // 场景无高速撞向冻结体的实体,传播输入为空 → 行为不变。
         // 风险 8(D17/确定性/grep):observed = None 不预测(同 05a);遍历
         // 全部来自排序结构(BTreeMap/BTreeSet/显式排序)。
-        let adjacency = crate::wake::frozen_adjacency(&frozen, skin);
-        let seeds: Vec<(EntityId, f32)> =
+        let seeds: BTreeMap<EntityId, f32> =
             crate::wake::contact_wake_seeds(&awake, &frozen, lookahead, skin, min_p, dt)
                 .into_iter()
                 .map(|(_a, b, p)| (b, p))
                 .collect();
+        let mut merged = seeds;
+        for (b, p) in compensated {
+            // B 必须仍是冻结候选(不在 → 已醒着/迁出/消失/待地形:静默跳过,
+            // 风险 1);同一 B 预测与补偿并存取最大(§4.10.4)。
+            if frozen.iter().any(|(fid, _, _)| fid == &b) {
+                merged
+                    .entry(b)
+                    .and_modify(|cur| {
+                        if p > *cur {
+                            *cur = p;
+                        }
+                    })
+                    .or_insert(p);
+            }
+        }
+        if merged.is_empty() {
+            return; // 无种子:邻接图(全冻结体两两比较)不构建(05b 修正)
+        }
+        let adjacency = crate::wake::frozen_adjacency(&frozen, skin);
+        let seed_list: Vec<(EntityId, f32)> = merged.into_iter().collect();
         let spread = crate::wake::propagate_momentum(
             &adjacency,
-            &seeds,
+            &seed_list,
             self.cfg.activation.contact_wake_decay,
             min_p,
             self.cfg.activation.contact_wake_max_hops,
@@ -1436,6 +1483,118 @@ impl ShardSim {
             woken_count += group_ids.len();
             let _missing = self.wake_group(&group_ids, budget, false);
             budget += group_ids.len();
+        }
+    }
+
+    /// 补偿路径收集(任务 05c;§4.10.4;调用点 = `step` 内 `phys.step()`
+    /// 之后、凝固桥/迁移检测之前——凝固桥会删实体、迁移检测会移出实体,
+    /// 先收集再处理,放行评论风险 1):遍历 rapier 接触对,取
+    /// "Dynamic 实体 ↔ 冻结实体"的对(冻结实体 = kinematic 且非待地形;
+    /// chunk 静态体、待地形实体不算,风险 3),`J =
+    /// ContactPair::total_impulse_magnitude()` 过
+    /// `contact_wake_min_momentum` 门槛者为冻结侧 B 的补偿种子 `p = J`,
+    /// 同一 B 多对取最大(风险 5:BTreeMap 按键序,与接触对遍历顺序无关)。
+    ///
+    /// **不计支撑接触**(D21,修订 8;风险 4):接触对为**竖向承载**
+    /// (任一流形的世界系法向 `|n·û| ≥ support_normal_min`,û = 重力反向)
+    /// 即静压接触,不进补偿。法向口径与 `evaluate_supports` 同款(世界系,
+    /// 不用中心连线近似)。**双向排除**(对修订 8 字面"B 是 A 的支撑"的
+    /// 扩展,回评偏差声明):醒体在下支撑冻结体的镜像叠放同样排除——实测
+    /// (04b 叠放验收用例暴露)rapier 0.36 的 `total_impulse_magnitude()`
+    /// 在**持久接触对**上跨拍累积(每拍 ≈ `m·g·dt`,双方入睡后读数残留),
+    /// 任一方向的静压都会把冻结体反复唤醒(醒 → 静止 → 冻结 → 又醒),
+    /// 与 D21 立论的故障模式相同;竖向撞击(落体)撞前速度预测可见
+    /// (§4.10.4 自身论证),由预测路径覆盖,不依赖补偿。零重力不判定
+    /// 支撑、不排除任何对;水平撞击 `n·û ≈ 0` 不受影响(AC-T17 主场景)。
+    ///
+    /// 当拍被预测唤醒的实体已是 Dynamic:它们的接触是 Dynamic ↔ Dynamic,
+    /// 不进补偿(风险 2,正确语义)。种子的**消费**在下一拍预测阶段
+    /// (`prestep_contact_wake` 取出即清);消费时 B 可能已迁出/消失/醒着,
+    /// 静默跳过(风险 1)。
+    ///
+    /// D17(风险 9):`observed = None`(激活从未刷新)不收集。rapier 类型
+    /// 不出 physics-sim(§14 第 5 条:冲量读取封在本函数)。
+    fn collect_contact_wake_compensation(&mut self) {
+        if self.observed.is_none() {
+            return;
+        }
+        let min_p = self.cfg.activation.contact_wake_min_momentum;
+        // D21 支撑排除的方向基准(û = 重力反向单位向量);零重力 → None =
+        // 不排除任何对(§4.10.4 修订 8)。
+        let gravity_len = self.cfg.gravity.length();
+        let up = if gravity_len > 0.0 {
+            Some(conv::vec3_to_rapier(-self.cfg.gravity / gravity_len))
+        } else {
+            None
+        };
+        let support_min = self.cfg.activation.support_normal_min;
+        // collider → 实体(1:1,insert 时创建;支撑判定同款映射)。键取
+        // handle 的 (index, generation)(rapier handle 本体无 Ord,§14 第 3
+        // 条遍历按键序)。已删除/换代的 collider 不在映射,接触对自然跳过。
+        let collider_to_entity: BTreeMap<(u32, u32), EntityId> = self
+            .entities
+            .iter()
+            .map(|(id, rec)| {
+                let idx = rec.collider.into_raw_parts();
+                ((idx.0, idx.1), *id)
+            })
+            .collect();
+        if collider_to_entity.is_empty() {
+            return;
+        }
+        // 冻结实体表(kinematic 且非待地形;与预测候选同口径,风险 3)。
+        let frozen: BTreeSet<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(id, rec)| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| b.is_kinematic())
+                    && !self.is_awaiting_terrain(**id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        if frozen.is_empty() {
+            return;
+        }
+        for pair in self.phys.narrow_phase.contact_pairs() {
+            let key1 = pair.collider1.into_raw_parts();
+            let key2 = pair.collider2.into_raw_parts();
+            let (Some(e1), Some(e2)) = (
+                collider_to_entity.get(&(key1.0, key1.1)),
+                collider_to_entity.get(&(key2.0, key2.1)),
+            ) else {
+                continue; // 一侧是 chunk 静态体(fixed)→ 不进补偿(风险 3)
+            };
+            // D21 双向排除后不再区分 A/B 方向,只取冻结侧为 B。
+            let b = match (frozen.contains(e1), frozen.contains(e2)) {
+                (false, true) => *e2,
+                (true, false) => *e1,
+                _ => continue, // 两侧同类(动-动/冻-冻)不进补偿(风险 2/3)
+            };
+            // D21(双向,见函数文档):竖向承载接触 = 静压,不进补偿。
+            if let Some(up) = &up {
+                let vertical = pair
+                    .manifolds()
+                    .iter()
+                    .any(|m| m.data.normal.dot(*up).abs() >= support_min);
+                if vertical {
+                    continue;
+                }
+            }
+            let j = pair.total_impulse_magnitude();
+            if j < min_p {
+                continue;
+            }
+            self.pending_contact_wakes
+                .entry(b)
+                .and_modify(|cur| {
+                    if j > *cur {
+                        *cur = j;
+                    }
+                })
+                .or_insert(j);
         }
     }
 
@@ -4958,8 +5117,9 @@ mod tests {
         for id in &row {
             assert!(is_frozen(&s, *id), "前置:一排 4 个全部冻结");
         }
-        // 撞击者 A 从 B1 左侧 1.5 m 以 5 m/s 撞来(动量 5;传播 2.5/1.25/
-        // 0.625,全部高于门槛 1——截断只来自每拍上限)。
+        // 撞击者 A 从 B1 左侧 1.5 m 以 5 m/s 撞来(动量 5;传播 2.5/1.25
+        // 高于门槛 1,第 3 跳 0.625 低于门槛——B4 本就到不了,截断只来自
+        // 每拍上限,作用于 B3)。
         let a = entity(1);
         s.apply_prefix(&[
             spawn_actor_v(
@@ -4992,5 +5152,155 @@ mod tests {
                 "拍 {k}:物理接触前,截断的 B3、B4 不被传播溢出唤醒"
             );
         }
+    }
+
+    // ---- 05c:撞后冲量补偿路径(§4.10.4;任务书测试 compensation_*)----
+
+    /// 预测漏判场景(05c;AC-T17 链式几何的 sim 级复刻):冻结 B,瞬态 A2、
+    /// A1 零缝正贴靠成链(B–A2–A1),C(1 kg)以 `speed` 从 0.5 m 缝外撞入。
+    /// prestep 时 A1/A2 速度为 0、C 的扫掠够不着 B(隔两块 3 m > 扫掠判定
+    /// ≈2.15)→ 预测无种子;一步内 C→A1→A2 的冲量全部打在 B(冻结墙)上,
+    /// 步后 A1/A2 停在 B 前、速度 ≈0——只有撞后补偿能在下一拍唤醒 B。
+    /// 返回 (b, a1, a2, c)。
+    ///
+    /// 零缝是关键:缝隙 > 0 时 A1→A2 分两拍传递,A2 中途获得速度,下一拍
+    /// **预测**接力命中 B——测的就不再是补偿(AC-T17 验收注释同理)。
+    fn missed_prediction_bodies(
+        s: &mut ShardSim,
+        speed: f32,
+        c_x: f32,
+    ) -> (EntityId, EntityId, EntityId, EntityId) {
+        let b = entity(1);
+        frozen_actor(s, b, Vec3::new(56.0, 66.5, 56.0));
+        // A2、A1 用瞬态(非 actor):不参与滞回冻结,保持醒着。
+        s.apply_prefix(&[
+            spawn_input(3, entity(2), Vec3::new(55.0, 66.5, 56.0)),
+            spawn_input(4, entity(3), Vec3::new(54.0, 66.5, 56.0)),
+        ]);
+        let c = entity(4);
+        s.apply_prefix(&[spawn_actor_v(
+            5,
+            c,
+            Vec3::new(c_x, 66.5, 56.0),
+            Vec3::new(speed, 0.0, 0.0),
+        )]);
+        // 激活刷新(锚在 A1 旁)开 D17 门控;B 刚冻结、翻转簿记未过冷却,
+        // 半径内也不被 plan 唤醒(与 05a 测试同款前置)。
+        let _ = s.apply_activation(&[Vec3::new(54.0, 66.5, 56.0)]);
+        (b, entity(3), entity(2), c)
+    }
+
+    /// 撞击 tick:C 速度首次降到 3/4 以下(动量已进链条)。
+    fn impact_tick(s: &mut ShardSim, c: EntityId, speed: f32) -> usize {
+        for k in 0..120 {
+            s.step();
+            if s.entity_state(c).expect("c 在表").linvel.x < speed * 0.75 {
+                return k;
+            }
+        }
+        panic!("前置:C 应在 120 拍内撞上 A1");
+    }
+
+    /// 任务书测试 `sim::compensation_next_tick_wake`(05c;T17,sim 级):
+    /// 预测漏判的撞击 → 补偿收集 A2↔B 冲量为种子,B 在下一拍醒来;种子随
+    /// 快照往返,恢复线同样下一拍醒;消费取出即清。
+    /// 会变红的实现:没有补偿收集(B 永远冻结,05b 行为);种子不进快照
+    /// (恢复线 B 不醒);取出后不清理(pending 残留,跨拍重试)。
+    #[test]
+    fn compensation_next_tick_wake() {
+        let mut s = contact_sim(16);
+        let (b, a1, a2, c) = missed_prediction_bodies(&mut s, 8.0, 52.5);
+        assert!(!is_frozen(&s, a1) && !is_frozen(&s, a2), "前置:A1/A2 醒着");
+        assert!(is_frozen(&s, b), "前置:B 冻结");
+        let impact = impact_tick(&mut s, c, 8.0);
+        assert!(impact < 120, "前置:撞击发生");
+        assert!(
+            is_frozen(&s, b),
+            "撞击当拍 B 仍冻结(预测确实漏判;预测接力唤醒会让本断言红)"
+        );
+        assert!(
+            !s.pending_contact_wakes.is_empty(),
+            "补偿收集已把 B 的种子入待处理集(无收集的实现此处红)"
+        );
+
+        // 撞击之后、消费之前:快照 → 恢复(种子此刻待处理)。
+        let bytes = s.snapshot();
+        let mut r = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+
+        // 原线:下一拍(≤2 拍)B 醒;取出即清。
+        let mut woke = false;
+        for _ in 0..2 {
+            s.step();
+            if !is_frozen(&s, b) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "补偿:B 应在下一拍醒来(无补偿收集的实现恒红)");
+        assert!(
+            s.pending_contact_wakes.is_empty(),
+            "取出即清:消费后待处理集为空(不跨拍重试)"
+        );
+
+        // 恢复线:同样下一拍醒(种子不进快照的实现此断言红)。
+        let mut woke_r = false;
+        for _ in 0..2 {
+            r.step();
+            if !is_frozen(&r, b) {
+                woke_r = true;
+                break;
+            }
+        }
+        assert!(woke_r, "恢复线:B 同样在下一拍醒来(种子随快照往返)");
+    }
+
+    /// AC-T17 守卫的 sim 级半边:0.4 m/s 推挤,冲量 0.4 < 门槛 1,补偿不
+    /// 收集,B 200 拍不醒。
+    /// 会变红的实现:补偿对任何接触冲量都入种子(收集侧无门槛——种子会
+    /// 出现在待处理集,首个断言红;最终唤醒会被传播门槛挡下,但收集口径
+    /// 已错)。
+    #[test]
+    fn compensation_below_threshold_not_collected() {
+        let mut s = contact_sim(16);
+        let (b, _a1, _a2, c) = missed_prediction_bodies(&mut s, 0.4, 52.5);
+        let _impact = impact_tick(&mut s, c, 0.4);
+        for k in 0..200 {
+            s.step();
+            assert!(is_frozen(&s, b), "拍 {k}:低于门槛的推挤不触发补偿唤醒");
+            assert!(
+                s.pending_contact_wakes.is_empty(),
+                "拍 {k}:收集侧门槛生效,0.4 kg·m/s 不入种子集"
+            );
+        }
+    }
+
+    /// 风险 1:补偿种子指向的实体在消费前消失(RemoveEntity)→ 静默跳过
+    /// 不 panic(§4.10.4 风险 1 的字面契约);取出即清同样适用。
+    /// 会变红的实现:消费侧对已消失实体 unwrap/索引 panic(测试以 panic
+    /// 失败);或种子残留跨拍(pending 非空断言红)。
+    #[test]
+    fn compensation_seed_to_missing_entity_skipped() {
+        let mut s = contact_sim(16);
+        let (b, a1, _a2, c) = missed_prediction_bodies(&mut s, 8.0, 52.5);
+        let _impact = impact_tick(&mut s, c, 8.0);
+        assert!(!s.pending_contact_wakes.is_empty(), "前置:种子已收集");
+        // 消费前删除 B:下一拍 prestep 消费时实体已不存在 → 静默跳过。
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 9,
+            payload: InputPayload::Command(SimCommand::RemoveEntity { entity: b }),
+        }]);
+        s.step();
+        assert!(
+            s.entity_state(b).is_none(),
+            "B 已被 RemoveEntity 删除(前提自检)"
+        );
+        assert!(s.entity_state(a1).is_some(), "链上其余实体不受消费影响");
+        assert!(
+            s.pending_contact_wakes.is_empty(),
+            "取出即清:指向消失实体的种子同样取出即弃"
+        );
     }
 }

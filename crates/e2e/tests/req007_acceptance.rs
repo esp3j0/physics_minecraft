@@ -1248,7 +1248,6 @@ fn missed_prediction_impact(h: &mut Harness, c_speed: f32, c_gap: f32) -> (Entit
 /// 会变红的实现:没有补偿路径(B 一直冻结,三块被 B 当墙挡住);补偿种子不进
 /// 快照或恢复时丢失(恢复线里 B 不醒)。
 #[test]
-#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05c_missed_prediction_compensated_next_tick() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let (b, _k) = missed_prediction_impact(&mut h, 8.0, 1.5);
@@ -1302,7 +1301,6 @@ fn acc_05c_missed_prediction_compensated_next_tick() {
 /// 会变红的实现:补偿对任何非零接触冲量都唤醒(没有用 `contact_wake_min_momentum`
 /// 作门槛)。
 #[test]
-#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05c_weak_push_below_threshold_not_compensated() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let (b, _k) = missed_prediction_impact(&mut h, 0.4, 0.05);
@@ -1321,7 +1319,6 @@ fn acc_05c_weak_push_below_threshold_not_compensated() {
 /// 会变红的实现:补偿把支撑接触的冲量也和门槛比较——B 一冻结就被静载唤醒,
 /// 醒 → 静止 → 冻结 → 又醒,循环往复。
 #[test]
-#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05c_static_load_never_compensates() {
     let mut h = Harness::new(|_| {});
     // B 落在地面上;H 放在 B 顶面正上方。
