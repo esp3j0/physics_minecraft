@@ -15,11 +15,13 @@ use std::collections::BTreeSet;
 
 use app::config::Config;
 use messaging::{InputSource, SimCommand};
-use physics_sim::tickets::{TicketHolder, TicketKind};
+use physics_sim::tickets::{TicketHolder, TicketKind, TicketState};
 use sim_api::session::Session;
 use storage::traits::ChunkKey;
 use types::glam::Vec3;
-use types::{DimensionId, EntityDesc, EntityId, EntityState, ShardId, ShardPos, WorldId};
+use types::{
+    BlockId, ChunkPos, DimensionId, EntityDesc, EntityId, EntityState, ShardId, ShardPos, WorldId,
+};
 
 /// 地表上贴地实体的中心高度。
 const GROUND_Y: f32 = -59.5;
@@ -186,6 +188,63 @@ impl Harness {
             .translation
     }
 
+    fn spawn_transient(&mut self, e: EntityId, pos: Vec3) {
+        self.session
+            .send(
+                origin(),
+                SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: pos,
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("spawn transient");
+    }
+
+    fn teleport(&mut self, e: EntityId, pos: Vec3) {
+        self.session
+            .send(
+                origin(),
+                SimCommand::TeleportEntity {
+                    entity: e,
+                    state: EntityState {
+                        translation: pos,
+                        ..EntityState::default()
+                    },
+                },
+            )
+            .expect("teleport");
+    }
+
+    fn transient_ticket_state(&self, e: EntityId) -> Option<TicketState> {
+        self.session
+            .ticket_table()
+            .get((TicketHolder::Entity(e), TicketKind::TransientMotion))
+            .map(|t| t.state)
+    }
+
+    fn exists(&self, e: EntityId) -> bool {
+        self.session.entity_state(origin(), e).is_some()
+    }
+
+    fn has_collider(&self, cp: ChunkPos) -> bool {
+        self.session.has_collider(origin(), cp)
+    }
+
+    /// 分片 (0,0) 中某格的方块(chunk 未装载时返回 None)。
+    fn block_at(&self, x: i32, y: i32, z: i32) -> Option<BlockId> {
+        let cp = ChunkPos::new(x.div_euclid(16), z.div_euclid(16));
+        let chunk = self.session.voxel_chunk(origin(), cp)?;
+        Some(chunk.get(
+            x.rem_euclid(16) as usize,
+            (y - types::WORLD_Y_MIN) as usize,
+            z.rem_euclid(16) as usize,
+        ))
+    }
+
     fn finish(self) {
         self.session.shutdown();
         let _ = self.store.shutdown();
@@ -310,8 +369,10 @@ fn acc_04a_actor_motion_ticket_capped() {
 
 /// AC-T8 常驻半边:超预算淘汰冻结的常驻体,同时撤销其常驻运动票(D14 补漏)。
 ///
-/// 场景:零重力分片、醒体预算 2;e1 先在远处漂移并持票,随后在区域票中心附近
-/// 再生成 e2、e3,醒数超限;按到唤醒中心距离降序淘汰,最远的 e1 被冻结。
+/// 场景:零重力分片、醒体预算 2;e1 先漂移并持票,随后再生成 e2、e3,醒数超限。
+/// 区域票只装载、不构成唤醒范围,三者到唤醒中心的距离都是 +∞,按 §4.12 的
+/// 平局规则(`EntityId` 升序)淘汰 e1。本用例锚定的是"淘汰冻结必须撤票",
+/// 不是距离排序;距离排序由实施方单测覆盖。
 ///
 /// 会变红的实现:被淘汰冻结的常驻体仍持有 `ActorMotion`;淘汰了错误的实体;
 /// e1 在超限前就被冻结(运动中不该冻结)。
@@ -430,5 +491,275 @@ fn acc_04a_wake_resets_stillness() {
         }
     }
     assert!(ended, "静止判据重新满足后(约 20 拍)应撤销常驻运动票");
+    h.finish();
+}
+
+// ===========================================================================
+// 04b:统一唤醒入口、推迟唤醒(当前足迹 ② 前置 + 阻塞请求)、向上支撑闭包
+// (AC-T10、AC-T12、AC-T9 中由 03 移来的"支撑闭包同组唤醒"段;§4.5、§4.6、§4.9)
+// ===========================================================================
+
+/// 场景位置:chunk (4,4) 的中心,实体足迹不跨 chunk。
+const SPOT: Vec3 = Vec3::new(72.0, GROUND_Y, 72.0);
+const SPOT_CHUNK: ChunkPos = ChunkPos::new(4, 4);
+
+/// 观察者位置:A 正下方 23.5 m。A 距 23.5 m(≤ 24,满足唤醒),B 距 24.5 m(> 24)。
+const BELOW_A: Vec3 = Vec3::new(72.0, GROUND_Y - 23.5, 72.0);
+
+/// AC-T10:复现 §3.3 第 3 条的折返竞态。冻结的常驻体在脚下 chunk 被卸载后,
+/// 观察者于 ① 冷却期内折返。要求:② 就绪前保持**冻结**(推迟唤醒,不是唤醒后
+/// 进入待地形);缺失的 chunk 作为阻塞请求**免冷却**重新装载;② 就绪后醒来;
+/// 全程不穿地。
+///
+/// 会变红的实现:唤醒不检查当前足迹 ②(醒来后掉进待地形或坠落);推迟唤醒
+/// 不发阻塞请求(chunk 要等约 160 拍 ① 冷却才重装);② 就绪后不唤醒。
+#[test]
+#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04b_roundtrip_wake_deferred_until_terrain() {
+    let mut h = Harness::new(|_| {});
+    let near = Vec3::new(72.0, GROUND_Y, 60.0); // 距实体 12 m
+    let mid = Vec3::new(112.0, GROUND_Y, 72.0); // 40 m:冻结,但 chunk 仍保留
+    let far = Vec3::new(232.0, GROUND_Y, 72.0); // 160 m:chunk 卸载
+    h.set_observer(near);
+    h.steps(60);
+    let e = actor(1);
+    h.spawn_actor(e, SPOT, Vec3::ZERO);
+    h.steps(80);
+
+    // 移到 40 m:静止的常驻体冻结,chunk 保留。
+    h.set_observer(mid);
+    let mut froze = false;
+    for _ in 0..30 {
+        h.step();
+        if h.frozen(e) {
+            froze = true;
+            break;
+        }
+    }
+    assert!(froze, "前置:静止常驻体在 40 m 外应冻结");
+    let mut since_freeze = 0usize;
+    h.steps(170);
+    since_freeze += 170;
+
+    // 移到 160 m:等实体脚下的 chunk 被卸载。
+    h.set_observer(far);
+    let mut unloaded = false;
+    for _ in 0..120 {
+        h.step();
+        since_freeze += 1;
+        if !h.session.is_chunk_loaded(origin(), SPOT_CHUNK) {
+            unloaded = true;
+            break;
+        }
+    }
+    assert!(unloaded, "前置:观察者 160 m 外,实体脚下的 chunk 应被卸载");
+    assert!(h.frozen(e), "前置:实体保持冻结");
+    // 保证翻转冷却(180 拍)已过,折返时满足唤醒条件;此时 ① 冷却仍未过。
+    while since_freeze < 185 {
+        h.step();
+        since_freeze += 1;
+    }
+
+    // 折返到 12 m。
+    h.set_observer(near);
+    let mut collider_back_at = None;
+    let mut woke_at = None;
+    for k in 0..90 {
+        h.step();
+        let y = h.pos(e).y;
+        assert!(y > GROUND_Y - 0.1, "拍 {k}:实体穿地(y = {y})");
+        let has_ground = h.has_collider(SPOT_CHUNK);
+        if has_ground && collider_back_at.is_none() {
+            collider_back_at = Some(k);
+        }
+        if !has_ground {
+            assert!(
+                h.frozen(e),
+                "拍 {k}:脚下 ② 未就绪时应保持冻结(推迟唤醒),而不是醒来"
+            );
+        }
+        if !h.frozen(e) {
+            woke_at = Some(k);
+            break;
+        }
+    }
+    let back = collider_back_at.expect("脚下 chunk 的 ② 应重新就绪");
+    assert!(
+        back < 40,
+        "推迟唤醒的缺失 chunk 是阻塞请求,应免冷却装载;实得 {back} 拍(① 冷却会让它拖到约 160 拍)"
+    );
+    let woke = woke_at.expect("② 就绪后应唤醒");
+    assert!(
+        woke >= back,
+        "唤醒不得早于 ② 就绪(唤醒拍 {woke} < ② 就绪拍 {back})"
+    );
+    h.finish();
+}
+
+/// 竖叠两个常驻体:A 在地面,B 压在 A 上。两者静止后在 40 m 外冻结,
+/// 再等翻转冷却过去。
+fn stacked_frozen_pair(h: &mut Harness) -> (EntityId, EntityId) {
+    let (a, b) = (actor(1), actor(2));
+    h.set_observer(Vec3::new(72.0, GROUND_Y, 60.0));
+    h.steps(60);
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_actor(b, SPOT + Vec3::new(0.0, 1.05, 0.0), Vec3::ZERO);
+    h.steps(80);
+    assert!(
+        (h.pos(b).y - (GROUND_Y + 1.0)).abs() < 0.1,
+        "前置:B 叠在 A 上(B 的 y = {})",
+        h.pos(b).y
+    );
+    h.set_observer(Vec3::new(112.0, GROUND_Y, 72.0));
+    let mut both = false;
+    for _ in 0..60 {
+        h.step();
+        if h.frozen(a) && h.frozen(b) {
+            both = true;
+            break;
+        }
+    }
+    assert!(both, "前置:A、B 静止后都在 40 m 外冻结");
+    h.steps(200); // 翻转冷却
+    (a, b)
+}
+
+/// AC-T12 第一项:唤醒 A 时,压在 A 上的冻结体 B 经向上支撑闭包同拍一起醒来。
+/// 观察者在 A 正下方,只有 A 落在唤醒半径内。
+///
+/// 会变红的实现:没有支撑闭包(B 在唤醒半径外保持冻结,A 一动 B 就悬空);
+/// 闭包晚一拍或分开生效。
+#[test]
+#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04b_closure_wakes_stack_together() {
+    let mut h = Harness::new(|_| {});
+    let (a, b) = stacked_frozen_pair(&mut h);
+    h.set_observer(BELOW_A);
+    let mut woke = false;
+    for k in 0..15 {
+        h.step();
+        let (fa, fb) = (h.frozen(a), h.frozen(b));
+        assert_eq!(
+            fa, fb,
+            "拍 {k}:A、B 必须同拍唤醒(A 冻结 = {fa},B 冻结 = {fb})"
+        );
+        if !fa {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "A 进入唤醒半径后,A 与压在其上的 B 应一起醒来");
+    h.finish();
+}
+
+/// AC-T12 第二项:醒体预算放不下整组时,整组推迟,无一单独醒来。
+///
+/// 会变红的实现:先唤醒 A 再按预算处理(A 单独醒来、B 留在空中);闭包成员被
+/// 拆开淘汰。
+#[test]
+#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04b_closure_deferred_when_budget_short() {
+    let mut h = Harness::new(|cfg| cfg.activation.max_awake_dynamic = 1);
+    let (a, b) = stacked_frozen_pair(&mut h);
+    h.set_observer(BELOW_A);
+    for k in 0..30 {
+        h.step();
+        assert!(
+            h.frozen(a) && h.frozen(b),
+            "拍 {k}:组大小 2 > 预算 1,整组应推迟(A 冻结 = {},B 冻结 = {})",
+            h.frozen(a),
+            h.frozen(b)
+        );
+    }
+    h.finish();
+}
+
+/// AC-T9 中由 03 移到 04b 的一段:瞬态方块 T 压在冻结常驻体 A 上(T 被承载,
+/// 静止后冻结、票据挂起)。唤醒 A 时 T 经闭包同拍醒来,票据从 Suspended 回到
+/// Paused(仍被承载);随后把 A 传送走,T 失去支撑下落,落地后凝固成方块,
+/// 实体消失、票据终结。
+///
+/// 会变红的实现:T 不随 A 唤醒(悬空);唤醒后票据回到 Active(仍被承载却恢复
+/// 计时);T 失去支撑后不下落或不凝固;凝固后票据不终结。
+#[test]
+#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04b_carried_block_wakes_with_supporter_then_lands() {
+    let mut h = Harness::new(|_| {});
+    let (a, t) = (actor(1), EntityId::from_parts(1, 9));
+    h.set_observer(Vec3::new(72.0, GROUND_Y, 60.0));
+    h.steps(60);
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_transient(t, SPOT + Vec3::new(0.0, 1.05, 0.0));
+    h.steps(80);
+    assert!(h.exists(t), "前置:压在常驻体上的瞬态方块不凝固(§4.7)");
+    assert_eq!(
+        h.transient_ticket_state(t),
+        Some(TicketState::Paused),
+        "前置:被承载的瞬态票据处于 Paused"
+    );
+
+    // 观察者移到 40 m:A 静止冻结,T 被承载且静止 → 冻结 + Suspended。
+    h.set_observer(Vec3::new(112.0, GROUND_Y, 72.0));
+    let mut both = false;
+    for _ in 0..60 {
+        h.step();
+        if h.frozen(a) && h.frozen(t) {
+            both = true;
+            break;
+        }
+    }
+    assert!(both, "前置:A 与其承载的 T 都冻结");
+    h.steps(2); // 票据操作 N+1 生效
+    assert_eq!(
+        h.transient_ticket_state(t),
+        Some(TicketState::Suspended),
+        "前置:承载静止冻结的瞬态票据处于 Suspended"
+    );
+    h.steps(200);
+
+    // 从 A 正下方唤醒 A;T 在 24 m 外,只能经闭包醒来。
+    h.set_observer(BELOW_A);
+    let mut woke = false;
+    for k in 0..15 {
+        h.step();
+        assert_eq!(h.frozen(a), h.frozen(t), "拍 {k}:A 与 T 必须同拍唤醒");
+        if !h.frozen(a) {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "A 被唤醒时 T 应经闭包同拍醒来");
+    h.steps(2); // 票据操作 N+1 生效
+    assert_eq!(
+        h.transient_ticket_state(t),
+        Some(TicketState::Paused),
+        "唤醒后 T 仍被承载,票据应回到 Paused 而不是 Active"
+    );
+
+    // 把 A 传送到 6 m 外:T 失去支撑,下落、落地、凝固。
+    assert_eq!(
+        h.block_at(72, -60, 72),
+        Some(BlockId::AIR),
+        "前置:落点格为空气"
+    );
+    h.teleport(a, SPOT + Vec3::new(6.0, 0.0, 0.0));
+    let mut gone = false;
+    for _ in 0..240 {
+        h.step();
+        if !h.exists(t) {
+            gone = true;
+            break;
+        }
+    }
+    assert!(gone, "T 失去支撑后应下落并凝固(240 拍内)");
+    assert_ne!(
+        h.block_at(72, -60, 72),
+        Some(BlockId::AIR),
+        "T 应凝固在 A 原来所在的格 (72,-60,72)"
+    );
+    h.steps(2);
+    assert_eq!(h.transient_ticket_state(t), None, "凝固后瞬态票据应已终结");
     h.finish();
 }
