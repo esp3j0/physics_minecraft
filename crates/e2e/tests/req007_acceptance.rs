@@ -125,6 +125,11 @@ impl Harness {
 
     /// 在分片 (0,0) 生成一个常驻体(同拍 MarkActor)。
     fn spawn_actor(&mut self, e: EntityId, pos: Vec3, vel: Vec3) {
+        self.spawn_actor_sized(e, pos, vel, EntityDesc::default().half_size);
+    }
+
+    /// 同 `spawn_actor`,指定立方体半边长(密度 1 → 质量 = (2·half)³ kg)。
+    fn spawn_actor_sized(&mut self, e: EntityId, pos: Vec3, vel: Vec3, half_size: f32) {
         self.session
             .send(
                 origin(),
@@ -135,7 +140,10 @@ impl Harness {
                         linvel: vel,
                         ..EntityState::default()
                     },
-                    desc: EntityDesc::default(),
+                    desc: EntityDesc {
+                        half_size,
+                        ..EntityDesc::default()
+                    },
                 },
             )
             .expect("spawn");
@@ -1179,6 +1187,185 @@ fn acc_05b_two_sided_impact_merges_by_max() {
         flags,
         vec![false; 5],
         "两侧同拍撞击:5 个应在同一拍全部醒来(冻结标志 = {flags:?})"
+    );
+    h.finish();
+}
+
+// ===========================================================================
+// 05c:撞后冲量补偿路径(AC-T17;需求 §4.10.4、§4.14)
+// ===========================================================================
+
+/// 构造一次"撞前预测必然漏判"的撞击(零重力)。一排三块水平贴靠(间隙 0):
+/// A1、A2 在唤醒范围内醒着且静止,B 在范围外冻结;C 以 `c_speed` 从 A1 外侧撞来。
+///
+/// 为什么预测看不到:B 只和 A2 相邻,而 A2 在物理步开始时速度为 0(p = 0);
+/// C 离 B 隔着两块(中心距约 3 m),超出 C 的扫掠包络与 B 的包络之和(约 2.1 m)。
+/// 这一步里 C→A1→A2 的冲量全部打在 B 上,B 被当作墙,三块一起停下,步后
+/// A2 也没有指向 B 的速度——只有撞后冲量补偿能在下一拍唤醒 B。
+///
+/// 撞击必须赶在 A1、A2 进入引擎睡眠(静止 0.5 s = 30 拍)之前:睡着的 A2 不参与
+/// 求解,冲量传不到 B,A1 会带着速度压进 A2,下一拍由预测唤醒 B——那就测不出补偿。
+///
+/// 返回 B 与"撞击发生的拍"(C 的 x 速度第一次降到 `c_speed` 的 3/4 以下)。
+fn missed_prediction_impact(h: &mut Harness, c_speed: f32, c_gap: f32) -> (EntityId, usize) {
+    let y = GROUND_Y + 20.0;
+    // 唤醒范围:中心在 A1、A2 之间,半径 0.9(区域票无滞回)。A1、A2 中心距 0.5
+    // 在内;B 中心距 1.5、最近面 1.0,都在外。
+    h.area_ticket(1, Vec3::new(72.5, y, 72.5), 0.9, 0b111);
+    h.steps(40);
+    let (a1, a2, b, c) = (actor(1), actor(2), actor(3), actor(4));
+    h.spawn_actor(b, Vec3::new(74.0, y, 72.5), Vec3::ZERO);
+    h.steps(40);
+    assert!(h.frozen(b), "前置:B 在唤醒范围外静止,应冻结");
+    h.spawn_actor(a1, Vec3::new(72.0, y, 72.5), Vec3::ZERO);
+    h.spawn_actor(a2, Vec3::new(73.0, y, 72.5), Vec3::ZERO);
+    h.steps(2);
+    assert!(
+        !h.frozen(a1) && !h.frozen(a2),
+        "前置:A1、A2 在唤醒范围内,醒着"
+    );
+    assert!(h.frozen(b), "前置:与 A2 静止贴靠不唤醒 B");
+    // C 的右面与 A1 的左面相距 c_gap。
+    h.spawn_actor(
+        c,
+        Vec3::new(72.0 - 1.0 - c_gap, y, 72.5),
+        Vec3::new(c_speed, 0.0, 0.0),
+    );
+    for k in 0..25 {
+        h.step();
+        if h.vel(c).x < c_speed * 0.75 {
+            return (b, k);
+        }
+        assert!(h.frozen(b), "拍 {k}:撞击发生前 B 保持冻结");
+    }
+    panic!("前置:C 应在 25 拍内撞上 A1(赶在 A1、A2 引擎睡眠之前)");
+}
+
+/// AC-T17 主体:预测漏判的撞击由撞后冲量补偿,被撞的冻结体在下一拍醒来;
+/// 补偿种子随 checkpoint 保存——在撞击那一拍之后截世界快照并恢复,恢复线同样
+/// 在下一拍唤醒 B。
+///
+/// 会变红的实现:没有补偿路径(B 一直冻结,三块被 B 当墙挡住);补偿种子不进
+/// 快照或恢复时丢失(恢复线里 B 不醒)。
+#[test]
+#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05c_missed_prediction_compensated_next_tick() {
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let (b, _k) = missed_prediction_impact(&mut h, 8.0, 1.5);
+    assert!(h.frozen(b), "前置:撞击那一拍 B 仍冻结(预测确实漏判)");
+
+    // 撞击那一拍之后、下一拍之前:截世界快照(补偿种子此刻待处理)。
+    let snapshot = h.session.world_snapshot();
+
+    // 原线:下一拍(最多两拍)内 B 醒来。
+    let mut woke = false;
+    for _ in 0..2 {
+        h.step();
+        if !h.frozen(b) {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "预测漏判的撞击应由撞后冲量补偿,被撞的 B 在下一拍醒来");
+
+    // 恢复线:同样在下一拍内醒来。
+    let mut restored = sim_api::replay::replay_world(
+        &snapshot,
+        &sim_api::log::CommandLog::new(),
+        Config::default().session_config(),
+        || Box::new(voxel::SimpleRegistry::builtin()),
+    )
+    .expect("自有快照必可恢复");
+    assert!(
+        restored.is_frozen(origin(), b),
+        "前置:恢复线起点 B 仍冻结(补偿尚未生效)"
+    );
+    let mut woke_r = false;
+    for _ in 0..2 {
+        restored.tick();
+        if !restored.is_frozen(origin(), b) {
+            woke_r = true;
+            break;
+        }
+    }
+    assert!(
+        woke_r,
+        "补偿种子应随 checkpoint 保存:恢复线里 B 同样在下一拍醒来"
+    );
+    restored.shutdown();
+    h.finish();
+}
+
+/// AC-T17 守卫:补偿路径同样受动量门槛约束。C 只以 0.4 m/s(1 kg)推这一排,
+/// 打到 B 上的冲量远低于 1.0 kg·m/s,B 不应被唤醒。
+///
+/// 会变红的实现:补偿对任何非零接触冲量都唤醒(没有用 `contact_wake_min_momentum`
+/// 作门槛)。
+#[test]
+#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05c_weak_push_below_threshold_not_compensated() {
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let (b, _k) = missed_prediction_impact(&mut h, 0.4, 0.05);
+    for k in 0..60 {
+        h.step();
+        assert!(h.frozen(b), "拍 {k}:低于门槛的推挤不应触发补偿唤醒");
+    }
+    h.finish();
+}
+
+/// AC-T16 在补偿路径上的守卫:醒着的重物静压在冻结体上。边长 2 m(8 kg)的 H
+/// 压在冻结的边长 3 m(27 kg)的 B 顶上,每步支撑冲量 m·g·dt ≈ 1.31 kg·m/s,
+/// 高于门槛 1.0——但这是静载,不是撞击。补偿不计支撑方向的接触(§4.10.4),
+/// 静载不得唤醒 B。
+///
+/// 会变红的实现:补偿把支撑接触的冲量也和门槛比较——B 一冻结就被静载唤醒,
+/// 醒 → 静止 → 冻结 → 又醒,循环往复。
+#[test]
+#[ignore = "REQ-007 05c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05c_static_load_never_compensates() {
+    let mut h = Harness::new(|_| {});
+    // B 落在地面上;H 放在 B 顶面正上方。
+    let b_spawn = Vec3::new(72.5, GROUND_Y + 1.0, 72.5);
+    let top_spawn = Vec3::new(72.5, GROUND_Y + 3.5, 72.5);
+    // 唤醒范围:中心在 H 上方 0.5 m、半径 1.2。H 中心距约 0.5 在内,B 中心距约 3.0 在外。
+    h.area_ticket(1, top_spawn + Vec3::new(0.0, 0.5, 0.0), 1.2, 0b111);
+    h.steps(40);
+    let (b, top) = (actor(1), actor(2));
+    h.spawn_actor_sized(b, b_spawn, Vec3::ZERO, 1.5);
+    let mut frozen = false;
+    for _ in 0..300 {
+        h.step();
+        if h.frozen(b) {
+            frozen = true;
+            break;
+        }
+    }
+    assert!(frozen, "前置:B 在唤醒范围外静止,应冻结");
+
+    h.spawn_actor_sized(top, top_spawn, Vec3::ZERO, 1.0);
+    // 放上去的那一下(新接触、去穿透)可以有扰动;先让它过去,再等"B 冻结、
+    // H 醒着压在上面"的稳态出现。(冻结支撑者会连带冻结上面的醒体;H 在唤醒
+    // 范围内,下一拍自己醒来。)
+    h.steps(120);
+    let mut settled = false;
+    for _ in 0..600 {
+        h.step();
+        if h.frozen(b) && !h.frozen(top) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "前置:应出现 B 冻结、H 醒着压在上面的稳态");
+
+    for k in 0..600 {
+        h.step();
+        assert!(h.frozen(b), "拍 {k}:静载不应触发补偿唤醒");
+        assert!(!h.frozen(top), "拍 {k}:H 在唤醒范围内,应保持醒着");
+    }
+    let rel = h.pos(top) - h.pos(b);
+    assert!(
+        (rel - Vec3::new(0.0, 2.5, 0.0)).length() < 0.1,
+        "H 始终压在 B 顶上(否则本用例不成立):相对位置 {rel:?}"
     );
     h.finish();
 }
