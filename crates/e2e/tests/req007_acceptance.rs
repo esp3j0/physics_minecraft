@@ -245,6 +245,13 @@ impl Harness {
         ))
     }
 
+    /// 外部 SetBlock(本地受信命令,owner = 分片 (0,0))。
+    fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockId) {
+        self.session
+            .set_block(origin(), types::BlockPos::new(x, y, z), block)
+            .expect("set_block");
+    }
+
     fn finish(self) {
         self.session.shutdown();
         let _ = self.store.shutdown();
@@ -759,5 +766,178 @@ fn acc_04b_carried_block_wakes_with_supporter_then_lands() {
     );
     h.steps(2);
     assert_eq!(h.transient_ticket_state(t), None, "凝固后瞬态票据应已终结");
+    h.finish();
+}
+
+// ===========================================================================
+// 04c:地形变更唤醒(AC-T13;需求 §4.9、§4.11)
+// ===========================================================================
+
+/// 观察者的"中距"位置:距 SPOT 约 40 m(> 32 冻结半径,< 48 chunk 保留半径)。
+const MID: Vec3 = Vec3::new(112.0, GROUND_Y, 72.5);
+
+/// 在 SPOT 放一个常驻体,静止后让观察者退到中距使其冻结,并**立刻返回**
+/// (翻转冷却远未过去)。
+fn freshly_frozen_actor(h: &mut Harness) -> EntityId {
+    let e = actor(1);
+    h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
+    h.steps(60);
+    h.spawn_actor(e, SPOT, Vec3::ZERO);
+    h.steps(80);
+    h.set_observer(MID);
+    for _ in 0..30 {
+        h.step();
+        if h.frozen(e) {
+            return e;
+        }
+    }
+    panic!("前置:静止常驻体在中距应冻结");
+}
+
+/// AC-T13 主体:挖掉冻结常驻体脚下的方块,下一拍它被唤醒并落下;唤醒
+/// **不受翻转冷却门控**(它刚冻结不久,按距离规则要 180 拍后才可能醒)。
+/// 醒来后它在唤醒范围外运动,应持常驻运动票。
+///
+/// 会变红的实现:冻结体不响应地形变化(悬在空中);地形变更唤醒被冷却挡住;
+/// 醒来后不签发常驻票。
+#[test]
+#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04c_removed_support_wakes_frozen_actor() {
+    let mut h = Harness::new(|_| {});
+    let e = freshly_frozen_actor(&mut h);
+    // 脚下的地表方块:SPOT 中心 y = -59.5,脚底 -60,正下方的格是 (72,-61,72)。
+    assert_ne!(
+        h.block_at(72, -61, 72),
+        Some(BlockId::AIR),
+        "前置:脚下有方块"
+    );
+    h.set_block(72, -61, 72, BlockId::AIR);
+
+    let mut woke_at = None;
+    for k in 0..3 {
+        h.step();
+        if !h.frozen(e) {
+            woke_at = Some(k);
+            break;
+        }
+    }
+    assert!(
+        woke_at.is_some(),
+        "脚下方块被移除后,冻结体应在下一拍被唤醒(不受翻转冷却门控)"
+    );
+    let mut fell = false;
+    let mut saw_ticket = false;
+    for _ in 0..60 {
+        h.step();
+        saw_ticket |= h.has_actor_ticket(e);
+        if h.pos(e).y < GROUND_Y - 0.5 {
+            fell = true;
+            break;
+        }
+    }
+    assert!(fell, "醒来后应落进被挖开的格");
+    assert!(saw_ticket, "醒来后在唤醒范围外运动,应持常驻运动票");
+    h.finish();
+}
+
+/// AC-T13 第二项:醒体预算已满时,地形变更唤醒仍然生效(当拍允许超限)。
+///
+/// 场景:预算 1;B 在观察者旁边醒着占满预算,A 在 40 m 外冻结。挖掉 A 脚下的
+/// 方块后,A 仍须醒来。只断言唤醒那一拍,之后的常规淘汰不在本用例范围内。
+///
+/// 会变红的实现:地形变更唤醒走"只占空闲预算"或"先唤醒再淘汰"的路径,
+/// 预算满时 A 不醒或在唤醒当拍就被淘汰。
+#[test]
+#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04c_terrain_wake_not_truncated_by_budget() {
+    let mut h = Harness::new(|cfg| cfg.activation.max_awake_dynamic = 1);
+    let a = freshly_frozen_actor(&mut h);
+    let b = actor(2);
+    h.spawn_actor(b, MID + Vec3::new(-6.0, 0.0, 0.0), Vec3::ZERO);
+    h.steps(40);
+    assert!(!h.frozen(b), "前置:B 在观察者旁醒着,占满预算 1");
+    assert!(h.frozen(a), "前置:A 冻结");
+
+    h.set_block(72, -61, 72, BlockId::AIR);
+    let mut a_woke = false;
+    for _ in 0..3 {
+        h.step();
+        if !h.frozen(a) {
+            a_woke = true;
+            break;
+        }
+    }
+    assert!(a_woke, "预算已满时,地形变更唤醒仍应生效(当拍允许超限,§4.9)");
+    h.finish();
+}
+
+/// AC-T13 第三项:地形变更唤醒同样带向上支撑闭包。挖掉 A 脚下的方块,
+/// 压在 A 上的 B 必须与 A 同拍醒来。
+///
+/// 会变红的实现:地形变更唤醒绕过统一唤醒入口,不做闭包(B 悬空)。
+#[test]
+#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04c_terrain_wake_carries_closure() {
+    let mut h = Harness::new(|_| {});
+    let (a, b) = stacked_frozen_pair(&mut h);
+    h.set_block(72, -61, 72, BlockId::AIR);
+    let mut woke = false;
+    for k in 0..3 {
+        h.step();
+        let (fa, fb) = (h.frozen(a), h.frozen(b));
+        assert_eq!(
+            fa, fb,
+            "拍 {k}:A、B 必须同拍唤醒(A 冻结 = {fa},B 冻结 = {fb})"
+        );
+        if !fa {
+            woke = true;
+            break;
+        }
+    }
+    assert!(woke, "挖掉 A 脚下方块后,A 与压在其上的 B 应一起醒来");
+    h.finish();
+}
+
+/// AC-T13 第四项:涌现写入(凝固桥)同样触发地形变更唤醒。一个瞬态方块贴地
+/// 生成在冻结常驻体的侧旁(留 0.02 m 缝,小于 skin 0.05 m,不接触、不下落),
+/// 静止后凝固成方块 (73,-60,72);新方块与常驻体贴靠,常驻体下一拍醒来。
+/// (不让它从空中落下:下落会擦到常驻体边角被弹开,凝固格不可控。)
+///
+/// 会变红的实现:只对外部 SetBlock 登记地形变更,漏掉凝固/强制落地/BlockWrite
+/// 信封等涌现写入。
+#[test]
+#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_04c_solidify_write_wakes_adjacent_frozen_actor() {
+    let mut h = Harness::new(|_| {});
+    let e = freshly_frozen_actor(&mut h);
+    // 瞬态方块贴地放在 x 方向紧邻的格 (73,-60,72),与常驻体之间留 0.02 m。
+    let t = EntityId::from_parts(1, 9);
+    h.spawn_transient(t, Vec3::new(73.52, GROUND_Y, 72.5));
+    let mut solidified_at = None;
+    for k in 0..300 {
+        h.step();
+        if h.block_at(73, -60, 72) != Some(BlockId::AIR) {
+            solidified_at = Some(k);
+            break;
+        }
+        assert!(h.frozen(e), "拍 {k}:新方块出现之前,常驻体保持冻结");
+    }
+    assert!(
+        solidified_at.is_some(),
+        "前置:瞬态方块应在 (73,-60,72) 凝固(300 拍内)"
+    );
+    assert!(!h.exists(t), "前置:凝固后瞬态实体消失");
+    let mut woke = false;
+    for _ in 0..3 {
+        h.step();
+        if !h.frozen(e) {
+            woke = true;
+            break;
+        }
+    }
+    assert!(
+        woke,
+        "凝固写入的格与冻结常驻体贴靠,常驻体应在下一拍被唤醒(涌现写入同样登记)"
+    );
     h.finish();
 }
