@@ -1054,11 +1054,6 @@ impl Scheduler {
                 transient.push(*entity);
             }
         }
-        eprintln!(
-            "DBGBF transient={:?} ownership={:?}",
-            transient,
-            self.entity_ownership.iter().collect::<Vec<_>>()
-        );
         for id in transient {
             self.issue_transient_on_claim(id, false);
         }
@@ -1073,7 +1068,6 @@ impl Scheduler {
             .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == entity))
             .map(|(k, _)| k)
             .collect();
-        eprintln!("DBGEND entity={:?} keys={:?}", entity, keys);
         for k in keys {
             self.tickets.end(k);
         }

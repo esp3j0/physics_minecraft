@@ -58,6 +58,11 @@ struct ShardSimSnapshot {
     deferred_wake_blocked: BTreeSet<ChunkPos>,
     /// 推迟唤醒的实体(04b;下一拍免冷却重试)。
     deferred_wake: BTreeSet<EntityId>,
+    /// 本拍体素写入登记(04c;§4.11:N 拍写入、N+1 唤醒,中间 checkpoint
+    /// 恢复后不得丢;风险 5)。随快照走。
+    pending_terrain_wakes: BTreeSet<types::BlockPos>,
+    /// 地形变更唤醒的推迟种子(04c;带 D20 预算豁免标记的推迟)。随快照走。
+    deferred_terrain_wake: BTreeSet<EntityId>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -147,6 +152,8 @@ impl ShardSim {
             capped_freeze_pending: self.capped_freeze_pending.clone(),
             deferred_wake_blocked: self.deferred_wake_blocked.clone(),
             deferred_wake: self.deferred_wake.clone(),
+            pending_terrain_wakes: self.pending_terrain_wakes.clone(),
+            deferred_terrain_wake: self.deferred_terrain_wake.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -202,6 +209,9 @@ impl ShardSim {
             capped_freeze_pending: snap.capped_freeze_pending,
             deferred_wake_blocked: snap.deferred_wake_blocked,
             deferred_wake: snap.deferred_wake,
+            pending_terrain_wakes: snap.pending_terrain_wakes,
+            deferred_terrain_wake: snap.deferred_terrain_wake,
+            terrain_woken_this_tick: BTreeSet::new(),
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,

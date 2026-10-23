@@ -801,7 +801,6 @@ fn freshly_frozen_actor(h: &mut Harness) -> EntityId {
 /// 会变红的实现:冻结体不响应地形变化(悬在空中);地形变更唤醒被冷却挡住;
 /// 醒来后不签发常驻票。
 #[test]
-#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04c_removed_support_wakes_frozen_actor() {
     let mut h = Harness::new(|_| {});
     let e = freshly_frozen_actor(&mut h);
@@ -855,7 +854,6 @@ fn acc_04c_removed_support_wakes_frozen_actor() {
 /// 会变红的实现:地形变更唤醒走"只占空闲预算"或"先唤醒再淘汰"的路径,
 /// 预算满时 A 不醒或在唤醒当拍就被淘汰。
 #[test]
-#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04c_terrain_wake_not_truncated_by_budget() {
     let mut h = Harness::new(|cfg| cfg.activation.max_awake_dynamic = 1);
     let a = freshly_frozen_actor(&mut h);
@@ -883,7 +881,6 @@ fn acc_04c_terrain_wake_not_truncated_by_budget() {
 ///
 /// 会变红的实现:地形变更唤醒绕过统一唤醒入口,不做闭包(B 悬空)。
 #[test]
-#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04c_terrain_wake_carries_closure() {
     let mut h = Harness::new(|_| {});
     let (a, b) = stacked_frozen_pair(&mut h);
@@ -913,7 +910,6 @@ fn acc_04c_terrain_wake_carries_closure() {
 /// 会变红的实现:只对外部 SetBlock 登记地形变更,漏掉凝固/强制落地/BlockWrite
 /// 信封等涌现写入。
 #[test]
-#[ignore = "REQ-007 04c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04c_solidify_write_wakes_adjacent_frozen_actor() {
     let mut h = Harness::new(|_| {});
     let e = freshly_frozen_actor(&mut h);

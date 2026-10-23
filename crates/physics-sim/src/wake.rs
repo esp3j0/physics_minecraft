@@ -68,9 +68,8 @@ pub fn upward_closure(
     group.into_iter().collect()
 }
 
-/// 地形变更唤醒辅助(任务书 04 接口设计;04c 接线,此处先落地纯函数):
-/// 改写格 `c` 与哪些冻结体 AABB(外扩 `skin_m`)相交。
-#[allow(dead_code)]
+/// 地形变更唤醒辅助(任务书 04 接口设计;04c 接线):改写格 `c` 与哪些
+/// 冻结体旋转包络 AABB(外扩 `skin_m`)相交。命中表 EntityId 升序。
 pub fn frozen_intersecting_cell(
     frozen: &[(EntityId, Vec3, f32)],
     c: types::BlockPos,

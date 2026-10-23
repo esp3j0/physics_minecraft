@@ -252,6 +252,23 @@ pub struct ShardSim {
     /// ② 齐的下一拍立即落实(§4.9 推迟唤醒语义)。每拍重查前置(状态推导);
     /// 实体终结/不再冻结时自然失效(重查时忽略非冻结体)。随快照。
     pub(crate) deferred_wake: BTreeSet<EntityId>,
+    /// 本拍体素写入登记(任务 04c;§4.11 地形变更唤醒):SetBlock、BlockWrite
+    /// 信封、凝固桥、强制落地四路写入经统一出口 `register_terrain_write`
+    /// 登记;下一拍 apply_activation 消费(清空),对 AABB(外扩
+    /// `contact_wake_skin_m`)与格相交的冻结体经 `wake_group` 唤醒——不受
+    /// 翻转冷却、不受预算截断(D20:单体与整组都当拍允许超限);② 缺照常
+    /// 推迟(推迟种子带预算豁免标记,`deferred_terrain_wake`)。D17 未启用
+    /// (激活从未刷新)不登记;同拍同格多次写入去重(BTreeSet)。随快照
+    /// (N 拍写入、N+1 唤醒,中间 checkpoint 恢复后不得丢;风险 5)。
+    pub(crate) pending_terrain_wakes: BTreeSet<BlockPos>,
+    /// 地形变更唤醒的推迟种子(04c;风险 2 同款:前置不满足时入集,下一拍
+    /// 免冷却重跑 wake_group,**仍带 D20 预算豁免**)。随快照。
+    pub(crate) deferred_terrain_wake: BTreeSet<EntityId>,
+    /// 当拍经地形变更唤醒的实体(04c;§4.12):下一拍 apply_activation 开头
+    /// 清空——常规淘汰只从当拍之后的拍开始;同拍 enforce_budget(命令唤醒
+    /// 淘汰)读它排除地形唤醒者。不进快照(只活一拍,checkpoint 落在拍间时
+    /// 必为空)。
+    pub(crate) terrain_woken_this_tick: BTreeSet<EntityId>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -288,6 +305,9 @@ impl ShardSim {
             capped_freeze_pending: BTreeSet::new(),
             deferred_wake_blocked: BTreeSet::new(),
             deferred_wake: BTreeSet::new(),
+            pending_terrain_wakes: BTreeSet::new(),
+            deferred_terrain_wake: BTreeSet::new(),
+            terrain_woken_this_tick: BTreeSet::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -490,6 +510,9 @@ impl ShardSim {
                                     self.rebuild_chunk_collider(cp);
                                 }
                             }
+                            // holder 侧同样登记(04c 风险 4):边界附近的
+                            // holder 侧冻结实体失去支撑也须醒来。
+                            self.register_terrain_write(pos);
                         }
                     }
                 },
@@ -509,6 +532,9 @@ impl ShardSim {
         let awake: Vec<(EntityId, Vec3)> = self
             .entities
             .iter()
+            // 当拍地形变更唤醒者不进淘汰池(04c;D20/§4.12):命令唤醒
+            // 与地形唤醒同拍时,超限者按常规规则下一拍起淘汰。
+            .filter(|(id, _)| !self.terrain_woken_this_tick.contains(id))
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 (*id, conv::rapier_to_vec3(b.translation()))
@@ -721,6 +747,9 @@ impl ShardSim {
                             block: desc.block,
                             kind: BlockWriteKind::Emergent,
                         });
+                        // 涌现写入同样登记地形变更唤醒(04c;验收
+                        // acc_04c_solidify_write_wakes_adjacent_frozen_actor)。
+                        self.register_terrain_write(cell);
                         continue;
                     }
                 }
@@ -824,6 +853,9 @@ impl ShardSim {
         // 例如观察者已移走致请求作废)就地作废——本拍 plan 重新决策。兑现过
         // 的条目已被 load_data_only 移除。
         self.pending_collider_builds.clear();
+        // 上一拍的地形变更唤醒豁免集(04c)就此到期:当拍不进淘汰池只保护
+        // 唤醒当拍,此后常规淘汰照常(§4.12"后续按常规淘汰")。
+        self.terrain_woken_this_tick.clear();
         let region = self.activation_region();
         let loaded: Vec<ChunkPos> = self.voxels.chunk_positions().collect();
         // ② 已建集合(REQ-007 任务 01;修订 5 D18:独立状态,非 chunk_bodies 键
@@ -996,19 +1028,67 @@ impl ShardSim {
                     .is_some_and(|b| !b.is_kinematic())
             })
             .count();
-        // 上一拍推迟的唤醒先重试(免冷却;② 齐即落实,风险 2)。
+        // 上一拍推迟的唤醒先重试(免冷却;② 齐即落实,风险 2)。来源分两类:
+        // 地形变更(预算豁免 D20 随种子保持)与观察者(常规 D19)。
+        let retry_terrain: Vec<EntityId> = self.deferred_terrain_wake.iter().copied().collect();
+        self.deferred_terrain_wake.clear();
+        for seed in retry_terrain {
+            let missing = self.wake_group(&[seed], awake_count, true);
+            if !missing.is_empty() {
+                self.deferred_terrain_wake.insert(seed);
+                self.deferred_wake_blocked.extend(missing);
+            }
+        }
         let retry: Vec<EntityId> = self.deferred_wake.iter().copied().collect();
         self.deferred_wake.clear();
         for seed in retry {
-            let missing = self.wake_group(&[seed], awake_count);
+            let missing = self.wake_group(&[seed], awake_count, false);
             if !missing.is_empty() {
                 // 仍缺:回队 + 阻塞请求继续(状态推导,每拍重查)。
                 self.deferred_wake.insert(seed);
                 self.deferred_wake_blocked.extend(missing);
             }
         }
+        // 地形变更唤醒(04c;§4.11):上一拍登记的写入格 → 与格相交(AABB
+        // 外扩 skin)的冻结体为种子,经统一入口唤醒——**免翻转冷却**(不经
+        // plan,决策冷却自然不挡)、**免预算截断**(D20)、带向上支撑闭包;
+        // ② 缺照常推迟(种子入 deferred_terrain_wake,豁免标记随行)。
+        // 风险 6:基线场景无体素写入,本段对 AC-T1 零影响。
+        let cells: Vec<BlockPos> = self.pending_terrain_wakes.iter().copied().collect();
+        self.pending_terrain_wakes.clear();
+        let skin = self.cfg.activation.contact_wake_skin_m;
+        for cell in cells {
+            let frozen: Vec<(EntityId, Vec3, f32)> = self
+                .entities
+                .iter()
+                .filter(|(id, rec)| {
+                    !self.terrain_woken_this_tick.contains(id)
+                        && self
+                            .phys
+                            .bodies
+                            .get(rec.handle)
+                            .is_some_and(|b| b.is_kinematic())
+                        && !self.is_awaiting_terrain(**id)
+                })
+                .map(|(id, rec)| {
+                    let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                    (
+                        *id,
+                        conv::rapier_to_vec3(b.translation()),
+                        rec.desc.half_size,
+                    )
+                })
+                .collect();
+            for seed in crate::wake::frozen_intersecting_cell(&frozen, cell, skin) {
+                let missing = self.wake_group(&[seed], awake_count, true);
+                if !missing.is_empty() {
+                    self.deferred_terrain_wake.insert(seed);
+                    self.deferred_wake_blocked.extend(missing);
+                }
+            }
+        }
         for seed in decisions.entities_to_wake.clone() {
-            let missing = self.wake_group(&[seed], awake_count);
+            let missing = self.wake_group(&[seed], awake_count, false);
             if !missing.is_empty() {
                 self.deferred_wake.insert(seed);
                 self.deferred_wake_blocked.extend(missing);
@@ -1034,6 +1114,8 @@ impl ShardSim {
     ///    承载冻结的瞬态体是成员;待地形体不属于(其 kinematic 但非冻结);
     /// 3. **整组原子**(D19):组 ≥ 2 时 `当前醒数 + 组大小 ≤ max_awake_
     ///    dynamic` 才唤醒,否则整组推迟;单实体保持现状(先醒再淘汰);
+    ///    `budget_exempt = true`(地形变更唤醒,D20 修订 7)跳过本检查——
+    ///    单体与整组都当拍允许超限(支撑已被移除,推迟就意味着悬空);
     /// 4. 落实:切 Dynamic、重置静止判据(§4.4.1)、清触顶标记;
     /// 5. 票据:被承载瞬态 → Pause(仍被承载,直达 Paused);脱离承载 →
     ///    Resume;常驻体(出范围唤醒)→ IssueActorMotion 由 lifecycle 按状
@@ -1041,7 +1123,12 @@ impl ShardSim {
     ///
     /// 返回整组推迟时缺失的 ② chunk(阻塞请求输入;前置不满足的组不落任何
     /// 成员——"下面的醒了走开、上面的悬空"被原子性排除)。
-    fn wake_group(&mut self, seeds: &[EntityId], awake_count: usize) -> BTreeSet<ChunkPos> {
+    fn wake_group(
+        &mut self,
+        seeds: &[EntityId],
+        awake_count: usize,
+        budget_exempt: bool,
+    ) -> BTreeSet<ChunkPos> {
         let region = self.activation_region();
         let skin = self.cfg.activation.contact_wake_skin_m;
         // 潜在成员 = 种子 ∪ 向上支撑闭包(只含**冻结**体:kinematic 且非待
@@ -1096,12 +1183,24 @@ impl ShardSim {
         if !missing.is_empty() {
             return missing; // 整组推迟(保持冻结);缺 ② 由调用方作阻塞请求
         }
-        // D19 预算:组 ≥ 2 整组放得下才醒;单实体保持现状。
-        if group.len() >= 2 && awake_count + group.len() > self.cfg.activation.max_awake_dynamic {
+        // D19 预算:组 ≥ 2 整组放得下才醒;单实体保持现状。D20:地形变更
+        // 唤醒豁免(budget_exempt,修订 7——支撑已被移除,推迟就意味着悬空)。
+        if !budget_exempt
+            && group.len() >= 2
+            && awake_count + group.len() > self.cfg.activation.max_awake_dynamic
+        {
             return BTreeSet::new(); // 整组推迟(预算不足;不走先醒再淘汰)
         }
         // 落实:整组原子。
         for id in &group {
+            // D20 豁免路径(04c):地形变更唤醒的组员全部记入当拍集——
+            // 同拍 enforce_budget(命令唤醒淘汰)与下一拍 plan 常规淘汰之前,
+            // 本拍内不因预算被冻结(§4.12"当拍因地形变更唤醒的实体不进
+            // 淘汰池";集合在下一拍 apply_activation 开头清空,此后常规
+            // 淘汰照常收敛)。
+            if budget_exempt {
+                self.terrain_woken_this_tick.insert(*id);
+            }
             let rec = self.entities.get(id).expect("存在");
             let is_actor = rec.actor;
             let carried_now = !is_actor && rec.carried;
@@ -1560,6 +1659,8 @@ impl ShardSim {
                 block: block_desc.block,
                 kind: BlockWriteKind::Emergent,
             });
+            // 强制落地的落点写入同样登记(04c 风险 1:四路全覆盖)。
+            self.register_terrain_write(landing);
             self.entities.remove(&id).expect("存在");
             self.phys.remove_body(handle);
             self.locomotion.remove(&id);
@@ -1622,6 +1723,18 @@ impl ShardSim {
 
     // ---- 内部 ----
 
+    /// 体素写入统一出口(任务 04c;§4.11:任何体素写入都登记被改写的格)。
+    /// 四路调用:SetBlock 命令、BlockWrite 信封应用、凝固桥、强制落地——
+    /// 不在各写入点分别登记(风险 1)。D17 未启用(激活从未刷新,
+    /// `activation_now == ZERO`)不登记、不唤醒(风险 7:未启用无新行为);
+    /// 同拍同格多次写入去重(BTreeSet,任务书偏离示意 2)。
+    fn register_terrain_write(&mut self, cell: BlockPos) {
+        if self.activation_now == Tick::ZERO {
+            return;
+        }
+        self.pending_terrain_wakes.insert(cell);
+    }
+
     fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
         match cmd {
             SimCommand::SetBlock { pos, block } => {
@@ -1643,6 +1756,7 @@ impl ShardSim {
                             block,
                             kind: BlockWriteKind::External,
                         });
+                        self.register_terrain_write(pos);
                     }
                     Err(e) => panic!("SetBlock 越界(fail-stop):{e}"),
                 }
@@ -1940,6 +2054,15 @@ mod tests {
                     ..EntityState::default()
                 },
             }),
+        }
+    }
+
+    fn setblock_input(seq: u64, pos: BlockPos, block: types::BlockId) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SetBlock { pos, block }),
         }
     }
 
@@ -3582,6 +3705,313 @@ mod tests {
             s2.entities.get(&e).unwrap().actor_motion_ticks,
             Some(1200),
             "目的片 claim 后记账连续(不重新签发)"
+        );
+    }
+
+    // ---- 04c:地形变更唤醒(§4.11、D20;任务书测试 terrain_wake_*)----
+
+    /// 中距观察者锚点:距场景实体 ≈40 m(> 32 唤醒卸载半径 → 冻结;< 48
+    /// ①② 保留半径 → 唤醒前置 ② 在场;复刻验收用例 freshly_frozen_actor
+    /// 的几何)。
+    const MID: Vec3 = Vec3::new(96.0, 3.0, 56.0);
+
+    /// 冻结一个常驻体在 `pos`(零重力悬停):观察者先在场让实体保持醒,
+    /// 21 拍累计静止判据,退到中距滞回冻结——翻转簿记已烧(地形唤醒
+    /// "免冷却"的对照面)。实体所在 chunk (3,3) 装载并已建 ②(wake_group
+    /// 的 ② 前置)。`budget` = max_awake_dynamic。
+    fn frozen_actor_at(cfg: ShardSimConfig, pos: Vec3, id: EntityId) -> ShardSim {
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(3, 3), solid_chunk());
+        s.apply_prefix(&[spawn_input(1, id, pos), mark_actor_input(2, id, true)]);
+        s.apply_activation(&[pos]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.apply_activation(&[MID]);
+        let rec = s.entities.get(&id).expect("前置:实体在表");
+        assert!(
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic(),
+            "前置:实体已冻结"
+        );
+        assert!(
+            s.has_collider(ChunkPos::new(3, 3)),
+            "前置:足迹 chunk ② 已建(wake_group 前置)"
+        );
+        s
+    }
+
+    fn is_frozen(s: &ShardSim, id: EntityId) -> bool {
+        s.entities
+            .get(&id)
+            .map(|rec| s.phys.bodies.get(rec.handle).unwrap().is_kinematic())
+            .unwrap_or(false)
+    }
+
+    /// 任务书测试 `sim::terrain_wake_under_frozen_actor`(T13)+ 免冷却:
+    /// SetBlock 移除冻结常驻体脚下的格(刚冻结、翻转冷却远未过)→ **下一拍**
+    /// apply_activation 唤醒。会变红的实现:冻结体不响应地形变化;地形唤醒
+    /// 被冷却挡住(实体刚烧簿记,按冷却要 180 拍后才可能经 plan 醒)。
+    #[test]
+    fn terrain_wake_under_frozen_actor() {
+        let mut s = frozen_actor_at(
+            budget_cfg(16),
+            Vec3::new(56.0, 66.5, 56.0), // chunk (3,3) 内;零重力悬停
+            entity(1),
+        );
+        // 脚下的格(中心 (56, 65.5, 56));零重力悬停,只锚定"地形写入唤醒"。
+        let below = BlockPos::new(56, 65, 56);
+        // 翻转冷却必然未过(冻结发生在上一拍激活刷新):唤醒只能来自地形变更。
+        s.apply_prefix(&[setblock_input(3, below, types::BlockId::AIR)]);
+        assert!(
+            !s.pending_terrain_wakes.is_empty(),
+            "外部 SetBlock 登记地形变更(统一出口)"
+        );
+        assert!(is_frozen(&s, entity(1)), "登记拍不唤醒(下一拍才醒)");
+        s.apply_activation(&[MID]);
+        assert!(!is_frozen(&s, entity(1)), "下一拍唤醒(免翻转冷却;§4.11)");
+        assert!(
+            s.terrain_woken_this_tick.contains(&entity(1)),
+            "当拍记入地形唤醒集(不进淘汰池的前提)"
+        );
+        // 下一拍:豁免集清空(常规淘汰接管),登记集清空(不再重复唤醒)。
+        s.apply_activation(&[MID]);
+        assert!(s.terrain_woken_this_tick.is_empty());
+        assert!(s.pending_terrain_wakes.is_empty());
+    }
+
+    /// 任务书测试 `wake::terrain_wake_next_tick_no_cooldown_no_budget`(T13)
+    /// 的预算半边(D20):预算 1 已被 B 占满,地形变更唤醒的 A 仍然生效
+    /// (单体当拍允许超限);plan 的超预算淘汰在 plan 时点计醒数(A 尚冻结
+    /// → 未超),地形唤醒不触发对他人的淘汰。后续拍的常规淘汰不在本用例
+    /// 范围(验收 acc_04c 第二项)。
+    #[test]
+    fn terrain_wake_next_tick_no_budget_truncation() {
+        let mut s = frozen_actor_at(
+            budget_cfg(1),
+            Vec3::new(56.0, 66.5, 56.0),
+            entity(1), // A:冻结(中距观察者,翻转簿记已烧)
+        );
+        // B:预算占用者——观察者旁醒着的常驻体。
+        s.apply_prefix(&[
+            spawn_input(3, entity(2), MID + Vec3::new(-6.0, 0.0, 0.0)),
+            mark_actor_input(4, entity(2), true),
+        ]);
+        s.apply_activation(&[MID]);
+        assert!(!is_frozen(&s, entity(2)), "前置:B 醒着占满预算 1");
+        assert!(is_frozen(&s, entity(1)), "前置:A 冻结");
+        // 挖 A 脚下 → 下一拍醒(超限容忍)。
+        s.apply_prefix(&[setblock_input(
+            5,
+            BlockPos::new(56, 65, 56),
+            types::BlockId::AIR,
+        )]);
+        s.apply_activation(&[MID]);
+        assert!(
+            !is_frozen(&s, entity(1)),
+            "预算已满时地形变更唤醒仍生效(D20 单体超限)"
+        );
+        assert!(
+            !is_frozen(&s, entity(2)),
+            "地形唤醒当拍不触发对他人的淘汰(先超限,后续常规淘汰)"
+        );
+    }
+
+    /// D20 整组半边:叠放组(2 成员)> 预算 1,地形变更唤醒**整组**醒
+    /// (预算检查整段跳过,与观察者唤醒的整组推迟 acc_04b_closure_deferred
+    /// 形成对照)。会变红的实现:地形唤醒复用 D19 预算门 → 整组推迟。
+    #[test]
+    fn terrain_wake_group_exempts_budget_d20() {
+        let mut s = frozen_actor_at(
+            budget_cfg(1),
+            Vec3::new(56.0, 66.5, 56.0),
+            entity(1), // A:种子(脚下格被写)
+        );
+        // B(actor)压在 A 上(贴靠,包络判定并入闭包):观察者先在原位让
+        // B 静止装载,退到 MID 后与 A 一样滞回冻结(瞬态不走滞回,04a)。
+        s.apply_prefix(&[
+            spawn_input(3, entity(2), Vec3::new(56.0, 67.55, 56.0)),
+            mark_actor_input(4, entity(2), true),
+        ]);
+        s.apply_activation(&[Vec3::new(56.0, 67.55, 56.0)]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.apply_activation(&[MID]);
+        assert!(
+            is_frozen(&s, entity(1)) && is_frozen(&s, entity(2)),
+            "前置:A、B 均冻结(闭包候选)"
+        );
+        s.apply_prefix(&[setblock_input(
+            4,
+            BlockPos::new(56, 65, 56),
+            types::BlockId::AIR,
+        )]);
+        s.apply_activation(&[MID]);
+        assert!(
+            !is_frozen(&s, entity(1)) && !is_frozen(&s, entity(2)),
+            "D20:叠放组(2 > 预算 1)整组当拍唤醒"
+        );
+        assert_eq!(
+            s.terrain_woken_this_tick,
+            std::iter::once(entity(1))
+                .chain(std::iter::once(entity(2)))
+                .collect(),
+            "整组成员都记入当拍地形唤醒集(不进淘汰池)"
+        );
+    }
+
+    /// D17(风险 7):激活从未刷新(`activation_now == ZERO`)时不登记、
+    /// 不唤醒——SetBlock 写块后 pending_terrain_wakes 保持空,无地形唤醒行为。
+    #[test]
+    fn terrain_wake_requires_activation_enabled() {
+        let mut s = ShardSim::new(budget_cfg(16), Box::new(voxel::SimpleRegistry::builtin()));
+        let e = entity(1);
+        s.apply_prefix(&[spawn_input(1, e, Vec3::new(56.0, 66.5, 56.0))]);
+        s.apply_prefix(&[setblock_input(
+            2,
+            BlockPos::new(56, 65, 56),
+            types::BlockId::AIR,
+        )]);
+        assert!(
+            s.pending_terrain_wakes.is_empty(),
+            "D17 未启用:不登记(风险 7)"
+        );
+        s.apply_activation(&[MID]);
+        assert!(!s.terrain_woken_this_tick.contains(&e));
+    }
+
+    /// 风险 4 的分片内半边:BlockWrite 信封应用(holder 副本)同样登记
+    /// ——边界附近的 holder 侧冻结实体失去支撑也须醒来。
+    #[test]
+    fn blockwrite_envelope_registers_terrain_wake() {
+        let mut s = frozen_actor_at(budget_cfg(16), Vec3::new(56.0, 66.5, 56.0), entity(1));
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 3,
+            payload: InputPayload::Envelope(messaging::Envelope {
+                produced_at: Tick::ZERO,
+                apply_at: Tick::ZERO,
+                source: shard_id(0, 0),
+                destination: shard_id(0, 0),
+                source_sequence: 0,
+                payload: EnvelopePayload::BlockWrite {
+                    pos: BlockPos::new(56, 65, 56),
+                    block: types::BlockId(1),
+                },
+            }),
+        }]);
+        assert!(
+            !s.pending_terrain_wakes.is_empty(),
+            "BlockWrite 信封(holder 侧涌现写入)同样登记(风险 4)"
+        );
+        s.apply_activation(&[MID]);
+        assert!(!is_frozen(&s, entity(1)), "下一拍唤醒");
+    }
+
+    /// 快照往返(风险 5):N 拍写入登记后做 checkpoint,恢复后登记集合在场
+    /// ——N+1 拍(恢复后的第一次 apply_activation)照常唤醒;推迟中的地形
+    /// 种子(带 D20 豁免)同样跨快照存续。
+    #[test]
+    fn snapshot_carries_pending_terrain_wakes() {
+        let mut s = frozen_actor_at(budget_cfg(16), Vec3::new(56.0, 66.5, 56.0), entity(1));
+        s.apply_prefix(&[setblock_input(
+            3,
+            BlockPos::new(56, 65, 56),
+            types::BlockId::AIR,
+        )]);
+        let bytes = s.snapshot();
+        let mut s2 = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("往返解码");
+        assert!(
+            !s2.pending_terrain_wakes.is_empty(),
+            "登记集合进快照(N 拍写入、N+1 唤醒,checkpoint 不丢;风险 5)"
+        );
+        s2.apply_activation(&[MID]);
+        assert!(!is_frozen(&s2, entity(1)), "恢复后下一拍照常唤醒");
+    }
+
+    /// `wake::frozen_intersecting_cell` 消费侧负例(纪律 12):skin 决定
+    /// 相交半径——贴靠(≤ 包络+skin)命中,离开(> 包络+skin)不命中;
+    /// 命中表升序。
+    #[test]
+    fn terrain_wake_intersection_respects_skin() {
+        use crate::wake::frozen_intersecting_cell;
+        let skin = 0.05_f32;
+        // half 0.5 的冻结体(旋转包络半高 0.866),中心 (56.0, 66.5, 56.0);
+        // 所在格 (56,66,56) 中心 (56.5, 66.5, 56.5):三轴距 0.5 ≤ 0.866 +
+        // 0.5 + skin ✓ → 命中。
+        let near = [(entity(2), Vec3::new(56.0, 66.5, 56.0), 0.5_f32)];
+        assert_eq!(
+            frozen_intersecting_cell(&near, BlockPos::new(56, 66, 56), skin),
+            vec![entity(2)]
+        );
+        // 同一实体挪远两格:x 距 2.5 > 0.866 + 0.5 + skin = 1.416 → 不命中
+        // (多唤醒是放宽,漏唤醒是错误;该负例锚定"更小不行"的边界)。
+        let far = [(entity(1), Vec3::new(56.0, 66.5, 56.0), 0.5_f32)];
+        assert!(
+            frozen_intersecting_cell(&far, BlockPos::new(58, 66, 56), skin).is_empty(),
+            "AABB 外扩 skin 不相交 → 不唤醒"
+        );
+        // 擦边正例:x 距 1.2 ∈ (half+0.5+skin, 包络+0.5+skin) —— 必须**仍
+        // 命中**(包络判定不能缩成非旋转 half,否则边界处漏唤醒)。
+        let graze = [(entity(4), Vec3::new(56.3, 66.5, 56.0), 0.5_f32)];
+        assert_eq!(
+            frozen_intersecting_cell(&graze, BlockPos::new(57, 66, 56), skin),
+            vec![entity(4)],
+            "包络+skin 边界内必须命中(判定不得更小)"
+        );
+        // 升序:小 id 虽在表中后位,命中表仍按 EntityId 升序。
+        let two = [
+            (entity(9), Vec3::new(56.0, 66.5, 56.0), 0.5_f32),
+            (entity(3), Vec3::new(56.0, 66.5, 56.0), 0.5_f32),
+        ];
+        assert_eq!(
+            frozen_intersecting_cell(&two, BlockPos::new(56, 66, 56), skin),
+            vec![entity(3), entity(9)],
+            "命中表 EntityId 升序"
+        );
+    }
+
+    /// 当拍不进淘汰池(§4.12;风险 3 的后一半):复刻调度器拍内顺序——
+    /// **先**激活刷新(N 拍登记的地形唤醒在本拍落实,A 超限入集),**后**
+    /// 前缀命令唤醒(Teleport 重建即醒 + enforce_budget)。B 移到观察者旁
+    /// 重建即醒 → 醒数超限,淘汰池若含 A(地形唤醒者、且更远)会同拍把
+    /// A 冻结——正确行为是豁免:A 保持动力态,下一拍起才按常规规则收敛。
+    #[test]
+    fn terrain_woken_not_in_same_tick_cull_pool() {
+        let mut s = frozen_actor_at(
+            budget_cfg(1),
+            Vec3::new(56.0, 66.5, 56.0),
+            entity(1), // A:冻结于 (56, 66.5, 56),距 MID ≈40
+        );
+        // B:观察者旁醒着的常驻体(预算 1 的占用者)。
+        s.apply_prefix(&[
+            spawn_input(3, entity(2), MID + Vec3::new(-6.0, 0.0, 0.0)),
+            mark_actor_input(4, entity(2), true),
+        ]);
+        s.apply_activation(&[MID]);
+        assert!(!is_frozen(&s, entity(2)), "前置:B 醒着");
+        // 挖 A 脚下(拍 N 的写入登记)。
+        s.apply_prefix(&[setblock_input(
+            5,
+            BlockPos::new(56, 65, 56),
+            types::BlockId::AIR,
+        )]);
+        // 拍 N+1:先激活刷新(地形唤醒落实,A 超限入豁免集),后前缀命令
+        // 唤醒(Teleport 重建即醒 + enforce_budget)。B 移到观察者正旁重建
+        // 即醒 → 醒数 {A, B} = 2 > 预算 1 → 超限者(更远的 A)不得被同拍
+        // 淘汰(命令唤醒与地形唤醒同拍时,A 随下一拍起按常规规则收敛)。
+        s.apply_activation(&[MID]);
+        assert!(!is_frozen(&s, entity(1)), "前置:地形唤醒已在拍 N+1 落实");
+        s.apply_prefix(&[teleport_input(
+            6,
+            entity(2),
+            MID + Vec3::new(-1.0, 0.0, 0.0),
+        )]);
+        assert!(
+            !is_frozen(&s, entity(1)),
+            "地形唤醒当拍不进淘汰池:命令唤醒超限时同拍不冻结 A(§4.12)"
         );
     }
 
