@@ -976,7 +976,6 @@ fn acc_04c_solidify_write_wakes_adjacent_frozen_actor() {
 /// 会变红的实现:没有接触唤醒(A 以约 -0.5 m/s 反弹,B 不动);只做撞后补偿
 /// (撞击那一步 B 仍是墙,A 已被弹回);唤醒后不签发常驻票。
 #[test]
-#[ignore = "REQ-007 05a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05a_prestep_wake_exchanges_momentum() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let at = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
@@ -1027,7 +1026,6 @@ fn acc_05a_prestep_wake_exchanges_momentum() {
 /// 这是防误报的守卫用例:在没有接触唤醒的旧实现下本来就是绿的;只有当实现
 /// "一有接触就唤醒"或补偿路径把静载冲量当作撞击时才会变红。
 #[test]
-#[ignore = "REQ-007 05a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05a_resting_contact_never_wakes() {
     let mut h = Harness::new(|_| {});
     let (b, a) = (actor(1), actor(2));

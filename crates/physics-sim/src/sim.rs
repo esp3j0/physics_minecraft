@@ -534,7 +534,16 @@ impl ShardSim {
             .iter()
             // 当拍地形变更唤醒者不进淘汰池(04c;D20/§4.12):命令唤醒
             // 与地形唤醒同拍时,超限者按常规规则下一拍起淘汰。
+            // 冻结( kinematic)体不占醒体预算(§9.4「醒数」= Dynamic 数;
+            // 05a 预算语义测试暴露的 04a 口径缺口)。
             .filter(|(id, _)| !self.terrain_woken_this_tick.contains(id))
+            .filter(|(_, rec)| {
+                !self
+                    .phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| b.is_kinematic())
+            })
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 (*id, conv::rapier_to_vec3(b.translation()))
@@ -649,8 +658,12 @@ impl ShardSim {
         body.set_body_type(RigidBodyType::KinematicPositionBased, true);
     }
 
-    /// 推进一拍:物理步进 → 凝固桥检测 → 迁移检测(demo A/C 时序)。
+    /// 推进一拍:撞前预测接触唤醒 → 物理步进 → 凝固桥检测 → 迁移检测
+    /// (demo A/C 时序;05a:预测在 `apply_prefix` 之后[生产路径 worker 的
+    /// `apply_prefix → step`]、`phys.step()` 之前——命令与爆炸冲量已施加,
+    /// 用的是更新后的速度,放行评论风险 1)。
     pub fn step(&mut self) {
+        self.prestep_contact_wake();
         self.phys.step();
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
@@ -1106,34 +1119,12 @@ impl ShardSim {
         decisions
     }
 
-    /// 统一唤醒入口(§4.9;任务 04b;观察者/区域票半径唤醒经 plan 落实、
-    /// 命令重建唤醒、承载 Resume 共用):依次执行——
-    /// 1. **前置**:每个潜在成员的当前足迹 ∩ 本分片区域 ② 齐;缺 → 整组
-    ///    推迟(保持冻结),缺的 chunk 返回给调用方作阻塞请求(免冷却);
-    /// 2. **向上支撑闭包**(几何;`wake::upward_closure`):冻结常驻体与
-    ///    承载冻结的瞬态体是成员;待地形体不属于(其 kinematic 但非冻结);
-    /// 3. **整组原子**(D19):组 ≥ 2 时 `当前醒数 + 组大小 ≤ max_awake_
-    ///    dynamic` 才唤醒,否则整组推迟;单实体保持现状(先醒再淘汰);
-    ///    `budget_exempt = true`(地形变更唤醒,D20 修订 7)跳过本检查——
-    ///    单体与整组都当拍允许超限(支撑已被移除,推迟就意味着悬空);
-    /// 4. 落实:切 Dynamic、重置静止判据(§4.4.1)、清触顶标记;
-    /// 5. 票据:被承载瞬态 → Pause(仍被承载,直达 Paused);脱离承载 →
-    ///    Resume;常驻体(出范围唤醒)→ IssueActorMotion 由 lifecycle 按状
-    ///    态产出(此处不产)。
-    ///
-    /// 返回整组推迟时缺失的 ② chunk(阻塞请求输入;前置不满足的组不落任何
-    /// 成员——"下面的醒了走开、上面的悬空"被原子性排除)。
-    fn wake_group(
-        &mut self,
-        seeds: &[EntityId],
-        awake_count: usize,
-        budget_exempt: bool,
-    ) -> BTreeSet<ChunkPos> {
-        let region = self.activation_region();
+    /// 统一唤醒入口的潜在成员(种子 ∪ 向上支撑闭包;04b 段落提取,接触唤醒
+    /// 预算判定共用):只含**冻结**体(kinematic 且非待地形)。seeds 中不在
+    /// 冻结表的条目忽略(命令唤醒的种子已是 Dynamic——此时闭包以其为根向上
+    /// 找)。返回 EntityId 升序。
+    fn wake_group_members(&self, seeds: &[EntityId]) -> Vec<EntityId> {
         let skin = self.cfg.activation.contact_wake_skin_m;
-        // 潜在成员 = 种子 ∪ 向上支撑闭包(只含**冻结**体:kinematic 且非待
-        // 地形;风险 3)。seeds 中不在实体表/非冻结的条目忽略(命令唤醒路径
-        // 的种子本来就是醒着的重建体——此时闭包以其为根向上找)。
         let frozen: Vec<(EntityId, Vec3, f32)> = self
             .entities
             .iter()
@@ -1158,7 +1149,34 @@ impl ShardSim {
             .copied()
             .filter(|id| frozen.iter().any(|(fid, _, _)| fid == id))
             .collect();
-        let group = crate::wake::upward_closure(&frozen, &seeds_frozen, skin);
+        crate::wake::upward_closure(&frozen, &seeds_frozen, skin)
+    }
+
+    /// 统一唤醒入口(§4.9;任务 04b;观察者/区域票半径唤醒经 plan 落实、
+    /// 命令重建唤醒、承载 Resume 共用):依次执行——
+    /// 1. **前置**:每个潜在成员的当前足迹 ∩ 本分片区域 ② 齐;缺 → 整组
+    ///    推迟(保持冻结),缺的 chunk 返回给调用方作阻塞请求(免冷却);
+    /// 2. **向上支撑闭包**(几何;`wake::upward_closure`):冻结常驻体与
+    ///    承载冻结的瞬态体是成员;待地形体不属于(其 kinematic 但非冻结);
+    /// 3. **整组原子**(D19):组 ≥ 2 时 `当前醒数 + 组大小 ≤ max_awake_
+    ///    dynamic` 才唤醒,否则整组推迟;单实体保持现状(先醒再淘汰);
+    ///    `budget_exempt = true`(地形变更唤醒,D20 修订 7)跳过本检查——
+    ///    单体与整组都当拍允许超限(支撑已被移除,推迟就意味着悬空);
+    /// 4. 落实:切 Dynamic、重置静止判据(§4.4.1)、清触顶标记;
+    /// 5. 票据:被承载瞬态 → Pause(仍被承载,直达 Paused);脱离承载 →
+    ///    Resume;常驻体(出范围唤醒)→ IssueActorMotion 由 lifecycle 按状
+    ///    态产出(此处不产)。
+    ///
+    /// 返回整组推迟时缺失的 ② chunk(阻塞请求输入;前置不满足的组不落任何
+    /// 成员——"下面的醒了走开、上面的悬空"被原子性排除)。
+    fn wake_group(
+        &mut self,
+        seeds: &[EntityId],
+        awake_count: usize,
+        budget_exempt: bool,
+    ) -> BTreeSet<ChunkPos> {
+        let region = self.activation_region();
+        let group = self.wake_group_members(seeds);
         // 组为空(种子非冻结体:命令唤醒的重建体已是 Dynamic)→ 无组可落,
         // 返回空缺集(调用方语义:无前置可查,物理自洽)。
         if group.is_empty() {
@@ -1236,6 +1254,112 @@ impl ShardSim {
             self.activation.note_flip(id, now);
         }
         BTreeSet::new()
+    }
+
+    /// 撞前预测接触唤醒(任务 05a;需求 §4.10.1–4.10.2、§4.10.5;调用点 =
+    /// `step` 开头、`phys.step()` 之前):醒着实体(升序)的扫掠体命中的
+    /// **冻结**实体(常驻体 + 承载静止冻结的瞬态体;待地形体不算——其
+    /// kinematic 但恢复有自己的路径)为候选;冲击动量过门槛者为种子,经
+    /// 统一入口 `wake_group` 当拍唤醒(② 前置、向上闭包、整组原子、静止
+    /// 重置、票据;风险 2:不另写一套)。落实后种子切 Dynamic 零速度起步,
+    /// rapier 在同一步里按两个动态体解算动量交换(§4.10.1)。
+    ///
+    /// 预算(风险 3,§4.12):接触唤醒**只占空闲预算**——组 ≤ 1 按现状
+    /// (先醒再淘汰,同 plan 单体);组 ≥ 2 按 D19 `当前醒数 + 组大小 ≤
+    /// max_awake_dynamic` 整组放得下才醒(不淘汰他人);放不下整组跳过
+    /// (下拍重算,`deferred` 不入——接触是几何现状的函数,重算即最新)。
+    /// **不触发淘汰、不入当拍豁免集**(与地形变更唤醒的 D20 不同:不存在
+    /// "推迟就悬空",预算不足推迟无害)。
+    ///
+    /// 风险 6(§4.10.5 不唤醒):方块/地形是 chunk 固定体不在实体表;观察者
+    /// 非物理实体;`wake_group` 内部滤待地形体;其他分片实体不在本表——
+    /// 四类天然不参与。
+    ///
+    /// D17(风险 8):`observed = None`(激活从未刷新)不预测——与地形变更
+    /// 唤醒同款门控。`wake_group` 恒返回空缺集语义下无阻塞请求通道:② 缺时
+    /// 种子保持冻结,几何继续命中,下一拍自然重试。
+    fn prestep_contact_wake(&mut self) {
+        if self.observed.is_none() {
+            return;
+        }
+        let lookahead = self.cfg.activation.contact_wake_lookahead_ticks;
+        let skin = self.cfg.activation.contact_wake_skin_m;
+        let min_p = self.cfg.activation.contact_wake_min_momentum;
+        let dt = self.cfg.dt;
+        let awake: Vec<(EntityId, Vec3, Vec3, f32, Vec3)> = self
+            .entities
+            .iter()
+            .filter(|(_id, rec)| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| !b.is_kinematic() && !b.is_sleeping())
+            })
+            .map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let h = rec.desc.half_size;
+                (
+                    *id,
+                    conv::rapier_to_vec3(b.translation()),
+                    Vec3::new(h, h, h),
+                    b.mass(),
+                    conv::rapier_to_vec3(b.linvel()),
+                )
+            })
+            .collect();
+        if awake.is_empty() {
+            return;
+        }
+        let frozen: Vec<(EntityId, Vec3, Vec3)> = self
+            .entities
+            .iter()
+            .filter(|(id, rec)| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| b.is_kinematic())
+                    && !self.is_awaiting_terrain(**id)
+            })
+            .map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                (
+                    *id,
+                    conv::rapier_to_vec3(b.translation()),
+                    Vec3::new(rec.desc.half_size, rec.desc.half_size, rec.desc.half_size),
+                )
+            })
+            .collect();
+        if frozen.is_empty() {
+            return;
+        }
+        // 种子(wake::contact_wake_seeds 返回按 B 升序)= 确定性遍历序;
+        // 同一 B 恰一条(风险 5:同 B 多 A 已在纯函数内取最大)。
+        // 预算语义(风险 3,§4.12"只占空闲预算,不淘汰他人"):整组放不下
+        // (`当前醒数 + 组大小 > max_awake_dynamic`)→ 整组跳过——不推迟、
+        // 不淘汰;几何是现状的函数,下一拍重算自然重试。组大小 1 同样受此
+        // 约束(区别于 plan/命令路径的"先醒再淘汰";这里不淘汰任何已醒
+        // 实体)。种子经 `wake_group` 走统一入口:② 前置(缺 → 整组推迟
+        // 保持冻结,接触路径无阻塞请求通道,几何继续命中下一拍自然重试)、
+        // 向上闭包、整组原子、静止重置、票据(风险 2)。
+        for (_a, b, _p) in
+            crate::wake::contact_wake_seeds(&awake, &frozen, lookahead, skin, min_p, dt)
+        {
+            let group = self.wake_group_members(&[b]);
+            let awake_count = self
+                .entities
+                .values()
+                .filter(|rec| {
+                    self.phys
+                        .bodies
+                        .get(rec.handle)
+                        .is_some_and(|x| !x.is_kinematic())
+                })
+                .count();
+            if awake_count + group.len() > self.cfg.activation.max_awake_dynamic {
+                continue;
+            }
+            let _missing = self.wake_group(&[b], awake_count, false);
+        }
     }
 
     /// 待地形进入/恢复(§4.6;瞬态体;调用点 = apply_activation 末与
@@ -4504,5 +4628,224 @@ mod tests {
             "Emergent BlockWrite 产出"
         );
         assert!(s.outbox.despawned.contains(&e));
+    }
+
+    // ---- 05a:撞前预测接触唤醒(§4.10.1–4.10.2;任务书测试 prestep_*)----
+
+    /// 启用激活的零重力 sim:观察者就位(D17 开),凝固关(漂移体不干扰)。
+    fn contact_sim(max_awake: usize) -> ShardSim {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.gravity = Vec3::ZERO;
+        cfg.activation.max_awake_dynamic = max_awake;
+        ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
+    }
+
+    /// 冻结一个常驻体(零重力悬停;复刻 04c 的 frozen_actor_at 几何语义:
+    /// chunk (3,3) 合一装载,近锚保持醒、21 拍静止、退到 MID 滞回冻结)。
+    fn frozen_actor(s: &mut ShardSim, id: EntityId, pos: Vec3) {
+        s.load_chunk(ChunkPos::new(3, 3), solid_chunk());
+        s.apply_prefix(&[spawn_input(1, id, pos), mark_actor_input(2, id, true)]);
+        s.apply_activation(&[pos]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.apply_activation(&[MID]);
+        assert!(is_frozen(s, id), "前置:实体已冻结");
+    }
+
+    /// 带初速的常驻体 spawn(撞击者构造;05a)。
+    fn spawn_actor_v(seq: u64, id: EntityId, pos: Vec3, vel: Vec3) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: pos,
+                    linvel: vel,
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            }),
+        }
+    }
+
+    /// 任务书测试 `sim::prestep_wake_momentum_exchange`(T14,sim 级):
+    /// 1 kg @30 m/s 撞向 2.5 m 外冻结的 1 kg 常驻体——撞前预测当拍唤醒 B,
+    /// rapier 同步解算:B 获得前向速度、A 明显减速(等质量恢复系数 0.1 的
+    /// 交换,不反弹)。会变红的实现:没有预测(A 撞"墙"反弹,B 不动);
+    /// 预测放 step 后(同撞墙);唤醒后被撞者没有切 Dynamic。
+    /// 几何:扫掠判定距离 = A 包络 0.866 + 扫掠 1(2 拍 @30 m/s)+ skin 0.075
+    /// + B 包络 0.866 + skin 0.075 ≈ 2.88;2.5 < 2.88 → 首拍命中。
+    #[test]
+    fn prestep_wake_momentum_exchange() {
+        let mut s = contact_sim(16);
+        let (a, b) = (entity(1), entity(2));
+        frozen_actor(&mut s, b, Vec3::new(56.0, 66.5, 56.0));
+        s.apply_prefix(&[
+            spawn_actor_v(3, a, Vec3::new(53.5, 66.5, 56.0), Vec3::new(30.0, 0.0, 0.0)),
+            mark_actor_input(4, a, true),
+        ]);
+        s.apply_activation(&[Vec3::new(53.5, 66.5, 56.0)]);
+        assert!(!is_frozen(&s, a), "前置:A 醒着");
+        assert!(is_frozen(&s, b), "前置:B 冻结(预测前)");
+
+        // 首拍 prestep 醒 B(物理接触在随后两拍内发生:间隙 0.62 m、
+        // 0.5 m/拍);30 拍窗口覆盖接触与交换。
+        for _ in 0..30 {
+            s.step();
+        }
+
+        assert!(!is_frozen(&s, b), "撞前预测:B 在同一步前被唤醒");
+        let (va, vb) = (
+            s.entity_state(a).unwrap().linvel,
+            s.entity_state(b).unwrap().linvel,
+        );
+        assert!(
+            vb.x > 0.5,
+            "B 从碰撞中获得前向速度(vB.x = {vb:?}),说明双方都是动态体解算"
+        );
+        assert!(
+            va.x < 25.0,
+            "A 明显减速(vA.x = {va:?}),动量已交换(不是撞墙反弹约 −22)"
+        );
+        assert!(va.x > 0.0, "A 不反向弹回");
+    }
+
+    /// 任务书测试 `sim::contact_wake_off_control_group`(T14 对照):
+    /// `contact_wake_min_momentum → +∞`(关门槛)不预测——A 撞冻结 B 如
+    /// 撞墙反弹,B 保持冻结。锚定"关掉新能力 = 旧行为"。
+    #[test]
+    fn contact_wake_off_control_group() {
+        let mut s = contact_sim(16);
+        let (a, b) = (entity(1), entity(2));
+        frozen_actor(&mut s, b, Vec3::new(56.0, 66.5, 56.0));
+        s.cfg.activation.contact_wake_min_momentum = f32::MAX;
+        s.apply_prefix(&[
+            spawn_actor_v(3, a, Vec3::new(53.5, 66.5, 56.0), Vec3::new(30.0, 0.0, 0.0)),
+            mark_actor_input(4, a, true),
+        ]);
+        s.apply_activation(&[Vec3::new(53.5, 66.5, 56.0)]);
+        // 关门槛的对照里 B 应保持冻结;A 撞"墙"是后续拍的物理,不在此锚定
+        // (本用例只锚定"关掉新能力 = B 不醒"的旧行为半边)。
+        s.step();
+        assert!(is_frozen(&s, b), "关能力(门槛 +∞):B 保持冻结(旧行为)");
+    }
+
+    /// 慢速撞击(动量 < 门槛)不唤醒:T16 的 sim 级半边。
+    /// 会变红的实现:预测只看几何相交不看动量。
+    #[test]
+    fn slow_contact_never_seeded() {
+        let mut s = contact_sim(16);
+        let (a, b) = (entity(1), entity(2));
+        frozen_actor(&mut s, b, Vec3::new(56.0, 66.5, 56.0));
+        // 0.5 m/s × 1 kg = p 0.5 < 1(静止贴靠同理由 v≈0 覆盖,wake.rs 侧
+        // seeds_require_momentum_and_sweep 已锚定 p=0)。1.5 m @0.5 m/s 约
+        // 180 拍贴靠;首拍距离 1.5 < 扫掠判定距离(0.866+0.017+0.075+
+        // 0.866+0.075 ≈ 1.9)→ 几何全程命中,只差动量门槛。
+        s.apply_prefix(&[
+            spawn_actor_v(3, a, Vec3::new(54.5, 66.5, 56.0), Vec3::new(0.5, 0.0, 0.0)),
+            mark_actor_input(4, a, true),
+        ]);
+        s.apply_activation(&[Vec3::new(54.5, 66.5, 56.0)]);
+        for k in 0..400 {
+            s.step();
+            assert!(is_frozen(&s, b), "拍 {k}:慢速(p < 门槛)不得唤醒 B");
+        }
+    }
+
+    /// 预算(风险 3):醒数已满预算时接触唤醒整组跳过——B 保持冻结、
+    /// **不淘汰任何已醒实体**。会变红的实现:先唤醒再淘汰(把别人挤下去);
+    /// 或预算语义沿用 D19 单体豁免(预算满也醒)。
+    #[test]
+    fn prestep_wake_skips_when_budget_full() {
+        let mut s = contact_sim(2);
+        let (a, b, c) = (entity(1), entity(2), entity(3));
+        // B 冻结在场景里;A、C 醒着占满预算 2。A 撞 B → 组 1,
+        // 2+1 > 2 → 跳过;A、C 保持醒着不被淘汰。
+        frozen_actor(&mut s, b, Vec3::new(56.0, 66.5, 56.0));
+        // 冻结 B 后、spawn A/C 前,先刷新一次激活把预算强制的距离中心换到
+        // 场景锚(否则 apply_prefix(spawn) 的命令唤醒预算强制仍以 frozen_actor
+        // 遗留的 MID 为中心计距——那是 04c 复刻的固有几何,不是被测语义)。
+        let _ = s.apply_activation(&[Vec3::new(54.75, 66.5, 56.0)]);
+        s.apply_prefix(&[
+            spawn_actor_v(3, a, Vec3::new(53.5, 66.5, 56.0), Vec3::new(30.0, 0.0, 0.0)),
+            mark_actor_input(4, a, true),
+            spawn_input(5, c, Vec3::new(56.0, 70.5, 56.0)),
+            mark_actor_input(6, c, true),
+        ]);
+        // 激活刷新锚点放两实体之间(观察者票半径 24 内;命令唤醒的预算强制
+        // 距离中心 = 该锚,两实体各距 ≈2–4 m,不触发淘汰)。
+        let _ = s.apply_activation(&[Vec3::new(54.75, 66.5, 56.0)]);
+        let awake = |s: &ShardSim| {
+            s.entities
+                .values()
+                .filter(|rec| !s.phys.bodies.get(rec.handle).unwrap().is_kinematic())
+                .count()
+        };
+        assert_eq!(awake(&s), 2, "前置:A、C 醒(预算 2 满)");
+        assert!(is_frozen(&s, b), "前置:B 冻结");
+        // 2.5 m @30 m/s 约拍 3 接触;40 拍窗口覆盖。
+        for k in 0..40 {
+            s.step();
+            assert_eq!(
+                awake(&s),
+                2,
+                "拍 {k}:预算满,接触唤醒跳过,不超限、不淘汰 A/C"
+            );
+            assert!(is_frozen(&s, b), "拍 {k}:预算满,B 不被接触唤醒");
+        }
+    }
+
+    /// 待地形体不参与(§4.10.5;风险 6):瞬态体 T 在缺 ② 区进待地形
+    /// (kinematic、不在任何一侧候选表);醒着体 A 高速穿过 T 旁的通道
+    /// 撞向冻结的 B——B 应被 A 经撞前预测唤醒(**正例**:接触唤醒路径
+    /// 畅通,不过度防御),T 全程保持待地形(既不被当作种子唤醒,也不
+    /// 被路径扰动)。
+    /// 会变红的实现:预测整体失效/把醒着体也滤掉(过防御 → B 永不醒);
+    /// 把待地形体当冻结种子(T 被唤醒脱离待地形)。
+    #[test]
+    fn awaiting_terrain_never_contact_wake() {
+        let mut s = contact_sim(16);
+        let (t, a, b) = (entity(1), entity(2), entity(3));
+        // B 冻结在 A 的通道上 (56,66.5,9.5)(chunk (3,0);手动复刻
+        // frozen_actor 的滞回冻结流程,载对应 chunk)。
+        s.load_chunk(ChunkPos::new(3, 0), solid_chunk());
+        s.apply_prefix(&[
+            spawn_input(1, b, Vec3::new(56.0, 66.5, 9.5)),
+            mark_actor_input(2, b, true),
+        ]);
+        s.apply_activation(&[Vec3::new(56.0, 66.5, 9.5)]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.apply_activation(&[MID]);
+        assert!(is_frozen(&s, b), "前置:B 冻结");
+        // T:瞬态出生在缺 ② 的 chunk 区域((0,0) 未装载)→ 待地形。
+        s.apply_prefix(&[spawn_input(3, t, Vec3::new(8.0, 66.5, 8.0))]);
+        let _ = s.apply_activation(&[Vec3::new(8.0, 66.5, 8.0)]);
+        assert!(s.is_awaiting_terrain(t), "前置:T 进待地形(kinematic)");
+        // A 高速穿过 T 旁(z 距 1.5 > collider 和 1.0,不碰 T)直奔 B。
+        s.apply_prefix(&[
+            spawn_actor_v(4, a, Vec3::new(8.0, 66.5, 9.5), Vec3::new(150.0, 0.0, 0.0)),
+            mark_actor_input(5, a, true),
+        ]);
+        let _ = s.apply_activation(&[Vec3::new(8.0, 66.5, 9.5)]);
+        assert!(!is_frozen(&s, a), "前置:A 醒着");
+        let mut woke = false;
+        for _ in 0..60 {
+            s.step();
+            assert!(
+                s.is_awaiting_terrain(t),
+                "待地形体不被接触唤醒路径扰动(两侧表都滤 kinematic)"
+            );
+            if !is_frozen(&s, b) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "正例:A 经撞前预测唤醒路径上的 B(路径畅通)");
     }
 }

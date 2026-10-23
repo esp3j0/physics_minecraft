@@ -66,6 +66,10 @@ pub struct ActivationConfig {
     /// 接触/贴靠唤醒外扩 m(REQ-007 §4.10/§4.9;默认 0.075 = 站立面容差;
     /// 支撑闭包邻接判定共用)。
     pub contact_wake_skin_m: f32,
+    /// 撞前预测扫掠拍数(REQ-007 §4.10.2;默认 2)。
+    pub contact_wake_lookahead_ticks: u64,
+    /// 接触唤醒种子与传播门槛 kg·m/s(REQ-007 §4.10.2;默认 1.0)。
+    pub contact_wake_min_momentum: f32,
     /// 虚空移除深度 m(默认 16;y < WORLD_Y_MIN − 深度 即删)。
     pub void_despawn_depth_m: f32,
 }
@@ -91,6 +95,8 @@ impl Default for ActivationConfig {
             actor_motion_max_ticks: 1200,
             support_normal_min: 0.7,
             contact_wake_skin_m: 0.075,
+            contact_wake_lookahead_ticks: 2,
+            contact_wake_min_momentum: 1.0,
             void_despawn_depth_m: 16.0,
         }
     }
