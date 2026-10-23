@@ -136,6 +136,117 @@ pub fn contact_wake_seeds(
     best.into_iter().map(|(b, (a, p))| (a, b, p)).collect()
 }
 
+/// 冻结邻接图(任务 05b;任务书 05 接口设计;需求 §4.10.3):两个冻结实体
+/// 碰撞形状间距 ≤ `skin_m` 即相邻——几何纯函数,判定与 [`upward_closure`]、
+/// [`contact_wake_seeds`] 同款:旋转包络 AABB(`half·√3`)外扩 `skin_m` 后
+/// 三轴重叠。图对称;键与邻接集都按 `EntityId` 升序(§14 第 3 条确定性)。
+///
+/// `frozen`:全部冻结实体的 `(id, center, half_extent)`;调用方保证只含冻结体
+/// (常驻体 + 承载静止冻结的瞬态体;醒着体与待地形体不在图中,风险 3)。
+pub fn frozen_adjacency(
+    frozen: &[(EntityId, Vec3, Vec3)],
+    skin_m: f32,
+) -> BTreeMap<EntityId, BTreeSet<EntityId>> {
+    let overlap = |a: f32, ha: f32, b: f32, hb: f32| (a - b).abs() <= ha + hb + skin_m;
+    // 包络 AABB 半高 = half·√3(逐分量;half 为三维半尺寸向量)。
+    let envelope = |h: Vec3| Vec3::new(h.x * SQRT_3, h.y * SQRT_3, h.z * SQRT_3);
+    // 全部冻结体都是图的节点(孤立者邻接集为空)——种子即使无邻接也要能
+    // 站在图上参与传播(自身即结果)。
+    let mut graph: BTreeMap<EntityId, BTreeSet<EntityId>> = frozen
+        .iter()
+        .map(|(id, _, _)| (*id, BTreeSet::new()))
+        .collect();
+    for (i, (ai, ca, hai)) in frozen.iter().enumerate() {
+        let ei = envelope(*hai);
+        for (aj, ca_, haj) in frozen.iter().skip(i + 1) {
+            let ej = envelope(*haj);
+            if overlap(ca.x, ei.x, ca_.x, ej.x)
+                && overlap(ca.y, ei.y, ca_.y, ej.y)
+                && overlap(ca.z, ei.z, ca_.z, ej.z)
+            {
+                graph.get_mut(ai).expect("节点已建").insert(*aj);
+                graph.get_mut(aj).expect("节点已建").insert(*ai);
+            }
+        }
+    }
+    graph
+}
+
+/// 最大动量传播(任务 05b;任务书 05 接口设计;需求 §4.10.3):从全部种子
+/// (第 0 跳)出发,`p(子) = decay · p(父)`,每节点取所有路径中的**最大值**
+/// ——优先队列按 `(p 降序, EntityId 升序)` 出队(风险 1:不是"先到先得"的
+/// BFS,小 p 先标记会把大 p 挡在外面;同 p 按 EntityId 升序定序)。出队即
+/// 定稿(首次出队的 p 即该节点最终 p;后续更大者已不可能——队列按 p 降序)。
+/// `p(子) < min_momentum` 或 `跳数 > max_hops` 停止(风险 2:种子 = 第 0 跳,
+/// 子节点跳数 = 父跳数 + 1;门槛对种子同样生效——p < 门槛的种子不入选)。
+/// 图**无向**:动量可沿任何边回传,每节点的 p = 所有路径的最大值。返回
+/// `(entity, p)`,p 降序、同 p `EntityId` 升序。种子若不在图中(邻接图只含
+/// 冻结体)忽略。
+pub fn propagate_momentum(
+    graph: &BTreeMap<EntityId, BTreeSet<EntityId>>,
+    seeds: &[(EntityId, f32)],
+    decay: f32,
+    min_momentum: f32,
+    max_hops: usize,
+) -> Vec<(EntityId, f32)> {
+    /// 优先队列项:p 降序、同 p EntityId 升序(跳数升序冗余定序)。
+    /// BinaryHeap 是大顶堆——"更大"= p 更高(先出队),p 同则 id 更小。
+    #[derive(PartialEq)]
+    struct WakeOrder(f32, EntityId, usize);
+    impl Eq for WakeOrder {}
+    impl Ord for WakeOrder {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0
+                .partial_cmp(&other.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(other.1.cmp(&self.1))
+                .then(self.2.cmp(&other.2))
+        }
+    }
+    impl PartialOrd for WakeOrder {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut queue: std::collections::BinaryHeap<WakeOrder> = std::collections::BinaryHeap::new();
+    for (id, p) in seeds {
+        // 门槛对种子同样生效(契约统一;p < 门槛的种子不站在图上)。
+        if *p >= min_momentum && graph.contains_key(id) {
+            queue.push(WakeOrder(*p, *id, 0));
+        }
+    }
+    let mut finalized: Vec<(EntityId, f32)> = Vec::new();
+    let mut done: BTreeSet<EntityId> = BTreeSet::new();
+    while let Some(WakeOrder(p, id, hops)) = queue.pop() {
+        if !done.insert(id) {
+            continue; // 已被更大(或相等)p 的路径定稿:风险 1 的"取最大"
+        }
+        finalized.push((id, p));
+        if hops >= max_hops {
+            continue; // 风险 2:子节点跳数 = hops+1 > max_hops,不再扩展
+        }
+        if let Some(neighbors) = graph.get(&id) {
+            for &next in neighbors {
+                if done.contains(&next) {
+                    continue;
+                }
+                let child_p = p * decay;
+                if child_p < min_momentum {
+                    continue; // 低于门槛:停止(该边)
+                }
+                queue.push(WakeOrder(child_p, next, hops + 1));
+            }
+        }
+    }
+    finalized.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    finalized
+}
+
 /// 地形变更唤醒辅助(任务书 04 接口设计;04c 接线):改写格 `c` 与哪些
 /// 冻结体旋转包络 AABB(外扩 `skin_m`)相交。命中表 EntityId 升序。
 pub fn frozen_intersecting_cell(
@@ -297,6 +408,145 @@ mod tests {
             contact_wake_seeds(&two, &near, look, skin, min_p, dt),
             vec![(id(1), id(2), 30.0)],
             "同 B 多 A 取最大 p(与遍历顺序无关)"
+        );
+    }
+
+    /// 任务书测试 `wake::adjacency_and_propagation_example`(05b;T15):
+    /// ① 邻接图——贴靠(间距 ≤ skin)相连、间隙断开、孤立体保留为空邻接
+    /// 节点、图对称、键序确定;② §4.10.3 示例数值——p0=5、decay 0.5、门槛
+    /// 1.0 → 恰 3 个(p=5/2.5/1.25),第 3 跳 0.625 停;③ 跳数上限——p 仍
+    /// 高于门槛但 hops > max_hops 不纳入。
+    /// 会变红的实现:间隙判相连(邻接过宽)、孤立体不进图(种子丢失)、衰减
+    /// 系数不对、门槛比较反向、跳数不计数。
+    #[test]
+    fn adjacency_and_propagation_example() {
+        let skin = 0.05_f32;
+        // 包络 AABB 判定(half·√3 ≈ 0.866 外扩):half-0.5 两体邻接阈值
+        // = 2×0.866 + skin ≈ 1.78(风险 3:几何保守,宁可多连)。
+        // 水平一排:间距 1.02 ≤ 1.78 → 全连;旁置 6 间隙 2.2 → 断开;
+        // 远处 9 孤立(空邻接节点仍在图中)。
+        let frozen = [
+            (id(1), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(2), Vec3::new(1.02, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(3), Vec3::new(2.04, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(4), Vec3::new(3.06, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(5), Vec3::new(4.08, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(6), Vec3::new(6.30, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)), // 间隙 2.22
+            (id(9), Vec3::new(50.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)), // 孤立
+        ];
+        let g = frozen_adjacency(&frozen, skin);
+        // 链 1–5 相连;6 与 5 断开;9 孤立节点仍在图中。
+        assert_eq!(
+            g[&id(1)],
+            BTreeSet::from([id(2)]),
+            "链头:只连 2(对称图的邻接集)"
+        );
+        assert_eq!(g[&id(3)], BTreeSet::from([id(2), id(4)]), "链中:连前后");
+        assert_eq!(
+            g[&id(5)],
+            BTreeSet::from([id(4)]),
+            "间隙 2.22 > 包络+skin:5–6 断开"
+        );
+        assert_eq!(g[&id(6)], BTreeSet::new(), "6 无邻接(孤立于链)");
+        assert!(g.contains_key(&id(9)), "孤立冻结体仍是图节点(种子资格)");
+
+        // §4.10.3 示例:种子 (1, 5.0),decay 0.5、门槛 1.0、max_hops 4。
+        let graph = frozen_adjacency(
+            &frozen[0..5]
+                .iter()
+                .map(|(i, c, h)| (*i, *c, *h))
+                .collect::<Vec<_>>(),
+            skin,
+        );
+        let out = propagate_momentum(&graph, &[(id(1), 5.0)], 0.5, 1.0, 4);
+        assert_eq!(
+            out,
+            vec![(id(1), 5.0), (id(2), 2.5), (id(3), 1.25)],
+            "示例:p0=5 → 2.5 → 1.25;第 3 跳 0.625 < 门槛恰醒 3 个"
+        );
+
+        // 跳数上限:同图门槛降到 0.1(p 不挡),max_hops = 2 → 只到第 2 跳
+        // (种子第 0 跳 + 两跳:B1、B2、B3);B4(第 3 跳)不纳入。
+        let out2 = propagate_momentum(&graph, &[(id(1), 5.0)], 0.5, 0.1, 2);
+        assert_eq!(
+            out2,
+            vec![(id(1), 5.0), (id(2), 2.5), (id(3), 1.25)],
+            "hops=2:第 3 跳的 B4(0.625 ≥ 门槛)也不纳入"
+        );
+        let out3 = propagate_momentum(&graph, &[(id(1), 5.0)], 0.5, 0.1, 3);
+        assert_eq!(
+            out3,
+            vec![(id(1), 5.0), (id(2), 2.5), (id(3), 1.25), (id(4), 0.625)],
+            "hops=3:第 3 跳纳入"
+        );
+        // 门槛优先于跳数:p 低于门槛,即使 hops 富余也停(0.3125 < 0.1?否
+        // ——0.3125 > 0.1,第 4 跳 B5 也应纳入;换门槛 0.4 → B5 不入)。
+        let out4 = propagate_momentum(&graph, &[(id(1), 5.0)], 0.5, 0.4, 4);
+        assert_eq!(
+            out4,
+            vec![(id(1), 5.0), (id(2), 2.5), (id(3), 1.25), (id(4), 0.625)],
+            "门槛 0.4:第 4 跳 0.3125 < 0.4 停"
+        );
+        // 种子 p 本身低于门槛:不入选。
+        let out5 = propagate_momentum(&graph, &[(id(1), 0.5)], 0.5, 1.0, 4);
+        assert!(out5.is_empty(), "种子 p < 门槛:不入选");
+        // 种子不在图中(非冻结体):忽略。
+        let out6 = propagate_momentum(&graph, &[(id(99), 5.0)], 0.5, 1.0, 4);
+        assert!(out6.is_empty(), "种子必须为冻结体(在图中)");
+    }
+
+    /// 任务书测试 `wake::propagation_order_independent`(05b;T15):种子集
+    /// 合同拍多源,每节点取所有路径最大值,结果与处理顺序无关;返回序 =
+    /// p 降序、同 p EntityId 升序。
+    /// 会变红的实现:先到先得的 BFS/DFS(小 p 先标记挡住大 p)、按路径求和、
+    /// 结果序不稳定。
+    #[test]
+    fn propagation_order_independent() {
+        let skin = 0.05_f32;
+        // 菱形:1–2、1–3、2–4、3–4;1 种子 p=8(近端),4 种子 p=5(远端)。
+        // 节点 2:路径 1(p=4)vs 4(p=2.5)→ 取 4;节点 3:同 → 4;
+        // 节点 4 自身 = max(种子 5, 经 1 到达 2) = 5。
+        let frozen = [
+            (id(1), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(2), Vec3::new(1.02, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            (id(3), Vec3::new(0.0, 0.0, 1.02), Vec3::new(0.5, 0.5, 0.5)),
+            (id(4), Vec3::new(1.02, 0.0, 1.02), Vec3::new(0.5, 0.5, 0.5)),
+        ];
+        let g = frozen_adjacency(&frozen, skin);
+        let seeds = vec![(id(1), 8.0_f32), (id(4), 5.0_f32)];
+        let base = propagate_momentum(&g, &seeds, 0.5, 0.5, 4);
+        // 期望:p(1)=8(种子)、p(4)=5(种子)、p(2)=max(8/2, 5/2)=4、
+        // p(3)=4。全图无环不存在路径叠加;4 与 2 同候选时按 p 降序。
+        assert_eq!(
+            base,
+            vec![(id(1), 8.0), (id(4), 5.0), (id(2), 4.0), (id(3), 4.0)],
+            "菱形多源:每节点取路径最大;同 p 按 EntityId 升序"
+        );
+        // 种子列表顺序翻转(同一集合):结果逐项相同(顺序无关)。
+        let flipped = propagate_momentum(
+            &g,
+            &seeds.iter().rev().copied().collect::<Vec<_>>(),
+            0.5,
+            0.5,
+            4,
+        );
+        assert_eq!(base, flipped, "多源结果与种子处理顺序无关");
+        // "先到先得"变异应在节点 3 显形:直链 1–3–4,种子 1 p=1、4 p=10。
+        // 图无向:p(3) = max(经 1 的 0.5, 经 4 的 5) = 5;p(1) = max(种子 1,
+        // 经 4→3 回传 2.5) = 2.5(回传正是"取所有路径最大值"的语义)。
+        let chain = frozen_adjacency(
+            &[
+                (id(1), Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+                (id(3), Vec3::new(1.02, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+                (id(4), Vec3::new(2.04, 0.0, 0.0), Vec3::new(0.5, 0.5, 0.5)),
+            ],
+            skin,
+        );
+        let out = propagate_momentum(&chain, &[(id(1), 1.0), (id(4), 10.0)], 0.5, 0.5, 4);
+        assert_eq!(
+            out,
+            vec![(id(4), 10.0), (id(3), 5.0), (id(1), 2.5)],
+            "节点 3 取 max(经 1 的 0.5, 经 4 的 5.0)——先到先得会错成 0.5"
         );
     }
 

@@ -1097,7 +1097,6 @@ fn frozen_flags_when_first_wakes(h: &mut Harness, first: EntityId, row: &[Entity
 /// 会变红的实现:只唤醒直接撞到的 B1(没有传播);不衰减或衰减系数不对(醒得
 /// 太多);传播分多拍生效。
 #[test]
-#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05b_row_of_five_wakes_exactly_three() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
@@ -1126,7 +1125,6 @@ fn acc_05b_row_of_five_wakes_exactly_three() {
 /// 会变红的实现:接触唤醒越过预算(唤醒 3 个);为腾预算而淘汰 A;截断顺序不按
 /// 动量大小。
 #[test]
-#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05b_contact_wake_uses_only_idle_budget() {
     let mut h = Harness::new(|cfg| {
         cfg.gravity = Vec3::ZERO;
@@ -1160,7 +1158,6 @@ fn acc_05b_contact_wake_uses_only_idle_budget() {
 /// 会变红的实现:只处理第一个种子;按路径求和而非取最大(仍会全醒,但由
 /// 其他两条用例约束);多源传播分多拍生效。
 #[test]
-#[ignore = "REQ-007 05b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_05b_two_sided_impact_merges_by_max() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);

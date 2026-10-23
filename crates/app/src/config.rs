@@ -234,6 +234,11 @@ impl Config {
                 // 参数化时引入,先以默认落)。
                 contact_wake_lookahead_ticks: 2,
                 contact_wake_min_momentum: 1.0,
+                // REQ-007 任务 05b 配置键(§4.15 默认表;Config 顶层键在 06
+                // 全参数化时引入,先以默认落)。
+                contact_wake_decay: 0.5,
+                contact_wake_max_hops: 4,
+                contact_wake_max_bodies_per_tick: 64,
                 void_despawn_depth_m: 16.0,
             },
         }

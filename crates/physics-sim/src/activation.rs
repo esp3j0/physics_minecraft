@@ -70,6 +70,13 @@ pub struct ActivationConfig {
     pub contact_wake_lookahead_ticks: u64,
     /// 接触唤醒种子与传播门槛 kg·m/s(REQ-007 §4.10.2;默认 1.0)。
     pub contact_wake_min_momentum: f32,
+    /// 传播每跳动量衰减(REQ-007 §4.10.3;默认 0.5;任务 05b)。
+    pub contact_wake_decay: f32,
+    /// 传播跳数上限(REQ-007 §4.10.3;默认 4;种子 = 第 0 跳)。
+    pub contact_wake_max_hops: usize,
+    /// 每片每拍接触唤醒实体上限(REQ-007 §4.10.3;默认 64;按实体数计,
+    /// 含支撑闭包成员)。
+    pub contact_wake_max_bodies_per_tick: usize,
     /// 虚空移除深度 m(默认 16;y < WORLD_Y_MIN − 深度 即删)。
     pub void_despawn_depth_m: f32,
 }
@@ -97,6 +104,9 @@ impl Default for ActivationConfig {
             contact_wake_skin_m: 0.075,
             contact_wake_lookahead_ticks: 2,
             contact_wake_min_momentum: 1.0,
+            contact_wake_decay: 0.5,
+            contact_wake_max_hops: 4,
+            contact_wake_max_bodies_per_tick: 64,
             void_despawn_depth_m: 16.0,
         }
     }

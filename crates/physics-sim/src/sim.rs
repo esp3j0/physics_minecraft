@@ -1256,20 +1256,27 @@ impl ShardSim {
         BTreeSet::new()
     }
 
-    /// 撞前预测接触唤醒(任务 05a;需求 §4.10.1–4.10.2、§4.10.5;调用点 =
-    /// `step` 开头、`phys.step()` 之前):醒着实体(升序)的扫掠体命中的
-    /// **冻结**实体(常驻体 + 承载静止冻结的瞬态体;待地形体不算——其
-    /// kinematic 但恢复有自己的路径)为候选;冲击动量过门槛者为种子,经
-    /// 统一入口 `wake_group` 当拍唤醒(② 前置、向上闭包、整组原子、静止
-    /// 重置、票据;风险 2:不另写一套)。落实后种子切 Dynamic 零速度起步,
-    /// rapier 在同一步里按两个动态体解算动量交换(§4.10.1)。
+    /// 撞前预测接触唤醒(任务 05a/05b;需求 §4.10.1–4.10.3、§4.10.5;调用
+    /// 点 = `step` 开头、`phys.step()` 之前):醒着实体(升序)的扫掠体命中
+    /// 的**冻结**实体(常驻体 + 承载静止冻结的瞬态体;待地形体不算——其
+    /// kinematic 但恢复有自己的路径)为候选;冲击动量过门槛者为种子,在
+    /// 冻结邻接图上做最大动量传播,传播结果与种子在**同一拍、同一预测阶段**
+    /// 经统一入口 `wake_group` 当拍唤醒(② 前置、向上闭包、整组原子、静止
+    /// 重置、票据)。落实后被唤醒者切 Dynamic 零速度起步,rapier 在同一步里
+    /// 按两个动态体解算动量交换(§4.10.1)。
     ///
-    /// 预算(风险 3,§4.12):接触唤醒**只占空闲预算**——组 ≤ 1 按现状
-    /// (先醒再淘汰,同 plan 单体);组 ≥ 2 按 D19 `当前醒数 + 组大小 ≤
-    /// max_awake_dynamic` 整组放得下才醒(不淘汰他人);放不下整组跳过
-    /// (下拍重算,`deferred` 不入——接触是几何现状的函数,重算即最新)。
-    /// **不触发淘汰、不入当拍豁免集**(与地形变更唤醒的 D20 不同:不存在
-    /// "推迟就悬空",预算不足推迟无害)。
+    /// 传播与截断(05b,§4.10.3):种子(第 0 跳)出发 `p(子) = decay·p(父)`
+    /// 每节点取最大(优先队列 p 降序、同 p EntityId 升序;低于门槛或跳数超
+    /// `max_hops` 停止);结果节点各自按 §4.9 成组,组按"组内最大 p 降序、
+    /// 最小 EntityId 升序"纳入,截断到 `contact_wake_max_bodies_per_tick`
+    /// 与空闲醒体预算。
+    ///
+    /// 预算(风险 4/6,§4.12"只占空闲预算"):预算基线 = 预测时刻的醒数
+    /// (本拍 `apply_activation` 的唤醒与淘汰之后);每个候选组要求
+    /// `当前醒数 + 组大小 ≤ max_awake_dynamic`(单体与整组同式;调用侧
+    /// 检查),放不下整组跳过——**不淘汰任何已醒实体、不推迟、不入当拍
+    /// 豁免集**(接触是几何现状的函数,下拍重算自然重试;与地形变更唤醒
+    /// 的 D20 不同:不存在"推迟就悬空",预算不足推迟无害)。
     ///
     /// 风险 6(§4.10.5 不唤醒):方块/地形是 chunk 固定体不在实体表;观察者
     /// 非物理实体;`wake_group` 内部滤待地形体;其他分片实体不在本表——
@@ -1334,31 +1341,101 @@ impl ShardSim {
         }
         // 种子(wake::contact_wake_seeds 返回按 B 升序)= 确定性遍历序;
         // 同一 B 恰一条(风险 5:同 B 多 A 已在纯函数内取最大)。
-        // 预算语义(风险 3,§4.12"只占空闲预算,不淘汰他人"):整组放不下
-        // (`当前醒数 + 组大小 > max_awake_dynamic`)→ 整组跳过——不推迟、
-        // 不淘汰;几何是现状的函数,下一拍重算自然重试。组大小 1 同样受此
-        // 约束(区别于 plan/命令路径的"先醒再淘汰";这里不淘汰任何已醒
-        // 实体)。种子经 `wake_group` 走统一入口:② 前置(缺 → 整组推迟
-        // 保持冻结,接触路径无阻塞请求通道,几何继续命中下一拍自然重试)、
-        // 向上闭包、整组原子、静止重置、票据(风险 2)。
-        for (_a, b, _p) in
+        //
+        // 05b(§4.10.3;放行评论 8 条风险):
+        // 1) 冻结邻接图(风险 3:只含冻结体——frozen 表即常驻体 + 承载
+        //    静止冻结的瞬态体,醒着体/待地形体已被过滤;几何保守 = 包络
+        //    AABB + skin);
+        // 2) 最大动量传播(风险 1:优先队列取最大,非先到先得 BFS;风险 2:
+        //    种子第 0 跳,超过 max_hops 不纳入);
+        // 3) 成组截断(风险 4、6):传播结果每节点按 §4.9 向上支撑闭包成组,
+        //    组按"组内最大 p 降序、最小 EntityId 升序"依次纳入,直到每拍
+        //    实体上限或空闲醒体预算用完;放不下的组整组跳过——不淘汰任何
+        //    已醒实体、不入豁免集(接触是几何现状的函数,下拍重算自然重试)。
+        //    预算口径在预测阶段 = 本拍 apply_activation 的唤醒与淘汰之后
+        //    的醒数(此处即 step 开头,其前的 apply_activation 已完成);
+        // 4) 同拍生效(风险 5):种子与传播所得在同一个预测阶段一起唤醒,
+        //    全部经统一入口 `wake_group`(② 前置——缺 → 整组推迟保持冻结、
+        //    向上闭包、整组原子、静止重置、票据)。
+        // 风险 7(守卫):静止接触 v≈0 不产生种子(05a 已锚定);AC-T1 的
+        // 场景无高速撞向冻结体的实体,传播输入为空 → 行为不变。
+        // 风险 8(D17/确定性/grep):observed = None 不预测(同 05a);遍历
+        // 全部来自排序结构(BTreeMap/BTreeSet/显式排序)。
+        let adjacency = crate::wake::frozen_adjacency(&frozen, skin);
+        let seeds: Vec<(EntityId, f32)> =
             crate::wake::contact_wake_seeds(&awake, &frozen, lookahead, skin, min_p, dt)
-        {
-            let group = self.wake_group_members(&[b]);
-            let awake_count = self
-                .entities
-                .values()
-                .filter(|rec| {
-                    self.phys
-                        .bodies
-                        .get(rec.handle)
-                        .is_some_and(|x| !x.is_kinematic())
-                })
-                .count();
-            if awake_count + group.len() > self.cfg.activation.max_awake_dynamic {
+                .into_iter()
+                .map(|(_a, b, p)| (b, p))
+                .collect();
+        let spread = crate::wake::propagate_momentum(
+            &adjacency,
+            &seeds,
+            self.cfg.activation.contact_wake_decay,
+            min_p,
+            self.cfg.activation.contact_wake_max_hops,
+        );
+        // 传播结果节点 → §4.9 支撑闭包成组(同节点组共享;节点顺序 =
+        // 传播序:p 降序、同 p EntityId 升序)。组排序键 = 组内最大 p、
+        // 最小 EntityId(需求 §4.10.3);已纳入组的成员从候选中消去
+        // (共享成员不重复成组、不重复计数)。
+        let per_tick_cap = self.cfg.activation.contact_wake_max_bodies_per_tick;
+        let p_of: BTreeMap<EntityId, f32> = spread.iter().copied().collect();
+        let mut woken: BTreeSet<EntityId> = BTreeSet::new();
+        let mut woken_count = 0usize;
+        let mut groups: Vec<(f32, EntityId, Vec<EntityId>)> = Vec::new();
+        for (node, p) in &spread {
+            if woken.contains(node) {
                 continue;
             }
-            let _missing = self.wake_group(&[b], awake_count, false);
+            let group = self.wake_group_members(&[*node]);
+            let group: Vec<EntityId> = group.into_iter().filter(|id| !woken.contains(id)).collect();
+            if group.is_empty() {
+                continue;
+            }
+            for id in &group {
+                woken.insert(*id);
+            }
+            // 组内最大 p(组员全部来自传播结果或就是本节点——支撑闭包成员
+            // 一定与种子节点相邻,若它不在传播结果里,则它没被传播波及,
+            // p 取本节点的 p 兜底)。
+            let key_p = group
+                .iter()
+                .map(|id| p_of.get(id).copied().unwrap_or(*p))
+                .fold(f32::MIN, f32::max);
+            let key_id = *group.iter().min().expect("组非空");
+            groups.push((key_p, key_id, group));
+        }
+        groups.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        // 依次纳入:每拍实体上限(风险 4:按实体数计,含闭包成员)+ 空闲
+        // 醒体预算(整组放得下才醒);放不下的组整组跳过(不淘汰、不推迟、
+        // 不入豁免集)。预算语义与 05a 一致:整组(含单体)醒数 + 组大小 >
+        // max_awake_dynamic 即跳过——检查在调用侧(D19 豁免单体不能直接
+        // 用 wake_group 的 ≥2 才检查分支)。
+        let mut budget = self
+            .entities
+            .values()
+            .filter(|rec| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| !b.is_kinematic())
+            })
+            .count();
+        for (_p, _min_id, group) in &groups {
+            if woken_count + group.len() > per_tick_cap {
+                continue; // 每拍上限:整组跳过(小序组优先纳入,不挤占)
+            }
+            if budget + group.len() > self.cfg.activation.max_awake_dynamic {
+                continue; // 空闲预算不足:整组跳过,不淘汰已醒者(风险 6)
+            }
+            let group_ids: Vec<EntityId> = group.clone();
+            woken_count += group_ids.len();
+            let _missing = self.wake_group(&group_ids, budget, false);
+            budget += group_ids.len();
         }
     }
 
@@ -4847,5 +4924,73 @@ mod tests {
             }
         }
         assert!(woke, "正例:A 经撞前预测唤醒路径上的 B(路径畅通)");
+    }
+
+    /// 任务书测试 `wake::per_tick_cap_and_idle_budget` 的 sim 级组合半边
+    /// (05b;T15;纯函数半边在 wake::tests):传播结果经每拍上限截断——
+    /// 4 连排、上限 2:同拍恰醒 2 个(传播序 p 降序 = B1、B2),B3、B4 保持
+    /// 冻结且在后续拍也**不**被补醒(同几何重算结果相同,截断稳定);组按
+    /// §4.9 闭包成组后整组纳入,单节点一排无向上成员 = 单体组。
+    /// 会变红的实现:无上限(4 个全醒)、上限语义错(醒 1 个)、截断顺序不按
+    /// 传播 p 序(醒 B2、B3 之类)、传播分多拍"补醒"。
+    #[test]
+    fn prestep_wake_per_tick_cap_truncates() {
+        let mut s = contact_sim(16);
+        s.cfg.activation.contact_wake_max_bodies_per_tick = 2;
+        // 一排 4 个冻结体:间距 1.02(包络 0.866 相邻),B1 在最左。
+        let b1 = Vec3::new(56.0, 66.5, 56.0);
+        let row: Vec<EntityId> = (2..=5).map(entity).collect();
+        s.load_chunk(ChunkPos::new(3, 3), solid_chunk());
+        let mut seq = 1u64;
+        for (k, id) in row.iter().enumerate() {
+            let pos = b1 + Vec3::new(k as f32 * 1.02, 0.0, 0.0);
+            s.apply_prefix(&[
+                spawn_input(seq, *id, pos),
+                mark_actor_input(seq + 1, *id, true),
+            ]);
+            seq += 2;
+        }
+        s.apply_activation(&[b1]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.apply_activation(&[MID]);
+        for id in &row {
+            assert!(is_frozen(&s, *id), "前置:一排 4 个全部冻结");
+        }
+        // 撞击者 A 从 B1 左侧 1.5 m 以 5 m/s 撞来(动量 5;传播 2.5/1.25/
+        // 0.625,全部高于门槛 1——截断只来自每拍上限)。
+        let a = entity(1);
+        s.apply_prefix(&[
+            spawn_actor_v(
+                seq,
+                a,
+                b1 + Vec3::new(-1.5, 0.0, 0.0),
+                Vec3::new(5.0, 0.0, 0.0),
+            ),
+            mark_actor_input(seq + 1, a, true),
+        ]);
+        let _ = s.apply_activation(&[b1 + Vec3::new(-1.5, 0.0, 0.0)]);
+        assert!(!is_frozen(&s, a), "前置:A 醒着");
+        // 首拍:预测醒 B1(p=5)、B2(p=2.5),上限 2 截断 B3、B4。
+        let frozen_flags =
+            |s: &ShardSim| row.iter().map(|id| is_frozen(s, *id)).collect::<Vec<_>>();
+        s.step();
+        assert_eq!(
+            frozen_flags(&s),
+            vec![false, false, true, true],
+            "上限 2:恰醒 p 最大的 B1、B2(同拍)"
+        );
+        // 物理接触前(A 距 B1 表面 0.5 m @5 m/s ≈ 6 拍):传播不溢出——
+        // 被截断的 B3、B4 保持冻结。物理接触之后的逐拍接力唤醒是真实动量
+        // 交换的新种子(05a 语义),不属于本拍传播,不在本断言内。
+        for k in 0..3 {
+            s.step();
+            assert_eq!(
+                frozen_flags(&s),
+                vec![false, false, true, true],
+                "拍 {k}:物理接触前,截断的 B3、B4 不被传播溢出唤醒"
+            );
+        }
     }
 }
