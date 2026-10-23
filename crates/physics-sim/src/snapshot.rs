@@ -52,6 +52,8 @@ struct ShardSimSnapshot {
     locomotion: BTreeMap<EntityId, crate::sim::LocomotionState>,
     /// 待执行强制落地(R10:到期/超预算簿记)。
     forced_pending: BTreeSet<EntityId>,
+    /// 待执行上限兜底冻结(04a)。
+    capped_freeze_pending: BTreeSet<EntityId>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -61,6 +63,8 @@ struct ShardSimSnapshot {
     /// 历史一致;`Some` = 最近一次 `apply_activation` 的观察者表。随快照走:
     /// 恢复后激活生效状态与距离中心不变)。
     observed: Option<Vec<types::glam::Vec3>>,
+    /// 唤醒中心(WakeSpec::Radius 票锚;04a;与 observed 分离)。随快照走。
+    wake_centers: Option<Vec<types::glam::Vec3>>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -98,6 +102,8 @@ struct SnapshotEntityRecord {
     /// 被承载/静止标志(K1:分片记录侧;随快照走)。
     carried: bool,
     at_rest: bool,
+    /// 常驻运动票持票拍数记账(04a;含已触顶标记;随快照走)。
+    actor_motion_ticks: Option<u64>,
 }
 
 impl ShardSim {
@@ -124,6 +130,7 @@ impl ShardSim {
                             window: rec.window.clone(),
                             carried: rec.carried,
                             at_rest: rec.at_rest,
+                            actor_motion_ticks: rec.actor_motion_ticks,
                         },
                     )
                 })
@@ -133,10 +140,12 @@ impl ShardSim {
             pending_collider_builds: self.pending_collider_builds.clone(),
             locomotion: self.locomotion.clone(),
             forced_pending: self.forced_pending.clone(),
+            capped_freeze_pending: self.capped_freeze_pending.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
             observed: self.observed.clone(),
+            wake_centers: self.wake_centers.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -168,6 +177,7 @@ impl ShardSim {
                         window: rec.window,
                         carried: rec.carried,
                         at_rest: rec.at_rest,
+                        actor_motion_ticks: rec.actor_motion_ticks,
                     },
                 )
             })
@@ -183,10 +193,12 @@ impl ShardSim {
             pending_collider_builds: snap.pending_collider_builds,
             locomotion: snap.locomotion,
             forced_pending: snap.forced_pending,
+            capped_freeze_pending: snap.capped_freeze_pending,
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,
             observed: snap.observed,
+            wake_centers: snap.wake_centers,
         })
     }
 }
@@ -351,7 +363,15 @@ mod tests {
     #[test]
     fn snapshot_roundtrip_keeps_activation_state() {
         let e = types::EntityId::from_parts(1, 1);
-        let mut a = ShardSim::new(cfg(), Box::new(SimpleRegistry::builtin()));
+        // §9-1(常驻半边)迁移:零重力(出生零速 = 立即静止;有重力虚空出生
+        // 在下落,"冻结只在静止时"永不冻结)。
+        let mut a = ShardSim::new(
+            ShardSimConfig {
+                gravity: Vec3::ZERO,
+                ..cfg()
+            },
+            Box::new(SimpleRegistry::builtin()),
+        );
         a.apply_prefix(&[
             StampedInput {
                 apply_at: types::Tick::ZERO,
@@ -377,6 +397,10 @@ mod tests {
                 }),
             },
         ]);
+        // §9-1:零重力零速生成推进 ≥ 21 拍(慢速计数达标 = "先静止")。
+        for _ in 0..21 {
+            a.step();
+        }
         // 拍 0(远观察者):实体冻结,簿记 flip@0,激活拍 → 1。
         let d = a.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(d.entities_to_freeze, vec![e], "远处实体被冻结");

@@ -161,6 +161,16 @@ impl TicketTable {
             .find(|(_, k)| **k == key)
             .map(|(i, _)| i as u32)
     }
+
+    /// 键序名次 → 持有者(views 导出子集的按名次配对;`views()` 的 order
+    /// 即全表键序名次,跳过条目不改变名次)。
+    pub fn holder_of_order(&self, order: u32) -> TicketHolder {
+        self.tickets
+            .keys()
+            .nth(order as usize)
+            .map(|k| k.0)
+            .expect("order 由 views() 生成,必在全表键序内")
+    }
 }
 
 /// 派生票据种类(签发侧的票种选择;§4.2.3 规则表——种类逻辑只允许出现在

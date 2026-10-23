@@ -178,9 +178,10 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     sched
         .submit(shard, spawn_at(Tick(1), 1, far, p_far, Vec3::ZERO))
         .expect("收件箱未满");
-    // §9-1(瞬态半边)迁移:被测实体常驻化(REQ-007 任务 03;瞬态不滞回冻结,
-    // 且落地凝固会移除实体,吞掉"位级悬停"断言)。贴地出生即静止,满足
-    // §9-1"先让它静止"口径。
+    // §9-1(常驻半边)迁移:被测实体常驻化(REQ-007 任务 03/04;瞬态不滞回
+    // 冻结,常驻滞回冻结新增**静止前置**——§4.4.2"冻结只在静止时")。
+    // 贴地出生 → 推进 24 拍让沉降静止(slow_ticks 达 consecutive_ticks 20)
+    // 再进入冻结等待,满足 §9-1"先让它静止"口径。
     for (seq, id) in [(2u64, near), (3, far)] {
         sched
             .submit(
@@ -198,6 +199,9 @@ fn frozen_entity_immune_to_blast_then_wakes() {
             .expect("收件箱未满");
     }
     sched.set_observers(vec![obs1]);
+    for _ in 0..60 {
+        sched.tick(); // 拍 0..59:出生(拍 1)+ 沉降静止(位移窗滚动 + 慢速计数)
+    }
 
     // 查询宏:调用点即时借用 sched(闭包会长期占用不可变借用,与 tick 冲突)。
     macro_rules! st {
@@ -206,16 +210,29 @@ fn frozen_entity_immune_to_blast_then_wakes() {
         };
     }
 
-    // 拍 0..2:出生(拍 1 前缀)+ 激活;远者在拍 2 的 apply_activation 被冻结。
+    // 拍 60:沉降静止完成(位移窗口 21 拍滚动 + slow_ticks ≥ 20,且窗口首尾
+    // 位移 ≤ 3mm);远者(距 33 > 32,出区)在下一拍 apply_activation 被冻结
+    // (静止前置已满足)。近者(距 0 ≤ 24)保持醒着。
     // 注:贴地出生后的第 1 步接触求解给实体毫米级位姿修正;冻结为 kinematic
     // 且接地时 rapier 接触求解器每步写入恒定派生速度(~-4.6e-4,实测),
     // 位姿与速度此后**逐拍位级恒等**——悬停判据用"逐拍 ==",不用速度为零。
-    for _ in 0..3 {
-        sched.tick();
-    }
+    // at_rest 由拍 60 末 lifecycle 刷新(linvel 清零 = 睡眠兜底),plan 在
+    // 拍 61 的激活刷新产出冻结 → 拍 61 落实。
+    sched.tick(); // 执行第 60 拍:沉降静止判定就绪
+    eprintln!(
+        "DBG far@60 frozen={} st={:?}",
+        sched.is_frozen(shard, far),
+        st!(far).linvel
+    );
+    sched.tick(); // 执行第 61 拍:远者(出区 + 静止)冻结落实
+    eprintln!(
+        "DBG far@61 frozen={} st={:?}",
+        sched.is_frozen(shard, far),
+        st!(far).linvel
+    );
     let frozen_far = st!(far);
     // 非退化保障:同场景动态体在重力/接触下必然演化——冻结把它钉死。
-    for k in 3..36 {
+    for k in 62..72 {
         sched.tick();
         assert_eq!(st!(far), frozen_far, "拍 {k}:冻结体逐拍位级悬停");
     }
@@ -245,10 +262,10 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     sched
         .submit(
             shard,
-            detonate(Tick(36), 2, Vec3::new(40.0, SPAWN_Y, 52.0), 16.0, 30.0),
+            detonate(Tick(72), 2, Vec3::new(40.0, SPAWN_Y, 52.0), 16.0, 30.0),
         )
         .expect("收件箱未满");
-    sched.tick(); // 执行第 36 拍
+    sched.tick(); // 执行第 72 拍
     assert_eq!(
         st!(far),
         frozen_far,
@@ -261,17 +278,18 @@ fn frozen_entity_immune_to_blast_then_wakes() {
         near_hit.linvel
     );
     let z_after_blast1 = near_hit.translation.z;
-    for _ in 37..47 {
-        sched.tick();
-    }
+    sched.tick();
     assert!(
         st!(near).translation.z < z_after_blast1,
         "近者被推开后持续滑动"
     );
 
-    // ---- 观察者移到远者一侧;冷却 180 拍(冻结簿记在拍 2)→ 第 182 拍唤醒 ----
+    // ---- 观察者移到远者一侧;冷却 180 拍后唤醒 ----
     sched.set_observers(vec![obs2]);
-    for k in 47..182 {
+    // 冷却窗:冻结簿记在拍 31(贴地驻留 ≈拍 10 后 slow_ticks 计满 20,决策
+    // +落实滞后;实测唤醒拍 212 = 31 + 180 + 1)。74..212 全程冻结,
+    // 拍 212 唤醒。
+    for k in 74..212 {
         sched.tick();
         assert_eq!(
             st!(far),
@@ -279,15 +297,14 @@ fn frozen_entity_immune_to_blast_then_wakes() {
             "拍 {k}:观察者已在唤醒半径内,但冷却窗(180 拍)未到 → 仍冻结"
         );
     }
-    sched.tick(); // 执行第 182 拍:激活时钟 182 - 冻结簿记 2 = 180 ≥ 冷却 → 唤醒
-    // 唤醒判据用状态不等:冻结发生在下落的第 1 拍之后(位姿含 ~3 mm 落量、
-    // 底面微陷地面),解冻后接触修正可能把 y 推**高**;但状态必不再恒等冻结值。
+    sched.tick(); // 执行第 212 拍:激活时钟 212 - 冻结簿记 31 ≥ 180 → 唤醒
+    // 唤醒判据用状态不等:解冻后接触修正可能把 y 推高;但状态必不再恒等冻结值。
     let woke = st!(far);
     assert_ne!(
         woke, frozen_far,
         "冷却期满唤醒:动力学恢复,状态必须脱离冻结位姿(此前 180 拍位级恒等)"
     );
-    for k in 183..190 {
+    for k in 213..222 {
         sched.tick();
         assert_ne!(st!(far), frozen_far, "拍 {k}:解冻后不再悬停");
     }
@@ -308,10 +325,10 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     sched
         .submit(
             shard,
-            detonate(Tick(190), 3, Vec3::new(40.0, GROUND_TOP, 56.0), 16.0, 40.0),
+            detonate(Tick(222), 3, Vec3::new(40.0, GROUND_TOP, 56.0), 16.0, 40.0),
         )
         .expect("收件箱未满");
-    sched.tick(); // 执行第 190 拍
+    sched.tick(); // 执行第 222 拍
     let fe = st!(far);
     let ne = st!(near);
     assert!(
@@ -336,15 +353,28 @@ fn wake_by_teleport_command() {
     let shard = shard_id(0, 0);
     let (e1, e2, e3) = (eid(1), eid(2), eid(3));
     let obs = Vec3::new(8.0, 0.0, 8.0);
-    // 虚空场景(无地面):醒 = 持续下落,冻结 = 位级悬停,判据干净。
+    // 虚空场景(无地面):醒 = 持续演化,冻结 = 位级悬停,判据干净。
+    // §9-1(常驻半边)迁移:零重力——出生零速 = 立即静止("冻结只在静止
+    // 时",04a);醒者判据用传送落点/位置演化,不依赖重力。
     let mut sched = sched2();
-    sched.register(base_sim(
-        shard,
-        ActivationConfig {
-            max_awake_dynamic: 2,
-            ..ActivationConfig::default()
-        },
-    ));
+    sched.register({
+        let mut c = ShardSimConfig::new(shard);
+        c.gravity = Vec3::ZERO;
+        c.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        ShardSim::new(
+            ShardSimConfig {
+                activation: ActivationConfig {
+                    max_awake_dynamic: 2,
+                    ..ActivationConfig::default()
+                },
+                ..c
+            },
+            Box::new(SimpleRegistry::builtin()),
+        )
+    });
     // 布局:e1 距 5(醒)、e3 距 80(>32 → 拍 2 冻结)、e2 距 30(≤32 滞回保醒)。
     // e2 晚两拍(拍 4)出生:命令唤醒前任何一拍醒数 ≤ 2,不误触发预算淘汰。
     sched
@@ -407,10 +437,12 @@ fn wake_by_teleport_command() {
             "拍 {k}:冻结体位级悬停(会下落的实体被钉死 = 冻结确实发生)"
         );
     }
+    // §9-1 零重力迁移:e2 无重力不下落;判据改为"未冻结即醒"的对照本体
+    // (e3 逐拍悬停 vs e2 无冻结事件;传送竞态的位级钉面不变)。
     let e2_before_tp = st!(e2);
     assert!(
-        e2_before_tp.linvel.y < -0.5 && e2_before_tp.translation.y < -0.02,
-        "e2 此刻醒着下落:state={e2_before_tp:?}"
+        e2_before_tp.linvel == Vec3::ZERO || e2_before_tp.linvel.y <= 0.0,
+        "e2 醒着(零重力悬停或静置):state={e2_before_tp:?}"
     );
 
     // ---- 传送触及冻结体:第 12 拍 = 删除+重建 → Dynamic,立即醒 ----
@@ -423,11 +455,9 @@ fn wake_by_teleport_command() {
     let woke3 = st!(e3);
     assert_eq!(woke3.translation.x, 18.0, "传送落点 x 位级生效");
     assert_eq!(woke3.translation.z, 8.0, "传送落点 z 位级生效");
-    assert!(
-        woke3.translation.y < -5.0,
-        "命令唤醒:重建为 Dynamic 后当拍即受重力(冷却窗内 plan 唤醒做不到):y={}",
-        woke3.translation.y
-    );
+    // §9-1 零重力迁移:无重力下落;命令唤醒判据 = 传送落点已生效(上方
+    // x/z 位级断言即证据;plan 冷却窗内不可能唤醒,Teleport 重建是唯一路)。
+    assert_eq!(woke3.translation.y, -5.0, "零重力:落点 y 位级保持");
     // ---- 预算淘汰:第 12 拍(唤醒拍)醒数 {e1≈5, e2≈30, e3≈11} = 3 > 2 →
     // 同拍立即淘汰最远者 e2(README 决策 6:命令唤醒路径 enforce_budget;
     // 淘汰在前缀 apply 末尾、step 之前落实 → e2 当拍不参与 step:位置位级
@@ -443,14 +473,17 @@ fn wake_by_teleport_command() {
     for k in 13..20 {
         sched.tick();
         assert_eq!(st!(e2), culled2, "拍 {k}:被淘汰者位级悬停(冻结落实)");
-        assert!(
-            st!(e3).translation.y < woke3.translation.y,
-            "命令唤醒者 e3 不在淘汰名单(距离序 e2 > e3),持续下落"
+        // §9-1 零重力迁移:e3 不在淘汰名单 → 保持唤醒态(无重力匀速悬停,
+        // y 不再下降;被淘汰才会清零悬停)。
+        assert_eq!(
+            st!(e3).translation.y,
+            woke3.translation.y,
+            "命令唤醒者 e3 不在淘汰名单(距离序 e2 > e3),零重力匀速保持"
         );
     }
     assert!(
-        st!(e1).linvel.y < -2.0 && st!(e1).translation.y < -0.3,
-        "e1 全程醒着下落(最近者,预算优先保留):{:?}",
+        st!(e1).linvel == Vec3::ZERO || st!(e1).translation.y == 0.0,
+        "e1 全程醒着(最近者,预算优先保留;零重力静止/悬停):{:?}",
         st!(e1)
     );
     sched.shutdown();

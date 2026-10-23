@@ -225,6 +225,9 @@ impl Config {
                 motion_lookahead_ticks: 30,
                 motion_max_lookahead_chunks: 4,
                 transient_settle_deadline_ticks: 1200,
+                // REQ-007 任务 04a:常驻运动票上限(默认 1200;Config 顶层
+                // 键在 06 全参数化时引入,先以默认落)。
+                actor_motion_max_ticks: 1200,
                 support_normal_min: 0.7,
                 void_despawn_depth_m: 16.0,
             },

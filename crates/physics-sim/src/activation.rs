@@ -58,6 +58,9 @@ pub struct ActivationConfig {
     pub motion_max_lookahead_chunks: usize,
     /// 瞬态票上限 active_ticks(默认 1200 = 20s)。
     pub transient_settle_deadline_ticks: u64,
+    /// 常驻运动票上限 active_ticks(默认 1200 = 20s;REQ-007 任务 04a):
+    /// 到达即撤票 + 冻结(兜底降级,即使仍在运动),撤票后不立即重签。
+    pub actor_motion_max_ticks: u64,
     /// 支撑判定法向阈值(默认 0.7)。
     pub support_normal_min: f32,
     /// 虚空移除深度 m(默认 16;y < WORLD_Y_MIN − 深度 即删)。
@@ -82,6 +85,7 @@ impl Default for ActivationConfig {
             motion_lookahead_ticks: 30,
             motion_max_lookahead_chunks: 4,
             transient_settle_deadline_ticks: 1200,
+            actor_motion_max_ticks: 1200,
             support_normal_min: 0.7,
             void_despawn_depth_m: 16.0,
         }
@@ -123,6 +127,10 @@ pub struct ActivationDecisions {
     pub entities_to_wake: Vec<EntityId>,
     /// 请求冻结的实体(到最近演员距离降序,远者先;§9.4 超预算淘汰亦在此)。
     pub entities_to_freeze: Vec<EntityId>,
+    /// 超预算淘汰冻结的实体(entities_to_freeze 的子集;04a 细则 7):
+    /// 预算强制**不受静止前置约束**(运动中也可冻结,§4.12),落实侧按此
+    /// 跳过静止前置;常驻体同时撤 ActorMotion(I3 第 4 条)。
+    pub over_budget_freeze: Vec<EntityId>,
 }
 
 /// 激活策略机:滞回/冷却/预算的簿记与决策(纯内存,serde 可快照)。
@@ -257,6 +265,15 @@ impl ActivationController {
         now: Tick,
         region: ChunkRegion,
         blocked: &BTreeSet<ChunkPos>,
+        // 运动中实体集(04a;§4.4.2"冻结只在静止时"的**决策侧**输入——
+        // 静止前置必须在 plan 判定,否则被前置挡下的冻结条目已烧掉翻转
+        // 冷却簿记,静止后滞回要再等 180 拍。超预算淘汰不受此限)。
+        moving: &BTreeSet<EntityId>,
+        // 实体占据的足迹 chunk 集(04a;§14-8 允许的实体状态输入):卸载
+        // 候选排除这些 chunk——实体活着就需要立足地;票撤换的空窗拍
+        // (观察者票撤、ActorMotion 未生效)不卸脚下地形(acc_04a_wake
+        // 暴露:空窗一拍卸 ② 且卸载冷却 180 拍挡住重装)。
+        occupied: &BTreeSet<ChunkPos>,
     ) -> ActivationDecisions {
         let mut d = ActivationDecisions::default();
 
@@ -412,6 +429,9 @@ impl ActivationController {
             if out_cover.contains(&cp) {
                 continue;
             }
+            if occupied.contains(&cp) {
+                continue; // 实体足迹:不卸(立足地保护;04a)
+            }
             if self.chunk_cooled(&cp, now) {
                 cands.push((cp, (min_priority, nearest_anchor(cp), 0), false, false));
             }
@@ -504,12 +524,19 @@ impl ActivationController {
         let mut wake: Vec<(EntityId, f32)> = Vec::new();
         let mut freeze: Vec<(EntityId, f32)> = Vec::new();
         let mut awake: Vec<(EntityId, f32)> = Vec::new();
+        // 超预算淘汰距离中心(04a 细则 7):到最近**占区域票锚点**(观察者 +
+        // 区域票,不限 WakeSpec)——预算排序是成本面不是唤醒面,仅装载的
+        // 区域票锚点同样参与"谁离服务区最远"的判定。
+        let budget_centers: Vec<Vec3> = occupying.iter().map(|t| t.anchor).collect();
         // 判定口径:任一中心 ≤ 该中心 load → 进;所有中心 > 各自 unload → 出;
         // 混合滞回带(多中心带宽重叠才出现)保持。仅观察者票时
         // (load/unload = cfg.awake_* 同源)与任务 01 数值等价。
         for &(id, pos, frozen, actor, carried) in entities {
             let dist =
                 nearest_observer_distance(&wake_centers, pos, false).unwrap_or(f32::INFINITY);
+            // 超预算排序距离(独立于滞回距离;无占区域票 → +∞)。
+            let budget_dist =
+                nearest_observer_distance(&budget_centers, pos, false).unwrap_or(f32::INFINITY);
             let inside = wake_specs
                 .iter()
                 .any(|(c, load_m, _)| (*c - pos).length() <= *load_m);
@@ -518,19 +545,23 @@ impl ActivationController {
                 .all(|(c, _, unload_m)| (*c - pos).length() > *unload_m);
             // 任务 03/细则 13 + H2:瞬态体从滞回冻结路径整体移除——**被承载
             // 的瞬态除外**(§4.4.2"按常驻规则":出区冻结 + Suspend、入区
-            // 唤醒 + Resume;复用 ③ 滞回与冷却簿记;静止前置与唤醒足迹 ②
-            // 检查由 sim 落实时把关)。常驻滞回冻结(04 完整:静止前置)。
+            // 唤醒 + Resume;复用 ③ 滞回与冷却簿记)。常驻滞回冻结(04a:
+            // **静止前置在决策侧**——运动中的实体不产出冻结条目,不烧翻转
+            // 冷却簿记;静止后下一拍照常决策)。
             let (wake_it, freeze_it) = if !actor && !carried {
                 (frozen && inside, false)
             } else {
-                match (inside, outside) {
+                let hysteresis = match (inside, outside) {
                     (true, _) => (frozen, false),
                     (false, true) => (false, !frozen),
                     (false, false) => (false, false), // 滞回带:保持
-                }
+                };
+                // §4.4.2:冻结只在静止时(超预算淘汰不经过此路径)。
+                (hysteresis.0, hysteresis.1 && !moving.contains(&id))
             };
             if !frozen {
-                awake.push((id, dist));
+                // 超预算排序距离 = 到最近占区域票锚点(细则 7;非滞回距离)。
+                awake.push((id, budget_dist));
             }
             if wake_it && self.entity_cooled(&id, now) {
                 wake.push((id, dist));
@@ -559,6 +590,7 @@ impl ActivationController {
                     .collect();
                 pool.sort_by(cmp_entity_desc);
                 for (id, dist) in pool.into_iter().take(overflow) {
+                    d.over_budget_freeze.push(id);
                     freeze.push((id, dist));
                 }
             }
@@ -658,6 +690,8 @@ mod tests {
             Tick::ZERO,
             core,
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             d.chunks_to_load.contains(&types::ChunkPos::new(7, 0)),
@@ -683,6 +717,8 @@ mod tests {
             Tick::ZERO,
             core,
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             d2.chunks_to_unload.contains(&types::ChunkPos::new(30, 0)),
@@ -755,6 +791,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             !d.chunks_to_load.contains(&ChunkPos::new(3, 0))
@@ -773,6 +811,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             d.entities_to_wake.is_empty() && d.entities_to_freeze.is_empty(),
@@ -789,6 +829,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d2.chunks_to_load,
@@ -813,6 +855,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d0.chunks_to_load,
@@ -848,7 +892,9 @@ mod tests {
                 &[],
                 Tick(1),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .chunks_to_unload
             .is_empty()
@@ -861,7 +907,9 @@ mod tests {
                 &[],
                 Tick(179),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .chunks_to_unload
             .is_empty(),
@@ -876,6 +924,8 @@ mod tests {
             Tick(180),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.chunks_to_unload,
@@ -932,6 +982,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.chunks_to_load.len() + d.chunks_to_unload.len(),
@@ -961,6 +1013,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d2.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(
@@ -993,6 +1047,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d0.entities_to_wake, vec![e1, e2, e3]);
         // 拍 1:3 醒 > 2 → 最远者(e3,距 20)立即冻结,不受冷却(flip@0 才过 1 拍)。
@@ -1008,6 +1064,8 @@ mod tests {
             Tick(1),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d1.entities_to_freeze, vec![e3], "距离降序淘汰超出者");
         assert!(d1.entities_to_wake.is_empty());
@@ -1039,6 +1097,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.entities_to_freeze,
@@ -1060,6 +1120,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             d2.entities_to_freeze.is_empty(),
@@ -1084,6 +1146,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d3.entities_to_freeze,
@@ -1107,6 +1171,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d.entities_to_wake, vec![eid(3)], "≤ 24 → 唤醒");
         let d = c.plan(
@@ -1117,6 +1183,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(d.entities_to_freeze.is_empty(), "32 不冻(> 32 才冻)");
 
@@ -1133,6 +1201,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d.entities_to_wake, vec![e], "冻 @20(≤ 24)→ 唤醒(flip@0)");
         assert!(
@@ -1143,7 +1213,9 @@ mod tests {
                 &[far],
                 Tick(1),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .entities_to_freeze
             .is_empty()
@@ -1156,7 +1228,9 @@ mod tests {
                 &[far],
                 Tick(179),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .entities_to_freeze
             .is_empty(),
@@ -1170,6 +1244,8 @@ mod tests {
             Tick(180),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.entities_to_freeze,
@@ -1184,7 +1260,9 @@ mod tests {
                 &[near],
                 Tick(181),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .entities_to_wake
             .is_empty()
@@ -1197,7 +1275,9 @@ mod tests {
                 &[near],
                 Tick(359),
                 wide_region(),
-                &std::collections::BTreeSet::new()
+                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
+                &BTreeSet::new(),
             )
             .entities_to_wake
             .is_empty(),
@@ -1211,6 +1291,8 @@ mod tests {
             Tick(360),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d.entities_to_wake, vec![e], "≤ 24 且冷却已过 → 唤醒");
     }
@@ -1252,6 +1334,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(d1.chunks_to_load, vec![ChunkPos::new(0, 0)]);
         assert_eq!(d1.chunks_to_unload, vec![ChunkPos::new(3, 1)]);
@@ -1269,6 +1353,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(d2.chunks_to_load.is_empty() && d2.chunks_to_unload.is_empty());
         assert!(d2.entities_to_wake.is_empty() && d2.entities_to_freeze.is_empty());
@@ -1317,6 +1403,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d0.chunks_to_unload,
@@ -1345,6 +1433,8 @@ mod tests {
             Tick(1),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(
             !d1.chunks_to_unload.contains(&b),
@@ -1417,6 +1507,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.chunks_to_unload,
@@ -1454,6 +1546,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         let center_dist = {
             let dx = 72.0_f32 - 32.0;
@@ -1495,6 +1589,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(d.chunks_to_load.is_empty(), "① 预算 0");
         assert!(d.colliders_to_build.is_empty(), "① 未载 → ② 不候选(前提)");
@@ -1516,6 +1612,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.chunks_to_load,
@@ -1549,6 +1647,8 @@ mod tests {
             Tick(1),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert!(d2.chunks_to_load.is_empty() && d2.colliders_pending_build.is_empty());
         assert_eq!(
@@ -1573,6 +1673,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         // ① 预算 2:距 0 的 (0,0) + 距 16 的 (-1,0)(候选排序距离升序)。
         assert_eq!(
@@ -1603,6 +1705,8 @@ mod tests {
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         // 预算 2 全给装载 [(0,0) 距 0,(0,-1) 距 16 首个] + pending;已载未建的
         // (-1,0) 单独构建被饿(共享预算,D18)。
@@ -1641,6 +1745,8 @@ mod tests {
             Tick(1),
             wide_region(),
             &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
         );
         assert_eq!(
             d.chunks_to_load,

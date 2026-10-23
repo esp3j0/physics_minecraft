@@ -207,7 +207,6 @@ fn actor(n: u32) -> EntityId {
 /// 会变红的实现:沿用旧规则"离观察者远就冻结"(在空中被冻住);运动中不签发
 /// `ActorMotion`;静止后不撤票;冻结时不要求静止。
 #[test]
-#[ignore = "REQ-007 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04a_moving_actor_not_frozen_midair() {
     let mut h = Harness::new(|_| {});
     h.set_observer(Vec3::new(64.0, GROUND_Y, 64.0));
@@ -264,7 +263,6 @@ fn acc_04a_moving_actor_not_frozen_midair() {
 /// 会变红的实现:漂移体被立即冻结;票没有上限;到上限撤票后又在下一拍重新签发
 /// (上限形同虚设);撤票后不冻结。
 #[test]
-#[ignore = "REQ-007 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04a_actor_motion_ticket_capped() {
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
     let start = Vec3::new(64.0, GROUND_Y + 20.0, 64.0);
@@ -318,7 +316,6 @@ fn acc_04a_actor_motion_ticket_capped() {
 /// 会变红的实现:被淘汰冻结的常驻体仍持有 `ActorMotion`;淘汰了错误的实体;
 /// e1 在超限前就被冻结(运动中不该冻结)。
 #[test]
-#[ignore = "REQ-007 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04a_over_budget_actor_frozen_and_ticket_ended() {
     let mut h = Harness::new(|cfg| {
         cfg.gravity = Vec3::ZERO;
@@ -376,7 +373,6 @@ fn acc_04a_over_budget_actor_frozen_and_ticket_ended() {
 /// 会变红的实现:唤醒时不重置 `slow_ticks`/位移窗口;唤醒后从不签发常驻票;
 /// 静止后不撤票。
 #[test]
-#[ignore = "REQ-007 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04a_wake_resets_stillness() {
     let mut h = Harness::new(|_| {});
     // chunk (4,4) 中心 (72,72);实体放在 chunk 中心,足迹不跨 chunk。

@@ -60,8 +60,10 @@ impl Default for SolidifyConfig {
     }
 }
 
-/// 实体票状态操作(§4.3.1;**不含 Issue**——S5:签发单点在调度器 claim/补签,
-/// 分片只产出状态依赖操作)。只追加;幂等由 TicketTable 保证。
+/// 实体票状态操作(§4.3.1;**瞬态票不含 Issue**——S5:签发单点在调度器
+/// claim/补签,分片只产出状态依赖操作。04a:常驻运动票的签发条件(醒着∧
+/// 运动中∧出唤醒范围)只有分片判定得出,经 `IssueActorMotion` 交调度器签发
+/// ——枚举只追加,幂等由 TicketTable 保证:键已在 → 无操作不重置时钟,D14)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TicketOp {
     End,
@@ -69,6 +71,8 @@ pub enum TicketOp {
     Unpause,
     Suspend,
     Resume,
+    /// 常驻运动票签发(REQ-007 任务 04a)。
+    IssueActorMotion,
 }
 
 /// 路由载体:(实体, 操作)——调度器按持有者分片盖章投递。
@@ -197,8 +201,13 @@ pub(crate) struct EntityRecord {
     /// 被承载(§4.4.1:有实体支撑;K1 返修:分片只**记录**,冻结/唤醒决策
     /// 单点在 plan)。生命周期段每拍刷新;随快照走。
     pub(crate) carried: bool,
-    /// 静止(§4.4.2:slow_ticks 达标或睡眠;K1:plan 冻结前置的记录侧镜像)。
+    /// 静止(§4.4.2:低速连续+位移门 / 睡眠;04a 起所有醒着实体记录,
+    /// 与 solidify.enabled 无关)。随快照走。
     pub(crate) at_rest: bool,
+    /// 常驻运动票持票拍数记账(04a;None = 无票/未触顶):醒着 ∧ 运动中 ∧
+    /// 出唤醒范围期间每拍 +1,到达 actor_motion_max_ticks → 兜底冻结(已
+    /// 触顶);静止/入唤醒范围/被唤醒 → 清 None(解除触顶,可重签)。随快照。
+    pub(crate) actor_motion_ticks: Option<u64>,
 }
 
 /// 单分片模拟器(字段 crate 内可见:snapshot.rs 读写快照结构)。
@@ -228,6 +237,9 @@ pub struct ShardSim {
     /// 待执行强制落地(REQ-007 §4.8):到期内部指令/超预算淘汰进入;中心柱
     /// ① 缺 → 推迟(阻塞请求),柱就绪的拍执行。随快照(R10)。
     pub(crate) forced_pending: BTreeSet<EntityId>,
+    /// 待执行上限兜底冻结(任务 04a):常驻运动票到期内部指令进入,下一拍
+    /// lifecycle 冻结。随快照。
+    pub(crate) capped_freeze_pending: BTreeSet<EntityId>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -239,6 +251,9 @@ pub struct ShardSim {
     /// 行为与历史一致;`Some` = 最近一次 `apply_activation` 的观察者表,
     /// 命令唤醒路径的预算强制以其为距离中心)。
     pub(crate) observed: Option<Vec<Vec3>>,
+    /// 唤醒中心(WakeSpec::Radius 票锚;04a;与 observed 分离——见
+    /// apply_activation_tickets 注释)。随快照走。
+    pub(crate) wake_centers: Option<Vec<Vec3>>,
 }
 
 impl ShardSim {
@@ -258,10 +273,12 @@ impl ShardSim {
             pending_collider_builds: BTreeSet::new(),
             locomotion: BTreeMap::new(),
             forced_pending: BTreeSet::new(),
+            capped_freeze_pending: BTreeSet::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
             observed: None,
+            wake_centers: None,
         }
     }
 
@@ -478,13 +495,18 @@ impl ShardSim {
         for id in self.activation.enforce_budget(&observers, &awake) {
             let now = self.activation_now;
             // §9-2/任务书细则 10(瞬态半边):被淘汰的**瞬态体 → 强制落地**
-            // (产出同 §4.8;非冻结);常驻体 → 冻结(04 起改 End ActorMotion)。
+            // (产出同 §4.8;非冻结);常驻体 → 冻结 + End ActorMotion
+            // (04a:I3 第 4 条,预算强制不受静止前置约束)。
             let is_transient = self.entities.get(&id).is_some_and(|rec| !rec.actor);
             if is_transient {
                 self.forced_pending.insert(id);
             } else {
                 self.freeze_entity(&id);
                 self.activation.note_flip(&id, now);
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: id,
+                    op: TicketOp::End,
+                });
             }
         }
     }
@@ -676,7 +698,7 @@ impl ShardSim {
                 anchor: pos,
             })
             .collect();
-        self.apply_activation_tickets(&tickets, observers)
+        self.apply_activation_tickets(&tickets, observers, observers)
     }
 
     /// 票据视图入口(REQ-007 任务 02:调度器的生产路径)。`observed_centers`
@@ -686,10 +708,16 @@ impl ShardSim {
         &mut self,
         tickets: &[crate::tickets::TicketView],
         observed_centers: &[Vec3],
+        wake_centers_in: &[Vec3],
     ) -> ActivationDecisions {
         let now = self.activation_now;
         self.activation_now = now.next();
         self.observed = Some(observed_centers.to_vec());
+        // 唤醒中心(04a):WakeSpec::Radius 票锚(与 plan 的 wake_centers 同
+        // 源;`observed_centers` 是**全部占区域票锚**(命令唤醒预算强制的
+        // 距离中心),实体票锚(= 实体自身)会把 lifecycle 的 in_wake 判成
+        // 恒真——常驻票 SelfOnly/足迹不构成唤醒中心)。
+        self.wake_centers = Some(wake_centers_in.to_vec());
         // R1(D18 情况 1):上一拍 pending 未兑现的条目(驱动未执行该装载,
         // 例如观察者已移走致请求作废)就地作废——本拍 plan 重新决策。兑现过
         // 的条目已被 load_data_only 移除。
@@ -715,9 +743,57 @@ impl ShardSim {
                 )
             })
             .collect();
+        // 运动中实体集(04a;plan 决策侧静止前置的输入):非记录侧 at_rest
+        // 的补充——待地形/无记录的醒着体按运动处理(宁可不冻,不可误冻)。
+        // kinematic(冻结/待地形)不在冻结候选,不入集。
+        // 运动中实体集(04a;plan 决策侧静止前置的输入):**现算**(低速
+        // 连续 + 位移门 / 睡眠;与 lifecycle 记录同判据,不依赖其刷新时序
+        // ——决策用当下物理状态)。kinematic(冻结/待地形)不在冻结候选,
+        // 不入集。
+        let moving: BTreeSet<EntityId> = self
+            .entities
+            .iter()
+            .filter(|(_id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                if b.is_kinematic() || b.is_sleeping() {
+                    return false;
+                }
+                let st = self.read_state(rec);
+                let slow = st.linvel.length() < self.cfg.solidify.linear_threshold
+                    && st.angvel.length() < self.cfg.solidify.angular_threshold;
+                let gate = self.cfg.solidify.displacement_gate_m <= 0.0
+                    || rec.window.front().is_none_or(|oldest| {
+                        (*oldest - st.translation).length() <= self.cfg.solidify.displacement_gate_m
+                    });
+                !(slow && gate && rec.slow_ticks >= self.cfg.solidify.consecutive_ticks)
+            })
+            .map(|(id, _)| *id)
+            .collect();
         // 阻塞请求(D15;判定只依实体状态,§14-8):待地形实体的足迹缺 ② +
         // 缺 ①(§4.12 三来源的前两个;强制落地柱缺 ① 在后续提交接)。
         let blocked = self.awaiting_terrain_blocked();
+        // 实体占据足迹(04a:卸载候选排除;立足地保护)——**只含醒着体**:
+        // 冻结/待地形体不依赖地形(冻结悬停、待地形挂起,恢复前置本就检查
+        // ②),基线(AC-T1)的冻结体足迹 chunk 照常卸载(golden 对齐)。
+        let occupied: BTreeSet<ChunkPos> = self
+            .entities
+            .values()
+            .filter(|rec| {
+                !self
+                    .phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| b.is_kinematic())
+            })
+            .flat_map(|rec| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                crate::settle::current_footprint(
+                    conv::rapier_to_vec3(b.translation()),
+                    rec.desc.half_size,
+                    self.cfg.activation.terrain_guard_m,
+                )
+            })
+            .collect();
         let decisions = self.activation.plan(
             tickets,
             &loaded,
@@ -726,6 +802,8 @@ impl ShardSim {
             now,
             region,
             &blocked,
+            &moving,
+            &occupied,
         );
 
         // tier② 落实(REQ-007 任务 01/B3:N3——决策在 plan,执行在此,与
@@ -753,34 +831,42 @@ impl ShardSim {
             self.drop_chunk_collider(cp);
         }
 
-        // tier③ 落实:施体类型切换。H2/K1:被承载瞬态的冻结/唤醒**只来自
-        // plan 决策**(实体档按常驻规则滞回+冷却),落实在此:
-        // - 冻结条目:静止前置(§4.4.2:被承载但仍在运动不冻结);被承载
-        //   瞬态被冻结 → 产 Suspend(票不占区域);
+        // tier③ 落实:施体类型切换。H2/K1/04a:冻结/唤醒只来自 plan 决策,
+        // 落实在此:
+        // - 冻结条目:**静止前置**(§4.4.2"冻结只在静止时",04a 推广到常驻
+        //   体:被承载瞬态仍在运动不冻结,常驻体运动中不冻结——蓝方块的
+        //   常驻版修复);被承载瞬态被冻结 → 产 Suspend(票不占区域);常驻
+        //   体被冻结 → 产 End(撤常驻运动票,I3 第 4 条);
         // - 唤醒条目:当前足迹 ② 前置(缺 → 不唤醒,交由待地形状态机处理
         //   ——kinematic 待地形体在 ② 齐时由 apply_awaiting_terrain 恢复,
         //   速度原样写回,语义等价"推迟唤醒"而非丢弃);被承载瞬态被唤醒
         //   → 仍被承载 → Paused(产 Pause;§4.4.2"唤醒仍被承载则 Paused"),
-        //   已脱离承载 → 产 Resume。
+        //   已脱离承载 → 产 Resume;**任何唤醒重置静止判据**(04a 细则 3:
+        //   slow_ticks = 0、位移窗口只留当前位置)。
         for id in &decisions.entities_to_freeze {
-            let (is_transient_carried, static_now) = {
+            let (is_transient_carried, is_actor) = {
                 let Some(rec) = self.entities.get(id) else {
                     continue;
                 };
-                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 let carried = supports.get(id).copied().unwrap_or(false);
-                let static_now =
-                    rec.slow_ticks >= self.cfg.solidify.consecutive_ticks || b.is_sleeping();
-                (!rec.actor && carried, static_now)
+                (!rec.actor && carried, rec.actor)
             };
-            if is_transient_carried && !static_now {
-                continue; // 被承载但仍在运动:不冻结(§4.4.2 静止前置)
-            }
+            // 冻结条目全部落实:静止前置已在 plan 决策侧(04a;被前置挡下的
+            // 条目不产出、不烧簿记),超预算淘汰(over_budget_freeze)不受
+            // 静止前置约束(§4.12 预算强制,决策已单独标出)。
             self.freeze_entity(id);
             if is_transient_carried {
                 self.outbox.ticket_ops.push(TicketOpRecord {
                     entity: *id,
                     op: TicketOp::Suspend,
+                });
+            }
+            if is_actor {
+                // 常驻体冻结 → 撤常驻运动票(滞回与超预算两路都撤;
+                // I3 第 4 条:冻结的常驻体不持票)。
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: *id,
+                    op: TicketOp::End,
                 });
             }
         }
@@ -813,6 +899,17 @@ impl ShardSim {
             }
             let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
             body.set_body_type(RigidBodyType::Dynamic, true);
+            // 04a 细则 3:任何唤醒重置静止判据(slow_ticks = 0、位移窗口只留
+            // 当前位置)+ 清常驻票触顶标记(重签资格恢复)。
+            {
+                let rec = self.entities.get_mut(id).expect("存在");
+                rec.slow_ticks = 0;
+                let pos = conv::rapier_to_vec3(body.translation());
+                rec.window.clear();
+                rec.window.push_back(pos);
+                rec.at_rest = false;
+                rec.actor_motion_ticks = None;
+            }
             if !is_actor {
                 // K1:被承载瞬态的唤醒 ops 随 plan 决策产出(§4.4.2:唤醒
                 // 仍被承载 → Paused;脱离承载 → Resume)。
@@ -1036,15 +1133,18 @@ impl ShardSim {
         out
     }
 
-    /// 承载判定与记录(K1 返修):分片只做两件事——
-    /// 1. **记录**每个瞬态体的 `carried`(有实体支撑,§4.4.1)与 `at_rest`
-    ///    (slow_ticks 达标或睡眠)到实体档;
-    /// 2. 在 `carried` **发生变化**时产出 Pause(进入承载)/ Unpause(脱离
-    ///    承载)。幂等由 TicketTable 保证;变化沿才产出(无每拍重发)。
+    /// 实体档记录 + 常驻运动票生命周期(任务 03 K1 / 任务 04a):
+    /// 1. **记录**每个醒着实体的 `carried`(有实体支撑,§4.4.1;常驻体同样
+    ///    记录)与 `at_rest`(低速连续 + 位移门 / 睡眠;与 solidify.enabled
+    ///    无关)到实体档;
+    /// 2. 瞬态体:`carried` 变化沿产出 Pause/Unpause(边沿触发,无每拍重发);
+    /// 3. 常驻体(04a):醒着 ∧ 运动中 ∧ 不在任何唤醒范围 → IssueActorMotion;
+    ///    静止 ∨ 进入唤醒范围 → End;到达 actor_motion_max_ticks → End + 冻结
+    ///    (兜底降级;已触顶标记防立即重签)。
     ///
-    /// 冻结 + Suspend、唤醒 + Resume **只能来自 plan 的决策**(§14-1 单点;
-    /// `apply_activation` 落实时产出对应 ops,受 D17 开关约束——本函数不判
-    /// 唤醒范围、不切刚体类型)。
+    /// 冻结(滞回)+ Suspend、唤醒 + Resume **只能来自 plan 的决策**(§14-1
+    /// 单点;`apply_activation` 落实时产出对应 ops,受 D17 开关约束——本函数
+    /// 不做滞回冻结决策、不判滞回出区)。
     fn emit_carry_ticket_ops(&mut self) {
         // D17:未启用 → 不记录、不产出(§9-7:未启用行为与 8702670 一致;
         // 叠放场景不得发生任何冻结/票操作)。
@@ -1052,14 +1152,12 @@ impl ShardSim {
             return;
         }
         let supports = self.evaluate_supports();
+        let wake_centers: Vec<Vec3> = self.wake_centers.clone().unwrap_or_default();
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         for id in ids {
             let Some(rec) = self.entities.get(&id) else {
                 continue;
             };
-            if rec.actor {
-                continue; // 常驻票 04
-            }
             let body = self.phys.bodies.get(rec.handle);
             let Some(body) = body else {
                 continue;
@@ -1072,12 +1170,69 @@ impl ShardSim {
                 continue;
             }
             let carried = carried_of(&supports, &id);
-            let at_rest =
-                rec.slow_ticks >= self.cfg.solidify.consecutive_ticks || body.is_sleeping();
+            // 静止判据(§4.4/任务书 04a 细则 3):低速连续 + 位移门通过,
+            // 或 rapier 睡眠;**与 solidify.enabled 无关**(所有醒着实体的
+            // 记录侧判据;凝固桥的 enabled 只影响凝固触发,不影响记录)。
+            let gate_passes = {
+                let w = &rec.window;
+                self.cfg.solidify.displacement_gate_m <= 0.0
+                    || w.front().is_none_or(|oldest| {
+                        (*oldest - conv::rapier_to_vec3(body.translation())).length()
+                            <= self.cfg.solidify.displacement_gate_m
+                    })
+            };
+            let at_rest = (rec.slow_ticks >= self.cfg.solidify.consecutive_ticks && gate_passes)
+                || body.is_sleeping();
             let was_carried = rec.carried;
+            let actor = rec.actor;
             let rec = self.entities.get_mut(&id).expect("存在");
             rec.carried = carried;
             rec.at_rest = at_rest;
+            if actor {
+                // ---- 常驻运动票生命周期(任务 04a;§4.3.4 常驻各行)----
+                // 醒着 ∧ 运动中 ∧ 不在任何唤醒范围 → IssueActorMotion(幂等;
+                // 持票记账 +1)+ 到达上限 → 兜底冻结(已触顶);
+                // 静止 ∨ 进入唤醒范围 → End + 清触顶标记(可重签)。
+                let pos = conv::rapier_to_vec3(body.translation());
+                let in_any_wake = wake_centers
+                    .iter()
+                    .any(|c| (*c - pos).length() <= self.cfg.activation.awake_load_radius);
+                if !at_rest && !in_any_wake {
+                    // 运动中出范围:持票记账推进。到达上限(已触顶)→ **不再
+                    // 产 Issue**(否则 §14-6 键序 End(0) < Issue(5) 下,拍末
+                    // "End 撤旧票 → Issue 签新票"无限续签,时钟永不到期);
+                    // 只产 End,冻结由调度器到期处理投内部指令在**撤票生效
+                    // 后**执行(acc_04a_ticket_capped:持票期间不得冻结)。
+                    let ticks = rec.actor_motion_ticks.unwrap_or(0) + 1;
+                    let rec = self.entities.get_mut(&id).expect("存在");
+                    rec.actor_motion_ticks = Some(ticks);
+                    if ticks < self.cfg.activation.actor_motion_max_ticks {
+                        self.outbox.ticket_ops.push(TicketOpRecord {
+                            entity: id,
+                            op: TicketOp::IssueActorMotion,
+                        });
+                    } else {
+                        // 触顶:产 End(撤票)+ 入下一拍冻结队列(撤票在拍末
+                        // 生效,冻结在其后的 lifecycle 段执行——持票期间不
+                        // 出现"已冻结"可观测态)。
+                        self.outbox.ticket_ops.push(TicketOpRecord {
+                            entity: id,
+                            op: TicketOp::End,
+                        });
+                        self.capped_freeze_pending.insert(id);
+                    }
+                } else {
+                    // 静止 ∨ 入唤醒范围:撤票 + 清记账/触顶(被唤醒时也清,
+                    // 见 apply_activation 唤醒落实;此处 = 状态自然恢复)。
+                    self.outbox.ticket_ops.push(TicketOpRecord {
+                        entity: id,
+                        op: TicketOp::End,
+                    });
+                    let rec = self.entities.get_mut(&id).expect("存在");
+                    rec.actor_motion_ticks = None;
+                }
+                continue;
+            }
             if carried && !was_carried {
                 self.outbox.ticket_ops.push(TicketOpRecord {
                     entity: id,
@@ -1092,9 +1247,28 @@ impl ShardSim {
         }
     }
 
+    /// 上限兜底冻结指令(任务 04a):常驻运动票到期(调度器 7.5)投递;
+    /// 下一拍 lifecycle 执行冻结(兜底降级,§4.12 相邻路径)。幂等(集合)。
+    pub fn apply_capped_freeze_directive(&mut self, entity: EntityId) {
+        self.capped_freeze_pending.insert(entity);
+    }
+
     /// step 末的瞬态体生命周期段(任务 03/提交 C):虚空移除 + 强制落地执行。
     /// 产出:despawned(+ forced 的 Emergent BlockWrite)/ void_removed。
     pub fn run_transient_lifecycle(&mut self) {
+        // 04a:上限兜底冻结(撤票生效后的下一拍;幂等)。
+        let capped: Vec<EntityId> = self.capped_freeze_pending.iter().copied().collect();
+        for id in capped {
+            self.capped_freeze_pending.remove(&id);
+            let Some(rec) = self.entities.get(&id) else {
+                continue;
+            };
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            if body.is_kinematic() {
+                continue; // 已冻结(滞回静止冻结)——幂等
+            }
+            self.freeze_entity(&id);
+        }
         // G1:承载判定与 ticket_ops 产出(§4.4.2;调度器拍末键序应用)。
         self.emit_carry_ticket_ops();
         // ---- 虚空移除(§4.8;所有实体;启用模式 = 已激活刷新过)----
@@ -1399,6 +1573,7 @@ impl ShardSim {
                 window: VecDeque::new(),
                 carried: false,
                 at_rest: false,
+                actor_motion_ticks: None,
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
@@ -1568,7 +1743,9 @@ mod tests {
     /// 冻结体状态位级不变(§9.12 事件免疫),近处实体受冲量。
     #[test]
     fn frozen_body_ignores_detonate() {
-        let mut s = sim(0, 0);
+        // §9-1(常驻半边)迁移:零重力(出生零速 = 立即静止;有重力虚空
+        // 出生在下落,"冻结只在静止时"永不冻结)。
+        let mut s = zero_g_sim();
         let (near, far) = (entity(1), entity(2)); // 近 (8,3,8)、远 (100,3,100)——爆炸中心取两者正中,几何对称。
         s.apply_prefix(&[
             spawn_input(0, near, Vec3::new(8.0, 3.0, 8.0)),
@@ -1578,6 +1755,10 @@ mod tests {
             mark_actor_input(2, near, true),
             mark_actor_input(3, far, true),
         ]);
+        // §9-1:零重力零速生成推进 ≥ 21 拍(慢速计数达标 = "先静止")。
+        for _ in 0..21 {
+            s.step();
+        }
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert!(
             decisions.entities_to_freeze.contains(&far),
@@ -1606,8 +1787,9 @@ mod tests {
     #[test]
     fn frozen_body_excluded_from_solidify_and_migration() {
         let e = entity(1);
-        // 对照:不做激活 → 第 1 拍即迁出(场景确实会触发两条路径)。
-        let mut control = sim(0, 0);
+        // §9-1(常驻半边)迁移:零重力(出生零速 = 立即静止;迁移对照仍成立
+        // ——本体区外出生第 1 拍即迁出,不依赖重力)。
+        let mut control = zero_g_sim();
         control.apply_prefix(&[spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0))]);
         control.step();
         assert!(
@@ -1617,12 +1799,18 @@ mod tests {
         assert_eq!(control.take_outbox().migrations.len(), 1);
 
         // 冻结路径:apply_activation → 200 拍仍原位原态,outbox 全空。
-        // §9-1 迁移:常驻化(瞬态不滞回冻结,任务 03)。
-        let mut s = sim(0, 0);
+        // §9-1 迁移:常驻化(瞬态不滞回冻结,任务 03)+ 零重力(静止)。
+        let mut s = zero_g_sim();
+        // 出生在本体区内、唤醒区外(距观察者 ≈130 > 32;本体区内不会在推进
+        // 期触发迁移,§9-1 的 21 拍静止推进才可能)。
         s.apply_prefix(&[
-            spawn_input(0, e, Vec3::new(130.0, 3.0, 100.0)),
+            spawn_input(0, e, Vec3::new(100.0, 3.0, 100.0)),
             mark_actor_input(1, e, true),
         ]);
+        // §9-1:零重力零速生成推进 ≥ 21 拍(先静止)。
+        for _ in 0..21 {
+            s.step();
+        }
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(decisions.entities_to_freeze, vec![e], "远处实体被冻结");
         let far_state = s.entity_state(e).expect("冻结后仍在表");
@@ -1660,6 +1848,7 @@ mod tests {
     fn budget_cfg(max_awake: usize) -> ShardSimConfig {
         let mut c = ShardSimConfig::new(shard_id(0, 0));
         c.solidify.enabled = false;
+        c.gravity = Vec3::ZERO; // §9-1(常驻半边)迁移:出生零速 = 立即静止
         c.activation.max_awake_dynamic = max_awake;
         c
     }
@@ -1682,22 +1871,24 @@ mod tests {
             mark_actor_input(2, e1, true),
             mark_actor_input(3, e3, true),
         ]);
-        // 拍 0(观察者已设):e3 距 ≈130 > 32 → 冻结;同时注册观察者供
-        // 后续命令唤醒路径复用。醒数 {e1} = 1 ≤ 预算 1,不淘汰。
+        // §9-1:零重力零速生成推进 ≥ 21 拍(先静止);e3 距 ≈130 > 32 →
+        // 冻结;醒数 {e1} = 1 ≤ 预算 1,不淘汰。
+        for k in 0..21 {
+            s.step();
+            let _ = k;
+        }
         let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(d.entities_to_freeze, vec![e3], "非退化:e3 先被滞回冻结");
-        s.step(); // 拍 1:无输入,e1 继续下落。
 
-        // 拍 2:命令唤醒 e3(Teleport 重建,距 2 ≤ 24)→ 醒数 2 > 1 →
-        // 同拍淘汰最远醒者 e1(距 5)。
+        // 命令唤醒 e3(Teleport 重建,距 2 ≤ 24)→ 醒数 2 > 1 →
+        // 同拍淘汰最远醒者 e1(距 5)。(零重力:唤醒后匀速保持,不下落。)
         s.apply_prefix(&[teleport_input(2, e3, Vec3::new(10.0, 3.0, 8.0))]);
         s.step();
         let e3_after = s.entity_state(e3).expect("e3 命令唤醒存活");
         assert_eq!(e3_after.translation.x, 10.0, "传送落点位级生效");
-        assert!(
-            e3_after.translation.y < 3.0,
-            "命令唤醒者当拍已受重力下落:y={}",
-            e3_after.translation.y
+        assert_eq!(
+            e3_after.translation.y, 3.0,
+            "零重力:命令唤醒者匀速保持(重建即醒,当拍动力学生效)"
         );
         let frozen1 = s.entity_state(e1).expect("e1 被淘汰,仍在实体表");
         assert_eq!(frozen1.linvel, Vec3::ZERO, "e1 淘汰:速度清零");
@@ -1730,22 +1921,23 @@ mod tests {
             mark_actor_input(2, e1, true),
             mark_actor_input(3, e2, true),
         ]);
-        // 注册观察者(e2 远 → 冻结);醒数 {e1} = 1 ≤ 预算 2。
+        // §9-1:先静止(21 拍);注册观察者(e2 远 → 冻结);醒数 {e1} ≤ 预算 2。
+        for _ in 0..21 {
+            s.step();
+        }
         let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(d.entities_to_freeze, vec![e2]);
-        s.step();
         // 命令唤醒 e2(重建至近处):醒数 {e1@5, e2@2} = 2 ≤ 预算 2 → 不淘汰。
         s.apply_prefix(&[teleport_input(2, e2, Vec3::new(10.0, 3.0, 8.0))]);
         s.step();
         let s2 = s.entity_state(e2).expect("e2 唤醒存活");
-        assert!(
-            s2.translation.y < 3.0,
-            "e2 命令唤醒后正常下落:y={}",
-            s2.translation.y
+        assert_eq!(
+            s2.translation.y, 3.0,
+            "零重力:e2 命令唤醒后匀速保持(重建即醒)"
         );
         assert!(
-            s.entity_state(e1).expect("e1 存活").translation.y < 3.0,
-            "e1 未被淘汰,正常下落"
+            s.entity_state(e1).expect("e1 存活").translation.y == 3.0,
+            "e1 未被淘汰(零重力:匀速保持原位)"
         );
         let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert!(
@@ -2419,6 +2611,10 @@ mod tests {
             mark_actor_input(2, near, true),
             mark_actor_input(3, far, true),
         ]);
+        // §9-1:零重力零速生成推进 ≥ 21 拍(先静止)。
+        for _ in 0..21 {
+            s.step();
+        }
         let decisions = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         assert_eq!(decisions.entities_to_freeze, vec![far], "非退化:far 冻结");
         let far_before = s.entity_state(far).expect("冻结体仍在表");
@@ -2595,7 +2791,7 @@ mod tests {
             state: crate::tickets::TicketState::Active,
             anchor: obs[0],
         }];
-        let d_tix = b.apply_activation_tickets(&tickets, &obs);
+        let d_tix = b.apply_activation_tickets(&tickets, &obs, &obs);
         assert_eq!(
             d_obs, d_tix,
             "同坐标观察者票 == 旧 observers 路径(逐字段相等)"
@@ -2629,15 +2825,10 @@ mod tests {
         let as_observer = [mk(0)];
         let as_area = [mk(0)];
         let mut a = sim(2, 2); // 锚点在分片 (0,0) 区域外?分片 (2,2) core 含 64m 处
-        let d1 = a.apply_activation_tickets(
-            &as_observer,
-            &as_observer.iter().map(|t| t.anchor).collect::<Vec<_>>(),
-        );
+        let anchors = as_observer.iter().map(|t| t.anchor).collect::<Vec<_>>();
+        let d1 = a.apply_activation_tickets(&as_observer, &anchors, &anchors);
         let mut b = sim(2, 2);
-        let d2 = b.apply_activation_tickets(
-            &as_area,
-            &as_area.iter().map(|t| t.anchor).collect::<Vec<_>>(),
-        );
+        let d2 = b.apply_activation_tickets(&as_area, &anchors, &anchors);
         assert_eq!(d1, d2, "同规格不同票种 → 决策逐字段相等(S1)");
     }
 
@@ -2910,6 +3101,201 @@ mod tests {
             "未启用模式:无任何票操作产出(D17;实得 {:?})",
             s.outbox.ticket_ops
         );
+    }
+
+    // ==== REQ-007 任务 04a(常驻运动票/静止判定与重置/超预算冻结撤票)====
+
+    /// 任务书测试 `sim::actor_motion_ticket_issue_end_lifecycle`(T11/§4.3.4):
+    /// 运动中 Issue(ops 变化沿)→ 静止 End → 再动再 Issue(新时钟 = 调度器
+    /// 侧重签,分片侧清触顶标记可重签)。全程 lifecycle + apply_activation
+    /// 生产入口;零重力(出生零速可控地运动/静止)。
+    #[test]
+    fn actor_motion_ticket_issue_end_lifecycle() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input(1, e, Vec3::new(60.0, 3.0, 60.0)),
+            mark_actor_input(2, e, true),
+        ]);
+        s.apply_activation(&[Vec3::new(60.0, 0.0, 60.0)]); // 启用(锚 = 实体处)
+        let _ = s.take_outbox();
+        // 观察者(唤醒中心)远离 → 出唤醒范围 + 运动中 → Issue。
+        s.apply_activation(&[Vec3::new(500.0, 0.0, 500.0)]);
+        s.step();
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == e && o.op == TicketOp::IssueActorMotion),
+            "运动中出唤醒范围 → IssueActorMotion(04a)"
+        );
+        let ticks1 = s.entities.get(&e).unwrap().actor_motion_ticks;
+        assert!(ticks1.is_some(), "持票记账开始");
+        // 静止(零速)+ 出范围 → End + 清记账。
+        let _ = s.take_outbox();
+        s.apply_prefix(&[teleport_input(3, e, Vec3::new(80.0, 3.0, 80.0))]);
+        // 传送后零速(重建按 state.linvel=0);推 21 拍静止达标。
+        for _ in 0..21 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == e && o.op == TicketOp::End),
+            "静止(出范围)→ End(撤票)"
+        );
+        assert!(
+            s.entities.get(&e).unwrap().actor_motion_ticks.is_none(),
+            "静止清触顶标记(可重签)"
+        );
+        // 再动再 Issue(新时钟由调度器签发侧保证;分片侧记账重新从 0)。
+        let _ = s.take_outbox();
+        s.apply_prefix(&[teleport_input(4, e, Vec3::new(60.0, 3.0, 60.0))]);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 5,
+            payload: InputPayload::Command(SimCommand::TeleportEntity {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(60.0, 3.0, 60.0),
+                    linvel: Vec3::new(0.3, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+            }),
+        }]);
+        for _ in 0..3 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == e && o.op == TicketOp::IssueActorMotion),
+            "再运动 → 再 Issue(新时钟;分片侧记账重起)"
+        );
+        assert_eq!(
+            s.entities.get(&e).unwrap().actor_motion_ticks,
+            Some(1),
+            "记账重起(清触顶后)"
+        );
+    }
+
+    /// 任务书测试 `sim::wake_resets_stillness_window`(T11):唤醒重置静止
+    /// 判据(slow_ticks = 0、位移窗口只留当前位置)——伪造旧窗口:静止达标
+    /// 的实体被冻结(触发唤醒前置),唤醒落实后 slow_ticks 必为 0。
+    #[test]
+    fn wake_resets_stillness_window() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input(1, e, Vec3::new(60.0, 3.0, 60.0)),
+            mark_actor_input(2, e, true),
+        ]);
+        s.apply_activation(&[Vec3::new(60.0, 0.0, 60.0)]);
+        // 远锚 21 拍:静止达标(出区 → 冻结决策;零速出生即静止)。
+        s.apply_activation(&[Vec3::new(500.0, 0.0, 500.0)]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        s.apply_activation(&[Vec3::new(500.0, 0.0, 500.0)]);
+        let frozen = {
+            let rec = s.entities.get(&e).unwrap();
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        assert!(frozen, "前置:静止常驻体出区冻结(决策侧静止前置已满足)");
+        // 等翻转冷却(180 拍)后近锚:唤醒落实 → 静止判据重置。
+        let _ = s.take_outbox();
+        for _ in 0..180 {
+            s.apply_activation(&[Vec3::new(500.0, 0.0, 500.0)]);
+        }
+        s.apply_activation(&[Vec3::new(61.0, 0.0, 61.0)]);
+        let (kinematic, slow_ticks, win_len) = {
+            let rec = s.entities.get(&e).unwrap();
+            let b = s.phys.bodies.get(rec.handle).unwrap();
+            (b.is_kinematic(), rec.slow_ticks, rec.window.len())
+        };
+        assert!(!kinematic, "唤醒落实(Dynamic)");
+        assert_eq!(slow_ticks, 0, "唤醒重置 slow_ticks(细则 3)");
+        assert!(win_len <= 1, "位移窗口只留当前位置(实得 {win_len})");
+    }
+
+    /// 任务书测试 `sim::over_budget_actor_freezes_and_ends_ticket`(T8/§9-2
+    /// 常驻半边):超预算淘汰冻结的常驻体同时撤 ActorMotion(I3 第 4 条);
+    /// 命令唤醒路径(enforce_budget)同语义。
+    #[test]
+    fn over_budget_actor_freezes_and_ends_ticket() {
+        let mut s = ShardSim::new(budget_cfg(1), Box::new(voxel::SimpleRegistry::builtin()));
+        let (a, b) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            spawn_input(0, a, Vec3::new(13.0, 3.0, 8.0)),
+            mark_actor_input(1, a, true),
+            spawn_input(2, b, Vec3::new(100.0, 3.0, 100.0)),
+            mark_actor_input(3, b, true),
+        ]);
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]); // 启用;b 远(静止)冻结
+        for _ in 0..21 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        let _ = s.take_outbox();
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]); // b 冻结落实(票 End)
+        let _ = s.take_outbox();
+        // 命令唤醒 b 至近处:醒数 {a, b} = 2 > 预算 1 → 淘汰最远醒者 a
+        // (命令唤醒路径 enforce_budget)→ 冻结 + End ActorMotion。
+        s.apply_prefix(&[teleport_input(4, b, Vec3::new(10.0, 3.0, 8.0))]);
+        s.step();
+        assert!(
+            s.entity_state(a).is_some_and(|st| st.linvel == Vec3::ZERO),
+            "a 被超预算淘汰:速度清零(冻结)"
+        );
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .any(|o| o.entity == a && o.op == TicketOp::End),
+            "超预算冻结的常驻体同时撤 ActorMotion(I3 第 4 条;命令唤醒路径)"
+        );
+    }
+
+    /// 任务书测试(shard 侧配套在 shard;此为分片侧消费面):常驻票到期
+    /// `apply_capped_freeze_directive` → 下一拍 lifecycle 冻结(兜底降级);
+    /// 指令对已冻结实体幂等。
+    #[test]
+    fn capped_freeze_directive_freezes_next_tick() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input(1, e, Vec3::new(60.0, 3.0, 60.0)),
+            mark_actor_input(2, e, true),
+        ]);
+        s.apply_activation(&[Vec3::new(60.0, 0.0, 60.0)]);
+        s.step();
+        let awake_before = {
+            let rec = s.entities.get(&e).unwrap();
+            !s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        assert!(awake_before, "前置:运动常驻体醒着");
+        s.apply_capped_freeze_directive(e);
+        s.run_transient_lifecycle();
+        let frozen = {
+            let rec = s.entities.get(&e).unwrap();
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        assert!(frozen, "上限兜底:到期指令 → lifecycle 冻结(降级)");
+        // 幂等:再投 + 再执行不 panic、保持冻结。
+        s.apply_capped_freeze_directive(e);
+        s.run_transient_lifecycle();
+        let still_frozen = {
+            let rec = s.entities.get(&e).unwrap();
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        assert!(still_frozen, "重复指令幂等(已冻结保持)");
     }
 
     /// 任务书测试 `sim::over_budget_transient_forced_landing`(T8/§9-2):

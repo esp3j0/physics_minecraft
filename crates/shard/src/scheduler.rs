@@ -123,11 +123,6 @@ pub struct SchedulerSnapshot {
     pub lifecycles: BTreeMap<ShardId, LifecycleSnapshot>,
 }
 
-/// 票视图锚点列表(命令唤醒预算强制的距离中心;order 序,确定性)。
-fn views_anchors(views: &[physics_sim::tickets::TicketView]) -> Vec<Vec3> {
-    views.iter().map(|t| t.anchor).collect()
-}
-
 /// 固定 worker 池调度器(OS 线程 + capacity-one 通道 + 每拍全员汇合屏障)。
 pub struct Scheduler {
     cfg: SchedulerConfig,
@@ -580,19 +575,20 @@ impl Scheduler {
         });
         // R1(任务 03):实体票的 Footprint 规格由调度器解析成 Chunks(预载足迹
         // = 当前 ∪ 前视)交给 plan;表内仍存 Footprint。plan/保活/ensure 只通用
-        // 支持 Chunks(§14-1)。
-        for (k, view) in self.tickets.iter().zip(views.iter_mut()) {
-            let TicketHolder::Entity(id) = k.0.0 else {
+        // 支持 Chunks(§14-1)。**按 holder 精确配对**(views() 会跳过 Suspended
+        // /无锚条目,与全表 iter() zip 会错位——04a 返修)。
+        for view in views.iter_mut() {
+            let TicketHolder::Entity(id) = self.tickets.holder_of_order(view.order) else {
                 continue;
             };
-            let physics_sim::tickets::RegionSpec::Footprint {
-                lookahead_ticks,
-                max_lookahead_chunks,
-            } = &view.data
-            else {
-                continue;
-            };
-            if let Some((pos, linvel, half)) = self.entity_motion_of(id) {
+            if let (
+                physics_sim::tickets::RegionSpec::Footprint {
+                    lookahead_ticks,
+                    max_lookahead_chunks,
+                },
+                Some((pos, linvel, half)),
+            ) = (&view.data, self.entity_motion_of(id))
+            {
                 view.data = physics_sim::tickets::RegionSpec::Chunks(
                     physics_sim::settle::preload_footprint(
                         pos,
@@ -1132,6 +1128,48 @@ impl Scheduler {
         self.entity_ownership.owner_of(entity)
     }
 
+    /// 常驻运动票签发(任务 04a;分片判定经 IssueActorMotion 触发,单点在
+    /// 调度器):表中已有 → 无操作(D14,不重置时钟);limit =
+    /// actor_motion_max_ticks(到期 = 撤票,非强制落地)。D17:未启用不签
+    /// (签发只能来自启用后的分片判定,防御性再查)。
+    fn issue_actor_motion_ticket(&mut self, entity: EntityId) {
+        use physics_sim::tickets::{
+            RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
+        };
+        if !self.activation_enabled() {
+            return;
+        }
+        let key = (TicketHolder::Entity(entity), TicketKind::ActorMotion);
+        if self.ticket_table().get(key).is_some() {
+            return; // 已在 → 无操作(D14)
+        }
+        let c = &self.activation_cfg;
+        self.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1, // §4.2.3:实体票 priority 1
+                // 足迹规格(与瞬态运动票同语义):运动中的常驻体要落回地形,
+                // 足迹装载/保活跟着走(否则唤醒范围消失后脚下 chunk 被卸,
+                // 实体穿地坠虚空——acc_04a_moving 暴露)。
+                data: RegionSpec::Footprint {
+                    lookahead_ticks: c.motion_lookahead_ticks,
+                    max_lookahead_chunks: c.motion_max_lookahead_chunks,
+                },
+                collider: RegionSpec::None, // ② 足迹由解析后的 Chunks 承载(views)
+                wake: WakeSpec::SelfOnly,   // ③ 只保证自身清醒(05 接触唤醒)
+                clock: TicketClock {
+                    issued_at: self.coordinator.tick(),
+                    active_ticks: 0,
+                    limit: Some(c.actor_motion_max_ticks),
+                    starts_at: None,
+                },
+                state: TicketState::Active,
+                center: None,
+            },
+            self.coordinator.tick(),
+        );
+    }
+
     /// 某分片当前持有的实体集合(升序)。
     pub fn entities_of(&self, shard: ShardId) -> BTreeSet<EntityId> {
         self.entity_ownership.entities_of(shard)
@@ -1334,8 +1372,26 @@ impl Scheduler {
             // 票据视图派生(REQ-007 任务 02:锚点 = 票持有者;plan 消费视图,
             // 无票种分支)。仅观察者票时与任务 01 等价(票规格同源半径)。
             let views = self.ticket_views();
+            // 预算强制/淘汰距离中心 = **非实体**占区域票锚(观察者 + 区域票;
+            // 细则 7"观察者 + 区域票锚点")——实体票锚 = 实体自身位置,会把
+            // "距服务区最远"的判定变成"距别的实体最近"(acc_04a_over_budget
+            // 暴露:e1 的票锚让 e1 成为最近者而淘汰了 e2)。实体票的装载
+            // 义务由 Footprint→Chunks 覆盖承担,不经锚点。
+            let external_anchors: Vec<Vec3> = views
+                .iter()
+                .filter(|t| !matches!(t.data, physics_sim::tickets::RegionSpec::Chunks(_)))
+                .map(|t| t.anchor)
+                .collect();
+            // 唤醒中心 = WakeSpec::Radius 票锚(④ 语义;实体票 SelfOnly 不
+            // 构成唤醒中心)。与 external_anchors(预算强制距离中心)分离。
+            let wake_anchors: Vec<Vec3> = views
+                .iter()
+                .filter(|t| matches!(t.wake, physics_sim::tickets::WakeSpec::Radius { .. }))
+                .map(|t| t.anchor)
+                .collect();
             for (shard, sim) in self.sims.iter_mut() {
-                let decisions = sim.apply_activation_tickets(&views, &views_anchors(&views));
+                let decisions =
+                    sim.apply_activation_tickets(&views, &external_anchors, &wake_anchors);
                 self.activation_requests.insert(*shard, decisions);
             }
         }
@@ -1562,31 +1618,52 @@ impl Scheduler {
 
         // 7.4 ticket_ops 应用(REQ-007 任务 03;§14-6):按 (ShardId, 实体)
         // 序(= 收集序,BTreeMap 归一);操作幂等(TicketTable);目标键 =
-        // 该实体的实体票(03 = TransientMotion)。应用在拍末 → N+1 生效。
+        // 该实体的实体票(瞬态 = TransientMotion;常驻 = ActorMotion)。
+        // 应用在拍末 → N+1 生效。
         self.pending_ticket_ops
             .sort_by_key(|(shard, op)| (*shard, op.entity, op.op as u8));
         for (origin, op) in std::mem::take(&mut self.pending_ticket_ops) {
-            use physics_sim::tickets::TicketHolder;
-            // 实体当前归属分片的票(迁移后键不变,只按 Entity 找)。
-            let keys: Vec<_> = self
-                .tickets
-                .iter()
-                .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == op.entity))
-                .map(|(k, _)| k)
-                .collect();
+            use physics_sim::tickets::{TicketHolder, TicketKind};
             let _ = origin;
-            for key in keys {
-                match op.op {
-                    physics_sim::TicketOp::End => self.tickets.end(key),
-                    physics_sim::TicketOp::Pause => self
+            match op.op {
+                // 签发(04a):表无该实体的 ActorMotion 票才签(键已在 → 无
+                // 操作不重置时钟,D14)。签发条件由分片判定(IssueActorMotion
+                // 每拍重发幂等);规格 = 常驻运动票默认(无足迹装载、
+                // SelfOnly 唤醒、limit = actor_motion_max_ticks)。
+                physics_sim::TicketOp::IssueActorMotion => {
+                    if self.tickets.iter().any(|(k, _)| {
+                        matches!(k, (TicketHolder::Entity(ref e), TicketKind::ActorMotion) if *e == op.entity)
+                    }) {
+                        continue;
+                    }
+                    self.issue_actor_motion_ticket(op.entity);
+                }
+                // 状态操作:应用到该实体**全部**实体票(瞬态/常驻各一张,
+                // 同一操作语义下双应用无害——表幂等;End 是关键:任一票都该撤)。
+                _ => {
+                    let keys: Vec<_> = self
                         .tickets
-                        .set_state(key, physics_sim::TicketState::Paused),
-                    physics_sim::TicketOp::Unpause | physics_sim::TicketOp::Resume => self
-                        .tickets
-                        .set_state(key, physics_sim::TicketState::Active),
-                    physics_sim::TicketOp::Suspend => self
-                        .tickets
-                        .set_state(key, physics_sim::TicketState::Suspended),
+                        .iter()
+                        .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == op.entity))
+                        .map(|(k, _)| k)
+                        .collect();
+                    for key in keys {
+                        match op.op {
+                            physics_sim::TicketOp::End => self.tickets.end(key),
+                            physics_sim::TicketOp::Pause => self
+                                .tickets
+                                .set_state(key, physics_sim::TicketState::Paused),
+                            physics_sim::TicketOp::Unpause | physics_sim::TicketOp::Resume => self
+                                .tickets
+                                .set_state(key, physics_sim::TicketState::Active),
+                            physics_sim::TicketOp::Suspend => self
+                                .tickets
+                                .set_state(key, physics_sim::TicketState::Suspended),
+                            physics_sim::TicketOp::IssueActorMotion => {
+                                unreachable!("签发分支已处理(IssueActorMotion 不进状态操作循环)")
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1608,6 +1685,28 @@ impl Scheduler {
             match key.0 {
                 physics_sim::tickets::TicketHolder::Area(_) => self.tickets.end(key),
                 physics_sim::tickets::TicketHolder::Entity(e) => {
+                    // 票种区分(风险 3;签发/转递一侧允许按票种,§14-1 只禁
+                    // plan/ensure/保活):
+                    // - TransientMotion(瞬态)→ 强制落地指令(§4.3.2;
+                    //   **不 End**(K2):落地推迟期间实体须持票,终结判定收口);
+                    // - ActorMotion(常驻,04a)→ **撤票,不落地**(§4.3.2
+                    //   常驻到期 = End;实体保持原状,分片侧的触顶冻结由
+                    //   lifecycle 兜底执行)。
+                    let kind = key.1;
+                    if kind == physics_sim::tickets::TicketKind::ActorMotion {
+                        // 常驻票到期 = 撤票 + 兜底冻结指令(§4.3.2:撤票不
+                        // 落地;冻结在撤票生效的下一拍——acc_04a_ticket_capped:
+                        // 持票期间不得冻结)。
+                        self.tickets.end(key);
+                        if let Some(sim) = self
+                            .entity_ownership
+                            .owner_of(e)
+                            .and_then(|owner| self.sims.get_mut(&owner.shard))
+                        {
+                            sim.apply_capped_freeze_directive(e);
+                        }
+                        continue;
+                    }
                     if let Some(owner) = self.entity_ownership.owner_of(e) {
                         if let Some(sim) = self.sims.get_mut(&owner.shard) {
                             sim.apply_forced_landing_directive(e);
@@ -1983,6 +2082,9 @@ mod tests {
             enabled: false,
             ..SolidifyConfig::default()
         };
+        // §9-1(常驻半边)迁移:零重力——出生零速 = 立即静止("冻结只在
+        // 静止时"的决策侧前置,04a;有重力虚空出生在下落,永不冻结)。
+        cfg.gravity = Vec3::ZERO;
         let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
         let (near, far) = (
             types::EntityId::from_parts(1, 1),
@@ -2045,7 +2147,10 @@ mod tests {
                 "远处实体冻结悬停(位级)"
             );
             let near_state = sched.entity_state(shard, near).expect("近处实体仍在");
-            assert!(near_state.translation.y < 3.0, "近处实体未被冻结,继续下落");
+            assert!(
+                near_state.translation.y == 3.0,
+                "近处实体未被冻结(零重力:匀速保持原位)"
+            );
         }
         sched.shutdown();
     }
@@ -2909,13 +3014,6 @@ mod tests {
             .map(|(_, d)| d)
             .expect("分片 (0,0) 有激活决策");
         assert!(
-            !sched.is_awaiting_terrain(shard_id(0, 0), e) || {
-                // 待地形确已建立(前置非退化)。
-                sched.is_awaiting_terrain(shard_id(0, 0), e)
-            },
-            "前置:实体待地形(阻塞来源)"
-        );
-        assert!(
             sched.is_awaiting_terrain(shard_id(0, 0), e),
             "前置非退化:实体已进待地形(足迹缺)"
         );
@@ -3027,6 +3125,73 @@ mod tests {
         assert!(
             clock > 0,
             "迁移票时钟连续(active_ticks = {clock},签发起持续计数)"
+        );
+        sched.shutdown();
+    }
+
+    /// 任务书测试 `shard/scheduler::actor_ticket_deadline_ends_ticket_only`
+    /// (§4.3.2/04a):常驻运动票到期 = 撤票 + 兜底冻结指令,**不投强制
+    /// 落地**(风险 3:7.5 到期处理不得对常驻票落地);实体保持原状态。
+    #[test]
+    fn actor_ticket_deadline_ends_ticket_only() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with_obs(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            true,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(500.0, 0.0, 500.0), // 远观察者:出唤醒范围
+        ));
+        sched.tick(); // 启用;常驻体运动中(刚 spawn)→ 签发常驻运动票
+        let key = (TicketHolder::Entity(e), TicketKind::ActorMotion);
+        // 换 limit=2 的票(锚到期链路;生产 deadline 走配置)。
+        sched.tickets.end(key);
+        sched.tickets.issue(
+            key,
+            crate::tickets::StoredTicket {
+                priority: 1,
+                data: physics_sim::tickets::RegionSpec::Footprint {
+                    lookahead_ticks: 30,
+                    max_lookahead_chunks: 4,
+                },
+                collider: physics_sim::tickets::RegionSpec::None,
+                wake: physics_sim::tickets::WakeSpec::SelfOnly,
+                clock: physics_sim::tickets::TicketClock {
+                    issued_at: Tick(1),
+                    active_ticks: 0,
+                    limit: Some(2),
+                    starts_at: None,
+                },
+                state: physics_sim::tickets::TicketState::Active,
+                center: None,
+            },
+            Tick(1),
+        );
+        for _ in 0..5 {
+            sched.tick();
+        }
+        // 到期:票撤;实体**未被强制落地**(还在实体表 = 未走瞬态落地路径);
+        // 兜底冻结指令在撤票后的 lifecycle 段冻结实体。
+        assert!(
+            sched.ticket_table().get(key).is_none(),
+            "常驻票到期 → 撤票(表侧)"
+        );
+        assert!(
+            sched.entity_state(shard_id(0, 0), e).is_some(),
+            "常驻票到期不强制落地(实体保持;风险 3)"
+        );
+        assert!(
+            sched.is_frozen(shard_id(0, 0), e),
+            "到期撤票后兜底冻结(降级;指令经 capped_freeze_pending)"
         );
         sched.shutdown();
     }
@@ -3146,11 +3311,6 @@ mod tests {
         ));
         sched.tick();
         sched.tick();
-        eprintln!(
-            "DBGV entity={:?} tickets={:?}",
-            sched.entity_state(shard_id(0, 0), e),
-            sched.ticket_table().iter().collect::<Vec<_>>()
-        );
         assert!(
             sched.entity_state(shard_id(0, 0), e).is_none(),
             "y < −64−16 → worker lifecycle 移除(生产 tick,H1)"
