@@ -245,6 +245,21 @@ impl Harness {
         ))
     }
 
+    /// 任意档位的区域票(`tiers`:0b001 ①、0b010 ②、0b100 ③)。区域票的唤醒范围
+    /// 没有滞回(load = unload = radius)。
+    fn area_ticket(&mut self, id: u64, center: Vec3, radius_m: f32, tiers: u8) {
+        self.session
+            .set_area_ticket(id, center, radius_m, tiers, None)
+            .expect("区域票");
+    }
+
+    fn vel(&self, e: EntityId) -> Vec3 {
+        self.session
+            .entity_state(origin(), e)
+            .unwrap_or_else(|| panic!("实体 {e:?} 应在分片 (0,0)"))
+            .linvel
+    }
+
     /// 外部 SetBlock(本地受信命令,owner = 分片 (0,0))。
     fn set_block(&mut self, x: i32, y: i32, z: i32, block: BlockId) {
         self.session
@@ -942,5 +957,100 @@ fn acc_04c_solidify_write_wakes_adjacent_frozen_actor() {
         woke,
         "凝固写入的格与冻结常驻体贴靠,常驻体应在下一拍被唤醒(涌现写入同样登记)"
     );
+    h.finish();
+}
+
+// ===========================================================================
+// 05a:撞前预测的接触唤醒、静止接触不唤醒(AC-T14、AC-T16;需求 §4.10.1–4.10.2)
+// ===========================================================================
+
+/// AC-T14:冻结体对求解器是无限质量。若等接触发生后才唤醒,撞击者会像撞墙一样
+/// 被弹回、被撞者拿不到动量;撞前预测要在撞击那一步之前把被撞者唤醒,让 rapier
+/// 按两个动态体交换动量。
+///
+/// 场景:零重力分片(没有地面摩擦干扰),只有"仅装载"的区域票(没有唤醒范围)。
+/// B(1 kg 常驻体)静止后冻结;A(1 kg 常驻体)从 5 m 外以 5 m/s 正面撞来。
+/// 等质量、恢复系数约 0.1 的正碰:B 应获得明显速度,A 明显减速但不反向。
+/// 被撞醒的 B 在唤醒范围外运动,应持常驻运动票。
+///
+/// 会变红的实现:没有接触唤醒(A 以约 -0.5 m/s 反弹,B 不动);只做撞后补偿
+/// (撞击那一步 B 仍是墙,A 已被弹回);唤醒后不签发常驻票。
+#[test]
+#[ignore = "REQ-007 05a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05a_prestep_wake_exchanges_momentum() {
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let at = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
+    h.terrain_only_area(at, 32.0);
+    h.steps(40);
+
+    let (a, b) = (actor(1), actor(2));
+    h.spawn_actor(b, at, Vec3::ZERO);
+    let mut b_frozen = false;
+    for _ in 0..40 {
+        h.step();
+        if h.frozen(b) {
+            b_frozen = true;
+            break;
+        }
+    }
+    assert!(b_frozen, "前置:静止的 B 在唤醒范围外应冻结");
+
+    h.spawn_actor(a, at - Vec3::new(6.0, 0.0, 0.0), Vec3::new(5.0, 0.0, 0.0));
+    // 5 m 间隙、5 m/s:约 60 拍后接触;观察到 90 拍。
+    h.steps(90);
+    let (va, vb) = (h.vel(a), h.vel(b));
+    assert!(!h.frozen(b), "B 应在撞击前被唤醒(撞前预测)");
+    assert!(
+        vb.x > 1.0,
+        "B 应从碰撞中获得明显速度(vB.x = {}),说明撞击那一步双方都是动态体",
+        vb.x
+    );
+    assert!(
+        va.x > 0.0 && va.x < 4.0,
+        "A 应明显减速且不反向弹回(vA.x = {});撞墙式反弹约为 -0.5",
+        va.x
+    );
+    h.steps(2);
+    assert!(
+        h.has_actor_ticket(b),
+        "被撞醒的 B 在唤醒范围外运动,应持常驻运动票"
+    );
+    h.finish();
+}
+
+/// AC-T16:静止接触不触发接触唤醒(冲击动量 m·max(0, v·n̂) ≈ 0)。
+///
+/// 场景:常规重力。B 在地面,A 叠在 B 上;一张带唤醒范围的区域票罩住 A
+/// (唤醒范围没有滞回,A 在半径内、B 在半径外)。于是 A 醒着、静止地压在
+/// 冻结的 B 上,持续 600 拍。B 必须一直冻结。
+///
+/// 这是防误报的守卫用例:在没有接触唤醒的旧实现下本来就是绿的;只有当实现
+/// "一有接触就唤醒"或补偿路径把静载冲量当作撞击时才会变红。
+#[test]
+#[ignore = "REQ-007 05a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_05a_resting_contact_never_wakes() {
+    let mut h = Harness::new(|_| {});
+    let (b, a) = (actor(1), actor(2));
+    // 区域票中心在 SPOT 正上方 5 m:A(叠在 B 上,中心高 1 m)距 4 m,B 距 5 m;
+    // 半径 4.5:A 在唤醒范围内,B 在外。
+    let center = SPOT + Vec3::new(0.0, 5.0, 0.0);
+    h.area_ticket(1, center, 4.5, 0b111);
+    h.steps(40);
+    h.spawn_actor(b, SPOT, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_actor(a, SPOT + Vec3::new(0.0, 1.05, 0.0), Vec3::ZERO);
+    h.steps(60);
+    assert!(
+        (h.pos(a).y - (GROUND_Y + 1.0)).abs() < 0.1,
+        "前置:A 叠在 B 上(A 的 y = {})",
+        h.pos(a).y
+    );
+    assert!(h.frozen(b), "前置:B 在唤醒范围外静止,应冻结");
+    assert!(!h.frozen(a), "前置:A 在唤醒范围内,醒着");
+
+    for k in 0..600 {
+        h.step();
+        assert!(h.frozen(b), "拍 {k}:A 静止压在 B 上,不应触发接触唤醒");
+    }
     h.finish();
 }
