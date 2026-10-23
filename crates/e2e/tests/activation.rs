@@ -219,17 +219,7 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     // at_rest 由拍 60 末 lifecycle 刷新(linvel 清零 = 睡眠兜底),plan 在
     // 拍 61 的激活刷新产出冻结 → 拍 61 落实。
     sched.tick(); // 执行第 60 拍:沉降静止判定就绪
-    eprintln!(
-        "DBG far@60 frozen={} st={:?}",
-        sched.is_frozen(shard, far),
-        st!(far).linvel
-    );
     sched.tick(); // 执行第 61 拍:远者(出区 + 静止)冻结落实
-    eprintln!(
-        "DBG far@61 frozen={} st={:?}",
-        sched.is_frozen(shard, far),
-        st!(far).linvel
-    );
     let frozen_far = st!(far);
     // 非退化保障:同场景动态体在重力/接触下必然演化——冻结把它钉死。
     for k in 62..72 {

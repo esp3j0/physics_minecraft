@@ -16,6 +16,7 @@ pub mod settle;
 pub mod sim;
 pub mod snapshot;
 pub mod tickets;
+pub mod wake;
 
 mod conv;
 mod solidify;

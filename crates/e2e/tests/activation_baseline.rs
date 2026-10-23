@@ -219,6 +219,7 @@ fn run_scenario() -> Vec<Frame> {
             let mut frozen_all: Vec<EntityId> = Vec::new();
             let mut woke_all: Vec<EntityId> = Vec::new();
             for (shard, decisions) in $session.take_activation_requests() {
+
                 frozen_all.extend(&decisions.entities_to_freeze);
                 woke_all.extend(&decisions.entities_to_wake);
                 for pos in decisions.chunks_to_load {

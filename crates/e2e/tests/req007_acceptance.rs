@@ -514,7 +514,6 @@ const BELOW_A: Vec3 = Vec3::new(72.0, GROUND_Y - 23.5, 72.0);
 /// 会变红的实现:唤醒不检查当前足迹 ②(醒来后掉进待地形或坠落);推迟唤醒
 /// 不发阻塞请求(chunk 要等约 160 拍 ① 冷却才重装);② 就绪后不唤醒。
 #[test]
-#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04b_roundtrip_wake_deferred_until_terrain() {
     let mut h = Harness::new(|_| {});
     let near = Vec3::new(72.0, GROUND_Y, 60.0); // 距实体 12 m
@@ -631,7 +630,6 @@ fn stacked_frozen_pair(h: &mut Harness) -> (EntityId, EntityId) {
 /// 会变红的实现:没有支撑闭包(B 在唤醒半径外保持冻结,A 一动 B 就悬空);
 /// 闭包晚一拍或分开生效。
 #[test]
-#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04b_closure_wakes_stack_together() {
     let mut h = Harness::new(|_| {});
     let (a, b) = stacked_frozen_pair(&mut h);
@@ -658,7 +656,6 @@ fn acc_04b_closure_wakes_stack_together() {
 /// 会变红的实现:先唤醒 A 再按预算处理(A 单独醒来、B 留在空中);闭包成员被
 /// 拆开淘汰。
 #[test]
-#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04b_closure_deferred_when_budget_short() {
     let mut h = Harness::new(|cfg| cfg.activation.max_awake_dynamic = 1);
     let (a, b) = stacked_frozen_pair(&mut h);
@@ -683,7 +680,6 @@ fn acc_04b_closure_deferred_when_budget_short() {
 /// 会变红的实现:T 不随 A 唤醒(悬空);唤醒后票据回到 Active(仍被承载却恢复
 /// 计时);T 失去支撑后不下落或不凝固;凝固后票据不终结。
 #[test]
-#[ignore = "REQ-007 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_04b_carried_block_wakes_with_supporter_then_lands() {
     let mut h = Harness::new(|_| {});
     let (a, t) = (actor(1), EntityId::from_parts(1, 9));

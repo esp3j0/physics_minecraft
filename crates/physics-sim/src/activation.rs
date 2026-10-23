@@ -63,6 +63,9 @@ pub struct ActivationConfig {
     pub actor_motion_max_ticks: u64,
     /// 支撑判定法向阈值(默认 0.7)。
     pub support_normal_min: f32,
+    /// 接触/贴靠唤醒外扩 m(REQ-007 §4.10/§4.9;默认 0.075 = 站立面容差;
+    /// 支撑闭包邻接判定共用)。
+    pub contact_wake_skin_m: f32,
     /// 虚空移除深度 m(默认 16;y < WORLD_Y_MIN − 深度 即删)。
     pub void_despawn_depth_m: f32,
 }
@@ -87,6 +90,7 @@ impl Default for ActivationConfig {
             transient_settle_deadline_ticks: 1200,
             actor_motion_max_ticks: 1200,
             support_normal_min: 0.7,
+            contact_wake_skin_m: 0.075,
             void_despawn_depth_m: 16.0,
         }
     }
@@ -402,10 +406,10 @@ impl ActivationController {
                 }
             }
             let key = key.expect("in_cover 条目必有覆盖票(构造保证)");
-            // 装载同样受冷却门控(任务书:「两者均需冷却」)——换装决策
-            // 采纳即记簿记,冷却窗内重复候选不再产出。
-            if self.chunk_cooled(&cp, now) {
-                // 阻塞请求免冷却(D15;blocked 输入,§14-8)。
+            // 装载受冷却门控(任务书:「两者均需冷却」);**阻塞请求免冷却**
+            // (D15;04b 修正:此前 blocked 在冷却检查内,注释声称的免冷却
+            // 实际从未生效——推迟唤醒的 40 拍内重装断言暴露)。
+            if self.chunk_cooled(&cp, now) || blocked.contains(&cp) {
                 cands.push((cp, key, true, blocked.contains(&cp)));
             }
         }
@@ -481,7 +485,11 @@ impl ActivationController {
             }
             // ② 覆盖 = 任一票 collider "进"区域。
             let collider_covered = occupying.iter().any(|t| collider_covers(t, &cp));
-            if collider_covered && self.collider_cooled(&cp, now) {
+            // 阻塞请求(推迟唤醒的缺 ②)免 ② 冷却(D15;卸载/拆除记下的 ②
+            // 冷却不能挡住"实体立足地"的重建,acc_04b_roundtrip 的 40 拍内
+            // 重装断言 / AC-T1 折返段暴露)。
+            let cooled = self.collider_cooled(&cp, now) || blocked.contains(&cp);
+            if collider_covered && cooled {
                 if collider_budget_left == 0 {
                     break;
                 }

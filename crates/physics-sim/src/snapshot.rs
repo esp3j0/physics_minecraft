@@ -54,6 +54,10 @@ struct ShardSimSnapshot {
     forced_pending: BTreeSet<EntityId>,
     /// 待执行上限兜底冻结(04a)。
     capped_freeze_pending: BTreeSet<EntityId>,
+    /// 推迟唤醒的阻塞请求(04b;未消费的跨拍存续)。
+    deferred_wake_blocked: BTreeSet<ChunkPos>,
+    /// 推迟唤醒的实体(04b;下一拍免冷却重试)。
+    deferred_wake: BTreeSet<EntityId>,
     outbox: Outbox,
     /// 激活簿记(两张冷却表;任务书 02 细则 4:随快照走,恢复后冷却窗口仍在)。
     activation: ActivationController,
@@ -141,6 +145,8 @@ impl ShardSim {
             locomotion: self.locomotion.clone(),
             forced_pending: self.forced_pending.clone(),
             capped_freeze_pending: self.capped_freeze_pending.clone(),
+            deferred_wake_blocked: self.deferred_wake_blocked.clone(),
+            deferred_wake: self.deferred_wake.clone(),
             outbox: self.outbox.clone(),
             activation: self.activation.clone(),
             activation_now: self.activation_now,
@@ -194,6 +200,8 @@ impl ShardSim {
             locomotion: snap.locomotion,
             forced_pending: snap.forced_pending,
             capped_freeze_pending: snap.capped_freeze_pending,
+            deferred_wake_blocked: snap.deferred_wake_blocked,
+            deferred_wake: snap.deferred_wake,
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,

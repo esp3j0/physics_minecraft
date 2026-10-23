@@ -3571,6 +3571,7 @@ mod tests {
                         desc: types::EntityDesc::default(),
                         actor: false,
                         source: None,
+                        actor_motion_ticks: None,
                     },
                 }],
                 Tick::ZERO,
@@ -3634,6 +3635,7 @@ mod tests {
                         desc: types::EntityDesc::default(),
                         actor: false,
                         source: None,
+                        actor_motion_ticks: None,
                     },
                 }],
                 Tick::ZERO,
@@ -4347,6 +4349,7 @@ mod tests {
                 desc: types::EntityDesc::default(),
                 actor: false,
                 source: None,
+                actor_motion_ticks: None,
             },
         };
         sched

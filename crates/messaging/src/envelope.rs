@@ -24,6 +24,10 @@ pub enum EnvelopePayload {
         actor: bool,
         /// 实体来源:外部 spawn = 玩家;服务端/内部 = None。
         source: Option<crate::InputSource>,
+        /// 常驻运动票持票记账/触顶标记(REQ-007 任务 04a 遗留返修):
+        /// 迁移带走(与 actor/source 同款),否则触顶实体借迁移绕过上限
+        /// ——目的分片 claim 后计数从零、重新签发。
+        actor_motion_ticks: Option<u64>,
     },
     /// 涌现事件(REQ-005 §4.3.2/D10):共享参数,各片本地求值;apply_at = N+1。
     Event(CrossEvent),
@@ -241,6 +245,7 @@ mod tests {
                     desc: EntityDesc::default(),
                     actor: false,
                     source: None,
+                    actor_motion_ticks: None,
                 },
             },
             Tick(10),
@@ -256,6 +261,7 @@ mod tests {
             desc: EntityDesc::default(),
             actor: false,
             source: None,
+            actor_motion_ticks: None,
         };
         assert_eq!(p.ordinal(), 0);
     }
@@ -281,6 +287,7 @@ mod tests {
             desc: EntityDesc::default(),
             actor: false,
             source: None,
+            actor_motion_ticks: None,
         };
         assert!(migrate.ordinal() < event.ordinal());
         assert!(event.ordinal() < write.ordinal(), "声明序 = 序号升序");

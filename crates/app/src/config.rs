@@ -229,6 +229,7 @@ impl Config {
                 // 键在 06 全参数化时引入,先以默认落)。
                 actor_motion_max_ticks: 1200,
                 support_normal_min: 0.7,
+                contact_wake_skin_m: 0.075,
                 void_despawn_depth_m: 16.0,
             },
         }

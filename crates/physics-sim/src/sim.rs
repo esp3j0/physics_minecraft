@@ -97,6 +97,9 @@ pub enum LocomotionState {
 /// (每 tick step 后采一个点,首尾相距 20 tick;任务书 01 接口设计)。
 pub(crate) const DISPLACEMENT_WINDOW_LEN: usize = 21;
 
+/// 旋转包络系数(stable 无 f32::consts::SQRT_3;wake.rs 同款常量)。
+const SQRT3: f32 = 1.732_050_8;
+
 /// 单分片配置。可序列化(快照,任务书 01 细则 2:gravity 为 glam Vec3,
 /// types 的 glam 已开 serde)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -240,6 +243,15 @@ pub struct ShardSim {
     /// 待执行上限兜底冻结(任务 04a):常驻运动票到期内部指令进入,下一拍
     /// lifecycle 冻结。随快照。
     pub(crate) capped_freeze_pending: BTreeSet<EntityId>,
+    /// 推迟唤醒的阻塞请求(任务 04b):wake_group 前置不满足时缺 ② 的集合;
+    /// 下一拍 plan 输入(免冷却、排序最前)。随快照。
+    pub(crate) deferred_wake_blocked: BTreeSet<ChunkPos>,
+    /// 推迟唤醒的实体(任务 04b;风险 2 的落实面):wake_group 前置不满足
+    /// 时种子入集;下一拍 apply_activation **直接重跑 wake_group(免冷却)**
+    /// ——plan 的唤醒决策已被翻转簿记挡住(决策即簿记),重试不能等 180 拍;
+    /// ② 齐的下一拍立即落实(§4.9 推迟唤醒语义)。每拍重查前置(状态推导);
+    /// 实体终结/不再冻结时自然失效(重查时忽略非冻结体)。随快照。
+    pub(crate) deferred_wake: BTreeSet<EntityId>,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -274,6 +286,8 @@ impl ShardSim {
             locomotion: BTreeMap::new(),
             forced_pending: BTreeSet::new(),
             capped_freeze_pending: BTreeSet::new(),
+            deferred_wake_blocked: BTreeSet::new(),
+            deferred_wake: BTreeSet::new(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -442,7 +456,15 @@ impl ShardSim {
                         desc,
                         actor,
                         source,
-                    } => self.spawn_entity(entity, state, desc, source, actor),
+                        actor_motion_ticks,
+                    } => {
+                        self.spawn_entity(entity, state, desc, source, actor);
+                        // 常驻运动票触顶标记随迁移载荷走(04a 遗留返修):
+                        // 目的分片 claim 后计数连续,不借迁移绕过上限。
+                        if let Some(rec) = self.entities.get_mut(&entity) {
+                            rec.actor_motion_ticks = actor_motion_ticks;
+                        }
+                    }
                     // 涌现事件(REQ-005 任务 03):共享参数本地求值,复用同一
                     // 纯函数;冻结体免疫语义不变(§9.12)。CrossEvent 未来变体
                     // 追加时本 match 穷举强制处理。
@@ -511,6 +533,82 @@ impl ShardSim {
         }
     }
 
+    /// 带闭包的冻结落实(风险 5,04b):冻结 `id` 并把压在其上方贴靠的
+    /// 醒着实体递归冻结(同一 outbox 语义:常驻 → End ActorMotion;被承载
+    /// 瞬态 → Suspend)。醒体需要先**现算支撑**才有 carried 记录——连带
+    /// 冻结时直接读 kinematic 转换前的状态。
+    fn freeze_with_closure(&mut self, id: &EntityId) {
+        // 上方贴靠的醒着实体(几何判定与 wake::upward_closure 同款;
+        // 用醒着体表而非冻结表——要找的是"压在支撑者上的醒着体")。
+        let mut stack: Vec<EntityId> = vec![*id];
+        let mut to_freeze: Vec<EntityId> = Vec::new();
+        let skin = self.cfg.activation.contact_wake_skin_m;
+        while let Some(cur) = stack.pop() {
+            to_freeze.push(cur);
+            let Some((cc, ch)) = self.entities.get(&cur).and_then(|rec| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .map(|b| (conv::rapier_to_vec3(b.translation()), rec.desc.half_size))
+            }) else {
+                continue;
+            };
+            let atop: Vec<EntityId> = self
+                .entities
+                .iter()
+                .filter(|(oid, _)| *oid != &cur)
+                .filter_map(|(oid, orec)| {
+                    let b = self.phys.bodies.get(orec.handle)?;
+                    if b.is_kinematic() {
+                        return None; // 已冻结的不重复处理(已在组里)
+                    }
+                    let (oc, oh) = (conv::rapier_to_vec3(b.translation()), orec.desc.half_size);
+                    let overlap = |a: f32, ha: f32, c: f32, hc: f32| {
+                        (a - c).abs() <= ha * SQRT3 + hc * SQRT3 + skin
+                    };
+                    // 在上方(中心更高)且三轴贴靠。
+                    if oc.y > cc.y
+                        && overlap(cc.x, ch, oc.x, oh)
+                        && overlap(cc.y, ch, oc.y, oh)
+                        && overlap(cc.z, ch, oc.z, oh)
+                    {
+                        Some(oid)
+                    } else {
+                        None
+                    }
+                })
+                .copied()
+                .collect();
+            for o in atop {
+                if !to_freeze.contains(&o) {
+                    stack.push(o);
+                }
+            }
+        }
+        // 收口后统一冻结(避免借用交错;组内确定性升序)。
+        to_freeze.sort();
+        to_freeze.dedup();
+        for fid in &to_freeze {
+            let Some(rec) = self.entities.get(fid) else {
+                continue;
+            };
+            let (is_actor, carried_now) = (rec.actor, rec.carried);
+            self.freeze_entity(fid);
+            if carried_now && !is_actor {
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: *fid,
+                    op: TicketOp::Suspend,
+                });
+            }
+            if is_actor {
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: *fid,
+                    op: TicketOp::End,
+                });
+            }
+        }
+    }
+
     /// 冻结落实(tier③;apply_activation 与命令唤醒淘汰共用):
     /// rapier 0.36 语义:KinematicPositionBased 下 set_linvel/set_angvel 是
     /// no-op → 必须先清速度再切类型。
@@ -540,6 +638,7 @@ impl ShardSim {
             };
             let (handle, desc, slow_ticks_base, source) =
                 (rec.handle, rec.desc, rec.slow_ticks, rec.source);
+            let actor_motion_ticks = rec.actor_motion_ticks;
             let state = self.read_state(rec);
             let is_sleeping = self
                 .phys
@@ -634,6 +733,8 @@ impl ShardSim {
                     self.cfg.shard.dimension,
                     pos_chunk(state.translation).shard_of(),
                 );
+                // 04a 遗留返修:触顶标记随迁移载荷带走(与 actor/source 同款)
+                // ——否则触顶实体借迁移绕过上限,目的分片重新签发。
                 self.entities.remove(&id).expect("存在");
                 self.phys.remove_body(handle);
                 self.outbox.despawned.push(id);
@@ -644,6 +745,7 @@ impl ShardSim {
                         state,
                         desc,
                         actor,
+                        actor_motion_ticks,
                         source,
                     },
                 });
@@ -770,8 +872,11 @@ impl ShardSim {
             .map(|(id, _)| *id)
             .collect();
         // 阻塞请求(D15;判定只依实体状态,§14-8):待地形实体的足迹缺 ② +
-        // 缺 ①(§4.12 三来源的前两个;强制落地柱缺 ① 在后续提交接)。
-        let blocked = self.awaiting_terrain_blocked();
+        // 缺 ①(§4.12 三来源的前两个)+ 上一拍推迟唤醒的缺 ②(04b:免冷却
+        // 重装,acc_04b_roundtrip 的 40 拍内重装断言)。
+        let mut blocked = self.awaiting_terrain_blocked();
+        blocked.extend(self.deferred_wake_blocked.iter().copied());
+        self.deferred_wake_blocked.clear();
         // 实体占据足迹(04a:卸载候选排除;立足地保护)——**只含醒着体**:
         // 冻结/待地形体不依赖地形(冻结悬停、待地形挂起,恢复前置本就检查
         // ②),基线(AC-T1)的冻结体足迹 chunk 照常卸载(golden 对齐)。
@@ -854,7 +959,11 @@ impl ShardSim {
             // 冻结条目全部落实:静止前置已在 plan 决策侧(04a;被前置挡下的
             // 条目不产出、不烧簿记),超预算淘汰(over_budget_freeze)不受
             // 静止前置约束(§4.12 预算强制,决策已单独标出)。
-            self.freeze_entity(id);
+            //
+            // 风险 5(04b):**淘汰不拆散叠放**——冻结支撑者时,把压在其上
+            // 方贴靠的**醒着**实体一并冻结(否则支撑者一走,上面的醒着实体
+            // 悬空)。连带冻结的实体同样撤票/记账(递归处理:叠三层的组)。
+            self.freeze_with_closure(id);
             if is_transient_carried {
                 self.outbox.ticket_ops.push(TicketOpRecord {
                     entity: *id,
@@ -870,57 +979,39 @@ impl ShardSim {
                 });
             }
         }
-        for id in &decisions.entities_to_wake {
-            let Some(rec) = self.entities.get(id) else {
-                continue;
-            };
-            let is_actor = rec.actor;
-            // K1:被承载瞬态的唤醒 ops 随 plan 决策产出。承载真值取**记录侧**
-            // (kinematic 体不在支撑判定输出里;冻结期间记录不刷新,冻结前的
-            // 承载状态即"仍被承载"的真值)。
-            let carried_now = !is_actor && rec.carried;
-            // 唤醒前置:当前足迹 ∩ 区域 ② 齐(§4.9 共同规则 1;瞬态体)。
-            if !rec.actor {
-                let pos = {
-                    let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
-                    conv::rapier_to_vec3(b.translation())
-                };
-                let region = self.activation_region();
-                let ready = crate::settle::current_footprint(
-                    pos,
-                    rec.desc.half_size,
-                    self.cfg.activation.terrain_guard_m,
-                )
-                .iter()
-                .all(|cp| !region.contains(*cp) || self.built_colliders.contains(cp));
-                if !ready {
-                    continue; // 推迟唤醒(待地形状态机接管)
-                }
+        // tier③ 唤醒落实(04b 统一唤醒入口;§4.9 共同规则):plan 的每个
+        // 唤醒条目为**种子**,经 `wake_group` 走同一入口——前置检查(足迹 ②,
+        // 缺 → 整组推迟保持冻结)、向上支撑闭包(冻结常驻体 + 承载冻结的
+        // 瞬态体;待地形体不属于)、整组原子、重置静止判据、票据操作
+        // (被承载瞬态 Paused / 脱离承载 Resume)。D19:组 ≥ 2 时
+        // `当前醒数 + 组大小 ≤ max_awake_dynamic` 才唤醒,否则整组推迟;
+        // 单个实体保持现状(先唤醒再淘汰,AC-T1 口径)。
+        let awake_count = self
+            .entities
+            .values()
+            .filter(|rec| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| !b.is_kinematic())
+            })
+            .count();
+        // 上一拍推迟的唤醒先重试(免冷却;② 齐即落实,风险 2)。
+        let retry: Vec<EntityId> = self.deferred_wake.iter().copied().collect();
+        self.deferred_wake.clear();
+        for seed in retry {
+            let missing = self.wake_group(&[seed], awake_count);
+            if !missing.is_empty() {
+                // 仍缺:回队 + 阻塞请求继续(状态推导,每拍重查)。
+                self.deferred_wake.insert(seed);
+                self.deferred_wake_blocked.extend(missing);
             }
-            let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
-            body.set_body_type(RigidBodyType::Dynamic, true);
-            // 04a 细则 3:任何唤醒重置静止判据(slow_ticks = 0、位移窗口只留
-            // 当前位置)+ 清常驻票触顶标记(重签资格恢复)。
-            {
-                let rec = self.entities.get_mut(id).expect("存在");
-                rec.slow_ticks = 0;
-                let pos = conv::rapier_to_vec3(body.translation());
-                rec.window.clear();
-                rec.window.push_back(pos);
-                rec.at_rest = false;
-                rec.actor_motion_ticks = None;
-            }
-            if !is_actor {
-                // K1:被承载瞬态的唤醒 ops 随 plan 决策产出(§4.4.2:唤醒
-                // 仍被承载 → Paused;脱离承载 → Resume)。
-                let op = if carried_now {
-                    TicketOp::Pause
-                } else {
-                    TicketOp::Resume
-                };
-                self.outbox
-                    .ticket_ops
-                    .push(TicketOpRecord { entity: *id, op });
+        }
+        for seed in decisions.entities_to_wake.clone() {
+            let missing = self.wake_group(&[seed], awake_count);
+            if !missing.is_empty() {
+                self.deferred_wake.insert(seed);
+                self.deferred_wake_blocked.extend(missing);
             }
         }
 
@@ -933,6 +1024,119 @@ impl ShardSim {
         // 对 kinematic 无效=既有免疫)。
         self.update_awaiting_terrain();
         decisions
+    }
+
+    /// 统一唤醒入口(§4.9;任务 04b;观察者/区域票半径唤醒经 plan 落实、
+    /// 命令重建唤醒、承载 Resume 共用):依次执行——
+    /// 1. **前置**:每个潜在成员的当前足迹 ∩ 本分片区域 ② 齐;缺 → 整组
+    ///    推迟(保持冻结),缺的 chunk 返回给调用方作阻塞请求(免冷却);
+    /// 2. **向上支撑闭包**(几何;`wake::upward_closure`):冻结常驻体与
+    ///    承载冻结的瞬态体是成员;待地形体不属于(其 kinematic 但非冻结);
+    /// 3. **整组原子**(D19):组 ≥ 2 时 `当前醒数 + 组大小 ≤ max_awake_
+    ///    dynamic` 才唤醒,否则整组推迟;单实体保持现状(先醒再淘汰);
+    /// 4. 落实:切 Dynamic、重置静止判据(§4.4.1)、清触顶标记;
+    /// 5. 票据:被承载瞬态 → Pause(仍被承载,直达 Paused);脱离承载 →
+    ///    Resume;常驻体(出范围唤醒)→ IssueActorMotion 由 lifecycle 按状
+    ///    态产出(此处不产)。
+    ///
+    /// 返回整组推迟时缺失的 ② chunk(阻塞请求输入;前置不满足的组不落任何
+    /// 成员——"下面的醒了走开、上面的悬空"被原子性排除)。
+    fn wake_group(&mut self, seeds: &[EntityId], awake_count: usize) -> BTreeSet<ChunkPos> {
+        let region = self.activation_region();
+        let skin = self.cfg.activation.contact_wake_skin_m;
+        // 潜在成员 = 种子 ∪ 向上支撑闭包(只含**冻结**体:kinematic 且非待
+        // 地形;风险 3)。seeds 中不在实体表/非冻结的条目忽略(命令唤醒路径
+        // 的种子本来就是醒着的重建体——此时闭包以其为根向上找)。
+        let frozen: Vec<(EntityId, Vec3, f32)> = self
+            .entities
+            .iter()
+            .filter(|(id, rec)| {
+                self.phys
+                    .bodies
+                    .get(rec.handle)
+                    .is_some_and(|b| b.is_kinematic())
+                    && !self.is_awaiting_terrain(**id)
+            })
+            .map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                (
+                    *id,
+                    conv::rapier_to_vec3(b.translation()),
+                    rec.desc.half_size,
+                )
+            })
+            .collect();
+        let seeds_frozen: Vec<EntityId> = seeds
+            .iter()
+            .copied()
+            .filter(|id| frozen.iter().any(|(fid, _, _)| fid == id))
+            .collect();
+        let group = crate::wake::upward_closure(&frozen, &seeds_frozen, skin);
+        // 组为空(种子非冻结体:命令唤醒的重建体已是 Dynamic)→ 无组可落,
+        // 返回空缺集(调用方语义:无前置可查,物理自洽)。
+        if group.is_empty() {
+            return BTreeSet::new();
+        }
+        // 前置:每个成员的当前足迹 ∩ 区域 ② 齐。
+        let mut missing: BTreeSet<ChunkPos> = BTreeSet::new();
+        for id in &group {
+            let rec = self.entities.get(id).expect("闭包成员在实体表");
+            let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            let pos = conv::rapier_to_vec3(b.translation());
+            for cp in crate::settle::current_footprint(
+                pos,
+                rec.desc.half_size,
+                self.cfg.activation.terrain_guard_m,
+            ) {
+                if region.contains(cp) && !self.built_colliders.contains(&cp) {
+                    missing.insert(cp);
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return missing; // 整组推迟(保持冻结);缺 ② 由调用方作阻塞请求
+        }
+        // D19 预算:组 ≥ 2 整组放得下才醒;单实体保持现状。
+        if group.len() >= 2 && awake_count + group.len() > self.cfg.activation.max_awake_dynamic {
+            return BTreeSet::new(); // 整组推迟(预算不足;不走先醒再淘汰)
+        }
+        // 落实:整组原子。
+        for id in &group {
+            let rec = self.entities.get(id).expect("存在");
+            let is_actor = rec.actor;
+            let carried_now = !is_actor && rec.carried;
+            {
+                let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+                body.set_body_type(RigidBodyType::Dynamic, true);
+            }
+            // 重置静止判据(§4.4.1)+ 清触顶标记。
+            let rec = self.entities.get_mut(id).expect("存在");
+            rec.slow_ticks = 0;
+            let pos = {
+                let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                conv::rapier_to_vec3(b.translation())
+            };
+            rec.window.clear();
+            rec.window.push_back(pos);
+            rec.at_rest = false;
+            rec.actor_motion_ticks = None;
+            if !is_actor {
+                // 被承载瞬态 → Paused(直达;03 做法);脱离承载 → Resume。
+                let op = if carried_now {
+                    TicketOp::Pause
+                } else {
+                    TicketOp::Resume
+                };
+                self.outbox
+                    .ticket_ops
+                    .push(TicketOpRecord { entity: *id, op });
+            }
+            // 翻转簿记(§4.9 规则 4;决策落实的唤醒同样防抖)——与 plan 的
+            // now 同拍(apply_activation 开头已 next(),本拍值 = 当前值-1)。
+            let now = Tick(self.activation_now.0 - 1);
+            self.activation.note_flip(id, now);
+        }
+        BTreeSet::new()
     }
 
     /// 待地形进入/恢复(§4.6;瞬态体;调用点 = apply_activation 末与
@@ -1988,6 +2192,16 @@ mod tests {
         let mut c = ShardSimConfig::new(shard_id(0, 0));
         c.gravity = Vec3::ZERO;
         c
+    }
+
+    fn zero_g_sim_at(shard: ShardId) -> ShardSim {
+        ShardSim::new(
+            ShardSimConfig {
+                gravity: Vec3::ZERO,
+                ..ShardSimConfig::new(shard)
+            },
+            Box::new(voxel::SimpleRegistry::builtin()),
+        )
     }
 
     fn zero_g_sim() -> ShardSim {
@@ -3191,6 +3405,8 @@ mod tests {
     #[test]
     fn wake_resets_stillness_window() {
         let mut s = zero_g_sim();
+        // 唤醒前置(wake_group 足迹 ②)需要地面 chunk 在场,否则整组推迟。
+        s.load_chunk(ChunkPos::new(3, 3), solid_chunk());
         let e = entity(1);
         s.apply_prefix(&[
             spawn_input(1, e, Vec3::new(60.0, 3.0, 60.0)),
@@ -3223,6 +3439,150 @@ mod tests {
         assert!(!kinematic, "唤醒落实(Dynamic)");
         assert_eq!(slow_ticks, 0, "唤醒重置 slow_ticks(细则 3)");
         assert!(win_len <= 1, "位移窗口只留当前位置(实得 {win_len})");
+    }
+
+    /// 任务书 04b 风险 5 单测(直接布景):醒着 B 压在醒着 A 上;命令唤醒
+    /// 淘汰 A(最远醒者)→ B 连同冻结(悬空防杜)。**零重力**免静止干扰。
+    #[test]
+    fn stacked_awake_frozen_with_supporter_on_cull() {
+        let mut s = ShardSim::new(budget_cfg(1), Box::new(voxel::SimpleRegistry::builtin()));
+        let (a, b, far_e) = (entity(1), entity(2), entity(3));
+        s.apply_prefix(&[
+            spawn_input(0, a, Vec3::new(40.0, 3.0, 8.0)),
+            mark_actor_input(1, a, true),
+            spawn_input(2, b, Vec3::new(40.0, 4.05, 8.0)),
+            mark_actor_input(3, b, true),
+            spawn_input(4, far_e, Vec3::new(8.0, 3.0, 8.0)),
+            mark_actor_input(5, far_e, true),
+        ]);
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]); // 启用;观察者在 far_e 旁
+        for _ in 0..25 {
+            s.step();
+        }
+        let _ = s.take_outbox();
+        // 命令唤醒 a、b 至远处(40m,出唤醒范围;命令重建即醒):
+        // 醒数 {a, b} = 2 > 预算 1 → enforce_budget 淘汰最远者……两者同距?
+        // 用 y 错开制造距离差:a 更远。
+        s.apply_prefix(&[
+            teleport_input(6, a, Vec3::new(50.0, 3.0, 8.0)),
+            teleport_input(7, b, Vec3::new(50.0, 4.05, 8.0)),
+        ]);
+        s.step();
+        // enforce_budget 淘汰距离降序最远者 = a(b 距近 0.05)→ a 冻结时
+        // b(压在 a 上)连同冻结。
+        let a_frozen = {
+            let rec = s.entities.get(&a).unwrap();
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        let b_frozen = {
+            let rec = s.entities.get(&b).unwrap();
+            s.phys.bodies.get(rec.handle).unwrap().is_kinematic()
+        };
+        assert!(
+            a_frozen && b_frozen,
+            "淘汰 a 时压在其上的 b 连同冻结(风险 5):a={a_frozen} b={b_frozen}"
+        );
+        assert!(
+            s.outbox
+                .ticket_ops
+                .iter()
+                .filter(|o| o.entity == b)
+                .any(|o| o.op == TicketOp::End),
+            "连带冻结的常驻体同样撤 ActorMotion(I3 第 4 条)"
+        );
+    }
+
+    /// 04a 遗留返修单测:常驻票触顶标记随迁移载荷带走——触顶实体迁移后
+    /// 目的片 claim 不重签(上限不可借迁移绕过)。
+    #[test]
+    fn migration_carries_actor_motion_ticks() {
+        let mut s = zero_g_sim();
+        let e = entity(1);
+        s.apply_prefix(&[
+            spawn_input(1, e, Vec3::new(8.0, 3.0, 8.0)),
+            mark_actor_input(2, e, true),
+        ]);
+        s.apply_activation(&[Vec3::new(8.0, 0.0, 8.0)]);
+        let _ = s.take_outbox();
+        // 远观察者 → 运动中出范围 → 记账推进;手工把记账顶到触顶位。
+        s.apply_activation(&[Vec3::new(500.0, 0.0, 500.0)]);
+        s.step();
+        s.run_transient_lifecycle();
+        {
+            let rec = s.entities.get_mut(&e).unwrap();
+            rec.actor_motion_ticks = Some(1200); // 触顶
+        }
+        // 迁移出本体区:teleport 到区内新位(重建清记账)→ 重新置触顶 →
+        // 下一拍给外漂速度,迁移检测带走(记账随载荷;Teleport 出区是同片
+        // 重建语义,不走迁移信封,覆盖不到这里)。
+        s.apply_prefix(&[teleport_input(3, e, Vec3::new(127.99, 3.0, 8.0))]);
+        // 重建清了记账 → 重新置触顶 → 下一拍以 2 m/s 漂出本体区。
+        {
+            let rec = s.entities.get_mut(&e).unwrap();
+            rec.actor_motion_ticks = Some(1200);
+        }
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 4,
+            payload: InputPayload::Command(SimCommand::TeleportEntity {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(127.99, 3.0, 8.0),
+                    linvel: Vec3::new(2.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+            }),
+        }]);
+        {
+            let rec = s.entities.get_mut(&e).unwrap();
+            rec.actor_motion_ticks = Some(1200);
+        }
+        s.step(); // 漂移出本体区 → 迁移信封(记账随载荷)
+        let out = s.take_outbox();
+        let carried = out.migrations.iter().any(|i| match &i.payload {
+            EnvelopePayload::MigrateEntity {
+                entity,
+                actor_motion_ticks,
+                ..
+            } => *entity == e && *actor_motion_ticks == Some(1200),
+            _ => false,
+        });
+        assert!(
+            carried,
+            "触顶标记随迁移载荷带走(04a 遗留;实得 {:?})",
+            out.migrations
+        );
+        // 目的片视角:前缀应用迁移信封 → 记账恢复(不借迁移绕过上限)。
+        let mut s2 = zero_g_sim_at(shard_id(1, 0));
+        s2.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Envelope(messaging::Envelope {
+                produced_at: Tick::ZERO,
+                apply_at: Tick::ZERO,
+                source: shard_id(0, 0),
+                destination: shard_id(1, 0),
+                source_sequence: 0,
+                payload: EnvelopePayload::MigrateEntity {
+                    entity: e,
+                    state: EntityState {
+                        translation: Vec3::new(8.0, 3.0, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                    actor: true,
+                    source: None,
+                    actor_motion_ticks: Some(1200),
+                },
+            }),
+        }]);
+        assert_eq!(
+            s2.entities.get(&e).unwrap().actor_motion_ticks,
+            Some(1200),
+            "目的片 claim 后记账连续(不重新签发)"
+        );
     }
 
     /// 任务书测试 `sim::over_budget_actor_freezes_and_ends_ticket`(T8/§9-2
