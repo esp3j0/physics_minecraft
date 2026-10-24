@@ -2140,3 +2140,207 @@ async fn pending_blockwrite_cells_defer_window() {
         "终末快照键集 = 观察者远端 ensure 两片(原两片完整回收)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-007 AC-T2(07 补锚):REQ-005 owner/holder 既有验收零回归
+// ---------------------------------------------------------------------------
+
+/// AC-T2(07 任务书"owner/holder 既有验收零回归"显式锚):REQ-007 激活票据
+/// 接管 owner/holder 编排(票据 ensure / 激活装卸)后,REQ-005 的既有验收面
+/// 不回归——分两段,各走生产路径:
+/// ① **holder 注册精确 + 装载幂等**(调度器级,acc1 同几何):观察者票贴
+///    边界,margin 重叠列 chunk 必为双 holder、装载恰一次;卸载后 holder
+///    登记撤销(经 `apply_chunk_unload` 走调度器同一条撤销路径);
+/// ② **owner-only 持久化 + 重载取库值**(Session 级,acc3 语义):观察者
+///    移出 48 m 卸载半径,owner 侧卸载返回修改 chunk(驱动写库条件)、
+///    holder 侧返回 None(零写入);观察者折返后重载,两片体素 = 修改值
+///    (持久层优先,不被生成器初生覆盖)。
+///
+/// 会变红的实现:票据化后 ensure/卸载绕过 chunk_holders 登记(holder 表缺失
+/// 或残留);扩张副本被写库(owner-only 被破坏);重复装载(acc1 ① 幂等)。
+#[test]
+fn acc_t2_owner_holder_semantics_survive_ticket_orchestration() {
+    let seed = WorldSeed(7);
+
+    // —— ① 调度器级:holder 注册精确 + 装载幂等 + 卸载撤销 ——
+    let mut sched = Scheduler::new(SchedulerConfig {
+        worker_count: 2,
+        ..SchedulerConfig::default()
+    });
+    sched.register(void_sim(0, 0, true));
+    sched.register(void_sim(1, 0, true));
+    sched.set_observers(vec![Vec3::new(126.0, 0.0, 64.0)]);
+    let s0 = shard_id(0, 0);
+    let s1 = shard_id(1, 0);
+    let mut applied: BTreeMap<(ShardId, ChunkPos), u32> = BTreeMap::new();
+    for _ in 0..400 {
+        sched.tick();
+        for (shard, decisions) in sched.take_activation_requests() {
+            for cp in decisions.chunks_to_load {
+                sched.apply_chunk_load(shard, cp, ground_chunk(4));
+                *applied.entry((shard, cp)).or_insert(0) += 1;
+            }
+        }
+    }
+    // 同一 (shard, chunk) 恰一次装载(acc1 ④;票据化簿记不得重复请求)。
+    for ((shard, cp), n) in &applied {
+        assert_eq!(*n, 1, "{shard:?} 重复装载 {cp:?} 共 {n} 次(票据化回归)");
+    }
+    // margin 重叠列(x=7/8)必为双 holder(acc1 ② 核心面,非退化;owner 按
+    // chunk 位置推导——x=8 列的 owner 是分片 (1,0))。
+    for cx in [7, 8] {
+        let cp = ChunkPos::new(cx, 3);
+        let owner = ShardId::new(WorldId(0), DimensionId(0), cp.shard_of());
+        let holders = sched.holders_of(owner, cp);
+        assert_eq!(
+            holders,
+            [s0, s1].into_iter().collect(),
+            "margin 重叠列 chunk {cp:?} 必为双 holder:{holders:?}(票据化回归)"
+        );
+    }
+    // 卸载一份副本 → 该副本的 holder 登记撤销(另一份保留);登记与装载态
+    // 同步(acc1 ② 的对偶面;走 apply_chunk_unload 同一条撤销路径)。
+    let c7 = ChunkPos::new(7, 3);
+    assert!(
+        applied.contains_key(&(s0, c7)) && applied.contains_key(&(s1, c7)),
+        "非退化:c7 应为双 holder 重叠列(实得 {:?})",
+        (
+            applied.contains_key(&(s0, c7)),
+            applied.contains_key(&(s1, c7))
+        )
+    );
+    assert!(
+        sched.apply_chunk_unload(s1, c7).is_none(),
+        "非 owner 副本:None(零写入条件)"
+    );
+    let holders_after = sched.holders_of(s0, c7);
+    assert_eq!(
+        holders_after,
+        [s0].into_iter().collect(),
+        "holder 卸载后登记撤销,只剩 owner:{holders_after:?}"
+    );
+    sched.shutdown();
+
+    // —— ② Session 级:owner-only 持久化 + 折返重载取库值 ——
+    let dir = tempfile::tempdir().expect("临时目录");
+    let chunks_store = Box::new(RedbStore::open(&dir.path().join("chunks.redb")).expect("真 redb"));
+    let worker = StoreWorker::new(chunks_store, Box::new(MemCheckpointStore::new()));
+    let provider = ChunkProvider::new(&worker, Box::new(Superflat::classic()), seed);
+    let mut session = Session::new(session_cfg());
+    session.register(void_sim(0, 0, true));
+    session.register(void_sim(1, 0, true));
+    session
+        .move_observer_from(InputSource(2), Vec3::new(126.0, 0.0, 64.0))
+        .expect("观察者入表");
+    let mut c7_loaded = false;
+    for _ in 0..400 {
+        session.tick();
+        for (shard, decisions) in session.take_activation_requests() {
+            for cp in decisions.chunks_to_load {
+                let key = ChunkKey {
+                    world: WorldId(0),
+                    dim: DimensionId(0),
+                    pos: cp,
+                };
+                let chunk = provider
+                    .get(key)
+                    .unwrap_or_else(|| panic!("provider.get 返回 None:{key:?}"));
+                session.apply_chunk_load(shard, cp, chunk);
+                if cp == c7 {
+                    c7_loaded = true;
+                }
+            }
+        }
+    }
+    assert!(c7_loaded, "前置:c7 经票据驱动装载(观察者贴边界)");
+
+    // 边界修改 → 观察者移出 48 m 卸载半径 → 激活卸载:owner 返回修改值、
+    // holder 先卸返回 None(acc3 语义;激活卸载路径)。
+    let generated = Superflat::classic().generate(seed, c7);
+    let mut expect = generated;
+    // 边界修改落在 c7 = (7,3) 内(x=120∈[112,128)、z=56∈[48,64);局部格
+    // (8, 0, 8) 与 acc3 同格位,只换 chunk 行。
+    expect.set(8, 0, 8, BlockId(2));
+    session
+        .set_block(s0, BlockPos::new(120, types::WORLD_Y_MIN, 56), BlockId(2))
+        .expect("边界修改");
+    session.tick();
+    session
+        .move_observer_from(InputSource(2), Vec3::new(2000.0, 0.0, 64.0))
+        .expect("观察者移出卸载半径");
+    let (mut holder_return, mut owner_return) = (None, None);
+    // s0 与 s1 对 c7 的卸载预算序不同(s0 的 c7 = 自家 core,距离序靠后;
+    // s1 的 c7 = 扩张副本,同款靠后)——不设提前 break,跑满冷却窗让两侧
+    // 决策自然到齐,再按记录值断言。
+    for _ in 0..600 {
+        session.tick();
+        for (shard, decisions) in session.take_activation_requests() {
+            for cp in decisions.chunks_to_unload {
+                let returned = session.apply_chunk_unload(shard, cp);
+                if cp == c7 {
+                    if shard == s1 {
+                        holder_return = returned;
+                    } else if shard == s0 {
+                        owner_return = returned;
+                    }
+                }
+            }
+        }
+        if owner_return.is_some() && holder_return.is_some() {
+            break;
+        }
+    }
+    let owner_chunk = owner_return.expect("前置:观察者远移后 owner 侧 ① 应被卸载");
+    assert_eq!(
+        holder_return, None,
+        "holder 侧(先卸)返回 None(零写入;owner-only 未被票据化破坏)"
+    );
+    assert_eq!(owner_chunk, expect, "owner 卸载返回修改值(可持久化)");
+    // 驱动写库条件 = Some(orchestrate 同款):owner chunk 修改值入持久层。
+    worker.put_chunks(vec![(
+        ChunkKey {
+            world: WorldId(0),
+            dim: DimensionId(0),
+            pos: c7,
+        },
+        owner_chunk,
+    )]);
+    assert!(worker.flush().recv().expect("flush ack").is_ok(), "屏障");
+
+    // 观察者折返 → 票据请求重载:两片体素 = 修改值(库值优先,非生成器初生)。
+    session
+        .move_observer_from(InputSource(2), Vec3::new(126.0, 0.0, 64.0))
+        .expect("观察者折返");
+    let mut reloaded = BTreeSet::new();
+    for _ in 0..600 {
+        session.tick();
+        for (shard, decisions) in session.take_activation_requests() {
+            for cp in decisions.chunks_to_load {
+                let key = ChunkKey {
+                    world: WorldId(0),
+                    dim: DimensionId(0),
+                    pos: cp,
+                };
+                let chunk = provider.get(key).expect("重载必命中库值");
+                if cp == c7 {
+                    assert_eq!(
+                        chunk, expect,
+                        "重载取回修改值(持久层优先,不被生成器初生覆盖)"
+                    );
+                    reloaded.insert(shard);
+                }
+                session.apply_chunk_load(shard, cp, chunk);
+            }
+        }
+        if reloaded.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        reloaded,
+        [s0, s1].into_iter().collect(),
+        "折返后两片照常重载 c7(卸载冷却后;票据路径不吞请求)"
+    );
+    session.shutdown();
+    worker.shutdown().expect("正常关停");
+}

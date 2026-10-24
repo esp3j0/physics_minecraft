@@ -4314,8 +4314,6 @@ mod tests {
                     saw_removed = true;
                     break;
                 }
-                Ok(Ok(other)) => eprintln!("[dbg] f {:?}", other),
-                Err(e) => eprintln!("[dbg] err {:?}", e),
                 _ => {}
             }
         }

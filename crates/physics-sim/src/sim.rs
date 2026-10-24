@@ -5587,4 +5587,85 @@ mod tests {
             "取出即清:指向消失实体的种子同样取出即弃"
         );
     }
+
+    /// 遥测专测(07 附加项 1;§4.16 `contact_wake_skipped_no_terrain`):
+    /// 接触唤醒的组因当前足迹缺 ② 被整组跳过时,计数 +1、被撞的冻结体保持
+    /// 冻结;② 就绪后再次撞击可以唤醒(计数不再增加)。
+    /// 会变红的实现:缺 ② 的组照常落实(计数 0 且 B 被唤醒);或把"缺 ②
+    /// 跳过"记进任何唤醒/推迟计数字段(首段断言红);或 ② 就绪后仍不醒
+    /// (末段断言红)。
+    ///
+    /// 场景(contact_sim 零重力;复刻 05b 的 5 m/s 撞击几何,该速度 ≥
+    /// 门槛 1 且预测扫掠首拍命中):冻结常驻体 B 在 chunk (3,3);② 卸载
+    /// 半径压到 32 后,frozen_actor 的 MID 激活即按 R2 单独拆 ②(锚
+    /// (96,·,56):chunk 中心距 40 ∈ (32,48] 带——② 超卸载半径、① 保留),
+    /// 制造"有 ① 无 ②"状态。撞击者 A 从 B 左侧 1.5 m 以 5 m/s 撞入 →
+    /// prestep 种子命中 B,但 wake_group 前置(足迹 ②)不满足 → 整组推迟:
+    /// `contact_wake_skipped_no_terrain` +1,无任何唤醒计数,B 保持冻结;
+    /// 种子取出即清(不跨拍重试,05c 语义)。再合一装载 (3,3)(② 就绪)后
+    /// A(动量未耗尽前)二次撞击 → B 被唤醒,计数不再增加。
+    #[test]
+    fn contact_wake_skipped_when_footprint_missing_collider_then_wakes_after_ready() {
+        let mut s = contact_sim(16);
+        // ② 卸载半径 32(< 默认 48;apply_activation_executes_collider_
+        // decisions 同款):让 MID 锚下 chunk (3,3)(中心距 40)落入
+        // (32, 48] 带 → ② 单独拆、① 保留(R2 合法路径)。在 frozen_actor
+        // 之前设置:其收尾的 MID 激活即完成单独拆 ②。
+        s.cfg.activation.collider_unload_radius = 32.0;
+        let (b, a) = (entity(1), entity(2));
+        frozen_actor(&mut s, b, Vec3::new(56.0, 66.5, 56.0));
+
+        assert!(
+            !s.has_collider(ChunkPos::new(3, 3))
+                && s.voxel().get_chunk(ChunkPos::new(3, 3)).is_some(),
+            "前置:足迹 chunk 有 ① 无 ②(frozen_actor 的 MID 激活已按 R2 单独拆 ②)"
+        );
+        assert!(is_frozen(&s, b), "前置:B 保持冻结(缺 ② 不经 plan 唤醒)");
+
+        // 撞击者 A 从 B 左侧 1.5 m、5 m/s 撞入(05b 同款几何)。
+        s.apply_prefix(&[
+            spawn_actor_v(3, a, Vec3::new(54.5, 66.5, 56.0), Vec3::new(5.0, 0.0, 0.0)),
+            mark_actor_input(4, a, true),
+        ]);
+        let _ = s.apply_activation(&[Vec3::new(54.5, 66.5, 56.0)]);
+        assert!(!is_frozen(&s, a), "前置:A 醒着");
+
+        // 首拍:预测种子命中 B,但 B 的足迹缺 ② → 整组推迟(保持冻结):
+        // 计数 +1、无任何唤醒计数(§4.16"只数真正从冻结切为 Dynamic 的")。
+        s.step();
+        let events = s.take_activation_events();
+        assert_eq!(
+            events.contact_wake_skipped_no_terrain, 1,
+            "缺 ② 的接触唤醒组:跳过计数 +1"
+        );
+        assert_eq!(
+            events.wakes_contact_pred
+                + events.wakes_contact_comp
+                + events.wakes_contact_spread
+                + events.wakes_terrain
+                + events.closure_deferred,
+            0,
+            "缺 ② 跳过不计唤醒、不计预算推迟(与 D19 分支区分)"
+        );
+        assert!(is_frozen(&s, b), "被撞的冻结体保持冻结(整组推迟)");
+
+        // ② 就绪(合一重载同 chunk)→ A(仍在途中/已贴靠,动量 ≥ 门槛
+        // 的接触继续产生种子)再次撞击 → B 被唤醒,跳过计数不再增加。
+        s.load_chunk(ChunkPos::new(3, 3), solid_chunk());
+        assert!(s.has_collider(ChunkPos::new(3, 3)), "前置:② 已就绪");
+        let mut woke = false;
+        for _ in 0..60 {
+            s.step();
+            if !is_frozen(&s, b) {
+                woke = true;
+                break;
+            }
+        }
+        assert!(woke, "② 就绪后再次撞击应唤醒 B(缺 ② 只是推迟,不是丢弃)");
+        let events = s.take_activation_events();
+        assert_eq!(
+            events.contact_wake_skipped_no_terrain, 0,
+            "就绪后的唤醒不产生新的跳过计数(累计仍为 1)"
+        );
+    }
 }
