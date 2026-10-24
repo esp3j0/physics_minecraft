@@ -1675,3 +1675,352 @@ fn acc_06a_repeated_mark_actor_keeps_ticket_clock() {
     );
     h.finish();
 }
+
+// ===========================================================================
+// 06b:快照收口与中途 checkpoint 一致(AC-T21、AC-T24;需求 §4.0、§4.14)
+// ===========================================================================
+//
+// 恢复一律走 checkpoint 的编码:世界快照经 bincode 往返,再 `replay_world`,
+// 套上与原线相同的编排(新建的 provider/store——Harness 不落盘卸载的 chunk,
+// 两线重新装载时都从生成器取,天然一致)。快照前后都不发外部命令,恢复用
+// 空日志。
+
+/// 世界快照 → bincode 往返 → `replay_world` → 带编排的恢复线。
+fn restore_harness(snapshot: &sim_api::snapshot::WorldSnapshot) -> Harness {
+    let bytes = bincode::serde::encode_to_vec(snapshot, bincode::config::standard())
+        .expect("世界快照可编码");
+    let (decoded, _): (sim_api::snapshot::WorldSnapshot, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .expect("世界快照可解码");
+    let config = Config::default();
+    let store = storage::worker::StoreWorker::new(
+        Box::new(storage::mem::MemChunkStore::new()),
+        Box::new(storage::mem::MemCheckpointStore::new()),
+    );
+    let session = sim_api::replay::replay_world(
+        &decoded,
+        &sim_api::log::CommandLog::new(),
+        config.session_config(),
+        || Box::new(voxel::SimpleRegistry::builtin()),
+    )
+    .expect("自有快照必可恢复");
+    let (provider, new_sim) = app::driver::wire_provider_and_new_sim(config, &store, || {
+        Box::new(voxel::SimpleRegistry::builtin())
+    });
+    Harness {
+        session,
+        store,
+        provider,
+        new_sim,
+    }
+}
+
+/// 一条线在某一拍的可比状态:票据表(含时钟与状态)、全部实体(状态逐位、
+/// 冻结、待地形)、全部已注册分片的 ①② 集合。完整的调度器快照(另含观察者、
+/// 在途信封、生命周期)序列化代价高,由 `assert_lines_match` 每 50 拍比一次。
+#[derive(Debug, PartialEq)]
+struct LineProbe {
+    tick: types::Tick,
+    tickets: shard::tickets::TicketTable,
+    entities: Vec<(ShardId, EntityId, EntityState, bool, bool)>,
+    chunks: Vec<(ShardId, ChunkPos, bool, bool)>,
+}
+
+fn probe(h: &Harness) -> LineProbe {
+    let mut entities = Vec::new();
+    let mut chunks = Vec::new();
+    for shard in h.session.shard_ids() {
+        for (e, st) in h.session.entity_states(shard).unwrap_or_default() {
+            entities.push((
+                shard,
+                e,
+                st,
+                h.session.is_frozen(shard, e),
+                h.session.is_awaiting_terrain(shard, e),
+            ));
+        }
+        for cx in shard.pos.x * 8..shard.pos.x * 8 + 8 {
+            for cz in shard.pos.z * 8..shard.pos.z * 8 + 8 {
+                let cp = ChunkPos::new(cx, cz);
+                chunks.push((
+                    shard,
+                    cp,
+                    h.session.is_chunk_loaded(shard, cp),
+                    h.session.has_collider(shard, cp),
+                ));
+            }
+        }
+    }
+    LineProbe {
+        tick: h.session.tick_now(),
+        tickets: h.session.ticket_table().clone(),
+        entities,
+        chunks,
+    }
+}
+
+/// 两线逐拍比对 `ticks` 拍(分项断言,出错时指明哪一项、哪一拍);完整调度器
+/// 快照在起点、每 50 拍与终点比对。
+fn assert_lines_match(a: &mut Harness, b: &mut Harness, ticks: usize) {
+    let (pa, pb) = (probe(a), probe(b));
+    assert_eq!(pa, pb, "恢复后起点两线一致");
+    for k in 0..ticks {
+        a.step();
+        b.step();
+        let (pa, pb) = (probe(a), probe(b));
+        assert_eq!(pa.tick, pb.tick, "拍号对齐");
+        assert_eq!(
+            pa.tickets, pb.tickets,
+            "快照后第 {k} 拍:票据表(键、规格、时钟、状态)两线不一致"
+        );
+        if k % 50 == 0 || k + 1 == ticks {
+            assert_eq!(
+                a.session.world_snapshot().scheduler,
+                b.session.world_snapshot().scheduler,
+                "快照后第 {k} 拍:调度器快照(观察者、在途信封、生命周期等)两线不一致"
+            );
+        }
+        assert_eq!(
+            pa.entities, pb.entities,
+            "快照后第 {k} 拍:实体状态(逐位、冻结、待地形)两线不一致"
+        );
+        assert_eq!(pa.chunks, pb.chunks, "快照后第 {k} 拍:①② 集合两线不一致");
+    }
+}
+
+/// AC-T21 主体:四种票、票据三态、承载、冻结、待地形、①② 冷却同时在场时截
+/// checkpoint;恢复线与原线逐拍位级一致 600 拍,终态体素一致。
+///
+/// 快照时刻在场的状态:观察者票;只装载、带 TTL 的区域票(到期落在窗口内);
+/// 下落中的瞬态体 F(Active,窗口内落地凝固);常驻体 A 上压着瞬态 C(Paused);
+/// 区域票下静止冻结的常驻体 B 上压着瞬态 D(Suspended);区域票下坠落中的常驻
+/// 体 M(持 ActorMotion);刚出生在无地形处、带初速度的瞬态体 W(待地形,保存
+/// 速度);观察者刚挪动 12 m(①② 装卸与冷却簿记跨过快照)。
+///
+/// 会变红的实现:§4.14 任一项没进快照或没恢复——票据时钟/状态、区域票 TTL、
+/// 待地形的保存速度、承载记录、①② 集合或冷却簿记、静止判据窗口;快照字段被
+/// serde 跳过而按默认值恢复。
+#[test]
+#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06b_midway_checkpoint_replays_identically() {
+    let mut h = Harness::new(|_| {});
+    h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
+    let far = Vec3::new(110.5, GROUND_Y, 72.5);
+    h.session
+        .set_area_ticket(7, far, 8.0, 0b011, Some(500))
+        .expect("区域票");
+    h.steps(60);
+    let (a, c, b, d) = (
+        actor(1),
+        EntityId::from_parts(1, 11),
+        actor(2),
+        EntityId::from_parts(1, 12),
+    );
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    h.spawn_actor(b, far, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_transient(c, SPOT + Vec3::new(0.0, 1.05, 0.0));
+    h.spawn_transient(d, far + Vec3::new(0.0, 1.05, 0.0));
+    h.steps(120);
+    assert_eq!(
+        h.transient_ticket_state(c),
+        Some(TicketState::Paused),
+        "前置:C 被承载"
+    );
+    assert_eq!(
+        h.transient_ticket_state(d),
+        Some(TicketState::Suspended),
+        "前置:D 承载静止冻结"
+    );
+    assert!(h.frozen(b) && !h.frozen(a), "前置:B 冻结、A 醒着");
+
+    let (f, m, w) = (
+        EntityId::from_parts(1, 13),
+        actor(3),
+        EntityId::from_parts(1, 14),
+    );
+    h.spawn_transient(f, SPOT + Vec3::new(4.0, 30.0, 0.0));
+    h.spawn_actor(m, far + Vec3::new(4.0, 15.0, -4.0), Vec3::ZERO);
+    h.steps(10);
+    h.set_observer(Vec3::new(72.5, GROUND_Y, 72.0));
+    h.steps(3);
+    h.spawn_transient_v(
+        w,
+        Vec3::new(8.5, GROUND_Y + 3.0, 120.5),
+        Vec3::new(1.0, 2.0, 0.5),
+    );
+    // 出生那拍先按动态体走一步,下一拍的激活检查发现足迹缺地形 → 待地形。
+    h.steps(2);
+    assert!(
+        h.session.is_awaiting_terrain(origin(), w),
+        "前置:W 出生在无地形处,待地形"
+    );
+    assert!(
+        h.has_actor_ticket(m),
+        "前置:M 在唤醒范围外坠落,持常驻运动票"
+    );
+    assert_eq!(
+        h.transient_ticket_state(f),
+        Some(TicketState::Active),
+        "前置:F 下落中"
+    );
+
+    let snapshot = h.session.world_snapshot();
+    let mut r = restore_harness(&snapshot);
+    assert_lines_match(&mut h, &mut r, 600);
+
+    // 非退化:窗口内区域票到期、F 落地凝固、W 恢复运动。
+    assert!(
+        h.session
+            .ticket_table()
+            .get((TicketHolder::Area(7), TicketKind::Area))
+            .is_none(),
+        "区域票在窗口内到期(两线已逐拍比对)"
+    );
+    assert!(!h.exists(f), "F 在窗口内落地凝固");
+    assert!(!h.session.is_awaiting_terrain(origin(), w), "W 已恢复运动");
+    // 终态体素:两线全部已装载 chunk 的内容逐格相等。
+    for shard in h.session.shard_ids() {
+        for cx in shard.pos.x * 8..shard.pos.x * 8 + 8 {
+            for cz in shard.pos.z * 8..shard.pos.z * 8 + 8 {
+                let cp = ChunkPos::new(cx, cz);
+                assert_eq!(
+                    h.session.voxel_chunk(shard, cp),
+                    r.session.voxel_chunk(shard, cp),
+                    "终态体素两线一致:{shard:?} {cp:?}"
+                );
+            }
+        }
+    }
+    h.finish();
+    r.finish();
+}
+
+/// §4.14"待处理的地形变更唤醒格"随快照保存:挖掉冻结常驻体脚下的方块,写入
+/// 当拍截快照(唤醒在下一拍消费),恢复线与原线一样在下一拍唤醒它,并逐拍一致。
+///
+/// 会变红的实现:待处理唤醒格不进快照(恢复线里常驻体一直悬空冻结)。
+#[test]
+#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06b_pending_terrain_wake_survives_checkpoint() {
+    let mut h = Harness::new(|_| {});
+    let e = freshly_frozen_actor(&mut h);
+    let p = h.pos(e);
+    let below = (
+        p.x.floor() as i32,
+        p.y.floor() as i32 - 1,
+        p.z.floor() as i32,
+    );
+    h.set_block(below.0, below.1, below.2, BlockId(0));
+    h.step();
+    assert_eq!(
+        h.block_at(below.0, below.1, below.2),
+        Some(BlockId(0)),
+        "前置:写入已生效"
+    );
+    assert!(h.frozen(e), "前置:写入当拍,唤醒尚未消费");
+    let snapshot = h.session.world_snapshot();
+    let mut r = restore_harness(&snapshot);
+    assert_lines_match(&mut h, &mut r, 120);
+    assert!(!r.frozen(e), "恢复线里常驻体同样被地形变更唤醒");
+    h.finish();
+    r.finish();
+}
+
+/// AC-T24:激活启用开关随快照往返,且单向不回退。
+/// - 从未启用的会话:快照恢复后仍未启用,新生成的瞬态体不签票;
+/// - 启用后又撤掉全部观察者的会话:快照恢复后仍是启用态,新瞬态体照常签票。
+///
+/// 会变红的实现:开关不进快照(恢复后按"观察者表是否为空"重新推断——第二种
+/// 情况会退回未启用);开关随观察者移除回退。
+#[test]
+#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06b_activation_switch_survives_checkpoint() {
+    let t = EntityId::from_parts(1, 9);
+
+    let mut never = Harness::new(|_| {});
+    never.steps(5);
+    assert!(!never.session.activation_enabled(), "前置:从未启用");
+    let mut r = restore_harness(&never.session.world_snapshot());
+    assert!(
+        !r.session.activation_enabled(),
+        "未启用的快照恢复后仍未启用"
+    );
+    r.spawn_transient(t, SPOT + Vec3::new(0.0, 5.0, 0.0));
+    r.steps(3);
+    assert!(
+        r.transient_ticket_state(t).is_none(),
+        "未启用:恢复线不签瞬态票"
+    );
+    never.finish();
+    r.finish();
+
+    let mut once = Harness::new(|_| {});
+    once.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
+    once.steps(30);
+    once.remove_observer();
+    once.steps(5);
+    assert!(
+        once.session.activation_enabled(),
+        "前置:启用后撤掉观察者仍是启用态"
+    );
+    let mut r = restore_harness(&once.session.world_snapshot());
+    assert!(
+        r.session.activation_enabled(),
+        "启用后的快照恢复后仍是启用态(单向)"
+    );
+    r.spawn_transient(t, SPOT + Vec3::new(0.0, 5.0, 0.0));
+    r.steps(3);
+    assert!(
+        r.transient_ticket_state(t).is_some(),
+        "恢复线按启用规则签瞬态票"
+    );
+    once.finish();
+    r.finish();
+}
+
+/// §4.6 待地形恢复"速度原样写回"(任务 03 遗留缺陷,06b 一并修):带初速度
+/// (1, 2, 0.5) 的瞬态体出生在无地形处,进入待地形;地形就绪后恢复,恢复那一步
+/// 的水平速度必须仍是 (1, ·, 0.5),竖直速度只少一拍重力。
+///
+/// 会变红的实现:恢复时先在 kinematic 状态下写速度、再切回 Dynamic——rapier
+/// 0.36 对 KinematicPositionBased 刚体的 `set_linvel` 不生效,保存的速度丢失,
+/// 实体从零速度起步(当前代码即如此)。
+#[test]
+#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06b_awaiting_terrain_resumes_with_saved_velocity() {
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let w = EntityId::from_parts(1, 14);
+    h.spawn_transient_v(
+        w,
+        Vec3::new(8.5, GROUND_Y + 3.0, 120.5),
+        Vec3::new(1.0, 2.0, 0.5),
+    );
+    let mut before: Option<Vec3> = None;
+    let mut resumed: Option<Vec3> = None;
+    for _ in 0..20 {
+        let v = h.session.entity_state(origin(), w).map(|s| s.linvel);
+        h.step();
+        let awaiting = h.session.is_awaiting_terrain(origin(), w);
+        if awaiting && before.is_none() {
+            before = v; // 进入待地形前一拍末的速度 = 应保存的速度
+        }
+        if !awaiting && before.is_some() {
+            resumed = h.session.entity_state(origin(), w).map(|s| s.linvel);
+            break;
+        }
+    }
+    let before = before.expect("前置:W 进入待地形");
+    let resumed = resumed.expect("前置:地形就绪后 W 恢复运动");
+    let g_dt = 9.81_f32 / 60.0;
+    assert!(
+        (resumed.x - before.x).abs() < 1e-4 && (resumed.z - before.z).abs() < 1e-4,
+        "恢复后水平速度原样写回:进入前 {before:?},恢复后 {resumed:?}"
+    );
+    assert!(
+        (resumed.y - (before.y - g_dt)).abs() < 1e-3,
+        "恢复后竖直速度只少一拍重力:进入前 {before:?},恢复后 {resumed:?}"
+    );
+    h.finish();
+}
