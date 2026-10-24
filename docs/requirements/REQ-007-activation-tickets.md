@@ -1,7 +1,7 @@
 # REQ-007:激活票据、票据转递与瞬态体落地保证
 
 - 状态:**已确认**(2026-10-20 用户拍板 D1–D9;同日修订 2 做逻辑补漏 D10–D13;
-  2026-10-21 修订 3 吸收实施方预审意见 D14–D16;同日修订 4 补激活启用开关 D17;修订 5 明确 ② 执行时序 D18;2026-10-22 修订 6 补唤醒与卸载口径 D19;2026-10-23 修订 7 明确地形变更唤醒豁免预算;同日修订 8 明确补偿路径不计支撑接触 D21,修订 9 将其推广为双向竖向接触,见 §10。
+  2026-10-21 修订 3 吸收实施方预审意见 D14–D16;同日修订 4 补激活启用开关 D17;修订 5 明确 ② 执行时序 D18;2026-10-22 修订 6 补唤醒与卸载口径 D19;2026-10-23 修订 7 明确地形变更唤醒豁免预算;同日修订 8 明确补偿路径不计支撑接触 D21,修订 9 将其推广为双向竖向接触;同日修订 10 回写 `contact_wake_skin_m` 校准值并确定配置键与别名(§4.15),见 §10。
   §4.15 参数默认值为建议值,实测可校准,不需再拍板)
 - 提出日期:2026-10-20
 - 上游:
@@ -584,7 +584,7 @@ AABB(外扩 `contact_wake_skin_m`)与 `c` 相交的冻结实体,在**下一拍**
 | `actor_motion_max_ticks` | 1200(20 s) | 常驻票上限 |
 | `support_normal_min` | 0.7(约 45°) | 支撑判定的法向阈值 |
 | `contact_wake_lookahead_ticks` | 2 | 撞前预测扫掠 |
-| `contact_wake_skin_m` | 0.05 m | 扫掠外扩 / 冻结邻接间距 / 地形变更判定外扩 |
+| `contact_wake_skin_m` | 0.075 m | 扫掠外扩 / 冻结邻接间距 / 地形变更判定外扩 / 支撑闭包贴靠判定(修订 10:任务 04b 实测校准为站立面容差,原建议 0.05) |
 | `contact_wake_min_momentum` | 1.0 kg·m/s | 种子与传播门槛(默认实体 1 kg,约 1 m/s 撞击) |
 | `contact_wake_decay` | 0.5 | 每跳动量衰减 |
 | `contact_wake_max_hops` | 4 | 传播跳数上限 |
@@ -594,17 +594,23 @@ AABB(外扩 `contact_wake_skin_m`)与 `c` 相交的冻结实体,在**下一拍**
 | `void_despawn_depth_m` | 16 m | 低于 `WORLD_Y_MIN` 多少即虚空移除 |
 | `max_awake_dynamic` | 512 | 不变 |
 
-旧配置键(`load_radius`、`swap_budget_chunks_per_tick` 等)保留为别名还是显式改名,由任务书定,
-但必须有配置测试锚定映射关系。
+配置键(修订 10,任务 06c 落地):上表激活参数放在 toml 的 `[activation]` 表,键名 = 参数名;
+`max_awake_dynamic`、`area_ticket_max_radius_m`、`area_ticket_max_count` 维持顶层。旧键保留为别名:
+`[activation] load_radius` / `unload_radius` → ① 与 ② 两档同值;`[activation] cooldown_secs` →
+`cooldown_ticks`(按 `dt` 换算);顶层 `swap_budget_chunks_per_tick` → ① 与 ② 两档预算(拆分前一份
+预算同管两档)。新旧键同给时逐键以新键为准,没给新键的那一档仍取别名值。加载时校验:
+`collider_load_radius ≤ data_load_radius`、`collider_unload_radius ≤ data_unload_radius`、
+`area_ticket_max_radius_m ≥ 0`,违反即报错并点名出错的键。
 
 ### 4.16 遥测
 
-每拍可观测(`TickSummary` / telemetry,供测试与 viewer HUD 可选显示):
+每拍可观测(`TickSummary.telemetry: ActivationTelemetry`,修订 10;供测试与 viewer HUD 可选显示。
+状态量取拍末、全部分片合计;事件量为本拍发生次数;唤醒按被唤醒的实体数计,闭包成员归入触发来源):
 
 - 票据:按种类 × 状态计数;
 - chunk:① 数 / ② 数;
 - 实体:醒着 / 待地形 / 冻结 / 被承载;
-- 强制落地(截止、预算分计)、虚空移除;
+- 强制落地(截止、预算分计;落地失败转虚空移除的只计虚空移除)、虚空移除;
 - 唤醒:接触(预测种子、补偿种子、传播)、地形变更、支撑闭包整组推迟次数、
   `contact_wake_skipped_no_terrain`;
 - `actor_motion_capped`。
