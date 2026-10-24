@@ -23,4 +23,6 @@ pub mod tickets;
 pub use entities::{EntityOwner, EntityOwnership};
 pub use lifecycle::LifecycleSnapshot;
 pub use router::RouterSnapshot;
-pub use scheduler::{Scheduler, SchedulerConfig, SchedulerSnapshot, TickSummary};
+pub use scheduler::{
+    ActivationTelemetry, Scheduler, SchedulerConfig, SchedulerSnapshot, TickSummary,
+};

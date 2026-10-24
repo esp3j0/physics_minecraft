@@ -100,6 +100,65 @@ pub struct TickSummary {
     pub stepped_shards: usize,
     /// 本拍成功入队的迁移信封数。
     pub migrations_admitted: usize,
+    /// 激活遥测(REQ-007 §4.16;任务 06c)。
+    pub telemetry: ActivationTelemetry,
+}
+
+/// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
+/// 由实施方接线计数**(桩阶段恒为 0)。全部分片合计;纯计数、每拍重算、不入快照。
+///
+/// - **状态量**(本拍末,调度器 7.6 之后、驱动编排之前的状态):票据按种类 ×
+///   状态;① / ② chunk 数;实体按 醒着 / 待地形 / 冻结 三分(互斥且覆盖全部
+///   实体),另计被承载(有实体支撑记录者,醒着或冻结均计);
+/// - **事件量**(本拍内发生次数):强制落地按原因分计(截止 / 超预算淘汰;
+///   落地失败转虚空移除的只计 `void_removals`);虚空移除;唤醒按来源计**被
+///   唤醒的实体数**(含支撑闭包成员,归入触发该组的来源):接触预测种子、接触
+///   补偿种子、接触传播所得、地形变更;支撑闭包整组因预算放不下而推迟的**组数**;
+///   接触唤醒因当前足迹缺 ② 而跳过的组数;常驻运动票因到达上限而撤票的张数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ActivationTelemetry {
+    /// 票据计数,下标 `[种类][状态]`(种类序 Observer / Area / TransientMotion /
+    /// ActorMotion,状态序 Active / Paused / Suspended);用 [`Self::ticket_count`] 读。
+    pub tickets: [[usize; 3]; 4],
+    pub chunks_data: usize,
+    pub chunks_collider: usize,
+    pub entities_awake: usize,
+    pub entities_awaiting_terrain: usize,
+    pub entities_frozen: usize,
+    pub entities_carried: usize,
+    pub forced_landings_deadline: u64,
+    pub forced_landings_budget: u64,
+    pub void_removals: u64,
+    pub wakes_contact_pred: u64,
+    pub wakes_contact_comp: u64,
+    pub wakes_contact_spread: u64,
+    pub wakes_terrain: u64,
+    pub closure_deferred: u64,
+    pub contact_wake_skipped_no_terrain: u64,
+    pub actor_motion_capped: u64,
+}
+
+impl ActivationTelemetry {
+    /// 某种类 × 状态的票据张数。
+    pub fn ticket_count(
+        &self,
+        kind: physics_sim::tickets::TicketKind,
+        state: physics_sim::TicketState,
+    ) -> usize {
+        use physics_sim::tickets::TicketKind;
+        let k = match kind {
+            TicketKind::Observer => 0,
+            TicketKind::Area => 1,
+            TicketKind::TransientMotion => 2,
+            TicketKind::ActorMotion => 3,
+        };
+        let s = match state {
+            physics_sim::TicketState::Active => 0,
+            physics_sim::TicketState::Paused => 1,
+            physics_sim::TicketState::Suspended => 2,
+        };
+        self.tickets[k][s]
+    }
 }
 
 /// 调度器快照(REQ-005 任务书 02,签名固定):观察者表 + 设置过标志 +
@@ -1877,6 +1936,7 @@ impl Scheduler {
             tick: at,
             stepped_shards,
             migrations_admitted,
+            telemetry: ActivationTelemetry::default(),
         }
     }
 
@@ -2135,6 +2195,7 @@ mod tests {
                 tick: Tick::ZERO,
                 stepped_shards: 2,
                 migrations_admitted: 0,
+                telemetry: ActivationTelemetry::default(),
             }
         );
         sched.shutdown();

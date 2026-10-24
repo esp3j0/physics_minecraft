@@ -41,18 +41,30 @@ struct Harness {
     store: storage::worker::StoreWorker,
     provider: storage::provider::ChunkProvider,
     new_sim: Box<dyn FnMut(ShardId) -> physics_sim::ShardSim + Send>,
+    /// 每拍 `Session::tick` 的摘要(含 06c 遥测),按拍序累积。
+    summaries: Vec<shard::TickSummary>,
 }
 
 impl Harness {
     /// `tweak_origin`:对分片 (0,0) 的 `ShardSimConfig` 做场景定制(例如零重力、
     /// 醒体预算);其余分片按生产配置由 ensure 懒创建。
     fn new(tweak_origin: impl FnOnce(&mut physics_sim::ShardSimConfig)) -> Self {
-        let config = Config::default();
+        Self::with_config(Config::default(), tweak_origin)
+    }
+
+    /// 同 `new`,但用给定的 `app::Config`(06c:参数经配置注入,走生产装配)。
+    fn with_config(
+        config: Config,
+        tweak_origin: impl FnOnce(&mut physics_sim::ShardSimConfig),
+    ) -> Self {
         let store = storage::worker::StoreWorker::new(
             Box::new(storage::mem::MemChunkStore::new()),
             Box::new(storage::mem::MemCheckpointStore::new()),
         );
         let mut session = Session::new(config.session_config());
+        // 与 bootstrap 同:区域票上限经配置注入。
+        let (max_r, max_c) = config.area_ticket_caps();
+        session.set_area_ticket_caps(max_r, max_c);
         let (provider, new_sim) =
             app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(voxel::SimpleRegistry::builtin())
@@ -68,6 +80,7 @@ impl Harness {
             store,
             provider,
             new_sim,
+            summaries: Vec::new(),
         }
     }
 
@@ -114,7 +127,8 @@ impl Harness {
 
     /// 推进一拍并编排。
     fn step(&mut self) {
-        self.session.tick();
+        let summary = self.session.tick();
+        self.summaries.push(summary);
         self.orchestrate();
     }
 
@@ -1712,6 +1726,7 @@ fn restore_harness(snapshot: &sim_api::snapshot::WorldSnapshot) -> Harness {
         store,
         provider,
         new_sim,
+        summaries: Vec::new(),
     }
 }
 
@@ -2017,6 +2032,660 @@ fn acc_06b_awaiting_terrain_resumes_with_saved_velocity() {
     assert!(
         (resumed.y - (before.y - g_dt)).abs() < 1e-3,
         "恢复后竖直速度只少一拍重力:进入前 {before:?},恢复后 {resumed:?}"
+    );
+    h.finish();
+}
+
+// ===========================================================================
+// 06c:全参数配置与遥测(AC-T22;需求 §4.15、§4.16)
+// ===========================================================================
+//
+// 配置键约定(总架构师裁定,见 #14 放行评论):§4.15 的激活参数一律放在 toml 的
+// `[activation]` 表,键名 = 参数名;`max_awake_dynamic`、`area_ticket_max_radius_m`、
+// `area_ticket_max_count` 维持顶层。旧键保留为别名:`[activation] load_radius /
+// unload_radius` → ① 与 ② 两档同值;`[activation] cooldown_secs` → `cooldown_ticks`
+// (按 dt 换算);顶层 `swap_budget_chunks_per_tick` → ① 与 ② 两档预算。新旧键
+// 同给时,逐键以新键为准(没给新键的那一档仍取别名值)。
+
+/// §4.15 全部参数都设成非默认值的配置。
+const ALL_PARAMS_TOML: &str = r#"
+max_awake_dynamic = 300
+area_ticket_max_radius_m = 96.0
+area_ticket_max_count = 12
+
+[activation]
+data_load_radius = 40
+data_unload_radius = 56
+collider_load_radius = 28
+collider_unload_radius = 36
+awake_load_radius = 20
+awake_unload_radius = 26
+data_budget_per_tick = 5
+collider_budget_per_tick = 3
+cooldown_ticks = 90
+terrain_guard_m = 1.5
+motion_lookahead_ticks = 20
+motion_max_lookahead_chunks = 3
+transient_settle_deadline_ticks = 900
+actor_motion_max_ticks = 700
+support_normal_min = 0.8
+contact_wake_lookahead_ticks = 3
+contact_wake_skin_m = 0.06
+contact_wake_min_momentum = 1.5
+contact_wake_decay = 0.4
+contact_wake_max_hops = 3
+contact_wake_max_bodies_per_tick = 32
+void_despawn_depth_m = 24.0
+"#;
+
+/// 断言注入到核内的激活参数(分片配置与调度器配置两处必须同值)。
+fn assert_activation_params(config: &Config, expect: &physics_sim::ActivationConfig) {
+    let shard = config.shard_sim_config(origin()).activation;
+    let sched = config.session_config().scheduler.activation;
+    for (name, got) in [("分片配置", shard), ("调度器配置", sched)] {
+        assert_eq!(
+            got.data_load_radius, expect.data_load_radius,
+            "{name}:data_load_radius"
+        );
+        assert_eq!(
+            got.data_unload_radius, expect.data_unload_radius,
+            "{name}:data_unload_radius"
+        );
+        assert_eq!(
+            got.collider_load_radius, expect.collider_load_radius,
+            "{name}:collider_load_radius"
+        );
+        assert_eq!(
+            got.collider_unload_radius, expect.collider_unload_radius,
+            "{name}:collider_unload_radius"
+        );
+        assert_eq!(
+            got.awake_load_radius, expect.awake_load_radius,
+            "{name}:awake_load_radius"
+        );
+        assert_eq!(
+            got.awake_unload_radius, expect.awake_unload_radius,
+            "{name}:awake_unload_radius"
+        );
+        assert_eq!(
+            got.data_budget_per_tick, expect.data_budget_per_tick,
+            "{name}:data_budget_per_tick"
+        );
+        assert_eq!(
+            got.collider_budget_per_tick, expect.collider_budget_per_tick,
+            "{name}:collider_budget_per_tick"
+        );
+        assert_eq!(
+            got.cooldown_ticks, expect.cooldown_ticks,
+            "{name}:cooldown_ticks"
+        );
+        assert_eq!(
+            got.terrain_guard_m, expect.terrain_guard_m,
+            "{name}:terrain_guard_m"
+        );
+        assert_eq!(
+            got.motion_lookahead_ticks, expect.motion_lookahead_ticks,
+            "{name}:motion_lookahead_ticks"
+        );
+        assert_eq!(
+            got.motion_max_lookahead_chunks, expect.motion_max_lookahead_chunks,
+            "{name}:motion_max_lookahead_chunks"
+        );
+        assert_eq!(
+            got.transient_settle_deadline_ticks, expect.transient_settle_deadline_ticks,
+            "{name}:transient_settle_deadline_ticks"
+        );
+        assert_eq!(
+            got.actor_motion_max_ticks, expect.actor_motion_max_ticks,
+            "{name}:actor_motion_max_ticks"
+        );
+        assert_eq!(
+            got.support_normal_min, expect.support_normal_min,
+            "{name}:support_normal_min"
+        );
+        assert_eq!(
+            got.contact_wake_lookahead_ticks, expect.contact_wake_lookahead_ticks,
+            "{name}:contact_wake_lookahead_ticks"
+        );
+        assert_eq!(
+            got.contact_wake_skin_m, expect.contact_wake_skin_m,
+            "{name}:contact_wake_skin_m"
+        );
+        assert_eq!(
+            got.contact_wake_min_momentum, expect.contact_wake_min_momentum,
+            "{name}:contact_wake_min_momentum"
+        );
+        assert_eq!(
+            got.contact_wake_decay, expect.contact_wake_decay,
+            "{name}:contact_wake_decay"
+        );
+        assert_eq!(
+            got.contact_wake_max_hops, expect.contact_wake_max_hops,
+            "{name}:contact_wake_max_hops"
+        );
+        assert_eq!(
+            got.contact_wake_max_bodies_per_tick, expect.contact_wake_max_bodies_per_tick,
+            "{name}:contact_wake_max_bodies_per_tick"
+        );
+        assert_eq!(
+            got.void_despawn_depth_m, expect.void_despawn_depth_m,
+            "{name}:void_despawn_depth_m"
+        );
+        assert_eq!(
+            got.max_awake_dynamic, expect.max_awake_dynamic,
+            "{name}:max_awake_dynamic"
+        );
+    }
+}
+
+/// AC-T22:§4.15 全部参数可经 `app::Config`(toml)注入,分片与调度器两处同值;
+/// 区域票上限经 bootstrap 装配生效;全参数配置经 `to_toml_string` 往返不丢键。
+///
+/// 会变红的实现:新参数没有 toml 键(仍写死默认值);只注入了分片配置、调度器
+/// 那份没跟上;区域票上限没接到会话;序列化漏掉新键。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_all_params_injectable() {
+    let config = Config::from_toml_str(ALL_PARAMS_TOML).expect("全参数配置合法");
+    let expect = physics_sim::ActivationConfig {
+        data_load_radius: 40.0,
+        data_unload_radius: 56.0,
+        collider_load_radius: 28.0,
+        collider_unload_radius: 36.0,
+        awake_load_radius: 20.0,
+        awake_unload_radius: 26.0,
+        data_budget_per_tick: 5,
+        collider_budget_per_tick: 3,
+        cooldown_ticks: 90,
+        terrain_guard_m: 1.5,
+        motion_lookahead_ticks: 20,
+        motion_max_lookahead_chunks: 3,
+        transient_settle_deadline_ticks: 900,
+        actor_motion_max_ticks: 700,
+        support_normal_min: 0.8,
+        contact_wake_lookahead_ticks: 3,
+        contact_wake_skin_m: 0.06,
+        contact_wake_min_momentum: 1.5,
+        contact_wake_decay: 0.4,
+        contact_wake_max_hops: 3,
+        contact_wake_max_bodies_per_tick: 32,
+        void_despawn_depth_m: 24.0,
+        max_awake_dynamic: 300,
+        ..config.shard_sim_config(origin()).activation
+    };
+    assert_activation_params(&config, &expect);
+    assert_eq!(config.area_ticket_caps(), (96.0, 12), "区域票上限");
+
+    let again = Config::from_toml_str(&config.to_toml_string()).expect("往返后仍合法");
+    assert_eq!(again, config, "全参数配置经 to_toml_string 往返相等");
+
+    // 生产装配:bootstrap 后会话按注入的上限拒绝过大的区域票。
+    let dir = tempfile::tempdir().expect("临时目录");
+    let mut boot = config.clone();
+    boot.data_dir = dir.path().to_path_buf();
+    let (mut session, _log, store, _resume, _seq) =
+        app::driver::bootstrap(&boot, || Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("bootstrap");
+    assert!(
+        session
+            .set_area_ticket(1, SPOT, 100.0, 0b011, None)
+            .is_err(),
+        "半径 100 > 注入的上限 96:应拒绝"
+    );
+    assert!(
+        session.set_area_ticket(1, SPOT, 90.0, 0b011, None).is_ok(),
+        "半径 90 ≤ 96:应接受"
+    );
+    session.shutdown();
+    let _ = store.shutdown();
+}
+
+/// AC-T22:默认值与 §4.15 表一致(含 04b 校准后的 `contact_wake_skin_m = 0.075`)。
+///
+/// 会变红的实现:默认值漂移;分片与调度器两处默认不一致。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_defaults_match_requirement() {
+    let config = Config::default();
+    let expect = physics_sim::ActivationConfig {
+        data_load_radius: 32.0,
+        data_unload_radius: 48.0,
+        collider_load_radius: 32.0,
+        collider_unload_radius: 48.0,
+        awake_load_radius: 24.0,
+        awake_unload_radius: 32.0,
+        data_budget_per_tick: 2,
+        collider_budget_per_tick: 2,
+        cooldown_ticks: 180,
+        terrain_guard_m: 1.0,
+        motion_lookahead_ticks: 30,
+        motion_max_lookahead_chunks: 4,
+        transient_settle_deadline_ticks: 1200,
+        actor_motion_max_ticks: 1200,
+        support_normal_min: 0.7,
+        contact_wake_lookahead_ticks: 2,
+        contact_wake_skin_m: 0.075,
+        contact_wake_min_momentum: 1.0,
+        contact_wake_decay: 0.5,
+        contact_wake_max_hops: 4,
+        contact_wake_max_bodies_per_tick: 64,
+        void_despawn_depth_m: 16.0,
+        max_awake_dynamic: 512,
+        ..config.shard_sim_config(origin()).activation
+    };
+    assert_activation_params(&config, &expect);
+    assert_eq!(config.area_ticket_caps(), (128.0, 64), "区域票上限默认");
+}
+
+/// AC-T22:旧键别名映射,及新旧键同给时逐键新键优先。
+///
+/// 会变红的实现:旧键被删(旧配置文件读不进来或静默失效);别名只映射到 ①、
+/// ② 没跟上;新旧同给时旧键覆盖新键。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_legacy_keys_alias() {
+    let legacy = Config::from_toml_str(
+        "swap_budget_chunks_per_tick = 6\n\
+         [activation]\n\
+         load_radius = 40\n\
+         unload_radius = 60\n\
+         cooldown_secs = 2\n",
+    )
+    .expect("旧键配置合法");
+    let a = legacy.shard_sim_config(origin()).activation;
+    assert_eq!(
+        (a.data_load_radius, a.collider_load_radius),
+        (40.0, 40.0),
+        "load_radius → ① 与 ② 同值"
+    );
+    assert_eq!(
+        (a.data_unload_radius, a.collider_unload_radius),
+        (60.0, 60.0),
+        "unload_radius → ① 与 ② 同值"
+    );
+    assert_eq!(a.cooldown_ticks, 120, "cooldown_secs = 2 → 120 拍");
+    assert_eq!(
+        (a.data_budget_per_tick, a.collider_budget_per_tick),
+        (6, 6),
+        "swap_budget_chunks_per_tick → ① 与 ② 两档预算"
+    );
+
+    let mixed = Config::from_toml_str(
+        "swap_budget_chunks_per_tick = 6\n\
+         [activation]\n\
+         load_radius = 40\n\
+         data_load_radius = 44\n\
+         cooldown_secs = 2\n\
+         cooldown_ticks = 100\n\
+         data_budget_per_tick = 4\n",
+    )
+    .expect("新旧混合配置合法");
+    let m = mixed.shard_sim_config(origin()).activation;
+    assert_eq!(m.data_load_radius, 44.0, "新键 data_load_radius 优先");
+    assert_eq!(
+        m.collider_load_radius, 40.0,
+        "没给新键的 ② 仍取别名 load_radius"
+    );
+    assert_eq!(
+        m.cooldown_ticks, 100,
+        "新键 cooldown_ticks 优先于 cooldown_secs"
+    );
+    assert_eq!(m.data_budget_per_tick, 4, "新键 data_budget_per_tick 优先");
+    assert_eq!(m.collider_budget_per_tick, 6, "没给新键的 ② 预算仍取别名");
+}
+
+/// AC-T22:配置校验——② 半径大于 ① 对应半径、区域票半径上限为负,`Config` 加载
+/// 即报错,错误信息点名出错的键。
+///
+/// 会变红的实现:不校验(非法配置被静默接受,运行期才出现 I1 违反);错误信息
+/// 不指出是哪个键。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_validation_rejects_bad_config() {
+    for (toml, key) in [
+        (
+            "[activation]\ncollider_load_radius = 40\n",
+            "collider_load_radius",
+        ),
+        (
+            "[activation]\ncollider_unload_radius = 60\n",
+            "collider_unload_radius",
+        ),
+        (
+            "area_ticket_max_radius_m = -1.0\n",
+            "area_ticket_max_radius_m",
+        ),
+    ] {
+        match Config::from_toml_str(toml) {
+            Ok(_) => panic!("非法配置应被拒绝:{toml}"),
+            Err(e) => assert!(e.to_string().contains(key), "错误信息应点名 {key}:{e}"),
+        }
+    }
+    assert!(
+        Config::from_toml_str("[activation]\ncollider_load_radius = 32\n").is_ok(),
+        "② 半径等于 ① 半径合法"
+    );
+}
+
+// ---- 遥测(§4.16)----
+
+/// 一段拍的事件量合计。
+fn telemetry_sum(
+    summaries: &[shard::TickSummary],
+    f: impl Fn(&shard::ActivationTelemetry) -> u64,
+) -> u64 {
+    summaries.iter().map(|s| f(&s.telemetry)).sum()
+}
+
+/// §4.16 状态量与世界实况逐拍一致:票据按种类 × 状态、① / ② chunk 数、实体
+/// 醒着 / 待地形 / 冻结 / 被承载。实况取自同一拍末(驱动编排之前)的会话查询。
+///
+/// 场景:观察者;只装载的区域票;常驻体 A 上压瞬态 C(Paused);远处冻结的常驻体
+/// B 上压瞬态 D(Suspended);下落中的瞬态 F(Active);区域票下坠落的常驻体 M
+/// (ActorMotion)。
+///
+/// 会变红的实现:遥测没接线(恒 0);计数口径与实况不符(例如待地形算进冻结、
+/// 只数原点分片、拍末状态取错时点)。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_telemetry_state_counts_match_world() {
+    let mut h = Harness::new(|_| {});
+    h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
+    let far = Vec3::new(110.5, GROUND_Y, 72.5);
+    h.session
+        .set_area_ticket(7, far, 8.0, 0b011, None)
+        .expect("区域票");
+    h.steps(60);
+    let (a, c, b, d) = (
+        actor(1),
+        EntityId::from_parts(1, 11),
+        actor(2),
+        EntityId::from_parts(1, 12),
+    );
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    h.spawn_actor(b, far, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_transient(c, SPOT + Vec3::new(0.0, 1.05, 0.0));
+    h.spawn_transient(d, far + Vec3::new(0.0, 1.05, 0.0));
+    h.steps(120);
+    let (f, m) = (EntityId::from_parts(1, 13), actor(3));
+    h.spawn_transient(f, SPOT + Vec3::new(4.0, 30.0, 0.0));
+    h.spawn_actor(m, far + Vec3::new(4.0, 15.0, -4.0), Vec3::ZERO);
+    h.steps(5);
+    assert_eq!(
+        h.transient_ticket_state(c),
+        Some(TicketState::Paused),
+        "前置:C 被承载"
+    );
+    assert_eq!(
+        h.transient_ticket_state(d),
+        Some(TicketState::Suspended),
+        "前置:D 承载静止冻结"
+    );
+    assert!(h.has_actor_ticket(m), "前置:M 持常驻运动票");
+
+    for k in 0..40 {
+        let summary = h.session.tick();
+        let t = summary.telemetry;
+        // 票据:按种类 × 状态与票据表实况比对。
+        for kind in [
+            TicketKind::Observer,
+            TicketKind::Area,
+            TicketKind::TransientMotion,
+            TicketKind::ActorMotion,
+        ] {
+            for state in [
+                TicketState::Active,
+                TicketState::Paused,
+                TicketState::Suspended,
+            ] {
+                let truth = h
+                    .session
+                    .ticket_table()
+                    .iter()
+                    .filter(|(key, st)| key.1 == kind && st.state == state)
+                    .count();
+                assert_eq!(
+                    t.ticket_count(kind, state),
+                    truth,
+                    "第 {k} 拍:{kind:?}/{state:?} 票数"
+                );
+            }
+        }
+        // 实体与 chunk:全部已注册分片合计。
+        let (mut awake, mut awaiting, mut frozen, mut data, mut collider) = (0, 0, 0, 0, 0);
+        for shard in h.session.shard_ids() {
+            for (e, _) in h.session.entity_states(shard).unwrap_or_default() {
+                if h.session.is_awaiting_terrain(shard, e) {
+                    awaiting += 1;
+                } else if h.session.is_frozen(shard, e) {
+                    frozen += 1;
+                } else {
+                    awake += 1;
+                }
+            }
+            for cx in shard.pos.x * 8 - 2..shard.pos.x * 8 + 10 {
+                for cz in shard.pos.z * 8 - 2..shard.pos.z * 8 + 10 {
+                    let cp = ChunkPos::new(cx, cz);
+                    data += usize::from(h.session.is_chunk_loaded(shard, cp));
+                    collider += usize::from(h.session.has_collider(shard, cp));
+                }
+            }
+        }
+        assert_eq!(
+            (
+                t.entities_awake,
+                t.entities_awaiting_terrain,
+                t.entities_frozen
+            ),
+            (awake, awaiting, frozen),
+            "第 {k} 拍:醒着 / 待地形 / 冻结"
+        );
+        assert_eq!(t.entities_carried, 2, "第 {k} 拍:被承载 = C、D");
+        assert_eq!(
+            (t.chunks_data, t.chunks_collider),
+            (data, collider),
+            "第 {k} 拍:① / ② chunk 数"
+        );
+        h.orchestrate();
+    }
+    h.finish();
+}
+
+/// §4.16 唤醒事件按来源计数(被唤醒的实体数):
+/// - 一排 5 个冻结体被 5 m/s 撞上:预测种子 1、传播 2;
+/// - 预测漏判的撞击:补偿种子 1,预测与传播 0;
+/// - 挖掉冻结常驻体脚下的方块:地形变更 1;
+/// - 预算 1 时唤醒叠放的一对:整组推迟至少 1 次,且没有任何唤醒计数。
+///
+/// 会变红的实现:没接线;来源归类错(例如传播算进预测);按组而不是按实体计;
+/// 推迟没计数。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_telemetry_counts_wake_sources() {
+    // 一排五个。
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let center = Vec3::new(72.5, GROUND_Y + 20.0, 72.5);
+    let row = frozen_row_of_five(&mut h, center);
+    let b1_x = center.x - 2.0 * 1.02;
+    h.spawn_actor(
+        actor(1),
+        Vec3::new(b1_x - 6.0, center.y, center.z),
+        Vec3::new(5.0, 0.0, 0.0),
+    );
+    let mark = h.summaries.len();
+    let flags = frozen_flags_when_first_wakes(&mut h, row[0], &row);
+    assert_eq!(
+        flags,
+        vec![false, false, false, true, true],
+        "前置:恰醒 3 个"
+    );
+    // 只看撞击那一拍(之后醒着的 B3 可能再撞 B4,属于新的事件)。
+    let (before, hit) = h.summaries[mark..].split_at(h.summaries.len() - mark - 1);
+    let all_wakes = |t: &shard::ActivationTelemetry| {
+        t.wakes_contact_pred + t.wakes_contact_comp + t.wakes_contact_spread + t.wakes_terrain
+    };
+    assert_eq!(telemetry_sum(before, all_wakes), 0, "撞击前没有唤醒");
+    let t = hit[0].telemetry;
+    assert_eq!(
+        (
+            t.wakes_contact_pred,
+            t.wakes_contact_spread,
+            t.wakes_contact_comp
+        ),
+        (1, 2, 0),
+        "撞击那一拍:预测种子 1、传播 2、补偿 0"
+    );
+    h.finish();
+
+    // 预测漏判 → 补偿。
+    let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
+    let mark = h.summaries.len();
+    let (b, _k) = missed_prediction_impact(&mut h, 8.0, 1.5);
+    h.steps(3);
+    assert!(!h.frozen(b), "前置:B 经补偿醒来");
+    let w = &h.summaries[mark..];
+    assert_eq!(
+        telemetry_sum(w, |t| t.wakes_contact_comp),
+        1,
+        "漏判:补偿种子 1"
+    );
+    assert_eq!(
+        telemetry_sum(w, |t| t.wakes_contact_pred + t.wakes_contact_spread),
+        0,
+        "漏判:预测与传播 0"
+    );
+    h.finish();
+
+    // 地形变更。
+    let mut h = Harness::new(|_| {});
+    let e = freshly_frozen_actor(&mut h);
+    let p = h.pos(e);
+    let mark = h.summaries.len();
+    h.set_block(
+        p.x.floor() as i32,
+        p.y.floor() as i32 - 1,
+        p.z.floor() as i32,
+        BlockId(0),
+    );
+    h.steps(3);
+    assert!(!h.frozen(e), "前置:地形变更唤醒");
+    let w = &h.summaries[mark..];
+    assert_eq!(telemetry_sum(w, |t| t.wakes_terrain), 1, "地形变更唤醒 1");
+    h.finish();
+
+    // 整组推迟。
+    let mut h = Harness::new(|cfg| cfg.activation.max_awake_dynamic = 1);
+    let (a, b) = stacked_frozen_pair(&mut h);
+    h.set_observer(BELOW_A);
+    let mark = h.summaries.len();
+    h.steps(30);
+    assert!(h.frozen(a) && h.frozen(b), "前置:整组推迟,无一醒来");
+    let w = &h.summaries[mark..];
+    assert!(
+        telemetry_sum(w, |t| t.closure_deferred) >= 1,
+        "预算放不下整组:推迟计数 ≥ 1"
+    );
+    assert_eq!(
+        telemetry_sum(w, |t| t.wakes_contact_pred
+            + t.wakes_contact_comp
+            + t.wakes_contact_spread
+            + t.wakes_terrain),
+        0,
+        "推迟期间没有任何唤醒计数"
+    );
+    h.finish();
+}
+
+/// §4.16 强制落地(按原因分计)、虚空移除、常驻票触顶;参数经 `app::Config` 注入。
+/// - 零重力漂移的瞬态体,截止拍 30:截止落地 1;
+/// - 醒体预算 2、三个下落的瞬态体:超预算淘汰落地 1;
+/// - 在虚空线以下生成的瞬态体:虚空移除 1;
+/// - 零重力漂移的常驻体,常驻票上限 60:触顶 1。
+///
+/// 会变红的实现:没接线;截止与超预算不分;虚空移除算进强制落地;触顶没计数。
+#[test]
+#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06c_telemetry_counts_landings_and_caps() {
+    // 截止落地。
+    let config = Config::from_toml_str("[activation]\ntransient_settle_deadline_ticks = 30\n")
+        .expect("配置");
+    let mut h = Harness::with_config(config, |cfg| cfg.gravity = Vec3::ZERO);
+    enable_activation(&mut h);
+    let t = EntityId::from_parts(1, 9);
+    let mark = h.summaries.len();
+    h.spawn_transient_v(t, SPOT + Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.3, 0.0, 0.0));
+    h.steps(80);
+    assert!(!h.exists(t), "前置:到期强制落地");
+    let w = &h.summaries[mark..];
+    assert_eq!(
+        telemetry_sum(w, |t| t.forced_landings_deadline),
+        1,
+        "截止落地 1"
+    );
+    assert_eq!(
+        telemetry_sum(w, |t| t.forced_landings_budget),
+        0,
+        "超预算落地 0"
+    );
+    h.finish();
+
+    // 超预算淘汰落地。
+    let config = Config::from_toml_str("max_awake_dynamic = 2\n").expect("配置");
+    let mut h = Harness::with_config(config, |_| {});
+    enable_activation(&mut h);
+    let mark = h.summaries.len();
+    for (n, dx) in [(21, 0.0), (22, 3.0), (23, 6.0)] {
+        h.spawn_transient(EntityId::from_parts(1, n), SPOT + Vec3::new(dx, 10.0, 0.0));
+    }
+    h.steps(120);
+    let w = &h.summaries[mark..];
+    assert_eq!(
+        telemetry_sum(w, |t| t.forced_landings_budget),
+        1,
+        "超预算淘汰落地 1"
+    );
+    assert_eq!(
+        telemetry_sum(w, |t| t.forced_landings_deadline),
+        0,
+        "截止落地 0"
+    );
+    h.finish();
+
+    // 虚空移除。
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let v = EntityId::from_parts(1, 30);
+    let mark = h.summaries.len();
+    h.spawn_transient(v, Vec3::new(72.5, types::WORLD_Y_MIN as f32 - 20.0, 72.5));
+    h.steps(5);
+    assert!(!h.exists(v), "前置:虚空线以下立即移除");
+    let w = &h.summaries[mark..];
+    assert_eq!(telemetry_sum(w, |t| t.void_removals), 1, "虚空移除 1");
+    assert_eq!(
+        telemetry_sum(w, |t| t.forced_landings_deadline + t.forced_landings_budget),
+        0,
+        "虚空移除不算强制落地"
+    );
+    h.finish();
+
+    // 常驻票触顶。
+    let config =
+        Config::from_toml_str("[activation]\nactor_motion_max_ticks = 60\n").expect("配置");
+    let mut h = Harness::with_config(config, |cfg| cfg.gravity = Vec3::ZERO);
+    let start = Vec3::new(64.0, GROUND_Y + 20.0, 64.0);
+    h.terrain_only_area(start, 32.0);
+    h.steps(40);
+    let e = actor(1);
+    let mark = h.summaries.len();
+    h.spawn_actor(e, start, Vec3::new(0.4, 0.0, 0.0));
+    h.steps(150);
+    assert!(!h.has_actor_ticket(e), "前置:常驻票已到上限撤票");
+    let w = &h.summaries[mark..];
+    assert_eq!(
+        telemetry_sum(w, |t| t.actor_motion_capped),
+        1,
+        "常驻票触顶 1"
     );
     h.finish();
 }
