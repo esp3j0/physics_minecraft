@@ -17,5 +17,9 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = "3"
 
+[features]
+# 测试钩子透传(REQ-007 06a;见 shard 同名 feature)。
+test-hooks = ["shard/test-hooks"]
+
 [lints]
 workspace = true

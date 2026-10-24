@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use app::config::Config;
 use messaging::{InputSource, SimCommand};
 use physics_sim::tickets::{TicketHolder, TicketKind, TicketState};
+use shard::tickets::StoredTicket;
 use sim_api::session::Session;
 use storage::traits::ChunkKey;
 use types::glam::Vec3;
@@ -1363,6 +1364,321 @@ fn acc_05c_static_load_never_compensates() {
     assert!(
         (rel - Vec3::new(0.0, 2.5, 0.0)).length() < 0.1,
         "H 始终压在 B 顶上(否则本用例不成立):相对位置 {rel:?}"
+    );
+    h.finish();
+}
+
+// ===========================================================================
+// 06a:不变量 I3 与操作幂等(AC-T19;需求 §4.3.1、§4.3.6)
+// ===========================================================================
+//
+// 违反用测试钩子 `Session::test_hook_tickets_mut` 制造(feature `test-hooks`,只在
+// 测试构建里打开):在两拍之间改票据表,其后一拍末的 I3 校验必须 fail-stop。
+// 约定 panic 消息含被违反条款的编号 `I3-<n>`(n 为 §4.3.6 列表序号 1–4),用例
+// 据此确认是哪一条拦下的。
+
+fn transient_key(e: EntityId) -> (TicketHolder, TicketKind) {
+    (TicketHolder::Entity(e), TicketKind::TransientMotion)
+}
+
+/// 某实体持有的全部实体票种类(键序)。
+fn entity_ticket_kinds(h: &Harness, e: EntityId) -> Vec<TicketKind> {
+    h.session
+        .ticket_table()
+        .iter()
+        .filter(|(k, _)| k.0 == TicketHolder::Entity(e))
+        .map(|(k, _)| k.1)
+        .collect()
+}
+
+impl Harness {
+    /// 带初速度的瞬态体。
+    fn spawn_transient_v(&mut self, e: EntityId, pos: Vec3, vel: Vec3) {
+        self.session
+            .send(
+                origin(),
+                SimCommand::SpawnDynamic {
+                    entity: e,
+                    state: EntityState {
+                        translation: pos,
+                        linvel: vel,
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("spawn transient");
+    }
+
+    /// 外部 MarkActor(owner = 分片 (0,0))。
+    fn mark_actor(&mut self, e: EntityId, actor: bool) {
+        self.session
+            .send(origin(), SimCommand::MarkActor { entity: e, actor })
+            .expect("mark actor");
+    }
+
+    /// 某张票的时钟。
+    fn ticket_clock(&self, key: (TicketHolder, TicketKind)) -> physics_sim::tickets::TicketClock {
+        self.session
+            .ticket_table()
+            .get(key)
+            .unwrap_or_else(|| panic!("票 {key:?} 应存在"))
+            .clock
+            .clone()
+    }
+}
+
+/// 启用激活:观察者在 SPOT 南侧 12.5 m,等地形就绪。
+fn enable_activation(h: &mut Harness) {
+    h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
+    h.steps(60);
+}
+
+/// 在 `at` 放一个瞬态体让它下落(5 m 约 1 s,期间一直持票),返回它的
+/// TransientMotion 票副本——钩子制造违反时用它当合法的票据原料。
+fn ticket_of_falling_transient(h: &mut Harness, e: EntityId, at: Vec3) -> StoredTicket {
+    h.spawn_transient(e, at);
+    h.steps(3);
+    h.session
+        .ticket_table()
+        .get(transient_key(e))
+        .cloned()
+        .expect("前置:下落中的瞬态体持 TransientMotion 票")
+}
+
+/// I3 第 1 条:存活的瞬态体必须恰持一张 TransientMotion 票。钩子删掉一个下落中
+/// 瞬态体的票,其后一拍末 fail-stop。
+///
+/// 会变红的实现:没有 I3 校验;校验不在 `tick` 的生产路径上(只在单测里调用);
+/// 只查"票指向的实体还在",不查"实体都有票"。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+#[should_panic(expected = "I3-1")]
+fn acc_06a_i3_live_transient_without_ticket_fails_stop() {
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let t = EntityId::from_parts(1, 9);
+    let _ = ticket_of_falling_transient(&mut h, t, SPOT + Vec3::new(4.0, 5.0, 0.0));
+    h.session.test_hook_tickets_mut().end(transient_key(t));
+    assert!(h.exists(t), "前置:瞬态体仍在下落");
+    h.steps(3);
+}
+
+/// I3 第 2 条:实体票的持有者必须存活或迁移在途。钩子给一个从未存在过的实体
+/// 签一张票,其后一拍末 fail-stop。
+///
+/// 会变红的实现:只按"实体都有票"单向检查;不存在的持有者被静默跳过。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+#[should_panic(expected = "I3-2")]
+fn acc_06a_i3_ticket_for_dead_entity_fails_stop() {
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let t = EntityId::from_parts(1, 9);
+    let ticket = ticket_of_falling_transient(&mut h, t, SPOT + Vec3::new(4.0, 5.0, 0.0));
+    let ghost = EntityId::from_parts(1, 777);
+    let now = h.session.tick_now();
+    h.session
+        .test_hook_tickets_mut()
+        .issue(transient_key(ghost), ticket, now);
+    h.steps(3);
+}
+
+/// I3 第 3 条:常驻体不持 TransientMotion。钩子给一个醒着的常驻体塞一张瞬态票,
+/// 其后一拍末 fail-stop。
+///
+/// 会变红的实现:不核对票种与实体的 actor 标记;只检查瞬态体一侧。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+#[should_panic(expected = "I3-3")]
+fn acc_06a_i3_actor_holding_transient_ticket_fails_stop() {
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let a = actor(1);
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    let t = EntityId::from_parts(1, 9);
+    let ticket = ticket_of_falling_transient(&mut h, t, SPOT + Vec3::new(4.0, 5.0, 0.0));
+    assert!(h.exists(a), "前置:常驻体存活");
+    let now = h.session.tick_now();
+    h.session
+        .test_hook_tickets_mut()
+        .issue(transient_key(a), ticket, now);
+    h.steps(3);
+}
+
+/// I3 第 4 条(前半):冻结的常驻体不持 ActorMotion。钩子给刚冻结的常驻体塞一张
+/// 常驻运动票,其后一拍末 fail-stop。
+///
+/// 会变红的实现:I3 不看冻结状态;冻结信息没有从分片汇聚到调度器。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+#[should_panic(expected = "I3-4")]
+fn acc_06a_i3_frozen_actor_holding_motion_ticket_fails_stop() {
+    let mut h = Harness::new(|_| {});
+    let e = freshly_frozen_actor(&mut h);
+    let t = EntityId::from_parts(1, 9);
+    let ticket = ticket_of_falling_transient(&mut h, t, MID + Vec3::new(0.0, 5.0, 0.0));
+    assert!(
+        h.frozen(e) && !h.has_actor_ticket(e),
+        "前置:常驻体冻结且不持票"
+    );
+    let now = h.session.tick_now();
+    h.session.test_hook_tickets_mut().issue(
+        (TicketHolder::Entity(e), TicketKind::ActorMotion),
+        ticket,
+        now,
+    );
+    h.steps(3);
+}
+
+/// I3 第 4 条(后半):承载静止冻结的瞬态体,其 TransientMotion 必须是 Suspended。
+/// 场景同 04b:瞬态方块 T 压在常驻体 A 上,两者在远处静止冻结、T 的票挂起;
+/// 钩子把 T 的票改回 Active,其后一拍末 fail-stop。
+///
+/// 会变红的实现:I3 只查票是否存在,不查承载冻结体的票据状态。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+#[should_panic(expected = "I3-4")]
+fn acc_06a_i3_carried_frozen_transient_must_stay_suspended() {
+    let mut h = Harness::new(|_| {});
+    let (a, t) = (actor(1), EntityId::from_parts(1, 9));
+    h.set_observer(Vec3::new(72.0, GROUND_Y, 60.0));
+    h.steps(60);
+    h.spawn_actor(a, SPOT, Vec3::ZERO);
+    h.steps(40);
+    h.spawn_transient(t, SPOT + Vec3::new(0.0, 1.05, 0.0));
+    h.steps(80);
+    h.set_observer(Vec3::new(112.0, GROUND_Y, 72.0));
+    let mut suspended = false;
+    for _ in 0..60 {
+        h.step();
+        if h.frozen(a) && h.frozen(t) && h.transient_ticket_state(t) == Some(TicketState::Suspended)
+        {
+            suspended = true;
+            break;
+        }
+    }
+    assert!(suspended, "前置:A、T 冻结,T 的票挂起");
+    h.session
+        .test_hook_tickets_mut()
+        .set_state(transient_key(t), TicketState::Active);
+    h.steps(3);
+}
+
+/// AC-T19 守卫:I3 不得误报。激活启用后,瞬态体与常驻体各一个飞越 x = 128 的
+/// 分片边界(迁移),瞬态体在新分片落地凝固;另一个瞬态体在半空中先切成常驻、
+/// 再切回瞬态,落地凝固。全程每拍末 I3 都必须成立(不 panic)。
+///
+/// 会变红的实现:I3 把迁移在途的实体当成已终结,或把在途实体的票当成悬空票
+/// (在途窗口误报 I3-1/I3-2);凝固终结与迁移 despawn 混淆;MarkActor 切换当拍
+/// 票据没收口。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06a_i3_quiet_across_migration_solidify_and_mark_actor() {
+    let mut h = Harness::new(|_| {});
+    h.set_observer(Vec3::new(128.0, GROUND_Y, 72.5));
+    h.steps(120);
+    let east = shard_id(1, 0);
+    let (t1, a, t2) = (
+        EntityId::from_parts(1, 9),
+        actor(1),
+        EntityId::from_parts(1, 10),
+    );
+    h.spawn_transient_v(
+        t1,
+        Vec3::new(124.5, GROUND_Y + 1.5, 72.5),
+        Vec3::new(6.0, 2.0, 0.0),
+    );
+    h.spawn_actor(
+        a,
+        Vec3::new(124.5, GROUND_Y + 1.5, 76.5),
+        Vec3::new(6.0, 2.0, 0.0),
+    );
+    h.spawn_transient(t2, Vec3::new(120.5, GROUND_Y + 15.0, 68.5));
+    h.steps(5);
+    h.mark_actor(t2, true);
+    h.steps(30);
+    h.mark_actor(t2, false);
+    let mut t1_crossed = false;
+    for _ in 0..600 {
+        h.step();
+        t1_crossed |= h.session.entity_state(east, t1).is_some();
+    }
+    assert!(t1_crossed, "前置:瞬态体 T1 飞越边界进入分片 (1,0)");
+    assert!(
+        h.session.entity_state(east, a).is_some(),
+        "前置:常驻体 A 落在分片 (1,0)"
+    );
+    assert_eq!(
+        entity_ticket_kinds(&h, a),
+        Vec::<TicketKind>::new(),
+        "A 在唤醒范围内静止:不持实体票"
+    );
+    for e in [t1, t2] {
+        assert!(
+            !h.exists(e) && h.session.entity_state(east, e).is_none(),
+            "瞬态体 {e:?} 应已落地凝固"
+        );
+        assert_eq!(
+            entity_ticket_kinds(&h, e),
+            Vec::<TicketKind>::new(),
+            "瞬态体 {e:?} 凝固后票据全部终结"
+        );
+    }
+    h.finish();
+}
+
+/// AC-T19(幂等,走生产路径):同一拍里重复的 MarkActor、以及对已是瞬态的实体
+/// 再发 MarkActor(false),都不得重签票据或重置时钟;切回瞬态时新票的时钟从切换
+/// 拍起算。
+///
+/// 会变红的实现:实体票 Issue 遇键已在时覆盖(时钟被重置);重复 MarkActor 报错
+/// 或留下两种票;切回瞬态沿用旧票时钟。
+#[test]
+#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+fn acc_06a_repeated_mark_actor_keeps_ticket_clock() {
+    let mut h = Harness::new(|_| {});
+    enable_activation(&mut h);
+    let t = EntityId::from_parts(1, 9);
+    // 30 m 高处下落约 2.5 s,整个用例期间都在空中。
+    h.spawn_transient(t, SPOT + Vec3::new(4.0, 30.0, 0.0));
+    h.steps(3);
+    assert!(h.transient_ticket_state(t).is_some(), "前置:瞬态体持票");
+
+    h.mark_actor(t, true);
+    h.mark_actor(t, true);
+    h.steps(2);
+    assert!(
+        !entity_ticket_kinds(&h, t).contains(&TicketKind::TransientMotion),
+        "切成常驻后不再持瞬态票"
+    );
+
+    h.mark_actor(t, false);
+    h.mark_actor(t, false);
+    h.steps(2);
+    assert_eq!(
+        entity_ticket_kinds(&h, t),
+        vec![TicketKind::TransientMotion],
+        "切回瞬态:恰持一张瞬态票"
+    );
+    let first = h.ticket_clock(transient_key(t));
+    assert!(
+        first.active_ticks <= 2,
+        "新瞬态票的时钟从切换拍起算:{first:?}"
+    );
+
+    h.steps(10);
+    h.mark_actor(t, false); // 已是瞬态:无操作
+    h.steps(2);
+    let later = h.ticket_clock(transient_key(t));
+    assert_eq!(
+        later.issued_at, first.issued_at,
+        "重复 MarkActor(false) 不重签"
+    );
+    assert_eq!(
+        later.active_ticks,
+        first.active_ticks + 12,
+        "时钟连续走,不被重置"
     );
     h.finish();
 }

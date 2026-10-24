@@ -11,5 +11,10 @@ voxel = { path = "../voxel" }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 
+[features]
+# 测试钩子(REQ-007 06a):只给验收/集成测试在两拍之间人为制造不变量违反;
+# 生产构建不启用(e2e 经 dev-dependency 打开)。
+test-hooks = []
+
 [lints]
 workspace = true

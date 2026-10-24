@@ -553,6 +553,13 @@ impl Session {
         self.scheduler.ticket_table()
     }
 
+    /// 调度器透传(REQ-007 06a;feature `test-hooks`):票据表可变访问,只用于
+    /// 测试在两拍之间人为制造 I3 违反。签名不得改动。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_hook_tickets_mut(&mut self) -> &mut shard::tickets::TicketTable {
+        self.scheduler.test_hook_tickets_mut()
+    }
+
     /// 调度器透传(REQ-007 D17):激活启用开关(曾设观察者或区域票;单向)。
     pub fn activation_enabled(&self) -> bool {
         self.scheduler.activation_enabled()

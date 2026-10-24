@@ -15,7 +15,8 @@ rapier3d = "0.36.1"
 # REQ-002 验收套件(任务书 05 授权增补):app 驱动路径 + storage 真路径 +
 # sim-api 会话/回放 + tokio(暂停时间驱动测试)/ tempfile(redb 临时库)。
 app = { path = "../app" }
-sim-api = { path = "../sim-api" }
+# REQ-007 06a:打开测试钩子(在两拍之间改票据表,验证 I3 fail-stop)。
+sim-api = { path = "../sim-api", features = ["test-hooks"] }
 storage = { path = "../storage" }
 # REQ-003 验收套件(任务书 04 授权增补):tokio 增 net + io-util
 # (内嵌测试客户端 = 真 TCP TcpStream + 帧读写;README 决策 10)。

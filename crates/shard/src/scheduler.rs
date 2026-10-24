@@ -345,6 +345,14 @@ impl Scheduler {
         &self.tickets
     }
 
+    /// 测试钩子(REQ-007 06a;feature `test-hooks`,生产构建不编译):票据表
+    /// 可变访问,只用于在两拍之间人为制造 I3 违反。总架构师提供的测试基础
+    /// 设施,签名不得改动。
+    #[cfg(feature = "test-hooks")]
+    pub fn test_hook_tickets_mut(&mut self) -> &mut crate::tickets::TicketTable {
+        &mut self.tickets
+    }
+
     /// 区域票半径上限(校验用;config 注入的默认 128)。
     pub fn area_ticket_max_radius(&self) -> f32 {
         self.area_ticket_max_radius_m
