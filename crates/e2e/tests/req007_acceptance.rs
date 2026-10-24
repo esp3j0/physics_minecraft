@@ -1801,7 +1801,6 @@ fn assert_lines_match(a: &mut Harness, b: &mut Harness, ticks: usize) {
 /// 待地形的保存速度、承载记录、①② 集合或冷却簿记、静止判据窗口;快照字段被
 /// serde 跳过而按默认值恢复。
 #[test]
-#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06b_midway_checkpoint_replays_identically() {
     let mut h = Harness::new(|_| {});
     h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
@@ -1901,7 +1900,6 @@ fn acc_06b_midway_checkpoint_replays_identically() {
 ///
 /// 会变红的实现:待处理唤醒格不进快照(恢复线里常驻体一直悬空冻结)。
 #[test]
-#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06b_pending_terrain_wake_survives_checkpoint() {
     let mut h = Harness::new(|_| {});
     let e = freshly_frozen_actor(&mut h);
@@ -1934,7 +1932,6 @@ fn acc_06b_pending_terrain_wake_survives_checkpoint() {
 /// 会变红的实现:开关不进快照(恢复后按"观察者表是否为空"重新推断——第二种
 /// 情况会退回未启用);开关随观察者移除回退。
 #[test]
-#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06b_activation_switch_survives_checkpoint() {
     let t = EntityId::from_parts(1, 9);
 
@@ -1987,7 +1984,6 @@ fn acc_06b_activation_switch_survives_checkpoint() {
 /// 0.36 对 KinematicPositionBased 刚体的 `set_linvel` 不生效,保存的速度丢失,
 /// 实体从零速度起步(当前代码即如此)。
 #[test]
-#[ignore = "REQ-007 06b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06b_awaiting_terrain_resumes_with_saved_velocity() {
     let mut h = Harness::new(|_| {});
     enable_activation(&mut h);

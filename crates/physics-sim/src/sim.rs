@@ -1676,9 +1676,11 @@ impl ShardSim {
                     rec.window.clear();
                     rec.window.push_back(pos);
                     let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+                    // 先切 Dynamic 再写速度(rapier 0.36:KinematicPositionBased
+                    // 下 set_linvel/set_angvel 是 no-op,顺序反了保存速度即丢)。
+                    body.set_body_type(RigidBodyType::Dynamic, true);
                     body.set_linvel(conv::vec3_to_rapier(saved_linvel), true);
                     body.set_angvel(conv::vec3_to_rapier(saved_angvel), true);
-                    body.set_body_type(RigidBodyType::Dynamic, true);
                 } else if !awaiting {
                     self.locomotion.entry(id).or_insert(LocomotionState::Awake);
                 }
@@ -4553,6 +4555,58 @@ mod tests {
                 .get(&e)
                 .is_some_and(|l| matches!(l, LocomotionState::AwaitingTerrain { .. })),
             "恢复后离开待地形"
+        );
+    }
+
+    /// 06b(§4.6 缺陷修复的回归锚;区别于上一条的手工塞 locomotion):
+    /// **真实路径**——进入待地形由 update_awaiting_terrain 自行保存速度
+    /// (刚体此刻被切到 KinematicPositionBased),恢复时先切 Dynamic 再写
+    /// 速度。rapier 0.36 对 KinematicPositionBased 的 set_linvel 是 no-op,
+    /// 顺序反了保存速度即丢(缺陷实现:恢复后速度 = 进入时清零的 0)。
+    #[test]
+    fn awaiting_terrain_recovery_real_path_keeps_saved_velocity() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        // 有①无②:足迹 (0,0) 缺 ② → 真实进入待地形。
+        s.load_data_only(ChunkPos::new(0, 0), solid_chunk());
+        let e = entity(9);
+        let saved = Vec3::new(3.0, -1.0, 2.0);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 8.0),
+                    linvel: saved,
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            }),
+        }]);
+        let _ = s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        assert!(s.is_awaiting_terrain(e), "前置:足迹缺 ② → 真实进入待地形");
+        assert_eq!(
+            s.locomotion.get(&e).expect("待地形记录在案"),
+            &LocomotionState::AwaitingTerrain {
+                saved_linvel: saved,
+                saved_angvel: Vec3::ZERO,
+            },
+            "进入时保存的速度 = 出生速度(step 前,重力未积分)"
+        );
+        // ② 就绪(手动 load_chunk 同点建 ②,绕预算)→ 下一拍激活恢复。
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s.apply_activation(&[Vec3::new(300.0, 0.0, 300.0)]);
+        assert!(!s.is_awaiting_terrain(e), "② 齐 → 恢复");
+        assert_eq!(
+            s.entity_state(e).expect("恢复后仍在表").linvel,
+            saved,
+            "恢复:保存的速度位级写回(先切 Dynamic 再写;§4.6)"
         );
     }
 

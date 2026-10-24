@@ -1706,8 +1706,10 @@ impl Scheduler {
         // - End → 常驻 = ActorMotion、瞬态 = TransientMotion(§4.3.4"End
         //   ActorMotion"/"End TransientMotion";不再无差别撤全部实体票——
         //   表幂等下两种票并存的错种票会吃掉 End,acc_06a_i3_actor 暴露);
-        // - Pause/Unpause/Suspend/Resume → TransientMotion(承载/静止冻结
-        //   只对瞬态票,§4.3.4 各行;常驻票无这些状态)。
+        // - Pause/Unpause/Suspend/Resume → 目标键 = 实体当前 actor 标记
+        //   对应的票种(瞬态 → TransientMotion;常驻被暂停/承载等操作触及
+        //   时定向到其 ActorMotion 票;代码按 ownership.actor 选键,语义
+        //   与 §4.3.4 各行等价)。
         // 定向引用 ownership 的 actor(claim 单点同源;终结判定窗口实体已
         // release → 按瞬态=End 全部实体票兜底,语义与旧无差别 End 一致)。
         self.pending_ticket_ops
@@ -2591,6 +2593,56 @@ mod tests {
         );
         sched.shutdown();
         sched2.shutdown();
+    }
+
+    /// 任务书测试 `activation_enabled_survives_snapshot`(REQ-007 任务书 06
+    /// 测试清单;AC-T24 表侧锚,区别于 e2e `acc_06b_activation_switch_survives_
+    /// checkpoint` 的生产行为面):开关随快照往返,两分支——
+    /// - 从未启用(无观察者、无区域票)→ 恢复后仍未启用;
+    /// - 曾有区域票(移除后;`tickets_ever_set` 单向)→ 恢复后仍启用。
+    ///
+    /// 变异检查:"恢复时丢 tickets_ever_set"(分支二)或丢 observers_ever_set
+    /// (分支一)→ 红。
+    #[test]
+    fn activation_enabled_survives_snapshot() {
+        // 分支一:从未启用。
+        let mut never = Scheduler::new(sched_cfg(2));
+        never.register(sim(0, 0));
+        assert!(!never.activation_enabled(), "前置:从未启用");
+        let snap = never.snapshot_state();
+        let mut r1 = Scheduler::new(SchedulerConfig {
+            start_tick: snap.tick,
+            ..sched_cfg(2)
+        });
+        r1.register(sim(0, 0));
+        r1.restore_state(snap);
+        assert!(
+            !r1.activation_enabled(),
+            "未启用的快照恢复后仍未启用(不得按表空重推断为启用)"
+        );
+        never.shutdown();
+        r1.shutdown();
+
+        // 分支二:曾有区域票(后移除;开关单向不回退)。
+        let mut once = Scheduler::new(sched_cfg(2));
+        once.register(sim(0, 0));
+        once.apply_area_ticket(1, types::glam::Vec3::new(8.0, 0.0, 8.0), 16.0, 0b001, None);
+        assert!(once.activation_enabled(), "前置:区域票启用");
+        once.apply_remove_area_ticket(1);
+        assert!(once.activation_enabled(), "前置:区域票移除后开关单向保持");
+        let snap2 = once.snapshot_state();
+        let mut r2 = Scheduler::new(SchedulerConfig {
+            start_tick: snap2.tick,
+            ..sched_cfg(2)
+        });
+        r2.register(sim(0, 0));
+        r2.restore_state(snap2);
+        assert!(
+            r2.activation_enabled(),
+            "启用(曾设区域票)的快照恢复后仍启用:恢复不得丢 tickets_ever_set"
+        );
+        once.shutdown();
+        r2.shutdown();
     }
 
     /// F3 返修测试 `observer_ticket_spec_from_injected_config`:自定义半径在

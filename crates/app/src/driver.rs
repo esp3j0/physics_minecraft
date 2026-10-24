@@ -431,7 +431,10 @@ pub struct DriverOutcome {
 /// v2 档解码必 UnexpectedEnd/版本拒绝;同样必须清 `data_dir`。
 /// **v4**(REQ-007 任务 01):`ActivationConfig` 拆 ①② 参数、`ActivationController`
 /// 增 ② 冷却表、`ShardSimConfig` 字段更名——v3 档解码必失败/版本拒绝;必须清
-/// `data_dir`。02–05 任务快照布局还会变,版本保持 4 不再逐任务升。
+/// `data_dir`。**v4 为 REQ-007 布局终稿(任务 06b 收口)**:§4.14 清单——完整
+/// 票据表、票据收件箱(随命令日志重放)、每分片 ② 集合、待地形保存速度与状态、
+/// ①/② 两套冷却簿记、待处理补偿种子与地形变更唤醒格、未消费 `ticket_ops`、
+/// D17 开关——全部已在快照字段内,此后不再改布局。v0/v1/v2/v3 一律显式拒绝。
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 4;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
@@ -1642,6 +1645,304 @@ mod tests {
         session
     }
 
+    /// 任务书测试 `app::snapshot_roundtrip_full_ticket_state`(REQ-007 06b;
+    /// §4.14 全字段非默认值往返,AC-T21 前置)。生产路径(Session + 编排)构造
+    /// 同时在场的状态:
+    /// - **四种票**:观察者票(Observer)、区域票(Area,带 TTL 与非零时钟)、
+    ///   瞬态体 TransientMotion(Paused 与 Suspended 两态)、常驻体
+    ///   ActorMotion(Active);
+    /// - **三种票据状态**:Active(区域/常驻)、Paused(被承载瞬态)、
+    ///   Suspended(承载静止冻结的瞬态);
+    /// - **待地形**:无 ①② 处带初速度的瞬态体(保存速度非零);
+    /// - **两开关**:observers_ever_set / tickets_ever_set 均 true;
+    /// - **分片侧**:② 集合(区域票覆盖 chunk)、①② 两套冷却簿记、待地形的
+    ///   保存速度(非零)——全部在分片快照字节里。
+    ///
+    /// 断言:① 原线与恢复线(世界快照 bincode 往返 → `replay_world` 空日志)
+    /// 各自立刻再取 `world_snapshot()`,调度器快照与全部分片字节**位级相等**
+    /// (票据表键、规格、时钟、状态,观察者表,两开关,lifecycles,② 集合,
+    /// 冷却簿记,待地形保存速度);② 非退化:恢复线票据表确有四键三态、非零
+    /// 时钟、非空 TTL、待地形在场——防"默认值往返"假绿(放行评论风险 3);
+    /// ③ 功能面:恢复线照常运转(区域票 ② 集合仍在、票据表不空)。
+    /// 补偿种子与地形变更唤醒格的快照存活由 e2e
+    /// `acc_05c_missed_prediction_compensated_next_tick` /
+    /// `acc_06b_pending_terrain_wake_survives_checkpoint` 锚定(此处不重复布景)。
+    #[test]
+    fn snapshot_roundtrip_full_ticket_state() {
+        use physics_sim::tickets::{TicketHolder, TicketKind, TicketState};
+
+        let config = Config::default();
+        let store = storage::worker::StoreWorker::new(
+            Box::new(storage::mem::MemChunkStore::new()),
+            Box::new(storage::mem::MemCheckpointStore::new()),
+        );
+        let mut session = sim_api::session::Session::new(config.session_config());
+        let (provider, mut new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
+            Box::new(SimpleRegistry::builtin())
+        });
+        session.register(sim(0, 0));
+
+        // —— 布景(生产 tick + 编排;Superflat 地表 y = -59.5)——
+        let base_y = -59.5_f32;
+        let spot = Vec3::new(72.5, base_y, 72.5);
+        let far = Vec3::new(110.5, base_y, 72.5);
+        // 观察者票(Observer;启用激活;observers_ever_set = true)。
+        session
+            .move_observer_from(messaging::InputSource(1), spot)
+            .expect("观察者");
+        // 区域票(Area;TTL 400 非零;tickets_ever_set = true)。
+        session
+            .set_area_ticket(7, far, 8.0, 0b011, Some(400))
+            .expect("区域票");
+        for _ in 0..60 {
+            session.tick();
+            orchestrate_test(&mut session, &provider, &mut new_sim);
+        }
+
+        let spawn = |session: &mut sim_api::session::Session,
+                     e: EntityId,
+                     pos: Vec3,
+                     actor: bool,
+                     vel: Vec3| {
+            session
+                .send(
+                    shard_id(0, 0),
+                    messaging::SimCommand::SpawnDynamic {
+                        entity: e,
+                        state: EntityState {
+                            translation: pos,
+                            linvel: vel,
+                            ..EntityState::default()
+                        },
+                        desc: EntityDesc::default(),
+                    },
+                )
+                .expect("spawn");
+            if actor {
+                session
+                    .send(
+                        shard_id(0, 0),
+                        messaging::SimCommand::MarkActor { entity: e, actor },
+                    )
+                    .expect("mark actor");
+            }
+        };
+
+        // 常驻体 A:贴地生成,静置(actor 豁免凝固,保持醒着、无票——在唤醒
+        // 范围内)。C 将落在它上面(被承载 → Paused)。
+        let a = EntityId::from_parts(1, 11);
+        spawn(&mut session, a, spot, true, Vec3::ZERO);
+        // 常驻体 B:远处区域票内生成,静置到冻结(承载静止冻结的 D 的支点)。
+        let b = EntityId::from_parts(1, 12);
+        spawn(&mut session, b, far, true, Vec3::ZERO);
+        for _ in 0..40 {
+            session.tick();
+            orchestrate_test(&mut session, &provider, &mut new_sim);
+        }
+        // 瞬态 C 落在 A 上;瞬态 D 落在静止冻结的 B 上(在 A/B 静置后)。
+        let c = EntityId::from_parts(1, 14);
+        let d = EntityId::from_parts(1, 15);
+        spawn(
+            &mut session,
+            c,
+            spot + Vec3::new(0.0, 1.05, 0.0),
+            false,
+            Vec3::ZERO,
+        );
+        spawn(
+            &mut session,
+            d,
+            far + Vec3::new(0.0, 1.05, 0.0),
+            false,
+            Vec3::ZERO,
+        );
+        for _ in 0..120 {
+            session.tick();
+            orchestrate_test(&mut session, &provider, &mut new_sim);
+        }
+
+        // —— 前置自检:四键三态与非零时钟 ——
+        let key_of = |e: EntityId| (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        assert!(
+            session
+                .ticket_table()
+                .iter()
+                .any(|(k, _)| k.1 == TicketKind::Observer),
+            "前置:观察者票在场"
+        );
+        let area = session
+            .ticket_table()
+            .get((TicketHolder::Area(7), TicketKind::Area))
+            .expect("前置:区域票在场");
+        assert_eq!(area.clock.limit, Some(400), "前置:TTL 非空");
+        assert!(area.clock.active_ticks > 0, "前置:区域票时钟非零");
+        assert_eq!(
+            session.ticket_table().get(key_of(c)).map(|t| t.state),
+            Some(TicketState::Paused),
+            "前置:C 被承载(Paused)"
+        );
+        assert_eq!(
+            session.ticket_table().get(key_of(d)).map(|t| t.state),
+            Some(TicketState::Suspended),
+            "前置:D 承载静止冻结(Suspended)"
+        );
+        // 运动常驻体 M:高空中生成、落点在唤醒范围外(距观察者 24 m 半径远),
+        // 下落中持 ActorMotion(Active)——整个断言窗口内不落地(15 m 自由落体
+        // ≈ 105 拍,窗口只有 ~2 拍 + 快照)。
+        let m = EntityId::from_parts(1, 13);
+        spawn(
+            &mut session,
+            m,
+            far + Vec3::new(12.0, 15.0, -4.0),
+            true,
+            Vec3::ZERO,
+        );
+
+        // —— 待地形:无 ①② 处带初速度的瞬态体 W(保存速度非零)——
+        let w = EntityId::from_parts(1, 16);
+        let w_vel = Vec3::new(1.0, 2.0, 0.5);
+        spawn(
+            &mut session,
+            w,
+            Vec3::new(8.5, base_y + 3.0, 120.5),
+            false,
+            w_vel,
+        );
+        // 出生拍先按动态体走一步,下一拍激活检查发现足迹缺地形 → 待地形。
+        for _ in 0..2 {
+            session.tick();
+            orchestrate_test(&mut session, &provider, &mut new_sim);
+        }
+        assert!(
+            session.is_awaiting_terrain(shard_id(0, 0), w),
+            "前置:W 出生在无地形处,待地形"
+        );
+        assert!(
+            session
+                .ticket_table()
+                .get((TicketHolder::Entity(m), TicketKind::ActorMotion))
+                .is_some_and(|t| t.state == TicketState::Active),
+            "前置:M 持 ActorMotion(Active;唤醒范围外运动中)"
+        );
+
+        // —— 截快照 → bincode 往返 → 恢复(空日志;此后无外部命令)——
+        let world = session.world_snapshot();
+        let bytes =
+            bincode::serde::encode_to_vec(&world, bincode::config::standard()).expect("编码");
+        let (decoded, _): (sim_api::snapshot::WorldSnapshot, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).expect("解码");
+        let mut restored = sim_api::replay::replay_world(
+            &decoded,
+            &sim_api::log::CommandLog::new(),
+            config.session_config(),
+            || Box::new(SimpleRegistry::builtin()),
+        )
+        .expect("自有快照必可恢复");
+
+        // ① 位级:两线各自再取世界快照——调度器状态(票据表/两开关/观察者/
+        //    lifecycles/Router)与全部分片字节(② 集合/两套冷却/待地形保存
+        //    速度/物理世界)必须相等。
+        let snap_a = session.world_snapshot();
+        let snap_b = restored.world_snapshot();
+        assert_eq!(
+            snap_b.scheduler, snap_a.scheduler,
+            "调度器快照位级一致(票据表/开关/观察者/生命周期)"
+        );
+        assert_eq!(
+            snap_b.shards.per_shard, snap_a.shards.per_shard,
+            "分片快照字节位级一致(② 集合/冷却簿记/待地形保存速度)"
+        );
+
+        // ② 非退化:恢复线票据表确有四键三态、非零时钟、非空 TTL、待地形
+        //    在场(默认值往返测不出字段丢失)。
+        let tbl = restored.ticket_table();
+        assert!(
+            tbl.iter().any(|(k, _)| k.1 == TicketKind::Observer),
+            "恢复线:观察者票在场"
+        );
+        let area_r = tbl
+            .get((TicketHolder::Area(7), TicketKind::Area))
+            .expect("恢复线:区域票在场");
+        assert_eq!(area_r.clock.limit, Some(400), "TTL 随往返");
+        assert!(area_r.clock.active_ticks > 0, "非零时钟随往返");
+        assert_eq!(
+            tbl.get(key_of(c)).map(|t| t.state),
+            Some(TicketState::Paused),
+            "Paused 随往返"
+        );
+        assert_eq!(
+            tbl.get(key_of(d)).map(|t| t.state),
+            Some(TicketState::Suspended),
+            "Suspended 随往返"
+        );
+        assert!(
+            tbl.get((TicketHolder::Entity(m), TicketKind::ActorMotion))
+                .is_some(),
+            "ActorMotion 随往返"
+        );
+        assert!(
+            restored.is_awaiting_terrain(shard_id(0, 0), w),
+            "待地形(含保存速度)随往返"
+        );
+
+        // ③ 功能面:恢复线照常运转——再跑 5 拍,区域票覆盖的 ② 集合不塌、
+        //    票据表不空(恢复态 ≠ 只读雕像)。
+        for _ in 0..5 {
+            restored.tick();
+        }
+        assert!(
+            restored.has_collider(shard_id(0, 0), types::ChunkPos::new(6, 4)),
+            "恢复线:区域票覆盖的 ② 仍在(far 中心 (110.5,·,72.5) ∈ chunk (6,4))"
+        );
+        assert!(
+            restored.ticket_table().area_count() >= 1,
+            "恢复线:区域票仍在"
+        );
+
+        session.shutdown();
+        restored.shutdown();
+        let _ = store.shutdown();
+    }
+
+    /// 测试用每拍编排(snapshot_roundtrip_full_ticket_state 专用):票据
+    /// ensure + 激活装卸 + despawn(复刻 orchestrate 最小版)。
+    fn orchestrate_test(
+        session: &mut sim_api::session::Session,
+        provider: &storage::provider::ChunkProvider,
+        new_sim: &mut Box<dyn FnMut(types::ShardId) -> ShardSim + Send>,
+    ) {
+        let mut ensure = session.ticket_ensure_shards();
+        ensure.extend(session.pending_shard_destinations());
+        for shard in ensure {
+            if !session.shard_ids().contains(&shard) {
+                session.register(new_sim(shard));
+            }
+        }
+        for (shard, decisions) in session.take_activation_requests() {
+            for pos in decisions.chunks_to_load {
+                let key = ChunkKey {
+                    world: shard.world,
+                    dim: shard.dimension,
+                    pos,
+                };
+                let chunk = provider
+                    .get(key)
+                    .unwrap_or_else(|| panic!("provider.get 返回 None:{key:?}"));
+                session.apply_chunk_load(shard, pos, chunk);
+            }
+            for pos in decisions.chunks_to_unload {
+                let _ = session.apply_chunk_unload(shard, pos);
+            }
+        }
+        let pending = session.pending_shard_destinations();
+        for shard in session.take_despawn_requests() {
+            if !session.shard_ids().contains(&shard) || pending.contains(&shard) {
+                continue;
+            }
+            let _ = session.unload_shard(shard);
+        }
+    }
+
     /// 测试清单(app::driver,任务书 02):区域票 Set/Remove 经本地受信通道
     /// (Session API 正路)生效——入日志、票据表变化(下一拍);外部缝
     /// (validate_external_command)拒绝;网络路径无入口(translate 拒绝,
@@ -2498,6 +2799,9 @@ mod tests {
         // ⑤ v3(REQ-007 任务 01 之前的格式,四字段)→ 版本拒绝;分片快照布局
         //    已随 ①② 拆分改变(ActivationConfig 拆参/② 冷却表/字段更名),
         //    必须清 data_dir(B5;v2/v1/v0 拒绝测试补齐在 06)。
+        // 06b 对账:任务书 `checkpoint_v4_rejects_v3_and_v2` 由本测试
+        // (v0/①②/④ + v1 + v2③ + v3⑤ 全拒,v2 旧字节 ④ 显式 UnexpectedEnd)
+        // 与 `checkpoint_v4_rejects_v3`(锚常量 = 4 + v3 行为)共同覆盖。
         let v3 = CheckpointBundle {
             format_version: 3,
             world: mk_world(types::Tick(7)),
