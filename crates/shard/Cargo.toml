@@ -16,5 +16,9 @@ thiserror = "2"
 # 生产构建不启用(e2e 经 dev-dependency 打开)。
 test-hooks = []
 
+# 单元测试自用(钩子制造 I3 违反的 fail-stop 测试;只在 cargo test 构建)。
+[dev-dependencies]
+shard = { path = ".", features = ["test-hooks"] }
+
 [lints]
 workspace = true

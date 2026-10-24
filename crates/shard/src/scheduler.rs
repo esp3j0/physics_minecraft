@@ -281,7 +281,15 @@ impl Scheduler {
             );
             self.tickets.issue(tkey, self.observer_ticket(now), now);
         }
+        // D17 启用补签(06a):直通路径在两拍之间翻转启用开关,下一拍
+        // `enabled_before_apply` 已为 true,收件箱路径的补签(`!enabled_before_
+        // apply && enabled`)不会触发——这里同样补签(时钟 = 当前拍;幂等),
+        // 否则启用前已 spawn 的瞬态体在 I3 下裸奔(直通启用当拍即 fail-stop)。
+        let was_enabled = self.observers_ever_set || self.tickets_ever_set;
         self.observers_ever_set = true;
+        if !was_enabled {
+            self.backfill_transient_tickets_on_enable(now);
+        }
     }
 
     /// D17 激活启用开关(REQ-007 §4.0,任务 02 推广):曾设置过观察者**或**
@@ -757,6 +765,14 @@ impl Scheduler {
             .is_some_and(|sim| sim.is_frozen(entity))
     }
 
+    /// 实体的承载记录(REQ-007 06a;I3 第 4 条后半的汇聚输入——与分片侧
+    /// Suspend/Resume 操作同源的记录口径)。分片未注册/实体不在 → false。
+    pub fn is_carried(&self, shard: ShardId, entity: EntityId) -> bool {
+        self.sims
+            .get(&shard)
+            .is_some_and(|sim| sim.is_carried(entity))
+    }
+
     /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
     /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
     /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内
@@ -1019,6 +1035,7 @@ impl Scheduler {
             self.entity_ownership.release(id);
         }
         // 再 claim/update 当前实体;若 ID 属于别的分片 = 全局重复,fail-stop。
+        let mut actor_flipped: Vec<EntityId> = Vec::new();
         for (id, source, actor) in current {
             let owner = EntityOwner {
                 shard,
@@ -1033,11 +1050,41 @@ impl Scheduler {
                     // 继续)。常驻体不签(04)。
                     self.issue_transient_on_claim(id, actor);
                 }
-                Some(prev) if prev.shard == shard => self.entity_ownership.update(id, owner),
+                Some(prev) if prev.shard == shard => {
+                    // MarkActor 转递检测(06a;§4.3.4):标记真翻转才触发,
+                    // 重复 MarkActor(同值、同拍多次)→ 无操作不重置时钟。
+                    if prev.actor != actor {
+                        actor_flipped.push(id);
+                    }
+                    self.entity_ownership.update(id, owner);
+                }
                 Some(prev) => panic!(
                     "实体 {id:?} 同时出现在分片 {shard:?} 与 {:?}(全局唯一性 fail-stop)",
                     prev.shard
                 ),
+            }
+        }
+        // MarkActor 票据转递(06a;§4.3.4 规则表两行;时钟从切换拍起算):
+        // - false → true:`End TransientMotion`,之后按常驻规则(运动中且不在
+        //   唤醒范围 → IssueActorMotion 由分片 lifecycle 每拍重发幂等签发,无
+        //   需此处补签);
+        // - true → false:`End ActorMotion`(若有)+ `Issue TransientMotion`
+        //   (新票,issued_at = 当前拍)。
+        // 放行评论风险 8:签发/转递是签发侧逻辑,允许按票种区分(§14-1 只禁
+        // plan/ensure/保活)。
+        for id in actor_flipped {
+            let now_actor = self.entity_ownership.owner_of(id).is_some_and(|o| o.actor);
+            if now_actor {
+                self.tickets.end((
+                    physics_sim::tickets::TicketHolder::Entity(id),
+                    physics_sim::tickets::TicketKind::TransientMotion,
+                ));
+            } else {
+                self.tickets.end((
+                    physics_sim::tickets::TicketHolder::Entity(id),
+                    physics_sim::tickets::TicketKind::ActorMotion,
+                ));
+                self.issue_transient_on_claim(id, false);
             }
         }
     }
@@ -1571,10 +1618,12 @@ impl Scheduler {
                     // 时(陈旧 outbox.spawned 残留:布景期 spawn 的 outbox 随
                     // 首拍一起到达;实体已被虚空/强制落地移除)不豁免,否则
                     // 票泄漏(H1 void 测试暴露)。
-                    let alive = self
-                        .sims
-                        .values()
-                        .any(|sim| sim.entity_state(*id).is_some());
+                    // alive 检查(06a 修正):必须包含**本分片当前 sim**——
+                    // 处理循环中 self.sims 尚未 insert 回(tick 开头已 take)。
+                    // 单分片传送场景旧写法 alive 恒 false → 同拍 despawn+spawn
+                    // 的传送被误判终结,票被 End(I3 落地暴露;读表时机 bug)。
+                    let alive = sim.entity_state(*id).is_some()
+                        || self.sims.values().any(|s| s.entity_state(*id).is_some());
                     let in_transit = self.router.in_transit_migrations().iter().any(|env| {
                         matches!(
                             &env.payload,
@@ -1583,7 +1632,38 @@ impl Scheduler {
                         )
                     });
                     if alive || in_transit {
-                        continue; // 真迁移/传送:票保留
+                        // 真迁移/传送:票保留(§4.3.3)。补签(06a,I3 暴露的
+                        // 边界):spawn 拍即迁移的瞬态体 claim 从未发生(生灭
+                        // 同拍,实体表已无它)→ 从未签票——而 I3 要求在途瞬态
+                        // 持票。签发单点仍在调度器(幂等;actor 取信封载荷或
+                        // 本分片实体表;瞬态才签,常驻不签)。
+                        let actor_now = self
+                            .router
+                            .in_transit_migrations()
+                            .iter()
+                            .find(|env| {
+                                matches!(
+                                    &env.payload,
+                                    messaging::EnvelopePayload::MigrateEntity {
+                                        entity: e,
+                                        ..
+                                    } if *e == *id
+                                )
+                            })
+                            .map(|env| match &env.payload {
+                                messaging::EnvelopePayload::MigrateEntity { actor, .. } => *actor,
+                                _ => false,
+                            })
+                            .or_else(|| {
+                                sim.entity_owners()
+                                    .into_iter()
+                                    .find(|(e, _, _)| e == id)
+                                    .map(|(_, _, a)| a)
+                            });
+                        if actor_now == Some(false) {
+                            self.issue_transient_on_claim(*id, false);
+                        }
+                        continue;
                     }
                 }
                 self.end_entity_tickets(*id);
@@ -1619,34 +1699,52 @@ impl Scheduler {
         }
 
         // 7.4 ticket_ops 应用(REQ-007 任务 03;§14-6):按 (ShardId, 实体)
-        // 序(= 收集序,BTreeMap 归一);操作幂等(TicketTable);目标键 =
-        // 该实体的实体票(瞬态 = TransientMotion;常驻 = ActorMotion)。
-        // 应用在拍末 → N+1 生效。
+        // 序(= 收集序,BTreeMap 归一);操作幂等(TicketTable);应用在拍末
+        // → N+1 生效。06a 收口(§4.3.4 + 放行评论风险 8:签发/撤票允许按票
+        // 种区分):目标键按实体**当前** actor 标记定向——
+        // - IssueActorMotion → ActorMotion(签发单点在调度器,04a);
+        // - End → 常驻 = ActorMotion、瞬态 = TransientMotion(§4.3.4"End
+        //   ActorMotion"/"End TransientMotion";不再无差别撤全部实体票——
+        //   表幂等下两种票并存的错种票会吃掉 End,acc_06a_i3_actor 暴露);
+        // - Pause/Unpause/Suspend/Resume → TransientMotion(承载/静止冻结
+        //   只对瞬态票,§4.3.4 各行;常驻票无这些状态)。
+        // 定向引用 ownership 的 actor(claim 单点同源;终结判定窗口实体已
+        // release → 按瞬态=End 全部实体票兜底,语义与旧无差别 End 一致)。
         self.pending_ticket_ops
             .sort_by_key(|(shard, op)| (*shard, op.entity, op.op as u8));
         for (origin, op) in std::mem::take(&mut self.pending_ticket_ops) {
             use physics_sim::tickets::{TicketHolder, TicketKind};
             let _ = origin;
+            let target_kind = |sched: &Self, entity: EntityId| -> Option<TicketKind> {
+                sched.entity_ownership.owner_of(entity).map(|o| {
+                    if o.actor {
+                        TicketKind::ActorMotion
+                    } else {
+                        TicketKind::TransientMotion
+                    }
+                })
+            };
             match op.op {
                 // 签发(04a):表无该实体的 ActorMotion 票才签(键已在 → 无
                 // 操作不重置时钟,D14)。签发条件由分片判定(IssueActorMotion
                 // 每拍重发幂等);规格 = 常驻运动票默认(无足迹装载、
                 // SelfOnly 唤醒、limit = actor_motion_max_ticks)。
                 physics_sim::TicketOp::IssueActorMotion => {
-                    if self.tickets.iter().any(|(k, _)| {
-                        matches!(k, (TicketHolder::Entity(ref e), TicketKind::ActorMotion) if *e == op.entity)
-                    }) {
-                        continue;
-                    }
                     self.issue_actor_motion_ticket(op.entity);
                 }
-                // 状态操作:应用到该实体**全部**实体票(瞬态/常驻各一张,
-                // 同一操作语义下双应用无害——表幂等;End 是关键:任一票都该撤)。
                 _ => {
+                    // 定向到当前票种;ownership 已 release(终结同拍)→ 无定向:
+                    // 全部实体票都 End(终结语义,End 才进此分支兜底)。
                     let keys: Vec<_> = self
                         .tickets
                         .iter()
-                        .filter(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == op.entity))
+                        .filter(|(k, _)| {
+                            matches!(k.0, TicketHolder::Entity(e) if e == op.entity)
+                                && match target_kind(self, op.entity) {
+                                    Some(kind) => k.1 == kind,
+                                    None => op.op == physics_sim::TicketOp::End,
+                                }
+                        })
                         .map(|(k, _)| k)
                         .collect();
                     for key in keys {
@@ -1722,6 +1820,53 @@ impl Scheduler {
                 }
                 physics_sim::tickets::TicketHolder::Observer(_) => {}
             }
+        }
+
+        // 7.6 不变量 I3(REQ-007 §4.3.6;06a;放行评论风险 1):应用完
+        // ticket_ops(7.4)与终结判定/票据时钟(7.5)之后、`coordinator.
+        // advance()` 之前,每拍恰一次,生产路径。激活未启用不校验(D17:
+        // 启用当拍的补签让 I3 从该拍起成立)。输入汇聚(放行评论风险 3/4):
+        // - 存活 = EntityOwnership(actor 元数据同拍已由 sync_entity_ownership
+        //   更新——MarkActor 分片改标记当拍即同步,不误报);在途 = Router
+        //   待投递迁移信封(actor 取信封载荷——风险 2);
+        // - 冻结/承载 = 各分片实体状态查询(分片上报,不新增快照字段——
+        //   任务书偏离第 1 条)。"冻结"口径 = kinematic ∧ 非待地形(待地形
+        //   体 kinematic 但票语义与醒着同,§4.4.2 状态表只对"冻结"行豁免)。
+        if self.activation_enabled() {
+            let mut alive_or_in_transit: BTreeMap<EntityId, bool> = BTreeMap::new();
+            for (id, owner) in self.entity_ownership.iter() {
+                alive_or_in_transit.insert(*id, owner.actor);
+            }
+            for env in self.router.in_transit_migrations() {
+                if let messaging::EnvelopePayload::MigrateEntity { entity, actor, .. } =
+                    &env.payload
+                {
+                    alive_or_in_transit.insert(*entity, *actor);
+                }
+            }
+            let mut frozen_actors: BTreeSet<EntityId> = BTreeSet::new();
+            let mut suspended_carried: BTreeSet<EntityId> = BTreeSet::new();
+            for (id, owner) in self.entity_ownership.iter() {
+                if self.entity_state(owner.shard, *id).is_none() {
+                    continue;
+                }
+                // 待地形体不算冻结(见上);承载 = 分片记录口径(与 Suspend
+                // 操作同源——emit_carry_ticket_ops 写入)。
+                let frozen =
+                    self.is_frozen(owner.shard, *id) && !self.is_awaiting_terrain(owner.shard, *id);
+                let carried = self.is_carried(owner.shard, *id);
+                if frozen && owner.actor {
+                    frozen_actors.insert(*id);
+                }
+                if frozen && !owner.actor && carried {
+                    suspended_carried.insert(*id);
+                }
+            }
+            self.tickets.check_invariants_i3(
+                &alive_or_in_transit,
+                &frozen_actors,
+                &suspended_carried,
+            );
         }
 
         // 8. 推进恰好一拍并汇报(决策 7:第 k 次调用执行第 k-1 拍)。
@@ -3435,6 +3580,243 @@ mod tests {
         assert!(
             sched.take_despawn_requests().contains(&shard),
             "票清 + 空 + idle 满 → 候选出现"
+        );
+        sched.shutdown();
+    }
+
+    // ==== REQ-007 任务 06a(MarkActor 转递 / I3 接线 / 幂等收口)====
+
+    /// §4.3.4 MarkActor 转递(生产 tick;经分片 MarkActor 命令):
+    /// 瞬态→常驻 `End TransientMotion`(之后按常驻规则);常驻→瞬态
+    /// `End ActorMotion` + `Issue TransientMotion`(新票时钟从切换拍起算);
+    /// 重复同值 MarkActor 不重签、不重置时钟。
+    ///
+    /// 变异锚定:转递缺失 / 切回瞬态沿用旧时钟 / 重复操作重置时钟,分别让
+    /// 各断言变红(纪律 11/12)。
+    #[test]
+    fn mark_actor_ticket_relays_both_ways() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            false,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+        ));
+        sched.tick();
+        let tkey = (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        assert!(sched.ticket_table().get(tkey).is_some(), "前置:瞬态票已签");
+        for _ in 0..5 {
+            sched.tick();
+        }
+        let ticks_before = sched.ticket_table().get(tkey).unwrap().clock.active_ticks;
+        // false → true:End TransientMotion;常驻票由 lifecycle 按状态签发
+        // (此处零重力静止 → 无常驻票,断言只剩瞬态票撤)。
+        sched
+            .submit(shard, stamped_mark(&sched, 1, e, true))
+            .expect("入箱");
+        sched.tick();
+        sched.tick(); // 拍末应用 → 下一拍生效
+        assert!(
+            sched.ticket_table().get(tkey).is_none(),
+            "切常驻后瞬态票应已撤(§4.3.4)"
+        );
+        // true → false:End ActorMotion(无)+ Issue TransientMotion(新票)。
+        let switch_at = sched.tick_now();
+        sched
+            .submit(shard, stamped_mark(&sched, 2, e, false))
+            .expect("入箱");
+        sched.tick();
+        sched.tick();
+        let t2 = sched.ticket_table().get(tkey).expect("切回瞬态应重签");
+        assert_eq!(
+            t2.clock.issued_at, switch_at,
+            "新票时钟从切换拍起算(非沿用旧票)"
+        );
+        assert_eq!(
+            t2.clock.active_ticks,
+            sched.tick_now().0 - switch_at.0,
+            "新票时钟重计(每 Active 拍 +1)"
+        );
+        let issued_at_new = t2.clock.issued_at;
+        // 重复同值 MarkActor(true 后再 true;此处已 false,连发 false):
+        // 无操作,不重签。
+        for _ in 0..3 {
+            sched
+                .submit(shard, stamped_mark(&sched, 3, e, false))
+                .expect("入箱");
+            sched.tick();
+        }
+        let t3 = sched.ticket_table().get(tkey).unwrap();
+        assert_eq!(
+            t3.clock.issued_at, issued_at_new,
+            "重复 MarkActor(同值)不重签"
+        );
+        assert!(
+            t3.clock.active_ticks > 1,
+            "时钟连续走(重复操作不重置;前置 active_ticks {})",
+            ticks_before
+        );
+        sched.shutdown();
+    }
+
+    fn stamped_mark(sched: &Scheduler, seq: u64, e: EntityId, actor: bool) -> StampedInput {
+        StampedInput {
+            apply_at: sched.tick_now(), // 当前拍(tick 开头前缀即应用)
+            source: InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::MarkActor { entity: e, actor }),
+        }
+    }
+
+    /// 06a:I3 经生产 tick 生效(守卫双向)。正向:启用模式下瞬态/常驻混跑
+    /// 数拍不误报(迁移守卫由 e2e acc_06a_i3_quiet_* 覆盖);反向:钩子删票
+    /// → 下一拍拍末 fail-stop(校验在 tick 内、每拍恰一次——绕过 tick 的
+    /// 校验过不了本测试)。
+    #[test]
+    fn i3_via_production_tick_fails_stop_on_violation() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            false,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+        ));
+        sched.tick();
+        for _ in 0..3 {
+            sched.tick(); // 正向:无误报
+        }
+        // 反向:钩子删票 → 下一拍 tick 拍末 panic(含 I3-1)。
+        sched
+            .test_hook_tickets_mut()
+            .end((TicketHolder::Entity(e), TicketKind::TransientMotion));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sched.tick();
+        }));
+        let msg = match result {
+            Ok(()) => panic!("删票后的 tick 应 fail-stop(I3-1)"),
+            Err(payload) => payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+        };
+        assert!(msg.contains("I3-1"), "panic 消息含条款编号:实为 {msg:?}");
+        // sched 的 worker 已被 panic 打断:不再 shutdown(join 会 panic)。
+        std::mem::forget(sched);
+    }
+
+    /// 06a:直通启用路径(set_observers)同样补签瞬态票(与收件箱启用路径
+    /// 同语义)——否则启用前已 spawn 的瞬态体在 I3 下裸奔(直通启用当拍即
+    /// fail-stop)。变异锚定:删掉 set_observers 的补签 → 本测试红。
+    #[test]
+    fn direct_enable_backfills_transient_tickets() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            false,
+        );
+        // 启用前 spawn(sim 注册即含实体);直通设观察者 → 启用 + 补签。
+        sched.set_observers(vec![types::glam::Vec3::new(8.0, 3.0, 8.0)]);
+        sched.tick();
+        let key = (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        let t = sched
+            .ticket_table()
+            .get(key)
+            .expect("直通启用当拍应补签瞬态票");
+        assert_eq!(t.clock.issued_at, Tick(0), "补签时钟 = 启用拍");
+        for _ in 0..3 {
+            sched.tick(); // I3 下持续无 panic
+        }
+        sched.shutdown();
+    }
+
+    /// 06a:传送(despawn + spawned 同拍)票保留、时钟继续——终结判定的
+    /// alive 检查必须看到**当前拍**重建后的实体(tick 循环中 self.sims 未
+    /// 回插的时机 bug 由 I3 暴露;变异锚定:回退 alive 检查 → 票被误 End →
+    /// 下一拍 I3-1 fail-stop,本测试 panic)。
+    #[test]
+    fn teleport_same_tick_keeps_ticket() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let e = EntityId::from_parts(1, 1);
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        spawn_sim_with(
+            &mut sched,
+            0,
+            0,
+            e,
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+            false,
+        );
+        sched.submit_observer(observer_input(
+            1,
+            0,
+            Tick(0),
+            types::glam::Vec3::new(8.0, 3.0, 8.0),
+        ));
+        sched.tick();
+        for _ in 0..5 {
+            sched.tick();
+        }
+        let tkey = (TicketHolder::Entity(e), TicketKind::TransientMotion);
+        let before = sched.ticket_table().get(tkey).unwrap().clock.active_ticks;
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: sched.tick_now(),
+                    source: InputSource::SCHEDULER,
+                    sequence: 7,
+                    payload: InputPayload::Command(SimCommand::TeleportEntity {
+                        entity: e,
+                        state: types::EntityState {
+                            translation: types::glam::Vec3::new(9.0, 3.0, 9.0),
+                            ..types::EntityState::default()
+                        },
+                    }),
+                },
+            )
+            .expect("入箱");
+        sched.tick(); // 传送拍
+        for _ in 0..3 {
+            sched.tick(); // 后续拍:票必须在、时钟连续、I3 不拦
+        }
+        let t = sched
+            .ticket_table()
+            .get(tkey)
+            .expect("传送后瞬态票保留(§4.3.3)");
+        assert_eq!(t.clock.issued_at, Tick(0), "键不变(时钟继续)");
+        assert!(
+            t.clock.active_ticks > before,
+            "时钟连续走(active {} > 前值 {before})",
+            t.clock.active_ticks
         );
         sched.shutdown();
     }

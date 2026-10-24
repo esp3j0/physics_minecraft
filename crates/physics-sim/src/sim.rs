@@ -2081,6 +2081,13 @@ impl ShardSim {
         })
     }
 
+    /// 实体的承载记录(06a;I3 第 4 条后半的 `suspended_carried` 输入——
+    /// 与 Suspend/Resume 操作同源的记录口径,`emit_carry_ticket_ops` 与
+    /// 冻结落实写入)。实体不在表 → false。
+    pub fn is_carried(&self, id: EntityId) -> bool {
+        self.entities.get(&id).is_some_and(|rec| rec.carried)
+    }
+
     // ---- 内部 ----
 
     /// 体素写入统一出口(任务 04c;§4.11:任何体素写入都登记被改写的格)。

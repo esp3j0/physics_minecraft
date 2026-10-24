@@ -1452,7 +1452,6 @@ fn ticket_of_falling_transient(h: &mut Harness, e: EntityId, at: Vec3) -> Stored
 /// 会变红的实现:没有 I3 校验;校验不在 `tick` 的生产路径上(只在单测里调用);
 /// 只查"票指向的实体还在",不查"实体都有票"。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 #[should_panic(expected = "I3-1")]
 fn acc_06a_i3_live_transient_without_ticket_fails_stop() {
     let mut h = Harness::new(|_| {});
@@ -1469,7 +1468,6 @@ fn acc_06a_i3_live_transient_without_ticket_fails_stop() {
 ///
 /// 会变红的实现:只按"实体都有票"单向检查;不存在的持有者被静默跳过。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 #[should_panic(expected = "I3-2")]
 fn acc_06a_i3_ticket_for_dead_entity_fails_stop() {
     let mut h = Harness::new(|_| {});
@@ -1489,7 +1487,6 @@ fn acc_06a_i3_ticket_for_dead_entity_fails_stop() {
 ///
 /// 会变红的实现:不核对票种与实体的 actor 标记;只检查瞬态体一侧。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 #[should_panic(expected = "I3-3")]
 fn acc_06a_i3_actor_holding_transient_ticket_fails_stop() {
     let mut h = Harness::new(|_| {});
@@ -1511,7 +1508,6 @@ fn acc_06a_i3_actor_holding_transient_ticket_fails_stop() {
 ///
 /// 会变红的实现:I3 不看冻结状态;冻结信息没有从分片汇聚到调度器。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 #[should_panic(expected = "I3-4")]
 fn acc_06a_i3_frozen_actor_holding_motion_ticket_fails_stop() {
     let mut h = Harness::new(|_| {});
@@ -1537,7 +1533,6 @@ fn acc_06a_i3_frozen_actor_holding_motion_ticket_fails_stop() {
 ///
 /// 会变红的实现:I3 只查票是否存在,不查承载冻结体的票据状态。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 #[should_panic(expected = "I3-4")]
 fn acc_06a_i3_carried_frozen_transient_must_stay_suspended() {
     let mut h = Harness::new(|_| {});
@@ -1573,7 +1568,6 @@ fn acc_06a_i3_carried_frozen_transient_must_stay_suspended() {
 /// (在途窗口误报 I3-1/I3-2);凝固终结与迁移 despawn 混淆;MarkActor 切换当拍
 /// 票据没收口。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06a_i3_quiet_across_migration_solidify_and_mark_actor() {
     let mut h = Harness::new(|_| {});
     h.set_observer(Vec3::new(128.0, GROUND_Y, 72.5));
@@ -1635,7 +1629,6 @@ fn acc_06a_i3_quiet_across_migration_solidify_and_mark_actor() {
 /// 会变红的实现:实体票 Issue 遇键已在时覆盖(时钟被重置);重复 MarkActor 报错
 /// 或留下两种票;切回瞬态沿用旧票时钟。
 #[test]
-#[ignore = "REQ-007 06a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06a_repeated_mark_actor_keeps_ticket_clock() {
     let mut h = Harness::new(|_| {});
     enable_activation(&mut h);

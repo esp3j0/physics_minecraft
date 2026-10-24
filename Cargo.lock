@@ -884,6 +884,7 @@ dependencies = [
  "messaging",
  "physics-sim",
  "serde",
+ "shard",
  "thiserror",
  "types",
  "voxel",

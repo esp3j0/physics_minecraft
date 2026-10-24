@@ -7,11 +7,11 @@
 //! Suspend 等遇不存在或已在目标态 → 无操作。正确性由每拍不变量校验兜底
 //! (I3,06 落地),比逐条操作报错更严格。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
-use types::Tick;
 use types::glam::Vec3;
+use types::{EntityId, Tick};
 
 use physics_sim::tickets::{TicketClock, TicketHolder, TicketKind, TicketState, TicketView};
 
@@ -171,6 +171,90 @@ impl TicketTable {
             .map(|k| k.0)
             .expect("order 由 views() 生成,必在全表键序内")
     }
+
+    /// 不变量 I3(REQ-007 §4.3.6/D14;任务书 06):违反即 panic(fail-stop),
+    /// 消息含被违反条款编号 `I3-<n>`(n 为 §4.3.6 列表序号 1–4)与实体/票键。
+    /// 调用点 = `Scheduler::tick` 拍末(应用 ticket_ops 与终结判定、推进时钟
+    /// 之后),每拍恰一次;激活未启用不校验(D17:启用当拍的补签让 I3 从该
+    /// 拍起成立)。输入(任务书签名固定):
+    /// - `alive_or_in_transit`:存活(EntityOwnership)∪ 在途(Router 待投递
+    ///   迁移信封)实体及其 actor 标记(在途取信封载荷——风险 2:迁移在途
+    ///   窗口的 actor 以信封为准);
+    /// - `frozen_actors`:冻结的常驻体集(滞回冻结,待地形不算——待地形的
+    ///   常驻体票语义与醒着同,§4.4.2 状态表只对"冻结"行豁免);
+    /// - `suspended_carried`:承载静止冻结的瞬态体集(其 TransientMotion 应
+    ///   处于 Suspended;与 Suspend 操作同源的记录口径)。
+    ///
+    /// 复杂度(风险 7):O(票数·log)——每张实体票按持有者查 BTreeMap,无
+    /// "每实体扫全表"的二重循环。
+    pub fn check_invariants_i3(
+        &self,
+        alive_or_in_transit: &BTreeMap<EntityId, bool>,
+        frozen_actors: &BTreeSet<EntityId>,
+        suspended_carried: &BTreeSet<EntityId>,
+    ) {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+        let actor_of = |e: EntityId| -> Option<bool> { alive_or_in_transit.get(&e).copied() };
+        // 逐票检查(键序遍历,确定性 = 首个违反者按键序固定)。
+        for (key, t) in self.tickets.iter() {
+            let TicketHolder::Entity(e) = key.0 else {
+                continue; // 观察者/区域票不属 I3(I3 全部关于实体票)
+            };
+            let kind = key.1;
+            let Some(actor) = actor_of(e) else {
+                // 第 2 条:实体票的持有者必须存活或在途(不存在指向已终结
+                // 实体的票)。
+                panic!(
+                    "I3-2 违反:实体票 ({e:?}, {kind:?}) 的持有者既不存活也非迁移在途\
+                     (票指向已终结实体,fail-stop;§4.3.6)"
+                );
+            };
+            // 第 3 条:瞬态不持 ActorMotion、常驻不持 TransientMotion。
+            if (kind == TicketKind::TransientMotion && actor)
+                || (kind == TicketKind::ActorMotion && !actor)
+            {
+                panic!(
+                    "I3-3 违反:票 ({e:?}, {kind:?}) 与持有者的 actor 标记不符 \
+                     (actor = {actor};瞬态体不持 ActorMotion、常驻体不持 \
+                     TransientMotion,fail-stop;§4.3.6)"
+                );
+            }
+            // 第 4 条前半:冻结的常驻体不持 ActorMotion。
+            if kind == TicketKind::ActorMotion && frozen_actors.contains(&e) {
+                panic!(
+                    "I3-4 违反:冻结的常驻体 {e:?} 持 ActorMotion 票 \
+                     (冻结常驻体不持运动票,fail-stop;§4.3.6)"
+                );
+            }
+            // 第 4 条后半:承载静止冻结的瞬态体,其 TransientMotion 应处于
+            // Suspended(任何非 Suspended 状态都违反——挂起是 Suspend 操作
+            // 的唯一合法落点)。
+            if kind == TicketKind::TransientMotion
+                && suspended_carried.contains(&e)
+                && t.state != TicketState::Suspended
+            {
+                panic!(
+                    "I3-4 违反:承载静止冻结的瞬态体 {e:?} 的 TransientMotion \
+                     状态为 {:?}(应为 Suspended,fail-stop;§4.3.6)",
+                    t.state
+                );
+            }
+        }
+        // 第 1 条:每个存活或在途的瞬态体恰好持一张 TransientMotion 票。
+        // 按 BTreeMap 键有序;瞬态票种类唯一 ⇒ "有键"即"恰一张"。
+        for (e, actor) in alive_or_in_transit {
+            if *actor {
+                continue;
+            }
+            let key = (TicketHolder::Entity(*e), TicketKind::TransientMotion);
+            if !self.tickets.contains_key(&key) {
+                panic!(
+                    "I3-1 违反:存活的瞬态体 {e:?} 不持 TransientMotion 票 \
+                     (每存活或在途瞬态体恰持一张,fail-stop;§4.3.6)"
+                );
+            }
+        }
+    }
 }
 
 /// 派生票据种类(签发侧的票种选择;§4.2.3 规则表——种类逻辑只允许出现在
@@ -189,6 +273,7 @@ mod tests {
     use physics_sim::tickets::{
         RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, WakeSpec,
     };
+    use std::collections::BTreeSet;
     use types::EntityId;
 
     fn now() -> Tick {
@@ -422,5 +507,192 @@ mod tests {
             before,
             "Suspended 时钟停"
         );
+    }
+
+    // ==== REQ-007 任务 06a(幂等矩阵 + I3 校验器)====
+
+    fn actor_key(n: u32) -> TicketKey {
+        (
+            TicketHolder::Entity(EntityId::from_parts(1, n)),
+            TicketKind::ActorMotion,
+        )
+    }
+
+    /// 任务书测试 `shard/tickets::all_ops_idempotent_matrix`(T19/D14/§4.3.1):
+    /// 6 操作 × (键已存在 / 不存在 / 已在目标态) 全矩阵——无 panic,状态与时钟
+    /// 符合预期;同拍同票多操作结果 = 单次(不同路径重复操作不误报)。每个
+    /// 分支失效(某操作非幂等)都会让对应断言变红(纪律 12)。
+    #[test]
+    fn all_ops_idempotent_matrix() {
+        // ---- 实体票:Issue 键已在(不重置时钟、不改状态)----
+        let mut t = TicketTable::new();
+        t.issue(entity_key(1), ticket(1, Some(50)), now());
+        t.set_state(entity_key(1), TicketState::Paused);
+        for _ in 0..7 {
+            t.advance_clocks();
+        }
+        let before = t.get(entity_key(1)).cloned().unwrap();
+        // 新规格/新 issued_at 重发:必须被整体忽略(覆盖 = 重置时钟即违反 D14)。
+        t.issue(entity_key(1), ticket(9, Some(9)), Tick(999));
+        let after = t.get(entity_key(1)).cloned().unwrap();
+        assert_eq!(
+            after, before,
+            "实体票 Issue 键已在 → 无操作(不重置时钟、不改状态、不换规格)"
+        );
+
+        // ---- End:存在 / 不存在 ----
+        let mut t = TicketTable::new();
+        t.issue(entity_key(2), ticket(1, None), now());
+        t.end(entity_key(2));
+        assert!(t.get(entity_key(2)).is_none(), "End 存在的票 → 删除");
+        t.end(entity_key(2));
+        t.end(actor_key(2));
+        assert!(
+            t.get(entity_key(2)).is_none(),
+            "End 不存在 → 无操作不 panic"
+        );
+
+        // ---- Pause / Unpause:已在目标态 / 不存在 ----
+        let mut t = TicketTable::new();
+        t.issue(entity_key(3), ticket(1, None), now());
+        t.advance_clocks();
+        t.set_state(entity_key(3), TicketState::Paused);
+        t.set_state(entity_key(3), TicketState::Paused); // 已在 Paused
+        assert_eq!(t.get(entity_key(3)).unwrap().state, TicketState::Paused);
+        t.set_state(actor_key(3), TicketState::Paused); // 票不存在
+        assert!(t.get(actor_key(3)).is_none(), "Pause 不存在的票不凭空建票");
+        t.set_state(entity_key(3), TicketState::Active); // Unpause 回 Active
+        t.set_state(entity_key(3), TicketState::Active); // 已在 Active(同拍重复)
+        assert_eq!(t.get(entity_key(3)).unwrap().state, TicketState::Active);
+
+        // ---- Suspend / Resume:已在目标态 / 不存在;Resume 恢复 Active ----
+        let mut t = TicketTable::new();
+        t.issue(entity_key(4), ticket(1, None), now());
+        t.set_state(entity_key(4), TicketState::Suspended);
+        t.set_state(entity_key(4), TicketState::Suspended); // 已在 Suspended
+        assert_eq!(t.get(entity_key(4)).unwrap().state, TicketState::Suspended);
+        let ticks_at_suspend = t.get(entity_key(4)).unwrap().clock.active_ticks;
+        for _ in 0..3 {
+            t.advance_clocks();
+        }
+        assert_eq!(
+            t.get(entity_key(4)).unwrap().clock.active_ticks,
+            ticks_at_suspend,
+            "Suspended 时钟停(重复 Suspend 不借状态切换推进时钟)"
+        );
+        t.set_state(entity_key(4), TicketState::Active); // Resume → Active
+        t.set_state(entity_key(4), TicketState::Active); // 已在 Active
+        assert_eq!(t.get(entity_key(4)).unwrap().state, TicketState::Active);
+        t.set_state(actor_key(4), TicketState::Suspended); // 不存在
+        t.set_state(actor_key(4), TicketState::Active);
+        assert!(t.get(actor_key(4)).is_none(), "状态操作不存在的票不建票");
+
+        // ---- 观察者/区域票:覆盖 = 续期(与实体票行为对照)----
+        let mut t = TicketTable::new();
+        t.issue(area_key(5), ticket(1, Some(3)), now());
+        t.advance_clocks();
+        t.issue(area_key(5), ticket(1, Some(30)), Tick(888));
+        let got = t.get(area_key(5)).unwrap();
+        assert_eq!(got.clock.issued_at, Tick(888), "区域票覆盖 = 续期(S3)");
+        assert_eq!(got.clock.active_ticks, 0);
+        assert_eq!(got.clock.limit, Some(30));
+
+        // ---- 同拍同票多操作(不同路径)= 单次:先 End 后 Issue(键序下
+        // End < 状态操作;这里按语义)净效果由最后的应用决定,不得 panic、
+        // 不得出现双票或时钟错乱。常驻静止分片发 End、同拍调度器终结判定
+        // 也 End(D14 的例子)→ 结果一致。
+        let mut t = TicketTable::new();
+        t.issue(actor_key(6), ticket(1, None), now());
+        t.end(actor_key(6));
+        t.end(actor_key(6));
+        // End 后再签 = 新建(生产侧构造 StoredTicket 时自带 issued_at = 当前拍;
+        // `issue` 的 now 参数只作用于观察者/区域票的覆盖续期)。
+        let mut renewed = ticket(1, None);
+        renewed.clock.issued_at = Tick(777);
+        renewed.clock.active_ticks = 0;
+        t.issue(actor_key(6), renewed, Tick(777));
+        let got = t.get(actor_key(6)).unwrap();
+        assert_eq!(
+            got.clock.issued_at,
+            Tick(777),
+            "End 后重签 = 新票(时钟从重签拍起算);全程无 panic"
+        );
+    }
+
+    // ---- I3 校验器单测(校验逻辑本体;生产接线由 e2e acc_06a_* 走)----
+
+    fn e(n: u32) -> EntityId {
+        EntityId::from_parts(1, n)
+    }
+
+    /// 四条规则各一条变异锚定:关掉对应规则(单测内手写违反场景)→ 红。
+    /// 这里正向断言四类违反各自 panic 且消息含 `I3-<n>`。
+    #[test]
+    #[should_panic(expected = "I3-1")]
+    fn i3_transient_without_ticket_panics() {
+        let t = TicketTable::new();
+        let alive = BTreeMap::from([(e(1), false)]);
+        t.check_invariants_i3(&alive, &BTreeSet::new(), &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "I3-2")]
+    fn i3_ticket_to_dead_entity_panics() {
+        let mut t = TicketTable::new();
+        t.issue(entity_key(9), ticket(1, None), now());
+        t.check_invariants_i3(&BTreeMap::new(), &BTreeSet::new(), &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "I3-3")]
+    fn i3_actor_with_transient_ticket_panics() {
+        let mut t = TicketTable::new();
+        t.issue(entity_key(1), ticket(1, None), now());
+        let alive = BTreeMap::from([(e(1), true)]);
+        t.check_invariants_i3(&alive, &BTreeSet::new(), &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "I3-3")]
+    fn i3_transient_with_actor_ticket_panics() {
+        let mut t = TicketTable::new();
+        t.issue(actor_key(1), ticket(1, None), now());
+        let alive = BTreeMap::from([(e(1), false)]);
+        t.check_invariants_i3(&alive, &BTreeSet::new(), &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "I3-4")]
+    fn i3_frozen_actor_with_motion_ticket_panics() {
+        let mut t = TicketTable::new();
+        t.issue(actor_key(1), ticket(1, None), now());
+        let alive = BTreeMap::from([(e(1), true)]);
+        let frozen = BTreeSet::from([e(1)]);
+        t.check_invariants_i3(&alive, &frozen, &BTreeSet::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "I3-4")]
+    fn i3_carried_frozen_transient_needs_suspended_panics() {
+        let mut t = TicketTable::new();
+        t.issue(entity_key(1), ticket(1, None), now());
+        let alive = BTreeMap::from([(e(1), false)]);
+        let carried = BTreeSet::from([e(1)]);
+        t.check_invariants_i3(&alive, &BTreeSet::new(), &carried);
+    }
+
+    /// 合法态不误报:常驻持 ActorMotion(Active)、瞬态持 TransientMotion
+    /// (Suspended 且在 carried 集)、冻结常驻无票——全部通过(无 panic)。
+    #[test]
+    fn i3_holds_on_legal_state() {
+        let mut t = TicketTable::new();
+        t.issue(entity_key(1), ticket(1, None), now()); // 瞬态
+        t.set_state(entity_key(1), TicketState::Suspended);
+        t.issue(actor_key(2), ticket(1, None), now()); // 常驻(醒着)
+        t.issue(area_key(3), ticket(1, None), now()); // 区域票不参与
+        let alive = BTreeMap::from([(e(1), false), (e(2), true)]);
+        let frozen = BTreeSet::new(); // e2 常驻醒着,不在冻结表
+        let carried = BTreeSet::from([e(1)]);
+        t.check_invariants_i3(&alive, &frozen, &carried);
     }
 }
