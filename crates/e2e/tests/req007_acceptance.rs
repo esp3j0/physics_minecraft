@@ -2184,7 +2184,6 @@ fn assert_activation_params(config: &Config, expect: &physics_sim::ActivationCon
 /// 会变红的实现:新参数没有 toml 键(仍写死默认值);只注入了分片配置、调度器
 /// 那份没跟上;区域票上限没接到会话;序列化漏掉新键。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_all_params_injectable() {
     let config = Config::from_toml_str(ALL_PARAMS_TOML).expect("全参数配置合法");
     let expect = physics_sim::ActivationConfig {
@@ -2244,7 +2243,6 @@ fn acc_06c_all_params_injectable() {
 ///
 /// 会变红的实现:默认值漂移;分片与调度器两处默认不一致。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_defaults_match_requirement() {
     let config = Config::default();
     let expect = physics_sim::ActivationConfig {
@@ -2282,7 +2280,6 @@ fn acc_06c_defaults_match_requirement() {
 /// 会变红的实现:旧键被删(旧配置文件读不进来或静默失效);别名只映射到 ①、
 /// ② 没跟上;新旧同给时旧键覆盖新键。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_legacy_keys_alias() {
     let legacy = Config::from_toml_str(
         "swap_budget_chunks_per_tick = 6\n\
@@ -2340,7 +2337,6 @@ fn acc_06c_legacy_keys_alias() {
 /// 会变红的实现:不校验(非法配置被静默接受,运行期才出现 I1 违反);错误信息
 /// 不指出是哪个键。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_validation_rejects_bad_config() {
     for (toml, key) in [
         (
@@ -2387,7 +2383,6 @@ fn telemetry_sum(
 /// 会变红的实现:遥测没接线(恒 0);计数口径与实况不符(例如待地形算进冻结、
 /// 只数原点分片、拍末状态取错时点)。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_telemetry_state_counts_match_world() {
     let mut h = Harness::new(|_| {});
     h.set_observer(Vec3::new(72.5, GROUND_Y, 60.0));
@@ -2501,7 +2496,6 @@ fn acc_06c_telemetry_state_counts_match_world() {
 /// 会变红的实现:没接线;来源归类错(例如传播算进预测);按组而不是按实体计;
 /// 推迟没计数。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_telemetry_counts_wake_sources() {
     // 一排五个。
     let mut h = Harness::new(|cfg| cfg.gravity = Vec3::ZERO);
@@ -2605,7 +2599,6 @@ fn acc_06c_telemetry_counts_wake_sources() {
 ///
 /// 会变红的实现:没接线;截止与超预算不分;虚空移除算进强制落地;触顶没计数。
 #[test]
-#[ignore = "REQ-007 06c 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_06c_telemetry_counts_landings_and_caps() {
     // 截止落地。
     let config = Config::from_toml_str("[activation]\ntransient_settle_deadline_ticks = 30\n")

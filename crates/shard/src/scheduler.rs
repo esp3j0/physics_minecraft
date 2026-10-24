@@ -30,8 +30,9 @@ use crate::router::{RouteError, Router, RouterConfig, RouterSnapshot};
 /// (元素 = (分片, sim 所有权, 本拍输入前缀),ShardId 升序)。
 type WorkerJob = Vec<(ShardId, ShardSim, Vec<StampedInput>)>;
 
-/// worker 回传:sim 连同本拍产出(回传完成顺序不定,屏障后进 BTreeMap 归一)。
-type WorkerResult = Vec<(ShardId, ShardSim, Outbox)>;
+/// worker 回传:sim 连同本拍产出与激活事件计数(06c 遥测;回传完成顺序不定,
+/// 屏障后进 BTreeMap 归一)。
+type WorkerResult = Vec<(ShardId, ShardSim, Outbox, physics_sim::ActivationEvents)>;
 
 /// worker 线程主体:循环收批;逐 job `apply_prefix → step → take_outbox` 后回传。
 ///
@@ -50,7 +51,10 @@ fn worker_main(job_rx: Receiver<WorkerJob>, result_tx: SyncSender<WorkerResult>)
                 // outbox(despawned/Emergent BlockWrite/ticket_ops)。
                 sim.run_transient_lifecycle();
                 let outbox = sim.take_outbox();
-                (shard, sim, outbox)
+                // 06c 遥测:生命周期产出并入计数后取走(取走即清,每拍重算;
+                // 与 outbox 同拍同序,屏障后调度器合计)。
+                let events = sim.take_activation_events();
+                (shard, sim, outbox, events)
             })
             .collect();
         if result_tx.send(result).is_err() {
@@ -1537,13 +1541,14 @@ impl Scheduler {
 
         // 5. 屏障:收齐全部已派发 worker 的结果;回传完成顺序不定,
         //    BTreeMap<ShardId, _> 归一(确定性)。
-        let mut results: BTreeMap<ShardId, (ShardSim, Outbox)> = BTreeMap::new();
+        let mut results: BTreeMap<ShardId, (ShardSim, Outbox, physics_sim::ActivationEvents)> =
+            BTreeMap::new();
         for &slot in &dispatched {
             let batch = self.result_rxs[slot]
                 .recv()
                 .expect("worker 结果通道断开:一致性违规(fail-stop)");
-            for (shard, sim, outbox) in batch {
-                results.insert(shard, (sim, outbox));
+            for (shard, sim, outbox, events) in batch {
+                results.insert(shard, (sim, outbox, events));
             }
         }
 
@@ -1551,12 +1556,25 @@ impl Scheduler {
         //    迭代天然升序):迁移意图盖章入队;涌现事件广播;凝固/涌现 block
         //    write 分流(External 发布 / Emergent 发布+solidified 兼容+信封)。
         let mut migrations_admitted = 0usize;
+        // 06c 遥测事件量合计(§4.16:全部分片合计;每拍重算)。
+        let mut events = physics_sim::ActivationEvents::default();
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
         // 方块写入收集(REQ-005 D11):同款恰一次;owner 过滤逐条判定。
         self.block_updates.clear();
-        for (shard, (sim, outbox)) in results {
+        for (shard, (sim, outbox, shard_events)) in results {
+            // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
+            events.forced_landings_deadline += shard_events.forced_landings_deadline;
+            events.forced_landings_budget += shard_events.forced_landings_budget;
+            events.void_removals += shard_events.void_removals;
+            events.wakes_contact_pred += shard_events.wakes_contact_pred;
+            events.wakes_contact_comp += shard_events.wakes_contact_comp;
+            events.wakes_contact_spread += shard_events.wakes_contact_spread;
+            events.wakes_terrain += shard_events.wakes_terrain;
+            events.closure_deferred += shard_events.closure_deferred;
+            events.contact_wake_skipped_no_terrain += shard_events.contact_wake_skipped_no_terrain;
+            events.actor_motion_capped += shard_events.actor_motion_capped;
             match self.router.collect_intents(shard, &outbox.migrations, at) {
                 Ok(()) => migrations_admitted += outbox.migrations.len(),
                 // TODO(反压):队列满当前的策略是 fail-stop;后续轮次接入
@@ -1931,12 +1949,79 @@ impl Scheduler {
         }
 
         // 8. 推进恰好一拍并汇报(决策 7:第 k 次调用执行第 k-1 拍)。
+        // 06c 遥测状态量(§4.16):**拍末**(7.4 ticket_ops 应用、7.5 时钟/
+        // 到期、7.6 I3 之后)= 本拍语义终态;驱动编排(装卸)在两拍之间,
+        // 不在本时点(放行评论风险 4)。全部分片合计:
+        // - 票据:种类 × 状态直接读票据表;
+        // - chunk:① = 分片体素在册;② = 分片 built_colliders;
+        // - 实体:三分(醒着 / 待地形 / 冻结,互斥且覆盖全部实体——与 I3
+        //   同口径:冻结 = kinematic ∧ 非待地形),另计被承载(有实体支撑
+        //   记录者,醒着或冻结均计)。
+        let mut telemetry = ActivationTelemetry {
+            chunks_data: 0,
+            chunks_collider: 0,
+            entities_awake: 0,
+            entities_awaiting_terrain: 0,
+            entities_frozen: 0,
+            entities_carried: 0,
+            ..ActivationTelemetry::default()
+        };
+        for (holder, ticket) in self.tickets.iter() {
+            let kind = match holder.1 {
+                physics_sim::tickets::TicketKind::Observer => 0,
+                physics_sim::tickets::TicketKind::Area => 1,
+                physics_sim::tickets::TicketKind::TransientMotion => 2,
+                physics_sim::tickets::TicketKind::ActorMotion => 3,
+            };
+            let state = match ticket.state {
+                physics_sim::TicketState::Active => 0,
+                physics_sim::TicketState::Paused => 1,
+                physics_sim::TicketState::Suspended => 2,
+            };
+            telemetry.tickets[kind][state] += 1;
+        }
+        for sim in self.sims.values() {
+            telemetry.chunks_data += sim.voxel().chunk_count();
+            telemetry.chunks_collider += sim.collider_chunk_count();
+            for (id, _source, _actor) in sim.entity_owners() {
+                let awaiting = sim.is_awaiting_terrain(id);
+                let frozen = sim.is_frozen(id) && !awaiting;
+                if awaiting {
+                    telemetry.entities_awaiting_terrain += 1;
+                } else if frozen {
+                    telemetry.entities_frozen += 1;
+                } else {
+                    telemetry.entities_awake += 1;
+                }
+                if sim.is_carried(id) {
+                    telemetry.entities_carried += 1;
+                }
+            }
+        }
         self.coordinator.advance();
         TickSummary {
             tick: at,
             stepped_shards,
             migrations_admitted,
-            telemetry: ActivationTelemetry::default(),
+            telemetry: ActivationTelemetry {
+                tickets: telemetry.tickets,
+                chunks_data: telemetry.chunks_data,
+                chunks_collider: telemetry.chunks_collider,
+                entities_awake: telemetry.entities_awake,
+                entities_awaiting_terrain: telemetry.entities_awaiting_terrain,
+                entities_frozen: telemetry.entities_frozen,
+                entities_carried: telemetry.entities_carried,
+                forced_landings_deadline: events.forced_landings_deadline,
+                forced_landings_budget: events.forced_landings_budget,
+                void_removals: events.void_removals,
+                wakes_contact_pred: events.wakes_contact_pred,
+                wakes_contact_comp: events.wakes_contact_comp,
+                wakes_contact_spread: events.wakes_contact_spread,
+                wakes_terrain: events.wakes_terrain,
+                closure_deferred: events.closure_deferred,
+                contact_wake_skipped_no_terrain: events.contact_wake_skipped_no_terrain,
+                actor_motion_capped: events.actor_motion_capped,
+            },
         }
     }
 
@@ -5673,6 +5758,114 @@ mod tests {
             )
             .expect("入箱");
         sched.tick();
+    }
+
+    /// 任务书测试 `shard::tick_summary_counts`(REQ-007 06c;§4.16):拍末
+    /// 状态量(票据按种类 × 状态、①/② chunk 数、实体醒着/冻结/被承载)与
+    /// 事件量(虚空移除)逐字段核对。变异即红:恒 0(桩)、待地形算进冻结、
+    /// 只数一个分片、拍末时点取错。
+    ///
+    /// 场景:观察者票 + 区域票(① 档);分片 (0,0) 手工合一装载 1 块
+    /// (①=②=1),分片 (1,0) 数据-only 装载 1 块(①=1、②=0,经 apply_
+    /// chunk_load 后 unload_chunk 的 ② 部分不重建——直接以两分片合计口径
+    /// 断言);(0,0) 一个贴地瞬态体(落地后 Active 票 + 醒着)+ (1,0) 一个
+    /// 出生在虚空线下的瞬态体(虚空移除 1)。
+    #[test]
+    fn tick_summary_counts() {
+        use physics_sim::tickets::{TicketHolder, TicketKind};
+
+        fn ground_chunk() -> voxel::Chunk {
+            let mut ground = voxel::Chunk::air();
+            for gx in 0..voxel::CHUNK_X {
+                for gz in 0..voxel::CHUNK_Z {
+                    ground.set(gx, 64, gz, BlockId(1));
+                }
+            }
+            ground
+        }
+
+        let mut sched = Scheduler::new(sched_cfg(1));
+        sched.register(sim(0, 0));
+        sched.register(sim(1, 0));
+        // 启用前合一装载(§4.0 未启用模式:① + ② 同建,①=②=1 的直接来源)。
+        sched.apply_chunk_load(shard_id(0, 0), ChunkPos::new(0, 0), ground_chunk());
+        // 启用激活:观察者票(source 7)——票据计数与拍末时点锚定。
+        sched.set_observers(vec![Vec3::new(8.0, 66.0, 8.0)]);
+        // 区域票(① 档):Area/Active 计数锚定。
+        sched.apply_area_ticket(1, Vec3::new(8.0, 66.0, 8.0), 16.0, 0b001, None);
+        // 分片 (1,0) 出生在虚空线下的瞬态体:本拍虚空移除(事件量锚定)。
+        // x/z 取 (1,0) 本体区(chunk 8..16;否则出生即触发迁移检测,不走去
+        // 虚空移除路径)。
+        let void_e = EntityId::from_parts(1, 2);
+        sched
+            .submit(
+                shard_id(1, 0),
+                cmd_input(
+                    InputSource(7),
+                    1,
+                    Tick::ZERO,
+                    SimCommand::SpawnDynamic {
+                        entity: void_e,
+                        state: EntityState {
+                            translation: Vec3::new(136.0, (types::WORLD_Y_MIN - 40) as f32, 8.0),
+                            ..EntityState::default()
+                        },
+                        desc: types::EntityDesc::default(),
+                    },
+                ),
+            )
+            .expect("入箱");
+        let summary = sched.tick();
+        let t = summary.telemetry;
+
+        // 票据:观察者 1 Active + 区域 1 Active。
+        assert_eq!(
+            t.ticket_count(TicketKind::Observer, physics_sim::TicketState::Active),
+            1,
+            "观察者票 Active 1"
+        );
+        assert_eq!(
+            t.ticket_count(TicketKind::Area, physics_sim::TicketState::Active),
+            1,
+            "区域票 Active 1"
+        );
+        assert_eq!(
+            t.ticket_count(TicketKind::ActorMotion, physics_sim::TicketState::Active),
+            0,
+            "无 ActorMotion 票"
+        );
+
+        // ①/②:两分片合计——(0,0) 1 块 ①② 同建;(1,0) 启用后无激活装载,
+        // 启用前无手工装载 → 0。chunks_data = 1、chunks_collider = 1。
+        assert_eq!(t.chunks_data, 1, "① 只有 (0,0) 手工装载的 1 块");
+        assert_eq!(t.chunks_collider, 1, "② 只有 (0,0) 的 1 块");
+
+        // 实体:虚空线下的瞬态体已移除(事件量);(0,0) 无实体。
+        assert_eq!(
+            (
+                t.entities_awake,
+                t.entities_awaiting_terrain,
+                t.entities_frozen
+            ),
+            (0, 0, 0),
+            "虚空体已移除,无实体"
+        );
+        assert_eq!(t.entities_carried, 0, "无被承载");
+        assert_eq!(t.void_removals, 1, "虚空移除 1(事件量)");
+        assert_eq!(
+            t.forced_landings_deadline + t.forced_landings_budget,
+            0,
+            "虚空移除不算强制落地(§4.16)"
+        );
+        // 票据表实况复核(拍末时点:虚空体的票已被终结判定 End)。
+        assert!(
+            !sched
+                .ticket_table()
+                .iter()
+                .any(|(k, _)| matches!(k.0, TicketHolder::Entity(e) if e == void_e)),
+            "虚空移除实体的票已被终结判定 End(拍末)"
+        );
+        sched.shutdown();
     }
 
     #[test]

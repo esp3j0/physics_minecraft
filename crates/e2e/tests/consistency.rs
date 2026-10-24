@@ -1151,9 +1151,11 @@ async fn acc6_network_observer_replay() {
         checkpoint_interval_ticks: 12, // 场景中点截一张(重放素材:激活在途中)
         // ④ 的素材设计:预算 1 片/拍 + 冷却 0 → B 区(cp12 时 12 候选,手算
         // 见下)必仍有未载完的在途候选;重放线"表→激活"闭环不用等簿记过期。
-        swap_budget_chunks_per_tick: 1,
+        // (REQ-007 06c:预算键升级为 ①② 分档,两档同给同值语义不变。)
         activation: app::config::ActivationConfig {
-            cooldown_secs: 0,
+            cooldown_ticks: 0,
+            data_budget_per_tick: 1,
+            collider_budget_per_tick: 1,
             ..app::config::ActivationConfig::default()
         },
         ..Config::default()
@@ -1986,7 +1988,9 @@ async fn pending_blockwrite_cells_defer_window() {
         despawn_after_secs: 2, // 加速回收(工程细节,acg4 同款授权)
         ..Config::default()
     };
-    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config) // 邻域一拍装齐(预算 2 会拖拍序)
+    // ①② 预算给足(§4.15 新键;邻域一拍装齐,预算 2 会拖拍序)。
+    config.activation.data_budget_per_tick = 14;
+    config.activation.collider_budget_per_tick = 14;
     let session = Session::new(config.session_config());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let checkpoints = SharedCheckpoints::default();

@@ -20,9 +20,9 @@ use physics_sim::{
 };
 use shard::SchedulerConfig;
 use sim_api::log::CommandLog;
-use sim_api::replay::replay;
+use sim_api::replay::replay_world;
 use sim_api::session::{Session, SessionConfig};
-use sim_api::snapshot::GlobalSnapshot;
+use sim_api::snapshot::WorldSnapshot;
 use storage::mem::MemCheckpointStore;
 use storage::provider::ChunkProvider;
 use storage::redb::RedbStore;
@@ -378,8 +378,9 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
     };
     // 冷却关(瞬移装卸立即生效)+ 预算给足(卸载候选与远邻域装载候选同队竞争,
     // 照 driver.rs chunk_unload 测试同款)。
-    config.activation.cooldown_secs = 0;
-    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config)
+    config.activation.cooldown_ticks = 0;
+    config.activation.data_budget_per_tick = 14; // ①② 预算给足(§4.15 新键)
+    config.activation.collider_budget_per_tick = 14;
 
     let session = Session::new(config.session_config());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
@@ -645,7 +646,7 @@ fn acg5_orchestrate(
 }
 
 /// 跑 AC-G5 原线:固定时间线到拍 600,拍 300 在两拍之间取全局快照。
-fn acg5_run_original(snapshot_at: Option<Tick>) -> (Acg5Line, Option<GlobalSnapshot>) {
+fn acg5_run_original(snapshot_at: Option<Tick>) -> (Acg5Line, Option<WorldSnapshot>) {
     let (provider, worker) = acg5_provider();
     let mut session = Session::new(acg5_session_config());
     for x in [0, 1] {
@@ -668,7 +669,11 @@ fn acg5_run_original(snapshot_at: Option<Tick>) -> (Acg5Line, Option<GlobalSnaps
     while session.tick_now() < FINAL_TICK {
         let at = session.tick_now();
         if Some(at) == snapshot_at {
-            snapshot = Some(session.global_snapshot());
+            // 06c(遥测暴露):快照必须含调度器状态(观察者表/票据表)——
+            // 旧 global_snapshot 只有分片字节,重放线在快照拍前的观察者票
+            // 丢失,遥测状态量在重放窗早期与原线不等(实体采样仍位级一致)。
+            // 迁到 world_snapshot + replay_world(REQ-005 细则 6 现代入口)。
+            snapshot = Some(session.world_snapshot());
         }
         match at.0 {
             MOVE1_TICK | MOVE2_TICK | MOVE3_TICK => {
@@ -734,11 +739,15 @@ fn acg5_run_original(snapshot_at: Option<Tick>) -> (Acg5Line, Option<GlobalSnaps
 
 /// 跑 AC-G5 重放线:快照 + tick>300 日志(replay 按变体路由观察者命令 →
 /// 调度器专用收件箱);测试逐拍继续复刻编排直到拍 600。
-fn acg5_run_replay(snapshot: &GlobalSnapshot, log: &CommandLog) -> Acg5Line {
+fn acg5_run_replay(snapshot: &WorldSnapshot, log: &CommandLog) -> Acg5Line {
     let (provider, worker) = acg5_provider();
-    let mut session =
-        replay(snapshot, log, acg5_session_config(), acg5_registry).expect("自有快照必可恢复");
-    assert_eq!(session.tick_now(), snapshot.tick, "重放线自快照拍对齐续跑");
+    let mut session = replay_world(snapshot, log, acg5_session_config(), acg5_registry)
+        .expect("自有快照必可恢复");
+    assert_eq!(
+        session.tick_now(),
+        snapshot.shards.tick,
+        "重放线自快照拍对齐续跑"
+    );
     let mut samples = Vec::new();
     let mut summaries = Vec::new();
     let (mut loaded, mut unloaded) = (0u64, 0u64);
@@ -750,7 +759,7 @@ fn acg5_run_replay(snapshot: &GlobalSnapshot, log: &CommandLog) -> Acg5Line {
     let line = Acg5Line {
         samples,
         summaries,
-        offset: snapshot.tick.0,
+        offset: snapshot.shards.tick.0,
         // 重放线命令全部原章直投,不产新日志条目。
         log: CommandLog::new(),
         loaded,
@@ -771,7 +780,7 @@ fn acg5_run_replay(snapshot: &GlobalSnapshot, log: &CommandLog) -> Acg5Line {
 fn acg5_replay_with_observers_and_loading() {
     let (orig, snapshot) = acg5_run_original(Some(Tick(SNAPSHOT_TICK)));
     let snapshot = snapshot.expect("拍 300 必已截取快照");
-    assert_eq!(snapshot.tick, Tick(SNAPSHOT_TICK));
+    assert_eq!(snapshot.shards.tick, Tick(SNAPSHOT_TICK));
     assert_eq!(orig.tick_now, FINAL_TICK);
 
     // 时间线非退化:3 观察者移动 + 1 出生 + 2 广播爆炸 = 6 条,全入日志。
@@ -872,8 +881,9 @@ async fn acg6_persisted_after_process_restart() {
         despawn_after_secs: 2,
         ..Config::default()
     };
-    config.activation.cooldown_secs = 0;
-    config.swap_budget_chunks_per_tick = 14; // 别名键,映射 ①② 预算(见 config)
+    config.activation.cooldown_ticks = 0;
+    config.activation.data_budget_per_tick = 14; // ①② 预算给足(§4.15 新键)
+    config.activation.collider_budget_per_tick = 14;
 
     // —— 段 1:bootstrap(空目录)→ 驱动生命周期 → 完整退出(终末 flush +
     //    store.shutdown,redb 锁释放 = 进程重启的等价前置)——

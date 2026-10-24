@@ -1211,7 +1211,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 处理——同拍或下一拍,永不阻塞 tick)。
     let mut pending_streams = PendingStreams::default();
     // 邻片 ensure 半径(REQ-005 D5 = awake_unload_radius,默认 32m)。
-    let ensure_radius = config.activation.awake_unload_radius as f32;
+    let ensure_radius = config.activation.awake_unload_radius;
     // 观察输出编排(REQ-003 §4.4;任务书 03):observe 缝在场才建(tick 末端
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
@@ -3202,8 +3202,9 @@ mod tests {
         // 候选同队竞争(瞬移后卸载候选距 ~5 万 m 排在装载候选 ~12m 之后),
         // 默认预算 2 会被装载吃光、卸载恒饿死(激活策略机实测语义);预算给足
         // (卸载 2 + 远邻域 12)让卸载请求出队。
-        config.activation.cooldown_secs = 0;
-        config.swap_budget_chunks_per_tick = 14;
+        config.activation.cooldown_ticks = 0;
+        config.activation.data_budget_per_tick = 14;
+        config.activation.collider_budget_per_tick = 14;
         let session = sim_api::session::Session::new(config.session_config());
         let chunks = SharedChunks::default();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
@@ -3413,8 +3414,9 @@ mod tests {
         config.despawn_after_secs = 0;
         // 同 chunk_unload 测试:预算给足让远走后的卸载请求出队(否则被远邻域
         // 装载候选饿死);冷却关让瞬移立即生效。
-        config.activation.cooldown_secs = 0;
-        config.swap_budget_chunks_per_tick = 14;
+        config.activation.cooldown_ticks = 0;
+        config.activation.data_budget_per_tick = 14;
+        config.activation.collider_budget_per_tick = 14;
         let session = sim_api::session::Session::new(config.session_config());
         let (args, tx, _checkpoints) = test_args(config, session);
         let driver = tokio::spawn(run(args));
@@ -3757,8 +3759,9 @@ mod tests {
     async fn owner_unload_persists_edit() {
         let mut config = test_config(600);
         config.despawn_after_secs = 0;
-        config.activation.cooldown_secs = 0;
-        config.swap_budget_chunks_per_tick = 14;
+        config.activation.cooldown_ticks = 0;
+        config.activation.data_budget_per_tick = 14;
+        config.activation.collider_budget_per_tick = 14;
         let session = sim_api::session::Session::new(config.session_config());
         let (args, tx, checkpoints) = test_args(config, session);
         let driver = tokio::spawn(run(args));

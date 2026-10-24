@@ -218,6 +218,10 @@ impl ShardSim {
             deferred_terrain_wake: snap.deferred_terrain_wake,
             pending_contact_wakes: snap.pending_contact_wakes,
             terrain_woken_this_tick: BTreeSet::new(),
+            // 06c 遥测:纯计数/瞬态记账不入快照(每拍重算;强制落地原因表
+            // 在恢复线为空、按截止归因——语义见字段文档)。
+            forced_reasons: BTreeMap::new(),
+            activation_events: crate::sim::ActivationEvents::default(),
             outbox: snap.outbox,
             activation: snap.activation,
             activation_now: snap.activation_now,

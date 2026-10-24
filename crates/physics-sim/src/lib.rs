@@ -23,8 +23,8 @@ mod solidify;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
 pub use sim::{
-    BlockWrite, BlockWriteKind, LocomotionState, Outbox, ShardSim, ShardSimConfig, SolidifyConfig,
-    TicketOp, TicketOpRecord,
+    ActivationEvents, BlockWrite, BlockWriteKind, ForcedLandingReason, LocomotionState, Outbox,
+    ShardSim, ShardSimConfig, SolidifyConfig, TicketOp, TicketOpRecord,
 };
 pub use snapshot::SimSnapshotError;
 pub use tickets::{

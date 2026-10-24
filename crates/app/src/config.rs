@@ -1,7 +1,7 @@
 //! 全部参数(蓝图 §6)+ toml 可覆写;唯一默认值来源。
 //!
-//! 激活参数(REQ-001 §4.3):经 `shard_sim_config` 换算注入激活策略机
-//! (任务书 req001-backlog/02 接入)。
+//! 激活参数(REQ-007 §4.15,修订 10):经 `shard_sim_config` 1:1 直传注入
+//! 策略机 `physics_sim::ActivationConfig`;调度器那份自同一换算派生(单一来源)。
 
 use std::path::{Path, PathBuf};
 
@@ -12,31 +12,88 @@ use shard::SchedulerConfig;
 use sim_api::session::SessionConfig;
 use types::{ShardId, Tick, WorldSeed};
 
-/// 激活参数(REQ-001 §4.3;经 `shard_sim_config` 换算注入策略机
-/// `physics_sim::ActivationConfig`,任务书 req001-backlog/02 已接入)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+/// 激活参数(REQ-007 §4.15 全表;toml 键 = 参数名,放 `[activation]` 表;
+/// 经 `shard_sim_config` 直传策略机)。默认值 = §4.15 表(含 04b 校准回写的
+/// `contact_wake_skin_m = 0.075`,修订 10)。
+///
+/// 旧键别名(`from_toml_str` 预处理,修订 10 总架构师裁定):`[activation]
+/// load_radius` / `unload_radius` → ① 与 ② 两档同值;`cooldown_secs` →
+/// `cooldown_ticks`(按 dt 换算);顶层 `swap_budget_chunks_per_tick` →
+/// ① 与 ② 两档预算。新旧键同给时逐键以新键为准,没给新键的那一档仍取别名值。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ActivationConfig {
-    /// 加载半径(chunk、collider 两档同参)。
-    pub load_radius: u32,
-    /// 卸载半径。
-    pub unload_radius: u32,
-    /// 唤醒加载半径。
-    pub awake_load_radius: u32,
-    /// 唤醒卸载半径。
-    pub awake_unload_radius: u32,
-    /// 激活冷却(秒)。
-    pub cooldown_secs: u32,
+    /// ① 数据加载半径 m。
+    pub data_load_radius: f32,
+    /// ① 数据卸载半径 m。
+    pub data_unload_radius: f32,
+    /// ② collider 加载半径 m(须 ≤ data_load_radius,校验在 [`Config::from_toml_str`])。
+    pub collider_load_radius: f32,
+    /// ② collider 卸载半径 m(须 ≤ data_unload_radius)。
+    pub collider_unload_radius: f32,
+    /// ③ 唤醒加载半径 m。
+    pub awake_load_radius: f32,
+    /// ③ 冻结卸载半径 m。
+    pub awake_unload_radius: f32,
+    /// ① 每拍装+卸合计预算。
+    pub data_budget_per_tick: usize,
+    /// ② 每拍构建预算。
+    pub collider_budget_per_tick: usize,
+    /// 翻转冷却(拍;①②③ 分档簿记同值)。
+    pub cooldown_ticks: u64,
+    /// 足迹外扩 m。
+    pub terrain_guard_m: f32,
+    /// 预载足迹前视拍。
+    pub motion_lookahead_ticks: u64,
+    /// 前视 chunk 上限。
+    pub motion_max_lookahead_chunks: usize,
+    /// 瞬态票上限 active_ticks(到期强制落地)。
+    pub transient_settle_deadline_ticks: u64,
+    /// 常驻运动票上限 active_ticks(到期撤票+兜底冻结)。
+    pub actor_motion_max_ticks: u64,
+    /// 支撑判定法向阈值。
+    pub support_normal_min: f32,
+    /// 撞前预测扫掠拍数。
+    pub contact_wake_lookahead_ticks: u64,
+    /// 接触/贴靠唤醒外扩 m(04b 实测校准,修订 10 回写)。
+    pub contact_wake_skin_m: f32,
+    /// 种子与传播门槛 kg·m/s。
+    pub contact_wake_min_momentum: f32,
+    /// 传播每跳动量衰减。
+    pub contact_wake_decay: f32,
+    /// 传播跳数上限。
+    pub contact_wake_max_hops: usize,
+    /// 每片每拍接触唤醒实体上限。
+    pub contact_wake_max_bodies_per_tick: usize,
+    /// 虚空移除深度 m。
+    pub void_despawn_depth_m: f32,
 }
 
 impl Default for ActivationConfig {
     fn default() -> Self {
         Self {
-            load_radius: 32,
-            unload_radius: 48,
-            awake_load_radius: 24,
-            awake_unload_radius: 32,
-            cooldown_secs: 3,
+            data_load_radius: 32.0,
+            data_unload_radius: 48.0,
+            collider_load_radius: 32.0,
+            collider_unload_radius: 48.0,
+            awake_load_radius: 24.0,
+            awake_unload_radius: 32.0,
+            data_budget_per_tick: 2,
+            collider_budget_per_tick: 2,
+            cooldown_ticks: 180,
+            terrain_guard_m: 1.0,
+            motion_lookahead_ticks: 30,
+            motion_max_lookahead_chunks: 4,
+            transient_settle_deadline_ticks: 1200,
+            actor_motion_max_ticks: 1200,
+            support_normal_min: 0.7,
+            contact_wake_lookahead_ticks: 2,
+            contact_wake_skin_m: 0.075,
+            contact_wake_min_momentum: 1.0,
+            contact_wake_decay: 0.5,
+            contact_wake_max_hops: 4,
+            contact_wake_max_bodies_per_tick: 64,
+            void_despawn_depth_m: 16.0,
         }
     }
 }
@@ -121,14 +178,106 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("配置解析失败:{0}")]
     Parse(String),
+    #[error("配置校验失败:{0}")]
+    Validate(String),
     #[error("配置读取失败:{0}")]
     Io(#[from] std::io::Error),
 }
 
+/// dt 缺省值(秒)。别名键 `cooldown_secs` 的拍换算需要 dt;config.toml 未给
+/// `dt` 时按本值(= [`Config::default`] 的 1/60)换算——给了 `dt` 的新旧键同
+/// 给场景以 toml 内的 dt 为准,与后续 `shard_sim_config` 的换算一致。
+const DEFAULT_DT: f32 = 1.0 / 60.0;
+
 impl Config {
     /// 从 toml 文本构造(部分覆写:缺省字段取 Default)。空串 = 全默认。
+    ///
+    /// 旧键别名(REQ-007 §4.15 修订 10;两遍解析):第一遍取别名键与 `dt`,
+    /// 把别名值**原位补写**成新键(逐键只在对应新键缺席时补),第二遍正常
+    /// 反序列化。`[activation]` 表开了 `deny_unknown_fields`:未知键(含写错
+    /// 的新键名)直接报错,不再静默忽略。
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
-        toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))
+        let mut value: toml::Value =
+            toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let dt = value
+            .get("dt")
+            .and_then(|v| v.as_float())
+            .map(|f| f as f32)
+            .unwrap_or(DEFAULT_DT);
+        // 顶层别名:swap_budget_chunks_per_tick → ① 与 ② 两档预算(逐键补缺)。
+        if let Some(budget) = value.get("swap_budget_chunks_per_tick") {
+            let budget = budget.clone();
+            let act = value
+                .as_table_mut()
+                .expect("toml 顶层必为表")
+                .entry("activation")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+            let act = act.as_table_mut().expect("[activation] 必为表");
+            act.entry("data_budget_per_tick").or_insert(budget.clone());
+            act.entry("collider_budget_per_tick").or_insert(budget);
+        }
+        // [activation] 表内别名。
+        if let Some(act) = value.get_mut("activation") {
+            let act = act.as_table_mut().expect("[activation] 必为表");
+            // load_radius / unload_radius → ① 与 ② 两档同值。
+            for (old, news) in [
+                ("load_radius", ["data_load_radius", "collider_load_radius"]),
+                (
+                    "unload_radius",
+                    ["data_unload_radius", "collider_unload_radius"],
+                ),
+            ] {
+                let Some(v) = act.get(old) else { continue };
+                let v = v.clone();
+                let n = v
+                    .as_integer()
+                    .ok_or_else(|| ConfigError::Parse(format!("{old} 须为整数(m),得到:{v}")))?;
+                for new in news {
+                    act.entry(new).or_insert(toml::Value::Float(n as f64));
+                }
+                act.remove(old); // 别名键消费掉(deny_unknown_fields 拒绝残留)
+            }
+            // cooldown_secs → cooldown_ticks(按 dt 换算,四舍五入;与
+            // despawn_after_ticks 同式)。
+            if let Some(secs) = act.get("cooldown_secs") {
+                let secs = secs.as_integer().ok_or_else(|| {
+                    ConfigError::Parse(format!("cooldown_secs 须为整数(秒),得到:{secs}"))
+                })?;
+                let ticks = (secs as f32 / dt).round() as i64;
+                act.entry("cooldown_ticks")
+                    .or_insert(toml::Value::Integer(ticks));
+                act.remove("cooldown_secs");
+            }
+        }
+        let config: Config = value
+            .try_into()
+            .map_err(|e| ConfigError::Parse(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 结构校验(REQ-007 §4.15 修订 10):② 半径 ≤ ① 对应半径、区域票半径
+    /// 上限非负;错误信息点名出错的键。
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.activation.collider_load_radius > self.activation.data_load_radius {
+            return Err(ConfigError::Validate(format!(
+                "collider_load_radius ({}) 不得大于 data_load_radius ({})",
+                self.activation.collider_load_radius, self.activation.data_load_radius
+            )));
+        }
+        if self.activation.collider_unload_radius > self.activation.data_unload_radius {
+            return Err(ConfigError::Validate(format!(
+                "collider_unload_radius ({}) 不得大于 data_unload_radius ({})",
+                self.activation.collider_unload_radius, self.activation.data_unload_radius
+            )));
+        }
+        if self.area_ticket_max_radius_m < 0.0 {
+            return Err(ConfigError::Validate(format!(
+                "area_ticket_max_radius_m ({}) 不得为负",
+                self.area_ticket_max_radius_m
+            )));
+        }
+        Ok(())
     }
 
     /// 读文件覆写;文件不存在 → 全默认(不报错);路径 None → 全默认。
@@ -168,8 +317,8 @@ impl Config {
             },
             despawn_after_ticks: (self.despawn_after_secs as f32 / self.dt).round() as u64,
             start_tick: Tick::ZERO,
-            // 激活配置注入(F3 返修:观察者票规格唯一来源——半径只在配置
-            // 出现一次;换算与 shard_sim_config 完全同式)。
+            // 激活配置注入(REQ-007 §4.15:单一来源——自 shard_sim_config
+            // 派生,放行评论风险 3,不另写一份换算)。
             activation: self
                 .shard_sim_config(types::ShardId::new(
                     types::WorldId(0),
@@ -195,51 +344,40 @@ impl Config {
     }
 
     /// → ShardSimConfig(gravity=(0,-9.81,0)、dt、solidify 默认;
-    /// activation 由本表换算(任务书 req001-backlog/02 接入):
-    /// 半径 u32 → f32 直传,cooldown_secs 按拍换算(与 despawn_after_ticks
-    /// 同式),预算字段直传)。
+    /// activation = §4.15 全参数 1:1 直传(修订 10:换算已前移到
+    /// `from_toml_str` 的别名预处理,两份配置同源不再二次换算)。
     pub fn shard_sim_config(&self, shard: ShardId) -> ShardSimConfig {
+        let a = &self.activation;
         ShardSimConfig {
             shard,
             gravity: types::glam::Vec3::new(0.0, -9.81, 0.0),
             dt: self.dt,
             solidify: SolidifyConfig::default(),
             activation: physics_sim::ActivationConfig {
-                // REQ-007 任务 01:①② 拆分;别名键 load_radius/unload_radius
-                // 同时映射两档(② 专用键在 06 任务书全参数化时引入显式 toml 字段;
-                // 本任务先以"别名同值"保配置兼容,校验在 config 测试锚定)。
-                data_load_radius: self.activation.load_radius as f32,
-                data_unload_radius: self.activation.unload_radius as f32,
-                collider_load_radius: self.activation.load_radius as f32,
-                collider_unload_radius: self.activation.unload_radius as f32,
-                awake_load_radius: self.activation.awake_load_radius as f32,
-                awake_unload_radius: self.activation.awake_unload_radius as f32,
-                cooldown_ticks: (self.activation.cooldown_secs as f32 / self.dt).round() as u64,
+                data_load_radius: a.data_load_radius,
+                data_unload_radius: a.data_unload_radius,
+                collider_load_radius: a.collider_load_radius,
+                collider_unload_radius: a.collider_unload_radius,
+                awake_load_radius: a.awake_load_radius,
+                awake_unload_radius: a.awake_unload_radius,
+                cooldown_ticks: a.cooldown_ticks,
                 max_awake_dynamic: self.max_awake_dynamic,
-                data_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
-                collider_budget_per_tick: self.swap_budget_chunks_per_tick as usize,
+                data_budget_per_tick: a.data_budget_per_tick,
+                collider_budget_per_tick: a.collider_budget_per_tick,
                 region_margin_chunks: self.region_margin_chunks(),
-                // REQ-007 任务 03 配置键(§4.15 默认表;Config 顶层键在 06 全
-                // 参数化时引入,先以默认落)。
-                terrain_guard_m: 1.0,
-                motion_lookahead_ticks: 30,
-                motion_max_lookahead_chunks: 4,
-                transient_settle_deadline_ticks: 1200,
-                // REQ-007 任务 04a:常驻运动票上限(默认 1200;Config 顶层
-                // 键在 06 全参数化时引入,先以默认落)。
-                actor_motion_max_ticks: 1200,
-                support_normal_min: 0.7,
-                contact_wake_skin_m: 0.075,
-                // REQ-007 任务 05a 配置键(§4.15 默认表;Config 顶层键在 06 全
-                // 参数化时引入,先以默认落)。
-                contact_wake_lookahead_ticks: 2,
-                contact_wake_min_momentum: 1.0,
-                // REQ-007 任务 05b 配置键(§4.15 默认表;Config 顶层键在 06
-                // 全参数化时引入,先以默认落)。
-                contact_wake_decay: 0.5,
-                contact_wake_max_hops: 4,
-                contact_wake_max_bodies_per_tick: 64,
-                void_despawn_depth_m: 16.0,
+                terrain_guard_m: a.terrain_guard_m,
+                motion_lookahead_ticks: a.motion_lookahead_ticks,
+                motion_max_lookahead_chunks: a.motion_max_lookahead_chunks,
+                transient_settle_deadline_ticks: a.transient_settle_deadline_ticks,
+                actor_motion_max_ticks: a.actor_motion_max_ticks,
+                support_normal_min: a.support_normal_min,
+                contact_wake_skin_m: a.contact_wake_skin_m,
+                contact_wake_lookahead_ticks: a.contact_wake_lookahead_ticks,
+                contact_wake_min_momentum: a.contact_wake_min_momentum,
+                contact_wake_decay: a.contact_wake_decay,
+                contact_wake_max_hops: a.contact_wake_max_hops,
+                contact_wake_max_bodies_per_tick: a.contact_wake_max_bodies_per_tick,
+                void_despawn_depth_m: a.void_despawn_depth_m,
             },
         }
     }
@@ -262,7 +400,8 @@ mod tests {
         ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
     }
 
-    /// 测试清单 1:逐字段断言蓝图 §6 表 + 决策 9 的默认值(含嵌套 activation 五项)。
+    /// 测试清单 1:逐字段断言蓝图 §6 表 + 决策 9 的默认值(含嵌套 activation;
+    /// REQ-007 §4.15 全表 22 项的逐值锚定在 `defaults_anchored_req007`)。
     #[test]
     fn defaults_match_blueprint_table() {
         let c = Config::default();
@@ -270,19 +409,13 @@ mod tests {
         assert_eq!(c.margin_meters, 16, "margin_meters = 16(§9.1)");
         assert_eq!(
             c.activation,
-            ActivationConfig {
-                load_radius: 32,
-                unload_radius: 48,
-                awake_load_radius: 24,
-                awake_unload_radius: 32,
-                cooldown_secs: 3,
-            },
-            "activation 五项(§4.3)"
+            ActivationConfig::default(),
+            "activation = §4.15 全表默认"
         );
         assert_eq!(c.max_awake_dynamic, 512, "max_awake_dynamic = 512(§9.4)");
         assert_eq!(
             c.swap_budget_chunks_per_tick, 2,
-            "swap_budget_chunks_per_tick = 2(§4.3)"
+            "swap_budget_chunks_per_tick = 2(§4.3;别名键,→ ①② 两档预算)"
         );
         assert_eq!(c.despawn_after_secs, 30, "despawn_after_secs = 30(§9.3)");
         assert_eq!(
@@ -341,7 +474,7 @@ mod tests {
         let custom = Config {
             dt: 0.03,
             activation: ActivationConfig {
-                load_radius: 64,
+                data_load_radius: 64.0,
                 ..ActivationConfig::default()
             },
             data_dir: PathBuf::from("somedir/store"),
@@ -505,48 +638,238 @@ mod tests {
         );
     }
 
-    /// 测试清单 8(任务书 req001-backlog/02 授权接线):shard_sim_config 的
-    /// activation 换算——3s @ 1/60 → 180 拍;半径 u32 → f32;预算直传。
-    /// 另以非默认值 + 非 1/60 的 dt 验证换算公式(round)而非巧合。
+    /// 任务书测试 `app::config::defaults_anchored`(REQ-007 任务 06c,T22):
+    /// §4.15 全表 22 个默认值逐一显式断言(不靠 Default 派生),并核两处
+    /// 派生配置(分片/调度器)同值;区域票上限默认 128/64。
     #[test]
-    fn shard_sim_config_converts_activation() {
+    fn defaults_anchored() {
         let c = Config::default();
-        let a = c.shard_sim_config(shard_id(0, 0)).activation;
-        assert_eq!(a.data_load_radius, 32.0, "① 加载半径 f32 化(§4.3)");
-        assert_eq!(a.data_unload_radius, 48.0, "① 卸载半径 f32 化");
-        // REQ-007 任务 01:② 与 ① 同源映射(别名键同值);显式 ② 键在 06 全参数化。
-        assert_eq!(a.collider_load_radius, 32.0, "② 加载半径 = ①(别名同值)");
-        assert_eq!(a.collider_unload_radius, 48.0, "② 卸载半径 = ①(别名同值)");
-        assert_eq!(a.awake_load_radius, 24.0, "唤醒半径 f32 化");
-        assert_eq!(a.awake_unload_radius, 32.0, "冻结半径 f32 化");
-        assert_eq!(a.cooldown_ticks, 180, "3s × 60Hz = 180 拍(§4.3)");
-        assert_eq!(a.max_awake_dynamic, 512, "预算直传(§9.4)");
-        assert_eq!(a.data_budget_per_tick, 2, "① 预算直传(§4.3)");
+        let a = &c.activation;
+        assert_eq!(a.data_load_radius, 32.0, "§4.15:① 载 32");
+        assert_eq!(a.data_unload_radius, 48.0, "§4.15:① 卸 48");
+        assert_eq!(a.collider_load_radius, 32.0, "§4.15:② 载 32");
+        assert_eq!(a.collider_unload_radius, 48.0, "§4.15:② 卸 48");
+        assert_eq!(a.awake_load_radius, 24.0, "§4.15:③ 载 24");
+        assert_eq!(a.awake_unload_radius, 32.0, "§4.15:③ 卸 32");
+        assert_eq!(a.data_budget_per_tick, 2, "§4.15:① 预算 2");
+        assert_eq!(a.collider_budget_per_tick, 2, "§4.15:② 预算 2");
+        assert_eq!(a.cooldown_ticks, 180, "§4.15:冷却 180 拍");
+        assert_eq!(a.terrain_guard_m, 1.0, "§4.15:足迹外扩 1 m");
+        assert_eq!(a.motion_lookahead_ticks, 30, "§4.15:前视 30 拍");
+        assert_eq!(a.motion_max_lookahead_chunks, 4, "§4.15:前视上限 4 chunk");
         assert_eq!(
-            a.collider_budget_per_tick, 2,
-            "② 预算同源直传(REQ-007 任务 01)"
+            a.transient_settle_deadline_ticks, 1200,
+            "§4.15:瞬态票上限 1200"
+        );
+        assert_eq!(a.actor_motion_max_ticks, 1200, "§4.15:常驻票上限 1200");
+        assert_eq!(a.support_normal_min, 0.7, "§4.15:支撑法向阈值 0.7");
+        assert_eq!(a.contact_wake_lookahead_ticks, 2, "§4.15:扫掠 2 拍");
+        assert_eq!(
+            a.contact_wake_skin_m, 0.075,
+            "§4.15:skin 0.075(04b 校准,修订 10 回写)"
+        );
+        assert_eq!(a.contact_wake_min_momentum, 1.0, "§4.15:动量门槛 1.0");
+        assert_eq!(a.contact_wake_decay, 0.5, "§4.15:衰减 0.5");
+        assert_eq!(a.contact_wake_max_hops, 4, "§4.15:跳数上限 4");
+        assert_eq!(
+            a.contact_wake_max_bodies_per_tick, 64,
+            "§4.15:每拍唤醒上限 64"
+        );
+        assert_eq!(a.void_despawn_depth_m, 16.0, "§4.15:虚空深度 16 m");
+        assert_eq!(c.area_ticket_caps(), (128.0, 64), "区域票上限默认");
+
+        // 两处派生配置同源:scheduler_config() 的 activation 取自
+        // shard_sim_config()(放行评论风险 3:单一来源,不另写换算)。
+        let shard = c.shard_sim_config(shard_id(0, 0)).activation;
+        let sched = c.session_config().scheduler.activation;
+        assert_eq!(shard, sched, "分片与调度器激活配置同值");
+    }
+
+    /// 任务书测试 `app::config::all_req007_params_injectable`(REQ-007 06c,
+    /// T22):22 个激活键 + 3 个顶层键全设非默认值,经 shard_sim_config 直传
+    /// 生效;to_toml_string 往返不丢新键。区域票上限的 bootstrap 装配面由
+    /// 验收用例 acc_06c_all_params_injectable 覆盖。
+    #[test]
+    fn all_req007_params_injectable() {
+        let c = Config::from_toml_str(
+            "max_awake_dynamic = 300\n\
+             area_ticket_max_radius_m = 96.0\n\
+             area_ticket_max_count = 12\n\
+             [activation]\n\
+             data_load_radius = 40\n\
+             data_unload_radius = 56\n\
+             collider_load_radius = 28\n\
+             collider_unload_radius = 36\n\
+             awake_load_radius = 20\n\
+             awake_unload_radius = 26\n\
+             data_budget_per_tick = 5\n\
+             collider_budget_per_tick = 3\n\
+             cooldown_ticks = 90\n\
+             terrain_guard_m = 1.5\n\
+             motion_lookahead_ticks = 20\n\
+             motion_max_lookahead_chunks = 3\n\
+             transient_settle_deadline_ticks = 900\n\
+             actor_motion_max_ticks = 700\n\
+             support_normal_min = 0.8\n\
+             contact_wake_lookahead_ticks = 3\n\
+             contact_wake_skin_m = 0.06\n\
+             contact_wake_min_momentum = 1.5\n\
+             contact_wake_decay = 0.4\n\
+             contact_wake_max_hops = 3\n\
+             contact_wake_max_bodies_per_tick = 32\n\
+             void_despawn_depth_m = 24.0\n",
+        )
+        .expect("全参数配置合法");
+        let a = c.shard_sim_config(shard_id(0, 0)).activation;
+        assert_eq!((a.data_load_radius, a.data_unload_radius), (40.0, 56.0));
+        assert_eq!(
+            (a.collider_load_radius, a.collider_unload_radius),
+            (28.0, 36.0)
+        );
+        assert_eq!((a.awake_load_radius, a.awake_unload_radius), (20.0, 26.0));
+        assert_eq!((a.data_budget_per_tick, a.collider_budget_per_tick), (5, 3));
+        assert_eq!(a.cooldown_ticks, 90);
+        assert_eq!(a.terrain_guard_m, 1.5);
+        assert_eq!(a.motion_lookahead_ticks, 20);
+        assert_eq!(a.motion_max_lookahead_chunks, 3);
+        assert_eq!(a.transient_settle_deadline_ticks, 900);
+        assert_eq!(a.actor_motion_max_ticks, 700);
+        assert_eq!(a.support_normal_min, 0.8);
+        assert_eq!(a.contact_wake_lookahead_ticks, 3);
+        assert_eq!(a.contact_wake_skin_m, 0.06);
+        assert_eq!(a.contact_wake_min_momentum, 1.5);
+        assert_eq!(a.contact_wake_decay, 0.4);
+        assert_eq!(a.contact_wake_max_hops, 3);
+        assert_eq!(a.contact_wake_max_bodies_per_tick, 32);
+        assert_eq!(a.void_despawn_depth_m, 24.0);
+        assert_eq!(a.max_awake_dynamic, 300);
+        assert_eq!(c.area_ticket_caps(), (96.0, 12), "区域票上限注入");
+
+        // 调度器那份同值(单一来源派生)。
+        assert_eq!(c.session_config().scheduler.activation, a, "调度器配置同值");
+
+        // 往返:to_toml_string → from_toml_str 相等(新键不丢)。
+        let again = Config::from_toml_str(&c.to_toml_string()).expect("往返后仍合法");
+        assert_eq!(again, c, "全参数往返无损");
+    }
+
+    /// 任务书测试 `app::config::legacy_keys_alias_mapping`(REQ-007 06c):
+    /// 旧键 → 两档同值、秒换算拍、顶层预算两档;新旧同给逐键新键优先,
+    /// 没给新键的那一档仍取别名值。
+    #[test]
+    fn legacy_keys_alias_mapping() {
+        let legacy = Config::from_toml_str(
+            "swap_budget_chunks_per_tick = 6\n\
+             [activation]\n\
+             load_radius = 40\n\
+             unload_radius = 60\n\
+             cooldown_secs = 2\n",
+        )
+        .expect("旧键配置合法");
+        let a = legacy.shard_sim_config(shard_id(0, 0)).activation;
+        assert_eq!(
+            (a.data_load_radius, a.collider_load_radius),
+            (40.0, 40.0),
+            "load_radius → ① 与 ② 同值"
+        );
+        assert_eq!(
+            (a.data_unload_radius, a.collider_unload_radius),
+            (60.0, 60.0),
+            "unload_radius → ① 与 ② 同值"
+        );
+        assert_eq!(a.cooldown_ticks, 120, "cooldown_secs = 2 → 120 拍(1/60)");
+        assert_eq!(
+            (a.data_budget_per_tick, a.collider_budget_per_tick),
+            (6, 6),
+            "swap_budget_chunks_per_tick → ① 与 ② 两档预算"
         );
 
-        // 换算公式:cooldown_secs=3(默认)@ dt=0.05(每拍 0.05s)= 60 拍。
-        let c2 = Config {
-            dt: 0.05,
-            ..Config::default()
-        };
+        let mixed = Config::from_toml_str(
+            "swap_budget_chunks_per_tick = 6\n\
+             [activation]\n\
+             load_radius = 40\n\
+             data_load_radius = 44\n\
+             cooldown_secs = 2\n\
+             cooldown_ticks = 100\n\
+             data_budget_per_tick = 4\n",
+        )
+        .expect("新旧混合配置合法");
+        let m = mixed.shard_sim_config(shard_id(0, 0)).activation;
+        assert_eq!(m.data_load_radius, 44.0, "新键 data_load_radius 优先");
         assert_eq!(
-            c2.shard_sim_config(shard_id(0, 0))
+            m.collider_load_radius, 40.0,
+            "没给新键的 ② 仍取别名 load_radius"
+        );
+        assert_eq!(
+            m.cooldown_ticks, 100,
+            "新键 cooldown_ticks 优先于 cooldown_secs"
+        );
+        assert_eq!(m.data_budget_per_tick, 4, "新键 data_budget_per_tick 优先");
+        assert_eq!(m.collider_budget_per_tick, 6, "没给新键的 ② 预算仍取别名");
+
+        // dt 影响 cooldown_secs 换算:dt = 0.05(20 Hz)时 2 s → 40 拍。
+        let slow = Config::from_toml_str(
+            "dt = 0.05\n\
+             [activation]\n\
+             cooldown_secs = 2\n",
+        )
+        .expect("dt + 旧键配置合法");
+        assert_eq!(
+            slow.shard_sim_config(shard_id(0, 0))
                 .activation
                 .cooldown_ticks,
-            60,
-            "cooldown_secs/dt 四舍五入换算"
+            40,
+            "cooldown_secs 按 toml 内 dt 换算"
         );
     }
-    /// 任务书测试 `app::config::collider_radius_validation`(REQ-007 任务 01,
-    /// T22 部分):别名键映射正确(①② 同值)+ 半径语义校验——collider 卸载
-    /// 半径 > data 卸载半径(或 collider 加载 > data 加载)时给出配置错误。
-    /// 校验落在本层(配置构造即失败,fail-stop;默认值合法通过)。
+
+    /// 任务书测试 `app::config::validation_rules`(REQ-007 06c,T22):
+    /// ② 半径 > ① 对应半径、区域票半径上限为负 → from_toml_str/load 报错
+    /// 且错误信息点名出错的键;边界(② = ①)合法。
+    #[test]
+    fn validation_rules() {
+        for (toml, key) in [
+            (
+                "[activation]\ncollider_load_radius = 40\n",
+                "collider_load_radius",
+            ),
+            (
+                "[activation]\ncollider_unload_radius = 60\n",
+                "collider_unload_radius",
+            ),
+            (
+                "area_ticket_max_radius_m = -1.0\n",
+                "area_ticket_max_radius_m",
+            ),
+        ] {
+            match Config::from_toml_str(toml) {
+                Ok(_) => panic!("非法配置应被拒绝:{toml}"),
+                Err(e) => assert!(e.to_string().contains(key), "错误信息应点名 {key}:{e}"),
+            }
+        }
+        // ② 半径等于 ① 半径合法(≤)。
+        assert!(
+            Config::from_toml_str("[activation]\ncollider_load_radius = 32\n").is_ok(),
+            "② 半径等于 ① 半径合法"
+        );
+        // 经 load(文件路径)同样校验:写临时文件(系统临时目录,不入仓库)。
+        let path = std::env::temp_dir().join("req007-06c-validation.toml");
+        std::fs::write(&path, "[activation]\ncollider_load_radius = 40\n").expect("写临时配置文件");
+        let err = Config::load(Some(&path)).expect_err("load 同样校验");
+        assert!(
+            err.to_string().contains("collider_load_radius"),
+            "load 的错误信息点名键:{err}"
+        );
+        let _ = std::fs::remove_file(&path);
+        // 校验前错误仍按解析错误上抛(未知键,deny_unknown_fields)。
+        let unknown = Config::from_toml_str("[activation]\nno_such_key = 1\n");
+        assert!(unknown.is_err(), "未知键必须报错(不静默忽略)");
+    }
+
+    /// 既有面(REQ-007 任务 01 引入的校验注释,06c 后由 `validation_rules`
+    /// 承担主断言):默认值恒合法(①② 同值默认)。
     #[test]
     fn collider_radius_validation() {
-        // 别名键映射:toml 只写 load_radius/unload_radius → ①② 四项同值。
         let c = Config::from_toml_str(
             "[activation]
 load_radius = 40
@@ -559,44 +882,12 @@ unload_radius = 64
         assert_eq!(a.collider_load_radius, 40.0, "别名键 → ② 同值");
         assert_eq!(a.data_unload_radius, 64.0);
         assert_eq!(a.collider_unload_radius, 64.0, "别名键 → ② 同值");
-
-        // 校验:② 半径 > ① 半径 → ConfigError(默认 ①② 同值恒合法)。
-        fn validate(a: &physics_sim::ActivationConfig) -> Result<(), ConfigError> {
-            if a.collider_load_radius > a.data_load_radius
-                || a.collider_unload_radius > a.data_unload_radius
-            {
-                return Err(ConfigError::Parse(format!(
-                    "collider 半径不得大于 data 半径(② ⊆ ①):load {}/{} unload {}/{}",
-                    a.collider_load_radius,
-                    a.data_load_radius,
-                    a.collider_unload_radius,
-                    a.data_unload_radius
-                )));
-            }
-            Ok(())
-        }
         assert!(
             Config::default()
                 .shard_sim_config(shard_id(0, 0))
                 .activation
                 .collider_load_radius
                 > 0.0
-        );
-        validate(
-            &Config::default()
-                .shard_sim_config(shard_id(0, 0))
-                .activation,
-        )
-        .expect("默认值合法(①② 同值)");
-        let bad = physics_sim::ActivationConfig {
-            collider_load_radius: 48.0,
-            data_load_radius: 32.0,
-            ..physics_sim::ActivationConfig::default()
-        };
-        let err = validate(&bad).expect_err("② 加载 > ① 加载必须报错");
-        assert!(
-            err.to_string().contains("collider 半径不得大于 data 半径"),
-            "错误信息说明违反 ②⊆①:{err}"
         );
     }
 }

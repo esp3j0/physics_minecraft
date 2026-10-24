@@ -184,6 +184,51 @@ pub struct Outbox {
     pub void_removed: Vec<EntityId>,
 }
 
+/// 强制落地的原因(06c 遥测;§4.16"截止、预算分计")。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForcedLandingReason {
+    /// 瞬态票到期(调度器 7.5 内部指令;§4.3.2)。
+    Deadline,
+    /// 醒体预算超限淘汰(§4.12;命令唤醒与 plan 两路)。
+    Budget,
+}
+
+/// 唤醒来源(06c 遥测;§4.16)。`wake_group` 只需二分:地形变更唤醒计
+/// `wakes_terrain`(按实体);观察者/接触路径的计数在调用侧完成——接触的
+/// 来源按**成员**归类(预测种子/补偿种子/传播所得/闭包成员随触发节点),
+/// 单一 source 表达不了,故 prestep 自行计数后以 Observer 落实。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WakeSource {
+    /// 不计事件量的落实(plan 半径唤醒、接触唤醒——计数在调用侧)。
+    Observer,
+    /// 地形变更唤醒(计 `wakes_terrain`,按实体)。
+    Terrain,
+}
+
+/// 一拍的激活事件计数(06c 遥测;§4.16 事件量)。全部分片由调度器合计成
+/// `ActivationTelemetry` 的事件字段;本结构只活在分片内,**不入快照**、
+/// 每拍重算(取走即清)。
+///
+/// - 唤醒按来源计**被唤醒的实体数**(含支撑闭包成员,归入触发该组的来源;
+///   同一 B 既是预测种子又是补偿种子时归为预测);只数真正从冻结切为
+///   Dynamic 的实体(被推迟/跳过的不计);
+/// - `closure_deferred` = 支撑闭包整组因预算放不下而推迟的**组数**;
+///   `contact_wake_skipped_no_terrain` = 接触唤醒因当前足迹缺 ② 而跳过的组数;
+/// - `actor_motion_capped` = 常驻运动票因到达上限而撤票的张数。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationEvents {
+    pub forced_landings_deadline: u64,
+    pub forced_landings_budget: u64,
+    pub void_removals: u64,
+    pub wakes_contact_pred: u64,
+    pub wakes_contact_comp: u64,
+    pub wakes_contact_spread: u64,
+    pub wakes_terrain: u64,
+    pub closure_deferred: u64,
+    pub contact_wake_skipped_no_terrain: u64,
+    pub actor_motion_capped: u64,
+}
+
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
 pub(crate) struct EntityRecord {
     pub(crate) handle: RigidBodyHandle,
@@ -276,6 +321,16 @@ pub struct ShardSim {
     /// 已消失,一律静默跳过(风险 1)。随快照走(checkpoint 落在撞击与
     /// 唤醒之间时,恢复线同样在下一拍唤醒——AC-T17)。
     pub(crate) pending_contact_wakes: BTreeMap<EntityId, f32>,
+    /// 强制落地的原因记账(06c 遥测;§4.16"按原因分计"):到期指令(截止)
+    /// 与超预算淘汰分别标记。指令跨拍存活(中心柱 ① 缺推迟),淘汰同拍执行
+    /// ——不入快照:checkpoint 落在指令投递与执行之间时,恢复线 reason 表
+    /// 为空、按截止归因(调度器 7.5 只对 TransientMotion 投指令,语义恰好
+    /// 正确;淘汰的执行永不跨拍,不受影响)。
+    pub(crate) forced_reasons: BTreeMap<EntityId, ForcedLandingReason>,
+    /// 本拍激活事件计数(06c 遥测;§4.16 事件量)。worker 在 `step →
+    /// run_transient_lifecycle` 之后、`take_outbox` 之前随 outbox 一并取走,
+    /// 调度器拍末合计。**不入快照**(纯计数、每拍重算、无累加状态)。
+    pub(crate) activation_events: ActivationEvents,
     pub(crate) outbox: Outbox,
     /// 激活策略机(滞回/冷却/预算簿记;任务书 02)。
     pub(crate) activation: crate::activation::ActivationController,
@@ -316,6 +371,8 @@ impl ShardSim {
             deferred_terrain_wake: BTreeSet::new(),
             terrain_woken_this_tick: BTreeSet::new(),
             pending_contact_wakes: BTreeMap::new(),
+            forced_reasons: BTreeMap::new(),
+            activation_events: ActivationEvents::default(),
             outbox: Outbox::default(),
             activation,
             activation_now: Tick::ZERO,
@@ -335,6 +392,17 @@ impl ShardSim {
 
     pub fn entity_count(&self) -> usize {
         self.entities.len()
+    }
+
+    /// ① 已装载 chunk 数(06c 遥测;§4.16"① 数")。
+    pub fn chunk_count(&self) -> usize {
+        self.voxels.chunk_count()
+    }
+
+    /// ② 已建 collider 的 chunk 数(06c 遥测;§4.16"② 数";built_colliders
+    /// 为准——全空气 chunk 无碰撞盒但 ② 已建)。
+    pub fn collider_chunk_count(&self) -> usize {
+        self.built_colliders.len()
     }
 
     /// 实体当前状态;不存在(已迁移/已凝固)返回 None。
@@ -564,6 +632,8 @@ impl ShardSim {
             // (04a:I3 第 4 条,预算强制不受静止前置约束)。
             let is_transient = self.entities.get(&id).is_some_and(|rec| !rec.actor);
             if is_transient {
+                // 06c 遥测:超预算淘汰归因(§4.16"预算分计")。
+                self.forced_reasons.insert(id, ForcedLandingReason::Budget);
                 self.forced_pending.insert(id);
             } else {
                 self.freeze_entity(&id);
@@ -811,6 +881,12 @@ impl ShardSim {
         std::mem::take(&mut self.outbox)
     }
 
+    /// 取走本拍激活事件计数(06c 遥测;worker 在 `take_outbox` 之后调用,
+    /// 调度器拍末合计)。取走即清(每拍重算)。
+    pub fn take_activation_events(&mut self) -> ActivationEvents {
+        std::mem::take(&mut self.activation_events)
+    }
+
     /// 激活刷新(README 决策 5):tier③ 落实(冻结 = set_body_type
     /// KinematicPositionBased + 清速度;唤醒 = Dynamic + wake_up),
     /// tier①② 以决策返回(chunk 数据源在 REQ-002,本轮调用方可忽略)。
@@ -1012,6 +1088,17 @@ impl ShardSim {
                 let carried = supports.get(id).copied().unwrap_or(false);
                 (!rec.actor && carried, rec.actor)
             };
+            // §4.12/§9-2(§5 修订行"超预算 → 瞬态强制落地"):plan 的超预算
+            // 淘汰(`over_budget_freeze` 子集)与命令唤醒路径同语义——被淘汰
+            // 的**瞬态体 → 强制落地**(非冻结;与命令唤醒路径的 enforce_
+            // budget 同式);常驻体照旧冻结 + End。此前瞬态淘汰被冻结悬停,
+            // over_budget_freeze 字段无消费者(06c 接线补齐,非行为面外扩)。
+            if decisions.over_budget_freeze.contains(id) && !is_actor && !is_transient_carried {
+                self.forced_reasons.insert(*id, ForcedLandingReason::Budget);
+                self.forced_pending.insert(*id);
+                self.activation.note_flip(id, now);
+                continue;
+            }
             // 冻结条目全部落实:静止前置已在 plan 决策侧(04a;被前置挡下的
             // 条目不产出、不烧簿记),超预算淘汰(over_budget_freeze)不受
             // 静止前置约束(§4.12 预算强制,决策已单独标出)。
@@ -1057,7 +1144,9 @@ impl ShardSim {
         let retry_terrain: Vec<EntityId> = self.deferred_terrain_wake.iter().copied().collect();
         self.deferred_terrain_wake.clear();
         for seed in retry_terrain {
-            let missing = self.wake_group(&[seed], awake_count, true);
+            // 推迟种子的来源随重试保持(地形变更 → 仍按地形计,§4.16)。
+            let (missing, _woken) =
+                self.wake_group(&[seed], awake_count, true, WakeSource::Terrain);
             if !missing.is_empty() {
                 self.deferred_terrain_wake.insert(seed);
                 self.deferred_wake_blocked.extend(missing);
@@ -1066,7 +1155,8 @@ impl ShardSim {
         let retry: Vec<EntityId> = self.deferred_wake.iter().copied().collect();
         self.deferred_wake.clear();
         for seed in retry {
-            let missing = self.wake_group(&[seed], awake_count, false);
+            let (missing, _woken) =
+                self.wake_group(&[seed], awake_count, false, WakeSource::Observer);
             if !missing.is_empty() {
                 // 仍缺:回队 + 阻塞请求继续(状态推导,每拍重查)。
                 self.deferred_wake.insert(seed);
@@ -1104,7 +1194,8 @@ impl ShardSim {
                 })
                 .collect();
             for seed in crate::wake::frozen_intersecting_cell(&frozen, cell, skin) {
-                let missing = self.wake_group(&[seed], awake_count, true);
+                let (missing, _woken) =
+                    self.wake_group(&[seed], awake_count, true, WakeSource::Terrain);
                 if !missing.is_empty() {
                     self.deferred_terrain_wake.insert(seed);
                     self.deferred_wake_blocked.extend(missing);
@@ -1112,7 +1203,8 @@ impl ShardSim {
             }
         }
         for seed in decisions.entities_to_wake.clone() {
-            let missing = self.wake_group(&[seed], awake_count, false);
+            let (missing, _woken) =
+                self.wake_group(&[seed], awake_count, false, WakeSource::Observer);
             if !missing.is_empty() {
                 self.deferred_wake.insert(seed);
                 self.deferred_wake_blocked.extend(missing);
@@ -1180,18 +1272,24 @@ impl ShardSim {
     ///
     /// 返回整组推迟时缺失的 ② chunk(阻塞请求输入;前置不满足的组不落任何
     /// 成员——"下面的醒了走开、上面的悬空"被原子性排除)。
+    ///
+    /// 06c 遥测:`source` 决定被唤醒实体的事件归类(§4.16"闭包成员归入触发
+    /// 该组的来源");预算放不下的整组推迟计 `closure_deferred`(+1/组);
+    /// `woken` = 真正从冻结切为 Dynamic 的实体(被推迟的不计)。预算不足的
+    /// 返回值仍为空缺集(阻塞语义只属于缺 ②)。
     fn wake_group(
         &mut self,
         seeds: &[EntityId],
         awake_count: usize,
         budget_exempt: bool,
-    ) -> BTreeSet<ChunkPos> {
+        source: WakeSource,
+    ) -> (BTreeSet<ChunkPos>, Vec<EntityId>) {
         let region = self.activation_region();
         let group = self.wake_group_members(seeds);
         // 组为空(种子非冻结体:命令唤醒的重建体已是 Dynamic)→ 无组可落,
         // 返回空缺集(调用方语义:无前置可查,物理自洽)。
         if group.is_empty() {
-            return BTreeSet::new();
+            return (BTreeSet::new(), Vec::new());
         }
         // 前置:每个成员的当前足迹 ∩ 区域 ② 齐。
         let mut missing: BTreeSet<ChunkPos> = BTreeSet::new();
@@ -1210,7 +1308,13 @@ impl ShardSim {
             }
         }
         if !missing.is_empty() {
-            return missing; // 整组推迟(保持冻结);缺 ② 由调用方作阻塞请求
+            // 整组推迟(保持冻结);缺 ② 由调用方作阻塞请求。接触唤醒的
+            // 缺 ② 推迟计 `contact_wake_skipped_no_terrain`(§4.16):按组
+            // 计,只对接触路径(落实侧自行计数时传入)——wake_group 无法
+            // 区分接触/观察者,二者都以 Observer 进来;该计数由 prestep 在
+            // 调用侧处理,此处不重复。
+            let _ = &source;
+            return (missing, Vec::new());
         }
         // D19 预算:组 ≥ 2 整组放得下才醒;单实体保持现状。D20:地形变更
         // 唤醒豁免(budget_exempt,修订 7——支撑已被移除,推迟就意味着悬空)。
@@ -1218,7 +1322,9 @@ impl ShardSim {
             && group.len() >= 2
             && awake_count + group.len() > self.cfg.activation.max_awake_dynamic
         {
-            return BTreeSet::new(); // 整组推迟(预算不足;不走先醒再淘汰)
+            // 整组推迟(预算不足;不走先醒再淘汰)——计推迟组数(§4.16)。
+            self.activation_events.closure_deferred += 1;
+            return (BTreeSet::new(), Vec::new());
         }
         // 落实:整组原子。
         for id in &group {
@@ -1264,7 +1370,12 @@ impl ShardSim {
             let now = Tick(self.activation_now.0 - 1);
             self.activation.note_flip(id, now);
         }
-        BTreeSet::new()
+        // 06c 遥测:本组被唤醒的实体按来源计数(§4.16;闭包成员归入触发
+        // 该组的来源——整组共用一个 source 即此语义)。
+        if source == WakeSource::Terrain {
+            self.activation_events.wakes_terrain += group.len() as u64;
+        }
+        (BTreeSet::new(), group)
     }
 
     /// 撞前预测接触唤醒 + 补偿消费(任务 05a/05b/05c;需求
@@ -1394,11 +1505,16 @@ impl ShardSim {
                 .into_iter()
                 .map(|(_a, b, p)| (b, p))
                 .collect();
+        // 06c 遥测的来源归属表(§4.16):预测种子与补偿种子分开记(同一 B
+        // 双重身份取最大值合并后归预测——风险 5)。
+        let pred_seeds: BTreeSet<EntityId> = seeds.keys().copied().collect();
+        let mut comp_seeds: BTreeSet<EntityId> = BTreeSet::new();
         let mut merged = seeds;
         for (b, p) in compensated {
             // B 必须仍是冻结候选(不在 → 已醒着/迁出/消失/待地形:静默跳过,
             // 风险 1);同一 B 预测与补偿并存取最大(§4.10.4)。
             if frozen.iter().any(|(fid, _, _)| fid == &b) {
+                comp_seeds.insert(b);
                 merged
                     .entry(b)
                     .and_modify(|cur| {
@@ -1408,6 +1524,10 @@ impl ShardSim {
                     })
                     .or_insert(p);
             }
+        }
+        // 双重身份归预测(§4.16 风险 5)。
+        for b in pred_seeds.iter() {
+            comp_seeds.remove(b);
         }
         if merged.is_empty() {
             return; // 无种子:邻接图(全冻结体两两比较)不构建(05b 修正)
@@ -1481,7 +1601,43 @@ impl ShardSim {
             }
             let group_ids: Vec<EntityId> = group.clone();
             woken_count += group_ids.len();
-            let _missing = self.wake_group(&group_ids, budget, false);
+            // 06c 遥测:按成员归类来源(§4.16"闭包成员归入触发该组的来源")
+            // ——成员自己是种子:预测/补偿(同一 B 双重身份已归预测);成员
+            // 是传播所得节点(非种子):spread;纯闭包成员(不在传播结果):
+            // 归入本组排序键的触发节点(种子 → 预测/补偿,传播节点 → spread)。
+            let mut pred = 0usize;
+            let mut comp = 0usize;
+            let mut spread_n = 0usize;
+            for id in &group_ids {
+                if pred_seeds.contains(id) {
+                    pred += 1;
+                } else if comp_seeds.contains(id) {
+                    comp += 1;
+                } else if p_of.contains_key(id) {
+                    spread_n += 1;
+                } else if pred_seeds.contains(_min_id) {
+                    pred += 1;
+                } else if comp_seeds.contains(_min_id) {
+                    comp += 1;
+                } else {
+                    spread_n += 1;
+                }
+            }
+            self.activation_events.wakes_contact_pred += pred as u64;
+            self.activation_events.wakes_contact_comp += comp as u64;
+            self.activation_events.wakes_contact_spread += spread_n as u64;
+            let (missing, woken) = self.wake_group(&group_ids, budget, false, WakeSource::Observer);
+            if !missing.is_empty() {
+                // 组因当前足迹缺 ② 整组推迟(保持冻结):撤销按成员计的
+                // 唤醒数,计 `contact_wake_skipped_no_terrain`(+1/组;§4.16
+                // "只数真正从冻结切为 Dynamic 的实体")。
+                self.activation_events.wakes_contact_pred -= pred as u64;
+                self.activation_events.wakes_contact_comp -= comp as u64;
+                self.activation_events.wakes_contact_spread -= spread_n as u64;
+                self.activation_events.contact_wake_skipped_no_terrain += 1;
+            } else {
+                debug_assert_eq!(woken.len(), group_ids.len(), "落实组应全员唤醒");
+            }
             budget += group_ids.len();
         }
     }
@@ -1716,8 +1872,11 @@ impl ShardSim {
 
     /// 到期内部指令应用(§4.3.2;任务 03):实体进入待执行强制落地集。
     /// 调度器 SCHEDULER 来源(不入外部日志);实体在本分片才收(在途时由
-    /// ownership 切换后的目的分片收)。
+    /// ownership 切换后的目的分片收)。06c 遥测:按截止归因(§4.16"截止、
+    /// 预算分计"——指令只来自调度器 7.5 的 TransientMotion 到期扫描)。
     pub fn apply_forced_landing_directive(&mut self, entity: EntityId) {
+        self.forced_reasons
+            .insert(entity, ForcedLandingReason::Deadline);
         self.forced_pending.insert(entity);
     }
 
@@ -1879,12 +2038,13 @@ impl ShardSim {
                     } else {
                         // 触顶:产 End(撤票)+ 入下一拍冻结队列(撤票在拍末
                         // 生效,冻结在其后的 lifecycle 段执行——持票期间不
-                        // 出现"已冻结"可观测态)。
+                        // 出现"已冻结"可观测态)。06c 遥测:计触顶撤票张数。
                         self.outbox.ticket_ops.push(TicketOpRecord {
                             entity: id,
                             op: TicketOp::End,
                         });
                         self.capped_freeze_pending.insert(id);
+                        self.activation_events.actor_motion_capped += 1;
                     }
                 } else {
                     // 静止 ∨ 入唤醒范围:撤票 + 清记账/触顶(被唤醒时也清,
@@ -1951,8 +2111,12 @@ impl ShardSim {
                     self.phys.remove_body(handle);
                     self.locomotion.remove(&id);
                     self.forced_pending.remove(&id);
+                    self.forced_reasons.remove(&id);
                     self.outbox.despawned.push(id);
                     self.outbox.void_removed.push(id);
+                    // 06c 遥测:虚空移除只计 void_removals(§4.16:落地失败
+                    // 转虚空移除的、虚空线以下生成的,都不算强制落地)。
+                    self.activation_events.void_removals += 1;
                 }
             }
         }
@@ -1999,13 +2163,16 @@ impl ShardSim {
             };
             let handle = rec.handle;
             let Some(landing) = landing else {
-                // 虚空移除(无支撑柱;无 BlockWrite)。
+                // 虚空移除(无支撑柱;无 BlockWrite)。§4.16:落地失败转虚空
+                // 移除的只计 void_removals,不算强制落地。
                 self.entities.remove(&id).expect("存在");
                 self.phys.remove_body(handle);
                 self.locomotion.remove(&id);
                 self.outbox.despawned.push(id);
                 self.outbox.void_removed.push(id);
                 self.forced_pending.remove(&id);
+                self.forced_reasons.remove(&id);
+                self.activation_events.void_removals += 1;
                 continue;
             };
             // 落点写块(Emergent)+ despawn(与凝固桥同产出;复用 REQ-005
@@ -2029,6 +2196,14 @@ impl ShardSim {
             self.outbox.despawned.push(id);
             self.outbox.forced_landings.push((id, landing));
             self.forced_pending.remove(&id);
+            // 06c 遥测:按原因分计(§4.16);无记账(恢复线缺表)按截止归因
+            // ——调度器只对 TransientMotion 到期投指令,语义一致。
+            match self.forced_reasons.remove(&id) {
+                Some(ForcedLandingReason::Budget) => {
+                    self.activation_events.forced_landings_budget += 1;
+                }
+                _ => self.activation_events.forced_landings_deadline += 1,
+            }
         }
     }
 
@@ -4487,6 +4662,54 @@ mod tests {
             "落点写块(Emergent)"
         );
         assert!(s.entity_state(a).is_some(), "近者保留");
+    }
+
+    /// 任务书测试 `sim::over_budget_transient_forced_landing`(T8/§9-2)的
+    /// **plan 路径补齐**(06c 接线暴露:plan 的超预算淘汰 `over_budget_freeze`
+    /// 此前无消费者,瞬态被冻结悬停而非强制落地):预算 1、两个醒着的瞬态体,
+    /// 下一拍 plan 淘汰远者 → 远者强制落地(消失 + 写块),事件计数
+    /// `forced_landings_budget = 1`(§4.16"预算分计")。变异即红:淘汰改回
+    /// 冻结悬停(over_budget_freeze 不分流)、预算归因丢失(计入截止)。
+    #[test]
+    fn plan_budget_eviction_forces_transient_landing_and_counts() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.max_awake_dynamic = 1;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let (a, b) = (entity(1), entity(2));
+        // 启用(近观察者):两体都在唤醒范围内保持醒着。
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        s.apply_prefix(&[
+            spawn_input(1, a, Vec3::new(8.0, 0.5, 8.0)),
+            spawn_input(2, b, Vec3::new(9.0, 0.5, 8.0)),
+        ]);
+        let _ = s.take_activation_events();
+        // 醒数 2 > 预算 1 → plan 距离降序淘汰远者 b(瞬态 → 强制落地)。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.over_budget_freeze, vec![b], "非退化:远者 b 被 plan 淘汰");
+        s.run_transient_lifecycle();
+        let events = s.take_activation_events();
+        assert!(
+            s.entity_state(b).is_none(),
+            "plan 淘汰瞬态 → 强制落地(消失)"
+        );
+        assert!(s.entity_state(a).is_some(), "近者 a 保留");
+        assert!(
+            s.outbox
+                .block_updates
+                .iter()
+                .any(|w| w.kind == BlockWriteKind::Emergent),
+            "落点写块(Emergent)"
+        );
+        assert_eq!(
+            events.forced_landings_budget, 1,
+            "事件量:预算淘汰落地 1(§4.16)"
+        );
+        assert_eq!(events.forced_landings_deadline, 0, "不计截止");
     }
     // ==== REQ-007 任务 03(G3 返修补齐测试)====
 
