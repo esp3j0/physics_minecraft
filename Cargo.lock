@@ -1157,6 +1157,7 @@ dependencies = [
  "messaging",
  "sim-api",
  "tokio",
+ "toml",
  "types",
  "voxel",
 ]

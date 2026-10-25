@@ -8,3 +8,5 @@
 pub mod client;
 pub mod mesh;
 pub mod render;
+/// REQ-008:图形冒烟场景脚本(纯逻辑,零 macroquad)。
+pub mod script;

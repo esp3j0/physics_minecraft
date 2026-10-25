@@ -10,6 +10,8 @@ voxel = { path = "../voxel" }
 sim-api = { path = "../sim-api" }
 tokio = { version = "1", features = ["macros", "rt", "time", "sync", "net", "io-util", "signal"] }
 macroquad = "0.4"
+# REQ-008:场景脚本解析。
+toml = "1"
 
 [lints]
 workspace = true
