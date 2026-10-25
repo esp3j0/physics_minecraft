@@ -8,6 +8,9 @@
 //! 实现函数体;可以新增私有项或拆分子模块,但 `viewer::script::*` 的公开面不得改名、删字段
 //! 或改类型。
 
+mod engine;
+mod parse;
+
 use types::glam::Vec3;
 use types::{BlockId, BlockPos, EntityId, EntityState};
 
@@ -151,8 +154,7 @@ impl std::error::Error for ScriptError {}
 
 /// 解析场景文本(REQ-008 §3.1–§3.3;AC-S1)。
 pub fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
-    let _ = text;
-    unimplemented!("REQ-008 单元 01:由实施方实现")
+    parse::parse_scenario(text)
 }
 
 /// 相机位姿。朝向约定与 viewer 飞行相机一致:
@@ -282,24 +284,24 @@ pub enum EngineStatus {
 
 /// 步骤状态机(REQ-008 §3.2、§4;AC-S2、AC-S3)。
 pub struct Engine {
-    scenario: Scenario,
+    inner: engine::EngineInner,
     status: EngineStatus,
 }
 
 impl Engine {
     /// 以起始相机位姿创建引擎;耦合初始为开。
     pub fn new(scenario: Scenario, start: CameraPose) -> Self {
-        let _ = start;
         Self {
-            scenario,
+            inner: engine::EngineInner::new(scenario, start),
             status: EngineStatus::Running { step: 1 },
         }
     }
 
     /// 推进一帧。
     pub fn frame(&mut self, input: &FrameInput<'_>) -> FrameOutput {
-        let _ = (input, &self.scenario);
-        unimplemented!("REQ-008 单元 01:由实施方实现")
+        let (output, status) = self.inner.frame(input);
+        self.status = status;
+        output
     }
 
     pub fn status(&self) -> &EngineStatus {
@@ -309,11 +311,10 @@ impl Engine {
     /// 结束后的退出码(REQ-008 §4):0 = 全部完成且检查成立;1 = 有检查失败;
     /// 2 = 场景失败。仍在运行 → None。
     pub fn exit_code(&self) -> Option<i32> {
-        match &self.status {
-            EngineStatus::Running { .. } => None,
-            EngineStatus::Done { failed_checks: 0 } => Some(0),
-            EngineStatus::Done { .. } => Some(1),
-            EngineStatus::Failed { .. } => Some(2),
-        }
+        engine::exit_code(&self.status)
     }
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

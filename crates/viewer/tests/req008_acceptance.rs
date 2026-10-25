@@ -105,7 +105,6 @@ fn scenario(steps: &str) -> String {
 /// 会变红的实现:漏掉某个动作或检查项;角度/坐标字段错位;方块名没有解析成 ID;
 /// `[server]` 覆盖项丢失。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s1_parses_all_actions_and_checks() {
     let text = r#"
 name = "all"
@@ -283,7 +282,6 @@ screenshot = { name = "return", expect = "地面上有方块", hud = true }
 ///
 /// 会变红的实现:缺省值写错;可选字段被当成必填。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s1_defaults() {
     let s = parse_scenario(&scenario(
         r#"
@@ -322,7 +320,6 @@ screenshot = { name = "a", expect = "b" }
 /// 会变红的实现:未知键被静默忽略;一步多个动作只取其一;错误不带步骤序号或序号从 0 开始;
 /// 未知方块名被当成空气。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s1_errors_report_step_index() {
     let ok_step = "[[step]]\nwait_ticks = { n = 1 }\n";
     let cases: Vec<(String, Option<usize>, &str)> = vec![
@@ -405,7 +402,6 @@ fn acc_s1_errors_report_step_index() {
 ///
 /// 会变红的实现:即时步骤要等下一帧;`look_at` 的角度换算与相机朝向约定不一致。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_camera_and_look_at_apply_immediately() {
     let mut e = engine(&scenario(
         r#"
@@ -446,7 +442,6 @@ look_at = { target = [8.0, -53.0, 29.0] }
 ///
 /// 会变红的实现:瞬移到终点;速度没乘帧时长;越过目标;到达前就报结束。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_fly_moves_at_speed_and_arrives() {
     let mut e = engine(&scenario(
         "[[step]]\nfly = { to = [16.0, -50.0, 0.0], speed = 16.0 }\n",
@@ -473,7 +468,6 @@ fn acc_s2_fly_moves_at_speed_and_arrives() {
 ///
 /// 会变红的实现:按帧数或墙钟计时;起点取错;用 `>` 而不是 `>=`。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_wait_ticks_uses_server_ticks() {
     let mut e = engine(&scenario("[[step]]\nwait_ticks = { n = 30 }\n"));
     let w = World::with_entities(&[]);
@@ -494,7 +488,6 @@ fn acc_s2_wait_ticks_uses_server_ticks() {
 ///
 /// 会变红的实现:条件成立不结束;超时不判失败;超时只记检查失败而不终止场景。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_wait_until_succeeds_or_times_out() {
     let text =
         scenario("[[step]]\nwait_until = { live_entities = { eq = 0 }, timeout_ticks = 100 }\n");
@@ -535,7 +528,6 @@ fn acc_s2_wait_until_succeeds_or_times_out() {
 /// 会变红的实现:基点没按相机朝向算;网格公式不同;忽略初速度;不等回执就结束;标签没记
 /// 回执 ID;等回执没有超时。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_spawn_emits_grid_and_waits_for_receipts() {
     let text = scenario(
         r#"
@@ -599,7 +591,6 @@ check = { labeled_alive = { label = "b", eq = 3 } }
 ///
 /// 会变红的实现:吸附不限距离;取了最远的;找不到实体时静默跳过或改用别的点。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_detonate_nearest_and_absolute() {
     let w = World::with_entities(&[
         (eid(1), Vec3::new(30.0, -59.5, 0.0)),
@@ -644,7 +635,6 @@ detonate = { at = [1.0, 2.0, 3.0], power = 6.0, radius = 4.0 }
 ///
 /// 会变红的实现:方块 ID 错;耦合开关不生效。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_set_block_and_couple() {
     let mut e = engine(&scenario(
         r#"
@@ -670,7 +660,6 @@ couple = { on = false }
 /// 会变红的实现:同一帧发出多个截图;截图后继续执行后续步骤(截到的不是期望的画面);
 /// 文件名格式不同。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_one_screenshot_per_frame() {
     let mut e = engine(&scenario(
         r#"
@@ -712,7 +701,6 @@ screenshot = { name = "b", expect = "第二张", hud = true }
 ///
 /// 会变红的实现:检查失败就终止场景;失败原因为空;退出码不区分检查失败与场景失败。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_check_failure_continues_with_exit_code_1() {
     let w = World::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
     let mut e = engine(&scenario(
@@ -742,7 +730,6 @@ camera = { pos = [1.0, -50.0, 1.0], yaw = 0.0, pitch = 0.0 }
 ///
 /// 会变红的实现:不计墙钟;按服务器拍号算超时。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s2_scenario_timeout() {
     let mut e = engine(&format!(
         "{HEADER}timeout_secs = 1\n[[step]]\nwait_ticks = {{ n = 1000 }}\n"
@@ -774,7 +761,6 @@ fn check_outcome(check: &str, world: &World) -> StepOutcome {
 ///
 /// 会变红的实现:比较方向写反;方块检查读错格子;chunk 计数取错来源。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s3_count_and_block_checks() {
     let two = World::with_entities(&[
         (eid(1), Vec3::new(0.5, -59.5, 0.5)),
@@ -814,7 +800,6 @@ fn acc_s3_count_and_block_checks() {
 /// 会变红的实现:只看高度不看静止(把下落中的碎片判为悬空);只看静止不看高度(把贴地的
 /// 判为悬空);历史不足也下结论;高度没减去半尺寸或没加上方块顶面。
 #[test]
-#[ignore = "REQ-008 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s3_no_floating() {
     let text = scenario(
         r#"
