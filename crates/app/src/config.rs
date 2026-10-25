@@ -134,8 +134,10 @@ pub struct Config {
     pub inbox_capacity: usize,
     /// checkpoint 间隔(拍),600(§9.11)。
     pub checkpoint_interval_ticks: u64,
-    /// checkpoint 保留数,10;0 = 不清理(#17;REQ-001 决议 11 修订)。
-    /// **总架构师接口桩**:字段已加,由实施方接到 bootstrap 的存储构造。
+    /// checkpoint 保留数(#17;REQ-001 决议 11 修订),10(回放窗口 90 s);
+    /// `0` = 不清理。bootstrap 用它打开 checkpoint 库:打开时与每次追加都
+    /// 只保留最近 `checkpoint_keep` 个(最新一个永不删,ID 不复用);
+    /// 无上限,`0` 合法。
     pub checkpoint_keep: usize,
     /// 分片 step P95 告警阈值(ms;持续 60 tick),5(§9.2)。
     pub shard_alert_ms: f32,

@@ -433,9 +433,13 @@ pub struct DriverOutcome {
 /// 增 ② 冷却表、`ShardSimConfig` 字段更名——v3 档解码必失败/版本拒绝;必须清
 /// `data_dir`。**v4 为 REQ-007 布局终稿(任务 06b 收口)**:§4.14 清单——完整
 /// 票据表、票据收件箱(随命令日志重放)、每分片 ② 集合、待地形保存速度与状态、
-/// ①/② 两套冷却簿记、待处理补偿种子与地形变更唤醒格、未消费 `ticket_ops`、
+/// ①② 两套冷却簿记、待处理补偿种子与地形变更唤醒格、未消费 `ticket_ops`、
 /// D17 开关——全部已在快照字段内,此后不再改布局。v0/v1/v2/v3 一律显式拒绝。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 4;
+/// **v5**(#17,D2):blob 改为「未压缩的 `format_version` varint 前缀 +
+/// `lz4_flex` 压缩的 bincode 体」;解码先读前缀再解压,旧版本报
+/// `unsupported checkpoint format version N`(点名版本,不是解压失败)。
+/// v4 及更早档必须清 `data_dir`(与 REQ-005 D8 版本记录一致)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 5;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -464,44 +468,39 @@ pub enum AppError {
     Decode(String),
 }
 
-/// bundle → bincode 字节(standard 配置;全字段可序列化,不可能失败 → fail-stop)。
-fn encode(bundle: &CheckpointBundle) -> Vec<u8> {
-    bincode::serde::encode_to_vec(bundle, bincode::config::standard())
-        .expect("检查点捆绑编码不可能失败(全字段可序列化,fail-stop)")
-}
-
-/// checkpoint 编码的公开入口(#17;e2e 与工具复用,不再各写一份解码)。v5 起格式为
-/// "未压缩的 `format_version` 前缀 + lz4 压缩体"(#17 D2)。
-///
-/// **总架构师接口桩(#17)**:签名固定;当前仍委托旧的 v4 编码,由实施方改为 v5。
+/// bundle → checkpoint 字节(v5,#17 D2;唯一编码入口,e2e 与工具复用):
+/// 未压缩的 `format_version` varint 前缀(bincode standard)+ `lz4_flex`
+/// 压缩的 bincode 体。bincode 与 lz4_flex 均为纯函数——同一 bundle 两次
+/// 编码逐字节相等(AC-C9)。
 pub fn encode_checkpoint(bundle: &CheckpointBundle) -> Vec<u8> {
-    encode(bundle)
+    let mut out = bincode::serde::encode_to_vec(bundle.format_version, bincode::config::standard())
+        .expect("版本前缀(u32)编码不可能失败(fail-stop)");
+    let body = bincode::serde::encode_to_vec(bundle, bincode::config::standard())
+        .expect("检查点捆绑编码不可能失败(全字段可序列化,fail-stop)");
+    out.extend_from_slice(&lz4_flex::compress_prepend_size(&body));
+    out
 }
 
-/// checkpoint 解码的公开入口(#17):先读版本前缀,不是当前版本即按 REQ-005 D8 报错
-/// (`unsupported checkpoint format version N`),再解压、解码。
-///
-/// **总架构师接口桩(#17)**:签名固定;当前仍委托旧的 v4 解码,由实施方改为 v5。
+/// checkpoint 字节 → bundle(v5,#17;唯一解码入口):先读版本前缀,不是当前
+/// 版本即按 REQ-005 D8 报错 `unsupported checkpoint format version N`(先看
+/// 版本再解压:旧档报版本错误而非解压失败,任务书风险 4);再解压、解码。
+/// 空输入/截断/乱码/解压或解码失败 → `Err(AppError::Decode)`,不 panic。
 pub fn decode_checkpoint(bytes: &[u8]) -> Result<CheckpointBundle, AppError> {
-    decode(bytes)
-}
-
-/// bincode 字节 → bundle(REQ-005 D8):
-/// - 解码失败(含任务 01 前旧布局 `{snapshot, log_bytes}` 的字节——无版本
-///   字段,结构不同自然解不开)→ `Err(AppError::Decode)`;
-/// - 解码成功但 `format_version != CHECKPOINT_FORMAT_VERSION` →
-///   `Err(AppError::Decode)` 带版本说明(不兼容旧格式,不静默降级)。
-fn decode(bytes: &[u8]) -> Result<CheckpointBundle, AppError> {
-    let (bundle, _len): (CheckpointBundle, usize) =
+    let (version, prefix_len): (u32, usize) =
         bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(|e| AppError::Decode(e.to_string()))?;
-    if bundle.format_version != CHECKPOINT_FORMAT_VERSION {
+            .map_err(|e| AppError::Decode(format!("checkpoint 版本前缀读取失败:{e}")))?;
+    if version != CHECKPOINT_FORMAT_VERSION {
         return Err(AppError::Decode(format!(
             "unsupported checkpoint format version {}, expected {}(REQ-005 D8:不兼容旧格式;\
              请清空 data_dir 后重开)",
-            bundle.format_version, CHECKPOINT_FORMAT_VERSION
+            version, CHECKPOINT_FORMAT_VERSION
         )));
     }
+    let body = lz4_flex::decompress_size_prepended(&bytes[prefix_len..])
+        .map_err(|e| AppError::Decode(format!("checkpoint 解压失败:{e}")))?;
+    let (bundle, _len): (CheckpointBundle, usize) =
+        bincode::serde::decode_from_slice(&body, bincode::config::standard())
+            .map_err(|e| AppError::Decode(e.to_string()))?;
     Ok(bundle)
 }
 
@@ -541,7 +540,7 @@ fn write_checkpoint(
         spawn_next_seq,
     };
     let tick = bundle.world.shards.tick;
-    store.append_checkpoint(tick, encode(&bundle));
+    store.append_checkpoint(tick, encode_checkpoint(&bundle));
     checkpoints_written.push(tick);
     spawn_next_seq
 }
@@ -1527,16 +1526,19 @@ pub fn bootstrap(
     let chunks_path = data_dir.join("chunks.redb");
     let checkpoints_path = data_dir.join("checkpoints.redb");
     let chunks = storage::redb::RedbStore::open(&chunks_path)?;
-    let checkpoints = storage::redb::RedbStore::open(&checkpoints_path)?;
+    // checkpoint 库按保留数打开(#17;REQ-001 决议 11 修订):打开时与追加时
+    // 都只保留最近 `checkpoint_keep` 个(0 = 不清理);chunk 库照旧 `open`。
+    let checkpoints =
+        storage::redb::RedbStore::open_with_keep(&checkpoints_path, config.checkpoint_keep)?;
 
     // read_latest 必须在移交 worker 之前(决策 6:移交后文件锁在手)。
     let latest = checkpoints.read_latest()?;
     let (session, log, resume_from, spawn_next_seq) = match latest {
         Some((at, blob)) => {
-            // 有检查点:解码 bundle(replay_world 恢复 Session + scheduler
-            // 状态 + log 续跑,拍号对齐)。旧格式/未知版本 → Err(AppError::
-            // Decode),不静默降级(REQ-005 D8)。
-            let bundle = decode(&blob)?;
+            // 有检查点:解码 bundle(v5 前缀 + 压缩体;replay_world 恢复
+            // Session + scheduler 状态 + log 续跑,拍号对齐)。旧格式/未知
+            // 版本 → Err(AppError::Decode),不静默降级(REQ-005 D8)。
+            let bundle = decode_checkpoint(&blob)?;
             let log = sim_api::log::CommandLog::from_bytes(&bundle.log_bytes)
                 .map_err(|e| AppError::Decode(e.to_string()))?;
             if bundle.world.shards.tick != at {
@@ -2283,7 +2285,7 @@ mod tests {
             .read_latest()
             .expect("读最新检查点")
             .expect("必有检查点");
-        decode(&blob).expect("自有编码必可解码")
+        decode_checkpoint(&blob).expect("自有编码必可解码")
     }
 
     /// 测试清单 1:start_paused;3 拍 + 拍间注入 Send(SpawnDynamic)→
@@ -2663,7 +2665,7 @@ mod tests {
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
             spawn_next_seq: 42,
         };
-        let decoded = decode(&encode(&bundle)).expect("自有编码必可解码");
+        let decoded = decode_checkpoint(&encode_checkpoint(&bundle)).expect("自有编码必可解码");
         assert_eq!(
             decoded.world.shards, bundle.world.shards,
             "快照往返逐字段相等"
@@ -2684,7 +2686,7 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        let decoded = decode(&encode(&empty)).expect("空 bundle 必可解码");
+        let decoded = decode_checkpoint(&encode_checkpoint(&empty)).expect("空 bundle 必可解码");
         assert!(decoded.world.shards.per_shard.is_empty(), "0 分片快照合法");
         assert_eq!(decoded.world.shards.tick, types::Tick(0));
     }
@@ -2708,8 +2710,8 @@ mod tests {
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
             spawn_next_seq: 0,
         };
-        let bytes = encode(&future);
-        match decode(&bytes) {
+        let bytes = encode_checkpoint(&future);
+        match decode_checkpoint(&bytes) {
             Err(AppError::Decode(msg)) => {
                 assert!(
                     msg.contains("unsupported checkpoint format version 99"),
@@ -2729,7 +2731,10 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        assert!(decode(&encode(&zero)).is_err(), "版本 0 = 旧格式,拒绝");
+        assert!(
+            decode_checkpoint(&encode_checkpoint(&zero)).is_err(),
+            "版本 0 = 旧格式,拒绝"
+        );
 
         // 1(REQ-005 的格式)→ 同样拒绝;REQ-006 任务 03 升档到 2。
         let v1 = CheckpointBundle {
@@ -2738,7 +2743,7 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        match decode(&encode(&v1)) {
+        match decode_checkpoint(&encode_checkpoint(&v1)) {
             Err(AppError::Decode(msg)) => {
                 assert!(
                     msg.contains("unsupported checkpoint format version 1"),
@@ -2767,7 +2772,7 @@ mod tests {
             bincode::config::standard(),
         )
         .expect("旧布局编码(测试构造)");
-        match decode(&old_bytes) {
+        match decode_checkpoint(&old_bytes) {
             Err(AppError::Decode(_)) => {}
             other => panic!(
                 "任务 01 前旧布局字节必须 Err(Decode),实为 {:?}",
@@ -2783,7 +2788,7 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        match decode(&encode(&v2)) {
+        match decode_checkpoint(&encode_checkpoint(&v2)) {
             Err(AppError::Decode(msg)) => {
                 assert!(
                     msg.contains("unsupported checkpoint format version 2"),
@@ -2810,7 +2815,7 @@ mod tests {
             bincode::config::standard(),
         )
         .expect("v2 三字段编码(测试构造)");
-        match decode(&v2_bytes) {
+        match decode_checkpoint(&v2_bytes) {
             Err(AppError::Decode(_)) => {}
             other => panic!("v2 三字段字节必须 Err(Decode),实为 {:?}", other.is_err()),
         }
@@ -2827,7 +2832,7 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        match decode(&encode(&v3)) {
+        match decode_checkpoint(&encode_checkpoint(&v3)) {
             Err(AppError::Decode(msg)) => {
                 assert!(
                     msg.contains("unsupported checkpoint format version 3"),
@@ -2839,11 +2844,12 @@ mod tests {
     }
 
     /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
-    /// 常量已升 4;v3 编码(bundle 形状同构、版本号 3)必须显式版本拒绝。
-    /// 与 `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,一个锚常量。
+    /// 常量已升 5(#17 D2;v4 时曾为 4);v3 编码(bundle 形状同构、版本号 3)
+    /// 必须显式版本拒绝。与 `old_checkpoint_version_rejected` ⑤ 相互独立:
+    /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 4, "任务 01 起 = v4(B5)");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 5, "#17 D2 起 = v5");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -2853,13 +2859,67 @@ mod tests {
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
         };
-        match decode(&encode(&v3)) {
+        match decode_checkpoint(&encode_checkpoint(&v3)) {
             Err(AppError::Decode(msg)) => assert!(
                 msg.contains("unsupported checkpoint format version 3"),
                 "v3 拒绝信息必须带版本说明:{msg}"
             ),
             other => panic!("v3 旧档必须 Err(Decode),实为 {:?}", other.is_err()),
         }
+    }
+
+    /// #17 Z2 对应单元:v5 编解码边界。
+    /// ① 编码 = 未压缩 varint 版本前缀(5 = 单字节 0x05)+ lz4 压缩体:
+    ///    1 MB 全零日志确实被压缩;② 往返无损,两次/解码再编码逐字节相等
+    ///    (AC-C9 同口径);③ 未压缩 bincode 的 v4 档(v4 起的真实磁盘字节
+    ///    形状)报「unsupported checkpoint format version 4」——只有先读版本
+    ///    再解压的实现才报得出版本错误(先解压的会报解压失败,本断言红);
+    /// ④ 空输入/只有前缀/版本对但体乱码 → Err 不 panic。
+    #[test]
+    fn checkpoint_v5_codec_boundaries() {
+        let mk = |format_version: u32| CheckpointBundle {
+            format_version,
+            world: sim_api::snapshot::WorldSnapshot {
+                shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(7)),
+                scheduler: empty_scheduler_snapshot(types::Tick(7)),
+            },
+            log_bytes: vec![0u8; 1_000_000],
+            spawn_next_seq: 42,
+        };
+        let v5 = mk(CHECKPOINT_FORMAT_VERSION);
+        let bytes = encode_checkpoint(&v5);
+        assert_eq!(bytes[0], 5, "前缀 = 未压缩 varint 版本(5 = 单字节)");
+        assert!(
+            bytes.len() < 50_000,
+            "1 MB 全零日志应被压缩,实为 {} 字节",
+            bytes.len()
+        );
+        let back = decode_checkpoint(&bytes).expect("自有编码必可解码");
+        assert_eq!(back.format_version, CHECKPOINT_FORMAT_VERSION);
+        assert_eq!(back.world.shards.tick, types::Tick(7), "世界快照无损");
+        assert_eq!(back.log_bytes, v5.log_bytes, "日志无损");
+        assert_eq!(back.spawn_next_seq, 42, "高水位无损");
+        assert_eq!(encode_checkpoint(&v5), bytes, "两次编码逐字节相等");
+        assert_eq!(encode_checkpoint(&back), bytes, "解码再编码仍逐字节相等");
+
+        // v4 档字节(未压缩 bincode,版本 4 在前)→ 版本错误,不是解压错误。
+        let v4_bytes =
+            bincode::serde::encode_to_vec(mk(4), bincode::config::standard()).expect("v4 编码");
+        match decode_checkpoint(&v4_bytes) {
+            Err(AppError::Decode(msg)) => assert!(
+                msg.contains("unsupported checkpoint format version 4"),
+                "v4 档应报版本错误:{msg}"
+            ),
+            other => panic!("v4 档必须 Err(Decode),实为 {:?}", other.is_err()),
+        }
+
+        assert!(decode_checkpoint(&[]).is_err(), "空输入报错");
+        assert!(
+            decode_checkpoint(&[5]).is_err(),
+            "只有前缀、体缺失:报错不 panic"
+        );
+        // 体前 4 字节 = 解压后大小(小端):宣告 4 字节却没有数据 → Err 不 panic。
+        assert!(decode_checkpoint(&[5, 4, 0, 0, 0]).is_err(), "体乱码报错");
     }
 
     // ---- #12:服务端 spawn ID 高水位持久化 ----

@@ -47,7 +47,6 @@ fn check_retention(store: &mut dyn CheckpointStore, keep: usize, appends: u64) {
 ///
 /// 会变红的实现:只删不留(删掉最新的);删多一个或少一个;`keep = 0` 也清理;内存存储没跟上。
 #[test]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_k1_k3_keep_last_n() {
     let dir = tempfile::tempdir().expect("临时目录");
     let mut redb3 = RedbStore::open_with_keep(&dir.path().join("k3.redb"), 3).expect("打开");
@@ -66,7 +65,6 @@ fn acc_k1_k3_keep_last_n() {
 ///
 /// 会变红的实现:按行数恢复 ID(删旧后行数变少,ID 被复用);只在追加时清理,打开时不清理。
 #[test]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_k2_ids_monotonic_and_prune_on_open() {
     let dir = tempfile::tempdir().expect("临时目录");
     let path = dir.path().join("ck.redb");
@@ -103,7 +101,6 @@ fn acc_k2_ids_monotonic_and_prune_on_open() {
 ///
 /// 会变红的实现:不删旧(文件随追加线性增长到 150 MiB 以上);删旧不在同一事务、空闲页无法复用。
 #[test]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_k5_file_size_bounded() {
     let dir = tempfile::tempdir().expect("临时目录");
     let path = dir.path().join("bounded.redb");
@@ -141,7 +138,6 @@ fn bundle(format_version: u32, log_bytes: Vec<u8>) -> CheckpointBundle {
 /// 会变红的实现:版本没升;没压缩;先解压再看版本(v4 档报"解压失败"而不是版本错误);
 /// 乱码 panic。
 #[test]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_z2_v5_codec_and_old_versions_rejected() {
     assert_eq!(CHECKPOINT_FORMAT_VERSION, 5, "#17 D2:v4 → v5");
 
@@ -179,7 +175,6 @@ fn acc_z2_v5_codec_and_old_versions_rejected() {
 ///
 /// 会变红的实现:默认值不是 10;键名不对(被当成未知键拒绝);负数被接受。
 #[test]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_c1_checkpoint_keep_config() {
     assert_eq!(Config::default().checkpoint_keep, 10);
     assert_eq!(
@@ -213,7 +208,6 @@ async fn advance_ticks(ticks: u32) {
 /// 会变红的实现:bootstrap 没把 `checkpoint_keep` 传给存储(库里留下全部);压缩没走生产编码
 /// 路径(最新一个约 2.7 MB);新格式写得出读不回(重启失败)。
 #[tokio::test(start_paused = true)]
-#[ignore = "#17 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 async fn acc_k4_z1_production_path_retention_and_compression() {
     let dir = tempfile::tempdir().expect("临时目录");
     let config = Config {

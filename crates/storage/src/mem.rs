@@ -49,6 +49,9 @@ impl ChunkStore for MemChunkStore {
 pub struct MemCheckpointStore {
     next_id: u64,
     records: BTreeMap<CheckpointId, (Tick, Vec<u8>)>,
+    /// checkpoint 保留数(#17;0 = 不清理)。`new()` 恒 0(语义不变),
+    /// `with_keep` 按参数设定:追加即只留最近 `keep` 个,ID 单调不复用。
+    keep: usize,
 }
 
 impl MemCheckpointStore {
@@ -57,11 +60,11 @@ impl MemCheckpointStore {
     }
 
     /// 带保留数的内存检查点存储(#17;语义同 `RedbStore::open_with_keep`,`keep = 0` 不清理)。
-    ///
-    /// **总架构师接口桩(#17)**:签名固定,由实施方实现。
     pub fn with_keep(keep: usize) -> Self {
-        let _ = keep;
-        unimplemented!("#17:由实施方实现")
+        Self {
+            keep,
+            ..Self::default()
+        }
     }
 }
 
@@ -71,6 +74,12 @@ impl CheckpointStore for MemCheckpointStore {
         self.next_id += 1;
         let id = CheckpointId(self.next_id);
         self.records.insert(id, (at, blob.to_vec()));
+        // 插入即删旧(#17;与 redb 实现同一事务语义):保留最近 `keep` 个,
+        // 最新一个永不删;`keep = 0` / `新 id ≤ keep` 不清理(减法不下溢)。
+        if self.keep > 0 && self.next_id > self.keep as u64 {
+            let cutoff = self.next_id - self.keep as u64;
+            self.records.retain(|k, _| k.0 > cutoff);
+        }
         Ok(id)
     }
 
@@ -186,5 +195,35 @@ mod tests {
     fn mem_stores_are_send() {
         assert_send::<MemChunkStore>();
         assert_send::<MemCheckpointStore>();
+    }
+
+    /// #17 K1/K3(单元):`with_keep` 追加即保留最近 N 个;`keep = 0` 与
+    /// `new()` 不清理。内存存储没跟上保留语义(与 redb 行为不一致)会红。
+    #[test]
+    fn mem_with_keep_retains_last_n() {
+        let mut s3 = MemCheckpointStore::with_keep(3);
+        for i in 1..=8u64 {
+            assert_eq!(
+                s3.append(Tick(i * 10), &[i as u8]).unwrap(),
+                CheckpointId(i)
+            );
+        }
+        let present: Vec<u64> = (1..=8)
+            .filter(|i| s3.read(CheckpointId(*i)).unwrap().is_some())
+            .collect();
+        assert_eq!(present, vec![6, 7, 8], "keep = 3:只剩最近 3 个");
+        let (tick, blob) = s3.read_latest().unwrap().expect("最新一个永远在");
+        assert_eq!(tick, Tick(80));
+        assert_eq!(blob, vec![8u8]);
+
+        for mut store in [MemCheckpointStore::with_keep(0), MemCheckpointStore::new()] {
+            for i in 1..=5u64 {
+                store.append(Tick(i), &[1]).unwrap();
+            }
+            let present: Vec<u64> = (1..=5)
+                .filter(|i| store.read(CheckpointId(*i)).unwrap().is_some())
+                .collect();
+            assert_eq!(present, vec![1, 2, 3, 4, 5], "keep = 0 / new():全保留");
+        }
     }
 }

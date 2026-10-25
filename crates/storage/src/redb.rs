@@ -32,9 +32,13 @@ const CHECKPOINTS: TableDefinition<u64, (u64, Vec<u8>)> = TableDefinition::new(C
 /// supertrait(README 决策 2),由单写 worker 线程持有。
 pub struct RedbStore {
     db: Database,
-    /// checkpoint 自增计数器:`open` 时从表现有行数初始化(细则 3),
+    /// checkpoint 自增计数器:`open` 时从表内最大键初始化(细则 3),
     /// 重启后不回退、不复用。`next_id` 即最近一次分配的 ID(0 = 尚未分配)。
     next_checkpoint_id: u64,
+    /// checkpoint 保留数(#17;REQ-001 决议 11 修订):0 = 不清理;`keep > 0`
+    /// 时每次 `append` 在同一写事务里删 `id ≤ 新 id − keep` 的旧行。
+    /// `open` 恒 0(语义不变),`open_with_keep` 按参数设定并在打开时先清理。
+    keep: usize,
 }
 
 /// 把 `Database::create` 的失败映射成 `StoreError`:IO(文件无法创建/打开、锁被占)
@@ -58,10 +62,24 @@ impl RedbStore {
     /// 立即删到只剩最近 `keep` 个;此后每次 `append` 在**同一个写事务**里插入新行并删除
     /// `id <= 新 id − keep` 的旧行。最新一个永不删除,ID 单调、不回退、不复用。
     ///
-    /// **总架构师接口桩(#17)**:签名固定,由实施方实现。
     pub fn open_with_keep(path: &Path, keep: usize) -> Result<Self, StoreError> {
-        let _ = (path, keep);
-        unimplemented!("#17:由实施方实现")
+        let mut store = Self::open(path)?;
+        // 打开时清理(#17;REQ-001 决议 11 修订):现存多于 `keep` 个 → 立即删到
+        // 只剩最近 `keep` 个(单个写事务,调小 keep 后重启生效)。范围删除
+        // `id ≤ 最大键 − keep`,最新一个(最大键)永不删,故 ID 计数器(取自
+        // 清理前的最大键)不受影响、不回退、不复用;`keep = 0` 不清理。
+        if keep > 0 && store.next_checkpoint_id > keep as u64 {
+            let write_txn = store.db.begin_write().map_err(map_db_error)?;
+            {
+                let mut table = write_txn.open_table(CHECKPOINTS).map_err(map_db_error)?;
+                table
+                    .retain_in(..=(store.next_checkpoint_id - keep as u64), |_, _| false)
+                    .map_err(map_db_error)?;
+            }
+            write_txn.commit().map_err(map_db_error)?;
+        }
+        store.keep = keep;
+        Ok(store)
     }
 
     /// 打开/创建数据库文件。路径由调用方给定(app 配置)。
@@ -71,7 +89,8 @@ impl RedbStore {
         // checkpoint 计数器从表最大键恢复:重开旧库再 append,ID 继续增长(细则 3)。
         // 用最大键而非行数:append 失败会在序号上留洞(线程粘滞错误路径),
         // 行数 < 最大键时按行数恢复会复用已存在 ID、静默覆盖(qwen 评审发现,
-        // 架构师复核升级采纳,2026-10-14)。
+        // 架构师复核升级采纳,2026-10-14)。#17 起 keep 清理会减少行数——按
+        // 最大键恢复的口径保证清理后 ID 仍不复用。
         let next_checkpoint_id = {
             let read_txn = db.begin_read().map_err(map_db_error)?;
             match read_txn.open_table(CHECKPOINTS) {
@@ -88,6 +107,7 @@ impl RedbStore {
         Ok(Self {
             db,
             next_checkpoint_id,
+            keep: 0,
         })
     }
 
@@ -177,6 +197,15 @@ impl CheckpointStore for RedbStore {
             table
                 .insert(id, (at.0, blob.to_vec()))
                 .map_err(map_db_error)?;
+            // 删旧与插入在同一个写事务(#17;REQ-001 决议 11 修订):中途崩溃
+            // 不会留下多于/少于 keep 个的状态。范围删除 `id ≤ 新 id − keep`
+            // (retain_in 界定范围,不做全表扫描);最新一个(新 id)永不删;
+            // `keep = 0` 不清理;`新 id ≤ keep` 时不删(减法不下溢)。
+            if self.keep > 0 && id > self.keep as u64 {
+                table
+                    .retain_in(..=(id - self.keep as u64), |_, _| false)
+                    .map_err(map_db_error)?;
+            }
         }
         write_txn.commit().map_err(map_db_error)?;
         Ok(CheckpointId(id))
@@ -371,5 +400,102 @@ mod tests {
     #[test]
     fn redb_store_is_send() {
         assert_send::<RedbStore>();
+    }
+
+    /// #17 K1/K3(单元):`open_with_keep` 追加即保留最近 N 个;`keep = 1`
+    /// 只留最新;`keep = 0` 不清理。删除多留/少留、keep = 0 也清理都会红。
+    #[test]
+    fn redb_open_with_keep_retains_last_n() {
+        let (_dir, path) = temp_db();
+        let mut store = RedbStore::open_with_keep(&path, 3).expect("打开");
+        for i in 1..=8u64 {
+            assert_eq!(
+                store.append(Tick(i * 10), &[i as u8]).unwrap(),
+                CheckpointId(i),
+                "ID 从 1 起连续递增"
+            );
+        }
+        for i in 1..=8u64 {
+            let present = store.read(CheckpointId(i)).unwrap().is_some();
+            assert_eq!(
+                present,
+                i > 5,
+                "keep = 3:第 {i} 个应{}",
+                if i > 5 { "保留" } else { "删除" }
+            );
+        }
+        let (tick, blob) = store.read_latest().unwrap().expect("最新一个永远在");
+        assert_eq!(tick, Tick(80));
+        assert_eq!(blob, vec![8u8]);
+
+        // keep = 1:只留最新一个。
+        let (_dir1, path1) = temp_db();
+        let mut s1 = RedbStore::open_with_keep(&path1, 1).expect("打开");
+        for i in 1..=5u64 {
+            s1.append(Tick(i), &[1]).unwrap();
+        }
+        for i in 1..=5u64 {
+            assert_eq!(
+                s1.read(CheckpointId(i)).unwrap().is_some(),
+                i == 5,
+                "keep = 1:只留第 5 个"
+            );
+        }
+
+        // keep = 0:不清理(同 open 语义)。
+        let (_dir0, path0) = temp_db();
+        let mut s0 = RedbStore::open_with_keep(&path0, 0).expect("打开");
+        for i in 1..=5u64 {
+            s0.append(Tick(i), &[1]).unwrap();
+        }
+        for i in 1..=5u64 {
+            assert!(
+                s0.read(CheckpointId(i)).unwrap().is_some(),
+                "keep = 0:全保留"
+            );
+        }
+    }
+
+    /// #17 K2(单元):清理后重开 ID 继续单调(按最大键恢复——按行数恢复的
+    /// 实现会复用 ID,此处必红);打开时现存多于 keep 个立即删到 keep 个
+    /// (调小 keep 后重启生效);`open` 语义不变(不清理)。
+    #[test]
+    fn redb_keep_prune_ids_monotonic_and_prune_on_open() {
+        let (_dir, path) = temp_db();
+        {
+            let mut store = RedbStore::open_with_keep(&path, 3).expect("打开");
+            for i in 1..=5u64 {
+                store.append(Tick(i), &[1]).unwrap();
+            }
+            let present: Vec<u64> = (1..=5)
+                .filter(|i| store.read(CheckpointId(*i)).unwrap().is_some())
+                .collect();
+            assert_eq!(present, vec![3, 4, 5], "追加期清理:只剩最近 3 个");
+        }
+        let mut store = RedbStore::open_with_keep(&path, 3).expect("重开");
+        // 行数 = 3,按行数恢复的 ID 会是 4——必须得 6(最大键 5 + 1)。
+        assert_eq!(
+            store.append(Tick(6), &[2]).unwrap(),
+            CheckpointId(6),
+            "清理后重开:ID 继续单调,不复用"
+        );
+        let present: Vec<u64> = (1..=6)
+            .filter(|i| store.read(CheckpointId(*i)).unwrap().is_some())
+            .collect();
+        assert_eq!(present, vec![4, 5, 6]);
+
+        // `open` 不清理;以 keep = 3 重开 → 打开时即删到只剩最近 3 个。
+        let (_dir2, path2) = temp_db();
+        {
+            let mut s2 = RedbStore::open(&path2).expect("打开(不清理)");
+            for i in 1..=8u64 {
+                s2.append(Tick(i), &[1]).unwrap();
+            }
+        }
+        let s3 = RedbStore::open_with_keep(&path2, 3).expect("以 keep = 3 重开");
+        let present: Vec<u64> = (1..=8)
+            .filter(|i| s3.read(CheckpointId(*i)).unwrap().is_some())
+            .collect();
+        assert_eq!(present, vec![6, 7, 8], "打开时即删到只剩最近 3 个");
     }
 }
