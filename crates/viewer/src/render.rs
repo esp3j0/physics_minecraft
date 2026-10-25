@@ -1,8 +1,11 @@
-//! render —— macroquad 主循环(窗口/相机/HUD;REQ-004A §2)。**不写窗口类
-//! 测试**(README 决策 2;ACV4 手动清单,禁造假断言)——本文件仅含装配编排,
-//! 纯算力全部在 mesh(有单测)与 client(零 macroquad)。
+//! render —— macroquad 主循环(窗口/相机/HUD;REQ-004A §2;REQ-008 §4 脚本模式)。
+//! **不写窗口类测试**(README 决策 2;ACV4 手动清单,禁造假断言)——本文件仅含装配
+//! 编排,纯算力全部在 mesh(有单测)、client(零 macroquad)、world/cli/manifest
+//! (REQ-008 纯逻辑层,各有单测)。
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Instant;
 
 use macroquad::camera::{Camera3D, Projection, set_camera, set_default_camera};
@@ -20,8 +23,15 @@ use types::{ChunkPos, EntityDesc, EntityId, EntityState};
 // 注:macroquad 0.4 内嵌 glam 0.27,types 用 glam 0.33——两版 Vec3 不互认,
 // 一切跨界处按字段换算(下文 vec3(t.x, t.y, t.z) / types::glam::Vec3::new)。
 
+use crate::cli::{ViewerArgs, ViewerMode};
 use crate::client::{ViewEvent, ViewerClient};
 use crate::mesh::chunk_mesh;
+use crate::script::WorldQuery;
+use crate::script::manifest::Manifest;
+use crate::script::{
+    CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
+};
+use crate::world::WorldState;
 
 /// 相机移动速度(格/秒)。
 const MOVE_SPEED: f32 = 16.0;
@@ -42,10 +52,22 @@ const BLAST_AHEAD: f32 = 12.0;
 /// 在地表平面——见 X 键注释)。
 const BLAST_POWER: f32 = 12.0;
 const BLAST_RADIUS: f32 = 8.0;
-/// 爆心高度(超平坦地表顶面 y=4 + 0.7 ≈ 落地立方体中心)。
-const BLAST_Y: f32 = 4.7;
+/// 超平坦地表顶面(world y)= WORLD_Y_MIN + 4(REQ-008 §4 顺带修正:旧值按
+/// y = 4 写死,生产超平坦地表顶面在 −60;交互与脚本模式共用)。
+const GROUND_TOP_Y: f32 = (types::WORLD_Y_MIN + 4) as f32;
+/// 爆心高度(地表顶面 + 0.7 ≈ 落地立方体中心;REQ-008 §4 顺带修正)。
+const BLAST_Y: f32 = GROUND_TOP_Y + 0.7;
 /// X 爆心吸附范围(米):相机附近最近的活实体直接作爆心(见 X 键注释)。
 const BLAST_SNAP: f32 = 25.0;
+/// 脚本模式观察者上报的立即触发阈值:相机较上次上报移动超过 1 m 即上报
+/// (不等 100 ms 节流——传送当帧即可带动观察者;REQ-008 单元 02 任务书)。
+const OBSERVER_JUMP_METERS: f32 = 1.0;
+
+/// 交互模式的飞行相机初始位姿(地表上方约 12 m;REQ-008 §4 顺带修正:旧值
+/// (8, 12, 24) 按 y=4 地表写死)。脚本模式以修正后的同一位姿为起始相机。
+fn start_camera_pos() -> macroquad::math::Vec3 {
+    vec3(8.0, GROUND_TOP_Y + 12.0, 24.0)
+}
 
 /// 自由飞行相机(欧拉:偏航绕 y,俯仰;WASD + 鼠标视角,Shift/Ctrl 升降)。
 struct FlyCamera {
@@ -55,10 +77,10 @@ struct FlyCamera {
 }
 
 impl FlyCamera {
-    /// 初始位姿:地表上方(超平坦顶面 world y=4),俯视地面。
+    /// 初始位姿:地表上方约 12 m,俯视地面(超平坦顶面 = WORLD_Y_MIN + 4)。
     fn new() -> Self {
         Self {
-            position: vec3(8.0, 12.0, 24.0),
+            position: start_camera_pos(),
             yaw: -90.0_f32.to_radians(),
             pitch: -30.0_f32.to_radians(),
         }
@@ -124,6 +146,22 @@ impl FlyCamera {
             ..Camera3D::default()
         }
     }
+
+    /// → 脚本引擎的位姿(types::glam 字段换算;角度转度)。
+    fn to_pose(&self) -> CameraPose {
+        CameraPose {
+            pos: types::glam::Vec3::new(self.position.x, self.position.y, self.position.z),
+            yaw: self.yaw.to_degrees(),
+            pitch: self.pitch.to_degrees(),
+        }
+    }
+
+    /// 从脚本引擎的位姿设置(角度为度)。
+    fn set_from_pose(&mut self, pose: &CameraPose) {
+        self.position = vec3(pose.pos.x, pose.pos.y, pose.pos.z);
+        self.yaw = pose.yaw.to_radians();
+        self.pitch = pose.pitch.to_radians();
+    }
 }
 
 /// HUD 文本行(HUD 四行:tick/chunks/entities/FPS)。
@@ -146,23 +184,24 @@ struct EntityPose {
 /// 位置插值速率(1/s;越大越紧跟,14 ≈ 70ms 追平大半)。
 const POSE_SMOOTH: f32 = 14.0;
 
-/// 世界渲染态(chunk Mesh 表 + 方块镜像 + 实体位姿表;增量事件驱动)。
+/// 世界渲染态(REQ-008 单元 02 重构):纯逻辑的 [`WorldState`(方块镜像/实体
+/// 服务器位置/拍号/回执)] + 渲染侧的 Mesh 表与实体插值表。每帧用
+/// `take_dirty_chunks` 同步 Mesh,实体插值表跟随 `live_entities`。
 struct WorldView {
-    chunks: BTreeMap<ChunkPos, Mesh>,
-    /// chunk 方块镜像(BlockUpdates 就地改写后整块重算 Mesh;demo 定位)。
-    blocks: BTreeMap<ChunkPos, voxel::Chunk>,
-    /// 实体位姿(增量 latest-wins;removed 即移除——README 决策 5)。
+    /// 纯逻辑世界状态(脚本引擎经 WorldQuery 读它)。
+    state: WorldState,
+    /// chunk Mesh 表(脏 chunk 在则重建、不在则删除)。
+    meshes: BTreeMap<ChunkPos, Mesh>,
+    /// 实体插值表(跟随 state 的实体表;新实体从目标位置起步、消失即删)。
     entities: BTreeMap<EntityId, EntityPose>,
-    tick: u64,
 }
 
 impl WorldView {
     fn new() -> Self {
         Self {
-            chunks: BTreeMap::new(),
-            blocks: BTreeMap::new(),
+            state: WorldState::new(),
+            meshes: BTreeMap::new(),
             entities: BTreeMap::new(),
-            tick: 0,
         }
     }
 
@@ -175,78 +214,339 @@ impl WorldView {
         )
     }
 
-    /// 应用一个事件(增删改;Disconnected 不在此处理——主循环判终)。
+    /// 应用一个事件(增删改;Disconnected 由各主循环判终)。
     fn apply(&mut self, event: ViewEvent) {
-        match event {
-            ViewEvent::Welcome { tick, .. } => self.tick = tick.0,
-            ViewEvent::Chunk { pos, chunk } => {
-                self.chunks
-                    .insert(pos, chunk_mesh(&chunk, Self::origin_of(pos)));
-                self.blocks.insert(pos, chunk);
-            }
-            ViewEvent::ChunkGone { pos } => {
-                self.chunks.remove(&pos);
-                self.blocks.remove(&pos);
-            }
-            ViewEvent::Entities {
-                tick,
-                states,
-                removed,
-                full,
-            } => {
-                self.tick = tick.0;
-                if full {
-                    // 全量对账:以 states 为准重建实体表——增量 removed 丢失或
-                    // 移除恰逢服务器全量周期(该路径不发 removed)时驱散幽灵
-                    // 实体(ACV4 实跑反馈 2 修复)。
-                    self.entities.clear();
+        self.state.apply(event);
+        self.sync_entities();
+    }
+
+    /// 每帧收尾:脏 chunk → Mesh 重建/删除;实体插值表对齐实体表。
+    /// (事件路径只改 state 与插值表;Mesh 同步集中在这一处。)
+    fn sync(&mut self) {
+        for pos in self.state.take_dirty_chunks() {
+            match self.state.chunk(pos) {
+                Some(chunk) => {
+                    self.meshes
+                        .insert(pos, chunk_mesh(chunk, Self::origin_of(pos)));
                 }
-                for (id, state) in states {
-                    let t = state.translation; // types::glam(0.33)→ macroquad(0.27)字段换算
-                    let target = vec3(t.x, t.y, t.z);
-                    // 新实体(含全量重建):current 从 target 起步,不从原点飞入;
-                    // 已有实体:只推进 target,渲染帧插值逼近。
-                    self.entities
-                        .entry(id)
-                        .and_modify(|pose| pose.target = target)
-                        .or_insert(EntityPose {
-                            current: target,
-                            target,
-                        });
-                }
-                for id in removed {
-                    self.entities.remove(&id);
+                None => {
+                    self.meshes.remove(&pos);
                 }
             }
-            ViewEvent::Blocks { updates } => {
-                // 方块增量:镜像就地改写,触及的 chunk 整块重算 Mesh(凝固/
-                // 挖掘可见即达意;demo 不做局部补丁)。chunk 未到手(流未达)
-                // 的格子先落镜像也不建 Mesh——ChunkData 随后整块覆盖。
-                for (pos, block) in updates {
-                    let cpos = pos.chunk_of();
-                    let chunk = self.blocks.entry(cpos).or_insert_with(voxel::Chunk::air);
-                    chunk.set(
-                        pos.x.rem_euclid(16) as usize,
-                        (pos.y - types::WORLD_Y_MIN) as usize,
-                        pos.z.rem_euclid(16) as usize,
-                        block,
-                    );
-                    self.chunks
-                        .insert(cpos, chunk_mesh(chunk, Self::origin_of(cpos)));
-                }
-            }
-            ViewEvent::Spawned { .. } => {
-                // 服务端分配 ID 的回执;demo 只渲染 EntityStates,无需本地句柄。
-            }
-            ViewEvent::Disconnected { .. } => {}
+        }
+    }
+
+    /// 实体插值表跟随 live_entities:新实体 current 从 target 起步、消失即删、
+    /// 已有实体只推进 target(渲染帧插值逼近)。
+    fn sync_entities(&mut self) {
+        let live = self.state.live_entities();
+        let present: std::collections::BTreeSet<EntityId> =
+            live.iter().map(|(id, _)| *id).collect();
+        self.entities.retain(|id, _| present.contains(id));
+        for (id, pos) in live {
+            let target = vec3(pos.x, pos.y, pos.z);
+            self.entities
+                .entry(id)
+                .and_modify(|pose| pose.target = target)
+                .or_insert(EntityPose {
+                    current: target,
+                    target,
+                });
         }
     }
 }
 
-/// 主循环入口(main 调用):连接 → 装配 → 窗口循环。
-/// 服务器地址由 main 传入(环境变量/默认);视距默认 4(REQ-004A §2)。
-/// 相机 → 观察者耦合:默认开(MoveObserver 跟相机,≥100ms 节流),空格切换。
-pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
+/// 主循环入口(main 调用):按模式分发。服务器地址优先级:
+/// `--addr` > 环境变量 `VIEWER_ADDR` > `127.0.0.1:25565`;视距 = `VIEWER_VIEW`
+/// 环境变量(缺省 4,REQ-004A §2)或场景 `[viewer] view_distance`。
+pub async fn run(args: ViewerArgs) {
+    let addr_str = args
+        .addr
+        .clone()
+        .or_else(|| std::env::var("VIEWER_ADDR").ok())
+        .unwrap_or_else(|| "127.0.0.1:25565".to_owned());
+    let addr: SocketAddr = addr_str.parse().unwrap_or_else(|e| {
+        eprintln!("服务器地址无效({addr_str}):{e}");
+        std::process::exit(2);
+    });
+    let env_view = std::env::var("VIEWER_VIEW")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok());
+    match args.mode {
+        ViewerMode::Interactive => {
+            run_viewer(addr, env_view.unwrap_or(4)).await;
+        }
+        ViewerMode::Script { script, out } => {
+            run_script(addr, env_view, &script, &out).await;
+        }
+    }
+}
+
+/// 脚本模式启动前置(非窗口部分):读场景、解析、创建输出目录。
+/// 失败 → 标准错误打印原因,退出码 2(REQ-008 §4)。
+fn prepare_script(
+    script: &Path,
+    out: &Path,
+) -> (crate::script::Scenario, crate::script::manifest::Manifest) {
+    let text = match std::fs::read_to_string(script) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("读取场景文件 {} 失败:{e}", script.display());
+            std::process::exit(2);
+        }
+    };
+    let scenario = match crate::script::parse_scenario(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("场景解析失败:{e}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = std::fs::create_dir_all(out) {
+        eprintln!("创建输出目录 {} 失败:{e}", out.display());
+        std::process::exit(2);
+    }
+    let manifest = Manifest::new(&scenario);
+    (scenario, manifest)
+}
+
+/// manifest 写盘(每条步骤记录后与收尾时重写;进程意外退出也留下已完成部分)。
+fn write_manifest(manifest: &Manifest, out: &Path) {
+    let path = out.join("manifest.json");
+    if let Err(e) = std::fs::write(&path, manifest.to_json()) {
+        eprintln!("写 {} 失败:{e}", path.display());
+    }
+}
+
+/// 截图:取当帧帧缓冲导出 PNG(`<输出目录>/<file_name()>`)。
+fn save_screenshot(request: &ScreenshotRequest, out: &Path) {
+    let path = out.join(request.file_name());
+    macroquad::prelude::get_screen_data().export_png(&path.display().to_string());
+}
+
+/// 把引擎命令转发给服务器(Spawn → control.spawn;Detonate/SetBlock → control.command)。
+fn forward_commands(commands: &[EngineCommand], control: &crate::client::ControlHandle) {
+    for command in commands {
+        match command {
+            EngineCommand::Spawn { state } => {
+                control.spawn(*state, EntityDesc::default());
+            }
+            EngineCommand::Detonate {
+                center,
+                power,
+                radius,
+            } => {
+                control.command(SimCommand::Detonate {
+                    center: *center,
+                    power: *power,
+                    radius: *radius,
+                });
+            }
+            EngineCommand::SetBlock { pos, block } => {
+                control.command(SimCommand::SetBlock {
+                    pos: *pos,
+                    block: *block,
+                });
+            }
+        }
+    }
+}
+
+/// 脚本模式观察者上报:耦合开启时,相机较上次上报变化超过 1 m 立即上报,
+/// 否则按 100 ms 节流(传送当帧即可带动观察者)。
+fn report_observer_if_due(
+    camera: &FlyCamera,
+    coupled: bool,
+    disconnected: bool,
+    last_sent: &mut Option<(macroquad::math::Vec3, Instant)>,
+    control: &crate::client::ControlHandle,
+) {
+    if !coupled || disconnected {
+        return;
+    }
+    // 距上次上报的位移(无记录 = 首报,视为已跳)与距上次上报的时长。
+    #[allow(clippy::disallowed_methods)] // 墙钟节流(渲染侧;边缘 crate 局部授权)
+    let jumped = match *last_sent {
+        None => true,
+        Some((pos, _)) => (camera.position - pos).length() > OBSERVER_JUMP_METERS,
+    };
+    #[allow(clippy::disallowed_methods)]
+    let throttled_ok = match *last_sent {
+        None => true,
+        Some((_, at)) => at.elapsed() >= OBSERVER_SEND_INTERVAL,
+    };
+    if jumped || throttled_ok {
+        let p = camera.position;
+        control.move_observer(types::glam::Vec3::new(p.x, p.y, p.z));
+        #[allow(clippy::disallowed_methods)]
+        {
+            *last_sent = Some((camera.position, Instant::now()));
+        }
+    }
+}
+
+/// 脚本模式主循环(REQ-008 §4):引擎驱动相机与命令、截图、写 manifest。
+/// 收到 Welcome 之前不推进引擎;引擎结束 → finish → 写 manifest → 按 exit_code
+/// 退出;结束前断连 → Failed{当前步, "断连:…"} 收尾,退出码 2。
+async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: &Path) {
+    let (scenario, mut manifest) = prepare_script(script, out);
+    let view_distance = scenario.view_distance.or(env_view).unwrap_or(4);
+    let (events, control) = ViewerClient::spawn(addr, view_distance)
+        .unwrap_or_else(|e| panic!("连接服务器 {addr} 失败(fail-stop):{e}"));
+
+    let total = scenario.steps.len();
+    let scenario_name = scenario.name.clone();
+    // 起始相机位姿 = 修正后的飞行相机初始位姿(交互/脚本一致);Welcome 前
+    // 不创建、不推进引擎。
+    let mut engine: Option<Engine> = None;
+    let mut camera = FlyCamera::new();
+    let start_pose = camera.to_pose();
+    let mut world = WorldView::new();
+    let mut welcome_seen = false;
+    let mut disconnected: Option<String> = None;
+    let mut finished = false;
+    let mut coupled = true;
+    let mut last_sent: Option<(macroquad::math::Vec3, Instant)> = None;
+
+    loop {
+        let dt = get_frame_time();
+
+        // 事件排空:进 WorldState;Welcome/Disconnected 单独记。
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ViewEvent::Disconnected { reason } => disconnected = Some(reason),
+                other => {
+                    if matches!(other, ViewEvent::Welcome { .. }) {
+                        welcome_seen = true;
+                    }
+                    world.apply(other);
+                }
+            }
+        }
+        world.sync();
+
+        if welcome_seen && engine.is_none() {
+            engine = Some(Engine::new(scenario.clone(), start_pose));
+        }
+
+        // 推进引擎(结束后不再推进):输出相机/耦合/命令/截图请求/步骤记录。
+        let mut frame_shot: Option<ScreenshotRequest> = None;
+        if let (false, Some(e)) = (finished, engine.as_mut()) {
+            let spawned = world.state.take_spawned();
+            let input = FrameInput {
+                dt,
+                server_tick: world.state.tick(),
+                world: &world.state,
+                spawned: &spawned,
+            };
+            let output = e.frame(&input);
+            camera.set_from_pose(&output.camera);
+            coupled = output.coupled;
+            forward_commands(&output.commands, &control);
+            report_observer_if_due(
+                &camera,
+                coupled,
+                disconnected.is_some(),
+                &mut last_sent,
+                &control,
+            );
+            // 每条结束的步骤记录立即 push 并重写 manifest.json(进程意外退出
+            // 也留下已完成部分)。
+            for record in &output.finished {
+                manifest.push(record, &world.state);
+                write_manifest(&manifest, out);
+            }
+            frame_shot = output.screenshot;
+            if !matches!(e.status(), EngineStatus::Running { .. }) {
+                manifest.finish(e.status());
+                write_manifest(&manifest, out);
+                finished = true;
+            }
+        }
+
+        // 结束前收到断连:以 Failed{当前步} 收尾(引擎已自然结束则走上面的路)。
+        if let (false, Some(reason)) = (finished, &disconnected) {
+            let step = match engine.as_ref().map(|e| e.status()) {
+                Some(EngineStatus::Running { step }) => *step,
+                Some(_) => 1,
+                None => 1,
+            };
+            let status = EngineStatus::Failed {
+                step,
+                reason: format!("断连:{reason}"),
+            };
+            manifest.finish(&status);
+            write_manifest(&manifest, out);
+            finished = true;
+        }
+
+        // —— 3D 场景 ——
+        clear_background(SKYBLUE);
+        set_camera(&camera.to_camera());
+        for mesh in world.meshes.values() {
+            draw_mesh(mesh);
+        }
+        // 实体:current 指数逼近 target(帧率无关),画 current。
+        for pose in world.entities.values_mut() {
+            let k = 1.0 - (-POSE_SMOOTH * dt).exp();
+            pose.current += (pose.target - pose.current) * k;
+            draw_cube(
+                pose.current,
+                vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
+                None,
+                BLUE,
+            );
+        }
+        set_default_camera();
+
+        // 截图(hud = false):3D 画完、HUD 之前截取。
+        if let Some(shot) = &frame_shot
+            && !shot.hud
+        {
+            save_screenshot(shot, out);
+        }
+
+        // —— HUD(脚本模式:四行 + SCRIPT 行 + 耦合 + 断连;不进 hud=false 截图)——
+        let step_now = current_step(&engine);
+        let script_line = format!("SCRIPT {scenario_name} 第 {step_now}/{total} 步");
+        draw_hud(
+            world.state.tick(),
+            world.meshes.len(),
+            world.state.live_entities().len(),
+            &script_line,
+            coupled,
+            disconnected.as_ref(),
+        );
+
+        // 截图(hud = true):HUD 画完之后截取。
+        if let Some(shot) = &frame_shot
+            && shot.hud
+        {
+            save_screenshot(shot, out);
+        }
+
+        // 场景结束:窗口关闭,以 exit_code 退出(manifest 已在上面的收尾写盘)。
+        if finished {
+            control.goodbye();
+            let code = engine.as_ref().and_then(|e| e.exit_code()).unwrap_or(2);
+            std::process::exit(code);
+        }
+
+        next_frame().await
+    }
+}
+
+/// 当前步(1 起;结束/失败后的帧停在该值;引擎未建 = 1)。
+fn current_step(engine: &Option<Engine>) -> usize {
+    match engine.as_ref().map(|e| e.status()) {
+        Some(EngineStatus::Running { step }) => *step,
+        Some(_) => 0,
+        None => 1,
+    }
+}
+
+/// 交互模式主循环(REQ-004A,行为不变;仅初始相机/BLAST_Y 常量修正)。
+pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
     let (events, control) = ViewerClient::spawn(addr, view_distance)
         .unwrap_or_else(|e| panic!("连接服务器 {addr} 失败(fail-stop):{e}"));
 
@@ -285,6 +585,7 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
                 other => world.apply(other),
             }
         }
+        world.sync();
 
         // 空格切换耦合(边沿触发,不连发)。
         if is_key_pressed(KeyCode::Space) {
@@ -355,7 +656,7 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
         // —— 3D 场景 ——
         clear_background(SKYBLUE);
         set_camera(&camera.to_camera());
-        for mesh in world.chunks.values() {
+        for mesh in world.meshes.values() {
             draw_mesh(mesh);
         }
         // 实体:current 指数逼近 target(帧率无关),画 current。
@@ -373,8 +674,8 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
 
         // —— HUD(2D 默认相机;四行)——
         let lines = hud_lines(
-            world.tick,
-            world.chunks.len(),
+            world.state.tick(),
+            world.meshes.len(),
             world.entities.len(),
             get_fps(),
         );
@@ -416,16 +717,61 @@ pub async fn run_viewer(addr: std::net::SocketAddr, view_distance: u8) {
     }
 }
 
+/// HUD 绘制(脚本模式;四行 + 耦合 + SCRIPT 行 + 断连提示)。
+fn draw_hud(
+    tick: u64,
+    chunks: usize,
+    entities: usize,
+    script_line: &str,
+    coupled: bool,
+    disconnected: Option<&String>,
+) {
+    let lines = hud_lines(tick, chunks, entities, get_fps());
+    for (i, line) in lines.iter().enumerate() {
+        draw_text(line, 12.0, 20.0 + i as f32 * 20.0, 18.0, WHITE);
+    }
+    draw_text(script_line, 12.0, 104.0, 16.0, YELLOW);
+    draw_text(
+        if coupled {
+            "coupled: ON(脚本模式)"
+        } else {
+            "coupled: OFF(脚本模式)"
+        },
+        12.0,
+        122.0,
+        16.0,
+        YELLOW,
+    );
+    if let Some(reason) = disconnected {
+        let text = format!("已断连:{reason}");
+        draw_text(&text, 12.0, 140.0, 18.0, YELLOW);
+    }
+}
+
 /// 窗口配置(标题/尺寸;crate 根 `#[macroquad::main(window_conf)]` 入口用)。
+/// 脚本模式:1280×720、不可调整大小、标题注明脚本模式。宏参数须是裸标识符,
+/// 命令行参数经进程级暂存(读一次 std::env::args)。
 /// 测试目标下不可达(dead_code 实警),allow 并注明。
 #[allow(dead_code)] // 测试目标(cargo test)不含窗口入口;bin 装配需要
-pub(crate) fn window_conf() -> macroquad::conf::Conf {
+pub fn window_conf() -> macroquad::conf::Conf {
+    // 命令行预读(parse_args 的结果由 run 再解析一次;此处只为挑窗口配置)。
+    let script_mode = crate::cli::parse_args(std::env::args().skip(1))
+        .map(|args| matches!(args.mode, ViewerMode::Script { .. }))
+        .unwrap_or(false);
+    let (title, resizable) = if script_mode {
+        (
+            "physics_minecraft viewer(脚本模式 REQ-008)".to_owned(),
+            false,
+        )
+    } else {
+        ("physics_minecraft viewer(REQ-004A demo)".to_owned(), true)
+    };
     macroquad::conf::Conf {
         miniquad_conf: macroquad::miniquad::conf::Conf {
-            window_title: "physics_minecraft viewer(REQ-004A demo)".to_owned(),
+            window_title: title,
             window_width: 1280,
             window_height: 720,
-            window_resizable: true,
+            window_resizable: resizable,
             ..macroquad::miniquad::conf::Conf::default()
         },
         // 批缓冲扩容(ACV4 实跑反馈 3):macroquad 默认 10000 顶点/5000 索引,
@@ -442,18 +788,17 @@ pub(crate) fn window_conf() -> macroquad::conf::Conf {
     }
 }
 
-/// 窗口入口体(crate 根的宏展开 `main` 调用 `amain()`):读环境变量 →
-/// run_viewer。服务器地址 = `VIEWER_ADDR`(缺省 127.0.0.1:25565,REQ-004A
-/// 决策 4);视距 = `VIEWER_VIEW`(缺省 4,REQ-004A §2)。
+/// 窗口入口体(crate 根的宏展开 `main` 调用 `amain()`):parse_args → 按模式
+/// 分发。参数错误 → 用法到标准错误,退出码 2(REQ-008 §4)。
 #[allow(dead_code)] // 测试目标不可达(同上)
-pub(crate) async fn amain() {
-    let addr_str = std::env::var("VIEWER_ADDR").unwrap_or_else(|_| "127.0.0.1:25565".to_owned());
-    let view_distance = std::env::var("VIEWER_VIEW")
-        .ok()
-        .and_then(|v| v.parse::<u8>().ok())
-        .unwrap_or(4);
-    let addr: std::net::SocketAddr = addr_str
-        .parse()
-        .unwrap_or_else(|e| panic!("VIEWER_ADDR 无效({addr_str}):{e}"));
-    run_viewer(addr, view_distance).await;
+pub async fn amain() {
+    let args = match crate::cli::parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("用法:viewer [--addr <地址>] [--script <场景文件> --out <输出目录>]");
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
+    run(args).await;
 }

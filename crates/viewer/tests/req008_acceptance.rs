@@ -880,7 +880,6 @@ mod unit02 {
     ///
     /// 会变红的实现:缺 `--out` 时静默用默认目录;未知参数被忽略;`--addr` 被吞掉。
     #[test]
-    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s4_cli_args() {
         assert_eq!(
             args(&[]),
@@ -948,7 +947,6 @@ mod unit02 {
     /// 会变红的实现:负坐标取模写错;未装载 chunk 的增量造出假 chunk(chunks_loaded 虚增、
     /// block_at 返回空气);卸载后仍可查;脏集合重复或不清。
     #[test]
-    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s4_world_state_blocks() {
         let mut w = WorldState::new();
         let west = ChunkPos::new(-1, 2);
@@ -1014,7 +1012,6 @@ mod unit02 {
     /// 会变红的实现:full 时不清旧实体(幽灵实体);removed 不生效;拍号只在 Welcome 时更新;
     /// 回执丢失或乱序。
     #[test]
-    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s4_world_state_entities_and_receipts() {
         let mut w = WorldState::new();
         w.apply(ViewEvent::Welcome {
@@ -1091,7 +1088,6 @@ mod unit02 {
     /// 会变红的实现:漏写步骤或字段;结果字符串不在约定取值内;截图统计取错来源;
     /// JSON 不能往返。
     #[test]
-    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s4_manifest_records_steps_and_result() {
         let text = r#"
 name = "m"
@@ -1169,7 +1165,6 @@ screenshot = { name = "s", expect = "期望文字", hud = true }
     ///
     /// 会变红的实现:失败场景记成 done;没有 reason;出错步骤没记录。
     #[test]
-    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s4_manifest_failed_scenario() {
         let text = r#"
 name = "f"
