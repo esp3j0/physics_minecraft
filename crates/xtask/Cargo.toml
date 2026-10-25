@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# REQ-008:仓库内开发工具(`cargo xtask smoke`)。只在本机运行,不进 CI 的窗口与 AI 步骤。
+[dependencies]
+app = { path = "../app" }
+viewer = { path = "../viewer" }
+toml = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+types = { path = "../types" }
+
+[lints]
+workspace = true

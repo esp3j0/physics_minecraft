@@ -1,0 +1,60 @@
+name = "req007-explode-fly-away"
+req = "REQ-007"
+description = "REQ-007 人工冒烟的自动化版:生成方块、落地凝固前引爆、飞到 80 m 外、飞回;碎片不悬空且全部凝固"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[[step]]
+label = "就位"
+camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [9.0, -57.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "生成 8 个方块(离地 8 m)"
+spawn = { at = [6.0, -52.0, 14.0], count = 8, spacing = 1.6, label = "blast" }
+
+[[step]]
+wait_ticks = { n = 70 }
+
+[[step]]
+label = "落地凝固前引爆"
+detonate = { nearest = true, power = 12.0, radius = 8.0 }
+
+[[step]]
+wait_ticks = { n = 6 }
+
+[[step]]
+screenshot = { name = "after-blast", expect = "画面中部的地面附近有若干蓝色立方体正被炸开、向四周或上方飞散" }
+
+[[step]]
+label = "飞到 80 m 外"
+fly = { to = [8.0, -50.0, 110.0], speed = 16.0 }
+
+[[step]]
+wait_ticks = { n = 300 }
+
+[[step]]
+label = "飞回"
+fly = { to = [8.0, -50.0, 30.0], speed = 16.0 }
+
+[[step]]
+look_at = { target = [9.0, -57.0, 14.0] }
+
+[[step]]
+wait_until = { labeled_alive = { label = "blast", eq = 0 }, block = { pos = [8, -61, 14], is = "dirt" }, timeout_ticks = 900 }
+
+[[step]]
+check = { live_entities = { eq = 0 }, no_floating = { height = 1.5, still_ticks = 30 } }
+
+[[step]]
+wait_ticks = { n = 30 }
+
+[[step]]
+screenshot = { name = "return", expect = "棕色地面上散落着若干凝固的灰色方块,空中没有任何蓝色立方体,也没有悬浮的方块" }

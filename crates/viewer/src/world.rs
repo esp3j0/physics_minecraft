@@ -98,6 +98,14 @@ impl WorldState {
         self.tick
     }
 
+    /// 是否已从实体状态包得知真实拍号(REQ-008 修订 2,D4)。`Welcome` 的拍号是占位值,
+    /// 不算;收到第一个 `Entities` 事件后恒为 true。脚本模式据此决定何时开始推进引擎。
+    ///
+    /// **总架构师接口桩(REQ-008 单元 03)**:签名固定,由实施方实现。
+    pub fn tick_known(&self) -> bool {
+        unimplemented!("REQ-008 单元 03:由实施方实现")
+    }
+
     /// 某个已装载 chunk 的方块镜像。
     pub fn chunk(&self, pos: ChunkPos) -> Option<&voxel::Chunk> {
         self.chunks.get(&pos)

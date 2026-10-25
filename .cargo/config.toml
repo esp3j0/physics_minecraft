@@ -1,0 +1,3 @@
+# REQ-008 D3:`cargo xtask <子命令>` 别名。
+[alias]
+xtask = "run --package xtask --"

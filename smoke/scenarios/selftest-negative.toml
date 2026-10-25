@@ -1,0 +1,24 @@
+name = "selftest-negative"
+req = "REQ-008"
+description = "自检专用:检查项必然失败,用来证明机器检查能报错(cargo xtask smoke --selftest 期望本场景以退出码 1 结束)"
+timeout_secs = 120
+
+[server]
+world_seed = 7
+
+[[step]]
+camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+spawn = { at = [6.0, -52.0, 14.0], count = 3, label = "cubes" }
+
+[[step]]
+label = "必然失败:刚生成就断言没有活实体"
+check = { live_entities = { eq = 0 } }
+
+[[step]]
+label = "必然失败:地表顶层是泥土不是石头"
+check = { block = { pos = [8, -61, 14], is = "stone" } }

@@ -1193,3 +1193,79 @@ detonate = { nearest = true, power = 12.0, radius = 8.0 }
         );
     }
 }
+
+// ===========================================================================
+// 单元 03 · AC-S5(viewer 一侧):引擎起点;AC-S9 守卫:仓库内场景文件都能解析
+// ===========================================================================
+
+mod unit03 {
+    use messaging::InputSource;
+    use types::Tick;
+    use viewer::client::ViewEvent;
+    use viewer::script::parse_scenario;
+    use viewer::world::WorldState;
+
+    /// `tick_known`:只有 `Welcome` 时为 false(其拍号是占位值 0);收到第一个实体状态包
+    /// 后为 true,并保持(D4)。
+    ///
+    /// 会变红的实现:把 Welcome 当作拍号已知(引擎从占位拍号 0 起算,第一个真实拍号一到,
+    /// 等待类步骤立即误判超时);收到空的全量包不算数。
+    #[test]
+    #[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s5_tick_known_only_after_entity_states() {
+        let mut w = WorldState::new();
+        assert!(!w.tick_known(), "初始未知");
+        w.apply(ViewEvent::Welcome {
+            player_id: InputSource(1),
+            tick: Tick(0),
+        });
+        assert!(!w.tick_known(), "Welcome 的拍号是占位值,不算");
+        w.apply(ViewEvent::Entities {
+            tick: Tick(20_617),
+            states: vec![],
+            removed: vec![],
+            full: true,
+        });
+        assert!(w.tick_known(), "空的全量包同样带来真实拍号");
+        assert_eq!(w.tick(), 20_617);
+        w.apply(ViewEvent::Disconnected {
+            reason: "bye".to_owned(),
+        });
+        assert!(w.tick_known(), "一旦已知即保持");
+    }
+
+    /// 守卫:`smoke/scenarios/` 下的每个场景都能解析,`name` 与文件名一致,且首批三个场景都在。
+    /// (场景由总架构师编写;本用例不随单元解除,一直生效。)
+    #[test]
+    fn acc_s9_committed_scenarios_parse() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../smoke/scenarios");
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&dir).expect("smoke/scenarios 目录存在") {
+            let path = entry.expect("目录项可读").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("场景文件可读");
+            let s =
+                parse_scenario(&text).unwrap_or_else(|e| panic!("{} 解析失败:{e}", path.display()));
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("文件名为 UTF-8")
+                .to_owned();
+            assert_eq!(s.name, stem, "{}:name 应与文件名一致", path.display());
+            names.push(stem);
+        }
+        names.sort();
+        for want in [
+            "basic-world",
+            "req007-explode-fly-away",
+            "selftest-negative",
+        ] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "首批场景 {want} 应存在:{names:?}"
+            );
+        }
+    }
+}

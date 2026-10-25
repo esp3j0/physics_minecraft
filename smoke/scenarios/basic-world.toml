@@ -1,0 +1,49 @@
+name = "basic-world"
+req = "REQ-008"
+description = "连接后依次传送到三处,俯视地面:地形完整装载、没有缺块或缺失的区块"
+timeout_secs = 180
+
+[server]
+world_seed = 7
+
+[[step]]
+label = "原点附近"
+camera = { pos = [8.0, -44.0, 24.0], yaw = -90.0, pitch = -45.0 }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 8], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+wait_ticks = { n = 60 }
+
+[[step]]
+screenshot = { name = "origin", expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块" }
+
+[[step]]
+label = "东南 130 m"
+camera = { pos = [100.0, -44.0, 110.0], yaw = -90.0, pitch = -45.0 }
+
+[[step]]
+wait_until = { block = { pos = [100, -61, 94], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+wait_ticks = { n = 60 }
+
+[[step]]
+screenshot = { name = "southeast", expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块" }
+
+[[step]]
+label = "西侧负坐标"
+camera = { pos = [-60.0, -44.0, 40.0], yaw = -90.0, pitch = -45.0 }
+
+[[step]]
+wait_until = { block = { pos = [-60, -61, 24], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+wait_ticks = { n = 60 }
+
+[[step]]
+check = { chunks_loaded = { ge = 25 }, live_entities = { eq = 0 } }
+
+[[step]]
+screenshot = { name = "west", expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块" }
