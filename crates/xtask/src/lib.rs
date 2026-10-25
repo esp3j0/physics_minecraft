@@ -12,6 +12,10 @@
 //! 计时/取时间用 `std::time`,逐处局部 `#[allow(clippy::disallowed_methods)]`。
 //! 面向用户的进度/汇总输出用 `println!`/`eprintln!` 是编排器的正当输出。
 
+/// REQ-008 单元 04:冒烟报告(接口桩)。
+pub mod report;
+/// REQ-008 单元 04:AI 审图与校准(接口桩)。
+pub mod review;
 pub mod smoke;
 
 use std::path::{Path, PathBuf};

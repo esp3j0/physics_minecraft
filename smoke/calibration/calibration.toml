@@ -1,0 +1,28 @@
+# REQ-008 §6 AI 审图校准集(总架构师确认)。图片取自 2026-10-25 单元 03 验收实跑的真实截图。
+# 每次审图前先判这一组;任何一条判错,本次所有 AI 结论作废、全部截图标记待复核。
+# 同一张图配相反的期望,检验 AI 确实在看图,而不是顺着期望文字作答。
+
+[[case]]
+file = "settled-blocks.png"
+expect = "棕色地面上散落着若干凝固的灰色方块,画面中没有任何蓝色立方体"
+pass = true
+
+[[case]]
+file = "settled-blocks.png"
+expect = "画面中部有若干蓝色立方体"
+pass = false
+
+[[case]]
+file = "blue-cubes.png"
+expect = "画面中部的地面附近有若干蓝色立方体"
+pass = true
+
+[[case]]
+file = "blue-cubes.png"
+expect = "画面中没有任何蓝色立方体,只有平坦的地面和天空"
+pass = false
+
+[[case]]
+file = "flat-ground.png"
+expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块"
+pass = true
