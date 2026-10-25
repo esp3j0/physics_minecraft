@@ -1,6 +1,6 @@
 # REQ-008:自动化图形冒烟——脚本驱动 viewer、截图、机器检查与 AI 审图
 
-- 状态:**已确认**(2026-10-25 用户拍板 D1–D3;同日修订 2 增补 D4 拍号心跳、修订 3 明确默认场景集与校准集,均为总架构师裁定)
+- 状态:**已完成**(2026-10-25 终审通过;用户拍板 D1–D3;同日修订 2 增补 D4 拍号心跳、修订 3 明确默认场景集与校准集,均为总架构师裁定)
 - 提出日期:2026-10-25
 - 上游:
   - [REQ-004A](REQ-004A-visual-viewer.md)(viewer:渲染、飞行相机、B/X 交互;决议"渲染代码不写窗口类测试")
@@ -246,7 +246,12 @@ viewer 只能从实体状态包得知服务器拍号:有实体变化时每 10 �
 
 ## 迁移清单(阶段 3 填写)
 
-- [ ] 验收标准 AC-S1–S10 落成测试或可执行检查
-- [ ] `cargo test --workspace` / clippy / fmt 全绿
-- [ ] 首个场景经 `cargo xtask smoke` 跑通,报告经总架构师复核
-- [ ] TEMPLATE.md 与 process.md 加入图形冒烟要求
+- [x] 验收标准 AC-S1–S10 落成测试或可执行检查:35 条 `acc_s*`(viewer 22,含 AC-S9 的场景解析守卫;e2e 1;xtask 12),
+  AC-S9 与 AC-S8 的窗口/AI 部分由 `cargo xtask smoke` 与 `--selftest` 实跑承担
+- [x] `cargo test --workspace` / clippy / fmt 全绿(单元 04 CI [40223697514](https://github.com/esp3j0/physics_minecraft/actions/runs/40223697514))
+- [x] 首个场景经 `cargo xtask smoke` 跑通,报告经总架构师复核(2026-10-25 总架构师本机实跑:`--no-ai` 退出码 0;
+  带 AI 校准 5/5 判对、5 张截图全部判通过、0 张待复核,截图逐张亲自看过;`--selftest` 5 项预期全部达成)
+- [x] TEMPLATE.md 与 process.md 加入图形冒烟要求
+
+提交:[bb97d0f](https://github.com/esp3j0/physics_minecraft/commit/bb97d0f) 定稿;[bd87f68](https://github.com/esp3j0/physics_minecraft/commit/bd87f68) 单元 01;[921b5ca](https://github.com/esp3j0/physics_minecraft/commit/921b5ca) 单元 02;[73891da](https://github.com/esp3j0/physics_minecraft/commit/73891da) 修订 2;[48ec576](https://github.com/esp3j0/physics_minecraft/commit/48ec576) 单元 03;
+[9596bec](https://github.com/esp3j0/physics_minecraft/commit/9596bec) 修订 3;[f0c1104](https://github.com/esp3j0/physics_minecraft/commit/f0c1104) 单元 04。
