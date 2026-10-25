@@ -16,7 +16,11 @@ wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, timeout_ticks = 1200
 spawn = { at = [6.0, -52.0, 14.0], count = 3, label = "cubes" }
 
 [[step]]
-label = "必然失败:刚生成就断言没有活实体"
+label = "等实体进入客户端视图(生成回执先于实体状态包到达)"
+wait_ticks = { n = 20 }
+
+[[step]]
+label = "必然失败:方块还在下落时断言没有活实体"
 check = { live_entities = { eq = 0 } }
 
 [[step]]

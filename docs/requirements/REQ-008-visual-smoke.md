@@ -1,6 +1,6 @@
 # REQ-008:自动化图形冒烟——脚本驱动 viewer、截图、机器检查与 AI 审图
 
-- 状态:**已确认**(2026-10-25 用户拍板 D1–D3;同日修订 2 增补 D4 拍号心跳,总架构师裁定)
+- 状态:**已确认**(2026-10-25 用户拍板 D1–D3;同日修订 2 增补 D4 拍号心跳、修订 3 明确默认场景集与校准集,均为总架构师裁定)
 - 提出日期:2026-10-25
 - 上游:
   - [REQ-004A](REQ-004A-visual-viewer.md)(viewer:渲染、飞行相机、B/X 交互;决议"渲染代码不写窗口类测试")
@@ -134,7 +134,8 @@ viewer 只能从实体状态包得知服务器拍号:有实体变化时每 10 �
 
 - 新建 `crates/xtask`(bin),`.cargo/config.toml` 增加别名 `xtask = "run --package xtask --"`。
 - **命令**:`cargo xtask smoke [场景名或路径 ...] [--no-ai] [--out <目录>]`;不给场景时跑 `smoke/scenarios/`
-  下全部场景;另有 `cargo xtask smoke --selftest`(§10 AC-S8)。
+  下除 `selftest-*` 以外的全部场景(修订 3:自检场景必然失败,只供 `--selftest` 使用);另有
+  `cargo xtask smoke --selftest`(§10 AC-S8)。
 - **每个场景**:
   1. 新建临时数据目录;选一个空闲端口;用 `app::config::Config` 生成配置文件(`listen_addr`、`data_dir`、
      场景 `[server]` 覆盖项),保证通过配置校验;
@@ -151,13 +152,14 @@ viewer 只能从实体状态包得知服务器拍号:有实体变化时每 10 �
   `node <zcode.mjs> -p <提示词> --attach <截图> --mode plan --json --cwd <场景输出目录>`。`zcode.mjs` 路径取环境
   变量 `ZCODE_MJS`,缺省 `%LOCALAPPDATA%\zcode\runtime\current\bin\zcode.mjs`;模型用 zcode 默认配置
   (公司 / glm-5.3-flash / max)。单次超时 180 s。
-- **提示词**:模板存于 `smoke/review-prompt.md`,内容包括:画面约定(天空色背景;地形与已凝固方块是地形色;
+- **提示词**:模板存于 `smoke/review-prompt.md`(总架构师编写,占位符 `{expect}`),内容包括:画面约定(天空色背景;地形与已凝固方块是地形色;
   **蓝色立方体是尚未凝固的活实体**;截图默认不含 HUD)、本张截图的 `expect`、要求先描述看到的内容再下结论、
   只输出一个 JSON 对象:`{"observed": "...", "pass": true|false, "issues": ["..."], "confidence": 0.0–1.0}`。
 - **解析**:从回复中取第一个 JSON 对象(容忍代码块包裹);解析失败或调用失败 → 结论记为 `unknown`。
 - **标记规则**:`pass = false`、`confidence < 0.7` 或 `unknown` → 标记"待复核",由总架构师打开截图复核(D1)。
 - **校准**:`smoke/calibration/` 存放已知好坏的标准截图与 `calibration.toml`(每条:文件、`expect`、应得的
-  `pass`),至少 2 张应判通过、2 张应判失败(例如:期望"空中没有蓝色立方体",而图中有悬空的蓝色立方体)。
+  `pass`),至少 2 条应判通过、2 条应判失败,至少 3 张不同的图(修订 3:同一张图可以配相反的期望,检验 AI 确实在看图,
+  而不是顺着期望文字作答)。
   每次审图前先判校准集;**任何一条判错,本次所有 AI 结论作废**,全部截图标记待复核。校准图取自真实冒烟运行,
   经总架构师确认后入库。
 
