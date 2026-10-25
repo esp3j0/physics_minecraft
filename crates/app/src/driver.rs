@@ -810,8 +810,8 @@ impl ObserveOrchestrator {
     /// (hub 注册表 = 活连接):收集各分片 entity_states → 3D 距离过滤
     /// (≤ view_distance×16,观察者表最新位置,细则 1)→ 与 last_sent 差分
     /// → EntityStates 入 World 队列 → 更新 last_sent;全量周期(或首包)整表
-    /// removed 空。方块变更按格位视距覆盖广播(单包合并,README 决策 9)。
-    /// Welcome 入 Critical。
+    /// removed 空,且**即使整表为空也发送**(拍号心跳,REQ-008 修订 2 D4)。
+    /// 方块变更按格位视距覆盖广播(单包合并,README 决策 9)。Welcome 入 Critical。
     ///
     /// 丢包自愈(细则 4):World 满丢最旧对 EntityStates 无损正确性
     /// (latest-wins,下轮全量周期整表覆盖)。
@@ -901,8 +901,11 @@ impl ObserveOrchestrator {
                 }
             }
             stream.last_sent = visible;
-            if states.is_empty() && removed.is_empty() {
-                continue; // 无变化不发包(增量语义)
+            // 无变化不发包 = 增量语义(REQ-008 修订 2,D4):全量包是客户端的
+            // 拍号心跳,即使实体表为空/无变化也发——否则空场景里 viewer 拍号
+            // 停摆(wait_ticks 卡死)、残留的幽灵实体也无法被全量包清除。
+            if !full && states.is_empty() && removed.is_empty() {
+                continue;
             }
             hub.push_world(
                 player,
@@ -4263,6 +4266,61 @@ mod tests {
             "全量 = 整表"
         );
         assert!(removed_full.is_empty(), "全量 removed 恒空");
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-008 修订 2(D4)拍号心跳:可见实体为空时,全量周期到仍发**全量空包**
+    /// (客户端的拍号来源);增量周期到不发(无变化不发仍成立)。驱动级生产路径
+    /// (真网络 + observe 缝)。
+    ///
+    /// 会变红的实现:空表连全量包也不发(修订前行为——客户端拍号停摆、
+    /// 幽灵实体无法清除);或空世界连增量包也发(增量语义被破坏)。
+    #[tokio::test(start_paused = true)]
+    async fn empty_world_full_snapshot_still_sent_as_tick_heartbeat() {
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _ = join_player(&mut c, 4).await;
+        inject_move(&tx, Vec3::new(8.0, 3.0, 8.0)).await;
+        advance_ticks(1).await; // 观察者入表(过滤中心;无实体 → 可见集恒空)
+
+        // 预算窗内收 EntityStates 包直至看到 ≥2 个:空世界里它们必须是
+        // 全量空包(full = true、states/removed 空、拍号递增——首包 +
+        // 全量周期各一);不得出现 full = false 的增量包(无变化不发)。
+        // 窗口 = 40 拍(≈4 个全量周期),预算 320 帧同既有辅助函数。
+        let mut heartbeats: Vec<types::Tick> = Vec::new();
+        for _ in 0..320 {
+            if heartbeats.len() >= 2 {
+                break;
+            }
+            let frame = tokio::time::timeout(Duration::from_millis(50), c.recv()).await;
+            match frame {
+                Ok(Ok(S2C::EntityStates {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                })) => {
+                    assert!(states.is_empty() && removed.is_empty(), "空世界:实体表为空");
+                    assert!(full, "空世界的包 = 全量心跳(full = true)");
+                    heartbeats.push(tick);
+                }
+                Ok(Ok(_)) => {}      // Welcome/ChunkData/BlockUpdates 等混流帧跳过
+                Ok(Err(_)) => break, // 对端关闭
+                Err(_) => {}         // 暂停时钟:50ms 软窗落空即继续(时间随驱动 tick 推进)
+            }
+        }
+        assert!(
+            heartbeats.len() >= 2,
+            "40 拍内应见 ≥2 个全量心跳包,实 {heartbeats:?}"
+        );
+        assert!(
+            heartbeats.windows(2).all(|w| w[0] < w[1]),
+            "心跳拍号严格递增:{heartbeats:?}"
+        );
 
         tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
         driver.await.expect("驱动不 panic");

@@ -26,6 +26,9 @@ pub struct WorldState {
     chunks: BTreeMap<ChunkPos, voxel::Chunk>,
     entities: BTreeMap<EntityId, Vec3>,
     tick: u64,
+    /// 是否已从实体状态包得知真实拍号(REQ-008 修订 2,D4):`Welcome` 的拍号
+    /// 是占位值 0,不算;第一个 `Entities` 包(含空的全量包)带来真实拍号,此后恒真。
+    tick_known: bool,
     /// 自上次 `take_dirty_chunks` 以来变脏的 chunk(BTreeSet:升序、去重)。
     dirty: std::collections::BTreeSet<ChunkPos>,
     /// 自上次 `take_spawned` 以来收到的 Spawned 回执(到达顺序)。
@@ -65,6 +68,9 @@ impl WorldState {
                 full,
             } => {
                 self.tick = tick.0;
+                // 第一个实体状态包(含空的全量心跳)即带来真实拍号(修订 2,D4);
+                // 一旦已知即保持(断连不改)。
+                self.tick_known = true;
                 if full {
                     // 全量对账:以 states 为准重建实体表(协议 full 同语义)。
                     self.entities.clear();
@@ -100,10 +106,8 @@ impl WorldState {
 
     /// 是否已从实体状态包得知真实拍号(REQ-008 修订 2,D4)。`Welcome` 的拍号是占位值,
     /// 不算;收到第一个 `Entities` 事件后恒为 true。脚本模式据此决定何时开始推进引擎。
-    ///
-    /// **总架构师接口桩(REQ-008 单元 03)**:签名固定,由实施方实现。
     pub fn tick_known(&self) -> bool {
-        unimplemented!("REQ-008 单元 03:由实施方实现")
+        self.tick_known
     }
 
     /// 某个已装载 chunk 的方块镜像。
@@ -301,5 +305,37 @@ mod tests {
         });
         assert_eq!(w.tick(), tick_before, "断连不改拍号");
         assert_eq!(w.live_entities(), entities_before, "断连不改实体表");
+    }
+
+    /// 拍号已知标志(REQ-008 修订 2,D4;锚定模块文档):初始未知;`Welcome`
+    /// 的拍号是占位值 0,不算;第一个实体状态包(含**空的全量包**)为真,
+    /// 此后(含断连)恒真。
+    ///
+    /// 会变红的实现:把 Welcome 当作拍号已知(引擎从占位拍号 0 起算,等待类
+    /// 步骤在首个真实拍号到达时立即误判超时);空的全量包不算数(空场景拍号
+    /// 永远未知,wait_ticks 卡死)。
+    #[test]
+    fn tick_known_only_after_first_entity_states() {
+        let mut w = WorldState::new();
+        assert!(!w.tick_known(), "初始未知");
+        w.apply(ViewEvent::Welcome {
+            player_id: InputSource(1),
+            tick: Tick(0),
+        });
+        assert!(!w.tick_known(), "Welcome 的拍号是占位值,不算");
+        // 连非空增量也不算"已经知道真实拍号"?算——任何实体状态包都行;
+        // 这里先验证空全量包(空场景唯一能收到的形态)。
+        w.apply(ViewEvent::Entities {
+            tick: Tick(20_617),
+            states: vec![],
+            removed: vec![],
+            full: true,
+        });
+        assert!(w.tick_known(), "空的全量包同样带来真实拍号");
+        assert_eq!(w.tick(), 20_617);
+        w.apply(ViewEvent::Disconnected {
+            reason: "bye".to_owned(),
+        });
+        assert!(w.tick_known(), "一旦已知即保持");
     }
 }

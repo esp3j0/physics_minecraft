@@ -1211,7 +1211,6 @@ mod unit03 {
     /// 会变红的实现:把 Welcome 当作拍号已知(引擎从占位拍号 0 起算,第一个真实拍号一到,
     /// 等待类步骤立即误判超时);收到空的全量包不算数。
     #[test]
-    #[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_s5_tick_known_only_after_entity_states() {
         let mut w = WorldState::new();
         assert!(!w.tick_known(), "初始未知");

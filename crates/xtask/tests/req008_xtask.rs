@@ -19,7 +19,6 @@ fn table(text: &str) -> toml::Table {
 /// 会变红的实现:覆盖项被忽略;只拼接字符串、不经 `Config` 校验(未知键或非法值漏到服务器
 /// 启动时才失败);listen/data_dir 没写进去。
 #[test]
-#[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s5_server_config_applies_overrides_and_validates() {
     let data = Path::new("C:/tmp/smoke-data");
     let cfg = server_config(
@@ -73,7 +72,6 @@ fn acc_s5_server_config_applies_overrides_and_validates() {
 ///
 /// 会变红的实现:只扫标准输出(panic 消息在标准错误);把普通日志判成 panic。
 #[test]
-#[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s5_scan_server_log() {
     assert_eq!(
         scan_server_log("监听 127.0.0.1:35999\n", ""),
@@ -97,7 +95,6 @@ fn acc_s5_scan_server_log() {
 ///
 /// 会变红的实现:把非 toml 文件当场景;顺序不稳定;找不到的名字被静默跳过。
 #[test]
-#[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s5_resolve_scenarios() {
     let dir = tempfile::tempdir().expect("临时目录");
     for f in ["b.toml", "a.toml", "notes.txt"] {
@@ -135,7 +132,6 @@ fn acc_s5_resolve_scenarios() {
 /// 会变红的实现:超时或服务器 panic 时仍判通过;检查失败(viewer 退出码 1)被当成通过;
 /// 一个场景都没跑却返回 0。
 #[test]
-#[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s5_exit_code_aggregation() {
     let run = |exit: Option<i32>, timed_out: bool, panicked: bool| ScenarioRun {
         name: "s".to_owned(),

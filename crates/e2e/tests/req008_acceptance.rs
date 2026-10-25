@@ -102,7 +102,6 @@ async fn start_server(
 /// 会变红的实现:可见实体为空时连全量包也不发(当前行为)——空场景里客户端永远不知道服务器
 /// 推进到了哪一拍,脚本的等待步骤卡死;也无法用空的全量包清掉残留的幽灵实体。
 #[tokio::test(start_paused = true)]
-#[ignore = "REQ-008 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 async fn acc_s5_empty_world_still_streams_tick_heartbeat() {
     let (tx, driver, addr) = start_server(10, 60).await;
     let (events, control) = ViewerClient::spawn(addr, 2).expect("连接真服务器");

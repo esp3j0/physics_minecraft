@@ -386,8 +386,10 @@ fn report_observer_if_due(
 }
 
 /// 脚本模式主循环(REQ-008 §4):引擎驱动相机与命令、截图、写 manifest。
-/// 收到 Welcome 之前不推进引擎;引擎结束 → finish → 写 manifest → 按 exit_code
-/// 退出;结束前断连 → Failed{当前步, "断连:…"} 收尾,退出码 2。
+/// 收到第一个实体状态包(`tick_known`,修订 2 D4)之前不推进引擎——`Welcome`
+/// 的拍号是占位值 0,且服务器要等观察者位置才发实体包;期间按初始相机位姿
+/// 上报观察者。引擎结束 → finish → 写 manifest → 按 exit_code 退出;结束前
+/// 断连 → Failed{当前步, "断连:…"} 收尾,退出码 2。
 async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: &Path) {
     let (scenario, mut manifest) = prepare_script(script, out);
     let view_distance = scenario.view_distance.or(env_view).unwrap_or(4);
@@ -396,13 +398,12 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
 
     let total = scenario.steps.len();
     let scenario_name = scenario.name.clone();
-    // 起始相机位姿 = 修正后的飞行相机初始位姿(交互/脚本一致);Welcome 前
+    // 起始相机位姿 = 修正后的飞行相机初始位姿(交互/脚本一致);tick 已知前
     // 不创建、不推进引擎。
     let mut engine: Option<Engine> = None;
     let mut camera = FlyCamera::new();
     let start_pose = camera.to_pose();
     let mut world = WorldView::new();
-    let mut welcome_seen = false;
     let mut disconnected: Option<String> = None;
     let mut finished = false;
     let mut coupled = true;
@@ -411,22 +412,23 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
     loop {
         let dt = get_frame_time();
 
-        // 事件排空:进 WorldState;Welcome/Disconnected 单独记。
+        // 事件排空:进 WorldState;Disconnected 单独记。
         while let Ok(event) = events.try_recv() {
             match event {
                 ViewEvent::Disconnected { reason } => disconnected = Some(reason),
-                other => {
-                    if matches!(other, ViewEvent::Welcome { .. }) {
-                        welcome_seen = true;
-                    }
-                    world.apply(other);
-                }
+                other => world.apply(other),
             }
         }
         world.sync();
 
-        if welcome_seen && engine.is_none() {
+        if world.state.tick_known() && engine.is_none() {
             engine = Some(Engine::new(scenario.clone(), start_pose));
+        }
+
+        // 引擎未建(tick 未知)也要上报观察者:服务器要等到观察者位置才开始
+        // 发实体状态包(初始位姿首报 + 100 ms 节流保活)。
+        if engine.is_none() && disconnected.is_none() {
+            report_observer_if_due(&camera, coupled, false, &mut last_sent, &control);
         }
 
         // 推进引擎(结束后不再推进):输出相机/耦合/命令/截图请求/步骤记录。
