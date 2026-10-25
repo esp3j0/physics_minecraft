@@ -68,7 +68,8 @@ pub fn scan_server_log(stdout: &str, stderr: &str) -> ServerLog {
 }
 
 /// 选出要跑的场景文件:
-/// - `selectors` 为空 → `dir` 下全部 `*.toml`,按文件名升序;
+/// - `selectors` 为空 → `dir` 下全部 `*.toml`,按文件名升序,**排除 `selftest-` 前缀**
+///   (修订 3:自检场景必然失败,只供 `--selftest` 使用);
 /// - 每个选择项先当作已存在的文件路径,否则当作场景名(`dir/<名>.toml`);
 /// - 找不到 → 报错并点名;`dir` 下没有任何场景 → 报错;重复项只保留第一次。
 pub fn resolve_scenarios(dir: &Path, selectors: &[String]) -> Result<Vec<PathBuf>, String> {
@@ -78,6 +79,11 @@ pub fn resolve_scenarios(dir: &Path, selectors: &[String]) -> Result<Vec<PathBuf
             .filter_map(|entry| {
                 let path = entry.ok()?.path();
                 (path.extension().and_then(|e| e.to_str()) == Some("toml")).then_some(path)
+            })
+            .filter(|path| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_none_or(|stem| !stem.starts_with("selftest-"))
             })
             .collect();
         if all.is_empty() {
@@ -216,21 +222,29 @@ mod tests {
         );
     }
 
-    /// 场景选择:全部按文件名升序、非 toml 排除;按名、按路径、混合、去重;
-    /// 找不到点名;空目录报错。
+    /// 场景选择:全部按文件名升序、非 toml 排除、`selftest-*` 不进默认集(修订 3);
+    /// 按名、按路径、混合、去重;找不到点名;空目录报错。
     ///
-    /// 会变红的实现:把 notes.txt 当场景;顺序不稳定;找不到被静默跳过。
+    /// 会变红的实现:把 notes.txt 当场景;默认集混入 selftest-negative;顺序不稳定;
+    /// 找不到被静默跳过。
     #[test]
     fn resolve_scenarios_selects_dedupes_and_reports_missing() {
         let dir = tempfile::tempdir().expect("临时目录");
-        for f in ["b.toml", "a.toml", "notes.txt"] {
+        for f in ["b.toml", "a.toml", "notes.txt", "selftest-negative.toml"] {
             std::fs::write(dir.path().join(f), "").expect("写文件");
         }
         let a = dir.path().join("a.toml");
         let b = dir.path().join("b.toml");
         assert_eq!(
             resolve_scenarios(dir.path(), &[]).expect("全部"),
-            vec![a.clone(), b.clone()]
+            vec![a.clone(), b.clone()],
+            "默认集排除 selftest-*"
+        );
+        let selftest = dir.path().join("selftest-negative.toml");
+        assert_eq!(
+            resolve_scenarios(dir.path(), &["selftest-negative".to_owned()]).expect("按名点名"),
+            vec![selftest],
+            "显式点名 selftest 场景仍可选(--selftest 路径)"
         );
         assert_eq!(
             resolve_scenarios(dir.path(), &["b".to_owned()]).expect("按名"),

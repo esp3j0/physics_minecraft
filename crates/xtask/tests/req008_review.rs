@@ -74,7 +74,6 @@ const FAIL_JSON: &str =
 ///
 /// 会变红的实现:只替换第一处;缺占位符时静默把期望丢掉;模板没说明蓝色立方体的含义。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s6_build_prompt() {
     assert_eq!(
         build_prompt("A {expect} B {expect}", "期望X").expect("有占位符"),
@@ -95,7 +94,6 @@ fn acc_s6_build_prompt() {
 /// 会变红的实现:只认纯 JSON;用"第一个 `{` 到最后一个 `}`"截取(多个对象或字符串里有花括号时
 /// 出错);不校验字段类型与取值范围。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s6_parse_verdict() {
     let want = Verdict {
         observed: "地面上有灰色方块".to_owned(),
@@ -163,7 +161,6 @@ fn acc_s6_parse_verdict() {
 ///
 /// 会变红的实现:门槛写成 `<=`;只看 pass 不看置信度;校准失败时仍采信 AI 结论。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s6_flag_rules() {
     assert!(!judged(true, 0.7).flagged(), "恰好 0.7 不待复核");
     assert!(judged(true, 0.69).flagged(), "低于 0.7 待复核");
@@ -185,7 +182,6 @@ fn acc_s6_flag_rules() {
 ///
 /// 会变红的实现:没把期望放进提示词;审图器出错时 panic;模板错误时仍去调用审图器。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s6_review_image_with_fake_reviewer() {
     let mut fake = FakeReviewer::new(&[("期望甲", Ok(PASS_JSON)), ("期望乙", Err("超时"))]);
     let img = Path::new("shots/01-a.png");
@@ -217,7 +213,6 @@ fn acc_s6_review_image_with_fake_reviewer() {
 ///
 /// 会变红的实现:只要多数判对就算通过;Unknown 被当作判对;mismatches 不点名文件;空集合算通过。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s8_run_calibration() {
     let case = |file: &str, expect: &str, pass: bool| CalibrationCase {
         file: PathBuf::from(file),
@@ -268,7 +263,6 @@ fn acc_s8_run_calibration() {
 ///
 /// 会变红的实现:`file` 没拼上校准目录;字段读错。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s8_committed_calibration_set() {
     let dir = repo_root().join("smoke/calibration");
     let cases = load_calibration(&dir).expect("校准集可读");
@@ -395,7 +389,6 @@ fn fixture(calibration: Option<CalibrationOutcome>) -> RunReport {
 ///
 /// 会变红的实现:漏写失败原因;截图用绝对路径或路径不含场景名;待复核没有标出;校准状态缺失。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s7_report_markdown() {
     let md = report_markdown(&fixture(Some(CalibrationOutcome {
         ok: true,
@@ -433,7 +426,6 @@ fn acc_s7_report_markdown() {
 ///
 /// 会变红的实现:字段名或结构与约定不符;汇总计数错;review 三种形态没区分。
 #[test]
-#[ignore = "REQ-008 单元 04 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_s7_report_json() {
     let v: serde_json::Value =
         serde_json::from_str(&report_json(&fixture(Some(CalibrationOutcome {
