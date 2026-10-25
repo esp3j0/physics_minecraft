@@ -5,8 +5,12 @@
 //! 窗口编排。bin 入口在 main.rs(双 target 各自编译,窗口行为不测试,
 //! ACV4 手动清单)。
 
+/// REQ-008:命令行参数(交互 / 脚本模式)。
+pub mod cli;
 pub mod client;
 pub mod mesh;
 pub mod render;
 /// REQ-008:图形冒烟场景脚本(纯逻辑,零 macroquad)。
 pub mod script;
+/// REQ-008:世界状态(纯逻辑;渲染与脚本引擎共用)。
+pub mod world;

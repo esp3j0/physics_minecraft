@@ -1155,6 +1155,8 @@ version = "0.1.0"
 dependencies = [
  "macroquad",
  "messaging",
+ "serde",
+ "serde_json",
  "sim-api",
  "tokio",
  "toml",

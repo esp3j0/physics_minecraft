@@ -851,3 +851,350 @@ check = { no_floating = { height = 1.5, still_ticks = 30 } }
         "观测不足 still_ticks 不判悬空"
     );
 }
+
+// ===========================================================================
+// 单元 02 · AC-S4(纯逻辑部分):命令行参数、世界状态、manifest
+// 窗口部分(截图尺寸 / 非纯色 / 方向、交互模式不变)由总架构师在单元交付后实跑核对。
+// ===========================================================================
+
+mod unit02 {
+    use std::path::PathBuf;
+
+    use messaging::InputSource;
+    use types::glam::Vec3;
+    use types::{BlockPos, ChunkPos, EntityId, EntityState, Tick};
+    use viewer::cli::{ViewerArgs, ViewerMode, parse_args};
+    use viewer::client::ViewEvent;
+    use viewer::script::manifest::Manifest;
+    use viewer::script::{Engine, EngineStatus, FrameInput, WorldQuery, parse_scenario};
+    use viewer::world::WorldState;
+
+    use super::{AIR, DIRT, World, eid, start_pose};
+
+    fn args(list: &[&str]) -> Result<ViewerArgs, String> {
+        parse_args(list.iter().map(|s| (*s).to_owned()))
+    }
+
+    /// 命令行:无参数为交互模式;`--script` 与 `--out` 成对出现;`--addr` 可选;未知参数、
+    /// 缺值、重复参数都报错。
+    ///
+    /// 会变红的实现:缺 `--out` 时静默用默认目录;未知参数被忽略;`--addr` 被吞掉。
+    #[test]
+    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s4_cli_args() {
+        assert_eq!(
+            args(&[]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Interactive,
+                addr: None
+            })
+        );
+        assert_eq!(
+            args(&["--script", "smoke/a.toml", "--out", "target/x"]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Script {
+                    script: PathBuf::from("smoke/a.toml"),
+                    out: PathBuf::from("target/x")
+                },
+                addr: None
+            })
+        );
+        assert_eq!(
+            args(&[
+                "--out",
+                "o",
+                "--addr",
+                "127.0.0.1:4000",
+                "--script",
+                "s.toml"
+            ]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Script {
+                    script: PathBuf::from("s.toml"),
+                    out: PathBuf::from("o")
+                },
+                addr: Some("127.0.0.1:4000".to_owned())
+            }),
+            "参数顺序无关"
+        );
+        assert_eq!(
+            args(&["--addr", "127.0.0.1:4000"]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Interactive,
+                addr: Some("127.0.0.1:4000".to_owned())
+            })
+        );
+        for bad in [
+            &["--script", "s.toml"][..],
+            &["--out", "o"][..],
+            &["--script"][..],
+            &["--script", "a", "--out", "o", "--script", "b"][..],
+            &["--fullscreen"][..],
+            &["s.toml"][..],
+        ] {
+            assert!(args(bad).is_err(), "应报错:{bad:?}");
+        }
+    }
+
+    fn chunk_with(local: (usize, usize, usize), block: types::BlockId) -> voxel::Chunk {
+        let mut c = voxel::Chunk::air();
+        c.set(local.0, local.1, local.2, block);
+        c
+    }
+
+    /// 方块镜像:chunk 装载 / 卸载 / 增量;负坐标换算;未装载为 None;未装载 chunk 的增量忽略;
+    /// 脏 chunk 升序去重、取走即清。
+    ///
+    /// 会变红的实现:负坐标取模写错;未装载 chunk 的增量造出假 chunk(chunks_loaded 虚增、
+    /// block_at 返回空气);卸载后仍可查;脏集合重复或不清。
+    #[test]
+    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s4_world_state_blocks() {
+        let mut w = WorldState::new();
+        let west = ChunkPos::new(-1, 2);
+        // 世界 (−5, −61, 40) → chunk (−1, 2),局部 (11, 3, 8)。
+        w.apply(ViewEvent::Chunk {
+            pos: west,
+            chunk: chunk_with((11, 3, 8), DIRT),
+        });
+        assert_eq!(w.chunks_loaded(), 1);
+        assert_eq!(w.block_at(BlockPos::new(-5, -61, 40)), Some(DIRT));
+        assert_eq!(w.block_at(BlockPos::new(-6, -61, 40)), Some(AIR));
+        assert_eq!(
+            w.block_at(BlockPos::new(20, -61, 40)),
+            None,
+            "未装载 → None"
+        );
+
+        w.apply(ViewEvent::Blocks {
+            updates: vec![
+                (BlockPos::new(-6, -61, 40), DIRT),
+                (BlockPos::new(-5, -61, 40), AIR),
+            ],
+        });
+        assert_eq!(w.block_at(BlockPos::new(-6, -61, 40)), Some(DIRT));
+        assert_eq!(w.block_at(BlockPos::new(-5, -61, 40)), Some(AIR));
+        w.apply(ViewEvent::Blocks {
+            updates: vec![(BlockPos::new(3, -61, 3), DIRT)],
+        });
+        assert_eq!(w.chunks_loaded(), 1, "未装载 chunk 的增量不造假 chunk");
+        assert_eq!(w.block_at(BlockPos::new(3, -61, 3)), None);
+
+        let north = ChunkPos::new(0, 1);
+        w.apply(ViewEvent::Chunk {
+            pos: north,
+            chunk: voxel::Chunk::air(),
+        });
+        assert_eq!(w.take_dirty_chunks(), vec![west, north], "升序去重");
+        assert!(w.take_dirty_chunks().is_empty(), "取走即清");
+        assert!(w.chunk(north).is_some());
+
+        w.apply(ViewEvent::ChunkGone { pos: west });
+        assert_eq!(w.block_at(BlockPos::new(-6, -61, 40)), None, "卸载后不可查");
+        assert_eq!(w.chunks_loaded(), 1);
+        assert!(w.chunk(west).is_none());
+        assert_eq!(w.take_dirty_chunks(), vec![west], "卸载也记脏");
+    }
+
+    fn state_at(p: Vec3) -> EntityState {
+        EntityState {
+            translation: p,
+            ..EntityState::default()
+        }
+    }
+
+    fn sorted(mut v: Vec<(EntityId, Vec3)>) -> Vec<(EntityId, Vec3)> {
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
+    /// 实体与拍号:增量 latest-wins、removed 删除、full 重建;Welcome/Entities 更新拍号;
+    /// Spawned 回执按序取走;Disconnected 不改状态。
+    ///
+    /// 会变红的实现:full 时不清旧实体(幽灵实体);removed 不生效;拍号只在 Welcome 时更新;
+    /// 回执丢失或乱序。
+    #[test]
+    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s4_world_state_entities_and_receipts() {
+        let mut w = WorldState::new();
+        w.apply(ViewEvent::Welcome {
+            player_id: InputSource(1),
+            tick: Tick(5),
+        });
+        assert_eq!(w.tick(), 5);
+        let (a, b, c, d) = (
+            Vec3::new(1.0, -59.5, 1.0),
+            Vec3::new(2.0, -59.5, 1.0),
+            Vec3::new(1.0, -58.0, 3.0),
+            Vec3::new(9.0, -59.5, 9.0),
+        );
+        w.apply(ViewEvent::Entities {
+            tick: Tick(10),
+            states: vec![(eid(1), state_at(a)), (eid(2), state_at(b))],
+            removed: vec![],
+            full: false,
+        });
+        assert_eq!(sorted(w.live_entities()), vec![(eid(1), a), (eid(2), b)]);
+        w.apply(ViewEvent::Entities {
+            tick: Tick(20),
+            states: vec![(eid(1), state_at(c))],
+            removed: vec![eid(2)],
+            full: false,
+        });
+        assert_eq!(sorted(w.live_entities()), vec![(eid(1), c)]);
+        w.apply(ViewEvent::Entities {
+            tick: Tick(30),
+            states: vec![(eid(3), state_at(d))],
+            removed: vec![],
+            full: true,
+        });
+        assert_eq!(
+            sorted(w.live_entities()),
+            vec![(eid(3), d)],
+            "full 以 states 重建"
+        );
+        assert_eq!(w.tick(), 30);
+
+        w.apply(ViewEvent::Spawned { entity: eid(7) });
+        w.apply(ViewEvent::Spawned { entity: eid(8) });
+        assert_eq!(w.take_spawned(), vec![eid(7), eid(8)]);
+        assert!(w.take_spawned().is_empty());
+
+        w.apply(ViewEvent::Disconnected {
+            reason: "bye".to_owned(),
+        });
+        assert_eq!(w.tick(), 30);
+        assert_eq!(w.live_entities().len(), 1);
+    }
+
+    /// 跑一个场景一帧,把结束的步骤写进 manifest 并收尾。
+    fn manifest_of(text: &str, world: &World) -> (Manifest, Engine) {
+        let scenario = parse_scenario(text).expect("场景应可解析");
+        let mut m = Manifest::new(&scenario);
+        let mut e = Engine::new(scenario, start_pose());
+        let out = e.frame(&FrameInput {
+            dt: 0.016,
+            server_tick: 40,
+            world,
+            spawned: &[],
+        });
+        for r in &out.finished {
+            m.push(r, world);
+        }
+        m.finish(e.status());
+        (m, e)
+    }
+
+    /// manifest:场景元数据、每步的相机 / 拍号 / 结果、截图信息(含当时的统计)、结果;
+    /// JSON 字段名即结构体字段名;可读回相等的值。
+    ///
+    /// 会变红的实现:漏写步骤或字段;结果字符串不在约定取值内;截图统计取错来源;
+    /// JSON 不能往返。
+    #[test]
+    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s4_manifest_records_steps_and_result() {
+        let text = r#"
+name = "m"
+req = "REQ-008"
+description = "manifest"
+
+[[step]]
+label = "就位"
+camera = { pos = [1.0, -50.0, 2.0], yaw = 10.0, pitch = -20.0 }
+
+[[step]]
+check = { live_entities = { eq = 0 } }
+
+[[step]]
+screenshot = { name = "s", expect = "期望文字", hud = true }
+"#;
+        let world = World::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
+        let (m, e) = manifest_of(text, &world);
+        assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 1 });
+
+        let json = m.to_json();
+        let v: serde_json::Value = serde_json::from_str(&json).expect("to_json 输出合法 JSON");
+        assert_eq!(v["scenario"], "m");
+        assert_eq!(v["req"], "REQ-008");
+        assert_eq!(v["description"], "manifest");
+        let steps = v["steps"].as_array().expect("steps 为数组");
+        assert_eq!(steps.len(), 3);
+
+        assert_eq!(steps[0]["step"], 1);
+        assert_eq!(steps[0]["label"], "就位");
+        assert_eq!(steps[0]["action"], "camera");
+        assert_eq!(steps[0]["end_tick"], 40);
+        assert_eq!(
+            steps[0]["camera"]["pos"],
+            serde_json::json!([1.0, -50.0, 2.0])
+        );
+        assert_eq!(steps[0]["camera"]["yaw"], 10.0);
+        assert_eq!(steps[0]["camera"]["pitch"], -20.0);
+        assert_eq!(steps[0]["outcome"], "ok");
+        assert_eq!(steps[0]["messages"], serde_json::json!([]));
+        assert!(
+            steps[0]["screenshot"].is_null(),
+            "非截图步骤不带 screenshot"
+        );
+
+        assert_eq!(steps[1]["action"], "check");
+        assert_eq!(steps[1]["outcome"], "check_failed");
+        assert!(
+            !steps[1]["messages"]
+                .as_array()
+                .expect("messages 为数组")
+                .is_empty(),
+            "检查失败带原因"
+        );
+
+        let shot = &steps[2]["screenshot"];
+        assert_eq!(shot["file"], "03-s.png");
+        assert_eq!(shot["name"], "s");
+        assert_eq!(shot["expect"], "期望文字");
+        assert_eq!(shot["hud"], true);
+        assert_eq!(shot["live_entities"], 1);
+        assert_eq!(shot["chunks_loaded"], 9);
+
+        assert_eq!(v["result"]["status"], "done");
+        assert_eq!(v["result"]["exit_code"], 1);
+        assert_eq!(v["result"]["failed_checks"], 1);
+        assert!(v["result"]["reason"].is_null());
+
+        assert_eq!(Manifest::from_json(&json), Ok(m), "JSON 往返相等");
+        assert!(Manifest::from_json("{}").is_err(), "残缺 JSON 报错");
+    }
+
+    /// 场景失败时 manifest 的结果:status failed、exit_code 2、reason 非空;出错步骤
+    /// outcome 为 error。
+    ///
+    /// 会变红的实现:失败场景记成 done;没有 reason;出错步骤没记录。
+    #[test]
+    #[ignore = "REQ-008 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_s4_manifest_failed_scenario() {
+        let text = r#"
+name = "f"
+description = "失败"
+
+[[step]]
+check = { live_entities = { eq = 1 } }
+
+[[step]]
+detonate = { nearest = true, power = 12.0, radius = 8.0 }
+"#;
+        let world = World::with_entities(&[(eid(1), Vec3::new(30.0, -59.5, 0.0))]);
+        let (m, e) = manifest_of(text, &world);
+        assert!(matches!(e.status(), EngineStatus::Failed { step: 2, .. }));
+        let v: serde_json::Value = serde_json::from_str(&m.to_json()).expect("合法 JSON");
+        assert_eq!(v["steps"][0]["outcome"], "ok");
+        assert_eq!(v["steps"][1]["outcome"], "error");
+        assert_eq!(v["result"]["status"], "failed");
+        assert_eq!(v["result"]["exit_code"], 2);
+        assert_eq!(v["result"]["failed_checks"], 0);
+        assert!(
+            v["result"]["reason"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            "失败带原因"
+        );
+    }
+}

@@ -11,6 +11,8 @@
 mod engine;
 mod parse;
 
+pub mod manifest;
+
 use types::glam::Vec3;
 use types::{BlockId, BlockPos, EntityId, EntityState};
 
