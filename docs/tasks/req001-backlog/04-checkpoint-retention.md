@@ -1,6 +1,8 @@
 # 任务 04:checkpoint 保留最近 N 个 + v5 压缩(#17)
 
-- 状态:**已签发(2026-10-25,总架构师)**;用户已拍板 D1–D4 全部按推荐。
+- 状态:**已完成(2026-10-25,总架构师验收通过;实现 [b51fb24](https://github.com/esp3j0/physics_minecraft/commit/b51fb24))**;用户已拍板 D1–D4 全部按推荐。
+  实测(真实服务器,默认配置,约 3.6 分钟、21 个 checkpoint):单个约 33 KB(修复前约 2.66 MiB),库中恰好 10 个,
+  `checkpoints.redb` 稳定在 0.78 MiB。
 - issue:[#17](https://github.com/esp3j0/physics_minecraft/issues/17)(实测数据与方案比较见 issue 正文)。
 - 需求:[REQ-001](../../requirements/REQ-001-architecture.md) §9 决议 11 的 #17 修订;
   [REQ-005 决策清单](../../requirements/REQ-005-decisions.md) D8 版本记录 v5。

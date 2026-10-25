@@ -14,7 +14,7 @@
 | 1 | [01-ac3-explosion.md](01-ac3-explosion.md) | AC3 爆炸等价(位级)+ AC8 长程(600 拍) | qwen |
 | 2 | [02-activation.md](02-activation.md) | AC4:激活策略机 + ShardSim 接线(冻结/唤醒/预算/滞回/冷却) | glm |
 | 3 | [03-ac4-e2e.md](03-ac4-e2e.md) | AC4 端到端(经 Scheduler:观察者→冻结落实施→事件免疫) | qwen |
-| 4 | [04-checkpoint-retention.md](04-checkpoint-retention.md) | #17 follow-up(2026-10-25):checkpoint 保留最近 N 个 + v5 lz4 压缩 | glm |
+| 4 | [04-checkpoint-retention.md](04-checkpoint-retention.md) | #17 follow-up(2026-10-25):checkpoint 保留最近 N 个 + v5 lz4 压缩 ✅ 已完成 | glm(Coding Lite 套餐) |
 
 ## 每份任务书的公共完成定义
 
