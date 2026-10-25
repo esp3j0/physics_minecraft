@@ -108,12 +108,9 @@ async fn advance_ticks(ticks: u32) {
     }
 }
 
-/// 解码检查点 blob → bundle(自有编码必可解码)。
+/// 解码检查点 blob → bundle(#17:走驱动的公开解码入口,v5 起带版本前缀与压缩体)。
 fn decode_bundle(blob: &[u8]) -> CheckpointBundle {
-    let (bundle, _len) =
-        bincode::serde::decode_from_slice::<CheckpointBundle, _>(blob, bincode::config::standard())
-            .expect("驱动自有编码必可解码");
-    bundle
+    app::driver::decode_checkpoint(blob).expect("驱动自有编码必可解码")
 }
 
 /// 凝固桥关闭的 new_sim 装配(激活参数取 Config 换算;AC-G3 用:实体保持

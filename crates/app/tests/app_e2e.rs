@@ -135,9 +135,8 @@ fn latest_bundle_from_disk(dir: &Path) -> CheckpointBundle {
         .read_latest()
         .expect("读最新检查点")
         .expect("必有检查点");
-    let (bundle, _len): (CheckpointBundle, usize) =
-        bincode::serde::decode_from_slice(&blob, bincode::config::standard())
-            .expect("驱动自有编码必可解码");
+    // #17:走驱动的公开解码入口(v5 起 blob 带版本前缀与压缩体,不能再直接 bincode 解)。
+    let bundle = app::driver::decode_checkpoint(&blob).expect("驱动自有编码必可解码");
     assert_eq!(
         bundle.world.shards.tick, tick,
         "库内元组 tick 与 bundle 快照拍一致"

@@ -134,6 +134,9 @@ pub struct Config {
     pub inbox_capacity: usize,
     /// checkpoint 间隔(拍),600(§9.11)。
     pub checkpoint_interval_ticks: u64,
+    /// checkpoint 保留数,10;0 = 不清理(#17;REQ-001 决议 11 修订)。
+    /// **总架构师接口桩**:字段已加,由实施方接到 bootstrap 的存储构造。
+    pub checkpoint_keep: usize,
     /// 分片 step P95 告警阈值(ms;持续 60 tick),5(§9.2)。
     pub shard_alert_ms: f32,
     /// worker 数(装配参数)。
@@ -163,6 +166,7 @@ impl Default for Config {
             envelope_queue_capacity: 1024,
             inbox_capacity: 256,
             checkpoint_interval_ticks: 600,
+            checkpoint_keep: 10,
             shard_alert_ms: 5.0,
             worker_count: 4,
             data_dir: PathBuf::from("data"),

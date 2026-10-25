@@ -192,6 +192,16 @@ owner despawn 的屏障只覆盖 owner chunk,语义更准确。
 
 **影响**:升级后首次启动需要清空/换 `data_dir`;文档要写。
 
+**版本记录**(按 A 执行后的升版;每次升版都必须清空 `data_dir`):
+
+| 版本 | 来源 | 变化 |
+| --- | --- | --- |
+| v1 | REQ-005 | `CheckpointBundle` 带 `format_version` |
+| v2 | REQ-006 | `Outbox.spawned/despawned`、`EntityRecord.source` |
+| v3 | #12 | bundle 追加尾字段 `spawn_next_seq` |
+| v4 | REQ-007 任务 01 | 激活参数拆分、② 冷却表、`ShardSimConfig` 字段更名(REQ-007 布局终稿) |
+| **v5** | **#17(2026-10-25 用户拍板)** | **blob = 未压缩的 `format_version` 前缀(bincode varint)+ `lz4_flex::compress_prepend_size(bincode(bundle))`;解码先读前缀,不是当前版本即报 `unsupported checkpoint format version N`,是才解压、解码。v4 及以前一律显式拒绝** |
+
 **拍板**:[ ] A  [ ] B  [ ] C
 
 ---

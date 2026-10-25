@@ -470,6 +470,22 @@ fn encode(bundle: &CheckpointBundle) -> Vec<u8> {
         .expect("检查点捆绑编码不可能失败(全字段可序列化,fail-stop)")
 }
 
+/// checkpoint 编码的公开入口(#17;e2e 与工具复用,不再各写一份解码)。v5 起格式为
+/// "未压缩的 `format_version` 前缀 + lz4 压缩体"(#17 D2)。
+///
+/// **总架构师接口桩(#17)**:签名固定;当前仍委托旧的 v4 编码,由实施方改为 v5。
+pub fn encode_checkpoint(bundle: &CheckpointBundle) -> Vec<u8> {
+    encode(bundle)
+}
+
+/// checkpoint 解码的公开入口(#17):先读版本前缀,不是当前版本即按 REQ-005 D8 报错
+/// (`unsupported checkpoint format version N`),再解压、解码。
+///
+/// **总架构师接口桩(#17)**:签名固定;当前仍委托旧的 v4 解码,由实施方改为 v5。
+pub fn decode_checkpoint(bytes: &[u8]) -> Result<CheckpointBundle, AppError> {
+    decode(bytes)
+}
+
 /// bincode 字节 → bundle(REQ-005 D8):
 /// - 解码失败(含任务 01 前旧布局 `{snapshot, log_bytes}` 的字节——无版本
 ///   字段,结构不同自然解不开)→ `Err(AppError::Decode)`;

@@ -53,6 +53,17 @@ fn map_db_error<E: Into<redb::Error>>(err: E) -> StoreError {
 }
 
 impl RedbStore {
+    /// 打开/创建数据库文件,并设定 checkpoint 保留数(#17;REQ-001 决议 11 修订、D1)。
+    /// `keep = 0` 不清理(同 [`Self::open`]);`keep > 0` 时:打开时若现存 checkpoint 多于 `keep`,
+    /// 立即删到只剩最近 `keep` 个;此后每次 `append` 在**同一个写事务**里插入新行并删除
+    /// `id <= 新 id − keep` 的旧行。最新一个永不删除,ID 单调、不回退、不复用。
+    ///
+    /// **总架构师接口桩(#17)**:签名固定,由实施方实现。
+    pub fn open_with_keep(path: &Path, keep: usize) -> Result<Self, StoreError> {
+        let _ = (path, keep);
+        unimplemented!("#17:由实施方实现")
+    }
+
     /// 打开/创建数据库文件。路径由调用方给定(app 配置)。
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         // `Database::create`:文件不存在/为空则新建,有效库则打开(redb 4 文档语义)。

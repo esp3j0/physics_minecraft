@@ -122,12 +122,9 @@ async fn advance_ticks(ticks: u32) {
     }
 }
 
-/// 解码检查点 blob → bundle(驱动自有 bincode standard 编码)。
+/// 解码检查点 blob → bundle(#17:走驱动的公开解码入口,v5 起带版本前缀与压缩体)。
 fn decode_bundle(blob: &[u8]) -> CheckpointBundle {
-    let (bundle, _len) =
-        bincode::serde::decode_from_slice::<CheckpointBundle, _>(blob, bincode::config::standard())
-            .expect("驱动自有编码必可解码");
-    bundle
+    app::driver::decode_checkpoint(blob).expect("驱动自有编码必可解码")
 }
 
 /// 顶层实心面 world y = top_ly - 64 的地形 chunk(migration.rs 同款)。
@@ -1937,14 +1934,12 @@ fn acc9_no_duplicate_loads_or_fanout() {
         log_bytes: CommandLog::new().to_bytes(),
         spawn_next_seq: 0,
     };
-    let bytes_a =
-        bincode::serde::encode_to_vec(&bundle, bincode::config::standard()).expect("编码");
-    let bytes_b =
-        bincode::serde::encode_to_vec(&bundle, bincode::config::standard()).expect("编码");
+    // #17:对拍生产编码(v5 = 版本前缀 + lz4 压缩体),压缩也必须确定。
+    let bytes_a = app::driver::encode_checkpoint(&bundle);
+    let bytes_b = app::driver::encode_checkpoint(&bundle);
     assert_eq!(bytes_a, bytes_b, "AC-C9:两次编码逐字节相等");
     let decoded = decode_bundle(&bytes_a);
-    let bytes_c =
-        bincode::serde::encode_to_vec(&decoded, bincode::config::standard()).expect("编码");
+    let bytes_c = app::driver::encode_checkpoint(&decoded);
     assert_eq!(bytes_a, bytes_c, "AC-C9:解码再编码仍逐字节相等(往返确定)");
     session.shutdown();
 }

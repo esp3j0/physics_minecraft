@@ -55,6 +55,14 @@ impl MemCheckpointStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// 带保留数的内存检查点存储(#17;语义同 `RedbStore::open_with_keep`,`keep = 0` 不清理)。
+    ///
+    /// **总架构师接口桩(#17)**:签名固定,由实施方实现。
+    pub fn with_keep(keep: usize) -> Self {
+        let _ = keep;
+        unimplemented!("#17:由实施方实现")
+    }
 }
 
 impl CheckpointStore for MemCheckpointStore {
