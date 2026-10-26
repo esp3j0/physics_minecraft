@@ -1772,3 +1772,177 @@ mod unit05 {
         b.shutdown();
     }
 }
+
+/// 单元 06:撞击破坏(AC-D8)。阈值与冲量见 REQ-009 §5 的 spike 结论(0.729 kg 方块:15 m/s ≈ 11.4、
+/// 30 m/s ≈ 22.4;dirt 7、stone 18)。经 `Session` 驱动,用半边长 0.45 的实体从地表上方高速落下。
+mod unit06 {
+    use messaging::SimCommand;
+    use physics_sim::destruction::DestructionStats;
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EMERGENT_ORIGIN, EntityDesc, EntityId,
+        EntityState, ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn session(tweak: impl Fn(&mut physics_sim::destruction::DestructionConfig)) -> Session {
+        let mut sim_cfg = ShardSimConfig::new(shard());
+        sim_cfg.destruction.enabled = true;
+        tweak(&mut sim_cfg.destruction);
+        let mut sim = ShardSim::new(sim_cfg, Box::new(SimpleRegistry::builtin()));
+        for x in 2..=6 {
+            for z in 2..=6 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        s.register(sim);
+        s
+    }
+
+    /// 在 (x+0.5, y, z+0.5) 生成一个半边长 0.45 的 stone 立方体,竖直速度 `vy`(覆盖单个格的正上方)。
+    fn drop(s: &mut Session, n: u32, x: i32, y: f32, z: i32, vy: f32) {
+        s.send(
+            shard(),
+            SimCommand::SpawnDynamic {
+                entity: EntityId::from_parts(0, n),
+                state: EntityState {
+                    translation: Vec3::new(x as f32 + 0.5, y, z as f32 + 0.5),
+                    rotation: Quat::IDENTITY,
+                    linvel: Vec3::new(0.0, vy, 0.0),
+                    angvel: Vec3::ZERO,
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: builtin::STONE,
+                },
+            },
+        )
+        .expect("生成");
+    }
+
+    fn block(s: &Session, p: BlockPos) -> BlockId {
+        let cp = p.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (p.x - cp.x * 16) as usize,
+            (p.y - WORLD_Y_MIN) as usize,
+            (p.z - cp.z * 16) as usize,
+        )
+    }
+
+    /// 跑 `n` 拍,返回逐拍破坏遥测之和。
+    fn run(s: &mut Session, n: usize) -> DestructionStats {
+        let mut sum = DestructionStats::default();
+        for _ in 0..n {
+            sum.add(&s.tick().destruction);
+        }
+        sum
+    }
+
+    /// AC-D8 撞击破坏:约 17 m/s 砸在 dirt 上撞掉落点那一格(遥测计 1 格),下一拍生成 1 个方块为 dirt 的涌现
+    /// 实体;同样的速度砸在 stone 上撞不坏;约 31 m/s 砸在 stone 上撞坏。
+    ///
+    /// 会变红的实现:没读接触点冲量(或读的是 Python 绑定那种恒 0 的口径);同一格的接触点取最大值而不是求和
+    /// (平落时单点只有约 1/4,撞不坏);格映射没越过薄片(落到空气格上被忽略);阈值用错材料。
+    #[test]
+    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d8_fast_drop_breaks_by_material() {
+        let mut s = session(|_| {});
+        drop(&mut s, 1, 64, -55.0, 64, -15.0);
+        let sum = run(&mut s, 40);
+        assert_eq!(
+            block(&s, BlockPos::new(64, -61, 64)),
+            builtin::AIR,
+            "落点 dirt 被撞掉"
+        );
+        assert_eq!(sum.cells_impacted, 1);
+        let debris: Vec<EntityId> = s
+            .entity_states(shard())
+            .expect("分片")
+            .into_iter()
+            .map(|(id, _)| id)
+            .filter(|id| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect();
+        assert_eq!(debris.len(), 1, "撞掉的格生成 1 个碎块");
+        assert_eq!(
+            s.entity_desc(shard(), debris[0]).map(|d| d.block),
+            Some(builtin::DIRT)
+        );
+        s.shutdown();
+
+        let mut s = session(|_| {});
+        for (x, z) in [(80, 80), (88, 80)] {
+            s.set_block(shard(), BlockPos::new(x, -61, z), builtin::STONE)
+                .expect("放 stone");
+        }
+        s.tick();
+        drop(&mut s, 1, 80, -55.0, 80, -15.0);
+        drop(&mut s, 2, 88, -55.0, 80, -30.0);
+        let sum = run(&mut s, 40);
+        assert_eq!(
+            block(&s, BlockPos::new(80, -61, 80)),
+            builtin::STONE,
+            "17 m/s 撞不坏 stone"
+        );
+        assert_eq!(
+            block(&s, BlockPos::new(88, -61, 80)),
+            builtin::AIR,
+            "31 m/s 撞坏 stone"
+        );
+        assert_eq!(sum.cells_impacted, 1);
+        s.shutdown();
+    }
+
+    /// AC-D8 静载与轻落不破坏:8 个方块静止叠放、一个方块从约 1 m 高处自由落下,300 拍内地形不变、撞击计数为 0。
+    ///
+    /// 会变红的实现:阈值比较用了单拍接触力而不是冲量(静载被放大 60 倍);把全部接触点冲量累加跨拍计算;
+    /// 实体之间的接触也算进地形。
+    #[test]
+    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d8_rest_and_gentle_drop_never_break() {
+        let mut s = session(|_| {});
+        for k in 0..8u32 {
+            drop(&mut s, k + 1, 70, -59.475 + 0.901 * k as f32, 70, 0.0);
+        }
+        drop(&mut s, 100, 74, -58.5, 74, 0.0);
+        let sum = run(&mut s, 300);
+        assert_eq!(sum.cells_impacted, 0, "{sum:?}");
+        assert_eq!(block(&s, BlockPos::new(70, -61, 70)), builtin::DIRT);
+        assert_eq!(block(&s, BlockPos::new(74, -61, 74)), builtin::DIRT);
+        s.shutdown();
+    }
+
+    /// AC-D8 每拍上限:6 个方块同一拍以同样速度砸在 6 块 dirt 上,`max_impact_breaks_per_tick` = 3 时只撞掉 3 格
+    /// (其余方块已经落定,之后不再撞坏)。
+    ///
+    /// 会变红的实现:撞击不受上限;超出上限的格推迟到下一拍(落定后冲量已经没有了,不该再破坏)。
+    #[test]
+    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d8_impact_cap() {
+        let mut s = session(|d| d.max_impact_breaks_per_tick = 3);
+        for k in 0..6 {
+            drop(&mut s, k as u32 + 1, 60 + 3 * k, -55.0, 90, -15.0);
+        }
+        let sum = run(&mut s, 120);
+        assert_eq!(sum.cells_impacted, 3);
+        let broken = (0..6)
+            .filter(|k| block(&s, BlockPos::new(60 + 3 * k, -61, 90)) == builtin::AIR)
+            .count();
+        assert_eq!(broken, 3);
+        s.shutdown();
+    }
+}
