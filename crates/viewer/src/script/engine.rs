@@ -188,6 +188,8 @@ impl EngineInner {
                         tick,
                     );
                 }
+                // **总架构师接口桩(REQ-009 单元 01)**:由实施方实现。
+                Action::Fill { .. } => unimplemented!("REQ-009 单元 01:由实施方实现"),
                 Action::SetBlock { pos, block } => {
                     out.commands.push(EngineCommand::SetBlock { pos, block });
                     self.finish_step(

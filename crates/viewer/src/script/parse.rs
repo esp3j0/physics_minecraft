@@ -25,7 +25,7 @@ const TOP_KEYS: [&str; 7] = [
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
 /// 全部动作键(与 [`Action`] 一一对应)。
-const ACTION_KEYS: [&str; 11] = [
+const ACTION_KEYS: [&str; 12] = [
     "camera",
     "look_at",
     "fly",
@@ -33,6 +33,7 @@ const ACTION_KEYS: [&str; 11] = [
     "spawn",
     "detonate",
     "set_block",
+    "fill",
     "wait_ticks",
     "wait_until",
     "check",
@@ -189,6 +190,7 @@ fn parse_action(
         ],
         "detonate" => &["at", "nearest", "power", "radius"],
         "set_block" => &["pos", "block"],
+        "fill" => &["from", "to", "block"],
         "wait_ticks" => &["n"],
         "wait_until" => &[
             "live_entities",
@@ -343,6 +345,9 @@ fn parse_action(
                 block: block_id(block, registry, "set_block.block").map_err(e)?,
             })
         }
+        // **总架构师接口桩(REQ-009 单元 01)**:由实施方实现(缺参、类型错误、未知方块、
+        // 超过 FILL_MAX_CELLS 都报带步骤序号的错误)。
+        "fill" => unimplemented!("REQ-009 单元 01:由实施方实现"),
         "wait_ticks" => {
             let n = t
                 .get("n")

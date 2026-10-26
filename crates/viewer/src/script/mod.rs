@@ -75,6 +75,15 @@ pub enum Action {
         pos: BlockPos,
         block: BlockId,
     },
+    /// 长方体填充(REQ-009 §10):解析时把两个对角规整为 `from` = 各轴最小、`to` = 各轴最大
+    /// (含两端);格数超过 [`FILL_MAX_CELLS`] 为解析错误。引擎按 `BlockPos` 升序展开为
+    /// `SetBlock` 命令,每帧最多 [`FILL_BATCH_PER_FRAME`] 条,最后一批发出的那一帧该步结束,
+    /// 后续瞬时步骤可在同一帧继续。
+    Fill {
+        from: BlockPos,
+        to: BlockPos,
+        block: BlockId,
+    },
     WaitTicks {
         n: u64,
     },
@@ -215,6 +224,11 @@ pub enum EngineCommand {
         block: BlockId,
     },
 }
+
+/// `fill` 单步格数上限(REQ-009 §10)。
+pub const FILL_MAX_CELLS: usize = 4096;
+/// `fill` 每帧最多发出的 `SetBlock` 条数(服务器分片收件箱每拍 256 条,REQ-009 §10)。
+pub const FILL_BATCH_PER_FRAME: usize = 64;
 
 /// 截图请求:渲染层在当帧画完后截取并保存为 [`ScreenshotRequest::file_name`]。
 #[derive(Debug, Clone, PartialEq)]

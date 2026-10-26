@@ -15,6 +15,55 @@ pub trait BlockRegistry: Send {
     fn is_solid(&self, id: BlockId) -> bool;
     /// 已注册方块数(有效 ID 范围 0..block_count)。
     fn block_count(&self) -> u16;
+    /// 方块材料(REQ-009 §3.1):实心方块恒为 `Some`;空气、非实心方块与未知 ID 为 `None`。
+    fn material(&self, id: BlockId) -> Option<Material>;
+}
+
+/// 方块的支撑规则(REQ-009 §3.1、§6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Support {
+    /// 与地基连通即不落(石、土)。
+    Connected,
+    /// 正下方不是实心就落,与连通性无关(沙)。
+    NeedsBelow,
+    /// 本身就是地基,坍塌搜索遇到即判定锚定(基岩)。
+    Anchor,
+}
+
+/// 方块材料(REQ-009 §3.1)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Material {
+    /// 抗爆强度 R,与爆炸压力同单位;`f32::INFINITY` = 不可破坏。
+    pub resistance: f32,
+    /// 撞击破坏所需的单格冲量 I,单位 kg·m/s;`f32::INFINITY` = 撞不坏。
+    pub impact_threshold: f32,
+    pub support: Support,
+    /// 粉碎倍数 k:爆炸压力 > k·R 粉碎,R < 压力 ≤ k·R 脱落。
+    pub pulverize_factor: f32,
+}
+
+impl Material {
+    /// 不可破坏:`SimpleRegistry::register` 注册的实心方块的默认材料(REQ-009 §3.2),
+    /// 让测试用的自定义方块表行为不变。
+    pub const INDESTRUCTIBLE: Self = Self {
+        resistance: f32::INFINITY,
+        impact_threshold: f32::INFINITY,
+        support: Support::Connected,
+        pulverize_factor: 2.0,
+    };
+}
+
+/// 内置方块 ID(`SimpleRegistry::builtin` 的注册顺序;只追加,存档兼容)。
+pub mod builtin {
+    use types::BlockId;
+
+    pub const AIR: BlockId = BlockId::AIR;
+    pub const STONE: BlockId = BlockId(1);
+    pub const DIRT: BlockId = BlockId(2);
+    /// REQ-009 新增:不可破坏,超平坦最底层。
+    pub const BEDROCK: BlockId = BlockId(3);
+    /// REQ-009 新增:`Support::NeedsBelow`。
+    pub const SAND: BlockId = BlockId(4);
 }
 
 /// 注册失败原因。
@@ -56,7 +105,20 @@ impl SimpleRegistry {
         Ok(BlockId(id))
     }
 
-    /// 内置方块表:air(0)、stone(1)、dirt(2)。
+    /// 追加注册一个带材料的实心方块(REQ-009 §3.1)。
+    ///
+    /// **总架构师接口桩(REQ-009 单元 01)**:签名固定,由实施方实现。
+    pub fn register_with_material(
+        &mut self,
+        name: &str,
+        material: Material,
+    ) -> Result<BlockId, SimpleRegistryError> {
+        let _ = (name, material);
+        unimplemented!("REQ-009 单元 01:由实施方实现")
+    }
+
+    /// 内置方块表:air(0)、stone(1)、dirt(2);REQ-009 起追加 bedrock(3)、sand(4),
+    /// 材料数值见 REQ-009 §3.2(**由实施方补齐**)。
     pub fn builtin() -> Self {
         let mut reg = Self::new();
         reg.register("stone", true).expect("内置方块注册不可能重名");
@@ -90,6 +152,12 @@ impl BlockRegistry for SimpleRegistry {
 
     fn block_count(&self) -> u16 {
         self.entries.len() as u16
+    }
+
+    /// **总架构师接口桩(REQ-009 单元 01)**:由实施方实现。
+    fn material(&self, id: BlockId) -> Option<Material> {
+        let _ = id;
+        unimplemented!("REQ-009 单元 01:由实施方实现")
     }
 }
 

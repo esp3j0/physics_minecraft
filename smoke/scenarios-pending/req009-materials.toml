@@ -1,0 +1,49 @@
+name = "req009-materials"
+req = "REQ-009"
+description = "单元 01:用 fill 搭石柱与沙柱、放一块基岩;新方块的颜色可辨,世界最底层是基岩"
+timeout_secs = 180
+
+[server]
+world_seed = 7
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [8.0, -58.0, 11.0] }
+
+[[step]]
+label = "等地形"
+wait_until = { block = { pos = [8, -61, 11], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "世界最底层是基岩"
+check = { block = { pos = [8, -64, 8], is = "bedrock" } }
+
+[[step]]
+label = "石柱 2×5×2"
+fill = { from = [4, -60, 10], to = [5, -56, 11], block = "stone" }
+
+[[step]]
+label = "沙柱 1×4×2"
+fill = { from = [9, -60, 10], to = [9, -57, 11], block = "sand" }
+
+[[step]]
+label = "一块基岩"
+set_block = { pos = [12, -60, 10], block = "bedrock" }
+
+[[step]]
+wait_until = { block = { pos = [5, -56, 11], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_until = { block = { pos = [9, -57, 11], is = "sand" }, timeout_ticks = 600 }
+
+[[step]]
+wait_until = { block = { pos = [12, -60, 10], is = "bedrock" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 30 }
+
+[[step]]
+screenshot = { name = "materials", expect = "棕色平地上从左到右依次是:一根较粗的灰色石柱(约 5 格高)、一根较细的浅黄色沙柱(约 4 格高)、一块贴地的深灰色方块;天空浅蓝" }
