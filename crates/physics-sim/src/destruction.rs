@@ -21,6 +21,13 @@ pub const DEBRIS_SPREAD: f32 = 0.4;
 /// 地形求值的半径上限 = REQ-001 的 `INTERACTION_MARGIN` 默认值(16 m):保证从爆心到本体区
 /// 任一受影响格的线段落在"本体区 ∪ 扩张区"之内(REQ-009 §4.1)。
 pub const MAX_TERRAIN_BLAST_RADIUS: f32 = 16.0;
+/// 撞击采样:从接触点的地形一侧位置沿"指向实体"的法向反方向退的深度
+/// (REQ-009 §5;0.1 m 越过暴露面薄片半厚 0.075,落到被撞的格上)。
+pub const IMPACT_SAMPLE_DEPTH: f32 = 0.1;
+/// 撞击点的接近速度下限(REQ-009 §5 修订 9):实体在本步之前的线速度沿该点
+/// 接触法向朝地形的分量 ≥ 此值的点才计入。排除静止挤压(坑内薄片对挤的
+/// 大而相互抵消的冲量)与穿透修正,只统计真正的撞击。
+pub const IMPACT_MIN_APPROACH_SPEED: f32 = 1.0;
 
 /// 地形破坏配置(REQ-009 §8)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -1018,6 +1025,15 @@ mod tests {
             [pos(1, 10, 0), pos(2, 10, 0), pos(3, 10, 0), pos(4, 10, 0)],
             "支撑是空气,横臂塌落"
         );
+    }
+
+    /// §5 修订 9:接近速度下限常量钉住 1.0 m/s(裁定口径;改动 = 规格变更,
+    /// 须经总架构师)。
+    ///
+    /// 变红:常量被改(0 = 无过滤,静载连锁回来;过大 = 慢速撞击漏计)。
+    #[test]
+    fn impact_min_approach_speed_is_one() {
+        assert_eq!(IMPACT_MIN_APPROACH_SPEED, 1.0);
     }
 
     /// §8 `DestructionStats::add`:11 个字段逐一相加(调度器合计用)。

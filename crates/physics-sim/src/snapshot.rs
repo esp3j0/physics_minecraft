@@ -234,6 +234,8 @@ impl ShardSim {
             wake_centers: snap.wake_centers,
             collapse_triggers: BTreeSet::new(),
             collapse_deferred: snap.collapse_deferred,
+            // 撞击接近速度基准不入快照(拍内表,两拍之间必为空)。
+            pre_impulse_vels: BTreeMap::new(),
         })
     }
 }

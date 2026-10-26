@@ -358,6 +358,10 @@ pub struct ShardSim {
     /// (凝固与强制落地只写实心,不走该出口);step 末 `evaluate_collapse`
     /// 取走求值后清空。checkpoint 只在两拍之间取,拍内集合必为空——不入快照。
     pub(crate) collapse_triggers: BTreeSet<BlockPos>,
+    /// 撞击接近速度基准(§5 修订 9):各醒着动态实体**本步之前的线速度**,
+    /// `step` 内 `phys.step()` 之前整表刷新;`evaluate_impacts` 只读。
+    /// checkpoint 只在两拍之间取,拍内表必为空——不入快照。
+    pub(crate) pre_impulse_vels: BTreeMap<EntityId, Vec3>,
     /// 坍塌推迟队列(§6.2.1;v6 快照追加):上一拍名额不足时 = 上一拍触发集
     /// 原样 ∪ 上一拍已转换的格;每拍求值输入之一。随分片快照走(checkpoint
     /// 落在推迟与再求值之间时恢复线不得丢,acc_d7)。
@@ -397,6 +401,7 @@ impl ShardSim {
             wake_centers: None,
             collapse_triggers: BTreeSet::new(),
             collapse_deferred: BTreeSet::new(),
+            pre_impulse_vels: BTreeMap::new(),
         }
     }
 
@@ -777,8 +782,22 @@ impl ShardSim {
     /// 之后——凝固桥会删实体、迁移检测会移出实体,先收集再处理,风险 1)。
     pub fn step(&mut self) {
         self.prestep_contact_wake();
+        // 撞击接近速度的基准(§5 修订 9):各醒着动态实体本步之前的线速度,
+        // 供 `evaluate_impacts` 使用(解算后的速度已被冲量修改)。
+        self.pre_impulse_vels = self
+            .entities
+            .iter()
+            .filter_map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle)?;
+                (b.is_dynamic() && !b.is_sleeping())
+                    .then(|| (*id, conv::rapier_to_vec3(b.linvel())))
+            })
+            .collect();
         self.phys.step();
         self.collect_contact_wake_compensation();
+        // 撞击破坏(REQ-009 §5,单元 06):物理步进之后、坍塌求值之前——本步
+        // 解算写入的接触冲量在此采样,破坏格进入本拍坍塌的触发集。
+        self.evaluate_impacts();
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         // 支撑判定(§4.4.1;一次计算,凝固前提 + 承载产出共用)。
@@ -2331,6 +2350,223 @@ impl ShardSim {
         if self.registry.material(new_block).is_none() {
             self.collapse_triggers.insert(pos);
         }
+    }
+
+    /// 撞击破坏采样与落写(REQ-009 §5,单元 06;调用点 = `step` 内
+    /// `phys.step()` 与补偿收集之后——接触冲量是本步解算写入的,随后凝固/
+    /// 迁移删掉的实体不影响本拍已采到的冲量)。遍历"醒着的动态实体 ↔ 地形
+    /// chunk 复合体"接触对:对每个 `data.impulse > 0` 的接触点,取地形一侧的
+    /// 位置,沿"指向实体"的法向**反方向**退 [`IMPACT_SAMPLE_DEPTH`](越过薄片
+    /// 半厚)取所在格;同一格的冲量相加(方块平落时冲量分摊在 4 个角点)。
+    /// J ≥ 材料的 `impact_threshold` → 脱落(不粉碎),脱落冲量 `(J − I)·d`
+    /// (`d` = 撞击方向,把碎块压向地形,§5 风险 5 允许再撞)。上限 =
+    /// `max_impact_breaks_per_tick` 与每拍剩余名额取小,按冲量降序(同值
+    /// `BlockPos` 升序)取前者;其余本拍不破坏、**也不推迟**(落定后没有冲量)。
+    /// 写入同爆炸:air、`Emergent`、§4.11 唤醒、重建 collider;撞击写入进入
+    /// 本拍坍塌的触发集。遥测:`cells_impacted`、`detached`。总开关关闭不检测。
+    fn evaluate_impacts(&mut self) {
+        if !self.cfg.destruction.enabled {
+            return;
+        }
+        // collider → 实体(1:1;同 collect_contact_wake_compensation 的键口径)
+        // 与地形 collider 表(chunk 固定体;实体↔实体、实体↔冻结体不参与,风险 3)。
+        let collider_to_entity: BTreeMap<(u32, u32), EntityId> = self
+            .entities
+            .iter()
+            .map(|(id, rec)| {
+                let idx = rec.collider.into_raw_parts();
+                ((idx.0, idx.1), *id)
+            })
+            .collect();
+        if collider_to_entity.is_empty() {
+            return;
+        }
+        let chunk_colliders: BTreeSet<(u32, u32)> = self
+            .chunk_bodies
+            .values()
+            .filter_map(|h| self.phys.bodies.get(*h))
+            .flat_map(|b| b.colliders().iter().copied())
+            .map(|c| {
+                let idx = c.into_raw_parts();
+                (idx.0, idx.1)
+            })
+            .collect();
+        if chunk_colliders.is_empty() {
+            return;
+        }
+        // 本体区(格坐标口径,同 core_contains / detonate_terrain)。
+        let min = self.cfg.shard.pos.min_chunk().block_min();
+        let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
+        let max_z = min.z + SHARD_CHUNKS * CHUNK_SIZE;
+
+        // 每格累计(先收进 BTreeMap 再排序,接触对遍历顺序不确定,风险 4):
+        // `impulse` = 各点冲量之和;`dir` = 最大点冲量的撞击方向(并列取字典序
+        // 小者,结果与采样顺序无关)。
+        #[derive(Default)]
+        struct Sample {
+            impulse: f32,
+            best: f32,
+            dir: Vec3,
+        }
+        let mut samples: BTreeMap<BlockPos, Sample> = BTreeMap::new();
+        for pair in self.phys.narrow_phase.contact_pairs() {
+            let key1 = pair.collider1.into_raw_parts();
+            let key2 = pair.collider2.into_raw_parts();
+            let (id, entity_is_1) = match (
+                collider_to_entity.get(&(key1.0, key1.1)),
+                collider_to_entity.get(&(key2.0, key2.1)),
+            ) {
+                (Some(e), None) if chunk_colliders.contains(&(key2.0, key2.1)) => (*e, true),
+                (None, Some(e)) if chunk_colliders.contains(&(key1.0, key1.1)) => (*e, false),
+                _ => continue,
+            };
+            // 醒着的动态实体(§5):冻结(kinematic)与睡着的不算。
+            let Some(rec) = self.entities.get(&id) else {
+                continue;
+            };
+            // 接近速度的基准 = 本步之前的线速度(修订 9;`step` 在
+            // `phys.step()` 前整表刷新 `pre_impulse_vels`,表里没有 = 本步
+            // 开始后新生的实体,本步无撞击)。
+            let Some(pre_vel) = self.pre_impulse_vels.get(&id).copied() else {
+                continue;
+            };
+            if !self
+                .phys
+                .bodies
+                .get(rec.handle)
+                .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
+            {
+                continue;
+            }
+            // 地形一侧 = 非实体的那一侧;其接触点 = local_p1(地形是 1)或
+            // local_p2(地形是 2)。
+            let (terrain_collider, terrain_is_1) = if entity_is_1 {
+                (pair.collider2, false)
+            } else {
+                (pair.collider1, true)
+            };
+            let terrain_pos = *self
+                .phys
+                .colliders
+                .get(terrain_collider)
+                .expect("地形 collider 在场")
+                .position();
+            // §5 口径 = `ContactManifold` 的每个点(pair.manifolds())。解算器
+            // 对多流形对(碎块嵌在坑里同时贴 4 面坑壁)启用 contact clustering,
+            // 冲量只写进 solver 簇、plain 流形不再回写——那些冲量是出生碎块与
+            // 坑壁薄片重叠的退插伪冲量,不该当撞击(§5 自激风险的边界);平面
+            // 落体是单流形对,plain 流形直接持有解算冲量,与 spike 逐位一致。
+            for m in pair.manifolds() {
+                // 法向为 world 系、以碰撞体 1 → 2 为正(风险 1):按实体在
+                // 1/2 定"指向实体"的法向,撞击方向 d = 其反方向(压向地形)。
+                let dir = if entity_is_1 {
+                    m.data.normal
+                } else {
+                    -m.data.normal
+                };
+                // 接近速度(修订 9):本步前线速度沿接触法向朝地形的分量;
+                // < IMPACT_MIN_APPROACH_SPEED 的点不计——静止挤压(坑内薄片
+                // 对挤的大而相互抵消的冲量)与穿透修正不是撞击。
+                if pre_vel.dot(dir) < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
+                    continue;
+                }
+                let subshape = if terrain_is_1 {
+                    m.subshape_pos1().copied()
+                } else {
+                    m.subshape_pos2().copied()
+                }
+                .unwrap_or(Pose::IDENTITY);
+                for pt in &m.points {
+                    if pt.data.impulse <= 0.0 {
+                        continue;
+                    }
+                    let p = if terrain_is_1 {
+                        terrain_pos * subshape * pt.local_p1
+                    } else {
+                        terrain_pos * subshape * pt.local_p2
+                    };
+                    // 沿"指向实体"的反方向退 0.1 m 取所在格(§5)。
+                    let q = p + dir * crate::destruction::IMPACT_SAMPLE_DEPTH;
+                    let cell =
+                        BlockPos::new(q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32);
+                    // 只看本体区内的格(范围 2;副本格由其 owner 采样)。
+                    if cell.x < min.x || cell.x >= max_x || cell.z < min.z || cell.z >= max_z {
+                        continue;
+                    }
+                    let s = samples.entry(cell).or_default();
+                    s.impulse += pt.data.impulse;
+                    if pt.data.impulse > s.best
+                        || (pt.data.impulse == s.best
+                            && (dir.x, dir.y, dir.z) < (s.dir.x, s.dir.y, s.dir.z))
+                    {
+                        s.best = pt.data.impulse;
+                        s.dir = dir;
+                    }
+                }
+            }
+        }
+        // 阈值判定(范围 2):J ≥ 该格材料的 `impact_threshold`(∞ 自然不破);
+        // 非实心/未装载/界外的格无材料,整体忽略(界外 get_block = AIR)。
+        let mut candidates: Vec<(BlockPos, f32, Vec3, BlockId, f32)> = Vec::new();
+        for (cell, s) in samples {
+            let block = self.voxels.get_block(cell);
+            let Some(m) = self.registry.material(block) else {
+                continue;
+            };
+            if s.impulse >= m.impact_threshold {
+                candidates.push((cell, s.impulse, s.dir, block, m.impact_threshold));
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+        // 上限:撞击专属上限与每拍剩余名额(爆炸拍首已用掉的扣掉)取小。
+        let budget = self.cfg.destruction.max_impact_breaks_per_tick.min(
+            self.cfg
+                .destruction
+                .max_detach_per_tick
+                .saturating_sub(self.outbox.detach_requests.len()),
+        );
+        if budget == 0 {
+            return;
+        }
+        // 冲量降序,同值 BlockPos 升序(范围 2)。
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut dirty: Vec<ChunkPos> = Vec::new();
+        for (cell, _j, _dir, block, _threshold) in candidates.into_iter().take(budget) {
+            let _ = self.voxels.set_block(cell, BlockId::AIR);
+            // 遥测(范围 4):撞击破坏的格与产出的脱落请求。
+            self.outbox.destruction_stats.cells_impacted += 1;
+            self.outbox.destruction_stats.detached += 1;
+            // 撞击写入进入本拍坍塌的触发集(范围 3;实心 → air)。
+            self.register_collapse_trigger(cell, true, BlockId::AIR);
+            self.outbox.block_updates.push(BlockWrite {
+                pos: cell,
+                block: BlockId::AIR,
+                kind: BlockWriteKind::Emergent,
+            });
+            // §4.11 统一出口:被撞掉的格下一拍唤醒压在其上的冻结体。
+            self.register_terrain_write(cell);
+            // 碎块零初速(§5 修订 8):带 `(J − I)·d` 会把碎块推进一格宽的坑
+            // 里,侧面撞坏坑壁引起连锁;零初速下下方是空的就掉下去,是实心
+            // 就落定并凝固回原位。
+            self.outbox
+                .detach_requests
+                .push(crate::destruction::DetachRequest {
+                    cell,
+                    block,
+                    impulse: Vec3::ZERO,
+                });
+            dirty.push(cell.chunk_of());
+        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain)。
+        for cp in expand_boundary(dirty, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
+        // 与同拍爆炸的脱落请求拼接后,保持整个 outbox 的 BlockPos 升序不变量。
+        self.outbox.detach_requests.sort_by_key(|req| req.cell);
     }
 
     /// 坍塌接入(REQ-009 §6.2.1,单元 04b;step 末调用 = 物理步进之后、交出
@@ -6656,6 +6892,202 @@ mod tests {
             );
         }
         assert_eq!(seen, [(5, 7, 5), (5, 2, 5), (2, 0, 2)]);
+    }
+
+    // ---- 单元 06:撞击破坏(REQ-009 §5,修订 8/9)----
+
+    /// 带初速的 SpawnDynamic 输入(撞击测试用;实心 stone、半边长 0.45)。
+    fn impact_drop_input(seq: u64, id: EntityId, x: i32, y: f32, z: i32, vy: f32) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(x as f32 + 0.5, y, z as f32 + 0.5),
+                    rotation: types::glam::Quat::IDENTITY,
+                    linvel: Vec3::new(0.0, vy, 0.0),
+                    angvel: Vec3::ZERO,
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                },
+            }),
+        }
+    }
+
+    /// §5 修订 8 生产路径(AC-D8):约 17 m/s 砸在 dirt 上——撞击拍落点写 air、
+    /// `cells_impacted` 计 1,脱落请求冲量为 0(零初速);之后 60 拍不再破坏
+    /// (碎块落回坑里落定凝固,无连锁)。
+    ///
+    /// 变红:没读接触冲量(不破坏);冲量不是 0(修订 8;碎块被推进坑里连锁)。
+    #[test]
+    fn impact_fast_drop_breaks_with_zero_impulse_debris() {
+        let mut s = destruction_sim(64);
+        s.apply_prefix(&[impact_drop_input(1, entity(1), 64, -55.0, 64, -15.0)]);
+        let mut hit = None;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.destruction_stats.cells_impacted > 0 {
+                hit = Some(out);
+                break;
+            }
+        }
+        let out = hit.expect("17 m/s 应撞坏 dirt");
+        assert_eq!(out.destruction_stats.cells_impacted, 1);
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(64, -61, 64)),
+            voxel::builtin::AIR,
+            "落点写 air"
+        );
+        assert_eq!(out.detach_requests.len(), 1, "产出 1 条脱落请求");
+        assert_eq!(
+            out.detach_requests[0].impulse,
+            Vec3::ZERO,
+            "碎块零初速(修订 8)"
+        );
+        assert_eq!(out.detach_requests[0].block, voxel::builtin::DIRT);
+        // 无连锁:之后 60 拍撞击计数为 0。
+        for _ in 0..60 {
+            s.step();
+            let t = s.take_outbox().destruction_stats;
+            assert_eq!(t.cells_impacted, 0, "连锁破坏(修订 8/9 失效):{t:?}");
+        }
+    }
+
+    /// §5 修订 9:接近速度过滤——同一个 0.729 kg 实体,17 m/s(落定前)撞坏;
+    /// 1 m 自由落地(落地速度约 4.4 ≥ 1,计入但 J < 7 不过阈值,不坏);静止
+    /// 叠放(接触冲量持续存在但接近速度 0)不坏。
+    ///
+    /// 变红:删掉接近速度过滤(静载冲量被当撞击);阈值比较对象换成
+    /// 冲量 × 60 的"力"(静载被放大 60 倍破阈)。
+    #[test]
+    fn impact_rest_and_gentle_drop_never_break() {
+        // 1 m 落地(轻落):计入接近速度但不过阈值。
+        let mut s = destruction_sim(64);
+        s.apply_prefix(&[impact_drop_input(1, entity(1), 70, -60.0, 70, 0.0)]);
+        for _ in 0..300 {
+            s.step();
+            let t = s.take_outbox().destruction_stats;
+            assert_eq!(t.cells_impacted, 0, "轻落不破坏:{t:?}");
+        }
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(70, -61, 70)),
+            voxel::builtin::DIRT
+        );
+        // 8 层静止叠放:底块与地形间的支撑冲量持续存在,接近速度为 0。
+        let mut s = destruction_sim(64);
+        for k in 0..8u32 {
+            s.apply_prefix(&[impact_drop_input(
+                k as u64 + 1,
+                entity(k + 1),
+                74,
+                -59.475 + 0.901 * k as f32,
+                74,
+                0.0,
+            )]);
+        }
+        for _ in 0..300 {
+            s.step();
+            let t = s.take_outbox().destruction_stats;
+            assert_eq!(t.cells_impacted, 0, "静载不破坏(修订 9):{t:?}");
+        }
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(74, -61, 74)),
+            voxel::builtin::DIRT
+        );
+    }
+
+    /// §5 范围 2:每拍上限——6 块同落、`max_impact_breaks_per_tick` = 3:撞击
+    /// 拍恰撞 3 格(按冲量降序,同值 BlockPos 升序),其余本拍不破坏、也不推迟
+    /// (落定后没有冲量,之后 120 拍不再有破坏);受每拍总名额约束。
+    ///
+    /// 变红:撞击不受上限(6 格全破);超出上限推迟到下一拍(总破坏 > 3)。
+    #[test]
+    fn impact_cap_no_defer() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_impact_breaks_per_tick = 3;
+        use voxel::WorldGenerator as _;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        for k in 0..6u32 {
+            s.apply_prefix(&[impact_drop_input(
+                k as u64 + 1,
+                entity(k + 1),
+                60 + 3 * k as i32,
+                -55.0,
+                90,
+                -15.0,
+            )]);
+        }
+        let mut hit = None;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.destruction_stats.cells_impacted > 0 {
+                hit = Some(out);
+                break;
+            }
+        }
+        assert_eq!(
+            hit.expect("应有撞击").destruction_stats.cells_impacted,
+            3,
+            "上限 3"
+        );
+        // 之后 120 拍不再破坏(不推迟)。
+        for _ in 0..120 {
+            s.step();
+            let t = s.take_outbox().destruction_stats;
+            assert_eq!(t.cells_impacted, 0, "落定后无冲量,不推迟:{t:?}");
+        }
+    }
+
+    /// §5 范围 5:总开关关闭不检测——同样的 17 m/s 撞击,关闭时零计数、零写入。
+    ///
+    /// 变红:收集闸删 enabled 条件(关闭时也检测)。
+    #[test]
+    fn impact_disabled_is_inert() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = false;
+        use voxel::WorldGenerator as _;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s.apply_prefix(&[impact_drop_input(1, entity(1), 64, -55.0, 64, -15.0)]);
+        for _ in 0..60 {
+            s.step();
+            let out = s.take_outbox();
+            assert_eq!(
+                out.destruction_stats,
+                crate::destruction::DestructionStats::default(),
+                "关闭时零计数"
+            );
+            assert!(out.detach_requests.is_empty(), "关闭时无脱落请求");
+        }
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(64, -61, 64)),
+            voxel::builtin::DIRT,
+            "关闭时不写格"
+        );
     }
 
     /// §8:预算锚定与超大块分开计——搜索预算 8 判锚定(`budget_anchored ≥ 1`、

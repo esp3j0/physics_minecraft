@@ -1775,6 +1775,7 @@ mod unit05 {
 
 /// 单元 06:撞击破坏(AC-D8)。阈值与冲量见 REQ-009 §5 的 spike 结论(0.729 kg 方块:15 m/s ≈ 11.4、
 /// 30 m/s ≈ 22.4;dirt 7、stone 18)。经 `Session` 驱动,用半边长 0.45 的实体从地表上方高速落下。
+/// 撞击碎块零初速(修订 8):落在实心上的碎块会原地落定并凝固回去,所以破坏只在撞击那一拍检查。
 mod unit06 {
     use messaging::SimCommand;
     use physics_sim::destruction::DestructionStats;
@@ -1853,57 +1854,74 @@ mod unit06 {
         sum
     }
 
-    /// AC-D8 撞击破坏:约 17 m/s 砸在 dirt 上撞掉落点那一格(遥测计 1 格),下一拍生成 1 个方块为 dirt 的涌现
-    /// 实体;同样的速度砸在 stone 上撞不坏;约 31 m/s 砸在 stone 上撞坏。
+    /// 逐拍推进到第一次出现撞击破坏(至多 `max` 拍),返回那一拍的遥测;没有发生 → None。
+    fn until_impact(s: &mut Session, max: usize) -> Option<DestructionStats> {
+        (0..max)
+            .map(|_| s.tick().destruction)
+            .find(|t| t.cells_impacted > 0)
+    }
+
+    fn emergent(s: &Session) -> Vec<(EntityId, EntityState)> {
+        s.entity_states(shard())
+            .expect("分片")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    /// AC-D8 撞击破坏:约 17 m/s 砸在 dirt 上——撞击那一拍落点格变 air、计 1 格;下一拍生成 1 个方块为 dirt、
+    /// 初速为 0 的碎块;之后 60 拍不再有任何撞击破坏(没有连锁)。同样的速度砸在 stone 上撞不坏;约 31 m/s
+    /// 砸在 stone 上撞坏。
     ///
-    /// 会变红的实现:没读接触点冲量(或读的是 Python 绑定那种恒 0 的口径);同一格的接触点取最大值而不是求和
-    /// (平落时单点只有约 1/4,撞不坏);格映射没越过薄片(落到空气格上被忽略);阈值用错材料。
+    /// 会变红的实现:没读接触点冲量;同一格的接触点取最大值而不是求和(平落时单点只有约 1/4,撞不坏);
+    /// 格映射没越过薄片;阈值用错材料;碎块带冲量被推进坑里、撞坏坑壁(连锁)。
     #[test]
-    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d8_fast_drop_breaks_by_material() {
         let mut s = session(|_| {});
         drop(&mut s, 1, 64, -55.0, 64, -15.0);
-        let sum = run(&mut s, 40);
+        let hit = until_impact(&mut s, 40).expect("17 m/s 砸 dirt 应撞坏");
+        assert_eq!(hit.cells_impacted, 1);
         assert_eq!(
             block(&s, BlockPos::new(64, -61, 64)),
             builtin::AIR,
             "落点 dirt 被撞掉"
         );
-        assert_eq!(sum.cells_impacted, 1);
-        let debris: Vec<EntityId> = s
-            .entity_states(shard())
-            .expect("分片")
-            .into_iter()
-            .map(|(id, _)| id)
-            .filter(|id| id.origin_shard() == EMERGENT_ORIGIN)
-            .collect();
+        s.tick();
+        let debris = emergent(&s);
         assert_eq!(debris.len(), 1, "撞掉的格生成 1 个碎块");
         assert_eq!(
-            s.entity_desc(shard(), debris[0]).map(|d| d.block),
+            s.entity_desc(shard(), debris[0].0).map(|d| d.block),
             Some(builtin::DIRT)
         );
+        assert!(
+            debris[0].1.linvel.length() < 0.5,
+            "碎块零初速:{:?}",
+            debris[0].1.linvel
+        );
+        assert_eq!(run(&mut s, 60).cells_impacted, 0, "没有连锁破坏");
         s.shutdown();
 
         let mut s = session(|_| {});
-        for (x, z) in [(80, 80), (88, 80)] {
-            s.set_block(shard(), BlockPos::new(x, -61, z), builtin::STONE)
-                .expect("放 stone");
-        }
+        s.set_block(shard(), BlockPos::new(80, -61, 80), builtin::STONE)
+            .expect("放 stone");
         s.tick();
         drop(&mut s, 1, 80, -55.0, 80, -15.0);
-        drop(&mut s, 2, 88, -55.0, 80, -30.0);
-        let sum = run(&mut s, 40);
-        assert_eq!(
-            block(&s, BlockPos::new(80, -61, 80)),
-            builtin::STONE,
-            "17 m/s 撞不坏 stone"
-        );
+        assert_eq!(run(&mut s, 40).cells_impacted, 0, "17 m/s 撞不坏 stone");
+        assert_eq!(block(&s, BlockPos::new(80, -61, 80)), builtin::STONE);
+        s.shutdown();
+
+        let mut s = session(|_| {});
+        s.set_block(shard(), BlockPos::new(88, -61, 80), builtin::STONE)
+            .expect("放 stone");
+        s.tick();
+        drop(&mut s, 1, 88, -55.0, 80, -30.0);
+        let hit = until_impact(&mut s, 40).expect("31 m/s 砸 stone 应撞坏");
+        assert_eq!(hit.cells_impacted, 1);
         assert_eq!(
             block(&s, BlockPos::new(88, -61, 80)),
             builtin::AIR,
             "31 m/s 撞坏 stone"
         );
-        assert_eq!(sum.cells_impacted, 1);
         s.shutdown();
     }
 
@@ -1912,7 +1930,6 @@ mod unit06 {
     /// 会变红的实现:阈值比较用了单拍接触力而不是冲量(静载被放大 60 倍);把全部接触点冲量累加跨拍计算;
     /// 实体之间的接触也算进地形。
     #[test]
-    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d8_rest_and_gentle_drop_never_break() {
         let mut s = session(|_| {});
         for k in 0..8u32 {
@@ -1926,23 +1943,23 @@ mod unit06 {
         s.shutdown();
     }
 
-    /// AC-D8 每拍上限:6 个方块同一拍以同样速度砸在 6 块 dirt 上,`max_impact_breaks_per_tick` = 3 时只撞掉 3 格
-    /// (其余方块已经落定,之后不再撞坏)。
+    /// AC-D8 每拍上限:6 个方块同一拍以同样速度砸在 6 块 dirt 上,`max_impact_breaks_per_tick` = 3 时,撞击那一拍
+    /// 只撞掉 3 格(6 格中恰有 3 格是 air);之后其余方块已经落定,120 拍内累计仍是 3 格。
     ///
     /// 会变红的实现:撞击不受上限;超出上限的格推迟到下一拍(落定后冲量已经没有了,不该再破坏)。
     #[test]
-    #[ignore = "REQ-009 单元 06 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d8_impact_cap() {
         let mut s = session(|d| d.max_impact_breaks_per_tick = 3);
         for k in 0..6 {
             drop(&mut s, k as u32 + 1, 60 + 3 * k, -55.0, 90, -15.0);
         }
-        let sum = run(&mut s, 120);
-        assert_eq!(sum.cells_impacted, 3);
+        let hit = until_impact(&mut s, 40).expect("应有撞击");
+        assert_eq!(hit.cells_impacted, 3);
         let broken = (0..6)
             .filter(|k| block(&s, BlockPos::new(60 + 3 * k, -61, 90)) == builtin::AIR)
             .count();
-        assert_eq!(broken, 3);
+        assert_eq!(broken, 3, "撞击那一拍恰有 3 格被撞掉");
+        assert_eq!(run(&mut s, 120).cells_impacted, 0, "之后不再破坏");
         s.shutdown();
     }
 }
