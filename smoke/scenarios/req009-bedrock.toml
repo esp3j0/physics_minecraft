@@ -1,0 +1,48 @@
+name = "req009-bedrock"
+req = "REQ-009"
+description = "大威力爆炸把地面炸到底:坑底露出完整的基岩层,没有被炸穿"
+timeout_secs = 180
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[[step]]
+label = "相机就位(俯视)"
+camera = { pos = [8.0, -42.0, 30.0], yaw = -90.0, pitch = -40.0 }
+
+[[step]]
+look_at = { target = [8.0, -63.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "大威力贴地引爆"
+detonate = { at = [8.0, -59.5, 14.0], power = 48.0, radius = 12.0 }
+
+[[step]]
+wait_until = { block = { pos = [8, -63, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { block = { pos = [8, -64, 14], is = "bedrock" }, no_floating = { height = 1.5, still_ticks = 30 } }
+
+[[step]]
+check = { block = { pos = [5, -64, 11], is = "bedrock" } }
+
+[[step]]
+check = { block = { pos = [8, -63, 14], is = "air" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "bedrock", expect = "地面上一个大坑,坑底是一层平整的深灰色方块(基岩),没有被炸穿;坑里可能散落着少量棕色方块" }

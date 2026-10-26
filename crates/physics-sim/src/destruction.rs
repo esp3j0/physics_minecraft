@@ -38,6 +38,9 @@ pub struct DestructionConfig {
     pub attenuation: f32,
     /// 单次爆炸在单个分片内的脱落上限(48)。
     pub max_debris_per_explosion: usize,
+    /// 单次爆炸在单个分片内的破坏格数上限(2048;REQ-009 修订 10):`evaluate_blast` 的结果超过时,按压力降序
+    /// (同值 `BlockPos` 升序)保留前这么多格,其余不破坏。**总架构师接口桩(单元 07)**:字段已加,由实施方接线。
+    pub max_cells_per_explosion: usize,
     /// 每分片每拍新生成实体上限(64;单元 03 使用)。
     pub max_detach_per_tick: usize,
     /// 每分片每拍撞击破坏上限(16;单元 06 使用)。
@@ -54,6 +57,7 @@ impl Default for DestructionConfig {
             enabled: false,
             attenuation: 1.0,
             max_debris_per_explosion: 48,
+            max_cells_per_explosion: 2048,
             max_detach_per_tick: 64,
             max_impact_breaks_per_tick: 16,
             collapse_max_cells: 2048,

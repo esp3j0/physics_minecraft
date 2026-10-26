@@ -1,0 +1,61 @@
+name = "req009-sand-column"
+req = "REQ-009"
+description = "石块上的沙柱:移走石块,整列沙子一起落下、落定成沙"
+timeout_secs = 180
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.0, -53.0, 24.0], yaw = -90.0, pitch = -10.0 }
+
+[[step]]
+look_at = { target = [6.5, -57.0, 14.5] }
+
+[[step]]
+wait_until = { block = { pos = [6, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+set_block = { pos = [6, -60, 14], block = "stone" }
+
+[[step]]
+fill = { from = [6, -59, 14], to = [6, -55, 14], block = "sand" }
+
+[[step]]
+wait_until = { block = { pos = [6, -55, 14], is = "sand" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "column", expect = "棕色地面上一块灰色石头,石头上立着一根浅黄色沙柱" }
+
+[[step]]
+label = "移走石块"
+set_block = { pos = [6, -60, 14], block = "air" }
+
+[[step]]
+label = "等沙柱塌落"
+wait_until = { block = { pos = [6, -55, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 600 }
+
+[[step]]
+check = { block = { pos = [6, -55, 14], is = "air" }, no_floating = { height = 1.5, still_ticks = 30 } }
+
+[[step]]
+check = { block = { pos = [6, -60, 14], is = "sand" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "fallen", expect = "浅黄色沙柱直接立在棕色地面上(灰色石头不见了),上方没有悬空的沙块" }

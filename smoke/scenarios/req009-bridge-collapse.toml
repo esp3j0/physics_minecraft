@@ -1,0 +1,85 @@
+name = "req009-bridge-collapse"
+req = "REQ-009"
+description = "两根石柱托着石桥:炸断一根,桥仍挂在另一根上;再炸断另一根,桥面连同两根柱子的上半截一起塌落并凝固"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.5, -51.0, 32.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [8.5, -56.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "左柱"
+fill = { from = [4, -60, 14], to = [4, -55, 14], block = "stone" }
+
+[[step]]
+label = "右柱"
+fill = { from = [13, -60, 14], to = [13, -55, 14], block = "stone" }
+
+[[step]]
+label = "桥面"
+fill = { from = [4, -54, 14], to = [13, -54, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [13, -54, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_until = { block = { pos = [4, -55, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "built", expect = "棕色地面上两根灰色石柱托着一座水平的灰色石桥" }
+
+[[step]]
+label = "炸断左柱"
+detonate = { at = [5.5, -57.5, 14.5], power = 12.0, radius = 8.0 }
+
+[[step]]
+wait_until = { block = { pos = [4, -58, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+check = { block = { pos = [8, -54, 14], is = "stone" } }
+
+[[step]]
+screenshot = { name = "one-pillar", expect = "左侧石柱中间被炸断(缺了一截),附近有蓝色立方体(刚炸松的碎块);灰色石桥仍横在空中,由右侧石柱撑着" }
+
+[[step]]
+label = "炸断右柱(趁左柱缺口的碎块还没落定)"
+detonate = { at = [12.5, -57.5, 14.5], power = 12.0, radius = 8.0 }
+
+[[step]]
+wait_until = { block = { pos = [8, -54, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, -54, 14], is = "air" } }
+
+[[step]]
+check = { block = { pos = [12, -54, 14], is = "air" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "rubble", expect = "桥面已经塌下来:原来桥面的高度上没有横梁,地面上散落着一排凝固的灰色方块(两侧可能还立着矮一些的石柱残段);空中没有悬浮的方块,也没有蓝色立方体" }

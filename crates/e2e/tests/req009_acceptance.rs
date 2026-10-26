@@ -1583,6 +1583,7 @@ mod unit05 {
             enabled: true,
             attenuation: 0.5,
             max_debris_per_explosion: 10,
+            max_cells_per_explosion: 2048,
             max_detach_per_tick: 20,
             max_impact_breaks_per_tick: 3,
             collapse_max_cells: 900,
@@ -1595,6 +1596,7 @@ mod unit05 {
                 enabled: true,
                 attenuation: 0.5,
                 max_debris_per_explosion: 10,
+                max_cells_per_explosion: 2048,
                 max_detach_per_tick: 20,
                 max_impact_breaks_per_tick: 3,
                 collapse_max_cells: 900,
@@ -1960,6 +1962,306 @@ mod unit06 {
             .count();
         assert_eq!(broken, 3, "撞击那一拍恰有 3 格被撞掉");
         assert_eq!(run(&mut s, 120).cells_impacted, 0, "之后不再破坏");
+        s.shutdown();
+    }
+}
+
+/// 单元 07:默认开启(D7)、与 REQ-007 的衔接(AC-D9)、跨分片坍塌经信封晚一拍触发(AC-D6 补全)。
+mod unit07 {
+    use physics_sim::tickets::{TicketHolder, TicketKind};
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EMERGENT_ORIGIN, EntityId, EntityState, ShardId,
+        ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    fn shard(x: i32) -> ShardId {
+        shard2(x, 0)
+    }
+
+    fn shard2(x: i32, z: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
+    }
+
+    fn owner(p: BlockPos) -> ShardId {
+        shard(if p.x < 128 { 0 } else { 1 })
+    }
+
+    /// 会话:`shards` 中每个分片装载 chunk x ∈ `cx`、z ∈ 2..=5 的平地;破坏用默认配置(本单元起默认开启)。
+    fn session(shards: &[i32], cx: std::ops::RangeInclusive<i32>) -> Session {
+        let shards: Vec<(i32, i32)> = shards.iter().map(|&x| (x, 0)).collect();
+        session2(&shards, cx, 2..=5)
+    }
+
+    /// 通用会话:`shards` 中每个分片 `(x, z)` 都装载 chunk x ∈ `cx`、z ∈ `cz` 的平地。
+    fn session2(
+        shards: &[(i32, i32)],
+        cx: std::ops::RangeInclusive<i32>,
+        cz: std::ops::RangeInclusive<i32>,
+    ) -> Session {
+        let mut s = Session::new(SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        for &(sx, sz) in shards {
+            let mut sim = ShardSim::new(
+                ShardSimConfig::new(shard2(sx, sz)),
+                Box::new(SimpleRegistry::builtin()),
+            );
+            for x in cx.clone() {
+                for z in cz.clone() {
+                    let cp = ChunkPos::new(x, z);
+                    sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+                }
+            }
+            s.register(sim);
+        }
+        s
+    }
+
+    fn set(s: &mut Session, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            s.set_block(owner(c), c, block).expect("set_block");
+        }
+    }
+
+    fn block(s: &Session, sh: ShardId, p: BlockPos) -> BlockId {
+        let cp = p.chunk_of();
+        s.voxel_chunk(sh, cp).expect("chunk 已装载").get(
+            (p.x - cp.x * 16) as usize,
+            (p.y - WORLD_Y_MIN) as usize,
+            (p.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn emergent(s: &Session, sh: ShardId) -> Vec<(EntityId, EntityState)> {
+        s.entity_states(sh)
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    /// D7 与修订 10:核内与应用层的地形破坏默认开启;单次爆炸破坏格数上限默认 2048(配置可覆写、0 报错);
+    /// 跨片信封队列默认容量 8192(核内常量与 app 配置一致)。
+    ///
+    /// 会变红的实现:只改了一处默认值(例如 app 开了而 `ShardSimConfig::new` 仍关);队列容量只改了 app 配置
+    /// (直接用 `SchedulerConfig::default()` 的会话仍是 1024);新键没接进配置表。
+    #[test]
+    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d7_defaults() {
+        assert!(physics_sim::destruction::DestructionConfig::default().enabled);
+        assert!(ShardSimConfig::new(shard(0)).destruction.enabled);
+        let c = app::config::Config::default();
+        assert!(c.destruction.enabled);
+        assert!(c.shard_sim_config(shard(0)).destruction.enabled);
+        assert_eq!(c.destruction.max_cells_per_explosion, 2048);
+        assert_eq!(messaging::DEFAULT_QUEUE_CAPACITY, 8192);
+        assert_eq!(c.envelope_queue_capacity, 8192);
+        let custom = app::config::Config::from_toml_str(
+            "[destruction]
+max_cells_per_explosion = 100
+",
+        )
+        .expect("合法");
+        assert_eq!(
+            custom
+                .shard_sim_config(shard(0))
+                .destruction
+                .max_cells_per_explosion,
+            100
+        );
+        assert!(
+            app::config::Config::from_toml_str(
+                "[destruction]
+max_cells_per_explosion = 0
+"
+            )
+            .is_err()
+        );
+    }
+
+    /// 修订 10 单次爆炸破坏格数上限:平地上 power 1000、半径 40(按 16 封顶)的爆炸本应破坏 2220 格,上限 2048 时
+    /// 那一拍恰好破坏 2048 格,保留的是压力最高的(爆心附近被炸穿,半径 15.5 m 处的地面完好)。
+    ///
+    /// 会变红的实现:上限没接线;截断按 BlockPos 而不是压力(会出现"中间完好、边缘被炸"的怪坑)。
+    #[test]
+    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d13_blast_cell_cap() {
+        let mut s = session(&[0], 2..=6);
+        s.detonate(Vec3::new(64.0, -59.5, 64.0), 1000.0, 40.0)
+            .expect("爆炸");
+        let t = s.tick().destruction;
+        assert_eq!(t.cells_blasted, 2048);
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(64, -61, 64)),
+            builtin::AIR
+        );
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(72, -61, 64)),
+            builtin::AIR
+        );
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(79, -61, 64)),
+            builtin::DIRT,
+            "压力最低的格被截掉,不破坏"
+        );
+        s.shutdown();
+    }
+
+    /// 修订 10 跨片信封容量:4 个分片交汇处(x = z = 128)平地上 power 48、半径 12 的爆炸共破坏 548 格,爆心附近的
+    /// 每格都被另外 3 个分片作为副本持有,一拍要发出约 1600 个涌现写入信封——旧容量 1024 会 fail-stop。
+    /// 现在 3 拍内不 panic,四个分片的视图里爆心格都是 air。
+    ///
+    /// 会变红的实现:队列容量仍是 1024(本用例在第一拍就 panic)。
+    #[test]
+    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d13_corner_blast_fits_envelope_queue() {
+        let shards = [(0, 0), (1, 0), (0, 1), (1, 1)];
+        let mut s = session2(&shards, 6..=9, 6..=9);
+        s.detonate(Vec3::new(128.0, -59.5, 128.0), 48.0, 12.0)
+            .expect("爆炸");
+        let mut blasted = 0;
+        for _ in 0..3 {
+            blasted += s.tick().destruction.cells_blasted;
+        }
+        assert_eq!(blasted, 548);
+        for (x, z) in shards {
+            for c in [BlockPos::new(128, -61, 128), BlockPos::new(127, -61, 127)] {
+                assert_eq!(
+                    block(&s, shard2(x, z), c),
+                    builtin::AIR,
+                    "({x},{z}) 视图里 {c:?}"
+                );
+            }
+        }
+        s.shutdown();
+    }
+
+    /// AC-D9 与 REQ-007 的衔接:有观察者(激活开启)时,爆炸产生的每个碎块在生成那一拍都持有瞬态运动票;
+    /// 碎块全部落定凝固后,这些票全部结束。
+    ///
+    /// 会变红的实现:涌现生成绕开了 `spawn_entity`(不签发运动票);碎块凝固后票据没有随实体结束。
+    #[test]
+    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d9_debris_hold_transient_tickets() {
+        let mut s = session(&[0], 2..=6);
+        s.move_observer(Vec3::new(64.0, -50.0, 64.0))
+            .expect("观察者");
+        s.tick();
+        s.detonate(Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)
+            .expect("爆炸");
+        s.tick();
+        s.tick();
+        let debris = emergent(&s, shard(0));
+        assert_eq!(debris.len(), 24);
+        let has_ticket = |s: &Session, id: EntityId| {
+            s.ticket_table().iter().any(|((h, k), _)| {
+                h == TicketHolder::Entity(id) && k == TicketKind::TransientMotion
+            })
+        };
+        for (id, _) in &debris {
+            assert!(has_ticket(&s, *id), "{id:?} 应持有瞬态运动票");
+        }
+        let mut settled = false;
+        for _ in 0..900 {
+            s.tick();
+            if emergent(&s, shard(0)).is_empty() {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "900 拍内碎块全部凝固");
+        for (id, _) in &debris {
+            assert!(!has_ticket(&s, *id), "{id:?} 凝固后票据应结束");
+        }
+        s.shutdown();
+    }
+
+    /// AC-D6 跨分片坍塌经信封触发:石桥柱 x = 122(分片 (0,0))与 x = 133(分片 (1,0)),桥面 x 122…133 横跨
+    /// x = 128。先拆掉右柱(桥仍挂在左柱上),再在左柱旁引爆。N 拍:分片 (0,0) 炸掉左柱并转换本体区桥面 6 格,
+    /// 分片 (1,0) 的视图里右半桥面仍是 stone(它要到 N+1 才收到左柱被移除的写入);N+1:分片 (1,0) 转换右半
+    /// 6 格;N+2:分片 (1,0) 生成 6 个桥面碎块,分片 (0,0) 的桥面碎块也是 6 个,没有重复转换。
+    ///
+    /// 会变红的实现:BlockWrite 信封的应用不登记坍塌触发(右半桥永远悬空);分片转换了副本格(重复)。
+    #[test]
+    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d6_cross_shard_collapse_via_envelope() {
+        let mut s = session(&[0, 1], 6..=9);
+        let pa: Vec<BlockPos> = (-60..=-55).map(|y| BlockPos::new(122, y, 64)).collect();
+        let pb: Vec<BlockPos> = (-60..=-55).map(|y| BlockPos::new(133, y, 64)).collect();
+        let deck: Vec<BlockPos> = (122..=133).map(|x| BlockPos::new(x, -54, 64)).collect();
+        set(
+            &mut s,
+            &[pa, pb.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        s.tick();
+        set(&mut s, &pb, builtin::AIR);
+        s.tick();
+        s.tick();
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(125, -54, 64)),
+            builtin::STONE,
+            "桥仍挂在左柱上"
+        );
+        assert_eq!(
+            block(&s, shard(1), BlockPos::new(130, -54, 64)),
+            builtin::STONE
+        );
+
+        s.detonate(Vec3::new(123.5, -57.5, 64.5), 12.0, 8.0)
+            .expect("爆炸");
+        s.tick();
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(122, -55, 64)),
+            builtin::AIR,
+            "左柱被炸掉"
+        );
+        assert_eq!(
+            block(&s, shard(0), BlockPos::new(125, -54, 64)),
+            builtin::AIR,
+            "左半桥面 N 拍转换"
+        );
+        assert_eq!(
+            block(&s, shard(1), BlockPos::new(130, -54, 64)),
+            builtin::STONE,
+            "右半桥面要等 N+1 收到写入"
+        );
+        s.tick();
+        for x in 128..=133 {
+            assert_eq!(
+                block(&s, shard(1), BlockPos::new(x, -54, 64)),
+                builtin::AIR,
+                "N+1 右半转换 x = {x}"
+            );
+        }
+        let deck_debris = |s: &Session, sh: ShardId| {
+            emergent(s, sh)
+                .into_iter()
+                .filter(|(_, e)| e.translation.y > -54.0)
+                .count()
+        };
+        assert_eq!(deck_debris(&s, shard(0)), 6, "左半桥面 6 个碎块(N+1 生成)");
+        s.tick();
+        assert_eq!(deck_debris(&s, shard(1)), 6, "右半桥面 6 个碎块(N+2 生成)");
+        s.tick();
+        for c in &deck {
+            for sh in [shard(0), shard(1)] {
+                assert_eq!(
+                    block(&s, sh, *c),
+                    builtin::AIR,
+                    "{sh:?} 视图里 {c:?} 是 air"
+                );
+            }
+        }
         s.shutdown();
     }
 }

@@ -48,7 +48,7 @@ fly = { to = [8.0, -50.0, 30.0], speed = 16.0 }
 look_at = { target = [9.0, -57.0, 14.0] }
 
 [[step]]
-wait_until = { labeled_alive = { label = "blast", eq = 0 }, block = { pos = [8, -61, 14], is = "dirt" }, timeout_ticks = 900 }
+wait_until = { labeled_alive = { label = "blast", eq = 0 }, live_entities = { eq = 0 }, block = { pos = [8, -64, 14], is = "bedrock" }, timeout_ticks = 900 }
 
 [[step]]
 check = { live_entities = { eq = 0 }, no_floating = { height = 1.5, still_ticks = 30 } }
@@ -57,4 +57,4 @@ check = { live_entities = { eq = 0 }, no_floating = { height = 1.5, still_ticks 
 wait_ticks = { n = 30 }
 
 [[step]]
-screenshot = { name = "return", expect = "棕色地面上散落着若干凝固的灰色方块,空中没有任何蓝色立方体,也没有悬浮的方块" }
+screenshot = { name = "return", expect = "棕色地面上散落着若干凝固的方块(灰色,以及爆炸炸松后落定的棕色土块),可能有一个浅坑;空中没有任何蓝色立方体,也没有悬浮的方块" }

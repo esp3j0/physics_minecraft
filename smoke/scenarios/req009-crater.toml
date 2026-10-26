@@ -1,0 +1,42 @@
+name = "req009-crater"
+req = "REQ-009"
+description = "平地引爆:炸出弹坑,坑内炸松的土块翻起后落定凝固,基岩完好"
+timeout_secs = 180
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [8.0, -60.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "贴地引爆"
+detonate = { at = [8.0, -59.5, 14.0], power = 12.0, radius = 8.0 }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "blast", expect = "棕色地面上出现一个浅坑,坑内和坑边有若干蓝色立方体(刚被炸松的土块)" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, -64, 14], is = "bedrock" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "棕色地面上有一个浅坑,坑里散落着凝固的棕色方块;空中没有蓝色立方体,也没有悬浮的方块" }
