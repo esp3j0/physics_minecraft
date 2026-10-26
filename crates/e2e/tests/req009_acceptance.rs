@@ -1084,3 +1084,389 @@ mod unit04a {
         assert!(grounded.run_default(&[p(3, 0, 0)]).falling.is_empty());
     }
 }
+
+/// 单元 04b:坍塌接入分片——触发与时机、本体区转换、每拍名额与推迟、跨分片(AC-D5 生产路径、AC-D6)。
+///
+/// 经 `Session` 驱动;用 `set_block` 搭结构、移除支撑(外部写入同样触发坍塌)。生产坐标:地表 y = −60。
+mod unit04b {
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EMERGENT_ORIGIN, EntityDesc, EntityId,
+        EntityState, ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    fn shard(x: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, 0))
+    }
+
+    fn owner(p: BlockPos) -> ShardId {
+        shard(if p.x < 128 { 0 } else { 1 })
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 会话:`shards` 中每个分片都装载 chunk x ∈ `cx`、z ∈ 2..=5 的平地(两分片时互为扩张区副本)。
+    fn session(
+        shards: &[i32],
+        cx: std::ops::RangeInclusive<i32>,
+        enabled: bool,
+        cap: usize,
+    ) -> Session {
+        let mut s = Session::new(cfg());
+        for &x in shards {
+            let mut sim_cfg = ShardSimConfig::new(shard(x));
+            sim_cfg.destruction = DestructionConfig {
+                enabled,
+                max_detach_per_tick: cap,
+                ..DestructionConfig::default()
+            };
+            let mut sim = ShardSim::new(sim_cfg, registry());
+            for x in cx.clone() {
+                for z in 2..=5 {
+                    let cp = ChunkPos::new(x, z);
+                    sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+                }
+            }
+            s.register(sim);
+        }
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(owner(c), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn block(s: &Session, sh: ShardId, p: BlockPos) -> BlockId {
+        let cp = p.chunk_of();
+        s.voxel_chunk(sh, cp).expect("chunk 已装载").get(
+            (p.x - cp.x * 16) as usize,
+            (p.y - WORLD_Y_MIN) as usize,
+            (p.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn emergent(s: &Session, sh: ShardId) -> Vec<(EntityId, EntityState)> {
+        s.entity_states(sh)
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    fn center_of(p: BlockPos) -> Vec3 {
+        Vec3::new(p.x as f32 + 0.5, p.y as f32 + 0.5, p.z as f32 + 0.5)
+    }
+
+    fn column(x: i32, ys: std::ops::RangeInclusive<i32>, z: i32) -> Vec<BlockPos> {
+        ys.map(|y| BlockPos::new(x, y, z)).collect()
+    }
+
+    fn row(xs: std::ops::RangeInclusive<i32>, y: i32, z: i32) -> Vec<BlockPos> {
+        xs.map(|x| BlockPos::new(x, y, z)).collect()
+    }
+
+    /// 单分片石桥:柱 x = 60、71(y −60…−55,z = 64),桥面 y = −54、x 60…71。
+    fn bridge(xa: i32, xb: i32) -> (Vec<BlockPos>, Vec<BlockPos>, Vec<BlockPos>) {
+        (
+            column(xa, -60..=-55, 64),
+            column(xb, -60..=-55, 64),
+            row(xa..=xb, -54, 64),
+        )
+    }
+
+    fn count(
+        s: &Session,
+        sh: ShardId,
+        b: BlockId,
+        xs: std::ops::RangeInclusive<i32>,
+        ys: std::ops::RangeInclusive<i32>,
+        zs: std::ops::RangeInclusive<i32>,
+    ) -> usize {
+        let mut n = 0;
+        for x in xs.clone() {
+            for y in ys.clone() {
+                for z in zs.clone() {
+                    if block(s, sh, BlockPos::new(x, y, z)) == b {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// 跑到本分片没有涌现实体为止(上限 900 拍),返回是否全部消失。
+    fn settle(s: &mut Session, sh: ShardId) -> bool {
+        for _ in 0..900 {
+            s.tick();
+            if emergent(s, sh).is_empty() {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// AC-D5 石桥(生产路径):去掉一根柱子桥不塌;两根都去掉,当拍(N)桥面 12 格变 air,N+1 生成 12 个
+    /// 涌现实体(描述 = 0.45 + stone,第 k 个对应 BlockPos 升序第 k 格);落地后全部凝固回 stone,
+    /// 都落在地表那一层(y = −60),空中不留东西。
+    ///
+    /// 会变红的实现:外部 SetBlock 不触发坍塌;坍塌推迟到下一拍才写 air;生成的实体描述沿用默认;
+    /// 坍塌块带了爆炸冲量四散。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_bridge_collapse_end_to_end() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, 64);
+        let mut log = CommandLog::new();
+        let (pa, pb, deck) = bridge(60, 71);
+        set(
+            &mut s,
+            &mut log,
+            &[pa.clone(), pb.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        s.tick();
+        set(&mut s, &mut log, &pa, builtin::AIR);
+        s.tick();
+        s.tick();
+        assert_eq!(
+            block(&s, sh, BlockPos::new(65, -54, 64)),
+            builtin::STONE,
+            "一根柱子还在,不塌"
+        );
+        assert!(emergent(&s, sh).is_empty());
+
+        set(&mut s, &mut log, &pb, builtin::AIR);
+        s.tick();
+        for c in &deck {
+            assert_eq!(block(&s, sh, *c), builtin::AIR, "N 拍桥面 {c:?} 已写 air");
+        }
+        assert!(emergent(&s, sh).is_empty(), "N 拍还没有实体");
+        s.tick();
+        let got = emergent(&s, sh);
+        assert_eq!(got.len(), 12);
+        for ((id, state), cell) in got.iter().zip(&deck) {
+            assert!(
+                (state.translation - center_of(*cell)).length() < 0.35,
+                "{id:?} 在 {cell:?} 附近"
+            );
+            assert_eq!(
+                s.entity_desc(sh, *id),
+                Some(EntityDesc {
+                    half_size: DEBRIS_HALF_SIZE,
+                    block: builtin::STONE
+                })
+            );
+        }
+        assert!(settle(&mut s, sh), "900 拍内全部凝固");
+        assert_eq!(
+            count(&s, sh, builtin::STONE, 56..=75, -60..=-50, 60..=68),
+            12,
+            "凝固回 12 格 stone"
+        );
+        assert_eq!(
+            count(&s, sh, builtin::STONE, 56..=75, -59..=-50, 60..=68),
+            0,
+            "都落在地表那一层"
+        );
+        s.shutdown();
+    }
+
+    /// AC-D5 沙柱(生产路径):石块上 5 格沙,移走石块 → 当拍 5 格沙变 air,N+1 生成 5 个实体
+    /// (方块 = sand),落地后叠成 5 格沙柱(最高 y = −56)。
+    ///
+    /// 会变红的实现:沙柱一拍只落一格;沙子凝固成 stone;沙子按连通性判定(沙柱经旁边的地面锚定)。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_sand_column_end_to_end() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, 64);
+        let mut log = CommandLog::new();
+        let base = BlockPos::new(66, -60, 70);
+        let sand = column(66, -59..=-55, 70);
+        set(&mut s, &mut log, &[base], builtin::STONE);
+        set(&mut s, &mut log, &sand, builtin::SAND);
+        s.tick();
+        set(&mut s, &mut log, &[base], builtin::AIR);
+        s.tick();
+        for c in &sand {
+            assert_eq!(block(&s, sh, *c), builtin::AIR, "{c:?}");
+        }
+        s.tick();
+        let got = emergent(&s, sh);
+        assert_eq!(got.len(), 5);
+        for (id, _) in &got {
+            assert_eq!(s.entity_desc(sh, *id).map(|d| d.block), Some(builtin::SAND));
+        }
+        assert!(settle(&mut s, sh));
+        assert_eq!(count(&s, sh, builtin::SAND, 63..=69, -60..=-50, 67..=73), 5);
+        assert_eq!(
+            count(&s, sh, builtin::SAND, 63..=69, -55..=-50, 67..=73),
+            0,
+            "叠成 5 格高"
+        );
+        s.shutdown();
+    }
+
+    /// AC-D7 坍塌推迟 + 快照:每拍名额 5,两根柱子同拍去掉 → N 拍按 BlockPos 升序转换前 5 格,其余 7 格
+    /// 推迟;在 N 与 N+1 之间取世界快照并回放,两线继续,N+3 后都正好生成 12 个实体,逐位相同、ID 不重复。
+    ///
+    /// 会变红的实现:超出名额的格丢失(只塌 5 格);推迟队列不进快照(回放线少塌 7 格);名额用完后
+    /// 当拍没有转换就再也不触发搜索。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d7_collapse_deferred_and_snapshot() {
+        let sh = shard(0);
+        let mut a = session(&[0], 2..=6, true, 5);
+        let mut log = CommandLog::new();
+        let (pa, pb, deck) = bridge(60, 71);
+        set(
+            &mut a,
+            &mut log,
+            &[pa.clone(), pb.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        a.tick();
+        set(&mut a, &mut log, &[pa, pb].concat(), builtin::AIR);
+        a.tick();
+        let air: Vec<BlockPos> = deck
+            .iter()
+            .copied()
+            .filter(|c| block(&a, sh, *c) == builtin::AIR)
+            .collect();
+        assert_eq!(air, deck[..5], "N 拍按 BlockPos 升序转换前 5 格");
+
+        let world = a.world_snapshot();
+        let mut b = sim_api::replay::replay_world(&world, &log, cfg(), registry).expect("回放");
+        for _ in 0..3 {
+            a.tick();
+            b.tick();
+        }
+        let ea = emergent(&a, sh);
+        assert_eq!(ea.len(), 12, "三拍内全部生成");
+        let ids: std::collections::BTreeSet<EntityId> = ea.iter().map(|e| e.0).collect();
+        assert_eq!(ids.len(), 12, "ID 不重复");
+        assert_eq!(ea, emergent(&b, sh), "回放线逐位相同");
+        for c in &deck {
+            assert_eq!(block(&a, sh, *c), builtin::AIR);
+        }
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// AC-D6 跨分片石桥:柱 x = 122(分片 (0,0))与 x = 133(分片 (1,0)),桥面 x 122…133 横跨 x = 128。
+    /// 两根柱子同拍去掉 → 两个分片各转换本体区内的 6 格;N+1 分片 (0,0) 得到 ID 1…6(x 122…127),
+    /// 分片 (1,0) 得到 ID 7…12(x 128…133);再过一拍,两边的体素视图里整座桥面都是 air。
+    ///
+    /// 会变红的实现:分片把副本格也转换了(两边各 12 个实体);只有一边塌;ID 分配不按 ShardId 升序。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d6_cross_shard_bridge() {
+        let mut s = session(&[0, 1], 6..=9, true, 64);
+        let mut log = CommandLog::new();
+        let (pa, pb, deck) = bridge(122, 133);
+        set(
+            &mut s,
+            &mut log,
+            &[pa.clone(), pb.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        s.tick();
+        set(&mut s, &mut log, &[pa, pb].concat(), builtin::AIR);
+        s.tick();
+        s.tick();
+        for (sh, xs, first) in [(shard(0), 122..=127, 1u32), (shard(1), 128..=133, 7u32)] {
+            let got = emergent(&s, sh);
+            let cells = row(xs, -54, 64);
+            assert_eq!(got.len(), 6, "{sh:?} 生成 6 个");
+            for (k, ((id, state), cell)) in got.iter().zip(&cells).enumerate() {
+                assert_eq!(*id, EntityId::from_parts(EMERGENT_ORIGIN, first + k as u32));
+                assert!((state.translation - center_of(*cell)).length() < 0.35);
+            }
+        }
+        s.tick();
+        for sh in [shard(0), shard(1)] {
+            for c in &deck {
+                assert_eq!(
+                    block(&s, sh, *c),
+                    builtin::AIR,
+                    "{sh:?} 视图里 {c:?} 已是 air"
+                );
+            }
+        }
+        s.shutdown();
+    }
+
+    /// AC-D5 世界顶部:贴着世界最高格(y = 319)的 20 格石塔,切断底部 → 上面 19 格照样塌落。世界高度之外的
+    /// 格是空气,不能当成"未装载"(否则碰到世界顶的结构会被误判为有地基)。
+    ///
+    /// 会变红的实现:`block_at` 对 y > WORLD_Y_MAX 返回 None(被当成未装载 → 锚定,塔不塌)。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_world_top_is_not_anchor() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, 64);
+        let mut log = CommandLog::new();
+        let tower = column(66, 300..=319, 60);
+        set(&mut s, &mut log, &tower, builtin::STONE);
+        s.tick();
+        set(&mut s, &mut log, &[tower[0]], builtin::AIR);
+        s.tick();
+        for c in &tower[1..] {
+            assert_eq!(block(&s, sh, *c), builtin::AIR, "{c:?} 塌落");
+        }
+        s.tick();
+        assert_eq!(emergent(&s, sh).len(), 19);
+        s.shutdown();
+    }
+
+    /// 关闭破坏时行为不变:两根柱子都去掉,桥面仍悬在原处,不产生任何实体。
+    ///
+    /// 会变红的实现:坍塌不受总开关控制。
+    #[test]
+    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_disabled_no_collapse() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, false, 64);
+        let mut log = CommandLog::new();
+        let (pa, pb, deck) = bridge(60, 71);
+        set(
+            &mut s,
+            &mut log,
+            &[pa.clone(), pb.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        s.tick();
+        set(&mut s, &mut log, &[pa, pb].concat(), builtin::AIR);
+        for _ in 0..5 {
+            s.tick();
+        }
+        for c in &deck {
+            assert_eq!(block(&s, sh, *c), builtin::STONE);
+        }
+        assert!(emergent(&s, sh).is_empty());
+        s.shutdown();
+    }
+}
