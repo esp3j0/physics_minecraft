@@ -385,6 +385,8 @@ impl Config {
                 contact_wake_max_bodies_per_tick: a.contact_wake_max_bodies_per_tick,
                 void_despawn_depth_m: a.void_despawn_depth_m,
             },
+            // REQ-009:`[destruction]` 配置表在单元 05 接入;此前取默认(实施期间关闭)。
+            destruction: physics_sim::destruction::DestructionConfig::default(),
         }
     }
 

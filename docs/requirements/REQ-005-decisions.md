@@ -201,6 +201,7 @@ owner despawn 的屏障只覆盖 owner chunk,语义更准确。
 | v3 | #12 | bundle 追加尾字段 `spawn_next_seq` |
 | v4 | REQ-007 任务 01 | 激活参数拆分、② 冷却表、`ShardSimConfig` 字段更名(REQ-007 布局终稿) |
 | **v5** | **#17(2026-10-25 用户拍板)** | **blob = 未压缩的 `format_version` 前缀(bincode varint)+ `lz4_flex::compress_prepend_size(bincode(bundle))`;解码先读前缀,不是当前版本即报 `unsupported checkpoint format version N`,是才解压、解码。v4 及以前一律显式拒绝** |
+| v6 | REQ-009(单元 02 起;单元 05 定稿) | `ShardSimConfig` 追加地形破坏配置;调度器快照追加涌现实体 ID 计数器、分片快照追加坍塌推迟队列;编码规则同 v5 |
 
 **拍板**:[ ] A  [ ] B  [ ] C
 

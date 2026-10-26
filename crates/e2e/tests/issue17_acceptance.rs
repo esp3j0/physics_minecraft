@@ -15,6 +15,9 @@ use types::Tick;
 use types::glam::Vec3;
 use voxel::{BlockRegistry, SimpleRegistry};
 
+// #17 D2:v5 起为"版本前缀 + lz4 压缩体";REQ-009 起为 v6,编码规则不变。
+const _: () = assert!(CHECKPOINT_FORMAT_VERSION >= 5);
+
 fn new_registry() -> impl Fn() -> Box<dyn BlockRegistry> + Send + 'static {
     || Box::new(SimpleRegistry::builtin())
 }
@@ -139,8 +142,6 @@ fn bundle(format_version: u32, log_bytes: Vec<u8>) -> CheckpointBundle {
 /// 乱码 panic。
 #[test]
 fn acc_z2_v5_codec_and_old_versions_rejected() {
-    assert_eq!(CHECKPOINT_FORMAT_VERSION, 5, "#17 D2:v4 → v5");
-
     let original = bundle(CHECKPOINT_FORMAT_VERSION, vec![0u8; 1_000_000]);
     let bytes = encode_checkpoint(&original);
     assert!(
@@ -261,7 +262,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
             blob.len()
         );
         let b = decode_checkpoint(&blob).expect("最新的可解码");
-        assert_eq!(b.format_version, 5);
+        assert_eq!(b.format_version, CHECKPOINT_FORMAT_VERSION);
         tick
     };
 

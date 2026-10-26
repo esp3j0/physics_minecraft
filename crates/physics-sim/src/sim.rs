@@ -110,6 +110,8 @@ pub struct ShardSimConfig {
     pub solidify: SolidifyConfig,
     /// 激活参数(§4.3;Default 默认,任务书 02)。
     pub activation: crate::activation::ActivationConfig,
+    /// 地形破坏(REQ-009;实施期间默认关闭,单元 07 改为开启)。
+    pub destruction: crate::destruction::DestructionConfig,
 }
 
 impl ShardSimConfig {
@@ -120,6 +122,7 @@ impl ShardSimConfig {
             dt: 1.0 / 60.0,
             solidify: SolidifyConfig::default(),
             activation: crate::activation::ActivationConfig::default(),
+            destruction: crate::destruction::DestructionConfig::default(),
         }
     }
 }
@@ -162,6 +165,9 @@ pub struct Outbox {
     /// `#[serde(default)]` 在此格式下对缺失尾字段不生效,不可用它声称旧快照
     /// 兼容。格式版本化由任务 02 的 format_version 处理。
     pub block_updates: Vec<BlockWrite>,
+    /// 本拍爆炸产生的脱落请求(REQ-009 §4.3、§7;按 `BlockPos` 升序)。调度器在 tick 末分配
+    /// ID 并盖章 N+1 生成(单元 03);对应格已在本拍写为 air。
+    pub detach_requests: Vec<crate::destruction::DetachRequest>,
     /// 涌现事件生产口(REQ-005 任务 03):分片内部语义(撞击触发等)未来把
     /// `CrossEvent` 推入此处,调度器 tick 末经 `broadcast_event` 广播(目标
     /// 分片 apply_at = N+1 本地求值)。本任务模拟核不主动产事件,字段恒空,

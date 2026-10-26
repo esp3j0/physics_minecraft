@@ -11,6 +11,7 @@
 
 pub mod activation;
 pub mod collider_build;
+pub mod destruction;
 pub mod explosion;
 pub mod settle;
 pub mod sim;
