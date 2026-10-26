@@ -1640,6 +1640,7 @@ mod tests {
                 sequences: std::collections::BTreeMap::new(),
             },
             lifecycles: std::collections::BTreeMap::new(),
+            next_emergent_seq: 1,
         }
     }
 

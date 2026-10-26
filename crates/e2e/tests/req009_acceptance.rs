@@ -568,3 +568,306 @@ mod unit02 {
         assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 6);
     }
 }
+
+/// 单元 03:脱落实体的生成——调度器分配涌现 ID、N+1 生成、每拍上限(AC-D4、AC-D7)。
+///
+/// 经 `Session`(生产会话接口)驱动;坐标与单元 02 相同(平地标准爆炸:脱落 24 格)。
+mod unit03 {
+    use physics_sim::destruction::{
+        CellFate, DEBRIS_HALF_SIZE, DEBRIS_MASS, DestructionConfig, DetachRequest, detach_spawn,
+        evaluate_blast,
+    };
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EMERGENT_ORIGIN, EntityDesc, EntityId, ShardId,
+        ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const CENTER: Vec3 = Vec3::new(64.0, -59.5, 64.0);
+    const FAR: Vec3 = Vec3::new(64.0, -59.5, 96.0);
+
+    fn flat(pos: BlockPos) -> Option<BlockId> {
+        Some(match pos.y {
+            -64 => builtin::BEDROCK,
+            -63..=-61 => builtin::DIRT,
+            _ => builtin::AIR,
+        })
+    }
+
+    /// 纯函数口径下某次爆炸的脱落格(BlockPos 升序)。
+    fn detached_cells(center: Vec3, max_debris: usize) -> Vec<BlockPos> {
+        evaluate_blast(
+            &flat,
+            &SimpleRegistry::builtin(),
+            &|_| true,
+            center,
+            12.0,
+            8.0,
+            1.0,
+            max_debris,
+        )
+        .into_iter()
+        .filter(|c| c.fate != CellFate::Pulverize)
+        .map(|c| c.pos)
+        .collect()
+    }
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 单分片会话:平地 chunk (2..=6, 2..=6) 已装载,破坏开启,每拍生成上限 `cap`。
+    fn session(cap: usize) -> Session {
+        let mut sim_cfg = ShardSimConfig::new(shard());
+        sim_cfg.destruction = DestructionConfig {
+            enabled: true,
+            max_detach_per_tick: cap,
+            ..DestructionConfig::default()
+        };
+        let mut sim = ShardSim::new(sim_cfg, registry());
+        for cx in 2..=6 {
+            for cz in 2..=6 {
+                let cp = ChunkPos::new(cx, cz);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        s
+    }
+
+    fn detonate(s: &mut Session, log: &mut CommandLog, center: Vec3) {
+        for entry in s.detonate(center, 12.0, 8.0).expect("爆炸命令") {
+            log.append(entry);
+        }
+    }
+
+    /// 本分片的涌现实体(EntityId 升序)。
+    fn emergent(s: &Session) -> Vec<(EntityId, types::EntityState)> {
+        s.entity_states(shard())
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    fn block(s: &Session, p: BlockPos) -> BlockId {
+        let cp = p.chunk_of();
+        let chunk = s.voxel_chunk(shard(), cp).expect("chunk 已装载");
+        chunk.get(
+            (p.x - cp.x * 16) as usize,
+            (p.y - WORLD_Y_MIN) as usize,
+            (p.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn center_of(p: BlockPos) -> Vec3 {
+        Vec3::new(p.x as f32 + 0.5, p.y as f32 + 0.5, p.z as f32 + 0.5)
+    }
+
+    /// 第 k 个涌现实体(seq = k)在生成后一拍内仍在第 k 个脱落格附近。
+    fn assert_spawned_at(got: &[(EntityId, types::EntityState)], cells: &[BlockPos]) {
+        assert_eq!(got.len(), cells.len(), "涌现实体数");
+        for (k, ((id, state), cell)) in got.iter().zip(cells).enumerate() {
+            assert_eq!(*id, EntityId::from_parts(EMERGENT_ORIGIN, k as u32 + 1));
+            assert!(
+                (state.translation - center_of(*cell)).length() < 0.35,
+                "{id:?} 应在 {cell:?} 附近,实为 {:?}",
+                state.translation
+            );
+        }
+    }
+
+    /// AC-D4 生成状态(纯函数):格中心、单位旋转、`linvel = impulse / DEBRIS_MASS`、角速度 0;
+    /// 半边长 0.45、方块为原方块;质量 0.729 kg。
+    ///
+    /// 会变红的实现:位置用格角;速度没除质量(或除了 1 kg);描述沿用默认的 stone / 0.5。
+    #[test]
+    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d4_detach_spawn_state() {
+        assert!((DEBRIS_MASS - 0.729).abs() < 1e-6);
+        let impulse = Vec3::new(-1.024652, 3.158188, -0.614791);
+        let (state, desc) = detach_spawn(&DetachRequest {
+            cell: BlockPos::new(61, -61, 62),
+            block: builtin::DIRT,
+            impulse,
+        });
+        assert!((state.translation - Vec3::new(61.5, -60.5, 62.5)).length() < 1e-6);
+        assert!(state.rotation.abs_diff_eq(Quat::IDENTITY, 1e-6));
+        assert!((state.linvel - impulse / DEBRIS_MASS).length() < 1e-4);
+        assert_eq!(state.angvel, Vec3::ZERO);
+        assert_eq!(
+            desc,
+            EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: builtin::DIRT,
+            }
+        );
+    }
+
+    /// AC-D4 生产路径:爆炸那一拍(N)格已写 air、还没有涌现实体;N+1 出现 24 个,ID 为
+    /// `(EMERGENT_ORIGIN, 1..=24)`,第 k 个对应第 k 个脱落格(BlockPos 升序);描述正确;归属本分片。
+    ///
+    /// 会变红的实现:当拍就生成(与 N+1 语义不符);ID 用服务端 origin 0 或按别的顺序编号;
+    /// 生成到别的分片;描述沿用默认值。
+    #[test]
+    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d4_spawned_next_tick_with_emergent_ids() {
+        let mut s = session(64);
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        s.tick();
+        assert_eq!(
+            block(&s, BlockPos::new(64, -61, 64)),
+            builtin::AIR,
+            "N 拍已写 air"
+        );
+        assert!(emergent(&s).is_empty(), "N 拍还没有涌现实体");
+        s.tick();
+        let got = emergent(&s);
+        assert_spawned_at(&got, &detached_cells(CENTER, 48));
+        for (id, _) in &got {
+            assert_eq!(
+                s.entity_desc(shard(), *id),
+                Some(EntityDesc {
+                    half_size: DEBRIS_HALF_SIZE,
+                    block: builtin::DIRT,
+                })
+            );
+            assert!(s.entities_of(shard()).contains(id), "归属本分片");
+        }
+        s.shutdown();
+    }
+
+    /// AC-D7 每拍上限:上限 10 时只生成压力最大的 10 个(其余粉碎,60 格全部变 air);同一拍两次爆炸
+    /// 共用上限 30——先到的爆炸脱落 24,后到的只剩 6 个名额,取它压力最大的 6 个。
+    ///
+    /// 会变红的实现:上限只按单次爆炸计;超限的格没写 air(坑变小);超限时按 BlockPos 截断而不是按压力。
+    #[test]
+    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d7_per_tick_cap() {
+        let mut s = session(10);
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        s.tick();
+        s.tick();
+        assert_spawned_at(&emergent(&s), &detached_cells(CENTER, 10));
+        for cell in detached_cells(CENTER, 48) {
+            assert_eq!(block(&s, cell), builtin::AIR, "{cell:?} 超限也要写 air");
+        }
+        s.shutdown();
+
+        let mut s = session(30);
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        detonate(&mut s, &mut log, FAR);
+        s.tick();
+        s.tick();
+        let mut cells = detached_cells(CENTER, 48);
+        cells.extend(detached_cells(FAR, 6));
+        cells.sort();
+        assert_spawned_at(&emergent(&s), &cells);
+        s.shutdown();
+    }
+
+    /// AC-D4 + 回放(生产恢复路径):在 N 拍(爆炸)与 N+1 拍(生成)之间取世界快照,用 `replay_world`
+    /// 恢复;两边继续跑,生成的实体 ID 与状态逐位相同;再各炸一次,新 ID 从 25 接着编,仍逐位相同。
+    ///
+    /// 会变红的实现:待生成的脱落请求不在快照里(恢复线少 24 个);涌现计数器不进快照(恢复线
+    /// 第二次爆炸从 1 重新编号);生成的盖章输入写进了外部命令日志(回放时重复生成)。
+    #[test]
+    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d4_pending_spawns_survive_snapshot_and_replay() {
+        let mut a = session(64);
+        let mut log = CommandLog::new();
+        detonate(&mut a, &mut log, CENTER);
+        a.tick();
+        let world = a.world_snapshot();
+        let mut b = sim_api::replay::replay_world(&world, &log, cfg(), registry).expect("回放");
+        a.tick();
+        b.tick();
+        let ea = emergent(&a);
+        assert_eq!(ea.len(), 24);
+        assert_eq!(ea, emergent(&b), "恢复线生成相同的实体");
+
+        detonate(&mut a, &mut log, FAR);
+        detonate(&mut b, &mut CommandLog::new(), FAR);
+        for _ in 0..2 {
+            a.tick();
+            b.tick();
+        }
+        let ea = emergent(&a);
+        assert_eq!(ea.len(), 48);
+        assert_eq!(
+            ea[24].0,
+            EntityId::from_parts(EMERGENT_ORIGIN, 25),
+            "接着编号"
+        );
+        assert_eq!(ea, emergent(&b), "第二次爆炸后两线仍逐位相同");
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// AC-D4 生命周期:碎块落定后凝固回 dirt——900 拍内涌现实体全部消失;弹坑周围的 dirt 比刚炸完时多
+    /// (碎块凝固回去),且没有任何 stone 出现(描述里的方块是原方块,不是默认的 stone)。
+    ///
+    /// 会变红的实现:碎块永远不凝固(比如被当成常驻体);凝固成 stone;碎块穿地掉进虚空。
+    #[test]
+    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d4_debris_settles_and_solidifies() {
+        let mut s = session(64);
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        let count = |s: &Session, b: BlockId| {
+            let mut n = 0;
+            for x in 52..=76 {
+                for z in 52..=76 {
+                    for y in -63..=-55 {
+                        if block(s, BlockPos::new(x, y, z)) == b {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+            n
+        };
+        assert_eq!(count(&s, builtin::DIRT), 25 * 25 * 3);
+        s.tick();
+        assert_eq!(count(&s, builtin::DIRT), 25 * 25 * 3 - 60, "刚炸完");
+        let mut ticks = 1;
+        while ticks < 900 {
+            s.tick();
+            ticks += 1;
+            if ticks > 2 && emergent(&s).is_empty() {
+                break;
+            }
+        }
+        assert!(emergent(&s).is_empty(), "900 拍内碎块全部凝固");
+        let dirt = count(&s, builtin::DIRT);
+        assert!(
+            dirt > 25 * 25 * 3 - 60 + 16 && dirt <= 25 * 25 * 3 - 60 + 24,
+            "碎块凝固回 dirt:{dirt}"
+        );
+        assert_eq!(count(&s, builtin::STONE), 0, "没有凝固成 stone");
+        s.shutdown();
+    }
+}

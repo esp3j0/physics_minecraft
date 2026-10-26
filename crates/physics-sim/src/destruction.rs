@@ -10,6 +10,9 @@ use voxel::BlockRegistry;
 
 /// 脱落块的半边长(REQ-009 §4.3;demo:0.45 静止最快)。
 pub const DEBRIS_HALF_SIZE: f32 = 0.45;
+/// 脱落块质量:碰撞体密度 1.0 × 体积 `(2·DEBRIS_HALF_SIZE)³`(与 sim 生成实体时 rapier 算出的质量一致)。
+pub const DEBRIS_MASS: f32 =
+    (2.0 * DEBRIS_HALF_SIZE) * (2.0 * DEBRIS_HALF_SIZE) * (2.0 * DEBRIS_HALF_SIZE);
 /// 碎块冲量方向里水平分量的比例(REQ-009 §4.3:`dir' = normalize(0.4·u_x, 1, 0.4·u_z)`)。
 pub const DEBRIS_SPREAD: f32 = 0.4;
 /// 地形求值的半径上限 = REQ-001 的 `INTERACTION_MARGIN` 默认值(16 m):保证从爆心到本体区
@@ -75,6 +78,16 @@ pub struct DetachRequest {
     pub cell: BlockPos,
     pub block: BlockId,
     pub impulse: Vec3,
+}
+
+/// 脱落请求 → 生成实体的初始状态与描述(REQ-009 §4.3、§7):位置 = 格中心、旋转为单位四元数、
+/// `linvel = impulse / DEBRIS_MASS`、`angvel = 0`;描述 = 半边长 `DEBRIS_HALF_SIZE`、方块 = 原方块
+/// (落地后凝固回同种材料)。坍塌块的 `impulse` 为 0。
+///
+/// **总架构师接口桩(REQ-009 单元 03)**:由实施方实现。
+pub fn detach_spawn(req: &DetachRequest) -> (types::EntityState, types::EntityDesc) {
+    let _ = req;
+    unimplemented!("REQ-009 单元 03:由实施方实现")
 }
 
 /// 线段 `from → to` 依次穿过的格,**含两端所在格**,按穿过顺序(REQ-009 §4.2):

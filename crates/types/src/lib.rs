@@ -16,7 +16,8 @@ pub mod tick;
 
 pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, ChunkRegion, WORLD_Y_MAX, WORLD_Y_MIN};
 pub use ids::{
-    BlockId, DimensionId, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId, WorldSeed,
+    BlockId, DimensionId, EMERGENT_ORIGIN, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId,
+    WorldSeed,
 };
 pub use state::{EntityDesc, EntityState};
 pub use tick::Tick;

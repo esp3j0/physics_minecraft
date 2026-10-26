@@ -411,6 +411,14 @@ impl ShardSim {
         self.built_colliders.len()
     }
 
+    /// 实体描述;不存在(已迁移/已凝固)返回 None(REQ-009 单元 03)。
+    ///
+    /// **总架构师接口桩(REQ-009 单元 03)**:由实施方实现。
+    pub fn entity_desc(&self, id: EntityId) -> Option<EntityDesc> {
+        let _ = id;
+        unimplemented!("REQ-009 单元 03:由实施方实现")
+    }
+
     /// 实体当前状态;不存在(已迁移/已凝固)返回 None。
     pub fn entity_state(&self, id: EntityId) -> Option<EntityState> {
         let rec = self.entities.get(&id)?;

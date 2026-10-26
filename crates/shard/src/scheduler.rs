@@ -184,6 +184,8 @@ pub struct SchedulerSnapshot {
     pub tickets_ever_set: bool,
     pub router: RouterSnapshot,
     pub lifecycles: BTreeMap<ShardId, LifecycleSnapshot>,
+    /// 下一个涌现实体序号(REQ-009 §7:`EntityId::from_parts(EMERGENT_ORIGIN, seq)`,从 1 起)。
+    pub next_emergent_seq: u32,
 }
 
 /// 固定 worker 池调度器(OS 线程 + capacity-one 通道 + 每拍全员汇合屏障)。
@@ -241,6 +243,11 @@ pub struct Scheduler {
     block_updates: Vec<(ShardId, BlockPos, BlockId)>,
     /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
     despawn_requests: BTreeSet<ShardId>,
+    /// 下一个涌现实体序号(REQ-009 §7;从 1 起,单调、不复用,入调度器快照)。
+    /// **总架构师接口桩(REQ-009 单元 03)**:字段与快照往返已接好;在 `tick` 屏障阶段按
+    /// canonical 序(分片 `ShardId` 升序、请求 `BlockPos` 升序)分配 ID 并盖章 N+1 生成,
+    /// 由实施方实现。
+    next_emergent_seq: u32,
     /// chunk 持有表(REQ-005 D2/D4):`(owner, chunk) → holder 集合`。
     /// owner 是纯函数(`owner_of`);本表随 apply_chunk_load/unload 维护,
     /// 不入快照(恢复时 rebuild_holders 重建)。
@@ -294,6 +301,7 @@ impl Scheduler {
             solidified: Vec::new(),
             block_updates: Vec::new(),
             despawn_requests: BTreeSet::new(),
+            next_emergent_seq: 1,
             chunk_holders: crate::chunks::ChunkHolders::new(),
             entity_ownership: EntityOwnership::new(),
             cfg,
@@ -2030,6 +2038,11 @@ impl Scheduler {
         self.sims.get(&shard)?.entity_state(entity)
     }
 
+    /// 实体描述(形状、凝固方块;REQ-009 单元 03 验收用)。分片未注册或实体不在该分片 → None。
+    pub fn entity_desc(&self, shard: ShardId, entity: EntityId) -> Option<types::EntityDesc> {
+        self.sims.get(&shard)?.entity_desc(entity)
+    }
+
     /// 票判定(REQ-002 §4.5;REQ-007 任务 02 改读票据表):任一 Active/Paused
     /// 票 ① "出"区域与分片核心 AABB(8×8 chunk 立柱)相交 → 有票。
     /// Radius 票 = 锚点到 AABB 水平距离 ≤ unload_m(观察者票 unload = 48m,
@@ -2106,6 +2119,7 @@ impl Scheduler {
                 .filter(|(shard, _)| self.sims.contains_key(shard))
                 .map(|(shard, lc)| (*shard, lc.snapshot()))
                 .collect(),
+            next_emergent_seq: self.next_emergent_seq,
         }
     }
 
@@ -2149,6 +2163,7 @@ impl Scheduler {
         // 观察者表整表替换(快照是 checkpoint 时刻兜底;日志是其后权威)。
         self.observer_table = snap.observers;
         self.observers_ever_set = snap.observers_ever_set;
+        self.next_emergent_seq = snap.next_emergent_seq;
         // 票据表整表替换(REQ-007 任务 02;区域票 Set/Remove 照常入日志回放,
         // 快照是兜底)。
         self.tickets = snap.tickets;

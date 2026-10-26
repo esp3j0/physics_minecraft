@@ -671,6 +671,11 @@ impl Session {
         self.scheduler.entity_state(shard, entity)
     }
 
+    /// 实体描述(REQ-009 单元 03;透传调度器)。
+    pub fn entity_desc(&self, shard: ShardId, entity: EntityId) -> Option<types::EntityDesc> {
+        self.scheduler.entity_desc(shard, entity)
+    }
+
     /// 实体当前权威归属(REQ-006 任务 01);迁移窗口/不存在 → None。
     pub fn entity_owner(&self, entity: EntityId) -> Option<shard::EntityOwner> {
         self.scheduler.owner_of_entity(entity)

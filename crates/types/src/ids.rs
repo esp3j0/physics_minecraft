@@ -61,6 +61,11 @@ impl ShardId {
 /// 一个分片一条边的 chunk 数(8×8 分片,REQ-001 §4.1)。
 pub const SHARD_CHUNKS: i32 = 8;
 
+/// 涌现实体(地形破坏的脱落块、坍塌块)的 `EntityId` origin(REQ-009 §7):调度器统一分配
+/// `EntityId::from_parts(EMERGENT_ORIGIN, seq)`,`seq` 从 1 起单调、不复用、随调度器快照持久化。
+/// 与服务端分配的 origin 0(REQ-006 §4.4)不冲突。
+pub const EMERGENT_ORIGIN: u32 = u32::MAX;
+
 /// 实体 ID(REQ-001 §9.7):`(origin_shard 序号, local_seq)` 打包 u64,单调不回收,
 /// 迁移后不变。origin 是分片的 **u32 序号**(由 shard 注册表分配),不是完整 ShardId。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
