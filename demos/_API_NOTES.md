@@ -68,3 +68,28 @@ world.step()       # 推进一步;固定步长,默认 dt 见下
   从已有刚体读回姿态重建时用 `body.rotation.scaled_axis`。`Rotation3.to_matrix()` 返回
   行主序 9 元展平数组。
 - `RigidBodyType.FIXED / DYNAMIC / KINEMATIC_POSITION_BASED / KINEMATIC_VELOCITY_BASED`。
+
+## 接触对与接触冲量(REQ-009 任务 00 实测,2026-10-25)
+
+- `world.narrow_phase.contact_pairs()` 是**方法**(存根未标注),返回 `ContactPair` 列表;
+  `world.step()` 后即有效,无需手动 update。同类陷阱:`has_any_active_contact`、
+  `is_dynamic`、`is_sleeping` 是**属性**不是方法(带括号会 TypeError)。
+- **ContactPair**:`collider1/collider2`(ColliderHandle)、`manifolds`、
+  `total_impulse()` / `total_impulse_magnitude()`(方法)、`has_any_active_contact`(属性)。
+- **ContactManifold**:`local_n1/local_n2`(法向)、`points`、`subshape1/subshape2`。
+- **接触点**:`impulse`(法向冲量标量,每接触点每步)、`tangent_impulse`、`dist`(负=刺穿)、
+  `local_p1/local_p2`(各自 collider 局部系)、`contact_id`、`fid1/fid2`。
+- **collider → body**:`world.colliders.get(pair.collider1).parent`(属性)→ `RigidBodyHandle`。
+- **⚠ 缺陷(0.36.0 实测)**:凡是**复合 collider**(如生产口径的地形薄片复合体)参与的接触对,
+  `point.impulse` 恒读 **0**(静置、撞击步都是;`total_impulse()` 同样不可信);
+  primitive↔primitive(尤其动态↔动态)读数精确(1 kg 静置 = 0.1635 = mg·dt,逐位吻合)。
+  `ActiveEvents.CONTACT_FORCE_EVENTS` 注册与否无影响。
+- **测地形冲量的可行路**(REQ-009 §5 认可的 fallback):动量差分。
+  竖直 `I = m·Δv_y + m·g·dt`(触地一步吸收时 ≈ m·v_impact);矢量式
+  `I⃗ = m·Δv⃗ − m·g⃗·dt`。叠放场景"上方载荷"用底块↔第二块的接触对直读
+  (动态↔动态,可靠),叠加即得地形对底块的冲量(1–8 层实测与 n·mg·dt 零误差)。
+- **激活阈值可运行时改**:`world.rigid_bodies[h].activation.linear_threshold = 0.09`
+  / `angular_threshold = 0.049`(默认 0.4 级别,`time_until_sleep` 默认 0.5 s)。
+  builder 侧 `can_sleep(bool)` 可用。
+- 复合体几何:`r.Collider.compound([(r.Isometry3.from_translation(x,y,z), r.SharedShape.cuboid(hx,hy,hz)), ...])`;
+  `Isometry3` 不可下标访问(要分量请存构造前的元组)。
