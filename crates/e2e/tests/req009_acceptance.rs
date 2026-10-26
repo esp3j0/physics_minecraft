@@ -866,3 +866,227 @@ mod unit03 {
         s.shutdown();
     }
 }
+
+/// 单元 04a:坍塌求值纯函数——沙子规则与向下优先的连通性搜索(AC-D5 的算法部分)。
+///
+/// 标准答案来自总架构师按 REQ-009 §6 写的参照实现。局部坐标:y = −4 bedrock、−3…−1 dirt
+/// (`thick` 层 dirt 时 bedrock 在 y = −thick−1),其上为结构;`removed` 中的格在世界里已是空气。
+mod unit04a {
+    use physics_sim::destruction::{CollapseOutcome, find_collapse};
+    use std::collections::{BTreeMap, BTreeSet};
+    use types::{BlockId, BlockPos};
+    use voxel::{SimpleRegistry, builtin};
+
+    const S: BlockId = builtin::STONE;
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    struct Case {
+        cells: BTreeMap<BlockPos, BlockId>,
+        thick: i32,
+        unloaded: BTreeSet<BlockPos>,
+    }
+
+    impl Case {
+        fn new(cells: impl IntoIterator<Item = (BlockPos, BlockId)>) -> Self {
+            Self {
+                cells: cells.into_iter().collect(),
+                thick: 3,
+                unloaded: BTreeSet::new(),
+            }
+        }
+
+        /// 移除 `removed` 后求值;同时核对把 `removed` 倒序传入结果相同(与顺序无关)。
+        fn run(
+            &self,
+            removed: &[BlockPos],
+            max_cells: usize,
+            max_cluster: usize,
+        ) -> CollapseOutcome {
+            let gone: BTreeSet<BlockPos> = removed.iter().copied().collect();
+            let world = |q: BlockPos| -> Option<BlockId> {
+                if self.unloaded.contains(&q) {
+                    return None;
+                }
+                if gone.contains(&q) {
+                    return Some(builtin::AIR);
+                }
+                if let Some(b) = self.cells.get(&q) {
+                    return Some(*b);
+                }
+                Some(if q.y == -self.thick - 1 {
+                    builtin::BEDROCK
+                } else if (-self.thick..=-1).contains(&q.y) {
+                    builtin::DIRT
+                } else {
+                    builtin::AIR
+                })
+            };
+            let reg = SimpleRegistry::builtin();
+            let out = find_collapse(&world, &reg, removed, max_cells, max_cluster);
+            let mut rev = removed.to_vec();
+            rev.reverse();
+            let again = find_collapse(&world, &reg, &rev, max_cells, max_cluster);
+            assert_eq!(
+                (&out.falling, out.oversized_clusters, out.budget_anchored),
+                (
+                    &again.falling,
+                    again.oversized_clusters,
+                    again.budget_anchored
+                ),
+                "结果与 removed 的顺序无关"
+            );
+            assert!(
+                out.falling.windows(2).all(|w| w[0] < w[1]),
+                "falling 按 BlockPos 升序且无重复"
+            );
+            out
+        }
+
+        fn run_default(&self, removed: &[BlockPos]) -> CollapseOutcome {
+            self.run(removed, 2048, 512)
+        }
+    }
+
+    fn line(xs: std::ops::RangeInclusive<i32>, y: i32, z: i32) -> Vec<BlockPos> {
+        xs.map(|x| p(x, y, z)).collect()
+    }
+
+    fn column(x: i32, ys: std::ops::RangeInclusive<i32>, z: i32) -> Vec<BlockPos> {
+        ys.map(|y| p(x, y, z)).collect()
+    }
+
+    /// AC-D5 石桥:两根 6 高石柱(x = 0、11)托着 12 格桥面(y = 6)。只去掉一根柱子,桥面经另一根柱子
+    /// 连着地基,不塌;两根都去掉,桥面 12 格塌落(柱子已全部移除,不在结果里)。
+    ///
+    /// 会变红的实现:把"去掉一根柱子"判成悬空(没有走到另一根柱子);把 `removed` 的格也算进结果;
+    /// 结果没排序。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_bridge_needs_both_pillars() {
+        let pa = column(0, 0..=5, 0);
+        let pb = column(11, 0..=5, 0);
+        let deck = line(0..=11, 6, 0);
+        let case = Case::new(pa.iter().chain(&pb).chain(&deck).map(|&c| (c, S)));
+        let one = case.run_default(&pa);
+        assert!(one.falling.is_empty(), "一根柱子还在,不塌:{one:?}");
+        let mut both = pa.clone();
+        both.extend(&pb);
+        assert_eq!(case.run_default(&both).falling, deck);
+    }
+
+    /// AC-D5 悬臂与塔:墙上伸出的 8 格横臂切断根部 → 其余 7 格塌落;1×1×20 的塔切断底部 → 上面 19 格塌落。
+    ///
+    /// 会变红的实现:墙与横臂的连接没算(横臂根部那一格被当成锚);塔只塌最底下一格。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_cantilever_and_tower() {
+        let mut cells: Vec<(BlockPos, BlockId)> = Vec::new();
+        for y in 0..=7 {
+            for z in -3..=3 {
+                cells.push((p(0, y, z), S));
+            }
+        }
+        cells.extend(line(1..=8, 5, 0).into_iter().map(|c| (c, S)));
+        assert_eq!(
+            Case::new(cells).run_default(&[p(1, 5, 0)]).falling,
+            line(2..=8, 5, 0)
+        );
+        let tower = Case::new(column(0, 0..=19, 0).into_iter().map(|c| (c, S)));
+        assert_eq!(
+            tower.run_default(&[p(0, 0, 0)]).falling,
+            column(0, 1..=19, 0)
+        );
+    }
+
+    /// AC-D5 平台与两个上限:4 根柱子托着 20×20 的平台,柱子全部去掉 → 400 格塌落;`max_cluster` = 300 时
+    /// 整块留在原地(计 1 个超大块);`max_cells` = 256 时搜索预算用完、判为锚定(计 1 次)。
+    ///
+    /// 会变红的实现:超大块塌了一部分;预算用完被当成悬空(大平台被误塌);两个计数混用。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_platform_and_limits() {
+        let mut pillars = Vec::new();
+        for (px, pz) in [(0, 0), (19, 0), (0, 19), (19, 19)] {
+            pillars.extend(column(px, 0..=4, pz));
+        }
+        let mut deck = Vec::new();
+        for x in 0..=19 {
+            for z in 0..=19 {
+                deck.push(p(x, 5, z));
+            }
+        }
+        let case = Case::new(pillars.iter().chain(&deck).map(|&c| (c, S)));
+        let all = case.run_default(&pillars);
+        assert_eq!(all.falling.len(), 400);
+        assert_eq!(all.falling, deck);
+        assert_eq!((all.oversized_clusters, all.budget_anchored), (0, 0));
+
+        let big = case.run(&pillars, 2048, 300);
+        assert!(big.falling.is_empty());
+        assert_eq!((big.oversized_clusters, big.budget_anchored), (1, 0));
+
+        let poor = case.run(&pillars, 256, 512);
+        assert!(poor.falling.is_empty());
+        assert_eq!((poor.oversized_clusters, poor.budget_anchored), (0, 1));
+    }
+
+    /// AC-D5 开阔地面上的代价:平地移除一格,向下优先很快碰到基岩(访问 ≤ 64);24 层厚的地基同样
+    /// 很快(访问 ≤ 500;按 BlockPos 顺序的广度优先要访问上千格)。
+    ///
+    /// 会变红的实现:用广度优先或按 BlockPos 出队(厚地基访问数上千);碰到基岩不停。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_open_ground_is_cheap() {
+        let flat = Case::new([]).run_default(&[p(5, -1, 5)]);
+        assert!(flat.falling.is_empty());
+        assert!(flat.visited <= 64, "平地访问 {}", flat.visited);
+        let mut thick = Case::new([]);
+        thick.thick = 24;
+        let deep = thick.run_default(&[p(5, -1, 5)]);
+        assert!(deep.falling.is_empty());
+        assert!(deep.visited <= 500, "厚地基访问 {}", deep.visited);
+    }
+
+    /// AC-D5 未装载即锚定:横臂唯一的支撑点所在 chunk 未装载 → 不塌;同样的支撑点是空气 → 横臂 8 格塌落。
+    ///
+    /// 会变红的实现:把未装载当成空气(看不见的地方被当成悬空,远处的结构被误塌)。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_unloaded_counts_as_anchor() {
+        let arm = || Case::new(line(1..=9, 5, 0).into_iter().map(|c| (c, S)));
+        let mut hidden = arm();
+        hidden.unloaded.insert(p(0, 5, 0));
+        assert!(hidden.run_default(&[p(9, 5, 0)]).falling.is_empty());
+        assert_eq!(arm().run_default(&[p(9, 5, 0)]).falling, line(1..=8, 5, 0));
+    }
+
+    /// AC-D5 沙子:石头上的 5 格沙柱,石头被移走 → 5 格沙同一轮全部塌落;贴在墙侧的沙子,下面那格被移走 →
+    /// 它塌落(尽管与墙相连);放在地面上的沙子,旁边的格被移走 → 不动。
+    ///
+    /// 会变红的实现:沙柱一拍只落最下面一格;沙子也按连通性判定(贴墙的沙子不落);旁边的移除也让沙子掉落。
+    #[test]
+    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d5_sand_rules() {
+        let mut col: Vec<(BlockPos, BlockId)> = vec![(p(0, 0, 0), S)];
+        col.extend(column(0, 1..=5, 0).into_iter().map(|c| (c, builtin::SAND)));
+        assert_eq!(
+            Case::new(col).run_default(&[p(0, 0, 0)]).falling,
+            column(0, 1..=5, 0)
+        );
+
+        let mut side: Vec<(BlockPos, BlockId)> =
+            column(0, 0..=5, 0).into_iter().map(|c| (c, S)).collect();
+        side.push((p(1, 2, 0), S));
+        side.push((p(1, 3, 0), builtin::SAND));
+        assert_eq!(
+            Case::new(side).run_default(&[p(1, 2, 0)]).falling,
+            [p(1, 3, 0)]
+        );
+
+        let grounded = Case::new([(p(2, 0, 0), builtin::SAND), (p(3, 0, 0), S)]);
+        assert!(grounded.run_default(&[p(3, 0, 0)]).falling.is_empty());
+    }
+}

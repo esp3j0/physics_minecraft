@@ -103,6 +103,45 @@ pub fn detach_spawn(req: &DetachRequest) -> (types::EntityState, types::EntityDe
     (state, desc)
 }
 
+/// 坍塌求值结果(REQ-009 §6)。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CollapseOutcome {
+    /// 应塌落的格(沙子规则 + 悬空且不超过 `max_cluster` 的连通块),`BlockPos` 升序、无重复。
+    pub falling: Vec<BlockPos>,
+    /// 悬空但超过 `max_cluster`、留在原地的连通块数。
+    pub oversized_clusters: usize,
+    /// 因单次搜索访问数超过 `max_cells` 而判为锚定的搜索次数。
+    pub budget_anchored: usize,
+    /// 全部搜索出队的格数之和(只用于遥测与代价验收,不参与判定)。
+    pub visited: usize,
+}
+
+/// 坍塌求值(纯函数,REQ-009 §6.1–§6.2):
+///
+/// - `block_at` 给出**移除之后**的世界(`removed` 中的格已是非实心);`None` = 所在 chunk 未装载;
+/// - **沙子**:对 `removed` 中每个格(`BlockPos` 升序),从其正上方起向上,连续的
+///   `Support::NeedsBelow` 实心格全部塌落;
+/// - **连通性**:记 `gone = removed ∪ 沙子塌落格`。种子 = `gone` 中各格的 6 邻居里的实心格(去重、
+///   `BlockPos` 升序、不含 `gone`)。对每个尚未判定的种子做 6 连通的**向下优先**搜索(优先队列,键
+///   `(y, x, z)` 升序;`gone` 视为非实心),出现以下任一即判定该连通块**已锚定**:出队的格是
+///   `Support::Anchor` 或 `y == WORLD_Y_MIN`;出队的格已被前面的搜索判为锚定;要入队的邻居所在
+///   chunk 未装载;本次搜索出队数超过 `max_cells`(计入 `budget_anchored`)。锚定时本次见过的格全部
+///   标记为锚定;否则整块为悬空:格数 ≤ `max_cluster` 的并入 `falling`,否则计入 `oversized_clusters`;
+///   悬空块同样标记,不重复搜索;
+/// - 结果与 `removed` 的顺序无关。
+///
+/// **总架构师接口桩(REQ-009 单元 04a)**:由实施方实现。
+pub fn find_collapse(
+    block_at: &dyn Fn(BlockPos) -> Option<BlockId>,
+    registry: &dyn BlockRegistry,
+    removed: &[BlockPos],
+    max_cells: usize,
+    max_cluster: usize,
+) -> CollapseOutcome {
+    let _ = (block_at, registry, removed, max_cells, max_cluster);
+    unimplemented!("REQ-009 单元 04a:由实施方实现")
+}
+
 /// 线段 `from → to` 依次穿过的格,**含两端所在格**,按穿过顺序(REQ-009 §4.2):
 /// Amanatides–Woo,全程 f64;同时跨越多个面(参数 t 相等)时按 x、y、z 的顺序逐轴步进,
 /// 中间格都计入;某轴方向分量为 0 时该轴永不步进。
