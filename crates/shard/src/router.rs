@@ -20,7 +20,7 @@ use types::{ShardId, Tick};
 pub struct RouterConfig {
     /// 每分片本地收件箱容量(默认 256,README 决策 1)。
     pub inbox_capacity: usize,
-    /// 跨片信封队列容量(默认 `DEFAULT_QUEUE_CAPACITY` = 1024)。
+    /// 跨片信封队列容量(默认 `DEFAULT_QUEUE_CAPACITY` = 8192,REQ-009 修订 10)。
     pub queue_capacity: usize,
 }
 

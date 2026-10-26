@@ -110,7 +110,7 @@ pub enum WorldKind {
 
 /// 全部参数(蓝图 §6 表 + app 装配参数,app README 决策 9)。
 /// 地形破坏配置表 `[destruction]`(REQ-009 §8)。键与默认值同
-/// `physics_sim::destruction::DestructionConfig`;**`enabled` 在 REQ-009 实施期间默认 `false`,单元 07 改为
+/// `physics_sim::destruction::DestructionConfig`;**`enabled` 自单元 07 起默认
 /// `true`(D7)**。校验:`attenuation` 为有限正数;各上限 ≥ 1;`collapse_max_cells ≥ collapse_max_cluster`。
 ///
 /// **总架构师接口桩(REQ-009 单元 05)**:结构与默认值已给出;校验与到 `shard_sim_config` 的映射由实施方实现。
@@ -165,7 +165,7 @@ pub struct Config {
     pub area_ticket_max_count: usize,
     /// 空片 despawn 阈值(秒),30(§9.3)。
     pub despawn_after_secs: u64,
-    /// 跨片信封队列容量,1024(§4.2)。
+    /// 跨片信封队列容量,8192(§4.2 决议 1024;REQ-009 修订 10 提到 8192)。
     pub envelope_queue_capacity: usize,
     /// 每分片命令收件箱容量,256(app README 决策 1)。
     pub inbox_capacity: usize,
@@ -203,7 +203,7 @@ impl Default for Config {
             area_ticket_max_radius_m: 128.0,
             area_ticket_max_count: 64,
             despawn_after_secs: 30,
-            envelope_queue_capacity: 1024,
+            envelope_queue_capacity: 8192,
             inbox_capacity: 256,
             checkpoint_interval_ticks: 600,
             checkpoint_keep: 10,
@@ -332,6 +332,7 @@ impl Config {
         }
         for (name, cap) in [
             ("max_debris_per_explosion", d.max_debris_per_explosion),
+            ("max_cells_per_explosion", d.max_cells_per_explosion),
             ("max_detach_per_tick", d.max_detach_per_tick),
             ("max_impact_breaks_per_tick", d.max_impact_breaks_per_tick),
             ("collapse_max_cells", d.collapse_max_cells),
@@ -500,8 +501,8 @@ mod tests {
         );
         assert_eq!(c.despawn_after_secs, 30, "despawn_after_secs = 30(§9.3)");
         assert_eq!(
-            c.envelope_queue_capacity, 1024,
-            "envelope_queue_capacity = 1024(§4.2)"
+            c.envelope_queue_capacity, 8192,
+            "envelope_queue_capacity = 8192(§4.2 决议 1024,REQ-009 修订 10 改)"
         );
         assert_eq!(c.inbox_capacity, 256, "inbox_capacity = 256(决策 1)");
         assert_eq!(
@@ -972,18 +973,18 @@ unload_radius = 64
         );
     }
 
-    /// REQ-009 §8(单元 05):`[destruction]` 默认值与核内同值(实施期
-    /// `enabled = false`);部分键其余取默认(结构体级 serde(default) 与表级
+    /// REQ-009 §8(单元 05):`[destruction]` 默认值与核内同值(单元 07 起
+    /// `enabled = true`,D7);部分键其余取默认(结构体级 serde(default) 与表级
     /// deny_unknown_fields 并存,风险 5);覆写逐字段映射进 `shard_sim_config`
     /// (替换写死的核内默认);覆写实例 toml 往返无损。
     ///
     /// 变红:表没接进 shard_sim_config(分片仍用核内默认);部分键解析失败。
     #[test]
     fn destruction_config_partial_keys_and_mapping() {
-        // 默认 = 核内默认,逐字段锚定(enabled 实施期 false,单元 07 改)。
+        // 默认 = 核内默认,逐字段锚定(enabled 单元 07 起 true,D7)。
         let d = Config::default().destruction;
         let core = physics_sim::destruction::DestructionConfig::default();
-        assert!(!d.enabled, "实施期间默认关闭");
+        assert!(d.enabled, "单元 07 起默认开启(D7)");
         assert_eq!(d.attenuation, core.attenuation);
         assert_eq!(d.max_debris_per_explosion, core.max_debris_per_explosion);
         assert_eq!(d.max_detach_per_tick, core.max_detach_per_tick);
@@ -1005,7 +1006,7 @@ unload_radius = 64
         let partial =
             Config::from_toml_str("[destruction]\nattenuation = 2.0\n").expect("部分键合法");
         assert_eq!(partial.destruction.attenuation, 2.0, "覆写生效");
-        assert!(!partial.destruction.enabled, "未给的键取默认");
+        assert!(partial.destruction.enabled, "未给的键取默认");
         assert_eq!(
             partial.destruction.max_detach_per_tick, core.max_detach_per_tick,
             "未给的键取默认"
@@ -1057,6 +1058,10 @@ unload_radius = 64
             (
                 "[destruction]\nmax_debris_per_explosion = 0\n",
                 "max_debris_per_explosion",
+            ),
+            (
+                "[destruction]\nmax_cells_per_explosion = 0\n",
+                "max_cells_per_explosion",
             ),
             (
                 "[destruction]\nmax_detach_per_tick = 0\n",

@@ -8,8 +8,9 @@ use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, ShardId, Tick}
 
 use crate::event::CrossEvent;
 
-/// 队列默认容量(REQ-001 §4.2 决议:1024)。
-pub const DEFAULT_QUEUE_CAPACITY: usize = 1024;
+/// 队列默认容量(REQ-001 §4.2 决议 1024;**REQ-009 修订 10 改为 8192**:一次
+/// 爆炸至多 `max_cells_per_explosion` = 2048 格 × 至多 3 个持副本的邻片,另留余量)。
+pub const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 
 /// 信封载荷。变体只允许**追加**。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -105,7 +106,7 @@ impl CrossShardQueue {
         }
     }
 
-    /// 默认容量(1024)。
+    /// 默认容量(`DEFAULT_QUEUE_CAPACITY`,修订 10 起 8192)。
     pub fn with_default_capacity() -> Self {
         Self::new(DEFAULT_QUEUE_CAPACITY)
     }
@@ -158,7 +159,7 @@ impl CrossShardQueue {
     }
 
     /// 仍在队的全部目的分片(升序;桶键即真相,REQ-005 D5 驱动 ensure 用)。
-    /// 桶数 ≤ 队列容量(1024),每次全扫可接受。
+    /// 桶数 ≤ 队列容量,每次全扫可接受。
     pub fn destinations(&self) -> std::collections::BTreeSet<ShardId> {
         self.buckets.keys().map(|(dest, _)| *dest).collect()
     }
@@ -430,5 +431,24 @@ mod tests {
             migrate(1, shard(0, 0), shard(1, 0)),
             migrate(2, shard(0, 0), shard(1, 0)),
         ]);
+    }
+
+    /// REQ-009 修订 10(单元 07):默认队列容量 8192(一次爆炸至多 2048 格 ×
+    /// 至多 3 个持副本的邻片,另留余量);`with_default_capacity` 跟随常量。
+    ///
+    /// 变红:常量回退 1024(默认配置下四分片交汇爆炸 fail-stop)。
+    #[test]
+    fn default_queue_capacity_is_8192() {
+        assert_eq!(DEFAULT_QUEUE_CAPACITY, 8192);
+        // 行为验证:默认队列恰能容纳 8192 枚,第 8193 枚被拒。
+        let mut q = CrossShardQueue::with_default_capacity();
+        for k in 0..8192u64 {
+            q.admit(migrate(k + 1, shard(0, 0), shard(1, 0)))
+                .expect("默认容量 ≥ 8192");
+        }
+        assert!(
+            q.admit(migrate(9999, shard(0, 0), shard(1, 0))).is_err(),
+            "第 8193 枚被拒(不多不少)"
+        );
     }
 }

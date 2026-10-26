@@ -32,7 +32,8 @@ pub const IMPACT_MIN_APPROACH_SPEED: f32 = 1.0;
 /// 地形破坏配置(REQ-009 §8)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DestructionConfig {
-    /// 总开关。**REQ-009 实施期间默认 `false`**,单元 07 迁移既有用例后改为 `true`(D7)。
+    /// 总开关。**D7(单元 07 起默认 `true`)**:爆炸会改地形;只测实体轨迹的
+    /// 用例须在装配处显式 `enabled = false`。
     pub enabled: bool,
     /// 射线衰减系数(1.0)。
     pub attenuation: f32,
@@ -54,7 +55,7 @@ pub struct DestructionConfig {
 impl Default for DestructionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             attenuation: 1.0,
             max_debris_per_explosion: 48,
             max_cells_per_explosion: 2048,

@@ -2888,8 +2888,8 @@ impl ShardSim {
                 .expect("handle 有效")
                 .apply_impulse(conv::vec3_to_rapier(impulse), true);
         }
-        // 地形破坏(REQ-009 §4.1):实施期间默认关闭(单元 07 D7 改开)。
-        // 实体冲量仍按原半径(REQ-001 §4.2 不变),地形求值在冲量之后。
+        // 地形破坏(REQ-009 §4.1):D7 起默认开启;实体冲量仍按原半径
+        // (REQ-001 §4.2 不变),地形求值在冲量之后。
         if self.cfg.destruction.enabled {
             self.detonate_terrain(center, power, radius);
         }
@@ -2923,7 +2923,7 @@ impl ShardSim {
             }
             Some(self.voxels.get_block(p))
         };
-        let cells = crate::destruction::evaluate_blast(
+        let mut cells = crate::destruction::evaluate_blast(
             &block_at,
             self.registry.as_ref(),
             &in_scope,
@@ -2939,6 +2939,20 @@ impl ShardSim {
                     .saturating_sub(self.outbox.detach_requests.len()),
             ),
         );
+        // 修订 10 破坏格数上限:单次爆炸单分片最多破坏 `max_cells_per_explosion`
+        // 格。在求值之后截断:截掉的格不写 air、不进 detach_requests、不触发
+        // 坍塌;保留压力最高的(按 P 降序,同值 BlockPos 升序),遥测只计实际
+        // 破坏的格(§4.3)。
+        let cap = self.cfg.destruction.max_cells_per_explosion;
+        if cells.len() > cap {
+            cells.sort_by(|a, b| {
+                b.pressure
+                    .total_cmp(&a.pressure)
+                    .then_with(|| a.pos.cmp(&b.pos))
+            });
+            cells.truncate(cap);
+            cells.sort_by_key(|c| c.pos);
+        }
         if cells.is_empty() {
             return;
         }
@@ -6704,7 +6718,10 @@ mod tests {
     /// 变红:收集闸去掉 enabled 条件(触发集不再受开关控制,桥面塌落)。
     #[test]
     fn collapse_disabled_is_inert() {
-        let cfg = ShardSimConfig::new(shard_id(0, 0));
+        // 单元 07 起 D7 默认开启(REQ-009 §9 迁移清单):本用例测"关闭时惰性",
+        // 在装配处显式关闭;断言不动。
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = false;
         assert!(!cfg.destruction.enabled, "默认关闭(实施期间)");
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         use voxel::WorldGenerator;
@@ -7153,6 +7170,128 @@ mod tests {
             s.take_outbox().destruction_stats,
             crate::destruction::DestructionStats::default(),
             "下一拍(生成拍)归零"
+        );
+    }
+
+    // ---- 单元 07:默认开启(D7)、修订 10 上限 ----
+
+    /// 修订 10 破坏格数上限(sim 级生产路径):平地 power 1000、半径 40
+    /// (有效半径按 16 封顶)全应破坏 2220 格,`max_cells_per_explosion` = 2048
+    /// 时那一拍恰破坏 2048 格——保留压力最高的(爆心附近被炸穿、压力最低的
+    /// 边缘格完好);被截掉的格不写 air、不进 detach_requests、不登记坍塌触发。
+    ///
+    /// 变红:上限没接线(全部 2220 格破坏);截断按 BlockPos 而不是压力
+    /// (保留的是坐标最小而非压力最高的格,爆心反而不在坑里)。
+    #[test]
+    fn blast_cell_cap_keeps_highest_pressure_and_skips_rest() {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_cells_per_explosion = 2048;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        // 前置复核:无上限时全部候选 2220 格(求值函数口径)。
+        let center = Vec3::new(64.0, -59.5, 64.0);
+        let all = crate::destruction::evaluate_blast(
+            &|p| {
+                if !(types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&p.y) {
+                    return None;
+                }
+                Some(s.voxel().get_block(p))
+            },
+            s.registry.as_ref(),
+            &|_| true,
+            center,
+            1000.0,
+            40.0,
+            1.0,
+            48,
+        );
+        assert_eq!(all.len(), 2220, "前置:无上限候选数");
+        assert!(
+            all.iter().any(|c| c.pos == BlockPos::new(64, -61, 64)),
+            "前置:爆心下方在候选内"
+        );
+
+        s.apply_prefix(&[detonate_input(1, center, 1000.0, 40.0)]);
+        let out = s.take_outbox();
+        assert_eq!(
+            out.destruction_stats.cells_blasted, 2048,
+            "上限截断到 max_cells_per_explosion"
+        );
+        assert_eq!(
+            out.block_updates.len(),
+            2048,
+            "写入格数 = 实际破坏格数(截掉的格不写 air)"
+        );
+        // 判别式逐格对照:实际写入集 == 候选中按压力降序(同值 BlockPos 升序)
+        // 的前 2048 名。两种次序的差分格(如 (48,−63,64) 的层首格 vs
+        // (79,−61,64) 的边缘格)由这个全集对照覆盖——按 BlockPos 截断会错留
+        // 层首低压力格、错杀高压力边缘格。
+        let mut by_pressure = all.clone();
+        by_pressure.sort_by(|a, b| {
+            b.pressure
+                .total_cmp(&a.pressure)
+                .then_with(|| a.pos.cmp(&b.pos))
+        });
+        let want: BTreeSet<BlockPos> = by_pressure.iter().take(2048).map(|c| c.pos).collect();
+        let got: BTreeSet<BlockPos> = out.block_updates.iter().map(|w| w.pos).collect();
+        assert_eq!(got, want, "保留的恰是压力最高的前 2048 格");
+        assert_eq!(
+            s.voxel().get_block(BlockPos::new(64, -61, 64)),
+            voxel::builtin::AIR,
+            "压力最高的爆心格被保留破坏"
+        );
+        assert_eq!(
+            s.voxel().get_block(BlockPos::new(79, -61, 64)),
+            voxel::builtin::DIRT,
+            "压力最低的边缘格被截掉、不破坏"
+        );
+        assert!(
+            !s.collapse_triggers.contains(&BlockPos::new(79, -61, 64)),
+            "截掉的格不登记坍塌触发"
+        );
+    }
+
+    /// 修订 10 守卫:上限充裕时小爆炸完全不受影响——标准弹坑 60 格、24 脱落,
+    /// 遥测同口径。防"截断路径改变了不触发上限的爆炸"。
+    ///
+    /// 变红:截断排序无条件执行且排序不稳定,标准弹坑格集合被重排/少写。
+    #[test]
+    fn blast_cell_cap_generous_leaves_standard_crater_intact() {
+        let mut s = destruction_sim(64);
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        let out = s.take_outbox();
+        let t = out.destruction_stats;
+        assert_eq!(
+            (t.cells_blasted, t.pulverized, t.detached),
+            (60, 36, 24),
+            "标准弹坑不受上限影响"
+        );
+        assert_eq!(out.block_updates.len(), 60);
+        assert_eq!(out.detach_requests.len(), 24);
+    }
+
+    /// D7 与修订 10 的核内默认锚定:`enabled = true`(D7)、
+    /// `max_cells_per_explosion = 2048`(修订 10)。
+    ///
+    /// 变红:默认值回退(只改了 app 层、核内仍关;上限默认漂移)。
+    #[test]
+    fn destruction_defaults_anchor_d7_and_revision10() {
+        let d = crate::destruction::DestructionConfig::default();
+        assert!(d.enabled, "D7:默认开启");
+        assert_eq!(d.max_cells_per_explosion, 2048, "修订 10 默认上限");
+        assert!(
+            ShardSimConfig::new(shard_id(0, 0)).destruction.enabled,
+            "ShardSimConfig::new 继承开启默认"
         );
     }
 }

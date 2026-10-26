@@ -2055,7 +2055,6 @@ mod unit07 {
     /// 会变红的实现:只改了一处默认值(例如 app 开了而 `ShardSimConfig::new` 仍关);队列容量只改了 app 配置
     /// (直接用 `SchedulerConfig::default()` 的会话仍是 1024);新键没接进配置表。
     #[test]
-    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d7_defaults() {
         assert!(physics_sim::destruction::DestructionConfig::default().enabled);
         assert!(ShardSimConfig::new(shard(0)).destruction.enabled);
@@ -2093,7 +2092,6 @@ max_cells_per_explosion = 0
     ///
     /// 会变红的实现:上限没接线;截断按 BlockPos 而不是压力(会出现"中间完好、边缘被炸"的怪坑)。
     #[test]
-    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d13_blast_cell_cap() {
         let mut s = session(&[0], 2..=6);
         s.detonate(Vec3::new(64.0, -59.5, 64.0), 1000.0, 40.0)
@@ -2122,7 +2120,6 @@ max_cells_per_explosion = 0
     ///
     /// 会变红的实现:队列容量仍是 1024(本用例在第一拍就 panic)。
     #[test]
-    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d13_corner_blast_fits_envelope_queue() {
         let shards = [(0, 0), (1, 0), (0, 1), (1, 1)];
         let mut s = session2(&shards, 6..=9, 6..=9);
@@ -2150,7 +2147,6 @@ max_cells_per_explosion = 0
     ///
     /// 会变红的实现:涌现生成绕开了 `spawn_entity`(不签发运动票);碎块凝固后票据没有随实体结束。
     #[test]
-    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d9_debris_hold_transient_tickets() {
         let mut s = session(&[0], 2..=6);
         s.move_observer(Vec3::new(64.0, -50.0, 64.0))
@@ -2192,7 +2188,6 @@ max_cells_per_explosion = 0
     ///
     /// 会变红的实现:BlockWrite 信封的应用不登记坍塌触发(右半桥永远悬空);分片转换了副本格(重复)。
     #[test]
-    #[ignore = "REQ-009 单元 07 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d6_cross_shard_collapse_via_envelope() {
         let mut s = session(&[0, 1], 6..=9);
         let pa: Vec<BlockPos> = (-60..=-55).map(|y| BlockPos::new(122, y, 64)).collect();
