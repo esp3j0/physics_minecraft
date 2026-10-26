@@ -2491,6 +2491,78 @@ impl ShardSim {
                 .expect("handle 有效")
                 .apply_impulse(conv::vec3_to_rapier(impulse), true);
         }
+        // 地形破坏(REQ-009 §4.1):实施期间默认关闭(单元 07 D7 改开)。
+        // 实体冲量仍按原半径(REQ-001 §4.2 不变),地形求值在冲量之后。
+        if self.cfg.destruction.enabled {
+            self.detonate_terrain(center, power, radius);
+        }
+    }
+
+    /// 爆炸的地形求值与落写(REQ-009 §4.1–§4.3;纯函数 `evaluate_blast`,
+    /// 不经 rapier)。求值范围 = 本体区内(格坐标口径,同 `core_contains`)且
+    /// 所在 chunk 已装载的格;副本格不求值但已装载、射线照常衰减。同一拍多个
+    /// 爆炸按输入序依次求值,后一个看到前一个写过的 air(风险 4)。
+    ///
+    /// 被破坏的格当拍写 air(`Emergent`,复用凝固桥的涌现写入与副本同步路径)、
+    /// 重建所在 chunk collider、按 REQ-007 §4.11 登记地形变更唤醒;脱落格追加
+    /// `DetachRequest` 到 `Outbox.detach_requests`(整个 outbox 按 `BlockPos`
+    /// 升序;调度器 tick 末分配 ID、盖章 N+1 生成,单元 03)。本单元不生成实体。
+    fn detonate_terrain(&mut self, center: Vec3, power: f32, radius: f32) {
+        let min = self.cfg.shard.pos.min_chunk().block_min();
+        let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
+        let max_z = min.z + SHARD_CHUNKS * CHUNK_SIZE;
+        let in_scope = |p: BlockPos| p.x >= min.x && p.x < max_x && p.z >= min.z && p.z < max_z;
+        let block_at = |p: BlockPos| -> Option<BlockId> {
+            // 界外/未装载 → None:不求值、射线不衰减(§4.1)。
+            if !(types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&p.y)
+                || self.voxels.get_chunk(p.chunk_of()).is_none()
+            {
+                return None;
+            }
+            Some(self.voxels.get_block(p))
+        };
+        let cells = crate::destruction::evaluate_blast(
+            &block_at,
+            self.registry.as_ref(),
+            &in_scope,
+            center,
+            power,
+            radius,
+            self.cfg.destruction.attenuation,
+            self.cfg.destruction.max_debris_per_explosion,
+        );
+        if cells.is_empty() {
+            return;
+        }
+        let mut dirty: Vec<ChunkPos> = Vec::new();
+        for cell in cells {
+            let _ = self.voxels.set_block(cell.pos, BlockId::AIR);
+            self.outbox.block_updates.push(BlockWrite {
+                pos: cell.pos,
+                block: BlockId::AIR,
+                kind: BlockWriteKind::Emergent,
+            });
+            // §4.11 统一出口:冻结体脚下的格被炸掉 → 下一拍被唤醒。
+            self.register_terrain_write(cell.pos);
+            if let crate::destruction::CellFate::Detach { impulse } = cell.fate {
+                self.outbox
+                    .detach_requests
+                    .push(crate::destruction::DetachRequest {
+                        cell: cell.pos,
+                        block: cell.block,
+                        impulse,
+                    });
+            }
+            dirty.push(cell.pos.chunk_of());
+        }
+        // 细则 4/5 同款守卫:只重建已建 ②。
+        for cp in expand_boundary(dirty, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
+        // 多个爆炸拼接后仍保持整个 outbox 的 BlockPos 升序不变量。
+        self.outbox.detach_requests.sort_by_key(|req| req.cell);
     }
 
     /// 实体中心是否在本体区内(8×8 chunk,REQ-001 §4.1)。
@@ -5673,5 +5745,136 @@ mod tests {
             events.contact_wake_skipped_no_terrain, 0,
             "就绪后的唤醒不产生新的跳过计数(累计仍为 1)"
         );
+    }
+
+    // ---- REQ-009 单元 02:爆炸求值与粉碎(#18;生产路径接入 detonate)----
+
+    /// 风险 5(§4.11 落地确认):爆炸炸掉冻结体脚下的格 → 写入经统一出口
+    /// `register_terrain_write` 登记,下一拍 apply_activation 唤醒(免冷却)。
+    ///
+    /// 变红:detonate_terrain 不登记地形变更唤醒(pending 保持空,实体长眠);
+    /// 爆炸写入没有进 detonate(格还在)。
+    #[test]
+    fn detonate_terrain_write_wakes_frozen_actor_next_tick() {
+        let mut cfg = budget_cfg(16);
+        cfg.destruction.enabled = true;
+        // 先按 terrain_wake_under_frozen_actor 的已验证路径冻结(零重力悬停,
+        // 脚下无块);再重载带 dirt 脚下格 (56,65,56) 的 chunk——重载不触发
+        // 地形变更唤醒(写入路径才登记),冻结体也不因 ② 重建而醒。
+        let mut s = frozen_actor_at(cfg, Vec3::new(56.0, 66.5, 56.0), entity(1));
+        let mut ch = solid_chunk();
+        // chunk (3,3) 局部 (8,129,8) = 世界 (56,65,56)。
+        ch.set(8, 129, 8, voxel::builtin::DIRT);
+        s.load_chunk(ChunkPos::new(3, 3), ch);
+        assert!(is_frozen(&s, entity(1)), "前置:重载带 ② 的 chunk 不唤醒");
+        let below = BlockPos::new(56, 65, 56);
+        assert_eq!(
+            s.voxel().get_block(below),
+            voxel::builtin::DIRT,
+            "前置:脚下格是 dirt"
+        );
+        // 爆心在脚下格下方一格:P = 12·(1−1/8) = 10.5 > k·R = 4 → 粉碎。
+        s.apply_prefix(&[detonate_input(3, Vec3::new(56.5, 64.5, 56.5), 12.0, 8.0)]);
+        assert_eq!(
+            s.voxel().get_block(below),
+            voxel::builtin::AIR,
+            "脚下格被炸掉"
+        );
+        assert!(
+            s.pending_terrain_wakes.contains(&below),
+            "爆炸写入登记地形变更(§4.11 统一出口)"
+        );
+        assert!(is_frozen(&s, entity(1)), "登记拍不唤醒(下一拍才醒)");
+        s.apply_activation(&[MID]);
+        assert!(
+            !is_frozen(&s, entity(1)),
+            "下一拍被唤醒(地形变更唤醒,§4.11)"
+        );
+        assert!(
+            s.terrain_woken_this_tick.contains(&entity(1)),
+            "当拍记入地形唤醒集"
+        );
+    }
+
+    /// 风险 4(写入顺序):同一拍(两个 apply_prefix)先后两个爆炸,第二个
+    /// 看到第一个写过的 air——不重复破坏同一格,只破坏首爆未及的格。
+    ///
+    /// 变红:求值基于爆炸前的体素快照(两爆重叠格被写两次);第二个爆炸
+    /// 无效(没有增量格)。
+    #[test]
+    fn detonate_twice_same_tick_second_sees_first_air() {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for &(cx, cz) in &[(3i32, 3i32), (3, 4), (4, 3), (4, 4)] {
+            let cp = ChunkPos::new(cx, cz);
+            s.load_chunk(
+                cp,
+                voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+            );
+        }
+        let c = Vec3::new(64.0, -59.5, 64.0);
+        s.apply_prefix(&[detonate_input(1, c, 12.0, 8.0)]);
+        let first = s.take_outbox();
+        assert_eq!(first.block_updates.len(), 60, "首爆 = 标准弹坑(60 格)");
+        s.apply_prefix(&[detonate_input(2, c + Vec3::new(2.0, 0.0, 0.0), 12.0, 8.0)]);
+        let second = s.take_outbox();
+        let first_pos: BTreeSet<BlockPos> = first.block_updates.iter().map(|w| w.pos).collect();
+        let second_pos: BTreeSet<BlockPos> = second.block_updates.iter().map(|w| w.pos).collect();
+        assert!(
+            !second_pos.is_empty(),
+            "第二个爆炸破坏了首爆未及的格(爆心偏移 2 m)"
+        );
+        assert!(
+            first_pos.is_disjoint(&second_pos),
+            "同一格不被破坏两次(第二个爆炸看到前一个写过的 air)"
+        );
+        for w in &second.block_updates {
+            assert_eq!(
+                (w.block, w.kind),
+                (voxel::builtin::AIR, BlockWriteKind::Emergent)
+            );
+        }
+        for p in first_pos.union(&second_pos) {
+            assert_eq!(s.voxel().get_block(*p), voxel::builtin::AIR);
+        }
+    }
+
+    /// §4.3/§7 分片侧:`max_debris_per_explosion` 上限生效——坑的大小不变
+    /// (全部写 air),只有脱落请求数被截断;请求按 `BlockPos` 升序,记录
+    /// 原方块,冲量向上。
+    ///
+    /// 变红:上限把多出来的格直接丢掉不写 air(坑变小);请求顺序不对;
+    /// 冲量方向向下。
+    #[test]
+    fn detonate_detach_requests_capped_and_ascending() {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_debris_per_explosion = 5;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for &(cx, cz) in &[(3i32, 3i32), (3, 4), (4, 3), (4, 4)] {
+            let cp = ChunkPos::new(cx, cz);
+            s.load_chunk(
+                cp,
+                voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+            );
+        }
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        let out = s.take_outbox();
+        assert_eq!(out.block_updates.len(), 60, "上限只改去向,不改坑的大小");
+        assert_eq!(out.detach_requests.len(), 5, "脱落上限生效(标准弹坑 24)");
+        assert!(
+            out.detach_requests
+                .windows(2)
+                .all(|w| w[0].cell < w[1].cell),
+            "脱落请求按 BlockPos 升序"
+        );
+        for req in &out.detach_requests {
+            assert_eq!(req.block, voxel::builtin::DIRT, "脱落格记录原方块");
+            assert!(req.impulse.y > 0.0, "dir' 以向上为主");
+            assert_eq!(s.voxel().get_block(req.cell), voxel::builtin::AIR);
+        }
     }
 }

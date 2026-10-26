@@ -439,7 +439,10 @@ pub struct DriverOutcome {
 /// `lz4_flex` 压缩的 bincode 体」;解码先读前缀再解压,旧版本报
 /// `unsupported checkpoint format version N`(点名版本,不是解压失败)。
 /// v4 及更早档必须清 `data_dir`(与 REQ-005 D8 版本记录一致)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 5;
+/// **v6**(REQ-009 单元 02,#18):`ShardSimConfig` 追加 `destruction`、
+/// `Outbox` 追加 `detach_requests`——分片快照布局变化;v5 及更早档解码必
+/// 失败/版本拒绝,必须清 `data_dir`(与 REQ-005 D8 版本记录一致)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 6;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -2844,12 +2847,12 @@ mod tests {
     }
 
     /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
-    /// 常量已升 5(#17 D2;v4 时曾为 4);v3 编码(bundle 形状同构、版本号 3)
-    /// 必须显式版本拒绝。与 `old_checkpoint_version_rejected` ⑤ 相互独立:
-    /// 一个锚行为,一个锚常量。
+    /// 常量已升 6(REQ-009 单元 02;#17 D2 时曾为 5);v3 编码(bundle 形状
+    /// 同构、版本号 3)必须显式版本拒绝。与 `old_checkpoint_version_rejected`
+    /// ⑤ 相互独立:一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 5, "#17 D2 起 = v5");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 6, "REQ-009 单元 02 起 = v6");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -2868,15 +2871,15 @@ mod tests {
         }
     }
 
-    /// #17 Z2 对应单元:v5 编解码边界。
-    /// ① 编码 = 未压缩 varint 版本前缀(5 = 单字节 0x05)+ lz4 压缩体:
+    /// #17 Z2 对应单元:v6 编解码边界。
+    /// ① 编码 = 未压缩 varint 版本前缀(6 = 单字节 0x06)+ lz4 压缩体:
     ///    1 MB 全零日志确实被压缩;② 往返无损,两次/解码再编码逐字节相等
     ///    (AC-C9 同口径);③ 未压缩 bincode 的 v4 档(v4 起的真实磁盘字节
     ///    形状)报「unsupported checkpoint format version 4」——只有先读版本
     ///    再解压的实现才报得出版本错误(先解压的会报解压失败,本断言红);
     /// ④ 空输入/只有前缀/版本对但体乱码 → Err 不 panic。
     #[test]
-    fn checkpoint_v5_codec_boundaries() {
+    fn checkpoint_v6_codec_boundaries() {
         let mk = |format_version: u32| CheckpointBundle {
             format_version,
             world: sim_api::snapshot::WorldSnapshot {
@@ -2886,9 +2889,9 @@ mod tests {
             log_bytes: vec![0u8; 1_000_000],
             spawn_next_seq: 42,
         };
-        let v5 = mk(CHECKPOINT_FORMAT_VERSION);
-        let bytes = encode_checkpoint(&v5);
-        assert_eq!(bytes[0], 5, "前缀 = 未压缩 varint 版本(5 = 单字节)");
+        let v6 = mk(CHECKPOINT_FORMAT_VERSION);
+        let bytes = encode_checkpoint(&v6);
+        assert_eq!(bytes[0], 6, "前缀 = 未压缩 varint 版本(6 = 单字节)");
         assert!(
             bytes.len() < 50_000,
             "1 MB 全零日志应被压缩,实为 {} 字节",
@@ -2897,9 +2900,9 @@ mod tests {
         let back = decode_checkpoint(&bytes).expect("自有编码必可解码");
         assert_eq!(back.format_version, CHECKPOINT_FORMAT_VERSION);
         assert_eq!(back.world.shards.tick, types::Tick(7), "世界快照无损");
-        assert_eq!(back.log_bytes, v5.log_bytes, "日志无损");
+        assert_eq!(back.log_bytes, v6.log_bytes, "日志无损");
         assert_eq!(back.spawn_next_seq, 42, "高水位无损");
-        assert_eq!(encode_checkpoint(&v5), bytes, "两次编码逐字节相等");
+        assert_eq!(encode_checkpoint(&v6), bytes, "两次编码逐字节相等");
         assert_eq!(encode_checkpoint(&back), bytes, "解码再编码仍逐字节相等");
 
         // v4 档字节(未压缩 bincode,版本 4 在前)→ 版本错误,不是解压错误。

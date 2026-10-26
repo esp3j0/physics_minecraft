@@ -231,7 +231,6 @@ mod unit02 {
     /// 会变红的实现:漏掉起点或终点;对角穿角时跳过中间格或按 z、y、x 顺序步进;
     /// 负方向边界取错(差一格)。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d2_segment_cells_rule() {
         let b = BlockPos::new;
         assert_eq!(
@@ -260,7 +259,6 @@ mod unit02 {
     /// 会变红的实现:用球形模型(破坏 224);k 用 3;距离量到格角而不是格中心;射线把目标格自身算进
     /// 衰减;冲量用 `P − R` 或用爆心方向;返回顺序不是升序。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d2_flat_crater_matches_reference() {
         let cells = blast(&flat, CENTER, 12.0, 8.0, 48);
         assert_eq!(counts(&cells), (60, 36, 24));
@@ -289,10 +287,33 @@ mod unit02 {
         let weakest = cells
             .iter()
             .filter(|c| c.fate != CellFate::Pulverize)
-            .min_by(|a, b| a.pressure.total_cmp(&b.pressure))
-            .expect("有脱落格");
-        assert_eq!(weakest.pos, BlockPos::new(67, -61, 64));
-        assert!((weakest.pressure - 2.488648).abs() < 1e-5);
+            .map(|c| c.pressure)
+            .fold(f64::INFINITY, f64::min);
+        assert!((weakest - 2.488648).abs() < 1e-5, "{weakest}");
+        let ties: Vec<BlockPos> = cells
+            .iter()
+            .filter(|c| c.fate != CellFate::Pulverize && c.pressure == weakest)
+            .map(|c| c.pos)
+            .collect();
+        let b = BlockPos::new;
+        assert_eq!(
+            ties,
+            [
+                b(60, -61, 63),
+                b(60, -61, 64),
+                b(61, -61, 61),
+                b(61, -61, 66),
+                b(63, -61, 60),
+                b(63, -61, 67),
+                b(64, -61, 60),
+                b(64, -61, 67),
+                b(66, -61, 61),
+                b(66, -61, 66),
+                b(67, -61, 63),
+                b(67, -61, 64),
+            ],
+            "压力最低的 12 格逐位相等(坑缘对称位置),按 BlockPos 升序"
+        );
 
         assert_vec(
             debris_direction(Vec3::new(0.5, 5.0, 0.5), BlockPos::new(0, 0, 0)),
@@ -305,7 +326,6 @@ mod unit02 {
     ///
     /// 会变红的实现:不做射线衰减(墙后被炸);衰减把整面墙挡死(墙面也不掉);石头强度不是 6。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d2_walls_shield() {
         for t in [1, 3] {
             let world = with_wall(t);
@@ -337,7 +357,6 @@ mod unit02 {
     ///
     /// 会变红的实现:截断按 BlockPos 而不是压力;多出来的直接丢掉而不是粉碎(坑变小);同压力取后者。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d2_debris_cap() {
         let full = blast(&flat, CENTER, 12.0, 8.0, 48);
         let capped = blast(&flat, CENTER, 12.0, 8.0, 10);
@@ -362,7 +381,6 @@ mod unit02 {
     ///
     /// 会变红的实现:`in_scope` 之外的格也返回(跨片重复);把未装载当成实心(墙后被挡);半径不封顶。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d2_scope_unloaded_and_radius_cap() {
         let reg = SimpleRegistry::builtin();
         let edge = Vec3::new(128.0, -59.5, 64.0);
@@ -450,7 +468,6 @@ mod unit02 {
     /// 会变红的实现:没接进 `detonate`;写入标成 `External`(副本不同步);脱落格没写 air;脱落请求的
     /// 冲量与纯函数不同;开关不起作用。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d3_shard_sim_applies_blast() {
         let want = blast(&flat, CENTER, 12.0, 8.0, 48);
         let mut s = sim(0, 0, true, &square(2, 6, 2, 6));
@@ -510,7 +527,6 @@ mod unit02 {
     /// 会变红的实现:分片把扩张区副本格也写了(两边各 60、重复写);把副本格当成未装载
     /// (射线不衰减,结果与整体不同)。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d3_two_shards_each_write_own_core() {
         let edge = Vec3::new(128.0, -59.5, 64.0);
         let event = InputPayload::Event(CrossEvent::Detonate {
@@ -548,7 +564,6 @@ mod unit02 {
     ///
     /// 会变红的实现:布局变了却没升版本(旧档按 v5 解码会读出错位数据或报非版本错误)。
     #[test]
-    #[ignore = "REQ-009 单元 02 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d10_checkpoint_version_is_v6() {
         assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 6);
     }
