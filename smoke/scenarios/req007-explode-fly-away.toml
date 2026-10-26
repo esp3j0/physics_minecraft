@@ -31,7 +31,7 @@ detonate = { nearest = true, power = 12.0, radius = 8.0 }
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "after-blast", expect = "画面中部的地面附近有若干蓝色立方体(尚未凝固的活实体),彼此分开、位置零散" }
+screenshot = { name = "after-blast", expect = "画面中部的地面上有一个刚炸出的浅坑,坑口周围散落着许多蓝色立方体(尚未凝固的活实体:生成的方块与炸松的土块),可能有不少紧贴在一起" }
 
 [[step]]
 label = "飞到 80 m 外"
@@ -57,4 +57,4 @@ check = { live_entities = { eq = 0 }, no_floating = { height = 1.5, still_ticks 
 wait_ticks = { n = 30 }
 
 [[step]]
-screenshot = { name = "return", expect = "棕色地面上散落着若干凝固的方块(灰色,以及爆炸炸松后落定的棕色土块),可能有一个浅坑;空中没有任何蓝色立方体,也没有悬浮的方块" }
+screenshot = { name = "return", expect = "棕色地面上可能有少量凝固的灰色方块(其余已飞出画面);炸松的土块落回坑里凝固,地面可能已基本填平,也可能留有浅坑或少量凸起的棕色土块;空中没有任何蓝色立方体,也没有悬浮的方块" }

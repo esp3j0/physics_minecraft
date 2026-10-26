@@ -1,6 +1,6 @@
 # REQ-009:地形破坏与结构坍塌——爆炸与撞击破坏方块、脱落成实体、悬空结构塌落
 
-- 状态:**已定稿**(2026-10-25 用户拍板 D1–D7 全部按推荐;2026-10-26 修订 1 按 demo 回写默认值与条文,见文末 demo 记录;同日修订 2 补齐单元 02 的求值细则、修订 3 补齐单元 03 的生成细则、修订 4 拆分单元 04 并定稿坍塌求值规格、修订 5 补齐单元 04b 的接入细则、修订 6 定稿配置表与遥测口径、修订 7 按 spike 定稿撞击破坏、修订 8 撞击碎块改为零初速、修订 9 撞击须有接近速度、修订 10 单次爆炸格数上限与跨片信封队列容量)
+- 状态:**已完成**(2026-10-26 总架构师终审通过,见文末迁移清单;以下为定稿与修订记录:2026-10-25 用户拍板 D1–D7 全部按推荐;2026-10-26 修订 1 按 demo 回写默认值与条文,见文末 demo 记录;同日修订 2 补齐单元 02 的求值细则、修订 3 补齐单元 03 的生成细则、修订 4 拆分单元 04 并定稿坍塌求值规格、修订 5 补齐单元 04b 的接入细则、修订 6 定稿配置表与遥测口径、修订 7 按 spike 定稿撞击破坏、修订 8 撞击碎块改为零初速、修订 9 撞击须有接近速度、修订 10 单次爆炸格数上限与跨片信封队列容量)
 - 提出日期:2026-10-25
 - 上游:
   - [REQ-001](REQ-001-architecture.md)(§4.2 跨片事件与涌现事件 N+1 盖章;§9.12 冻结体对事件免疫)
@@ -373,6 +373,40 @@ README 所说"原版没有的物理"(结构坍塌等)的第一步。
 
 ## 迁移清单(阶段 3 填写)
 
-- [ ] 验收标准逐条落成测试
-- [ ] `cargo test --workspace` / clippy / fmt 全绿
-- [ ] 图形冒烟场景经 `cargo xtask smoke` 机器检查全部通过,报告经总架构师复核
+- [x] 验收标准逐条落成测试:43 条 `acc_d*`(e2e `crates/e2e/tests/req009_acceptance.rs` 40 条,
+  viewer `crates/viewer/tests/req009_acceptance.rs` 3 条),对应关系:
+
+  | AC | 用例 |
+  | --- | --- |
+  | AC-D1 材料表 | `acc_d1_builtin_materials`、`acc_d1_register_defaults_and_custom_material`、`acc_d1_world_bottom_is_bedrock`;viewer `acc_d1_fill_parse`、`acc_d1_fill_engine_batches`、`acc_d1_block_colors` |
+  | AC-D2 爆炸求值 | `acc_d2_segment_cells_rule`、`acc_d2_flat_crater_matches_reference`、`acc_d2_walls_shield`、`acc_d2_debris_cap`、`acc_d2_scope_unloaded_and_radius_cap` |
+  | AC-D3 owner 求值与跨片 | `acc_d3_shard_sim_applies_blast`、`acc_d3_two_shards_each_write_own_core` |
+  | AC-D4 脱落实体 | `acc_d4_detach_spawn_state`、`acc_d4_spawned_next_tick_with_emergent_ids`、`acc_d4_pending_spawns_survive_snapshot_and_replay`、`acc_d4_debris_settles_and_solidifies` |
+  | AC-D5 坍塌 | `acc_d5_bridge_needs_both_pillars`、`acc_d5_cantilever_and_tower`、`acc_d5_platform_and_limits`、`acc_d5_open_ground_is_cheap`、`acc_d5_unloaded_counts_as_anchor`、`acc_d5_sand_rules`、`acc_d5_bridge_collapse_end_to_end`、`acc_d5_sand_column_end_to_end`、`acc_d5_world_top_is_not_anchor`、`acc_d5_disabled_no_collapse` |
+  | AC-D6 跨片坍塌 | `acc_d6_cross_shard_bridge`、`acc_d6_cross_shard_collapse_via_envelope` |
+  | AC-D7 上限与降级 | `acc_d7_per_tick_cap`、`acc_d7_collapse_deferred_and_snapshot`、`acc_d7_defaults`;单次爆炸脱落上限见 `acc_d2_debris_cap` |
+  | AC-D8 撞击 | `acc_d8_fast_drop_breaks_by_material`、`acc_d8_rest_and_gentle_drop_never_break`、`acc_d8_impact_cap` |
+  | AC-D9 与 REQ-007 衔接 | `acc_d9_debris_hold_transient_tickets`;冻结体脚下被炸空后下一拍唤醒由 `physics-sim` 单测 `detonate_terrain_write_wakes_frozen_actor_next_tick` 锚定;碎块落地凝固见 `acc_d4_debris_settles_and_solidifies` |
+  | AC-D10 回放与 v6 | `acc_d10_checkpoint_version_is_v6`、`acc_d10_checkpoint_roundtrip_replay` |
+  | AC-D11 配置与遥测 | `acc_d11_destruction_config_table`、`acc_d11_blast_telemetry`、`acc_d11_collapse_telemetry` |
+  | AC-D12 图形冒烟 | `cargo xtask smoke` 实跑(见下) |
+  | AC-D13 回归与修订 10 | `acc_d13_blast_cell_cap`、`acc_d13_corner_blast_fits_envelope_queue`、`acc_d5_disabled_no_collapse`;全仓门禁(见下) |
+
+- [x] `cargo test --workspace` / clippy / fmt 全绿(单元 07 [31cffe7](https://github.com/esp3j0/physics_minecraft/commit/31cffe7),
+  CI [40374112924](https://github.com/esp3j0/physics_minecraft/actions/runs/40374112924):40 条 e2e 与 3 条 viewer 验收用例全部 `ok`)
+- [x] §9 迁移:默认开启后全仓只有 3 处变红,均按授权处理——app 配置单测两条钉死旧默认值的断言
+  (`destruction.enabled` 改为 true、`envelope_queue_capacity` 1024 改为 8192)、`physics-sim` 单测
+  `collapse_disabled_is_inert` 在装配处显式关闭破坏(断言零改动);REQ-007 轨迹、回放类用例未受影响;
+  `superflat_layers_match_table`(底层 bedrock)与 `builtin_ids_are_stable`(追加 3、4)在单元 01 已迁移;
+  `req007-explode-fly-away` 场景的地形检查改为基岩格(7d3824a),两张截图期望改为默认开启后的画面(终审提交)
+- [x] 图形冒烟场景经 `cargo xtask smoke` 机器检查全部通过,报告经总架构师复核(2026-10-26 总架构师本机实跑,
+  带 AI:7 个场景机器检查全部通过,校准 5/5 判对,14 张截图 13 张判通过;唯一待复核的
+  `req007-explode-fly-away/08-after-blast.png` 经复核是场景期望过时——默认开启后爆炸炸出浅坑、坑缘堆满蓝色碎块,
+  而期望仍写"彼此分开、位置零散";改期望后单独重跑,2 张截图均判通过、0 张待复核。截图逐张亲自看过)
+
+提交:[0e05930](https://github.com/esp3j0/physics_minecraft/commit/0e05930) 草案;[3ecb8f1](https://github.com/esp3j0/physics_minecraft/commit/3ecb8f1) 拍板;
+[824b02d](https://github.com/esp3j0/physics_minecraft/commit/824b02d) demo;[d85e450](https://github.com/esp3j0/physics_minecraft/commit/d85e450) 修订 1;
+[5b38401](https://github.com/esp3j0/physics_minecraft/commit/5b38401) 单元 01;[be2caa4](https://github.com/esp3j0/physics_minecraft/commit/be2caa4) 单元 02;
+[ebe57be](https://github.com/esp3j0/physics_minecraft/commit/ebe57be) 单元 03;[0b8372c](https://github.com/esp3j0/physics_minecraft/commit/0b8372c) 单元 04a;
+[c8d7f92](https://github.com/esp3j0/physics_minecraft/commit/c8d7f92) 单元 04b;[1189ce5](https://github.com/esp3j0/physics_minecraft/commit/1189ce5) 单元 05;
+[a7c8d96](https://github.com/esp3j0/physics_minecraft/commit/a7c8d96) 单元 06;[31cffe7](https://github.com/esp3j0/physics_minecraft/commit/31cffe7) 单元 07。
