@@ -415,8 +415,7 @@ impl ShardSim {
     ///
     /// **总架构师接口桩(REQ-009 单元 03)**:由实施方实现。
     pub fn entity_desc(&self, id: EntityId) -> Option<EntityDesc> {
-        let _ = id;
-        unimplemented!("REQ-009 单元 03:由实施方实现")
+        self.entities.get(&id).map(|rec| rec.desc)
     }
 
     /// 实体当前状态;不存在(已迁移/已凝固)返回 None。
@@ -2514,7 +2513,12 @@ impl ShardSim {
     /// 被破坏的格当拍写 air(`Emergent`,复用凝固桥的涌现写入与副本同步路径)、
     /// 重建所在 chunk collider、按 REQ-007 §4.11 登记地形变更唤醒;脱落格追加
     /// `DetachRequest` 到 `Outbox.detach_requests`(整个 outbox 按 `BlockPos`
-    /// 升序;调度器 tick 末分配 ID、盖章 N+1 生成,单元 03)。本单元不生成实体。
+    /// 升序;调度器 tick 末分配 ID、盖章 N+1 生成,单元 03)。
+    ///
+    /// 每拍上限由分片执行(§7 单元 03 细则):脱落上限取
+    /// `min(max_debris_per_explosion, max_detach_per_tick − 本拍已有脱落请求数)`
+    /// (不足 0 取 0)——同一拍多次爆炸按输入序共用 `max_detach_per_tick` 名额,
+    /// 超出部分按 §4.3 的规则改为粉碎(格照样写 air)。
     fn detonate_terrain(&mut self, center: Vec3, power: f32, radius: f32) {
         let min = self.cfg.shard.pos.min_chunk().block_min();
         let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
@@ -2537,7 +2541,13 @@ impl ShardSim {
             power,
             radius,
             self.cfg.destruction.attenuation,
-            self.cfg.destruction.max_debris_per_explosion,
+            // §7 每拍上限由分片执行:单爆上限与本拍剩余名额取小(不足 0 取 0)。
+            self.cfg.destruction.max_debris_per_explosion.min(
+                self.cfg
+                    .destruction
+                    .max_detach_per_tick
+                    .saturating_sub(self.outbox.detach_requests.len()),
+            ),
         );
         if cells.is_empty() {
             return;
@@ -5884,5 +5894,113 @@ mod tests {
             assert!(req.impulse.y > 0.0, "dir' 以向上为主");
             assert_eq!(s.voxel().get_block(req.cell), voxel::builtin::AIR);
         }
+    }
+
+    /// §7 单元 03:`entity_desc` 透传生成时的描述(凝固桥/验收观测面);
+    /// 未知实体(已凝固/不存在)→ None。
+    ///
+    /// 变红:返回默认描述(0.5/stone)而非实体自己的。
+    #[test]
+    fn entity_desc_returns_spawned_desc_and_none_for_unknown() {
+        let mut s = sim(0, 0);
+        let id = entity(1);
+        let desc = EntityDesc {
+            half_size: 0.45,
+            block: voxel::builtin::DIRT,
+        };
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState::default(),
+                desc,
+            }),
+        }]);
+        assert_eq!(s.entity_desc(id), Some(desc), "透传生成时的描述");
+        assert_eq!(s.entity_desc(entity(2)), None, "未知实体 → None");
+    }
+
+    /// §7 每拍上限由分片执行:同一拍两次爆炸按输入序共用
+    /// `max_detach_per_tick` 名额——先到的取满,后到的只剩余额;超限的格
+    /// 改粉碎但照样写 air(坑不变小)。
+    ///
+    /// 变红:上限只按单次爆炸计(两次各 24 = 48 个请求);超限的格不写 air。
+    #[test]
+    fn detonate_per_tick_cap_shared_across_explosions() {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_detach_per_tick = 30;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        let center = Vec3::new(64.0, -59.5, 64.0);
+        let far = Vec3::new(64.0, -59.5, 96.0);
+        s.apply_prefix(&[
+            detonate_input(1, center, 12.0, 8.0),
+            detonate_input(2, far, 12.0, 8.0),
+        ]);
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests.len(),
+            30,
+            "两爆合计 30 = 24 + 6(输入序消耗名额)"
+        );
+        assert!(
+            out.detach_requests
+                .windows(2)
+                .all(|w| w[0].cell < w[1].cell),
+            "整个 outbox 保持 BlockPos 升序"
+        );
+        assert_eq!(
+            out.detach_requests.iter().filter(|r| r.cell.z < 80).count(),
+            24,
+            "先到的爆炸占满 24 个名额"
+        );
+        assert_eq!(
+            out.detach_requests.iter().filter(|r| r.cell.z > 80).count(),
+            6,
+            "后到的爆炸只剩 6 个名额"
+        );
+        assert_eq!(
+            out.block_updates.len(),
+            120,
+            "两个标准弹坑 60 + 60 全部写 air(坑不变小)"
+        );
+    }
+
+    /// §7 名额耗尽:剩余名额取 0(不足 0 取 0)→ 全部改粉碎,坑照样写
+    /// air、无脱落请求。
+    ///
+    /// 变红:上限下探为负/panic;或超限格不写 air。
+    #[test]
+    fn detonate_per_tick_cap_exhausted_still_writes_air() {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_detach_per_tick = 0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 0, "名额 0 → 无脱落请求");
+        assert_eq!(out.block_updates.len(), 60, "坑照样写 air");
     }
 }

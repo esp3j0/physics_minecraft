@@ -186,6 +186,12 @@ pub struct SchedulerSnapshot {
     pub lifecycles: BTreeMap<ShardId, LifecycleSnapshot>,
     /// 下一个涌现实体序号(REQ-009 §7:`EntityId::from_parts(EMERGENT_ORIGIN, seq)`,从 1 起)。
     pub next_emergent_seq: u32,
+    /// 待生效的涌现实体生成盖章输入(REQ-009 §7:tick N 末分配、N+1 生效;
+    /// `(目的分片, 盖章输入)`,按分配序 = canonical 序存放)。
+    /// **不进外部命令日志**(回放时由模拟重新产生),随本快照恢复——
+    /// 路由收件箱不在 `RouterSnapshot` 里(外部命令由日志回放,不可整体入
+    /// 快照,否则重放双投),故单独成字段(v6 布局内追加)。
+    pub pending_emergent_spawns: Vec<(ShardId, StampedInput)>,
 }
 
 /// 固定 worker 池调度器(OS 线程 + capacity-one 通道 + 每拍全员汇合屏障)。
@@ -248,6 +254,10 @@ pub struct Scheduler {
     /// canonical 序(分片 `ShardId` 升序、请求 `BlockPos` 升序)分配 ID 并盖章 N+1 生成,
     /// 由实施方实现。
     next_emergent_seq: u32,
+    /// 待生效的涌现实体生成盖章输入(REQ-009 §7;与 [`SchedulerSnapshot::
+    /// pending_emergent_spawns`] 同物:tick N 末屏障阶段分配,下一拍并入
+    /// 目的分片的输入前缀;不入外部命令日志,随调度器快照恢复)。
+    pending_emergent_spawns: Vec<(ShardId, StampedInput)>,
     /// chunk 持有表(REQ-005 D2/D4):`(owner, chunk) → holder 集合`。
     /// owner 是纯函数(`owner_of`);本表随 apply_chunk_load/unload 维护,
     /// 不入快照(恢复时 rebuild_holders 重建)。
@@ -302,6 +312,7 @@ impl Scheduler {
             block_updates: Vec::new(),
             despawn_requests: BTreeSet::new(),
             next_emergent_seq: 1,
+            pending_emergent_spawns: Vec::new(),
             chunk_holders: crate::chunks::ChunkHolders::new(),
             entity_ownership: EntityOwnership::new(),
             cfg,
@@ -1519,6 +1530,24 @@ impl Scheduler {
         // 2+3. 按 ShardId 升序取本拍前缀(BTreeMap into_iter 即升序),
         //      静态轮转分配 WorkerSlot:每分配一个分片后游标 +1 取模。
         //      把整表移出:sim 所有权离开调度器,屏障后才回来(AC5)。
+        //      到拍的涌现生成盖章输入(REQ-009 §7)并入各目的分片的前缀,
+        //      与外部命令按 canonical 序合并(盖的是 at+1,正常只可能"到拍",
+        //      过期 = 内部状态损坏 fail-stop)。
+        let mut due_spawns: BTreeMap<ShardId, Vec<StampedInput>> = BTreeMap::new();
+        let mut kept_spawns: Vec<(ShardId, StampedInput)> = Vec::new();
+        for (dest, input) in std::mem::take(&mut self.pending_emergent_spawns) {
+            if input.apply_at == at {
+                due_spawns.entry(dest).or_default().push(input);
+            } else if input.apply_at < at {
+                panic!(
+                    "涌现生成盖章输入过期(apply_at {} < 当前拍 {}):内部状态损坏(fail-stop)",
+                    input.apply_at.0, at.0
+                );
+            } else {
+                kept_spawns.push((dest, input));
+            }
+        }
+        self.pending_emergent_spawns = kept_spawns;
         let sims = std::mem::take(&mut self.sims);
         let stepped_shards = sims.len();
         let mut slots: Vec<WorkerJob> = (0..self.cfg.worker_count).map(|_| Vec::new()).collect();
@@ -1526,7 +1555,11 @@ impl Scheduler {
         // 空片判定要留证:前缀非空的分片集合(步骤 7 用,屏障后 prefix 已消耗)。
         let mut had_prefix: BTreeSet<ShardId> = BTreeSet::new();
         for (shard, sim) in sims {
-            let prefix = self.router.dispatch_prefix(shard, at);
+            let mut prefix = self.router.dispatch_prefix(shard, at);
+            if let Some(spawns) = due_spawns.remove(&shard) {
+                prefix.extend(spawns);
+                prefix.sort_by_key(|input| input.canonical_key());
+            }
             if !prefix.is_empty() {
                 had_prefix.insert(shard);
             }
@@ -1571,7 +1604,7 @@ impl Scheduler {
         self.solidified.clear();
         // 方块写入收集(REQ-005 D11):同款恰一次;owner 过滤逐条判定。
         self.block_updates.clear();
-        for (shard, (sim, outbox, shard_events)) in results {
+        for (shard, (sim, mut outbox, shard_events)) in results {
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -1583,6 +1616,37 @@ impl Scheduler {
             events.closure_deferred += shard_events.closure_deferred;
             events.contact_wake_skipped_no_terrain += shard_events.contact_wake_skipped_no_terrain;
             events.actor_motion_capped += shard_events.actor_motion_capped;
+            // 涌现生成盖章(REQ-009 §7;单元 03):本分片的脱落请求按
+            // `BlockPos` 升序(sim 侧已排序,此处钉住不变量)依次分配
+            // `EntityId::from_parts(EMERGENT_ORIGIN, seq)`(用后 +1,u32
+            // 用尽 = 内部错误 fail-stop),`detach_spawn` 得生成状态与描述,
+            // 盖章 N+1 生效的 `SpawnDynamic`(来源 `InputSource::SCHEDULER`;
+            // 序列号用 seq——全局唯一、单调,canonical 序 = 分配序)。分配
+            // 只依赖 canonical 序:results 是 BTreeMap,按 ShardId 升序迭代,
+            // 与 worker 回传完成顺序无关(风险 1)。生成输入不进外部命令日志
+            //(回放时由模拟重新产生),挂起待 N+1 并入目的分片前缀。
+            let mut requests = std::mem::take(&mut outbox.detach_requests);
+            requests.sort_by_key(|req| req.cell);
+            for req in requests {
+                let seq = self.next_emergent_seq;
+                self.next_emergent_seq = seq.checked_add(1).unwrap_or_else(|| {
+                    panic!("涌现 ID 计数器溢出(u32 用尽,seq = {seq}):内部错误 fail-stop")
+                });
+                let (state, desc) = physics_sim::destruction::detach_spawn(&req);
+                self.pending_emergent_spawns.push((
+                    shard,
+                    StampedInput {
+                        apply_at: Tick(at.0 + 1),
+                        source: InputSource::SCHEDULER,
+                        sequence: u64::from(seq),
+                        payload: InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                            entity: EntityId::from_parts(types::EMERGENT_ORIGIN, seq),
+                            state,
+                            desc,
+                        }),
+                    },
+                ));
+            }
             match self.router.collect_intents(shard, &outbox.migrations, at) {
                 Ok(()) => migrations_admitted += outbox.migrations.len(),
                 // TODO(反压):队列满当前的策略是 fail-stop;后续轮次接入
@@ -2120,6 +2184,7 @@ impl Scheduler {
                 .map(|(shard, lc)| (*shard, lc.snapshot()))
                 .collect(),
             next_emergent_seq: self.next_emergent_seq,
+            pending_emergent_spawns: self.pending_emergent_spawns.clone(),
         }
     }
 
@@ -2160,10 +2225,21 @@ impl Scheduler {
                 );
             }
         }
+        for (dest, _) in &snap.pending_emergent_spawns {
+            if !self.sims.contains_key(dest) {
+                panic!(
+                    "快照涌现生成目的地 {dest:?} 未注册(快照时刻待生效生成输入的\
+                     目的分片必须已在快照分片集内,内部状态损坏,fail-stop)"
+                );
+            }
+        }
         // 观察者表整表替换(快照是 checkpoint 时刻兜底;日志是其后权威)。
         self.observer_table = snap.observers;
         self.observers_ever_set = snap.observers_ever_set;
         self.next_emergent_seq = snap.next_emergent_seq;
+        // 待生效生成输入整表替换(N 与 N+1 之间快照的真相;不恢复 = 恢复线
+        // 少生成一批实体,REQ-009 §7 回放等价)。
+        self.pending_emergent_spawns = snap.pending_emergent_spawns;
         // 票据表整表替换(REQ-007 任务 02;区域票 Set/Remove 照常入日志回放,
         // 快照是兜底)。
         self.tickets = snap.tickets;
@@ -5900,5 +5976,289 @@ mod tests {
         let mut sched = Scheduler::new(sched_cfg(1));
         sched.register(s0);
         sched.register(s1); // rebuild 全量时发现重复
+    }
+
+    /// 破坏开启的分片:平地 chunk (2..=6, 2..=6) 已装载。
+    fn destruction_sim(x: i32, z: i32) -> ShardSim {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.destruction.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = types::ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s
+    }
+
+    fn detonate_cmd(center: types::glam::Vec3) -> InputPayload {
+        InputPayload::Command(messaging::SimCommand::Detonate {
+            center,
+            power: 12.0,
+            radius: 8.0,
+        })
+    }
+
+    /// REQ-009 §7(单元 03):tick N 屏障阶段按 canonical 序分配涌现 ID、
+    /// 盖章 N+1 生效的 `SpawnDynamic`(SCHEDULER 来源;序列号 = seq);N 拍
+    /// 无实体;N+1 实体出现,ID/描述正确,ownership 接管。
+    ///
+    /// 变红:当拍就生成;ID 从 0 起或按反序;apply_at 用 N;来源用外部;
+    /// 计数器不递增(下一拍重复 ID fail-stop)。
+    #[test]
+    fn emergent_spawns_stamped_and_applied_next_tick() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let shard = shard_id(0, 0);
+        sched.register(destruction_sim(0, 0));
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: Tick::ZERO,
+                    source: InputSource(1),
+                    sequence: 0,
+                    payload: detonate_cmd(types::glam::Vec3::new(64.0, -59.5, 64.0)),
+                },
+            )
+            .expect("收件箱未满");
+        sched.tick();
+        // 屏障后:24 条盖章输入待 N+1 生效;N 拍无涌现实体。
+        assert_eq!(sched.pending_emergent_spawns.len(), 24, "标准弹坑脱落 24");
+        for (k, (dest, input)) in sched.pending_emergent_spawns.iter().enumerate() {
+            assert_eq!(*dest, shard, "发回产出分片");
+            assert_eq!(input.apply_at, Tick(1), "N+1 生效");
+            assert_eq!(input.source, InputSource::SCHEDULER, "调度器来源");
+            assert_eq!(input.sequence, u64::from(k as u32 + 1), "序列号 = seq");
+            let InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity,
+                state,
+                desc,
+            }) = &input.payload
+            else {
+                panic!("应为 SpawnDynamic:实际 {input:?}");
+            };
+            assert_eq!(
+                *entity,
+                EntityId::from_parts(types::EMERGENT_ORIGIN, k as u32 + 1),
+                "ID 按 canonical 序从 1 起编"
+            );
+            assert_eq!(desc.block, voxel::builtin::DIRT, "描述 = 原方块");
+            assert!((desc.half_size - 0.45).abs() < 1e-6, "半边长 0.45");
+            assert!(state.linvel.y > 0.0, "dir' 以向上为主");
+        }
+        assert!(
+            sched
+                .entity_states(shard)
+                .expect("分片已注册")
+                .iter()
+                .all(|(id, _)| id.origin_shard() != types::EMERGENT_ORIGIN),
+            "N 拍还没有涌现实体"
+        );
+        // N+1:实体出现,ID/归属正确。
+        sched.tick();
+        let emergent: Vec<_> = sched
+            .entity_states(shard)
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == types::EMERGENT_ORIGIN)
+            .collect();
+        assert_eq!(emergent.len(), 24, "N+1 全部生成");
+        assert_eq!(
+            emergent[0].0,
+            EntityId::from_parts(types::EMERGENT_ORIGIN, 1)
+        );
+        assert!(
+            sched.entities_of(shard).contains(&emergent[0].0),
+            "ownership 接管"
+        );
+        sched.shutdown();
+    }
+
+    /// REQ-009 §7:N 与 N+1 之间取快照(分片 + 调度器),恢复线 tick 生成
+    /// 逐位相同的实体(待生效盖章输入 + 计数器随调度器快照)。
+    ///
+    /// 变红:pending_emergent_spawns 不入快照(恢复线 0 个实体);计数器
+    /// 不恢复(恢复线第二次爆炸从 1 重新编号)。
+    #[test]
+    fn emergent_pending_spawns_survive_snapshot() {
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(destruction_sim(0, 0));
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: Tick::ZERO,
+                    source: InputSource(1),
+                    sequence: 0,
+                    payload: detonate_cmd(types::glam::Vec3::new(64.0, -59.5, 64.0)),
+                },
+            )
+            .expect("收件箱未满");
+        sched.tick();
+        let sim_bytes = sched.snapshot_shard(shard).expect("分片已注册");
+        let snap = sched.snapshot_state();
+        assert!(
+            !snap.pending_emergent_spawns.is_empty(),
+            "待生效输入在快照里"
+        );
+        assert_eq!(snap.next_emergent_seq, 25, "计数器已推进");
+
+        // 恢复线:分片快照 + 调度器状态恢复 → tick 生成相同实体。
+        // start_tick 对齐快照拍(与 replay_world 同口径)。
+        let mut sched2 = Scheduler::new(SchedulerConfig {
+            start_tick: snap.tick,
+            ..sched_cfg(2)
+        });
+        sched2.register(
+            ShardSim::restore(&sim_bytes, Box::new(SimpleRegistry::builtin()))
+                .expect("自有快照必可恢复"),
+        );
+        sched2.restore_state(snap);
+        sched.tick();
+        sched2.tick();
+        let a = sched.entity_states(shard).expect("分片已注册");
+        let b = sched2.entity_states(shard).expect("分片已注册");
+        assert_eq!(a, b, "恢复线生成逐位相同的实体(含 ID 与状态)");
+        assert_eq!(
+            a.iter()
+                .filter(|(id, _)| id.origin_shard() == types::EMERGENT_ORIGIN)
+                .count(),
+            24,
+            "24 个涌现实体"
+        );
+        // 计数器等位:两线各炸一次,ID 从 25 接着编,仍逐位相同。
+        for sched in [&mut sched, &mut sched2] {
+            sched
+                .submit(
+                    shard,
+                    StampedInput {
+                        apply_at: Tick(2),
+                        source: InputSource(1),
+                        sequence: 1,
+                        payload: detonate_cmd(types::glam::Vec3::new(64.0, -59.5, 96.0)),
+                    },
+                )
+                .expect("收件箱未满");
+            sched.tick(); // 拍 2:第二次爆炸求值
+            sched.tick(); // 拍 3:第二批生成
+        }
+        let a = sched.entity_states(shard).expect("分片已注册");
+        let b = sched2.entity_states(shard).expect("分片已注册");
+        assert_eq!(a, b, "第二次爆炸后两线仍逐位相同");
+        assert!(
+            a.iter()
+                .any(|(id, _)| *id == EntityId::from_parts(types::EMERGENT_ORIGIN, 25)),
+            "新 ID 从 25 接着编"
+        );
+        sched.shutdown();
+        sched2.shutdown();
+    }
+
+    /// REQ-009 §7 风险 1:分配顺序只依赖 canonical 序——两分片同拍产出时,
+    /// `ShardId` 升序分配(results 是 BTreeMap,与 worker 回传完成顺序无关)。
+    ///
+    /// 变红:按回传顺序分配(两分片分配互换);或每分片各自从 1 起编。
+    #[test]
+    fn emergent_allocation_follows_shard_id_order() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let a = shard_id(0, 0);
+        let b = shard_id(1, 0);
+        sched.register(destruction_sim(0, 0));
+        // 分片 B 覆盖 chunk x ∈ [8,16):装载其上的平地,爆心 x=160。
+        let sim_b = {
+            use voxel::WorldGenerator;
+            let mut cfg = ShardSimConfig::new(b);
+            cfg.destruction.enabled = true;
+            let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+            for cx in 9..=11i32 {
+                for cz in 3..=5i32 {
+                    let cp = types::ChunkPos::new(cx, cz);
+                    s.load_chunk(
+                        cp,
+                        voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                    );
+                }
+            }
+            s
+        };
+        sched.register(sim_b);
+        for (shard, cx0) in [(a, 64.0f32), (b, 160.0f32)] {
+            sched
+                .submit(
+                    shard,
+                    StampedInput {
+                        apply_at: Tick::ZERO,
+                        source: InputSource(1),
+                        sequence: 0,
+                        payload: detonate_cmd(types::glam::Vec3::new(cx0, -59.5, 64.0)),
+                    },
+                )
+                .expect("收件箱未满");
+        }
+        sched.tick();
+        let pending = sched.pending_emergent_spawns.clone();
+        assert_eq!(pending.len(), 48, "两片各 24");
+        let seqs: Vec<u32> = pending
+            .iter()
+            .map(|(_, input)| match &input.payload {
+                InputPayload::Command(messaging::SimCommand::SpawnDynamic { entity, .. }) => {
+                    entity.local_seq()
+                }
+                _ => panic!("应为 SpawnDynamic"),
+            })
+            .collect();
+        assert_eq!(seqs, (1u32..=48).collect::<Vec<_>>(), "全局连续编号,无重复");
+        assert!(
+            pending[..24].iter().all(|(dest, _)| *dest == a),
+            "ShardId 升序:分片 A 先分配"
+        );
+        assert!(
+            pending[24..].iter().all(|(dest, _)| *dest == b),
+            "分片 B 后分配"
+        );
+        // N+1:两片各自生成自己的 24 个,ID 段正确。
+        sched.tick();
+        for (shard, lo) in [(a, 1u32), (b, 25)] {
+            let emergent: Vec<EntityId> = sched
+                .entity_states(shard)
+                .expect("分片已注册")
+                .into_iter()
+                .map(|(id, _)| id)
+                .filter(|id| id.origin_shard() == types::EMERGENT_ORIGIN)
+                .collect();
+            assert_eq!(emergent.len(), 24);
+            assert_eq!(emergent[0].local_seq(), lo, "各片拿到自己的 ID 段");
+        }
+        sched.shutdown();
+    }
+
+    /// REQ-009 §7:计数器溢出(u32 用尽)= 内部错误 fail-stop。
+    ///
+    /// 变红:溢出被 wrapping 回绕(ID 复用,违反"单调不复用")。
+    #[test]
+    #[should_panic(expected = "涌现 ID 计数器溢出")]
+    fn emergent_seq_overflow_fails_stop() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let shard = shard_id(0, 0);
+        sched.register(destruction_sim(0, 0));
+        sched.next_emergent_seq = u32::MAX;
+        sched
+            .submit(
+                shard,
+                StampedInput {
+                    apply_at: Tick::ZERO,
+                    source: InputSource(1),
+                    sequence: 0,
+                    payload: detonate_cmd(types::glam::Vec3::new(64.0, -59.5, 64.0)),
+                },
+            )
+            .expect("收件箱未满");
+        sched.tick();
     }
 }

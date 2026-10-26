@@ -702,7 +702,6 @@ mod unit03 {
     ///
     /// 会变红的实现:位置用格角;速度没除质量(或除了 1 kg);描述沿用默认的 stone / 0.5。
     #[test]
-    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d4_detach_spawn_state() {
         assert!((DEBRIS_MASS - 0.729).abs() < 1e-6);
         let impulse = Vec3::new(-1.024652, 3.158188, -0.614791);
@@ -730,7 +729,6 @@ mod unit03 {
     /// 会变红的实现:当拍就生成(与 N+1 语义不符);ID 用服务端 origin 0 或按别的顺序编号;
     /// 生成到别的分片;描述沿用默认值。
     #[test]
-    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d4_spawned_next_tick_with_emergent_ids() {
         let mut s = session(64);
         let mut log = CommandLog::new();
@@ -763,7 +761,6 @@ mod unit03 {
     ///
     /// 会变红的实现:上限只按单次爆炸计;超限的格没写 air(坑变小);超限时按 BlockPos 截断而不是按压力。
     #[test]
-    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d7_per_tick_cap() {
         let mut s = session(10);
         let mut log = CommandLog::new();
@@ -795,7 +792,6 @@ mod unit03 {
     /// 会变红的实现:待生成的脱落请求不在快照里(恢复线少 24 个);涌现计数器不进快照(恢复线
     /// 第二次爆炸从 1 重新编号);生成的盖章输入写进了外部命令日志(回放时重复生成)。
     #[test]
-    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d4_pending_spawns_survive_snapshot_and_replay() {
         let mut a = session(64);
         let mut log = CommandLog::new();
@@ -832,7 +828,6 @@ mod unit03 {
     ///
     /// 会变红的实现:碎块永远不凝固(比如被当成常驻体);凝固成 stone;碎块穿地掉进虚空。
     #[test]
-    #[ignore = "REQ-009 单元 03 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d4_debris_settles_and_solidifies() {
         let mut s = session(64);
         let mut log = CommandLog::new();

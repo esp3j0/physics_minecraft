@@ -4,7 +4,7 @@
 //! 算法规格见 REQ-009 §4(修订 2);标准答案由总架构师的参照实现给出(验收用例)。
 
 use serde::{Deserialize, Serialize};
-use types::glam::Vec3;
+use types::glam::{Quat, Vec3};
 use types::{BlockId, BlockPos};
 use voxel::BlockRegistry;
 
@@ -86,8 +86,21 @@ pub struct DetachRequest {
 ///
 /// **总架构师接口桩(REQ-009 单元 03)**:由实施方实现。
 pub fn detach_spawn(req: &DetachRequest) -> (types::EntityState, types::EntityDesc) {
-    let _ = req;
-    unimplemented!("REQ-009 单元 03:由实施方实现")
+    let state = types::EntityState {
+        translation: Vec3::new(
+            req.cell.x as f32 + 0.5,
+            req.cell.y as f32 + 0.5,
+            req.cell.z as f32 + 0.5,
+        ),
+        rotation: Quat::IDENTITY,
+        linvel: req.impulse / DEBRIS_MASS,
+        angvel: Vec3::ZERO,
+    };
+    let desc = types::EntityDesc {
+        half_size: DEBRIS_HALF_SIZE,
+        block: req.block,
+    };
+    (state, desc)
 }
 
 /// 线段 `from → to` 依次穿过的格,**含两端所在格**,按穿过顺序(REQ-009 §4.2):
@@ -544,6 +557,44 @@ mod tests {
             !sixteen.is_empty() && sixteen.len() < 40 * 40,
             "16 m 半径只破坏周围一圈,而非整层:{}",
             sixteen.len()
+        );
+    }
+
+    /// §7 生成状态(纯函数):位置 = 格中心、旋转 = 单位四元数、
+    /// `linvel = impulse / DEBRIS_MASS`(0.729 kg)、角速度 0;描述 =
+    /// 半边长 `DEBRIS_HALF_SIZE`、原方块(凝固回原方块,不出现默认 stone)。
+    ///
+    /// 变红:位置用格角(漏 +0.5);速度没除质量;描述沿用默认 0.5/stone。
+    #[test]
+    fn detach_spawn_matches_spec() {
+        let impulse = Vec3::new(-1.024652, 3.158188, -0.614791);
+        let (state, desc) = detach_spawn(&DetachRequest {
+            cell: pos(61, -61, 62),
+            block: builtin::DIRT,
+            impulse,
+        });
+        assert!(
+            (state.translation - Vec3::new(61.5, -60.5, 62.5)).length() < 1e-6,
+            "位置 = 格中心,实为 {:?}",
+            state.translation
+        );
+        assert!(
+            state.rotation.abs_diff_eq(Quat::IDENTITY, 1e-6),
+            "旋转 = 单位四元数"
+        );
+        assert!(
+            (state.linvel - impulse / DEBRIS_MASS).length() < 1e-6,
+            "linvel = impulse / DEBRIS_MASS,实为 {:?}",
+            state.linvel
+        );
+        assert_eq!(state.angvel, Vec3::ZERO, "角速度 0");
+        assert_eq!(
+            desc,
+            types::EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: builtin::DIRT,
+            },
+            "描述 = 半边长 0.45 + 原方块"
         );
     }
 }
