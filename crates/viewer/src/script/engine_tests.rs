@@ -327,3 +327,72 @@ impl FlatWorld {
         }
     }
 }
+
+/// fill 分批(REQ-009 §10):130 格跨 3 帧(64+64+2),全程 BlockPos 严格升序、
+/// 每格恰好一次;最后一批发出的那一帧该步结束,后续瞬时步骤同帧继续。
+/// 每帧预算重置的实现错误(重发/漏发/乱序)在这里变红。
+#[test]
+fn fill_batches_across_three_frames_ascending() {
+    let mut e = engine(
+        "[[step]]\nfill = { from = [0, -70, 0], to = [12, -61, 0], block = \"stone\" }\n\
+         [[step]]\nset_block = { pos = [9, -61, 9], block = \"dirt\" }\n",
+    );
+    let world = FlatWorld::default();
+    let want: Vec<types::BlockPos> = (0..=12)
+        .flat_map(|x| (-70..=-61).map(move |y| types::BlockPos::new(x, y, 0)))
+        .collect();
+    assert_eq!(want.len(), 130);
+
+    let mut got: Vec<types::BlockPos> = Vec::new();
+    let mut finished_per_frame: Vec<Vec<String>> = Vec::new();
+    for tick in 10..=12 {
+        let out = frame(&mut e, 0.016, tick, &world, &[]);
+        for c in &out.commands {
+            match c {
+                crate::script::EngineCommand::SetBlock { pos, block } => {
+                    if *block == STONE {
+                        got.push(*pos);
+                    } else {
+                        // 尾随的 set_block:只能是最后一帧、位置 (9,-61,9)、方块 dirt。
+                        assert_eq!(*block, types::BlockId(2), "尾随 set_block 应发 dirt");
+                        assert_eq!(*pos, types::BlockPos::new(9, -61, 9), "尾随 set_block 位置");
+                        assert_eq!(tick, 12, "尾随 set_block 只应在最后一帧");
+                    }
+                }
+                other => panic!("只应有 SetBlock,实为 {other:?}"),
+            }
+        }
+        finished_per_frame.push(out.finished.iter().map(|r| r.action.clone()).collect());
+    }
+    let expect: [Vec<String>; 3] = [vec![], vec![], vec!["fill".into(), "set_block".into()]];
+    assert_eq!(
+        finished_per_frame, expect,
+        "前两帧不结束,第三帧收尾并同帧跑完 set_block"
+    );
+    assert_eq!(got, want, "跨帧拼接后应等于升序全量格");
+    let mut sorted = got.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, got, "升序且无重复");
+    assert_eq!(e.exit_code(), Some(0));
+}
+
+/// 单格 fill(from = to)当帧完成;动作名 "fill"、结果 Ok。
+#[test]
+fn fill_single_cell_finishes_in_one_frame() {
+    let mut e =
+        engine("[[step]]\nfill = { from = [3, -61, 4], to = [3, -61, 4], block = \"bedrock\" }\n");
+    let world = FlatWorld::default();
+    let out = frame(&mut e, 0.016, 10, &world, &[]);
+    assert_eq!(
+        out.commands,
+        vec![crate::script::EngineCommand::SetBlock {
+            pos: types::BlockPos::new(3, -61, 4),
+            block: types::BlockId(3),
+        }]
+    );
+    assert_eq!(out.finished.len(), 1);
+    assert_eq!(out.finished[0].action, "fill");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+    assert_eq!(e.exit_code(), Some(0));
+}

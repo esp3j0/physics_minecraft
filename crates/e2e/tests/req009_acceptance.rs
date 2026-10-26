@@ -25,7 +25,6 @@ mod unit01 {
     /// 会变红的实现:ID 顺序不对(破坏存档兼容);数值抄错或 k 不是 2;基岩不是 `Anchor`;
     /// 沙不是 `NeedsBelow`;空气返回了材料。
     #[test]
-    #[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d1_builtin_materials() {
         let reg = SimpleRegistry::builtin();
         assert_eq!(reg.block_count(), 5);
@@ -73,7 +72,6 @@ mod unit01 {
     /// 会变红的实现:`register` 的实心方块给了可破坏的材料(既有用例会突然开始破坏地形);
     /// `register_with_material` 注册成非实心;重名时占用了 ID。
     #[test]
-    #[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d1_register_defaults_and_custom_material() {
         let mut reg = SimpleRegistry::new();
         let x = reg.register("x", true).expect("注册");
@@ -103,7 +101,6 @@ mod unit01 {
     /// 会变红的实现:只改了 `Superflat::classic` 没改散布世界的基底;把 bedrock 叠在原有
     /// 四层之上(地表抬高一格,既有轨迹基线全部变化);只改了生成器单测用的表,生产装配没换。
     #[test]
-    #[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d1_world_bottom_is_bedrock() {
         for kind in [WorldKind::Superflat, WorldKind::SeededScatter] {
             let dir = tempfile::tempdir().expect("临时目录");

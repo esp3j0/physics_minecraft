@@ -8,7 +8,7 @@ use types::glam::Vec3;
 use types::{BlockId, BlockPos};
 use voxel::{BlockRegistry, SimpleRegistry};
 
-use super::{Action, Check, Cmp, DetonateAt, Scenario, ScriptError, SpawnAt, Step};
+use super::{Action, Check, Cmp, DetonateAt, FILL_MAX_CELLS, Scenario, ScriptError, SpawnAt, Step};
 
 /// `[viewer]` 下已知的键。
 const VIEWER_KEYS: [&str; 1] = ["view_distance"];
@@ -345,9 +345,34 @@ fn parse_action(
                 block: block_id(block, registry, "set_block.block").map_err(e)?,
             })
         }
-        // **总架构师接口桩(REQ-009 单元 01)**:由实施方实现(缺参、类型错误、未知方块、
-        // 超过 FILL_MAX_CELLS 都报带步骤序号的错误)。
-        "fill" => unimplemented!("REQ-009 单元 01:由实施方实现"),
+        // 缺参、类型错误、未知方块、超过 FILL_MAX_CELLS 都报带步骤序号的错误(REQ-009 §10)。
+        "fill" => {
+            let from_v = t
+                .get("from")
+                .ok_or_else(|| e("动作 fill 缺必填参数 from".into()))?;
+            let to_v = t
+                .get("to")
+                .ok_or_else(|| e("动作 fill 缺必填参数 to".into()))?;
+            let block_v = t
+                .get("block")
+                .ok_or_else(|| e("动作 fill 缺必填参数 block".into()))?;
+            let a = block_pos(from_v, "fill.from").map_err(e)?;
+            let b = block_pos(to_v, "fill.to").map_err(e)?;
+            let block = block_id(block_v, registry, "fill.block").map_err(e)?;
+            // 两个对角顺序任意:规整为 from = 各轴最小、to = 各轴最大(含两端)。
+            let from = BlockPos::new(a.x.min(b.x), a.y.min(b.y), a.z.min(b.z));
+            let to = BlockPos::new(a.x.max(b.x), a.y.max(b.y), a.z.max(b.z));
+            // 单轴跨度先于乘积判限,避免 i64 乘积溢出;三轴都 ≤ 上限时乘积 ≤ 4096³。
+            let span = |lo: i32, hi: i32| i64::from(hi) - i64::from(lo) + 1;
+            let (sx, sy, sz) = (span(from.x, to.x), span(from.y, to.y), span(from.z, to.z));
+            let cells = sx * sy * sz;
+            if cells > FILL_MAX_CELLS as i64 {
+                return Err(e(format!(
+                    "动作 fill 的格数 {cells} 超过单步上限 {FILL_MAX_CELLS}"
+                )));
+            }
+            Ok(Action::Fill { from, to, block })
+        }
         "wait_ticks" => {
             let n = t
                 .get("n")

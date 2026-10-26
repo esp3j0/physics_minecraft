@@ -99,6 +99,9 @@ pub fn block_color(id: BlockId) -> [f32; 4] {
         BlockId::AIR => [0.0, 0.0, 0.0, 0.0],
         BlockId(1) => [0.55, 0.55, 0.58, 1.0],
         BlockId(2) => [0.45, 0.33, 0.22, 1.0],
+        // REQ-009 §9:bedrock 深灰(比 stone 暗)、sand 浅黄。
+        BlockId(3) => [0.30, 0.30, 0.32, 1.0],
+        BlockId(4) => [0.87, 0.80, 0.55, 1.0],
         _ => [1.0, 0.0, 1.0, 1.0], // 品红警示色(未知方块不静默)
     }
 }
@@ -198,7 +201,7 @@ mod tests {
     const DIRT: BlockId = BlockId(2);
     const UNKNOWN: BlockId = BlockId(42);
 
-    /// 超平坦经典层表(stone×1 + dirt×3,顶面局部 y=3)。
+    /// 超平坦经典层表(bedrock×1 + dirt×3,顶面局部 y=3;REQ-009 D6)。
     fn superflat() -> Chunk {
         use types::{ChunkPos, WorldSeed};
         voxel::Superflat::classic().generate(WorldSeed(0), ChunkPos::new(0, 0))
@@ -312,7 +315,7 @@ mod tests {
     }
 
     /// 测试清单 `block_color_table`:三内置色(air 透明/stone 灰/dirt 棕)
-    /// + 未知品红警示色。
+    /// + REQ-009 追加的 bedrock 深灰、sand 浅黄 + 未知品红警示色。
     #[test]
     fn block_color_table() {
         let air = block_color(BlockId::AIR);
@@ -330,6 +333,20 @@ mod tests {
         assert_eq!(dirt[1], 0.33, "dirt g");
         assert_eq!(dirt[2], 0.22, "dirt b");
         assert_eq!(dirt[3], 1.0, "dirt alpha = 1");
+
+        // REQ-009 §9 追加:bedrock 深灰(比 stone 暗)、sand 浅黄。
+        let bedrock = block_color(BlockId(3));
+        assert_eq!(bedrock[3], 1.0, "bedrock 不透明");
+        assert!(
+            bedrock[0] + bedrock[1] + bedrock[2] < stone[0] + stone[1] + stone[2],
+            "bedrock 比 stone 暗"
+        );
+        let sand = block_color(BlockId(4));
+        assert_eq!(sand[3], 1.0, "sand 不透明");
+        assert!(
+            sand[0] > sand[2] && sand[1] > sand[2],
+            "sand 偏黄(r、g 高于 b)"
+        );
 
         // 未知(未进表的实心方块)→ 品红 (1,0,1) 警示色,不透明。
         let magenta = block_color(UNKNOWN);

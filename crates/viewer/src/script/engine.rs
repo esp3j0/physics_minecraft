@@ -6,12 +6,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use types::glam::Vec3;
-use types::{BlockPos, EntityId, EntityState, WORLD_Y_MIN};
+use types::{BlockId, BlockPos, EntityId, EntityState, WORLD_Y_MIN};
 use voxel::{BlockRegistry, SimpleRegistry};
 
 use super::{
-    Action, CameraPose, Check, Cmp, DetonateAt, EngineCommand, EngineStatus, FrameInput,
-    FrameOutput, Scenario, ScreenshotRequest, SpawnAt, StepOutcome, StepRecord, WorldQuery,
+    Action, CameraPose, Check, Cmp, DetonateAt, EngineCommand, EngineStatus, FILL_BATCH_PER_FRAME,
+    FrameInput, FrameOutput, Scenario, ScreenshotRequest, SpawnAt, StepOutcome, StepRecord,
+    WorldQuery,
 };
 
 /// 结束后的退出码(REQ-008 §4):0 = 全部完成且检查成立;1 = 有检查失败;2 = 场景失败。
@@ -32,6 +33,33 @@ const DETONATE_SNAP_RADIUS: f32 = 25.0;
 const ENTITY_HALF_SIZE: f32 = 0.5;
 /// 静止判定:观测窗口内最大位移 ≤ 0.05 m(细则 9)。
 const STILL_DRIFT_MAX: f32 = 0.05;
+
+/// 进行中的 `fill` 步骤(REQ-009 §10):长方体按 `BlockPos` 升序展开的待发格队列,
+/// 每帧最多发 [`FILL_BATCH_PER_FRAME`] 条。
+#[derive(Debug, Clone, PartialEq)]
+struct FillProgress {
+    /// 全部待填格,`BlockPos` 升序,展开时一次算好(解析已保证 ≤ 4096 格)。
+    cells: Vec<BlockPos>,
+    block: BlockId,
+    /// 下一条待发格的下标。
+    next: usize,
+    /// 步骤开始那一帧的拍号(写进 StepRecord.start_tick)。
+    start_tick: u64,
+}
+
+/// `from..=to`(解析已保证各轴 from ≤ to)按 `BlockPos` 升序展开;`BlockPos` 的
+/// `Ord` 是 (x, y, z) 字典序,三重循环顺序即升序,每格恰好一次。
+fn fill_cells(from: BlockPos, to: BlockPos) -> Vec<BlockPos> {
+    let mut cells = Vec::new();
+    for x in from.x..=to.x {
+        for y in from.y..=to.y {
+            for z in from.z..=to.z {
+                cells.push(BlockPos::new(x, y, z));
+            }
+        }
+    }
+    cells
+}
 
 /// 等待步骤的跨帧状态(与当前步骤一一对应;即时步骤不进入等待状态)。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,6 +101,8 @@ pub(super) struct EngineInner {
     /// 实心判断用内置注册表(细则 8)。
     registry: SimpleRegistry,
     wait: Option<WaitState>,
+    /// 进行中的 `fill` 步骤(REQ-009 §10;与当前步骤一一对应)。
+    fill: Option<FillProgress>,
     /// 当前 spawn 步骤已收到的回执(细则 6:按到达顺序消费)。
     spawn_received: Vec<EntityId>,
     /// 场景墙钟累计,秒(细则 10:含当前帧;与服务器拍号无关)。
@@ -107,6 +137,7 @@ impl EngineInner {
             max_still_ticks,
             registry: SimpleRegistry::builtin(),
             wait: None,
+            fill: None,
             spawn_received: Vec::new(),
             elapsed_secs: 0.0,
             scenario,
@@ -188,8 +219,40 @@ impl EngineInner {
                         tick,
                     );
                 }
-                // **总架构师接口桩(REQ-009 单元 01)**:由实施方实现。
-                Action::Fill { .. } => unimplemented!("REQ-009 单元 01:由实施方实现"),
+                // REQ-009 §10:按 BlockPos 升序每帧最多 FILL_BATCH_PER_FRAME 条;
+                // 最后一批发出的那一帧该步结束,后续瞬时步骤可在同一帧继续。
+                Action::Fill { from, to, block } => {
+                    let mut state = self.fill.take().unwrap_or_else(|| FillProgress {
+                        cells: fill_cells(from, to),
+                        block,
+                        next: 0,
+                        start_tick: tick,
+                    });
+                    let end = (state.next + FILL_BATCH_PER_FRAME).min(state.cells.len());
+                    for pos in &state.cells[state.next..end] {
+                        out.commands.push(EngineCommand::SetBlock {
+                            pos: *pos,
+                            block: state.block,
+                        });
+                    }
+                    state.next = end;
+                    if state.next >= state.cells.len() {
+                        let start_tick = state.start_tick;
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            label,
+                            "fill",
+                            StepOutcome::Ok,
+                            None,
+                            start_tick,
+                            tick,
+                        );
+                    } else {
+                        self.fill = Some(state);
+                        break;
+                    }
+                }
                 Action::SetBlock { pos, block } => {
                     out.commands.push(EngineCommand::SetBlock { pos, block });
                     self.finish_step(

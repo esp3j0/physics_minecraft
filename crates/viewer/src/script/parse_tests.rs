@@ -1,6 +1,8 @@
 //! 解析单元测试(纪律 11、12):每条锚定一个可变异的实现点,功能失效即红。
 
-use crate::script::{Action, Check, Cmp, DetonateAt, ScriptError, SpawnAt, parse_scenario};
+use crate::script::{
+    Action, Check, Cmp, DetonateAt, FILL_MAX_CELLS, ScriptError, SpawnAt, parse_scenario,
+};
 use types::glam::Vec3;
 use types::{BlockId, BlockPos};
 
@@ -187,5 +189,64 @@ fn empty_check_rejected_but_wait_until_allows_empty() {
             assert_eq!(*timeout_ticks, 5);
         }
         other => panic!("应为 wait_until:{other:?}"),
+    }
+}
+
+/// fill(REQ-009 §10):两个对角顺序任意,规整为 from = 各轴最小、to = 各轴最大;
+/// 新方块名 bedrock/sand 可用;1×1×4096 细长盒恰好合法、再长一格报错
+/// (与验收用例的 16³ 形状互补,锚定"按体积而非单轴判限"与上限差一)。
+#[test]
+fn fill_normalizes_corners_and_cell_limit_boundary() {
+    let s = parse_scenario(&one_step(
+        "fill = { from = [3, -60, 5], to = [1, -58, 4], block = \"sand\" }",
+    ))
+    .expect("对角逆序也应可解析");
+    assert_eq!(
+        s.steps[0].action,
+        Action::Fill {
+            from: BlockPos::new(1, -60, 4),
+            to: BlockPos::new(3, -58, 5),
+            block: BlockId(4),
+        }
+    );
+    let bedrock = parse_scenario(&one_step(
+        "fill = { from = [0, 0, 0], to = [0, 0, 0], block = \"bedrock\" }",
+    ))
+    .expect("单格 fill(from = to)应可解析");
+    assert_eq!(
+        bedrock.steps[0].action,
+        Action::Fill {
+            from: BlockPos::ZERO,
+            to: BlockPos::ZERO,
+            block: BlockId(3),
+        }
+    );
+
+    let line = |len: i32| {
+        one_step(&format!(
+            "fill = {{ from = [0, -64, 0], to = [0, {}, 0], block = \"stone\" }}",
+            -64 + len - 1
+        ))
+    };
+    let n = FILL_MAX_CELLS as i32;
+    parse_scenario(&line(n)).expect("恰好上限格数应合法(1×1×4096)");
+    let e = err(&line(n + 1));
+    assert_eq!(e.step, Some(1), "超限要带步骤序号");
+    assert!(e.message.contains("4096"), "错误要点名上限:{e}");
+}
+
+/// fill 错误路径:缺 to、缺 block、坐标非整数、未知方块、未知键,全部带步骤序号。
+#[test]
+fn fill_rejects_missing_and_malformed_params() {
+    let cases = [
+        "fill = { from = [0, -60, 0], block = \"stone\" }",
+        "fill = { from = [0, -60, 0], to = [1, -60, 1] }",
+        "fill = { from = [0, -60.5, 0], to = [1, -60, 1], block = \"stone\" }",
+        "fill = { from = [0, -60, 0], to = [1, -60, 1], block = \"lava\" }",
+        "fill = { from = [0, -60, 0], to = [1, -60, 1], block = \"stone\", speed = 1 }",
+    ];
+    for case in cases {
+        let e = err(&one_step(case));
+        assert_eq!(e.step, Some(1), "错误要带步骤序号:{case} → {e}");
     }
 }

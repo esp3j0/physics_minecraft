@@ -1,15 +1,13 @@
 //! 世界生成器(REQ-002 §4.1):纯函数,同 `(seed, pos)` 位级确定(AC-G1)。
 //!
 //! 纪律(蓝图 §4):无 IO/随机/墙钟;哈希用自实现 splitmix64,不引 rand 依赖。
-//! 内置方块表只有 air(0)/stone(1)/dirt(2)(`voxel::SimpleRegistry::builtin`),
-//! 层表只允许取其中的方块。
+//! 内置方块表 air(0)/stone(1)/dirt(2) + REQ-009 追加的 bedrock(3)/sand(4)
+//! (`voxel::SimpleRegistry::builtin`),层表只允许取其中的方块。
 
 use types::{BlockId, ChunkPos, WorldSeed};
 
+use crate::builtin::{self, DIRT};
 use crate::chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
-
-const STONE: BlockId = BlockId(1);
-const DIRT: BlockId = BlockId(2);
 
 /// 世界生成器:纯函数,无 IO/随机/墙钟(蓝图 §4 纪律)。
 /// 同 `(seed, pos)` 必须产出位级相同的 Chunk(AC-G1)。
@@ -24,12 +22,13 @@ pub struct Superflat {
 }
 
 impl Superflat {
-    /// 经典:v1 内置方块 = stone×1 + dirt×3(方块表扩充后自然可加 grass)。
+    /// 经典:最底层 bedrock(REQ-009 D6,不可破坏)+ dirt×3;总厚 4 不变
+    /// (碰撞几何与既有轨迹基线不变,§3.3)。
     pub fn classic() -> Self {
         Self {
             layers: vec![
-                (1, BlockId(1)), // stone × 1
-                (3, BlockId(2)), // dirt  × 3
+                (1, builtin::BEDROCK), // bedrock × 1
+                (3, DIRT),             // dirt  × 3
             ],
         }
     }
@@ -92,7 +91,7 @@ impl WorldGenerator for SeededScatter {
                 // f64 域比较:f32 density 精确提升,比值取高 53 位无精度损失。
                 if scatter_ratio(h) < f64::from(self.density) {
                     // 顶层取一比特选散布方块(内置表:stone/dirt)。
-                    let block = if h >> 63 == 0 { STONE } else { DIRT };
+                    let block = if h >> 63 == 0 { builtin::STONE } else { DIRT };
                     chunk.set(x, y, z, block);
                 }
             }
@@ -164,9 +163,9 @@ mod tests {
     fn superflat_layers_match_table() {
         let generator = Superflat::classic();
         let chunk = generator.generate(WorldSeed(0), ChunkPos::new(0, 0));
-        // 局部 y=0 对应世界 y = WORLD_Y_MIN(-64):stone 底,dirt×3 叠上。
-        assert_eq!(chunk.get(0, 0, 0), STONE);
-        assert_eq!(chunk.get(CHUNK_X - 1, 0, CHUNK_Z - 1), STONE);
+        // 局部 y=0 对应世界 y = WORLD_Y_MIN(-64):bedrock 底(REQ-009 D6),dirt×3 叠上。
+        assert_eq!(chunk.get(0, 0, 0), builtin::BEDROCK);
+        assert_eq!(chunk.get(CHUNK_X - 1, 0, CHUNK_Z - 1), builtin::BEDROCK);
         for ly in 1..=3 {
             for z in 0..CHUNK_Z {
                 for x in 0..CHUNK_X {
@@ -179,6 +178,19 @@ mod tests {
                 assert_eq!(chunk.get(x, 4, z), BlockId::AIR, "层表之上应为空气");
             }
         }
+    }
+
+    /// REQ-009 §3.3:classic 总厚不变(4)——把 bedrock 叠在原有四层之上(地表抬高一格)
+    /// 的错误实现在这里变红。
+    #[test]
+    fn classic_total_thickness_unchanged() {
+        let total: usize = Superflat::classic().layers.iter().map(|(t, _)| *t).sum();
+        assert_eq!(total, 4, "classic 总厚应保持 4(地表高度不变)");
+        assert_eq!(
+            Superflat::classic().layers[0],
+            (1, builtin::BEDROCK),
+            "最底层 1 格 bedrock"
+        );
     }
 
     #[test]
@@ -214,7 +226,7 @@ mod tests {
                     } else if y == 4 {
                         // 顶面上一格:air 或散布方块(内置表内)。
                         assert!(
-                            block == BlockId::AIR || block == STONE || block == DIRT,
+                            block == BlockId::AIR || block == builtin::STONE || block == DIRT,
                             "散布格出现未知方块 {block:?}"
                         );
                     } else {

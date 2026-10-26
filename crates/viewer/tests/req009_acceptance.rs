@@ -79,7 +79,6 @@ fn box_cells(from: (i32, i32, i32), to: (i32, i32, i32)) -> Vec<BlockPos> {
 /// 会变红的实现:不规整对角(引擎展开为空集或负数个格);格数上限差一;`bedrock`/`sand` 不认;
 /// 错误不带步骤序号;把未知方块当成空气。
 #[test]
-#[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_d1_fill_parse() {
     assert_eq!((FILL_MAX_CELLS, FILL_BATCH_PER_FRAME), (4096, 64));
     let sc = parse_scenario(&format!(
@@ -132,7 +131,6 @@ fn acc_d1_fill_parse() {
 /// 会变红的实现:一帧发完 90 条(服务器收件箱会拒);顺序不是升序;漏格或重格;最后一批之后
 /// 还要空等一帧;动作名不是 "fill"。
 #[test]
-#[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_d1_fill_engine_batches() {
     let mut e = engine(
         "[[step]]\nfill = { from = [2, -51, 2], to = [0, -60, 0], block = \"stone\" }\n\
@@ -182,7 +180,6 @@ fn acc_d1_fill_engine_batches() {
 ///
 /// 会变红的实现:新方块落到品红警示色;bedrock 用了和 stone 一样的灰;sand 用了 dirt 的棕。
 #[test]
-#[ignore = "REQ-009 单元 01 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
 fn acc_d1_block_colors() {
     assert_eq!(block_color(builtin::AIR), [0.0, 0.0, 0.0, 0.0]);
     assert_eq!(block_color(builtin::STONE), [0.55, 0.55, 0.58, 1.0]);

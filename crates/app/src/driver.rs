@@ -3143,8 +3143,8 @@ mod tests {
 
     // ---- 任务 04:驱动接线(测试清单)----
 
-    /// 地面顶面高度(world y):Superflat classic = stone×1 + dirt×3,层底在
-    /// 世界 y = WORLD_Y_MIN(-64)→ 顶面 y = -60。
+    /// 地面顶面高度(world y):Superflat classic = bedrock×1 + dirt×3(REQ-009 D6),
+    /// 层底在世界 y = WORLD_Y_MIN(-64)→ 顶面 y = -60(总厚 4 不变)。
     const GROUND_TOP_Y: f32 = types::WORLD_Y_MIN as f32 + 4.0;
 
     /// MoveObserver 命令(注入通道)。

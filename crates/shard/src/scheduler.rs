@@ -4388,8 +4388,8 @@ mod tests {
         }]);
         let mut sched = Scheduler::new(sched_cfg(2));
         sched.register(sim0);
-        // 装载生成的 chunk(Superflat classic:stone×1 + dirt×3,层底在
-        // 世界 y = -64 → 地面顶面 y = -60)。
+        // 装载生成的 chunk(Superflat classic:bedrock×1 + dirt×3,层底在
+        // 世界 y = -64 → 地面顶面 y = -60;REQ-009 D6 后总厚不变)。
         let cp = types::ChunkPos::new(0, 0);
         let chunk = Superflat::classic().generate(types::WorldSeed(0), cp);
         sched.apply_chunk_load(shard, cp, chunk);

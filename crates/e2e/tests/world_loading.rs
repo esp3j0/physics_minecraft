@@ -6,7 +6,7 @@
 //! 位级断言 `==`,物理量按容差。
 //!
 //! 场景几何口径(照 driver.rs 任务 04 测试 / app_e2e.rs):
-//! - Superflat classic = stone×1 + dirt×3,层底世界 y = WORLD_Y_MIN(-64)
+//! - Superflat classic = bedrock×1 + dirt×3(REQ-009 D6),层底世界 y = WORLD_Y_MIN(-64)
 //!   → 地面顶面 world y = -60(实体半边 0.5,驻留中心 ≈ -59.4);
 //! - 观察者/实体放置 y 取地面附近,保证 3D 距离 ≤ 唤醒半径 24m(不被 tier③ 冻结)。
 
@@ -206,7 +206,7 @@ fn acg2_store_takes_priority_over_generator() {
         "前置:空持久层 → 兜底生成器初生值"
     );
 
-    // 修改:底层 stone(1) 改成 dirt(2)——与初生值可区分。
+    // 修改:底层 bedrock(3) 改成 dirt(2)——与初生值可区分。
     let mut modified = fresh.clone();
     modified.set(1, 0, 2, BlockId(2));
     assert_ne!(modified, fresh, "前提:修改值 ≠ 初生值");
@@ -404,7 +404,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
     }));
 
     let shard = shard_id(1, 0);
-    let edited = BlockPos::new(200, types::WORLD_Y_MIN, 8); // chunk (12,0) 底层 stone(1)
+    let edited = BlockPos::new(200, types::WORLD_Y_MIN, 8); // chunk (12,0) 底层 bedrock(3)
     // ① 进区:ensure 建片 + 激活装载。
     inject_move(&tx, Vec3::new(200.0, GROUND_TOP_Y, 8.0)).await;
     advance_ticks(8).await;
@@ -413,7 +413,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         shard,
         command: SimCommand::SetBlock {
             pos: edited,
-            block: BlockId(2), // stone → dirt:与初生值可区分
+            block: BlockId(2), // bedrock → dirt:与初生值可区分
         },
     })
     .await
@@ -489,7 +489,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         restored
             .voxel()
             .get_block(BlockPos::new(200, types::WORLD_Y_MIN, 9)),
-        BlockId(1),
+        BlockId(3),
         "同 chunk 其余方块保持初生值(等价,非整体重写)"
     );
     assert!(
@@ -940,8 +940,8 @@ async fn acg6_persisted_after_process_restart() {
         generator
             .generate(config.world_seed, ChunkPos::new(12, 0))
             .get(8, 0, 8),
-        BlockId(1),
-        "期望构造自检:初生 (12,0) 底层是 stone"
+        BlockId(3),
+        "期望构造自检:初生 (12,0) 底层是 bedrock"
     );
     for (cp, expect) in [
         (ChunkPos::new(12, 0), modified.clone()),
