@@ -445,7 +445,9 @@ pub struct DriverOutcome {
 /// v6 布局在后续单元内继续追加(REQ-009 §8,单元 05 定稿):单元 03 追加
 /// `SchedulerSnapshot.next_emergent_seq` 与 `pending_emergent_spawns`
 /// (涌现实体的待生效生成盖章输入,不入外部命令日志,随调度器快照恢复)——
-/// 单元 02 时点的 v6 档解码必失败,同样必须清 `data_dir`。
+/// 单元 02 时点的 v6 档解码必失败,同样必须清 `data_dir`;单元 04b 追加
+/// 分片快照的坍塌推迟队列(`ShardSimSnapshot.collapse_deferred`,REQ-009
+/// §6.2.1)——单元 03 时点的 v6 档解码必失败,同样必须清 `data_dir`。
 pub const CHECKPOINT_FORMAT_VERSION: u32 = 6;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,

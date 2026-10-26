@@ -351,6 +351,15 @@ pub struct ShardSim {
     /// 唤醒中心(WakeSpec::Radius 票锚;04a;与 observed 分离——见
     /// apply_activation_tickets 注释)。随快照走。
     pub(crate) wake_centers: Option<Vec<Vec3>>,
+    /// 本拍实心→非实心写入的坍塌触发集(REQ-009 §6.2.1,单元 04b):爆炸、
+    /// 外部 SetBlock、BlockWrite 信封经 `register_collapse_trigger` 登记
+    /// (凝固与强制落地只写实心,不走该出口);step 末 `evaluate_collapse`
+    /// 取走求值后清空。checkpoint 只在两拍之间取,拍内集合必为空——不入快照。
+    pub(crate) collapse_triggers: BTreeSet<BlockPos>,
+    /// 坍塌推迟队列(§6.2.1;v6 快照追加):上一拍名额不足时 = 上一拍触发集
+    /// 原样 ∪ 上一拍已转换的格;每拍求值输入之一。随分片快照走(checkpoint
+    /// 落在推迟与再求值之间时恢复线不得丢,acc_d7)。
+    pub(crate) collapse_deferred: BTreeSet<BlockPos>,
 }
 
 impl ShardSim {
@@ -384,6 +393,8 @@ impl ShardSim {
             activation_now: Tick::ZERO,
             observed: None,
             wake_centers: None,
+            collapse_triggers: BTreeSet::new(),
+            collapse_deferred: BTreeSet::new(),
         }
     }
 
@@ -592,6 +603,9 @@ impl ShardSim {
                             "BlockWrite 信封落到未装载 chunk {pos:?}(owner/holder 必然\
                              装载着该 chunk,内部一致性违规,fail-stop)"
                         );
+                        // 坍塌触发要判断"由实心变为非实心",先取写入前的实心性。
+                        let old_solid =
+                            self.registry.material(self.voxels.get_block(pos)).is_some();
                         if self.voxels.set_block(pos, block).is_ok() {
                             // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                             for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
@@ -602,6 +616,10 @@ impl ShardSim {
                             // holder 侧同样登记(04c 风险 4):边界附近的
                             // holder 侧冻结实体失去支撑也须醒来。
                             self.register_terrain_write(pos);
+                            // 坍塌触发(REQ-009 §6.2.1 风险 1):邻片 owner 的
+                            // 涌现写入同样登记——漏了它,跨分片悬空块的另一半
+                            // 会因"没看到"而永远悬空(§6.3,acc_d6)。
+                            self.register_collapse_trigger(pos, old_solid, block);
                         }
                     }
                 },
@@ -887,6 +905,9 @@ impl ShardSim {
                 });
             }
         }
+        // 坍塌求值(REQ-009 §6.2.1,单元 04b):物理步进之后、交出 outbox
+        // 之前;本拍外部写入与爆炸的结果都已落地(风险 3)。
+        self.evaluate_collapse();
     }
 
     /// 取走并清空本 tick 产出。
@@ -2292,9 +2313,123 @@ impl ShardSim {
         self.pending_terrain_wakes.insert(cell);
     }
 
+    /// 坍塌触发登记(REQ-009 §6.2.1 范围 1):仅当写入把**实心格变为非实心**
+    /// (`old_solid` 且新方块无材料 = air、非实心或未知 ID)才登记;总开关关闭
+    /// 时不收集(范围 5)。四路写入中三路走本出口(SetBlock 命令、BlockWrite
+    /// 信封、爆炸写 air),第四路(坍塌转换)在 `evaluate_collapse` 内直接并入
+    /// 推迟队列。
+    ///
+    /// **守卫用例的变异点**:`evaluate_collapse` 不再重复判开关——关闭时触发集
+    /// 恒空、求值入口首行即返回,天然"不收集、不求值";若在本出口再放一道闸,
+    /// 单一变异无法让守卫用例 `acc_d5_disabled_no_collapse` 变红(纪律 12)。
+    fn register_collapse_trigger(&mut self, pos: BlockPos, old_solid: bool, new_block: BlockId) {
+        if !old_solid || !self.cfg.destruction.enabled {
+            return;
+        }
+        if self.registry.material(new_block).is_none() {
+            self.collapse_triggers.insert(pos);
+        }
+    }
+
+    /// 坍塌接入(REQ-009 §6.2.1,单元 04b;step 末调用 = 物理步进之后、交出
+    /// outbox 之前)。触发集 = 本拍实心→非实心写入 ∪ 推迟队列(上一拍触发集
+    /// 原样 + 上一拍已转换的格);对**本分片体素**求值 `find_collapse` 后,只
+    /// 转换本体区内的 `falling` 格(`BlockPos` 升序,find_collapse 已排序),
+    /// 受本拍剩余名额 `max_detach_per_tick − 本拍已有脱落请求数` 约束;转换 =
+    /// 写 air、`Emergent` 写入、§4.11 唤醒、重建 collider、追加冲量为 0 的
+    /// `DetachRequest`(生成走单元 03 的调度器路径,N+1 生效)。名额不足且
+    /// 本体区内还有悬空格未转换时,整个触发集原样连同已转换格一起推迟到下一拍
+    /// (不只留没转换的格——名额为 0 的那一拍不能丢触发,风险 4)。
+    fn evaluate_collapse(&mut self) {
+        let mut removed: BTreeSet<BlockPos> = std::mem::take(&mut self.collapse_triggers);
+        removed.extend(std::mem::take(&mut self.collapse_deferred));
+        if removed.is_empty() {
+            return;
+        }
+        let min = self.cfg.shard.pos.min_chunk().block_min();
+        let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
+        let max_z = min.z + SHARD_CHUNKS * CHUNK_SIZE;
+        let in_core = |p: BlockPos| p.x >= min.x && p.x < max_x && p.z >= min.z && p.z < max_z;
+        let block_at = |p: BlockPos| -> Option<BlockId> {
+            if !(types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&p.y) {
+                // 世界高度范围之外按空气,不是未装载(§6.2.1;风险 2)——
+                // 贴着世界顶的结构不能被误判有地基(acc_d5_world_top)。
+                return Some(BlockId::AIR);
+            }
+            // 所在 chunk 未装载 → None(保守:看不见的地方当作有地基)。
+            self.voxels.get_chunk(p.chunk_of())?;
+            Some(self.voxels.get_block(p))
+        };
+        let removed_vec: Vec<BlockPos> = removed.iter().copied().collect();
+        let outcome = crate::destruction::find_collapse(
+            &block_at,
+            self.registry.as_ref(),
+            &removed_vec,
+            self.cfg.destruction.collapse_max_cells,
+            self.cfg.destruction.collapse_max_cluster,
+        );
+        if outcome.falling.is_empty() {
+            // 没有可转换格:推迟队列已随 take 清空,本拍结束(无推迟)。
+            return;
+        }
+        // 本拍剩余名额:爆炸在拍首(apply_prefix)已用掉的脱落请求要扣掉。
+        let quota = self
+            .cfg
+            .destruction
+            .max_detach_per_tick
+            .saturating_sub(self.outbox.detach_requests.len());
+        let mut converted: Vec<BlockPos> = Vec::new();
+        let mut deferred = false;
+        let mut dirty: Vec<ChunkPos> = Vec::new();
+        for &cell in &outcome.falling {
+            if !in_core(cell) {
+                continue; // 跨分片的另一半由其 owner 转换,不占本分片名额(§6.3)
+            }
+            if converted.len() >= quota {
+                deferred = true;
+                break;
+            }
+            let block = self.voxels.get_block(cell);
+            let _ = self.voxels.set_block(cell, BlockId::AIR);
+            self.outbox.block_updates.push(BlockWrite {
+                pos: cell,
+                block: BlockId::AIR,
+                kind: BlockWriteKind::Emergent,
+            });
+            // §4.11 统一出口:脚下被掏空的冻结体下一拍被唤醒。
+            self.register_terrain_write(cell);
+            self.outbox
+                .detach_requests
+                .push(crate::destruction::DetachRequest {
+                    cell,
+                    block,
+                    impulse: Vec3::ZERO,
+                });
+            dirty.push(cell.chunk_of());
+            converted.push(cell);
+        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain)。
+        for cp in expand_boundary(dirty, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
+        // 与同拍爆炸的脱落请求拼接后,保持整个 outbox 的 BlockPos 升序不变量。
+        self.outbox.detach_requests.sort_by_key(|req| req.cell);
+        let mut carry: BTreeSet<BlockPos> = converted.into_iter().collect();
+        if deferred {
+            // 已转换的格成为下一拍的触发(§6.2 连锁坍塌);推迟时整个触发集
+            // 原样保留,下一拍重新搜索。
+            carry.extend(removed);
+        }
+        self.collapse_deferred = carry;
+    }
+
     fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
         match cmd {
             SimCommand::SetBlock { pos, block } => {
+                // 坍塌触发要判断"由实心变为非实心",先取写入前的实心性。
+                let old_solid = self.registry.material(self.voxels.get_block(pos)).is_some();
                 let edit = VoxelEdit::new().set(pos, block);
                 match edit.apply(&mut self.voxels) {
                     Ok(dirty) => {
@@ -2314,6 +2449,8 @@ impl ShardSim {
                             kind: BlockWriteKind::External,
                         });
                         self.register_terrain_write(pos);
+                        // 坍塌触发(REQ-009 §6.2.1):实心→非实心的写入。
+                        self.register_collapse_trigger(pos, old_solid, block);
                     }
                     Err(e) => panic!("SetBlock 越界(fail-stop):{e}"),
                 }
@@ -2555,6 +2692,8 @@ impl ShardSim {
         let mut dirty: Vec<ChunkPos> = Vec::new();
         for cell in cells {
             let _ = self.voxels.set_block(cell.pos, BlockId::AIR);
+            // 坍塌触发(REQ-009 §6.2.1):爆炸破坏格由实心变 air。
+            self.register_collapse_trigger(cell.pos, true, BlockId::AIR);
             self.outbox.block_updates.push(BlockWrite {
                 pos: cell.pos,
                 block: BlockId::AIR,
@@ -6002,5 +6141,391 @@ mod tests {
         let out = s.take_outbox();
         assert_eq!(out.detach_requests.len(), 0, "名额 0 → 无脱落请求");
         assert_eq!(out.block_updates.len(), 60, "坑照样写 air");
+    }
+
+    // ---- 坍塌接入分片(REQ-009 §6.2.1,单元 04b)----
+
+    /// 开启破坏的单分片平地(_chunks cx 2..=6、cz 2..=6,超平坦;名额 = cap)。
+    fn destruction_sim(cap: usize) -> ShardSim {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.destruction.enabled = true;
+        cfg.destruction.max_detach_per_tick = cap;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s
+    }
+
+    /// 单分片石桥(与验收 unit04b 同形):柱 x=60、71(y −60…−55,z=64),
+    /// 桥面 y=−54、x 60…71;返回 (左柱, 右柱, 桥面)。
+    fn bridge_cells() -> (Vec<BlockPos>, Vec<BlockPos>, Vec<BlockPos>) {
+        let pa: Vec<BlockPos> = (-60..=-55).map(|y| BlockPos::new(60, y, 64)).collect();
+        let pb: Vec<BlockPos> = (-60..=-55).map(|y| BlockPos::new(71, y, 64)).collect();
+        let deck: Vec<BlockPos> = (60..=71).map(|x| BlockPos::new(x, -54, 64)).collect();
+        (pa, pb, deck)
+    }
+
+    /// 搭桥就位(搭建写入 air→实心,不产生坍塌触发)。
+    fn build_bridge(s: &mut ShardSim) -> (Vec<BlockPos>, Vec<BlockPos>, Vec<BlockPos>) {
+        let (pa, pb, deck) = bridge_cells();
+        let build: Vec<StampedInput> = [&pa[..], &pb[..], &deck[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(k as u64, *p, voxel::builtin::STONE))
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        (pa, pb, deck)
+    }
+
+    /// §6.2.1 生产路径(AC-D5):两柱同拍去掉 → 当拍桥面 12 格写 air,产出
+    /// 12 条冲量为 0 的脱落请求(BlockPos 升序、记录原方块 stone、Emergent
+    /// 写入、collider 重建)。
+    ///
+    /// 变红:求值入口整体跳过(桥面不塌);冲量非 0(坍塌块带了爆炸冲量)。
+    #[test]
+    fn collapse_bridge_converts_and_requests_detach() {
+        let mut s = destruction_sim(64);
+        let (pa, pb, deck) = build_bridge(&mut s);
+        let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+            .collect();
+        s.apply_prefix(&remove);
+        s.step();
+        let out = s.take_outbox();
+        for c in &deck {
+            assert_eq!(
+                s.voxel().get_block(*c),
+                voxel::builtin::AIR,
+                "{c:?} 当拍写 air"
+            );
+        }
+        assert_eq!(out.detach_requests.len(), 12, "桥面 12 格全部脱落");
+        assert!(
+            out.detach_requests
+                .windows(2)
+                .all(|w| w[0].cell < w[1].cell),
+            "脱落请求按 BlockPos 升序"
+        );
+        for req in &out.detach_requests {
+            assert_eq!(req.block, voxel::builtin::STONE, "记录原方块");
+            assert_eq!(req.impulse, Vec3::ZERO, "坍塌块冲量为 0");
+        }
+        assert_eq!(
+            out.block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent && deck.contains(&w.pos))
+                .count(),
+            12,
+            " Emergent 写入恰 12 条"
+        );
+    }
+
+    /// §6.2.1 推迟(风险 4 后半):名额被同拍爆炸占满(剩余 0)的拍不转换、
+    /// 也不丢触发——整个触发集原样推迟,下一拍名额恢复时照常塌。
+    ///
+    /// 变红:推迟只留已转换格(本拍 0 转换 → 推迟队列空 → 下一拍无触发,
+    /// 桥面永远悬在原地)。
+    #[test]
+    fn collapse_quota_zero_defers_triggers_to_next_tick() {
+        let mut s = destruction_sim(24); // 标准弹坑脱落恰好 24,占满名额
+        let (pa, pb, deck) = build_bridge(&mut s);
+        let mut inputs = vec![detonate_input(200, Vec3::new(64.0, -59.5, 96.0), 12.0, 8.0)];
+        inputs.extend(
+            [&pa[..], &pb[..]]
+                .concat()
+                .iter()
+                .enumerate()
+                .map(|(k, p)| setblock_input(300 + k as u64, *p, voxel::builtin::AIR)),
+        );
+        s.apply_prefix(&inputs);
+        s.step();
+        let out1 = s.take_outbox();
+        assert_eq!(out1.detach_requests.len(), 24, "名额被爆炸占满");
+        for c in &deck {
+            assert_eq!(
+                s.voxel().get_block(*c),
+                voxel::builtin::STONE,
+                "名额 0:当拍不转换"
+            );
+        }
+        s.step();
+        let out2 = s.take_outbox();
+        assert_eq!(out2.detach_requests.len(), 12, "下一拍触发集仍在,照常塌");
+        for c in &deck {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR);
+        }
+    }
+
+    /// §6.2.1 名额与升序:每拍名额 5,两柱同拍去掉 → 当拍按 `BlockPos` 升序
+    /// 转换前 5 格,推迟的下一拍续 5 格,再下一拍收尾 2 格(5/5/2)。
+    ///
+    /// 变红:转换不按升序(当拍塌的是升序末 5 格);名额不约束(当拍全塌)。
+    #[test]
+    fn collapse_quota_converts_ascending_across_ticks() {
+        let mut s = destruction_sim(5);
+        let (pa, pb, deck) = build_bridge(&mut s);
+        let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+            .collect();
+        s.apply_prefix(&remove);
+        for take in 0..3 {
+            s.step();
+            let out = s.take_outbox();
+            assert_eq!(out.detach_requests.len(), [5, 5, 2][take], "第 {take} 拍");
+            for (k, c) in deck.iter().enumerate() {
+                let expected = if k < 5 * (take + 1) {
+                    voxel::builtin::AIR
+                } else {
+                    voxel::builtin::STONE
+                };
+                assert_eq!(s.voxel().get_block(*c), expected, "拍 {take} 的 {c:?}");
+            }
+        }
+    }
+
+    /// §6.2.1/§8:推迟队列随分片快照走——名额 5 塌到一半取快照,恢复线继续
+    /// 5/2 收尾,脱落请求与原线逐位一致。
+    ///
+    /// 变红:快照丢推迟队列(恢复线首拍无触发,少塌 7 格)。
+    #[test]
+    fn collapse_deferred_queue_survives_snapshot() {
+        let mut a = destruction_sim(5);
+        let (pa, pb, deck) = build_bridge(&mut a);
+        let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+            .collect();
+        a.apply_prefix(&remove);
+        a.step();
+        assert_eq!(a.take_outbox().detach_requests.len(), 5, "首拍 5 格");
+        let bytes = a.snapshot();
+        let mut b = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        for _ in 0..2 {
+            a.step();
+            b.step();
+            let (oa, ob) = (a.take_outbox(), b.take_outbox());
+            assert_eq!(oa.detach_requests, ob.detach_requests, "恢复线逐位一致");
+        }
+        assert_eq!(
+            a.voxel().get_block(deck[11]),
+            voxel::builtin::AIR,
+            "两拍收尾 7 格(5 + 2)"
+        );
+        assert_eq!(b.voxel().get_block(deck[11]), voxel::builtin::AIR);
+    }
+
+    /// §6.2.1(风险 2):世界高度范围之外按空气,不是未装载——贴着世界顶
+    /// (y = 319)的石塔切底,上面 19 格照塌。
+    ///
+    /// 变红:block_at 对 y > WORLD_Y_MAX 返回 None(照搬爆炸口径,被当未装载
+    /// → 锚定,塔不塌)。
+    #[test]
+    fn collapse_world_top_is_air_not_unloaded() {
+        let mut s = destruction_sim(64);
+        let tower: Vec<BlockPos> = (300..=319).map(|y| BlockPos::new(66, y, 60)).collect();
+        let build: Vec<StampedInput> = tower
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(k as u64, *p, voxel::builtin::STONE))
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        s.apply_prefix(&[setblock_input(100, tower[0], voxel::builtin::AIR)]);
+        s.step();
+        let out = s.take_outbox();
+        for c in &tower[1..] {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?} 塌落");
+        }
+        assert_eq!(out.detach_requests.len(), 19);
+    }
+
+    /// §6.2.1 风险 1:BlockWrite 信封的涌现写入(邻片 owner 的转换到达)同样
+    /// 登记触发——信封写掉悬空平台的唯一支撑,平台当拍塌。
+    ///
+    /// 变红:信封应用路径不登记触发(平台永远悬在原地)。
+    #[test]
+    fn collapse_envelope_write_triggers() {
+        let mut s = destruction_sim(64);
+        // 悬空平台:柱 (40, 5..=9, 40) + 横杆 (40..=43, 10, 40),整体在空中。
+        let column: Vec<BlockPos> = (5..=9).map(|y| BlockPos::new(40, y, 40)).collect();
+        let bar: Vec<BlockPos> = (40..=43).map(|x| BlockPos::new(x, 10, 40)).collect();
+        let build: Vec<StampedInput> = [&column[..], &bar[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(k as u64, *p, voxel::builtin::STONE))
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        s.apply_prefix(&[envelope_input(
+            1,
+            shard_id(1, 0),
+            EnvelopePayload::BlockWrite {
+                pos: BlockPos::new(40, 9, 40),
+                block: voxel::builtin::AIR,
+            },
+        )]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 8, "柱余 4 格 + 横杆 4 格");
+        for c in column.iter().chain(bar.iter()) {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+    }
+
+    /// §6.2.1 触发要"由实心变为非实心":向已是空气的格写 air 不登记触发——
+    /// 旁边悬空的既有结构不受无转换写入的扰动。
+    ///
+    /// 变红:任何 SetBlock 写入(无论是否转换)都登记触发(悬空杆被误塌)。
+    #[test]
+    fn collapse_no_trigger_without_solid_to_nonsolid() {
+        let mut s = destruction_sim(64);
+        let bar: Vec<BlockPos> = (40..=43).map(|x| BlockPos::new(x, 10, 40)).collect();
+        let build: Vec<StampedInput> = bar
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(k as u64, *p, voxel::builtin::STONE))
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        // 两条无转换写入:同格重写 air、别处向空气格写 air。
+        s.apply_prefix(&[
+            setblock_input(1, BlockPos::new(40, 11, 40), voxel::builtin::AIR),
+            setblock_input(2, BlockPos::new(48, 10, 44), voxel::builtin::AIR),
+        ]);
+        s.step();
+        let out = s.take_outbox();
+        assert!(out.detach_requests.is_empty(), "无转换无触发");
+        for c in &bar {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE);
+        }
+    }
+
+    /// 范围 5(守卫):总开关关闭不收集、不求值——两柱去掉、连跑三拍,桥面
+    /// 原样、零脱落请求。与验收守卫用例 `acc_d5_disabled_no_collapse` 同语义。
+    ///
+    /// 变红:收集闸去掉 enabled 条件(触发集不再受开关控制,桥面塌落)。
+    #[test]
+    fn collapse_disabled_is_inert() {
+        let cfg = ShardSimConfig::new(shard_id(0, 0));
+        assert!(!cfg.destruction.enabled, "默认关闭(实施期间)");
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        use voxel::WorldGenerator;
+        for cx in 2..=6i32 {
+            for cz in 2..=5i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        let (pa, pb, deck) = build_bridge(&mut s);
+        let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+            .collect();
+        s.apply_prefix(&remove);
+        for _ in 0..3 {
+            s.step();
+            assert!(
+                s.take_outbox().detach_requests.is_empty(),
+                "关闭时零脱落请求"
+            );
+        }
+        for c in &deck {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE, "{c:?} 不塌");
+        }
+    }
+
+    /// §6.2.1/§7 名额共用(风险 4 前半):爆炸在拍首已用掉的名额要扣掉——
+    /// 名额 30、标准弹坑 24 → 坍塌当拍只剩 6 个名额,按升序转换前 6 格,
+    /// 其余推迟到下一拍。
+    ///
+    /// 变红:名额不减去本拍已有脱落请求(坍塌 12 格全转换,当拍 36 > 30)。
+    #[test]
+    fn collapse_quota_shared_with_explosion() {
+        let mut s = destruction_sim(30);
+        let (pa, pb, deck) = build_bridge(&mut s);
+        let mut inputs = vec![detonate_input(200, Vec3::new(64.0, -59.5, 96.0), 12.0, 8.0)];
+        inputs.extend(
+            [&pa[..], &pb[..]]
+                .concat()
+                .iter()
+                .enumerate()
+                .map(|(k, p)| setblock_input(300 + k as u64, *p, voxel::builtin::AIR)),
+        );
+        s.apply_prefix(&inputs);
+        s.step();
+        let out1 = s.take_outbox();
+        assert_eq!(out1.detach_requests.len(), 30, "24 爆炸 + 6 坍塌");
+        for (k, c) in deck.iter().enumerate() {
+            let expected = if k < 6 {
+                voxel::builtin::AIR
+            } else {
+                voxel::builtin::STONE
+            };
+            assert_eq!(s.voxel().get_block(*c), expected, "{c:?}");
+        }
+        s.step();
+        let out2 = s.take_outbox();
+        assert_eq!(out2.detach_requests.len(), 6, "推迟收尾 6 格");
+        for c in &deck {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR);
+        }
+    }
+
+    /// §6.2 沙子规则生产路径:石块上 5 格沙,移走石块 → 5 格沙当拍塌落,
+    /// 脱落请求记录原方块 sand、冲量为 0。
+    ///
+    /// 变红:请求的 block 沿用默认 stone(凝固回错方块,acc_d5_sand 变红)。
+    #[test]
+    fn collapse_sand_column_records_sand_block() {
+        let mut s = destruction_sim(64);
+        let base = BlockPos::new(66, -60, 70);
+        let sand: Vec<BlockPos> = (-59..=-55).map(|y| BlockPos::new(66, y, 70)).collect();
+        let build: Vec<StampedInput> =
+            std::iter::once(setblock_input(0, base, voxel::builtin::STONE))
+                .chain(
+                    sand.iter()
+                        .enumerate()
+                        .map(|(k, p)| setblock_input(1 + k as u64, *p, voxel::builtin::SAND)),
+                )
+                .collect();
+        s.apply_prefix(&build);
+        s.step();
+        s.apply_prefix(&[setblock_input(100, base, voxel::builtin::AIR)]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 5);
+        for req in &out.detach_requests {
+            assert_eq!(req.block, voxel::builtin::SAND, "记录原方块 sand");
+            assert!(sand.contains(&req.cell), "{:?}", req.cell);
+            assert_eq!(req.impulse, Vec3::ZERO);
+        }
+        for c in &sand {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
     }
 }

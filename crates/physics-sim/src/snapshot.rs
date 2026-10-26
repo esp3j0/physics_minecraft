@@ -78,6 +78,10 @@ struct ShardSimSnapshot {
     observed: Option<Vec<types::glam::Vec3>>,
     /// 唤醒中心(WakeSpec::Radius 票锚;04a;与 observed 分离)。随快照走。
     wake_centers: Option<Vec<types::glam::Vec3>>,
+    /// 坍塌推迟队列(REQ-009 §6.2.1,单元 04b):上一拍触发集原样 ∪ 上一拍
+    /// 已转换的格;checkpoint 落在推迟与再求值之间时恢复线不得丢(acc_d7)。
+    /// 随快照走。**布局变化**:更早时点的 v6 档解码失败——需清 data_dir。
+    collapse_deferred: BTreeSet<types::BlockPos>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -164,6 +168,7 @@ impl ShardSim {
             activation_now: self.activation_now,
             observed: self.observed.clone(),
             wake_centers: self.wake_centers.clone(),
+            collapse_deferred: self.collapse_deferred.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -227,6 +232,8 @@ impl ShardSim {
             activation_now: snap.activation_now,
             observed: snap.observed,
             wake_centers: snap.wake_centers,
+            collapse_triggers: BTreeSet::new(),
+            collapse_deferred: snap.collapse_deferred,
         })
     }
 }

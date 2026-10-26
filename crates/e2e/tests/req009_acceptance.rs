@@ -1235,7 +1235,6 @@ mod unit04b {
     /// 会变红的实现:外部 SetBlock 不触发坍塌;坍塌推迟到下一拍才写 air;生成的实体描述沿用默认;
     /// 坍塌块带了爆炸冲量四散。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_bridge_collapse_end_to_end() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, 64);
@@ -1299,7 +1298,6 @@ mod unit04b {
     ///
     /// 会变红的实现:沙柱一拍只落一格;沙子凝固成 stone;沙子按连通性判定(沙柱经旁边的地面锚定)。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_sand_column_end_to_end() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, 64);
@@ -1336,7 +1334,6 @@ mod unit04b {
     /// 会变红的实现:超出名额的格丢失(只塌 5 格);推迟队列不进快照(回放线少塌 7 格);名额用完后
     /// 当拍没有转换就再也不触发搜索。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d7_collapse_deferred_and_snapshot() {
         let sh = shard(0);
         let mut a = session(&[0], 2..=6, true, 5);
@@ -1382,7 +1379,6 @@ mod unit04b {
     ///
     /// 会变红的实现:分片把副本格也转换了(两边各 12 个实体);只有一边塌;ID 分配不按 ShardId 升序。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d6_cross_shard_bridge() {
         let mut s = session(&[0, 1], 6..=9, true, 64);
         let mut log = CommandLog::new();
@@ -1424,7 +1420,6 @@ mod unit04b {
     ///
     /// 会变红的实现:`block_at` 对 y > WORLD_Y_MAX 返回 None(被当成未装载 → 锚定,塔不塌)。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_world_top_is_not_anchor() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, 64);
@@ -1446,7 +1441,6 @@ mod unit04b {
     ///
     /// 会变红的实现:坍塌不受总开关控制。
     #[test]
-    #[ignore = "REQ-009 单元 04b 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_disabled_no_collapse() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, false, 64);
