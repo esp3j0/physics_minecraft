@@ -168,6 +168,8 @@ pub struct Outbox {
     /// 本拍爆炸产生的脱落请求(REQ-009 §4.3、§7;按 `BlockPos` 升序)。调度器在 tick 末分配
     /// ID 并盖章 N+1 生成(单元 03);对应格已在本拍写为 air。
     pub detach_requests: Vec<crate::destruction::DetachRequest>,
+    /// 本拍地形破坏遥测(REQ-009 §8;单元 05 接线)。
+    pub destruction_stats: crate::destruction::DestructionStats,
     /// 涌现事件生产口(REQ-005 任务 03):分片内部语义(撞击触发等)未来把
     /// `CrossEvent` 推入此处,调度器 tick 末经 `broadcast_event` 广播(目标
     /// 分片 apply_at = N+1 本地求值)。本任务模拟核不主动产事件,字段恒空,

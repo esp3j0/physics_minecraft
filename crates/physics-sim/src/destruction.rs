@@ -55,6 +55,44 @@ impl Default for DestructionConfig {
     }
 }
 
+/// 地形破坏遥测(REQ-009 §8):分片每拍计数(经 `Outbox::destruction_stats` 交出),调度器全部分片合计
+/// 进 `TickSummary::destruction`。纯计数、每拍重算、不入快照。
+///
+/// **总架构师接口桩(REQ-009 单元 05)**:字段固定,由实施方接线计数(桩阶段恒为 0)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DestructionStats {
+    /// 本拍爆炸破坏(写 air)的格数 = 粉碎 + 脱落。
+    pub cells_blasted: u64,
+    /// 本拍撞击破坏的格数(单元 06 接线,之前恒 0)。
+    pub cells_impacted: u64,
+    /// 本拍坍塌转换的格数。
+    pub cells_collapsed: u64,
+    /// 本拍新产出的脱落请求数(爆炸 + 撞击 + 坍塌)。
+    pub detached: u64,
+    /// 本拍爆炸粉碎的格数(含因上限从脱落改为粉碎的)。
+    pub pulverized: u64,
+    /// 其中因单次爆炸上限或每拍名额从脱落改为粉碎的格数。
+    pub pulverized_over_cap: u64,
+    /// 本拍 `find_collapse` 调用次数(每分片每拍至多 1 次)。
+    pub collapse_evaluations: u64,
+    /// `find_collapse` 结果中 `visited` 之和。
+    pub collapse_visited: u64,
+    /// `find_collapse` 结果中 `budget_anchored` 之和。
+    pub collapse_budget_anchored: u64,
+    /// `find_collapse` 结果中 `oversized_clusters` 之和。
+    pub collapse_oversized: u64,
+    /// 本拍因名额不足、未转换的本体区悬空格数。
+    pub collapse_deferred: u64,
+}
+
+impl DestructionStats {
+    /// 逐字段相加(调度器合计用)。
+    pub fn add(&mut self, other: &Self) {
+        let _ = other;
+        unimplemented!("REQ-009 单元 05:由实施方实现")
+    }
+}
+
 /// 被破坏的格的去向(REQ-009 §4.3)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CellFate {

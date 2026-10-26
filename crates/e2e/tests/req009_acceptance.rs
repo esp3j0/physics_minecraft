@@ -1464,3 +1464,315 @@ mod unit04b {
         s.shutdown();
     }
 }
+
+/// 单元 05:配置表 `[destruction]`、地形破坏遥测、checkpoint v6 往返回放(AC-D10、AC-D11)。
+mod unit05 {
+    use app::config::{Config, DestructionConfig};
+    use app::driver::{
+        CHECKPOINT_FORMAT_VERSION, CheckpointBundle, decode_checkpoint, encode_checkpoint,
+    };
+    use physics_sim::destruction::DestructionStats;
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, ShardId, ShardPos, WORLD_Y_MIN, WorldId,
+        WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const CENTER: Vec3 = Vec3::new(64.0, -59.5, 64.0);
+    const FAR: Vec3 = Vec3::new(64.0, -59.5, 96.0);
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 单分片会话(平地 chunk 2..=6 × 2..=6,破坏开启),破坏参数由 `tweak` 调整。
+    fn session(tweak: impl Fn(&mut physics_sim::destruction::DestructionConfig)) -> Session {
+        let mut sim_cfg = ShardSimConfig::new(shard());
+        sim_cfg.destruction.enabled = true;
+        tweak(&mut sim_cfg.destruction);
+        let mut sim = ShardSim::new(sim_cfg, registry());
+        for x in 2..=6 {
+            for z in 2..=6 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(shard(), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn detonate(s: &mut Session, log: &mut CommandLog, center: Vec3) {
+        for entry in s.detonate(center, 12.0, 8.0).expect("爆炸") {
+            log.append(entry);
+        }
+    }
+
+    fn block(s: &Session, p: BlockPos) -> BlockId {
+        let cp = p.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (p.x - cp.x * 16) as usize,
+            (p.y - WORLD_Y_MIN) as usize,
+            (p.z - cp.z * 16) as usize,
+        )
+    }
+
+    /// 单分片石桥:柱 x = 60、71(y −60…−55,z = 64),桥面 y = −54、x 60…71。
+    fn bridge() -> (Vec<BlockPos>, Vec<BlockPos>) {
+        let mut pillars = Vec::new();
+        for x in [60, 71] {
+            for y in -60..=-55 {
+                pillars.push(BlockPos::new(x, y, 64));
+            }
+        }
+        let deck = (60..=71).map(|x| BlockPos::new(x, -54, 64)).collect();
+        (pillars, deck)
+    }
+
+    /// AC-D11 配置表:默认值;`[destruction]` 各键可覆写并映射到每个分片的配置;未知键、非正或非有限的
+    /// `attenuation`、为 0 的上限、`collapse_max_cells < collapse_max_cluster` 都报错;toml 往返不丢字段。
+    /// (`enabled` 的默认值在单元 07 定为 true,这里不断言。)
+    ///
+    /// 会变红的实现:表没接进 `shard_sim_config`(分片仍用核内默认);漏掉某条校验;键名拼错被当成未知键。
+    #[test]
+    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d11_destruction_config_table() {
+        let d = Config::default().destruction;
+        assert_eq!(
+            (
+                d.attenuation,
+                d.max_debris_per_explosion,
+                d.max_detach_per_tick,
+                d.max_impact_breaks_per_tick,
+                d.collapse_max_cells,
+                d.collapse_max_cluster
+            ),
+            (1.0, 48, 64, 16, 2048, 512)
+        );
+        let text = "[destruction]\nenabled = true\nattenuation = 0.5\nmax_debris_per_explosion = 10\n\
+                    max_detach_per_tick = 20\nmax_impact_breaks_per_tick = 3\ncollapse_max_cells = 900\n\
+                    collapse_max_cluster = 300\n";
+        let c = Config::from_toml_str(text).expect("合法");
+        let want = DestructionConfig {
+            enabled: true,
+            attenuation: 0.5,
+            max_debris_per_explosion: 10,
+            max_detach_per_tick: 20,
+            max_impact_breaks_per_tick: 3,
+            collapse_max_cells: 900,
+            collapse_max_cluster: 300,
+        };
+        assert_eq!(c.destruction, want);
+        assert_eq!(
+            c.shard_sim_config(shard()).destruction,
+            physics_sim::destruction::DestructionConfig {
+                enabled: true,
+                attenuation: 0.5,
+                max_debris_per_explosion: 10,
+                max_detach_per_tick: 20,
+                max_impact_breaks_per_tick: 3,
+                collapse_max_cells: 900,
+                collapse_max_cluster: 300,
+            }
+        );
+        assert_eq!(Config::from_toml_str(&c.to_toml_string()).expect("往返"), c);
+        for bad in [
+            "[destruction]\nfoo = 1\n",
+            "[destruction]\nattenuation = 0.0\n",
+            "[destruction]\nattenuation = -1.0\n",
+            "[destruction]\nattenuation = inf\n",
+            "[destruction]\nmax_debris_per_explosion = 0\n",
+            "[destruction]\nmax_detach_per_tick = 0\n",
+            "[destruction]\nmax_impact_breaks_per_tick = 0\n",
+            "[destruction]\ncollapse_max_cluster = 0\n",
+            "[destruction]\ncollapse_max_cells = 100\ncollapse_max_cluster = 512\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "应拒绝:{bad}");
+        }
+    }
+
+    /// AC-D11 爆炸遥测:平地标准爆炸那一拍 `cells_blasted` 60 = 粉碎 36 + 脱落 24,爆炸写入随后触发一次坍塌
+    /// 求值(访问数 > 0、没有转换);下一拍(生成)全部为 0。名额 10 时脱落 10、粉碎 50,其中 14 个是因名额改粉碎。
+    ///
+    /// 会变红的实现:计数没接线;粉碎数漏掉因上限改粉碎的;调度器只取了某一个分片的计数;计数跨拍累计。
+    #[test]
+    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d11_blast_telemetry() {
+        let mut s = session(|_| {});
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        let t = s.tick().destruction;
+        assert_eq!(
+            (
+                t.cells_blasted,
+                t.pulverized,
+                t.detached,
+                t.pulverized_over_cap,
+                t.cells_collapsed
+            ),
+            (60, 36, 24, 0, 0)
+        );
+        assert_eq!(t.collapse_evaluations, 1);
+        assert!(t.collapse_visited > 0);
+        assert_eq!(
+            s.tick().destruction,
+            DestructionStats::default(),
+            "下一拍归零"
+        );
+        s.shutdown();
+
+        let mut s = session(|d| d.max_detach_per_tick = 10);
+        let mut log = CommandLog::new();
+        detonate(&mut s, &mut log, CENTER);
+        let t = s.tick().destruction;
+        assert_eq!(
+            (
+                t.cells_blasted,
+                t.pulverized,
+                t.detached,
+                t.pulverized_over_cap
+            ),
+            (60, 50, 10, 14)
+        );
+        s.shutdown();
+    }
+
+    /// AC-D11 坍塌遥测:名额 5 时桥面分三拍塌完(转换 5/5/2、推迟 7/2/0);搜索预算 8 时判为锚定
+    /// (`collapse_budget_anchored` ≥ 1,不塌);悬空块上限 8 时计 1 个超大块(不塌)。
+    ///
+    /// 会变红的实现:推迟数没算或算成触发集大小;预算锚定与超大块混计;坍塌转换没计入 `detached`。
+    #[test]
+    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d11_collapse_telemetry() {
+        let (pillars, deck) = bridge();
+        let mut s = session(|d| d.max_detach_per_tick = 5);
+        let mut log = CommandLog::new();
+        set(
+            &mut s,
+            &mut log,
+            &[pillars.clone(), deck.clone()].concat(),
+            builtin::STONE,
+        );
+        s.tick();
+        set(&mut s, &mut log, &pillars, builtin::AIR);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            let t = s.tick().destruction;
+            seen.push((t.cells_collapsed, t.collapse_deferred, t.detached));
+        }
+        assert_eq!(seen, [(5, 7, 5), (5, 2, 5), (2, 0, 2)]);
+        s.shutdown();
+
+        for (cells, cluster, budget, oversized) in [(8, 8, true, false), (2048, 8, false, true)] {
+            let mut s = session(|d| {
+                d.collapse_max_cells = cells;
+                d.collapse_max_cluster = cluster;
+            });
+            let mut log = CommandLog::new();
+            set(
+                &mut s,
+                &mut log,
+                &[pillars.clone(), deck.clone()].concat(),
+                builtin::STONE,
+            );
+            s.tick();
+            set(&mut s, &mut log, &pillars, builtin::AIR);
+            let t = s.tick().destruction;
+            assert_eq!(t.cells_collapsed, 0);
+            assert_eq!(t.collapse_budget_anchored >= 1, budget, "预算锚定:{t:?}");
+            assert_eq!(t.collapse_oversized, u64::from(oversized), "超大块:{t:?}");
+            assert_eq!(
+                block(&s, BlockPos::new(65, -54, 64)),
+                builtin::STONE,
+                "桥面留在原地"
+            );
+            s.shutdown();
+        }
+    }
+
+    /// AC-D10 checkpoint v6 往返 + 回放:在"爆炸碎块待生成、桥面坍塌被名额推迟、涌现计数器 > 1"的时刻,
+    /// 把世界快照与命令日志编码成 checkpoint 字节、解码、`replay_world` 恢复;两线各跑 300 拍,
+    /// 全部 chunk 与全部实体状态逐位相同。
+    ///
+    /// 会变红的实现:任何一块新状态(待生成输入、推迟队列、涌现计数器、破坏配置)没进 v6 布局,
+    /// 或解码后丢失——恢复线会少生成实体、少塌格或 ID 不同。
+    #[test]
+    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
+    fn acc_d10_checkpoint_roundtrip_replay() {
+        let (pillars, deck) = bridge();
+        let mut a = session(|d| d.max_detach_per_tick = 5);
+        let mut log = CommandLog::new();
+        set(
+            &mut a,
+            &mut log,
+            &[pillars.clone(), deck].concat(),
+            builtin::STONE,
+        );
+        a.tick();
+        detonate(&mut a, &mut log, CENTER);
+        a.tick();
+        a.tick();
+        set(&mut a, &mut log, &pillars, builtin::AIR);
+        detonate(&mut a, &mut log, FAR);
+        a.tick();
+
+        let bundle = CheckpointBundle {
+            format_version: CHECKPOINT_FORMAT_VERSION,
+            world: a.world_snapshot(),
+            log_bytes: log.to_bytes(),
+            spawn_next_seq: 0,
+        };
+        let back = decode_checkpoint(&encode_checkpoint(&bundle)).expect("v6 往返");
+        let replay_log = CommandLog::from_bytes(&back.log_bytes).expect("日志");
+        let mut b =
+            sim_api::replay::replay_world(&back.world, &replay_log, cfg(), registry).expect("回放");
+        for _ in 0..300 {
+            a.tick();
+            b.tick();
+        }
+        assert_eq!(
+            a.entity_states(shard()),
+            b.entity_states(shard()),
+            "实体逐位相同"
+        );
+        for x in 2..=6 {
+            for z in 2..=6 {
+                let cp = ChunkPos::new(x, z);
+                assert_eq!(
+                    a.voxel_chunk(shard(), cp),
+                    b.voxel_chunk(shard(), cp),
+                    "{cp:?}"
+                );
+            }
+        }
+        a.shutdown();
+        b.shutdown();
+    }
+}

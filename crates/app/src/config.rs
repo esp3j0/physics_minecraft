@@ -109,6 +109,38 @@ pub enum WorldKind {
 }
 
 /// 全部参数(蓝图 §6 表 + app 装配参数,app README 决策 9)。
+/// 地形破坏配置表 `[destruction]`(REQ-009 §8)。键与默认值同
+/// `physics_sim::destruction::DestructionConfig`;**`enabled` 在 REQ-009 实施期间默认 `false`,单元 07 改为
+/// `true`(D7)**。校验:`attenuation` 为有限正数;各上限 ≥ 1;`collapse_max_cells ≥ collapse_max_cluster`。
+///
+/// **总架构师接口桩(REQ-009 单元 05)**:结构与默认值已给出;校验与到 `shard_sim_config` 的映射由实施方实现。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DestructionConfig {
+    pub enabled: bool,
+    pub attenuation: f32,
+    pub max_debris_per_explosion: usize,
+    pub max_detach_per_tick: usize,
+    pub max_impact_breaks_per_tick: usize,
+    pub collapse_max_cells: usize,
+    pub collapse_max_cluster: usize,
+}
+
+impl Default for DestructionConfig {
+    fn default() -> Self {
+        let d = physics_sim::destruction::DestructionConfig::default();
+        Self {
+            enabled: d.enabled,
+            attenuation: d.attenuation,
+            max_debris_per_explosion: d.max_debris_per_explosion,
+            max_detach_per_tick: d.max_detach_per_tick,
+            max_impact_breaks_per_tick: d.max_impact_breaks_per_tick,
+            collapse_max_cells: d.collapse_max_cells,
+            collapse_max_cluster: d.collapse_max_cluster,
+        }
+    }
+}
+
 /// 结构体级 `#[serde(default)]`:toml 文件可只写要覆写的字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -118,6 +150,8 @@ pub struct Config {
     /// 分片本体外扩边距(格),16(§9.1)。
     pub margin_meters: u32,
     pub activation: ActivationConfig,
+    /// 地形破坏(REQ-009 §8)。
+    pub destruction: DestructionConfig,
     /// 唤醒动态实体预算,512(§9.4)。
     pub max_awake_dynamic: usize,
     /// 每拍 chunk 换装预算,2(§4.3)。
@@ -160,6 +194,7 @@ impl Default for Config {
             dt: 1.0 / 60.0,
             margin_meters: 16,
             activation: ActivationConfig::default(),
+            destruction: DestructionConfig::default(),
             max_awake_dynamic: 512,
             swap_budget_chunks_per_tick: 2,
             area_ticket_max_radius_m: 128.0,

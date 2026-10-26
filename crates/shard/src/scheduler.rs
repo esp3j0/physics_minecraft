@@ -106,6 +106,9 @@ pub struct TickSummary {
     pub migrations_admitted: usize,
     /// 激活遥测(REQ-007 §4.16;任务 06c)。
     pub telemetry: ActivationTelemetry,
+    /// 地形破坏遥测(REQ-009 §8):全部分片的 `Outbox::destruction_stats` 合计。
+    /// **总架构师接口桩(REQ-009 单元 05)**:字段已加,合计由实施方接线(桩阶段恒为默认)。
+    pub destruction: physics_sim::destruction::DestructionStats,
 }
 
 /// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
@@ -2075,6 +2078,7 @@ impl Scheduler {
             tick: at,
             stepped_shards,
             migrations_admitted,
+            destruction: physics_sim::destruction::DestructionStats::default(),
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -2372,6 +2376,7 @@ mod tests {
                 stepped_shards: 2,
                 migrations_admitted: 0,
                 telemetry: ActivationTelemetry::default(),
+                destruction: physics_sim::destruction::DestructionStats::default(),
             }
         );
         sched.shutdown();
