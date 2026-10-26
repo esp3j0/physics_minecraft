@@ -2370,6 +2370,12 @@ impl ShardSim {
             self.cfg.destruction.collapse_max_cells,
             self.cfg.destruction.collapse_max_cluster,
         );
+        // 遥测(REQ-009 §8):求值数、访问数、预算锚定与超大块——`falling`
+        // 为空的拍(判定不塌)同样计入,空触发集的拍不进来(上方早退)。
+        self.outbox.destruction_stats.collapse_evaluations += 1;
+        self.outbox.destruction_stats.collapse_visited += outcome.visited as u64;
+        self.outbox.destruction_stats.collapse_budget_anchored += outcome.budget_anchored as u64;
+        self.outbox.destruction_stats.collapse_oversized += outcome.oversized_clusters as u64;
         if outcome.falling.is_empty() {
             // 没有可转换格:推迟队列已随 take 清空,本拍结束(无推迟)。
             return;
@@ -2380,6 +2386,8 @@ impl ShardSim {
             .destruction
             .max_detach_per_tick
             .saturating_sub(self.outbox.detach_requests.len());
+        // 推迟数口径(§8):本体区内悬空格总数 − 本拍已转换数(不是触发集大小)。
+        let in_core_falling = outcome.falling.iter().filter(|c| in_core(**c)).count();
         let mut converted: Vec<BlockPos> = Vec::new();
         let mut deferred = false;
         let mut dirty: Vec<ChunkPos> = Vec::new();
@@ -2393,6 +2401,9 @@ impl ShardSim {
             }
             let block = self.voxels.get_block(cell);
             let _ = self.voxels.set_block(cell, BlockId::AIR);
+            // 遥测(§8):坍塌转换的格与产出的脱落请求。
+            self.outbox.destruction_stats.cells_collapsed += 1;
+            self.outbox.destruction_stats.detached += 1;
             self.outbox.block_updates.push(BlockWrite {
                 pos: cell,
                 block: BlockId::AIR,
@@ -2416,6 +2427,10 @@ impl ShardSim {
                 self.rebuild_chunk_collider(cp);
             }
         }
+        // 遥测(§8):本拍因名额不足未转换的本体区悬空格数(converted 只含
+        // 本体区格,差值恒非负;saturating 防御遥测不 panic)。
+        self.outbox.destruction_stats.collapse_deferred +=
+            in_core_falling.saturating_sub(converted.len()) as u64;
         // 与同拍爆炸的脱落请求拼接后,保持整个 outbox 的 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
         let mut carry: BTreeSet<BlockPos> = converted.into_iter().collect();
@@ -2693,6 +2708,24 @@ impl ShardSim {
         }
         let mut dirty: Vec<ChunkPos> = Vec::new();
         for cell in cells {
+            // 遥测(REQ-009 §8):计数进 outbox,每拍随 take_outbox 归零(不进
+            // 分片长期字段)。粉碎数含因上限改粉碎的格;over_cap 用与
+            // `evaluate_blast` 同一判别式复核——P 未超粉碎阈值(P ≤ k·R)的
+            // 粉碎格必是"原判脱落、被上限改粉碎"(f64 同值同式,逐位一致)。
+            self.outbox.destruction_stats.cells_blasted += 1;
+            match cell.fate {
+                crate::destruction::CellFate::Pulverize => {
+                    self.outbox.destruction_stats.pulverized += 1;
+                    if let Some(m) = self.registry.material(cell.block)
+                        && cell.pressure <= m.pulverize_factor as f64 * m.resistance as f64
+                    {
+                        self.outbox.destruction_stats.pulverized_over_cap += 1;
+                    }
+                }
+                crate::destruction::CellFate::Detach { .. } => {
+                    self.outbox.destruction_stats.detached += 1;
+                }
+            }
             let _ = self.voxels.set_block(cell.pos, BlockId::AIR);
             // 坍塌触发(REQ-009 §6.2.1):爆炸破坏格由实心变 air。
             self.register_collapse_trigger(cell.pos, true, BlockId::AIR);
@@ -6149,10 +6182,17 @@ mod tests {
 
     /// 开启破坏的单分片平地(_chunks cx 2..=6、cz 2..=6,超平坦;名额 = cap)。
     fn destruction_sim(cap: usize) -> ShardSim {
+        destruction_sim_tuned(cap, 2048, 512)
+    }
+
+    /// 同上,另调坍塌搜索预算与悬空块上限(遥测测试用)。
+    fn destruction_sim_tuned(cap: usize, max_cells: usize, max_cluster: usize) -> ShardSim {
         use voxel::WorldGenerator;
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.destruction.enabled = true;
         cfg.destruction.max_detach_per_tick = cap;
+        cfg.destruction.collapse_max_cells = max_cells;
+        cfg.destruction.collapse_max_cluster = max_cluster;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         for cx in 2..=6i32 {
             for cz in 2..=6i32 {
@@ -6529,5 +6569,158 @@ mod tests {
         for c in &sand {
             assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
         }
+    }
+
+    // ---- 遥测接线(REQ-009 §8,单元 05)----
+
+    /// §8 爆炸遥测:标准弹坑 cells_blasted 60 = 粉碎 36 + 脱落 24(detached
+    /// 与 detach_requests 列表等长);名额 10 时 14 格因上限改粉碎——计入
+    /// `pulverized`(50)并单列 `pulverized_over_cap`(= 24 − 10)。
+    ///
+    /// 变红:计数没接线(恒 0);粉碎数漏掉因上限改粉碎的格;detached 与
+    /// 请求列表脱节。
+    #[test]
+    fn blast_telemetry_counts_fates_and_over_cap() {
+        let mut s = destruction_sim(64);
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        s.step();
+        let out = s.take_outbox();
+        let t = out.destruction_stats;
+        assert_eq!(
+            (
+                t.cells_blasted,
+                t.pulverized,
+                t.detached,
+                t.pulverized_over_cap
+            ),
+            (60, 36, 24, 0),
+            "标准弹坑口径(名额充裕,无 over_cap)"
+        );
+        assert_eq!(
+            t.cells_blasted,
+            t.pulverized + t.detached,
+            "爆炸格数 = 粉碎 + 脱落"
+        );
+        assert_eq!(
+            usize::try_from(t.detached).expect("计数非负"),
+            out.detach_requests.len(),
+            "detached == 脱落请求列表长"
+        );
+
+        let mut s = destruction_sim(10);
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        s.step();
+        let out = s.take_outbox();
+        let t = out.destruction_stats;
+        assert_eq!(
+            (
+                t.cells_blasted,
+                t.pulverized,
+                t.detached,
+                t.pulverized_over_cap
+            ),
+            (60, 50, 10, 14),
+            "名额 10:脱落候选 24 → 14 格因上限改粉碎(坑不变小)"
+        );
+    }
+
+    /// §8 坍塌遥测:名额 5 三拍 (cells_collapsed, collapse_deferred, detached)
+    /// = (5,7,5)/(5,2,5)/(2,0,2);每拍触发集非空恰一次求值、visited > 0、
+    /// detached 与请求列表等长。
+    ///
+    /// 变红:推迟数没算(恒 0);推迟数算成触发集大小(首拍 17 = 12 柱 +
+    /// 5 面);转换数没计;detached 漏掉坍塌贡献。
+    #[test]
+    fn collapse_telemetry_counts_conversion_and_deferral() {
+        let mut s = destruction_sim(5);
+        let (pa, pb, _deck) = build_bridge(&mut s);
+        let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+            .collect();
+        s.apply_prefix(&remove);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            s.step();
+            let out = s.take_outbox();
+            let t = out.destruction_stats;
+            seen.push((t.cells_collapsed, t.collapse_deferred, t.detached));
+            assert_eq!(t.collapse_evaluations, 1, "触发集非空恰一次求值:{t:?}");
+            assert!(t.collapse_visited > 0, "访问数照记:{t:?}");
+            assert_eq!(
+                usize::try_from(t.detached).expect("计数非负"),
+                out.detach_requests.len(),
+                "detached == 脱落请求列表长"
+            );
+        }
+        assert_eq!(seen, [(5, 7, 5), (5, 2, 5), (2, 0, 2)]);
+    }
+
+    /// §8:预算锚定与超大块分开计——搜索预算 8 判锚定(`budget_anchored ≥ 1`、
+    /// oversized 0);悬空上限 8 计 1 个超大块(oversized 1、budget 0);两种
+    /// 不塌的拍同样计求值数、转换与推迟均为 0。
+    ///
+    /// 变红:两计数混计;求值数挪到"有转换才计"。
+    #[test]
+    fn collapse_telemetry_budget_anchor_vs_oversized() {
+        for (max_cells, max_cluster, want_budget, want_oversized) in [
+            (8usize, 8usize, true, false),
+            (2048usize, 8usize, false, true),
+        ] {
+            let mut s = destruction_sim_tuned(64, max_cells, max_cluster);
+            let (pa, pb, _deck) = build_bridge(&mut s);
+            let remove: Vec<StampedInput> = [&pa[..], &pb[..]]
+                .concat()
+                .iter()
+                .enumerate()
+                .map(|(k, p)| setblock_input(100 + k as u64, *p, voxel::builtin::AIR))
+                .collect();
+            s.apply_prefix(&remove);
+            s.step();
+            let t = s.take_outbox().destruction_stats;
+            assert_eq!(
+                (t.cells_collapsed, t.collapse_deferred, t.detached),
+                (0, 0, 0),
+                "上限之内不塌不推迟:{t:?}"
+            );
+            assert_eq!(
+                t.collapse_budget_anchored >= 1,
+                want_budget,
+                "预算锚定({max_cells}):{t:?}"
+            );
+            assert_eq!(
+                t.collapse_oversized,
+                u64::from(want_oversized),
+                "超大块({max_cluster}):{t:?}"
+            );
+            assert_eq!(t.collapse_evaluations, 1, "不塌的拍同样计求值");
+        }
+    }
+
+    /// §8/修订 6:触发集为空的拍不求值(求值数 0、全部计数为默认);爆炸的
+    /// 下一拍(生成拍)计数归零——计数进 outbox 随 take 取走即清,不跨拍累计。
+    ///
+    /// 变红:空集也调用 `find_collapse`(安静拍求值数 1);计数挪进分片长期
+    /// 字段跨拍累计。
+    #[test]
+    fn collapse_stats_zero_on_quiet_tick() {
+        let mut s = destruction_sim(64);
+        s.step();
+        assert_eq!(
+            s.take_outbox().destruction_stats,
+            crate::destruction::DestructionStats::default(),
+            "安静拍(无触发)全 0"
+        );
+        s.apply_prefix(&[detonate_input(1, Vec3::new(64.0, -59.5, 64.0), 12.0, 8.0)]);
+        s.step();
+        assert_eq!(s.take_outbox().destruction_stats.cells_blasted, 60);
+        s.step();
+        assert_eq!(
+            s.take_outbox().destruction_stats,
+            crate::destruction::DestructionStats::default(),
+            "下一拍(生成拍)归零"
+        );
     }
 }

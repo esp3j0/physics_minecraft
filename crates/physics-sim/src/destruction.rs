@@ -88,8 +88,17 @@ pub struct DestructionStats {
 impl DestructionStats {
     /// 逐字段相加(调度器合计用)。
     pub fn add(&mut self, other: &Self) {
-        let _ = other;
-        unimplemented!("REQ-009 单元 05:由实施方实现")
+        self.cells_blasted += other.cells_blasted;
+        self.cells_impacted += other.cells_impacted;
+        self.cells_collapsed += other.cells_collapsed;
+        self.detached += other.detached;
+        self.pulverized += other.pulverized;
+        self.pulverized_over_cap += other.pulverized_over_cap;
+        self.collapse_evaluations += other.collapse_evaluations;
+        self.collapse_visited += other.collapse_visited;
+        self.collapse_budget_anchored += other.collapse_budget_anchored;
+        self.collapse_oversized += other.collapse_oversized;
+        self.collapse_deferred += other.collapse_deferred;
     }
 }
 
@@ -1008,6 +1017,58 @@ mod tests {
             out.falling,
             [pos(1, 10, 0), pos(2, 10, 0), pos(3, 10, 0), pos(4, 10, 0)],
             "支撑是空气,横臂塌落"
+        );
+    }
+
+    /// §8 `DestructionStats::add`:11 个字段逐一相加(调度器合计用)。
+    ///
+    /// 变红:漏加任一字段(合计比两分片之和小)。
+    #[test]
+    fn destruction_stats_add_sums_every_field() {
+        let a = DestructionStats {
+            cells_blasted: 1,
+            cells_impacted: 2,
+            cells_collapsed: 3,
+            detached: 4,
+            pulverized: 5,
+            pulverized_over_cap: 6,
+            collapse_evaluations: 7,
+            collapse_visited: 8,
+            collapse_budget_anchored: 9,
+            collapse_oversized: 10,
+            collapse_deferred: 11,
+        };
+        let b = DestructionStats {
+            cells_blasted: 100,
+            cells_impacted: 200,
+            cells_collapsed: 300,
+            detached: 400,
+            pulverized: 500,
+            pulverized_over_cap: 600,
+            collapse_evaluations: 700,
+            collapse_visited: 800,
+            collapse_budget_anchored: 900,
+            collapse_oversized: 1000,
+            collapse_deferred: 1100,
+        };
+        let mut sum = a;
+        sum.add(&b);
+        assert_eq!(
+            sum,
+            DestructionStats {
+                cells_blasted: 101,
+                cells_impacted: 202,
+                cells_collapsed: 303,
+                detached: 404,
+                pulverized: 505,
+                pulverized_over_cap: 606,
+                collapse_evaluations: 707,
+                collapse_visited: 808,
+                collapse_budget_anchored: 909,
+                collapse_oversized: 1010,
+                collapse_deferred: 1111,
+            },
+            "逐字段相加,一个不漏"
         );
     }
 }

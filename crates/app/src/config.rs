@@ -318,6 +318,32 @@ impl Config {
                 self.area_ticket_max_radius_m
             )));
         }
+        // 地形破坏(REQ-009 §8):`attenuation` 为有限正数;各上限 ≥ 1;
+        // `collapse_max_cells ≥ collapse_max_cluster`。
+        let d = &self.destruction;
+        if !d.attenuation.is_finite() || d.attenuation <= 0.0 {
+            return Err(ConfigError::Validate(format!(
+                "attenuation ({}) 须为有限正数",
+                d.attenuation
+            )));
+        }
+        for (name, cap) in [
+            ("max_debris_per_explosion", d.max_debris_per_explosion),
+            ("max_detach_per_tick", d.max_detach_per_tick),
+            ("max_impact_breaks_per_tick", d.max_impact_breaks_per_tick),
+            ("collapse_max_cells", d.collapse_max_cells),
+            ("collapse_max_cluster", d.collapse_max_cluster),
+        ] {
+            if cap < 1 {
+                return Err(ConfigError::Validate(format!("{name} ({cap}) 须 ≥ 1")));
+            }
+        }
+        if d.collapse_max_cells < d.collapse_max_cluster {
+            return Err(ConfigError::Validate(format!(
+                "collapse_max_cells ({}) 不得小于 collapse_max_cluster ({})",
+                d.collapse_max_cells, d.collapse_max_cluster
+            )));
+        }
         Ok(())
     }
 
@@ -420,8 +446,16 @@ impl Config {
                 contact_wake_max_bodies_per_tick: a.contact_wake_max_bodies_per_tick,
                 void_despawn_depth_m: a.void_despawn_depth_m,
             },
-            // REQ-009:`[destruction]` 配置表在单元 05 接入;此前取默认(实施期间关闭)。
-            destruction: physics_sim::destruction::DestructionConfig::default(),
+            // REQ-009 §8:`[destruction]` 配置表 1:1 直传(单元 05;字段同构)。
+            destruction: physics_sim::destruction::DestructionConfig {
+                enabled: self.destruction.enabled,
+                attenuation: self.destruction.attenuation,
+                max_debris_per_explosion: self.destruction.max_debris_per_explosion,
+                max_detach_per_tick: self.destruction.max_detach_per_tick,
+                max_impact_breaks_per_tick: self.destruction.max_impact_breaks_per_tick,
+                collapse_max_cells: self.destruction.collapse_max_cells,
+                collapse_max_cluster: self.destruction.collapse_max_cluster,
+            },
         }
     }
 
@@ -931,6 +965,129 @@ unload_radius = 64
                 .activation
                 .collider_load_radius
                 > 0.0
+        );
+    }
+
+    /// REQ-009 §8(单元 05):`[destruction]` 默认值与核内同值(实施期
+    /// `enabled = false`);部分键其余取默认(结构体级 serde(default) 与表级
+    /// deny_unknown_fields 并存,风险 5);覆写逐字段映射进 `shard_sim_config`
+    /// (替换写死的核内默认);覆写实例 toml 往返无损。
+    ///
+    /// 变红:表没接进 shard_sim_config(分片仍用核内默认);部分键解析失败。
+    #[test]
+    fn destruction_config_partial_keys_and_mapping() {
+        // 默认 = 核内默认,逐字段锚定(enabled 实施期 false,单元 07 改)。
+        let d = Config::default().destruction;
+        let core = physics_sim::destruction::DestructionConfig::default();
+        assert!(!d.enabled, "实施期间默认关闭");
+        assert_eq!(d.attenuation, core.attenuation);
+        assert_eq!(d.max_debris_per_explosion, core.max_debris_per_explosion);
+        assert_eq!(d.max_detach_per_tick, core.max_detach_per_tick);
+        assert_eq!(
+            d.max_impact_breaks_per_tick,
+            core.max_impact_breaks_per_tick
+        );
+        assert_eq!(d.collapse_max_cells, core.collapse_max_cells);
+        assert_eq!(d.collapse_max_cluster, core.collapse_max_cluster);
+        assert_eq!(
+            Config::default()
+                .shard_sim_config(shard_id(0, 0))
+                .destruction,
+            core,
+            "默认映射 = 核内默认"
+        );
+
+        // 部分键:给了的生效,没给的取默认。
+        let partial =
+            Config::from_toml_str("[destruction]\nattenuation = 2.0\n").expect("部分键合法");
+        assert_eq!(partial.destruction.attenuation, 2.0, "覆写生效");
+        assert!(!partial.destruction.enabled, "未给的键取默认");
+        assert_eq!(
+            partial.destruction.max_detach_per_tick, core.max_detach_per_tick,
+            "未给的键取默认"
+        );
+
+        // 覆写:7 键全给,逐字段映射进分片配置。
+        let c = Config::from_toml_str(
+            "[destruction]\nenabled = true\nattenuation = 0.5\nmax_debris_per_explosion = 10\n\
+             max_detach_per_tick = 20\nmax_impact_breaks_per_tick = 3\ncollapse_max_cells = 900\n\
+             collapse_max_cluster = 300\n",
+        )
+        .expect("合法");
+        let m = c.shard_sim_config(shard_id(0, 0)).destruction;
+        assert_eq!(
+            (
+                m.enabled,
+                m.attenuation,
+                m.max_debris_per_explosion,
+                m.max_detach_per_tick,
+                m.max_impact_breaks_per_tick,
+                m.collapse_max_cells,
+                m.collapse_max_cluster
+            ),
+            (true, 0.5, 10, 20, 3, 900, 300),
+            "覆写逐字段直传(替换写死的核内默认)"
+        );
+
+        // 往返:覆写实例无损(新表真实走序列化)。
+        assert_eq!(
+            Config::from_toml_str(&c.to_toml_string()).expect("往返后仍合法"),
+            c,
+            "[destruction] 往返不丢字段"
+        );
+    }
+
+    /// REQ-009 §8 校验:`attenuation` 非正或非有限、各上限为 0、
+    /// `collapse_max_cells < collapse_max_cluster` 都被拒绝且错误信息点名键;
+    /// 边界(上限恰 1、cells == cluster)合法。未知键经表级
+    /// deny_unknown_fields 在解析期报错。
+    ///
+    /// 变红:漏掉某条校验(对应键不再被点名)。
+    #[test]
+    fn destruction_config_validation_rules() {
+        for (toml, key) in [
+            ("[destruction]\nfoo = 1\n", "foo"),
+            ("[destruction]\nattenuation = 0.0\n", "attenuation"),
+            ("[destruction]\nattenuation = -1.0\n", "attenuation"),
+            ("[destruction]\nattenuation = inf\n", "attenuation"),
+            (
+                "[destruction]\nmax_debris_per_explosion = 0\n",
+                "max_debris_per_explosion",
+            ),
+            (
+                "[destruction]\nmax_detach_per_tick = 0\n",
+                "max_detach_per_tick",
+            ),
+            (
+                "[destruction]\nmax_impact_breaks_per_tick = 0\n",
+                "max_impact_breaks_per_tick",
+            ),
+            (
+                "[destruction]\ncollapse_max_cells = 0\n",
+                "collapse_max_cells",
+            ),
+            (
+                "[destruction]\ncollapse_max_cluster = 0\n",
+                "collapse_max_cluster",
+            ),
+            (
+                "[destruction]\ncollapse_max_cells = 100\n",
+                "collapse_max_cells",
+            ),
+        ] {
+            match Config::from_toml_str(toml) {
+                Ok(_) => panic!("非法配置应被拒绝:{toml}"),
+                Err(e) => assert!(e.to_string().contains(key), "错误信息应点名 {key}:{e}"),
+            }
+        }
+        // 边界合法:各上限恰 1;cells == cluster。
+        assert!(
+            Config::from_toml_str(
+                "[destruction]\nmax_debris_per_explosion = 1\nmax_detach_per_tick = 1\n\
+                 max_impact_breaks_per_tick = 1\ncollapse_max_cells = 8\ncollapse_max_cluster = 8\n",
+            )
+            .is_ok(),
+            "边界值合法"
         );
     }
 }

@@ -1602,12 +1602,17 @@ impl Scheduler {
         let mut migrations_admitted = 0usize;
         // 06c 遥测事件量合计(§4.16:全部分片合计;每拍重算)。
         let mut events = physics_sim::ActivationEvents::default();
+        // 地形破坏遥测合计(REQ-009 §8,单元 05):屏障阶段把各分片的
+        // `Outbox::destruction_stats` 相加(outbox 每拍取走即清,计数按拍归零)。
+        let mut destruction = physics_sim::destruction::DestructionStats::default();
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
         // 方块写入收集(REQ-005 D11):同款恰一次;owner 过滤逐条判定。
         self.block_updates.clear();
         for (shard, (sim, mut outbox, shard_events)) in results {
+            // 地形破坏遥测(REQ-009 §8):本分片本拍计数并入合计(加法可交换)。
+            destruction.add(&outbox.destruction_stats);
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -2078,7 +2083,7 @@ impl Scheduler {
             tick: at,
             stepped_shards,
             migrations_admitted,
-            destruction: physics_sim::destruction::DestructionStats::default(),
+            destruction,
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -6007,6 +6012,79 @@ mod tests {
             power: 12.0,
             radius: 8.0,
         })
+    }
+
+    /// 破坏开启的分片,爆心 = 本体区中心 (x·128+64, −59.5, z·128+64),周边
+    /// chunk 已装载(遥测合计测试用:两分片同相对几何,弹坑同为 60 格)。
+    fn destruction_sim_centered(x: i32, z: i32) -> ShardSim {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.destruction.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let (bx, bz) = (x * 8, z * 8); // min_chunk
+        for cx in bx + 2..=bx + 6 {
+            for cz in bz + 2..=bz + 6 {
+                let cp = types::ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s
+    }
+
+    /// REQ-009 §8(单元 05):屏障阶段把**全部分片**的 `Outbox::destruction_stats`
+    /// 合计进 `TickSummary::destruction`;计数每拍归零(outbox 取走即清)。
+    ///
+    /// 变红:合计没接线(summary 恒默认);只取了某一个分片的计数(总数减半);
+    /// 跨拍累计(生成拍不为 0)。
+    #[test]
+    fn tick_summary_aggregates_destruction_stats() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let (a, b) = (shard_id(0, 0), shard_id(1, 0));
+        sched.register(destruction_sim_centered(0, 0));
+        sched.register(destruction_sim_centered(1, 0));
+        for (shard, seq) in [(a, 0u64), (b, 1)] {
+            sched
+                .submit(
+                    shard,
+                    StampedInput {
+                        apply_at: Tick::ZERO,
+                        source: InputSource(1),
+                        sequence: seq,
+                        payload: detonate_cmd(types::glam::Vec3::new(
+                            shard.pos.x as f32 * 128.0 + 64.0,
+                            -59.5,
+                            shard.pos.z as f32 * 128.0 + 64.0,
+                        )),
+                    },
+                )
+                .expect("收件箱未满");
+        }
+        let t = sched.tick();
+        assert_eq!(
+            (
+                t.destruction.cells_blasted,
+                t.destruction.pulverized,
+                t.destruction.detached
+            ),
+            (120, 72, 48),
+            "两分片各 60/36/24,合计逐字段相加"
+        );
+        assert_eq!(
+            t.destruction.collapse_evaluations, 2,
+            "两分片各一次坍塌求值"
+        );
+        assert!(t.destruction.collapse_visited > 0);
+        // 第二拍(生成拍):计数归零,不跨拍累计。
+        let t2 = sched.tick();
+        assert_eq!(
+            t2.destruction,
+            physics_sim::destruction::DestructionStats::default(),
+            "下一拍归零"
+        );
+        sched.shutdown();
     }
 
     /// REQ-009 §7(单元 03):tick N 屏障阶段按 canonical 序分配涌现 ID、

@@ -1562,7 +1562,6 @@ mod unit05 {
     ///
     /// 会变红的实现:表没接进 `shard_sim_config`(分片仍用核内默认);漏掉某条校验;键名拼错被当成未知键。
     #[test]
-    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d11_destruction_config_table() {
         let d = Config::default().destruction;
         assert_eq!(
@@ -1623,7 +1622,6 @@ mod unit05 {
     ///
     /// 会变红的实现:计数没接线;粉碎数漏掉因上限改粉碎的;调度器只取了某一个分片的计数;计数跨拍累计。
     #[test]
-    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d11_blast_telemetry() {
         let mut s = session(|_| {});
         let mut log = CommandLog::new();
@@ -1669,7 +1667,6 @@ mod unit05 {
     ///
     /// 会变红的实现:推迟数没算或算成触发集大小;预算锚定与超大块混计;坍塌转换没计入 `detached`。
     #[test]
-    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d11_collapse_telemetry() {
         let (pillars, deck) = bridge();
         let mut s = session(|d| d.max_detach_per_tick = 5);
@@ -1724,7 +1721,6 @@ mod unit05 {
     /// 会变红的实现:任何一块新状态(待生成输入、推迟队列、涌现计数器、破坏配置)没进 v6 布局,
     /// 或解码后丢失——恢复线会少生成实体、少塌格或 ID 不同。
     #[test]
-    #[ignore = "REQ-009 单元 05 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d10_checkpoint_roundtrip_replay() {
         let (pillars, deck) = bridge();
         let mut a = session(|d| d.max_detach_per_tick = 5);
