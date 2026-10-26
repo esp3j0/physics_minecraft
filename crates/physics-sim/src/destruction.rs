@@ -3,10 +3,13 @@
 //! **总架构师接口桩(REQ-009 单元 02)**:公开类型、常量与签名固定,函数体由实施方实现。
 //! 算法规格见 REQ-009 §4(修订 2);标准答案由总架构师的参照实现给出(验收用例)。
 
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, BinaryHeap};
+
 use serde::{Deserialize, Serialize};
 use types::glam::{Quat, Vec3};
-use types::{BlockId, BlockPos};
-use voxel::BlockRegistry;
+use types::{BlockId, BlockPos, WORLD_Y_MIN};
+use voxel::{BlockRegistry, Material, Support};
 
 /// 脱落块的半边长(REQ-009 §4.3;demo:0.45 静止最快)。
 pub const DEBRIS_HALF_SIZE: f32 = 0.45;
@@ -116,6 +119,16 @@ pub struct CollapseOutcome {
     pub visited: usize,
 }
 
+/// 6 邻居的偏移(坍塌搜索与种子收集用)。
+const NEIGHBOR_DELTAS: [(i32, i32, i32); 6] = [
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+];
+
 /// 坍塌求值(纯函数,REQ-009 §6.1–§6.2):
 ///
 /// - `block_at` 给出**移除之后**的世界(`removed` 中的格已是非实心);`None` = 所在 chunk 未装载;
@@ -138,8 +151,122 @@ pub fn find_collapse(
     max_cells: usize,
     max_cluster: usize,
 ) -> CollapseOutcome {
-    let _ = (block_at, registry, removed, max_cells, max_cluster);
-    unimplemented!("REQ-009 单元 04a:由实施方实现")
+    // 结果与 removed 的顺序无关:去重、升序后处理。
+    let mut removed_sorted: Vec<BlockPos> = removed.to_vec();
+    removed_sorted.sort_unstable();
+    removed_sorted.dedup();
+
+    // 材料查询:None = 非实心或未装载。
+    let material_at =
+        |p: BlockPos| -> Option<Material> { block_at(p).and_then(|b| registry.material(b)) };
+
+    // 沙子规则:被移除格正上方起,连续的 NeedsBelow 实心格全部塌落(与连通性无关)。
+    let mut gone: BTreeSet<BlockPos> = removed_sorted.iter().copied().collect();
+    let mut falling: Vec<BlockPos> = Vec::new();
+    for &cell in &removed_sorted {
+        let mut y = cell.y + 1;
+        loop {
+            let above = BlockPos::new(cell.x, y, cell.z);
+            let falls = material_at(above).is_some_and(|m| m.support == Support::NeedsBelow);
+            if !falls || !gone.insert(above) {
+                break;
+            }
+            falling.push(above);
+            y += 1;
+        }
+    }
+
+    // 种子:gone 各格的 6 邻居里的实心格(去重、升序、不含 gone;未装载格不实心)。
+    let mut seeds: BTreeSet<BlockPos> = BTreeSet::new();
+    for &cell in &gone {
+        for (dx, dy, dz) in NEIGHBOR_DELTAS {
+            let n = BlockPos::new(cell.x + dx, cell.y + dy, cell.z + dz);
+            if gone.contains(&n) {
+                continue;
+            }
+            if material_at(n).is_some() {
+                seeds.insert(n);
+            }
+        }
+    }
+
+    // 已判定的格:锚定 / 悬空(同一拍内复用,后续种子碰到即不再搜索)。
+    let mut anchored: BTreeSet<BlockPos> = BTreeSet::new();
+    let mut floating: BTreeSet<BlockPos> = BTreeSet::new();
+    let mut oversized_clusters = 0usize;
+    let mut budget_anchored = 0usize;
+    let mut visited = 0usize;
+
+    for &seed in &seeds {
+        if anchored.contains(&seed) || floating.contains(&seed) {
+            continue;
+        }
+        // 向下优先搜索:优先队列键 (y, x, z) 升序,不是 BlockPos 的 (x, y, z)。
+        let mut queue: BinaryHeap<Reverse<(i32, i32, i32)>> = BinaryHeap::new();
+        let mut enqueued: BTreeSet<BlockPos> = BTreeSet::new();
+        let mut dequeued: Vec<BlockPos> = Vec::new();
+        enqueued.insert(seed);
+        queue.push(Reverse((seed.y, seed.x, seed.z)));
+        let mut anchored_now = false;
+        let mut over_budget = false;
+        while let Some(Reverse((y, x, z))) = queue.pop() {
+            let p = BlockPos::new(x, y, z);
+            visited += 1;
+            dequeued.push(p);
+            // 出队的格是地基(Anchor 或世界底)或已被前面的搜索判为锚定 → 本块锚定。
+            let is_anchor = material_at(p).is_some_and(|m| m.support == Support::Anchor);
+            if is_anchor || y == WORLD_Y_MIN || anchored.contains(&p) {
+                anchored_now = true;
+                break;
+            }
+            // 邻居扩展:要入队的邻居所在 chunk 未装载 → 保守判锚定;gone 与非实心不入队。
+            let mut hits_unloaded = false;
+            for (dx, dy, dz) in NEIGHBOR_DELTAS {
+                let n = BlockPos::new(x + dx, y + dy, z + dz);
+                let Some(block) = block_at(n) else {
+                    hits_unloaded = true;
+                    break;
+                };
+                if gone.contains(&n) || registry.material(block).is_none() {
+                    continue;
+                }
+                if enqueued.insert(n) {
+                    queue.push(Reverse((n.y, n.x, n.z)));
+                }
+            }
+            if hits_unloaded {
+                anchored_now = true;
+                break;
+            }
+            // 搜索预算:出队数超过 max_cells 判锚定(计 budget_anchored,与超大块分开计)。
+            if dequeued.len() > max_cells {
+                anchored_now = true;
+                over_budget = true;
+                break;
+            }
+        }
+        if anchored_now {
+            if over_budget {
+                budget_anchored += 1;
+            }
+            anchored.extend(dequeued);
+        } else {
+            // 整块悬空:dequeued 即完整连通块;超 max_cluster 的整块留在原地。
+            if dequeued.len() <= max_cluster {
+                falling.extend_from_slice(&dequeued);
+            } else {
+                oversized_clusters += 1;
+            }
+            floating.extend(dequeued);
+        }
+    }
+    falling.sort_unstable();
+    CollapseOutcome {
+        falling,
+        oversized_clusters,
+        budget_anchored,
+        visited,
+    }
 }
 
 /// 线段 `from → to` 依次穿过的格,**含两端所在格**,按穿过顺序(REQ-009 §4.2):
@@ -634,6 +761,215 @@ mod tests {
                 block: builtin::DIRT,
             },
             "描述 = 半边长 0.45 + 原方块"
+        );
+    }
+
+    /// §6.1 锚定规则边界:`y == WORLD_Y_MIN` 的格即使不是基岩也判锚定;同一形状
+    /// 抬高一格(不触底、无基岩)就悬空塌落。
+    ///
+    /// 变红:去掉 `y == WORLD_Y_MIN` 判定(只剩基岩材质判锚定,触底柱被误判悬空)。
+    #[test]
+    fn find_collapse_world_bottom_is_anchor_without_bedrock() {
+        let touching = |p: BlockPos| {
+            Some(if p.x == 0 && p.z == 0 && (-64..=-62).contains(&p.y) {
+                builtin::STONE
+            } else {
+                builtin::AIR
+            })
+        };
+        let out = find_collapse(&touching, &reg(), &[pos(0, -62, 0)], 2048, 512);
+        assert!(out.falling.is_empty(), "触底即锚定:{:?}", out.falling);
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+
+        let lifted = |p: BlockPos| {
+            Some(if p.x == 0 && p.z == 0 && (-63..=-61).contains(&p.y) {
+                builtin::STONE
+            } else {
+                builtin::AIR
+            })
+        };
+        let out = find_collapse(&lifted, &reg(), &[pos(0, -61, 0)], 2048, 512);
+        assert_eq!(
+            out.falling,
+            [pos(0, -63, 0), pos(0, -62, 0)],
+            "不触底就悬空"
+        );
+    }
+
+    /// §6.2 cluster 上限边界:悬空块恰好 == `max_cluster` 照常塌落;再大一格,整块
+    /// 留在原地计 `oversized_clusters`(不塌一半,不混入 `budget_anchored`)。
+    ///
+    /// 变红:判断写成 `<`(恰好等于上限被误判超大);超大块塌一部分。
+    #[test]
+    fn find_collapse_cluster_limit_boundary() {
+        // 4 格横杆 (0..=3,10,0),支撑 (0,9,0) 被移除;杆下与四周全空气。
+        let world = |p: BlockPos| {
+            Some(if (0..=3).contains(&p.x) && p.y == 10 && p.z == 0 {
+                builtin::STONE
+            } else {
+                builtin::AIR
+            })
+        };
+        let removed = [pos(0, 9, 0)];
+        let bar = [pos(0, 10, 0), pos(1, 10, 0), pos(2, 10, 0), pos(3, 10, 0)];
+
+        let out = find_collapse(&world, &reg(), &removed, 2048, 4);
+        assert_eq!(out.falling, bar, "恰好等于上限的整块照常塌落");
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+
+        let out = find_collapse(&world, &reg(), &removed, 2048, 3);
+        assert!(out.falling.is_empty(), "超限整块留在原地,不塌一半");
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (1, 0));
+    }
+
+    /// §6.1 搜索预算边界:出队数恰好 == `max_cells` 的搜索正常完成(悬空照塌);
+    /// 再多出一格出队就超预算判锚定(计 `budget_anchored`,不计 `oversized_clusters`)。
+    ///
+    /// 变红:判断写成 `>=`(恰好用满预算被误判锚定);预算与超大块计数混用。
+    #[test]
+    fn find_collapse_budget_limit_boundary() {
+        let world = |p: BlockPos| {
+            Some(if (0..=3).contains(&p.x) && p.y == 10 && p.z == 0 {
+                builtin::STONE
+            } else {
+                builtin::AIR
+            })
+        };
+        let removed = [pos(0, 9, 0)];
+        let bar = [pos(0, 10, 0), pos(1, 10, 0), pos(2, 10, 0), pos(3, 10, 0)];
+
+        let out = find_collapse(&world, &reg(), &removed, 4, 512);
+        assert_eq!(out.falling, bar, "恰好用满预算的搜索正常完成");
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+
+        let out = find_collapse(&world, &reg(), &removed, 3, 512);
+        assert!(out.falling.is_empty(), "超预算保守判锚定");
+        assert_eq!(
+            (out.oversized_clusters, out.budget_anchored),
+            (0, 1),
+            "两个计数分开"
+        );
+    }
+
+    /// §6.1 锚定标记复用:第一次搜索预算用完判锚定时,本次出队过的格全部标记;
+    /// 未被标记的另一端种子照常搜索,中途出队到已标记格即判锚定,不再计一次
+    /// `budget_anchored`,也不把半截平台重新搜成悬空。
+    ///
+    /// 变红:标记只在种子起点检查(搜索中途不停)——半截桥面被误塌、预算重计。
+    #[test]
+    fn find_collapse_marked_anchor_stops_mid_search() {
+        // 底层基岩(y=0),两根柱 (0/7,1..=4,0),8 格桥面 (0..=7,5,0);柱子全移除。
+        let world = |p: BlockPos| {
+            Some(match (p.x, p.y, p.z) {
+                (_, 0, _) => builtin::BEDROCK,
+                (0, 1..=4, 0) | (7, 1..=4, 0) => builtin::STONE,
+                (0..=7, 5, 0) => builtin::STONE,
+                _ => builtin::AIR,
+            })
+        };
+        let removed: Vec<BlockPos> = (1..=4).flat_map(|y| [pos(0, y, 0), pos(7, y, 0)]).collect();
+        let out = find_collapse(&world, &reg(), &removed, 5, 512);
+        assert!(out.falling.is_empty(), "{:?}", out.falling);
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 1));
+        assert!(out.visited <= 11, "另一端搜到已标记格即停:{}", out.visited);
+    }
+
+    /// §6.2 沙子规则:向上扫描只吃连续的 `NeedsBelow`,遇到石质(Connected)就停;
+    /// 石头经侧墙连着地基仍然锚定,只有它下面的那格沙子塌。
+    ///
+    /// 变红:扫描不查支撑类型(石头也被扫塌);沙子按连通性判定(贴墙沙不落)。
+    #[test]
+    fn find_collapse_sand_scan_stops_at_connected_material() {
+        let world = |p: BlockPos| {
+            Some(match (p.x, p.y, p.z) {
+                (0, 1, 0) => builtin::SAND,
+                (0, 2, 0) | (1, 0..=3, 0) => builtin::STONE,
+                (_, -1, _) => builtin::DIRT,
+                (_, -2, _) => builtin::BEDROCK,
+                _ => builtin::AIR,
+            })
+        };
+        let out = find_collapse(&world, &reg(), &[pos(0, 0, 0)], 2048, 512);
+        assert_eq!(out.falling, [pos(0, 1, 0)], "只塌连续的沙,石头经侧墙锚定");
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+    }
+
+    /// §6.2 沙子塌落格并入 `gone`:架在它上面的石头(它的实心邻居)成为种子;
+    /// 支撑没了,同一轮跟着悬空塌落。
+    ///
+    /// 变红:种子只从被移除格收(漏掉沙子塌落格的邻居)——石头错误地留在原地。
+    #[test]
+    fn find_collapse_block_on_fallen_sand_joins_collapse() {
+        let world = |p: BlockPos| {
+            Some(match (p.x, p.y, p.z) {
+                (0, 1, 0) => builtin::SAND,
+                (0, 2, 0) => builtin::STONE,
+                (_, -1, _) => builtin::DIRT,
+                (_, -2, _) => builtin::BEDROCK,
+                _ => builtin::AIR,
+            })
+        };
+        let out = find_collapse(&world, &reg(), &[pos(0, 0, 0)], 2048, 512);
+        assert_eq!(
+            out.falling,
+            [pos(0, 1, 0), pos(0, 2, 0)],
+            "沙子和失去支撑的石头同一轮塌落"
+        );
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+    }
+
+    /// §6.1 向下优先:无限 dirt 平面(y=-3..-1,基岩 y=-4)移除一格,5 个种子全部
+    /// 直线向下探到基岩,共 19 次出队;按 `BlockPos` 的 (x,y,z) 出队会横着爬满一层。
+    ///
+    /// 变红:优先队列键用 (x, y, z) 而不是 (y, x, z)(访问数暴涨、预算误判)。
+    #[test]
+    fn find_collapse_dives_straight_down() {
+        let world = |p: BlockPos| {
+            Some(match p.y {
+                -4 => builtin::BEDROCK,
+                -3..=-1 => builtin::DIRT,
+                _ => builtin::AIR,
+            })
+        };
+        let out = find_collapse(&world, &reg(), &[pos(5, -1, 5)], 2048, 512);
+        assert!(out.falling.is_empty());
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+        assert_eq!(out.visited, 19, "5 个种子各自向下直探基岩");
+    }
+
+    /// §6.1 未装载即锚定:搜索途中要入队的邻居所在 chunk 未装载 → 该块保守判锚定,
+    /// 不塌、不计 budget_anchored;同一形状换成空气支撑就正常塌落。
+    ///
+    /// 变红:把 None 当空气(远端结构被误塌);判锚定却计入 budget_anchored。
+    #[test]
+    fn find_collapse_unloaded_neighbor_anchors() {
+        let arm = [(1, 10, 0), (2, 10, 0), (3, 10, 0), (4, 10, 0)];
+        let mk = |unloaded: bool| {
+            move |p: BlockPos| {
+                if p == pos(0, 10, 0) && unloaded {
+                    None // 支撑点所在 chunk 未装载
+                } else {
+                    Some(if arm.contains(&(p.x, p.y, p.z)) {
+                        builtin::STONE
+                    } else {
+                        builtin::AIR
+                    })
+                }
+            }
+        };
+        let out = find_collapse(&mk(true), &reg(), &[pos(4, 9, 0)], 2048, 512);
+        assert!(
+            out.falling.is_empty(),
+            "看不见的支撑当有地基:{:?}",
+            out.falling
+        );
+        assert_eq!((out.oversized_clusters, out.budget_anchored), (0, 0));
+
+        let out = find_collapse(&mk(false), &reg(), &[pos(4, 9, 0)], 2048, 512);
+        assert_eq!(
+            out.falling,
+            [pos(1, 10, 0), pos(2, 10, 0), pos(3, 10, 0), pos(4, 10, 0)],
+            "支撑是空气,横臂塌落"
         );
     }
 }

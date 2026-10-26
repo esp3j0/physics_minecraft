@@ -964,7 +964,6 @@ mod unit04a {
     /// 会变红的实现:把"去掉一根柱子"判成悬空(没有走到另一根柱子);把 `removed` 的格也算进结果;
     /// 结果没排序。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_bridge_needs_both_pillars() {
         let pa = column(0, 0..=5, 0);
         let pb = column(11, 0..=5, 0);
@@ -981,7 +980,6 @@ mod unit04a {
     ///
     /// 会变红的实现:墙与横臂的连接没算(横臂根部那一格被当成锚);塔只塌最底下一格。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_cantilever_and_tower() {
         let mut cells: Vec<(BlockPos, BlockId)> = Vec::new();
         for y in 0..=7 {
@@ -1006,7 +1004,6 @@ mod unit04a {
     ///
     /// 会变红的实现:超大块塌了一部分;预算用完被当成悬空(大平台被误塌);两个计数混用。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_platform_and_limits() {
         let mut pillars = Vec::new();
         for (px, pz) in [(0, 0), (19, 0), (0, 19), (19, 19)] {
@@ -1038,7 +1035,6 @@ mod unit04a {
     ///
     /// 会变红的实现:用广度优先或按 BlockPos 出队(厚地基访问数上千);碰到基岩不停。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_open_ground_is_cheap() {
         let flat = Case::new([]).run_default(&[p(5, -1, 5)]);
         assert!(flat.falling.is_empty());
@@ -1054,7 +1050,6 @@ mod unit04a {
     ///
     /// 会变红的实现:把未装载当成空气(看不见的地方被当成悬空,远处的结构被误塌)。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_unloaded_counts_as_anchor() {
         let arm = || Case::new(line(1..=9, 5, 0).into_iter().map(|c| (c, S)));
         let mut hidden = arm();
@@ -1068,7 +1063,6 @@ mod unit04a {
     ///
     /// 会变红的实现:沙柱一拍只落最下面一格;沙子也按连通性判定(贴墙的沙子不落);旁边的移除也让沙子掉落。
     #[test]
-    #[ignore = "REQ-009 单元 04a 验收用例:实现完成后由实施方移除 ignore,不得修改断言"]
     fn acc_d5_sand_rules() {
         let mut col: Vec<(BlockPos, BlockId)> = vec![(p(0, 0, 0), S)];
         col.extend(column(0, 1..=5, 0).into_iter().map(|c| (c, builtin::SAND)));
