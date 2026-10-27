@@ -445,7 +445,6 @@ mod unit01 {
     /// 会变红的实现:数值抄错;`register` 的默认材料 B 不是 ∞(既有用例的自定义方块会突然开始断);
     /// 改了内置方块的 ID 顺序。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c1_builtin_bonds() {
         let reg = SimpleRegistry::builtin();
         let table = [
@@ -478,7 +477,6 @@ mod unit01 {
     ///
     /// 会变红的实现:取了较大值或和;空气、未知 ID 没有返回 0。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c1_pairwise_min() {
         let reg = SimpleRegistry::builtin();
         assert_eq!(bond_between(&reg, STONE, STONE), 8);
@@ -503,7 +501,6 @@ mod unit01 {
     /// 会变红的实现:只认世界底、不认悬空的基岩(与 REQ-009 的锚定口径不一致);未装载按无地基;
     /// 起点本身是空气却返回 true。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_grounded_scan() {
         let reg = SimpleRegistry::builtin();
         let mut w = W::new();
@@ -533,7 +530,6 @@ mod unit01 {
     ///
     /// 会变红的实现:只掉超载的那几格;粘结容量用了较大值;F 漏掉被吊着的格。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_door_lintel() {
         let (w, removed) = door(DIRT);
         let out = eval(&w, &removed);
@@ -550,7 +546,6 @@ mod unit01 {
     /// 会变红的实现:上限不等于 B(容量或网络方向写错);厚 2 能挂更长(把正下方也限了量或漏了
     /// 正上方的拉);超载只掉末端几格;放置不触发。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_cantilever_limit_equals_bond() {
         for (block, bond, name) in [(STONE, 8, "石"), (DIRT, 3, "土")] {
             for thick in [1, 2] {
@@ -578,7 +573,6 @@ mod unit01 {
     ///
     /// 会变红的实现:两侧共用一个容量;梁只计一端的容量;净跨超限时只掉中间几格。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_tbeam_and_two_end_beam() {
         for k in 3..=10 {
             let mut w = W::new();
@@ -619,7 +613,6 @@ mod unit01 {
     ///
     /// 会变红的实现:向上的边当成了不限量(拱腿移走后仍挂住);向下的边受 B 限制。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_arch() {
         let cells: Vec<BlockPos> = (-4..=4)
             .flat_map(|x| (0..=4).map(move |y| p(x, y, 0)))
@@ -646,7 +639,6 @@ mod unit01 {
     ///
     /// 会变红的实现:加重的写入不触发;放上去的格不进 F;沙子压不断(沙也有重量);塔判稳定。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_weight_and_tower() {
         for (extra, block) in [(1, STONE), (2, STONE), (4, STONE), (1, SAND)] {
             let (mut w, arm) = cantilever(8, 1, STONE);
@@ -673,7 +665,6 @@ mod unit01 {
     ///
     /// 会变红的实现:沙与墙之间有粘结;沙柱只掉最底下一格。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_sand() {
         let mut w = W::new();
         w.fill(column(0, 0..3, 0), STONE);
@@ -695,7 +686,6 @@ mod unit01 {
     ///
     /// 会变红的实现:接地格之间也建了边(容量算多);柱顶格算作悬挑。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_point_supported_platform_collapses() {
         let (w, plat) = platform();
         let out = eval(&w, &plat);
@@ -710,7 +700,6 @@ mod unit01 {
     ///
     /// 会变红的实现:上层的重量只能经下层传出(层与层之间向上的边漏了);接地判定把房顶当作接地。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_rooms_and_tunnels() {
         let (w, hole) = dug(12, -20..=20, 0..12);
         assert!(eval(&w, &hole).falling.is_empty(), "土房间 12×12");
@@ -734,7 +723,6 @@ mod unit01 {
     /// 会变红的实现:预算按全部种子合计(大块把小块也判稳定了);超预算的块被判塌;未装载按空气;
     /// 弹坑周围的接地格被当作悬挑(visited 不为 0)。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_budget_unloaded_and_crater() {
         let (w, slab) = edge_slab(15);
         let out = eval(&w, &slab);
@@ -772,7 +760,6 @@ mod unit01 {
     ///
     /// 会变红的实现:接地判定与 REQ-009 的锚定口径不一致;未装载或世界底的处理不同。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_infinite_bonds_match_find_collapse() {
         let mut reg = SimpleRegistry::new();
         let inf = |support| Material {
@@ -845,7 +832,6 @@ mod unit01 {
     ///
     /// 会变红的实现:任何与 §4.3 网络规格不一致的细节(边的方向、容量、接地判定、种子范围)。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c2_random_structures_match_reference() {
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = move || {
@@ -920,7 +906,6 @@ mod unit01 {
     /// 会变红的实现:切块网格不是世界对齐(按 F 自身的包围盒切);负坐标用了截断除法;沙子与石头成块;
     /// 只按网格切、没有在块内再按粘结连通划分。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c3_split_segments() {
         let mut w = W::new();
         let lintel = line_x(-3..3, 5, 0);
@@ -970,7 +955,6 @@ mod unit01 {
     ///
     /// 会变红的实现:段内不连通;段过大或包络半径超界。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c3_platform_segments_bounded() {
         let (w, plat) = platform();
         let falling = eval(&w, &plat).falling;
@@ -996,7 +980,6 @@ mod unit01 {
     ///
     /// 会变红的实现:同距取了大者;负坐标取整方向错;半径漏了 0.45·√3。
     #[test]
-    #[ignore = "REQ-010 单元 01 待实施方解除"]
     fn acc_c3_origin_and_radius() {
         assert_eq!(compound_origin(&line_x(0..6, 5, 0)), p(2, 5, 0));
         assert_eq!(compound_origin(&line_x(-3..3, 5, 0)), p(-1, 5, 0));
