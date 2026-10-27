@@ -1,0 +1,90 @@
+name = "req010-beam-whole"
+req = "REQ-010"
+description = "6 格石梁架在两根矮石柱上(同一个切块内),先后移走两根柱子:整根梁作为一个实体平落 2 m,整块凝固回一排石头"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.5, -54.0, 28.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [8.5, -59.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "两根矮柱"
+fill = { from = [6, -60, 14], to = [6, -59, 14], block = "stone" }
+
+[[step]]
+fill = { from = [11, -60, 14], to = [11, -59, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [11, -59, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "石梁 x 6..=11(同一个 6 格切块)"
+fill = { from = [6, -58, 14], to = [11, -58, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [11, -58, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "built", expect = "两根矮矮的灰色石柱托着一根水平的灰色石梁" }
+
+[[step]]
+label = "移走左柱(右柱仍托着,5 格悬臂挂得住)"
+fill = { from = [6, -60, 14], to = [6, -59, 14], block = "air" }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+check = { block = { pos = [8, -58, 14], is = "stone" } }
+
+[[step]]
+label = "移走右柱"
+fill = { from = [11, -60, 14], to = [11, -59, 14], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [8, -58, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 6 }
+
+[[step]]
+screenshot = { name = "falling", expect = "一整根蓝色横梁(6 个方块连成一根)在空中平平地下落;两根石柱都不见了" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [6, -60, 14], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [8, -60, 14], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [11, -60, 14], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [8, -58, 14], is = "air" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "一根完整的灰色石梁平躺在地面上(一排 6 格连续的石头);空中没有蓝色立方体" }

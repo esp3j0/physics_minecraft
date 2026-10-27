@@ -3318,3 +3318,84 @@ mod unit07 {
         assert!(st.rotation != Quat::IDENTITY || st.angvel.length() > 0.2);
     }
 }
+
+/// 单元 08:默认开启、配置表、迁移与图形冒烟(AC-C13、AC-C15、AC-C16;REQ-010 §11、§12.1,修订 9)。
+/// 图形冒烟(AC-C15)由 `smoke/scenarios-pending/req010-*.toml` 四个场景承担,机器检查通过后移入 `smoke/scenarios/`。
+mod unit08 {
+    use app::config::Config;
+    use physics_sim::ShardSimConfig;
+    use physics_sim::cohesion::CohesionConfig;
+    use types::{DimensionId, ShardId, ShardPos, WorldId};
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    /// AC-C16 默认开启(D9):核内默认、分片默认、app 配置默认、装配出的分片配置都开启。
+    ///
+    /// 会变红的实现:只改了某一层的默认值。
+    #[test]
+    #[ignore = "REQ-010 单元 08 待实施方解除"]
+    fn acc_c16_default_on() {
+        assert!(CohesionConfig::default().enabled);
+        assert!(ShardSimConfig::new(shard()).cohesion.enabled);
+        assert!(Config::default().cohesion.enabled);
+        assert!(Config::default().shard_sim_config(shard()).cohesion.enabled);
+    }
+
+    /// AC-C13 配置表 `[cohesion]`(§12.1 第 2 条):默认值;全键覆写 1:1 直传到分片配置;toml 往返;只写部分键时其余取默认;
+    /// 校验拒绝未知键、`load_max_cells = 0`、`compound_split_size` 为 0 或超出余量(默认 16 m 下 S = 8 → 8.58 > 8;
+    /// margin 8 m 下 S = 6 → 6.85 > 4)、`max_converted_cells_per_tick < S³`、`max_fractures_per_tick = 0`、负的上移格数;
+    /// S = 7 与默认余量相容(7.71 ≤ 8,1024 ≥ 343)。
+    ///
+    /// 会变红的实现:映射漏字段或写成默认值;校验缺项;余量没按 `margin_meters` 算。
+    #[test]
+    #[ignore = "REQ-010 单元 08 待实施方解除"]
+    fn acc_c13_cohesion_config_table() {
+        let d = Config::default().cohesion;
+        assert_eq!(
+            (
+                d.load_max_cells,
+                d.compound_split_size,
+                d.max_converted_cells_per_tick,
+                d.max_fractures_per_tick,
+                d.compound_snap_lift
+            ),
+            (2048, 6, 1024, 16, 2)
+        );
+        let text = "[cohesion]\nenabled = false\nload_max_cells = 900\ncompound_split_size = 4\n\
+                    max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n";
+        let c = Config::from_toml_str(text).expect("合法");
+        assert_eq!(
+            c.shard_sim_config(shard()).cohesion,
+            CohesionConfig {
+                enabled: false,
+                load_max_cells: 900,
+                compound_split_size: 4,
+                max_converted_cells_per_tick: 64,
+                max_fractures_per_tick: 3,
+                compound_snap_lift: 1,
+            }
+        );
+        assert_eq!(Config::from_toml_str(&c.to_toml_string()).expect("往返"), c);
+        let partial = Config::from_toml_str("[cohesion]\nload_max_cells = 100\n").expect("部分键");
+        assert_eq!(partial.cohesion.load_max_cells, 100);
+        assert_eq!(partial.cohesion.compound_split_size, 6, "未写的键取默认");
+        assert!(
+            Config::from_toml_str("[cohesion]\ncompound_split_size = 7\n").is_ok(),
+            "S = 7 与默认余量相容"
+        );
+        for bad in [
+            "[cohesion]\nfoo = 1\n",
+            "[cohesion]\nload_max_cells = 0\n",
+            "[cohesion]\ncompound_split_size = 0\n",
+            "[cohesion]\ncompound_split_size = 8\n",
+            "margin_meters = 8\n[cohesion]\ncompound_split_size = 6\n",
+            "[cohesion]\ncompound_split_size = 6\nmax_converted_cells_per_tick = 215\n",
+            "[cohesion]\nmax_fractures_per_tick = 0\n",
+            "[cohesion]\ncompound_snap_lift = -1\n",
+        ] {
+            assert!(Config::from_toml_str(bad).is_err(), "应拒绝:{bad}");
+        }
+    }
+}

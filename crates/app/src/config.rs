@@ -144,6 +144,35 @@ impl Default for DestructionConfig {
     }
 }
 
+/// 粘结与整块塌落配置表 `[cohesion]`(REQ-010 §11、§12.1)。键与默认值同 `physics_sim::cohesion::CohesionConfig`;
+/// **`enabled` 自单元 08 起默认 `true`(D9)**。校验见 §12.1 第 2 条。
+///
+/// **总架构师接口桩(REQ-010 单元 08)**:结构与默认值来源已给出;校验与到 `shard_sim_config` 的映射由实施方实现。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CohesionConfig {
+    pub enabled: bool,
+    pub load_max_cells: usize,
+    pub compound_split_size: i32,
+    pub max_converted_cells_per_tick: usize,
+    pub max_fractures_per_tick: usize,
+    pub compound_snap_lift: i32,
+}
+
+impl Default for CohesionConfig {
+    fn default() -> Self {
+        let c = physics_sim::cohesion::CohesionConfig::default();
+        Self {
+            enabled: c.enabled,
+            load_max_cells: c.load_max_cells,
+            compound_split_size: c.compound_split_size,
+            max_converted_cells_per_tick: c.max_converted_cells_per_tick,
+            max_fractures_per_tick: c.max_fractures_per_tick,
+            compound_snap_lift: c.compound_snap_lift,
+        }
+    }
+}
+
 /// 结构体级 `#[serde(default)]`:toml 文件可只写要覆写的字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -155,6 +184,8 @@ pub struct Config {
     pub activation: ActivationConfig,
     /// 地形破坏(REQ-009 §8)。
     pub destruction: DestructionConfig,
+    /// 粘结与整块塌落(REQ-010 §11)。
+    pub cohesion: CohesionConfig,
     /// 唤醒动态实体预算,512(§9.4)。
     pub max_awake_dynamic: usize,
     /// 每拍 chunk 换装预算,2(§4.3)。
@@ -198,6 +229,7 @@ impl Default for Config {
             margin_meters: 16,
             activation: ActivationConfig::default(),
             destruction: DestructionConfig::default(),
+            cohesion: CohesionConfig::default(),
             max_awake_dynamic: 512,
             swap_budget_chunks_per_tick: 2,
             area_ticket_max_radius_m: 128.0,

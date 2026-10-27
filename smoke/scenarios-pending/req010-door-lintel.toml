@@ -1,0 +1,113 @@
+name = "req010-door-lintel"
+req = "REQ-010"
+description = "并排两个门框(石柱 + 土门楣、石柱 + 石门楣),同时移走左柱:土门楣左边 6 格连成一整根落下、落地碎开;石门楣挂在右柱上"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [9.0, -52.0, 36.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [9.0, -57.0, 17.0] }
+
+[[step]]
+wait_until = { block = { pos = [9, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "门柱"
+fill = { from = [6, -60, 14], to = [6, -56, 14], block = "stone" }
+
+[[step]]
+fill = { from = [12, -60, 14], to = [12, -56, 14], block = "stone" }
+
+[[step]]
+fill = { from = [6, -60, 20], to = [6, -56, 20], block = "stone" }
+
+[[step]]
+fill = { from = [12, -60, 20], to = [12, -56, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [12, -56, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "土门楣下的临时脚手架(fill 可能跨拍,土悬臂最长 3 格,先撑住中间)"
+fill = { from = [9, -60, 14], to = [9, -56, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [9, -56, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "土门楣(7 格,中间 5 格靠两端各 3 的粘结挂住)"
+fill = { from = [6, -55, 14], to = [12, -55, 14], block = "dirt" }
+
+[[step]]
+label = "石门楣"
+fill = { from = [6, -55, 20], to = [12, -55, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [12, -55, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_until = { block = { pos = [12, -55, 14], is = "dirt" }, timeout_ticks = 600 }
+
+[[step]]
+label = "拆脚手架(门楣挂在两根柱子上)"
+fill = { from = [9, -60, 14], to = [9, -56, 14], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [9, -56, 14], is = "air" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+check = { block = { pos = [9, -55, 14], is = "dirt" } }
+
+[[step]]
+screenshot = { name = "built", expect = "两个并排的门框:灰色石柱;前面一个的门楣是棕色土,后面一个的门楣是灰色石头,都横在两根柱子顶上" }
+
+[[step]]
+label = "移走两个左柱"
+fill = { from = [6, -60, 14], to = [6, -56, 14], block = "air" }
+
+[[step]]
+fill = { from = [6, -60, 20], to = [6, -56, 20], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [9, -55, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 15 }
+
+[[step]]
+screenshot = { name = "falling", expect = "前面门框的土门楣左边一长条变成一整根连在一起的蓝色横条,在原门楣高度附近下落(是一根,不是一串分开的方块);后面的灰色石门楣仍横挂在右侧石柱上,左端悬空" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [9, -55, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [6, -55, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [12, -55, 14], is = "dirt" } }
+
+[[step]]
+check = { block = { pos = [6, -55, 14], is = "air" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "后面的灰色石门楣仍完整地横在石柱顶上(左端悬空);前面门框只剩右柱顶上一格棕色土,原来门楣的位置空了,地面上散落着一些棕色土块;空中没有蓝色立方体" }

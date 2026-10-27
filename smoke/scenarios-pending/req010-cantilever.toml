@@ -1,0 +1,105 @@
+name = "req010-cantilever"
+req = "REQ-010"
+description = "同一面石墙伸出 6 格与 12 格两根石悬臂,末端各有临时支柱;移走支柱:6 格的挂得住,12 格的从根部整根断下,按切块落成三段并凝固"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [9.0, -53.0, 38.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [9.0, -59.0, 17.0] }
+
+[[step]]
+wait_until = { block = { pos = [9, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "石墙"
+fill = { from = [2, -60, 12], to = [3, -58, 22], block = "stone" }
+
+[[step]]
+label = "临时支柱"
+fill = { from = [9, -60, 14], to = [9, -59, 14], block = "stone" }
+
+[[step]]
+fill = { from = [15, -60, 20], to = [15, -59, 20], block = "stone" }
+
+[[step]]
+label = "长悬臂中段的临时脚手架(fill 可能跨拍,石悬臂最长 8 格)"
+fill = { from = [10, -60, 20], to = [10, -59, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [15, -59, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_until = { block = { pos = [10, -59, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "6 格悬臂"
+fill = { from = [4, -58, 14], to = [9, -58, 14], block = "stone" }
+
+[[step]]
+label = "12 格悬臂"
+fill = { from = [4, -58, 20], to = [15, -58, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [15, -58, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "拆脚手架(长悬臂由墙与末端支柱托着,净跨 11 ≤ 16)"
+fill = { from = [10, -60, 20], to = [10, -59, 20], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [10, -59, 20], is = "air" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+check = { block = { pos = [10, -58, 20], is = "stone" } }
+
+[[step]]
+screenshot = { name = "built", expect = "一面矮石墙伸出两根灰色石梁:前面一根短、后面一根长,两根末端各有一根矮石柱撑着" }
+
+[[step]]
+label = "移走两根支柱"
+fill = { from = [9, -60, 14], to = [9, -59, 14], block = "air" }
+
+[[step]]
+fill = { from = [15, -60, 20], to = [15, -59, 20], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [10, -58, 20], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [9, -58, 14], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [4, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [4, -60, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [10, -60, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [15, -60, 20], is = "stone" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "after", expect = "前面那根短石梁仍从墙上水平伸出(末端悬空,没有支柱);后面那根长石梁已经整根掉到地上,平躺成一排灰色石头,紧贴墙脚;空中没有蓝色立方体" }

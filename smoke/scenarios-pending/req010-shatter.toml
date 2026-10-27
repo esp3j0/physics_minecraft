@@ -1,0 +1,77 @@
+name = "req010-shatter"
+req = "REQ-010"
+description = "9 格高的石柱顶着一块 3×3 的土板;移走石柱后土板作为一个整体平落约 9 m,落地时碎成单格土块"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [7.5, -48.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [7.5, -56.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [7, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "石柱"
+fill = { from = [7, -60, 14], to = [7, -52, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [7, -52, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+label = "3×3 土板:先中心(压在柱顶),再十字,最后四角——fill 可能跨拍,每格放下时都要连着已有的格"
+fill = { from = [7, -51, 14], to = [7, -51, 14], block = "dirt" }
+
+[[step]]
+wait_until = { block = { pos = [7, -51, 14], is = "dirt" }, timeout_ticks = 600 }
+
+[[step]]
+fill = { from = [6, -51, 14], to = [8, -51, 14], block = "dirt" }
+
+[[step]]
+fill = { from = [7, -51, 13], to = [7, -51, 15], block = "dirt" }
+
+[[step]]
+wait_until = { block = { pos = [7, -51, 15], is = "dirt" }, timeout_ticks = 600 }
+
+[[step]]
+fill = { from = [6, -51, 13], to = [8, -51, 15], block = "dirt" }
+
+[[step]]
+wait_until = { block = { pos = [8, -51, 15], is = "dirt" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "built", expect = "一根细高的灰色石柱顶着一块小小的方形棕色土板" }
+
+[[step]]
+label = "移走石柱"
+fill = { from = [7, -60, 14], to = [7, -52, 14], block = "air" }
+
+[[step]]
+wait_until = { block = { pos = [7, -51, 14], is = "air" }, timeout_ticks = 120 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [7, -51, 14], is = "air" } }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "shattered", expect = "石柱和土板都不见了;地面上散落着若干棕色土块(不是一块完整平整的 3×3 土板);空中没有蓝色立方体" }
