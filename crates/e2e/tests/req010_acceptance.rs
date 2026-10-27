@@ -2532,13 +2532,20 @@ mod unit05 {
         log.append(entry);
     }
 
-    /// 跑到分片里没有任何实体为止(上限 900 拍),返回期间 `TickSummary::cohesion` 的累计值。
+    /// 跑到分片里连续 2 拍没有任何实体为止(上限 900 拍),返回期间 `TickSummary::cohesion` 的累计值。
+    /// 连续 2 拍:倾斜散开时复合体在 N 拍删除、碎块 N+1 才出现,中间有 1 拍实体表为空(§8.3 第 3 条)。
     fn settle(s: &mut Session) -> (bool, physics_sim::cohesion::CohesionStats) {
         let mut total = physics_sim::cohesion::CohesionStats::default();
+        let mut empty = 0;
         for _ in 0..900 {
             let n = s.tick();
             total.add(&n.cohesion);
-            if s.entity_states(shard()).expect("分片").is_empty() {
+            empty = if s.entity_states(shard()).expect("分片").is_empty() {
+                empty + 1
+            } else {
+                0
+            };
+            if empty >= 2 {
                 return (true, total);
             }
         }
@@ -2602,7 +2609,6 @@ mod unit05 {
     ///
     /// 会变红的实现:倾斜时强行整块吸附(石头穿进石堆或悬空);散开时丢格;散开后的碎块仍带形状。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除(settle() 在散开拍提前返回,见 #19)"]
     fn acc_c7_tilted_compound_scatters() {
         let mut s = session(false);
         let mut log = CommandLog::new();
