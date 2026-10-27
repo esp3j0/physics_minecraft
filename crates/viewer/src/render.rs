@@ -176,12 +176,34 @@ fn hud_lines(tick: u64, chunks: usize, entities: usize, fps: i32) -> [String; 4]
 
 /// 实体渲染位姿:服务器流(默认 10 tick 一帧)只推进 target,渲染帧对
 /// current 指数逼近——阶梯更新被平滑成连续运动(下落不"一格一格跳")。
+/// 旋转同样按 slerp 逼近 target(复合体展开各格的方向,REQ-010 §10 修订 4;
+/// 时间常数沿用 `POSE_SMOOTH`)。
 struct EntityPose {
     current: macroquad::math::Vec3,
     target: macroquad::math::Vec3,
+    current_rot: macroquad::math::Quat,
+    target_rot: macroquad::math::Quat,
 }
 
-/// 位置插值速率(1/s;越大越紧跟,14 ≈ 70ms 追平大半)。
+impl EntityPose {
+    fn new(target: macroquad::math::Vec3, target_rot: macroquad::math::Quat) -> Self {
+        Self {
+            current: target,
+            target,
+            current_rot: target_rot,
+            target_rot,
+        }
+    }
+
+    /// 渲染帧插值:位置线性指数逼近、旋转 slerp 指数逼近(帧率无关,t 因子
+    /// 同 `POSE_SMOOTH`)。
+    fn advance(&mut self, k: f32) {
+        self.current += (self.target - self.current) * k;
+        self.current_rot = self.current_rot.slerp(self.target_rot, k.clamp(0.0, 1.0));
+    }
+}
+
+/// 位置插值速率(1/s;越大越紧跟,14 ≈ 70ms 追平大半;旋转 slerp 同款因子)。
 const POSE_SMOOTH: f32 = 14.0;
 
 /// 世界渲染态(REQ-008 单元 02 重构):纯逻辑的 [`WorldState`(方块镜像/实体
@@ -192,7 +214,7 @@ struct WorldView {
     state: WorldState,
     /// chunk Mesh 表(脏 chunk 在则重建、不在则删除)。
     meshes: BTreeMap<ChunkPos, Mesh>,
-    /// 实体插值表(跟随 state 的实体表;新实体从目标位置起步、消失即删)。
+    /// 实体插值表(跟随 state 的实体表;新实体从目标位姿起步、消失即删)。
     entities: BTreeMap<EntityId, EntityPose>,
 }
 
@@ -237,7 +259,7 @@ impl WorldView {
     }
 
     /// 实体插值表跟随 live_entities:新实体 current 从 target 起步、消失即删、
-    /// 已有实体只推进 target(渲染帧插值逼近)。
+    /// 已有实体只推进 target(位置与服务器旋转,渲染帧插值逼近)。
     fn sync_entities(&mut self) {
         let live = self.state.live_entities();
         let present: std::collections::BTreeSet<EntityId> =
@@ -245,15 +267,48 @@ impl WorldView {
         self.entities.retain(|id, _| present.contains(id));
         for (id, pos) in live {
             let target = vec3(pos.x, pos.y, pos.z);
+            let rot = mq_quat(self.state.entity_rotation(id));
             self.entities
                 .entry(id)
-                .and_modify(|pose| pose.target = target)
-                .or_insert(EntityPose {
-                    current: target,
-                    target,
-                });
+                .and_modify(|pose| {
+                    pose.target = target;
+                    pose.target_rot = rot;
+                })
+                .or_insert_with(|| EntityPose::new(target, rot));
         }
     }
+
+    /// 画一个实体(REQ-010 §10 修订 4 第 4 条):复合体按形状逐格画 0.9 m
+    /// 蓝色立方体(轴对齐,与单格一致),位置 = 插值原点 + 插值旋转 × 偏移;
+    /// 单格(形状未知)画插值原点一个立方体,与改前逐位一致。
+    fn draw_entity(&self, id: EntityId, pose: &EntityPose) {
+        match self.state.entity_shape(id) {
+            None => draw_cube(
+                pose.current,
+                vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
+                None,
+                BLUE,
+            ),
+            Some(shape) => {
+                for cell in shape.cells() {
+                    let [x, y, z] = cell.offset;
+                    let center =
+                        pose.current + pose.current_rot * vec3(x as f32, y as f32, z as f32);
+                    draw_cube(
+                        center,
+                        vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
+                        None,
+                        BLUE,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// types glam 0.33 Quat → macroquad glam 0.27 Quat(字段换算;跨界纪律同 Vec3)。
+fn mq_quat(q: types::glam::Quat) -> macroquad::math::Quat {
+    macroquad::math::Quat::from_xyzw(q.x, q.y, q.z, q.w)
 }
 
 /// 主循环入口(main 调用):按模式分发。服务器地址优先级:
@@ -488,16 +543,14 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
         for mesh in world.meshes.values() {
             draw_mesh(mesh);
         }
-        // 实体:current 指数逼近 target(帧率无关),画 current。
+        // 实体:current 指数逼近 target(帧率无关),画 current;复合体逐格
+        // (REQ-010 §10 修订 4 第 4 条)。
         for pose in world.entities.values_mut() {
             let k = 1.0 - (-POSE_SMOOTH * dt).exp();
-            pose.current += (pose.target - pose.current) * k;
-            draw_cube(
-                pose.current,
-                vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
-                None,
-                BLUE,
-            );
+            pose.advance(k);
+        }
+        for (id, pose) in world.entities.iter() {
+            world.draw_entity(*id, pose);
         }
         set_default_camera();
 
@@ -661,16 +714,14 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         for mesh in world.meshes.values() {
             draw_mesh(mesh);
         }
-        // 实体:current 指数逼近 target(帧率无关),画 current。
+        // 实体:current 指数逼近 target(帧率无关),画 current;复合体逐格
+        // (REQ-010 §10 修订 4 第 4 条)。
         for pose in world.entities.values_mut() {
             let k = 1.0 - (-POSE_SMOOTH * dt).exp();
-            pose.current += (pose.target - pose.current) * k;
-            draw_cube(
-                pose.current,
-                vec3(ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE, ENTITY_CUBE_SIZE),
-                None,
-                BLUE,
-            );
+            pose.advance(k);
+        }
+        for (id, pose) in world.entities.iter() {
+            world.draw_entity(*id, pose);
         }
         set_default_camera();
 
@@ -803,4 +854,48 @@ pub async fn amain() {
         }
     };
     run(args).await;
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 旋转几乎同向(|dot| ≥ 1−ε 即夹角 ≲ √(2ε);不走 `angle_between`——
+    /// 它经 acos_approx,dot≈1 处极小逼近误差 ~4e-4 rad,度量不了近恒等)。
+    fn rot_close(a: macroquad::math::Quat, b: macroquad::math::Quat) -> bool {
+        a.dot(b).abs() > 0.999_999
+    }
+
+    /// 实体位姿插值(纯计算,REQ-010 §10 修订 4 第 4 条):k = 1 一步到位
+    /// (位置与旋转都追平 target);k = 0 不动;中间 k 位置线性逼近。
+    ///
+    /// 会变红的实现:旋转漏插值(slerp 行删掉——复合体永远按旧朝向画);
+    /// k 符号反向(越插越远)。
+    #[test]
+    fn entity_pose_advance_lerps_position_and_slerps_rotation() {
+        let mut pose = EntityPose::new(vec3(0.0, 0.0, 0.0), macroquad::math::Quat::IDENTITY);
+        pose.target = vec3(10.0, 0.0, 0.0);
+        let q = macroquad::math::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        pose.target_rot = q;
+
+        pose.advance(0.0);
+        assert_eq!(pose.current, vec3(0.0, 0.0, 0.0), "k = 0 不动");
+        assert!(
+            rot_close(pose.current_rot, macroquad::math::Quat::IDENTITY),
+            "k = 0 旋转不动"
+        );
+
+        pose.advance(1.0);
+        assert_eq!(pose.current, vec3(10.0, 0.0, 0.0), "k = 1 位置追平");
+        assert!(rot_close(pose.current_rot, q), "k = 1 旋转追平(slerp 生效)");
+
+        // 中间值:位置线性逼近(0 < k < 1)。
+        let mut pose2 = EntityPose::new(vec3(0.0, 0.0, 0.0), macroquad::math::Quat::IDENTITY);
+        pose2.target = vec3(10.0, 0.0, 0.0);
+        pose2.advance(0.5);
+        assert!(
+            (pose2.current.x - 5.0).abs() < 1e-5,
+            "线性插值中点,实得 {}",
+            pose2.current.x
+        );
+    }
 }

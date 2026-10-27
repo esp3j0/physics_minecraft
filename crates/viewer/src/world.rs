@@ -9,25 +9,35 @@
 //!   ChunkData 已含最新内容,不为它造一个只有空气的假 chunk);
 //! - `Entities` 增量按 latest-wins 更新、`removed` 删除;`full` 时以 `states` 重建实体表;
 //!   `live_entities` 返回服务器位置(不是渲染插值后的位置);
+//! - `Shapes` 按 ID 记复合体形状(覆盖旧值;REQ-010 §10 修订 4);`removed`
+//!   与全量包清掉过期形状;
 //! - `Spawned` 回执按到达顺序累积,由 [`WorldState::take_spawned`] 取走;
 //! - `Disconnected` 不改状态(由渲染层处理)。
 
 use std::collections::BTreeMap;
 
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, ChunkPos, EntityId};
+use types::{BlockId, BlockPos, ChunkPos, CompoundShape, EntityId};
 
 use crate::client::ViewEvent;
 
 /// 复合实体各格中心(纯函数,REQ-010 §10 修订 4):`position + rotation × offset`;`shape` 为 `None` 时只有原点。
-/// **接口桩(单元 03b)**:桩阶段一律按单格。
 pub fn cube_centers(
     position: Vec3,
     rotation: types::glam::Quat,
-    shape: Option<&types::CompoundShape>,
+    shape: Option<&CompoundShape>,
 ) -> Vec<Vec3> {
-    let _ = (rotation, shape);
-    vec![position]
+    match shape {
+        None => vec![position],
+        Some(shape) => shape
+            .cells()
+            .iter()
+            .map(|cell| {
+                let [x, y, z] = cell.offset;
+                position + rotation * Vec3::new(x as f32, y as f32, z as f32)
+            })
+            .collect(),
+    }
 }
 use crate::script::WorldQuery;
 
@@ -36,6 +46,12 @@ use crate::script::WorldQuery;
 pub struct WorldState {
     chunks: BTreeMap<ChunkPos, voxel::Chunk>,
     entities: BTreeMap<EntityId, Vec3>,
+    /// 实体的服务器旋转(REQ-010 §10 修订 4 第 3 条):复合体展开各格要按
+    /// 服务器旋转转偏移;随实体状态 latest-wins 记录。
+    rotations: BTreeMap<EntityId, types::glam::Quat>,
+    /// 复合体形状(REQ-010 §10 修订 4 第 3 条):`Shapes` 事件按 ID 记(覆盖
+    /// 旧值);`removed` 与全量包清掉过期形状。
+    shapes: BTreeMap<EntityId, CompoundShape>,
     tick: u64,
     /// 是否已从实体状态包得知真实拍号(REQ-008 修订 2,D4):`Welcome` 的拍号
     /// 是占位值 0,不算;第一个 `Entities` 包(含空的全量包)带来真实拍号,此后恒真。
@@ -83,14 +99,22 @@ impl WorldState {
                 // 一旦已知即保持(断连不改)。
                 self.tick_known = true;
                 if full {
-                    // 全量对账:以 states 为准重建实体表(协议 full 同语义)。
+                    // 全量对账:以 states 为准重建实体表(协议 full 同语义);
+                    // 形状同样按 states 对账(不在 states 里的形状清掉——World
+                    // 队列丢最旧时形状包可能丢,全量重发自愈,§10 修订 4)。
                     self.entities.clear();
+                    self.shapes
+                        .retain(|id, _| states.iter().any(|(present, _)| present == id));
                 }
                 for (id, state) in states {
                     self.entities.insert(id, state.translation);
+                    self.rotations.insert(id, state.rotation);
                 }
                 for id in removed {
                     self.entities.remove(&id);
+                    self.rotations.remove(&id);
+                    // removed 删掉实体时一并删掉形状(ID 复用时不再按旧形状画)。
+                    self.shapes.remove(&id);
                 }
             }
             ViewEvent::Blocks { updates } => {
@@ -106,16 +130,36 @@ impl WorldState {
                 }
             }
             ViewEvent::Spawned { entity } => self.spawned.push(entity),
-            // REQ-010 单元 03b 接口桩:由实施方按 §10 修订 4 记录形状。
-            ViewEvent::Shapes { .. } => {}
+            // 形状按 ID 记(覆盖旧值;§10 修订 4 第 3 条)。
+            ViewEvent::Shapes { shapes } => {
+                for (id, shape) in shapes {
+                    self.shapes.insert(id, shape);
+                }
+            }
             ViewEvent::Disconnected { .. } => {}
         }
     }
 
-    /// 实体各格的中心(服务器位姿,不是渲染插值;REQ-010 §10 修订 4):原点 + 旋转 × 偏移,形状未知按单格;
-    /// 实体不存在为 `None`。**接口桩(单元 03b)**:桩阶段一律按单格。
+    /// 实体各格的中心(服务器位姿,不是渲染插值;REQ-010 §10 修订 4):原点 +
+    /// 服务器旋转 × 偏移,形状未知按单格(只有原点);实体不存在为 `None`。
     pub fn entity_cube_centers(&self, id: EntityId) -> Option<Vec<Vec3>> {
-        self.entities.get(&id).map(|p| vec![*p])
+        let position = *self.entities.get(&id)?;
+        let shape = self.shapes.get(&id);
+        Some(cube_centers(
+            position,
+            self.rotations.get(&id).copied().unwrap_or_default(),
+            shape,
+        ))
+    }
+
+    /// 实体的复合体形状(渲染层按插值位姿逐格画用);单格实体为 `None`。
+    pub fn entity_shape(&self, id: EntityId) -> Option<&CompoundShape> {
+        self.shapes.get(&id)
+    }
+
+    /// 实体的服务器旋转(渲染层旋转插值用);未知 = 恒等。
+    pub fn entity_rotation(&self, id: EntityId) -> types::glam::Quat {
+        self.rotations.get(&id).copied().unwrap_or_default()
     }
 
     /// 最新服务器拍号。
@@ -170,7 +214,7 @@ impl WorldQuery for WorldState {
 mod tests {
     use super::*;
     use messaging::InputSource;
-    use types::{EntityState, Tick};
+    use types::{EntityState, ShapeCell, Tick};
 
     fn block_at_pos(w: &WorldState, pos: BlockPos) -> Option<BlockId> {
         w.block_at(pos)
@@ -356,5 +400,183 @@ mod tests {
             reason: "bye".to_owned(),
         });
         assert!(w.tick_known(), "一旦已知即保持");
+    }
+
+    /// 2 格梁(测试形状;BlockId 任意)。
+    fn beam2() -> CompoundShape {
+        CompoundShape::new(vec![
+            ShapeCell {
+                offset: [0, 0, 0],
+                block: BlockId(1),
+            },
+            ShapeCell {
+                offset: [1, 0, 0],
+                block: BlockId(1),
+            },
+        ])
+        .expect("2 格梁")
+    }
+
+    fn entity_state(p: Vec3, rot: types::glam::Quat) -> EntityState {
+        EntityState {
+            translation: p,
+            rotation: rot,
+            ..EntityState::default()
+        }
+    }
+
+    /// `Shapes` 事件按 ID 记形状且**覆盖旧值**(§10 修订 4 第 3 条);单格实体
+    /// 从不进形状表(发过形状的实体,状态照常更新)。
+    ///
+    /// 会变红的实现:同 ID 二次 Shapes 被丢弃(按形状内容去重等自作主张)。
+    #[test]
+    fn world_shapes_overwrite_by_id() {
+        let id = EntityId::from_parts(0, 9);
+        let pa = Vec3::new(1.0, 2.0, 3.0);
+        let pb = Vec3::new(4.0, 5.0, 6.0);
+        let mut w = WorldState::new();
+        w.apply(ViewEvent::Shapes {
+            shapes: vec![(id, beam2())],
+        });
+        w.apply(ViewEvent::Entities {
+            tick: Tick(1),
+            states: vec![(id, entity_state(pa, types::glam::Quat::IDENTITY))],
+            removed: vec![],
+            full: false,
+        });
+        let mut want: Vec<Vec3> = (0..=1)
+            .map(|x| pa + Vec3::new(x as f32, 0.0, 0.0))
+            .collect();
+        assert_eq!(
+            w.entity_cube_centers(id),
+            Some(want.clone()),
+            "首份形状生效"
+        );
+
+        // 覆盖:同一 ID 换成不同形状(此处用 3 格)后再查,应按新形状展开。
+        let beam3 = CompoundShape::new(vec![
+            ShapeCell {
+                offset: [0, 0, 0],
+                block: BlockId(1),
+            },
+            ShapeCell {
+                offset: [1, 0, 0],
+                block: BlockId(1),
+            },
+            ShapeCell {
+                offset: [2, 0, 0],
+                block: BlockId(1),
+            },
+        ])
+        .expect("3 格梁");
+        w.apply(ViewEvent::Shapes {
+            shapes: vec![(id, beam3)],
+        });
+        want.push(pa + Vec3::new(2.0, 0.0, 0.0));
+        assert_eq!(
+            w.entity_cube_centers(id),
+            Some(want),
+            "同 ID 的 Shapes 覆盖旧形状"
+        );
+
+        // 状态更新不丢形状(位置变了仍按形状展开)。
+        w.apply(ViewEvent::Entities {
+            tick: Tick(2),
+            states: vec![(id, entity_state(pb, types::glam::Quat::IDENTITY))],
+            removed: vec![],
+            full: false,
+        });
+        assert_eq!(
+            w.entity_cube_centers(id),
+            Some(vec![
+                pb,
+                pb + Vec3::new(1.0, 0.0, 0.0),
+                pb + Vec3::new(2.0, 0.0, 0.0)
+            ]),
+            "状态更新保留形状"
+        );
+    }
+
+    /// `removed` 删掉实体时一并删掉形状;全量包删掉不在 `states` 里的形状
+    /// (§10 修订 4 第 3 条;ID 复用/过期形状不再画出来)。旋转随实体状态
+    /// 记录:`entity_rotation` 返回服务器旋转,未收到状态 = 恒等。
+    ///
+    /// 会变红的实现:形状永不清理;全量对账漏形状;旋转没记。
+    #[test]
+    fn world_shapes_removed_and_full_reconcile() {
+        let (a, b) = (EntityId::from_parts(0, 1), EntityId::from_parts(0, 2));
+        let rot = types::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let pa = Vec3::new(0.5, 1.5, 2.5);
+        let mut w = WorldState::new();
+        assert_eq!(
+            w.entity_rotation(a),
+            types::glam::Quat::IDENTITY,
+            "未收到状态 = 恒等旋转"
+        );
+        w.apply(ViewEvent::Shapes {
+            shapes: vec![(a, beam2()), (b, beam2())],
+        });
+        w.apply(ViewEvent::Entities {
+            tick: Tick(1),
+            states: vec![(a, entity_state(pa, rot))],
+            removed: vec![],
+            full: false,
+        });
+        assert_eq!(w.entity_rotation(a), rot, "服务器旋转随状态记录");
+
+        // 全量包只含 a → b 的形状被清掉(全量对账)。
+        w.apply(ViewEvent::Entities {
+            tick: Tick(2),
+            states: vec![(a, entity_state(pa, rot))],
+            removed: vec![],
+            full: true,
+        });
+        assert!(
+            w.entity_shape(b).is_none(),
+            "全量包清掉不在 states 里的形状"
+        );
+        assert!(w.entity_shape(a).is_some(), "states 里的形状保留");
+
+        // removed a → 形状同删;同 ID 再出现(无新形状)按单格 + 恒等旋转。
+        w.apply(ViewEvent::Entities {
+            tick: Tick(3),
+            states: vec![],
+            removed: vec![a],
+            full: false,
+        });
+        assert_eq!(w.entity_cube_centers(a), None, "实体删除");
+        w.apply(ViewEvent::Entities {
+            tick: Tick(4),
+            states: vec![(a, entity_state(pa, types::glam::Quat::IDENTITY))],
+            removed: vec![],
+            full: false,
+        });
+        assert_eq!(
+            w.entity_cube_centers(a),
+            Some(vec![pa]),
+            "removed 已清掉 a 的形状:按单格"
+        );
+        assert_eq!(w.entity_rotation(a), types::glam::Quat::IDENTITY);
+    }
+
+    /// `cube_centers` 旋转展开与单格退化(纯函数;渲染与 `entity_cube_centers`
+    /// 共用):偏移随旋转转动(绕 y 90°:+x → −z);`None` 只有原点。
+    ///
+    /// 会变红的实现:偏移没乘旋转;用了 `inverse()`;单格也展开。
+    #[test]
+    fn world_cube_centers_rotates_offsets() {
+        let pos = Vec3::new(10.5, 3.5, -2.5);
+        let rot = types::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let got = cube_centers(pos, rot, Some(&beam2()));
+        let want = vec![pos, pos + Vec3::new(0.0, 0.0, -1.0)];
+        assert!(
+            got.len() == want.len()
+                && got
+                    .iter()
+                    .zip(&want)
+                    .all(|(g, w)| (*g - *w).length() < 1e-5),
+            "绕 y 转 90°:+x 偏移转到 −z,实得 {got:?}"
+        );
+        assert_eq!(cube_centers(pos, rot, None), vec![pos], "单格只有原点");
     }
 }

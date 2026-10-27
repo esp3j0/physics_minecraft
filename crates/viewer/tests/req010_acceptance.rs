@@ -46,7 +46,6 @@ fn near(a: &[Vec3], b: &[Vec3]) -> bool {
 ///
 /// 会变红的实现:形状包被吞掉(viewer 永远不知道形状,复合体画成一个方块)。
 #[test]
-#[ignore = "REQ-010 单元 03b 待实施方解除"]
 fn acc_c14_shapes_event_mapping() {
     let id = EntityId::from_parts(0, 7);
     let shapes = vec![(id, beam())];
@@ -62,7 +61,6 @@ fn acc_c14_shapes_event_mapping() {
 ///
 /// 会变红的实现:偏移没随旋转转动;用了 `rotation.inverse()`;单格也按形状展开。
 #[test]
-#[ignore = "REQ-010 单元 03b 待实施方解除"]
 fn acc_c14_cube_centers_rotate_offsets() {
     let pos = Vec3::new(10.5, 3.5, -2.5);
     let rot = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
@@ -82,7 +80,6 @@ fn acc_c14_cube_centers_rotate_offsets() {
 ///
 /// 会变红的实现:形状永不清理(复用 ID 时画错形状);全量包没清过期形状;状态里的旋转没记下来。
 #[test]
-#[ignore = "REQ-010 单元 03b 待实施方解除"]
 fn acc_c14_world_state_tracks_shapes() {
     let (a, b, c) = (
         EntityId::from_parts(0, 1),

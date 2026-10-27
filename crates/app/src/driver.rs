@@ -889,6 +889,14 @@ impl ObserveOrchestrator {
             }
         }
 
+        // id → 所在分片(形状经该分片的实体描述取;REQ-010 §10 修订 4)。
+        let mut shard_of: BTreeMap<types::EntityId, types::ShardId> = BTreeMap::new();
+        for (&shard, table) in &tables {
+            for (id, _) in table {
+                shard_of.insert(*id, shard);
+            }
+        }
+
         // 实体状态:对每订阅玩家差分(全量周期到 或 首包 → 整表)。
         for player in hub.subscribers() {
             let Some(stream) = self.players.get_mut(&player) else {
@@ -929,12 +937,32 @@ impl ObserveOrchestrator {
                     }
                 }
             }
+            // 复合体形状先于状态(REQ-010 §10 修订 4 第 2 条):states 里该玩家
+            // 此前没收过的复合体(不在上一张已发送实体表里)或本包为全量包
+            // → 同一 World 队列里紧挨着、先于状态包推 EntityShapes(只含复合
+            // 体,按 ID 升序;单格实体从不出现)。全量包重发 = World 丢最旧的
+            // 自愈。上一张已发送实体表在下方覆盖前先取快照。
+            let prev_sent: std::collections::BTreeSet<types::EntityId> =
+                stream.last_sent.keys().copied().collect();
+
             stream.last_sent = visible;
             // 无变化不发包 = 增量语义(REQ-008 修订 2,D4):全量包是客户端的
             // 拍号心跳,即使实体表为空/无变化也发——否则空场景里 viewer 拍号
             // 停摆(wait_ticks 卡死)、残留的幽灵实体也无法被全量包清除。
             if !full && states.is_empty() && removed.is_empty() {
                 continue;
+            }
+            let shapes: Vec<(types::EntityId, types::CompoundShape)> = states
+                .iter()
+                .filter(|(id, _)| full || !prev_sent.contains(id))
+                .filter_map(|(id, _)| {
+                    let desc = session.entity_desc(*shard_of.get(id)?, *id)?;
+                    let shape = desc.shape()?.clone();
+                    Some((*id, shape))
+                })
+                .collect();
+            if !shapes.is_empty() {
+                hub.push_world(player, S2C::EntityShapes { shapes });
             }
             hub.push_world(
                 player,
@@ -4857,5 +4885,194 @@ mod tests {
             }
         }
         false
+    }
+
+    // ---- REQ-010 单元 03b:复合体形状先于状态(测试辅助与用例)----
+
+    /// 2 格梁(复合体测试形状;BlockId 任意)。
+    fn beam2_desc() -> types::EntityDesc {
+        types::EntityDesc::compound(
+            0.45,
+            types::CompoundShape::new(vec![
+                types::ShapeCell {
+                    offset: [0, 0, 0],
+                    block: types::BlockId(1),
+                },
+                types::ShapeCell {
+                    offset: [1, 0, 0],
+                    block: types::BlockId(1),
+                },
+            ])
+            .expect("2 格梁"),
+        )
+    }
+
+    /// 经网络 spawn 一个实体(拿 `Spawned` 回执 ID);desc 由调用方给。
+    async fn spawn_with_desc(
+        c: &mut MiniClient,
+        translation: Vec3,
+        desc: types::EntityDesc,
+    ) -> EntityId {
+        c.send(&C2S::Spawn {
+            state: types::EntityState {
+                translation,
+                ..types::EntityState::default()
+            },
+            desc,
+        })
+        .await
+        .expect("Spawn 写入");
+        for _ in 0..64 {
+            if let S2C::Spawned { entity } = c.recv_timeout().await {
+                return entity;
+            }
+        }
+        panic!("64 帧内未收到 Spawned 回执");
+    }
+
+    /// 读帧直到含 `id` 的 EntityStates(吞掉路上其它帧);返回途中**紧邻该
+    /// 状态包之前**最近一次 EntityShapes 里的形状(没有 = None);途中任何
+    /// EntityShapes 含单格实体 / 不按 ID 升序 → panic。
+    ///
+    /// 注意单格判据:Spawn 的 desc 单格 = `shape: None` —— EntityShapes 携带
+    /// `CompoundShape`,单格实体不应出现在其中,出现即说明驱动按错集合发。
+    async fn shapes_before_entity_states(
+        c: &mut MiniClient,
+        id: EntityId,
+    ) -> Option<types::CompoundShape> {
+        let mut last: Option<types::CompoundShape> = None;
+        for _ in 0..320 {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await;
+            match frame {
+                Ok(Ok(S2C::EntityShapes { shapes })) => {
+                    assert!(
+                        shapes.windows(2).all(|w| w[0].0 < w[1].0),
+                        "EntityShapes 按 EntityId 升序:{shapes:?}"
+                    );
+                    last = shapes.into_iter().find(|(e, _)| *e == id).map(|(_, s)| s);
+                }
+                Ok(Ok(S2C::EntityStates { states, .. }))
+                    if states.iter().any(|(e, _)| *e == id) =>
+                {
+                    return last;
+                }
+                Ok(Ok(S2C::EntityStates { .. })) => last = None,
+                Ok(Ok(_)) => {}
+                _ => {}
+            }
+        }
+        panic!("320 帧内未等到含该实体的状态包")
+    }
+
+    /// REQ-010 §10 修订 4 第 2 条(驱动级):复合体首次进入某玩家的状态流前,
+    /// 同一 World 队列里先有一个含它形状的 EntityShapes;增量包(形状已发过、
+    /// 状态又变)**不再重发**;下一个全量包前重发;单格实体(同场景 spawn)
+    /// 从不出现在 EntityShapes 里。
+    ///
+    /// 会变红的实现:不发形状;形状包在状态包之后;每拍重发(增量也发);
+    /// 全量不重发;单格也发。
+    #[tokio::test(start_paused = true)]
+    async fn compound_shapes_precede_states_and_resent_on_full() {
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _ = join_player(&mut c, 3).await;
+        c.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("观察者写入");
+        advance_ticks(3).await;
+
+        let single = spawn_with_desc(
+            &mut c,
+            Vec3::new(8.0, 3.0, 8.0),
+            types::EntityDesc::default(),
+        )
+        .await;
+        let compound = spawn_with_desc(&mut c, Vec3::new(10.0, 3.0, 8.0), beam2_desc()).await;
+
+        // 首次出现:形状先于状态,且形状与单格无关。
+        let first = shapes_before_entity_states(&mut c, compound).await;
+        assert!(
+            matches!(&first, Some(s) if s.cells().len() == 2),
+            "复合体首次出现前先到形状(2 格),实得 {first:?}"
+        );
+        // 单格实体出现:途中若有 EntityShapes,必不含它(find 不到 = None 与
+        // 复合体断言分开;这里断言单格的状态包可达即可,shapes_before 里
+        // 升序断言常开)。直接复用辅助:单格 find 不到 → None。
+        let _single_got = shapes_before_entity_states(&mut c, single).await;
+
+        // 形状已发过:等下一次增量(状态仍会因物理微变/差分重置),确认增量
+        // 面不再重发形状——读帧窗里收集所有 EntityShapes,若含复合体即违例。
+        // (观察间隔 3 拍,推进足够拍数产生若干增量输出点。)
+        advance_ticks(9).await;
+        let mut incremental_shapes: Vec<EntityId> = Vec::new();
+        for _ in 0..16 {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await;
+            match frame {
+                Ok(Ok(S2C::EntityShapes { shapes })) => {
+                    incremental_shapes.extend(shapes.into_iter().map(|(e, _)| e));
+                }
+                Ok(Ok(S2C::EntityStates { full: false, .. })) | Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+        assert!(
+            !incremental_shapes.contains(&compound),
+            "形状已发过:增量包不再重发,实得 {incremental_shapes:?}"
+        );
+
+        // 全量包前重发(observe full = 9 拍)。
+        advance_ticks(9).await;
+        let resent = shapes_before_entity_states(&mut c, compound).await;
+        assert!(
+            matches!(&resent, Some(s) if s.cells().len() == 2),
+            "全量包前重发形状,实得 {resent:?}"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-010 §10 修订 4 第 2 条(驱动级):晚加入的客户端在自己的首个
+    /// (全量)状态包前收到所有可见复合体的形状——按玩家判断"首次",
+    /// 不是全局广播一次了事。
+    ///
+    /// 会变红的实现:只在实体出生时全局发一次(晚加入者永远收不到);或
+    /// 判断成全局首次(早加入者收到、晚加入者收不到)。
+    #[tokio::test(start_paused = true)]
+    async fn compound_shapes_per_player_first_full() {
+        let (args, tx, _hub, addr, _checkpoints) = observe_harness(observe_config()).await;
+        let driver = tokio::spawn(run(args));
+        // 玩家 A 先入会并生成复合体(形状随首次全量包发出)。
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let _ = join_player(&mut a, 3).await;
+        a.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("A 观察者写入");
+        advance_ticks(3).await;
+        let compound = spawn_with_desc(&mut a, Vec3::new(10.0, 3.0, 8.0), beam2_desc()).await;
+        let got_a = shapes_before_entity_states(&mut a, compound).await;
+        assert!(got_a.is_some(), "A 首个状态包前收到形状");
+
+        // 玩家 B 晚加入(同一位置):首个全量状态包前也要收到形状。
+        let mut b = MiniClient::connect(addr).await.expect("B 连入");
+        let _ = join_player(&mut b, 3).await;
+        b.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("B 观察者写入");
+        let got_b = shapes_before_entity_states(&mut b, compound).await;
+        assert!(
+            matches!(&got_b, Some(s) if s.cells().len() == 2),
+            "晚加入的 B 首个全量包前收到形状,实得 {got_b:?}"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        driver.await.expect("驱动不 panic");
     }
 }

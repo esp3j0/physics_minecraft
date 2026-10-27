@@ -867,7 +867,6 @@ async fn shapes_before_states(
 /// 会变红的实现:不发形状;形状包排在状态包之后;只在实体出生时全局广播一次(晚加入的客户端永远收不到);
 /// 全量包前不重发;单格实体也发形状。
 #[tokio::test(start_paused = true)]
-#[ignore = "REQ-010 单元 03b 待实施方解除"]
 async fn acn7_compound_shape_precedes_states() {
     let h = harness(base_config(), PumpConfig::default(), (2, 60), true).await;
     let (mut a, mut rx_a) = client(h.addr).await;

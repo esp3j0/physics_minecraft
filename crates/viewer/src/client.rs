@@ -140,10 +140,9 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
         }),
         S2C::BlockUpdates { updates } => Some(ViewEvent::Blocks { updates }),
         S2C::Spawned { entity } => Some(ViewEvent::Spawned { entity }),
-        S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
+        S2C::EntityShapes { shapes } => Some(ViewEvent::Shapes { shapes }),
         S2C::Pong => None,
-        // REQ-010 单元 03b 接口桩:由实施方映射到 `ViewEvent::Shapes`。
-        S2C::EntityShapes { .. } => None,
+        S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
     }
 }
 
@@ -422,6 +421,22 @@ mod tests {
             S2C::Spawned {
                 entity: EntityId::from_parts(0, 3),
             },
+            S2C::EntityShapes {
+                shapes: vec![(
+                    EntityId::from_parts(0, 5),
+                    types::CompoundShape::new(vec![
+                        types::ShapeCell {
+                            offset: [0, 0, 0],
+                            block: types::BlockId(1),
+                        },
+                        types::ShapeCell {
+                            offset: [1, 0, 0],
+                            block: types::BlockId(1),
+                        },
+                    ])
+                    .expect("2 格梁"),
+                )],
+            },
         ];
 
         for case in cases {
@@ -478,6 +493,9 @@ mod tests {
                 }
                 (S2C::Spawned { entity }, Some(ViewEvent::Spawned { entity: e })) => {
                     assert_eq!(e, entity, "Spawned 回执字段一致");
+                }
+                (S2C::EntityShapes { shapes }, Some(ViewEvent::Shapes { shapes: s })) => {
+                    assert_eq!(s, shapes, "EntityShapes 字段一致(内容原样)");
                 }
                 (S2C::Pong, None) => {}
                 (original, event) => panic!("变体 {original:?} 映射不符: {event:?}"),
