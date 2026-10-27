@@ -327,6 +327,45 @@ pub fn compound_forced_landing(
     CompoundLanding::Write { cells }
 }
 
+/// 碎裂断键(纯函数,REQ-010 §7.3 第 3 条):`total_impulse` = 本拍接近速度 ≥ 1 m/s 的接触点冲量合计;`contacts` = 各接触格
+/// (形状格序号, 受力方向:世界坐标、指向本体内部、已归一化);`rotation` = 刚体旋转。返回断开的粘结
+/// (形状格序号对,小者在前)。
+///
+/// **总架构师接口桩(REQ-010 单元 06)**:由实施方实现。
+pub fn fracture_bonds(
+    shape: &types::CompoundShape,
+    rotation: types::glam::Quat,
+    total_impulse: f32,
+    contacts: &[(usize, types::glam::Vec3)],
+    registry: &dyn BlockRegistry,
+) -> BTreeSet<(usize, usize)> {
+    let _ = (shape, rotation, total_impulse, contacts, registry);
+    BTreeSet::new()
+}
+
+/// 断键后的连通分量(纯函数,REQ-010 §7.3 第 4 条):按未断的共面连接划分形状格序号;分量内升序、各分量按首格升序。
+///
+/// **总架构师接口桩(REQ-010 单元 06)**:桩阶段恒为一个分量。
+pub fn fracture_components(
+    shape: &types::CompoundShape,
+    broken: &BTreeSet<(usize, usize)>,
+) -> Vec<Vec<usize>> {
+    let _ = broken;
+    vec![(0..shape.cells().len()).collect()]
+}
+
+/// 各分量的新实体(纯函数,REQ-010 §7.3 第 5 条):返回 (状态, 描述),顺序同 `components`。
+///
+/// **总架构师接口桩(REQ-010 单元 06)**:由实施方实现。
+pub fn fracture_pieces(
+    state: &types::EntityState,
+    desc: &types::EntityDesc,
+    components: &[Vec<usize>],
+) -> Vec<(types::EntityState, types::EntityDesc)> {
+    let _ = (state, desc, components);
+    Vec::new()
+}
+
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
 /// 任一侧不是实心方块(空气、非实心、未知 ID)为 0。
 pub fn bond_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId) -> u32 {

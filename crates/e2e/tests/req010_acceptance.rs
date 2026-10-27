@@ -2666,3 +2666,402 @@ mod unit05 {
         assert!(broke, "梁凝固在悬臂上后,悬臂整根断下");
     }
 }
+
+/// 单元 06:碎裂与复合体砸地形(AC-C5 撞地形、AC-C6;REQ-010 §7.3,修订 7)。
+#[allow(clippy::clone_on_copy)]
+mod unit06 {
+    use messaging::InputSource;
+    use physics_sim::cohesion::{
+        CohesionConfig, CohesionStats, fracture_bonds, fracture_components, fracture_pieces,
+    };
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use std::collections::BTreeSet;
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EntityDesc, EntityId, EntityState,
+        ShapeCell, ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+    const AIR: BlockId = builtin::AIR;
+    const UP: Vec3 = Vec3::Y;
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    /// 6 格梁:偏移 x = −2..=3,方块 `block`(序号 0..=5 依次对应偏移 −2..=3)。
+    fn beam(block: BlockId) -> CompoundShape {
+        CompoundShape::new(
+            (-2..=3)
+                .map(|x| ShapeCell {
+                    offset: [x, 0, 0],
+                    block,
+                })
+                .collect(),
+        )
+        .expect("6 格梁")
+    }
+
+    fn bonds(pairs: &[(usize, usize)]) -> BTreeSet<(usize, usize)> {
+        pairs.iter().copied().collect()
+    }
+
+    fn near(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1e-4
+    }
+
+    // ------------------------------------------------------------------ 纯函数
+
+    /// AC-C6 断键(§7.3 第 3 条):平落时冲量在接触格间均摊——石梁合计 46.8(每格 7.8 < 18)不断,合计 108(每格 18)
+    /// 5 根横向粘结全断;土梁合计 46.8(每格 7.8 ≥ 7)全断;竖立的梁只有底格着地,向上那根粘结是压向,冲量再大也不断;
+    /// 倾斜 30° 角先着地,粘结方向与受力方向夹角 60°(点积 0.5 < cos 45°),冲量 20 ≥ 18 → 断开底格那一根。
+    ///
+    /// 会变红的实现:不均摊(每格都按合计算,石梁平落 46.8 就全断);不豁免压向(竖落必断底格);压向判定用了本体坐标。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_fracture_bond_rules() {
+        let reg = SimpleRegistry::builtin();
+        let all: Vec<(usize, Vec3)> = (0..6).map(|i| (i, UP)).collect();
+        let chain = bonds(&[(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]);
+        let stone = beam(STONE);
+        assert!(
+            fracture_bonds(&stone, Quat::IDENTITY, 46.8, &all, &reg).is_empty(),
+            "石梁平落:每格 7.8 < 18"
+        );
+        assert_eq!(
+            fracture_bonds(&stone, Quat::IDENTITY, 108.0, &all, &reg),
+            chain,
+            "每格 18 ≥ 18:横向粘结全断"
+        );
+        assert_eq!(
+            fracture_bonds(&beam(DIRT), Quat::IDENTITY, 46.8, &all, &reg),
+            chain,
+            "土梁平落:每格 7.8 ≥ 7"
+        );
+        let upright = Quat::from_rotation_z(90f32.to_radians());
+        assert!(
+            fracture_bonds(&stone, upright, 1000.0, &[(0, UP)], &reg).is_empty(),
+            "竖落:底格向上那根粘结是压向"
+        );
+        let tilted = Quat::from_rotation_z(30f32.to_radians());
+        assert_eq!(
+            fracture_bonds(&stone, tilted, 20.0, &[(0, UP)], &reg),
+            bonds(&[(0, 1)]),
+            "角先着地:断开底格那一根"
+        );
+        let mixed = CompoundShape::new(vec![
+            ShapeCell {
+                offset: [0, 0, 0],
+                block: STONE,
+            },
+            ShapeCell {
+                offset: [1, 0, 0],
+                block: DIRT,
+            },
+        ])
+        .expect("2 格");
+        assert_eq!(
+            fracture_bonds(&mixed, Quat::IDENTITY, 8.0, &[(0, UP)], &reg),
+            bonds(&[(0, 1)]),
+            "石–土粘结取较小的 I = 7"
+        );
+    }
+
+    /// AC-C6 拆分(§7.3 第 4 条):梁断一根 → 2 个分量;断两根 → 3 个;2×2×2 立方底层四根横向粘结全断,竖向与顶层仍连着 → 1 个。
+    ///
+    /// 会变红的实现:分量顺序不按首格;把断开粘结两端的格都单独拆出来。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_fracture_components_rules() {
+        let stone = beam(STONE);
+        assert_eq!(
+            fracture_components(&stone, &bonds(&[(0, 1)])),
+            vec![vec![0], vec![1, 2, 3, 4, 5]]
+        );
+        assert_eq!(
+            fracture_components(&stone, &bonds(&[(1, 2), (3, 4)])),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5]]
+        );
+        let cube = CompoundShape::new(
+            (0..2)
+                .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| [x, y, z])))
+                .map(|offset| ShapeCell {
+                    offset,
+                    block: STONE,
+                })
+                .collect(),
+        )
+        .expect("立方");
+        // 偏移升序:0 (0,0,0) 1 (0,0,1) 2 (0,1,0) 3 (0,1,1) 4 (1,0,0) 5 (1,0,1) 6 (1,1,0) 7 (1,1,1);底层 = 0、1、4、5。
+        assert_eq!(
+            fracture_components(&cube, &bonds(&[(0, 1), (0, 4), (1, 5), (4, 5)])),
+            vec![(0..8).collect::<Vec<usize>>()],
+            "底层横向全断,仍经竖向与顶层连成一块"
+        );
+    }
+
+    /// AC-C6 分块(§7.3 第 5 条):梁以 v = (0, −5, 0)、ω = (0, 0, 2) 运动时拆成 [0,1,2] 与 [3,4,5]——两段的新原点在偏移
+    /// −1 与 2,形状都是 −1..=1;速度 = v + ω × (分量质心 − 原质心) = (0, −8, 0) 与 (0, −2, 0)。拆成 [0] 与 [1..=5] 时,
+    /// 单格那段是普通单格碎块(平移 = 该格中心,速度 (0, −10, 0)),另一段原点偏移 1、形状 −2..=2、速度 (0, −4, 0)。
+    ///
+    /// 会变红的实现:分量直接沿用原平移(各段叠在一起);速度只给 v 不加 ω × r;单格分量仍带形状。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_fracture_pieces_rules() {
+        let state = EntityState {
+            translation: Vec3::new(10.5, 5.5, 3.5),
+            rotation: Quat::IDENTITY,
+            linvel: Vec3::new(0.0, -5.0, 0.0),
+            angvel: Vec3::new(0.0, 0.0, 2.0),
+        };
+        let desc = EntityDesc::compound(DEBRIS_HALF_SIZE, beam(STONE));
+        let short = |lo: i32, hi: i32| {
+            EntityDesc::compound(
+                DEBRIS_HALF_SIZE,
+                CompoundShape::new(
+                    (lo..=hi)
+                        .map(|x| ShapeCell {
+                            offset: [x, 0, 0],
+                            block: STONE,
+                        })
+                        .collect(),
+                )
+                .expect("段"),
+            )
+        };
+        let halves = fracture_pieces(&state, &desc, &[vec![0, 1, 2], vec![3, 4, 5]]);
+        assert_eq!(halves.len(), 2);
+        let want = [
+            (Vec3::new(9.5, 5.5, 3.5), Vec3::new(0.0, -8.0, 0.0)),
+            (Vec3::new(12.5, 5.5, 3.5), Vec3::new(0.0, -2.0, 0.0)),
+        ];
+        for ((st, d), (t, v)) in halves.iter().zip(want) {
+            assert!(near(st.translation, t), "平移 {:?} ≠ {t:?}", st.translation);
+            assert!(near(st.linvel, v), "速度 {:?} ≠ {v:?}", st.linvel);
+            assert!(near(st.angvel, state.angvel));
+            assert_eq!(st.rotation, state.rotation);
+            assert_eq!(d, &short(-1, 1));
+        }
+        let split = fracture_pieces(&state, &desc, &[vec![0], vec![1, 2, 3, 4, 5]]);
+        let (single, single_desc) = &split[0];
+        assert!(near(single.translation, Vec3::new(8.5, 5.5, 3.5)));
+        assert!(near(single.linvel, Vec3::new(0.0, -10.0, 0.0)));
+        assert!(single_desc.shape().is_none(), "单格分量是普通单格碎块");
+        assert_eq!(
+            (single_desc.half_size, single_desc.block),
+            (DEBRIS_HALF_SIZE, STONE)
+        );
+        let (rest, rest_desc) = &split[1];
+        assert!(near(rest.translation, Vec3::new(11.5, 5.5, 3.5)));
+        assert!(near(rest.linvel, Vec3::new(0.0, -4.0, 0.0)));
+        assert_eq!(rest_desc, &short(-2, 2));
+    }
+
+    // ------------------------------------------------------------------ 端到端
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 单分片会话(chunk x 2..=6、z 2..=5),破坏与本 REQ 开启;`pad` 时把 x 56..=69、z 60..=80 的地表一层(y = −61)换成石头
+    /// (I = 18,只看复合体自身是否碎裂,不让地面被砸穿)。
+    fn session(pad: bool) -> (Session, CommandLog) {
+        let mut c = ShardSimConfig::new(shard());
+        c.destruction = DestructionConfig {
+            enabled: true,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: true,
+            ..CohesionConfig::default()
+        };
+        let mut sim = ShardSim::new(c, registry());
+        for x in 2..=6 {
+            for z in 2..=5 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        let mut log = CommandLog::new();
+        if pad {
+            // 每拍命令收件箱上限 256:逐行写、每行一拍。
+            for x in 56..=69 {
+                for z in 60..=80 {
+                    for entry in s.set_block(shard(), p(x, -61, z), STONE).expect("石垫") {
+                        log.append(entry);
+                    }
+                }
+                s.tick();
+            }
+        }
+        (s, log)
+    }
+
+    fn block(s: &Session, q: BlockPos) -> BlockId {
+        let cp = q.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (q.x - cp.x * 16) as usize,
+            (q.y - WORLD_Y_MIN) as usize,
+            (q.z - cp.z * 16) as usize,
+        )
+    }
+
+    /// 生成一根 6 格梁:原点格中心 x = 62.5、给定 z,最低点离地 `h` 米(平放时原点 y = −59.475 + h)。
+    fn drop_beam(
+        s: &mut Session,
+        log: &mut CommandLog,
+        k: u32,
+        z: f32,
+        h: f32,
+        block: BlockId,
+        rotation: Quat,
+    ) {
+        let entry = s
+            .spawn_owned(
+                shard(),
+                EntityId::from_parts(0, k),
+                EntityState {
+                    translation: Vec3::new(62.5, -59.475 + h, z),
+                    rotation,
+                    ..EntityState::default()
+                },
+                EntityDesc::compound(DEBRIS_HALF_SIZE, beam(block)),
+                InputSource(7),
+            )
+            .expect("spawn");
+        log.append(entry);
+    }
+
+    /// 跑到连续 2 拍没有实体(上限 900 拍),返回累计遥测。
+    fn settle(s: &mut Session) -> (bool, CohesionStats) {
+        let mut total = CohesionStats::default();
+        let mut empty = 0;
+        for _ in 0..900 {
+            let n = s.tick();
+            total.add(&n.cohesion);
+            empty = if s.entity_states(shard()).expect("分片").is_empty() {
+                empty + 1
+            } else {
+                0
+            };
+            if empty >= 2 {
+                return (true, total);
+            }
+        }
+        (false, total)
+    }
+
+    /// AC-C6 石梁平落 5 m 不碎(设计意图):落在石垫上,整块凝固回一排 6 格石头,期间不断任何粘结。
+    ///
+    /// 会变红的实现:逐格相加而不均摊(求解器把冲量集中在一格,5 m 就断)。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_stone_beam_flat_5m_stays_whole() {
+        let (mut s, mut log) = session(true);
+        drop_beam(&mut s, &mut log, 1, 64.5, 5.0, STONE, Quat::IDENTITY);
+        let (done, total) = settle(&mut s);
+        assert!(done);
+        assert_eq!(total.bonds_broken, 0);
+        assert_eq!(total.fracture_components, 0);
+        assert_eq!(total.compounds_solidified, 1);
+        for x in 60..=65 {
+            assert_eq!(block(&s, p(x, -60, 64)), STONE, "x = {x}");
+        }
+    }
+
+    /// AC-C6 土梁平落 8 m 碎开(设计意图:土桥面同高平落碎成几段):每个接触格均摊约 9.8 ≥ 7,5 根横向粘结全断,
+    /// 拆成 6 个单格碎块,最终石垫上多出 6 格土。
+    ///
+    /// 会变红的实现:碎裂没接线;拆分后丢格。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_dirt_beam_flat_8m_shatters() {
+        let (mut s, mut log) = session(true);
+        drop_beam(&mut s, &mut log, 1, 64.5, 8.0, DIRT, Quat::IDENTITY);
+        let (done, total) = settle(&mut s);
+        assert!(done);
+        assert_eq!(total.bonds_broken, 5);
+        assert_eq!(total.fracture_components, 6);
+        let mut dirt = 0;
+        for x in 54..=72 {
+            for y in -60..=-55 {
+                for z in 58..=72 {
+                    if block(&s, p(x, y, z)) == DIRT {
+                        dirt += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(dirt, 6, "6 格土落在石垫上");
+    }
+
+    /// AC-C6 角先着地:石梁倾斜 30° 从 8 m 高落下,最低的那一格先着地(demo:单格冲量约 30 ≥ 18)→ 断开、拆成至少 2 段。
+    ///
+    /// 会变红的实现:压向豁免写反(所有粘结都被当成压向)。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c6_corner_first_stone_beam_breaks() {
+        let (mut s, mut log) = session(true);
+        drop_beam(
+            &mut s,
+            &mut log,
+            1,
+            72.5,
+            8.0 + 1.0,
+            STONE,
+            Quat::from_rotation_z(30f32.to_radians()),
+        );
+        let (done, total) = settle(&mut s);
+        assert!(done);
+        assert!(total.bonds_broken >= 1, "至少断一根:{total:?}");
+        assert!(total.fracture_components >= 2, "至少拆成 2 段:{total:?}");
+    }
+
+    /// AC-C5 复合体砸地形按均摊口径(§7.3 第 7 条):两根石梁平落在土地上——2 m 那根每格 4.9 < 7,脚下的土一格都不脱落;
+    /// 8 m 那根每格 9.8 ≥ 7,脚下 6 格土在同一拍一起脱落(写 air)。
+    ///
+    /// 会变红的实现:复合体仍按单格口径逐地形格相加(桩上实测:8 m 那根脚下的 6 格不会同拍一起脱落);阈值或均摊分母算错。
+    #[test]
+    #[ignore = "REQ-010 单元 06 待实施方解除"]
+    fn acc_c5_compound_terrain_impact_averaged() {
+        let (mut s, mut log) = session(false);
+        drop_beam(&mut s, &mut log, 1, 64.5, 2.0, STONE, Quat::IDENTITY);
+        drop_beam(&mut s, &mut log, 2, 72.5, 8.0, STONE, Quat::IDENTITY);
+        let low: Vec<BlockPos> = (60..=65).map(|x| p(x, -61, 64)).collect();
+        let high: Vec<BlockPos> = (60..=65).map(|x| p(x, -61, 72)).collect();
+        let mut crushed_together = false;
+        for _ in 0..300 {
+            s.tick();
+            for c in &low {
+                assert_eq!(block(&s, *c), DIRT, "2 m 那根脚下的土 {c:?} 不脱落");
+            }
+            if high.iter().all(|c| block(&s, *c) == AIR) {
+                crushed_together = true;
+            }
+        }
+        assert!(crushed_together, "8 m 那根脚下 6 格土同一拍一起脱落");
+    }
+}
