@@ -719,7 +719,7 @@ impl ShardSim {
         let Some(observers) = self.observed.clone() else {
             return;
         };
-        let awake: Vec<(EntityId, Vec3)> = self
+        let awake: Vec<(EntityId, Vec3, u32)> = self
             .entities
             .iter()
             // 当拍地形变更唤醒者不进淘汰池(04c;D20/§4.12):命令唤醒
@@ -736,10 +736,12 @@ impl ShardSim {
             })
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
-                (*id, conv::rapier_to_vec3(b.translation()))
+                // 格数口径(REQ-010 §5.5 第 5 条):单格 1、复合体 = 格数。
+                let cells = rec.desc.shape().map_or(1, |s| s.cells().len() as u32);
+                (*id, conv::rapier_to_vec3(b.translation()), cells)
             })
             .collect();
-        for id in self.activation.enforce_budget(&observers, &awake) {
+        for id in self.activation.enforce_budget_cells(&observers, &awake) {
             let now = self.activation_now;
             // §9-2/任务书细则 10(瞬态半边):被淘汰的**瞬态体 → 强制落地**
             // (产出同 §4.8;非冻结);常驻体 → 冻结 + End ActorMotion
@@ -1110,17 +1112,20 @@ impl ShardSim {
         let collider_loaded: Vec<ChunkPos> = self.built_colliders.iter().copied().collect();
         // H2:carried = 有实体支撑(§4.4.1)——被承载瞬态按常驻规则参与滞回。
         let supports = self.evaluate_supports();
-        let entities: Vec<(EntityId, Vec3, bool, bool, bool)> = self
+        // 醒体预算按格数(REQ-010 §5.5 第 5 条):单格 1、复合体 = 形状格数。
+        let entities: Vec<(EntityId, Vec3, bool, bool, bool, u32)> = self
             .entities
             .iter()
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let cells = rec.desc.shape().map_or(1, |s| s.cells().len() as u32);
                 (
                     *id,
                     conv::rapier_to_vec3(b.translation()),
                     b.is_kinematic(),
                     rec.actor,
                     supports.get(id).copied().unwrap_or(false),
+                    cells,
                 )
             })
             .collect();
@@ -2898,49 +2903,79 @@ impl ShardSim {
             }
         }
 
-        // 转换:待转换队列按 BlockPos 升序,直接转换、不重新求值(§4.6 第 4
-        // 条);数量受本拍剩余名额(爆炸等拍内已用掉的扣掉)约束。
-        let mut quota = self
-            .cfg
-            .destruction
-            .max_detach_per_tick
-            .saturating_sub(self.outbox.detach_requests.len());
+        // 转换(§5.5,修订 5):待转换队列里仍为实心的格先按 `split_segments`
+        // 划段(段内升序、各段按首格升序),依次处理——1 格的段 = 单格脱落请求
+        // (同 REQ-009),≥ 2 格的段 = 一个复合体生成请求;每段占 1 个实体名额
+        // (与同拍已有的脱落/复合体请求共用 `max_detach_per_tick`),格数另受
+        // `max_converted_cells_per_tick` 约束;**某段放不下时本拍停止转换**,该段
+        // 与其后各段整段留在待转换集合,下一拍继续——不跳段、不拆段(§5.5 第
+        // 2 条;跳段会让转换顺序随名额变化,回放与跨分片不一致)。
+        let mut quota = self.cfg.destruction.max_detach_per_tick.saturating_sub(
+            self.outbox.detach_requests.len() + self.outbox.compound_requests.len(),
+        );
+        let mut cells_budget = self.cfg.cohesion.max_converted_cells_per_tick;
         let queue: Vec<BlockPos> = self.load_pending.iter().copied().collect();
+        // 各格转换前的方块(划段求 bond 与构造形状都要它;逐段写 air 不改未
+        // 转换格,先读齐再处理,不做跨段重读)。
+        let mut solid_blocks: BTreeMap<BlockPos, BlockId> = BTreeMap::new();
+        for cell in &queue {
+            let block = self.voxels.get_block(*cell);
+            if self.registry.material(block).is_some() {
+                solid_blocks.insert(*cell, block);
+            } else {
+                // 轮到时已不是实心(同拍爆炸/撞击已写掉):丢弃,不占名额。
+                self.load_pending.remove(cell);
+            }
+        }
+        let still_solid: Vec<BlockPos> = solid_blocks.keys().copied().collect();
+        let reg = self.registry.as_ref();
+        let lookup = |p: BlockPos| solid_blocks.get(&p).copied();
+        let segments = crate::cohesion::split_segments(
+            &lookup,
+            reg,
+            &still_solid,
+            self.cfg.cohesion.compound_split_size,
+        );
         let mut dirty: Vec<ChunkPos> = Vec::new();
-        for cell in queue {
-            if quota == 0 {
+        // 遥测(§5.5 第 6 条):切块产生的段数(含 1 格段)。
+        self.outbox.cohesion_stats.segments += segments.len() as u64;
+        for segment in segments {
+            if quota == 0 || cells_budget < segment.len() {
+                // 名额或格数不足:本拍停止转换,该段与其后各段整段留下(§5.5 第 2 条)。
                 break;
             }
-            let block = self.voxels.get_block(cell);
-            if self.registry.material(block).is_none() {
-                // 轮到时已不是实心(同拍爆炸/撞击已写掉):丢弃,不占名额。
-                self.load_pending.remove(&cell);
-                continue;
-            }
-            let _ = self.voxels.set_block(cell, BlockId::AIR);
-            self.load_pending.remove(&cell);
             quota -= 1;
-            // 遥测(§4.6 第 7 条):转换的格照常计入 REQ-009 的口径。
-            self.outbox.destruction_stats.cells_collapsed += 1;
-            self.outbox.destruction_stats.detached += 1;
-            self.outbox.block_updates.push(BlockWrite {
-                pos: cell,
-                block: BlockId::AIR,
-                kind: BlockWriteKind::Emergent,
-                load_conversion: true,
-            });
-            // §4.11 统一出口:脚下被掏空的冻结体下一拍被唤醒。
-            self.register_terrain_write(cell);
-            self.outbox
-                .detach_requests
-                .push(crate::destruction::DetachRequest {
-                    cell,
-                    block,
-                    impulse: Vec3::ZERO,
-                });
-            // 转换的写入登记为下一拍的触发(§4.4 连锁断裂自然发生)。
-            self.collapse_triggers.insert(cell);
-            dirty.push(cell.chunk_of());
+            cells_budget -= segment.len();
+            if segment.len() == 1 {
+                let cell = segment[0];
+                let block = solid_blocks[&cell];
+                self.convert_load_cell(cell, &mut dirty);
+                self.outbox
+                    .detach_requests
+                    .push(crate::destruction::DetachRequest {
+                        cell,
+                        block,
+                        impulse: Vec3::ZERO,
+                    });
+            } else {
+                let origin = crate::cohesion::compound_origin(&segment);
+                let world: Vec<(BlockPos, BlockId)> =
+                    segment.iter().map(|&c| (c, solid_blocks[&c])).collect();
+                let shape = types::CompoundShape::from_world(origin, &world)
+                    .expect("段内 ≥ 2 格、偏移不重复(划分保证)");
+                for &cell in &segment {
+                    self.convert_load_cell(cell, &mut dirty);
+                }
+                // 遥测(§5.5 第 6 条):复合体在转换拍计数。
+                self.outbox.cohesion_stats.compounds_spawned += 1;
+                self.outbox.cohesion_stats.compound_cells += segment.len() as u64;
+                self.outbox
+                    .compound_requests
+                    .push(crate::cohesion::CompoundRequest { origin, shape });
+            }
+            for &cell in &segment {
+                self.load_pending.remove(&cell);
+            }
         }
         // 细则 4/5 同款守卫:只重建已建 ②(同 REQ-009 转换)。
         for cp in expand_boundary(dirty, &self.voxels) {
@@ -2951,6 +2986,27 @@ impl ShardSim {
         // 与同拍爆炸/撞击的脱落请求拼接后,保持 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
         self.outbox.cohesion_stats.load_pending = self.load_pending.len() as u64;
+    }
+
+    /// 承载转换的单格写入(§5.5 第 3 条):写 air、带承载转换标记的
+    /// `Emergent` 写入、§4.11 唤醒、登记为下一拍的触发(连锁断裂);
+    /// REQ-009 口径遥测(cells_collapsed/detached,单格与复合体的格都计)。
+    /// caller 负责名额扣减、请求产出与 collider 重建。
+    fn convert_load_cell(&mut self, cell: BlockPos, dirty: &mut Vec<ChunkPos>) {
+        let _ = self.voxels.set_block(cell, BlockId::AIR);
+        self.outbox.destruction_stats.cells_collapsed += 1;
+        self.outbox.destruction_stats.detached += 1;
+        self.outbox.block_updates.push(BlockWrite {
+            pos: cell,
+            block: BlockId::AIR,
+            kind: BlockWriteKind::Emergent,
+            load_conversion: true,
+        });
+        // §4.11 统一出口:脚下被掏空的冻结体下一拍被唤醒。
+        self.register_terrain_write(cell);
+        // 转换的写入登记为下一拍的触发(§4.4 连锁断裂自然发生)。
+        self.collapse_triggers.insert(cell);
+        dirty.push(cell.chunk_of());
     }
 
     fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
@@ -5567,6 +5623,96 @@ mod tests {
         );
         assert_eq!(events.forced_landings_deadline, 0, "不计截止");
     }
+    // ==== REQ-010 单元 04(§5.5 第 5 条:醒体预算按格数,ShardSim 接线)====
+
+    /// 复合体按格数占醒体预算(ShardSim 层接线):预算 10、单格 a(距 9)+
+    /// 6 格复合体 b(距 1,chunk 内不跨 ②)+ 6 格复合体 c(距 5)= 13 格 →
+    /// plan 由远到近淘汰 a、c(1 + 6 = 7 扣足 3 格溢出后停,b 保住);按实体
+    /// 个数口径(3 个 ≤ 10)不淘汰。复合体描述经 `spawn_entity` 真实建体
+    /// (cells().len() 接线,变异"恒传 1"即红:淘汰只有 a 一格就够了)。
+    #[test]
+    fn plan_budget_counts_compound_cells() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.activation.max_awake_dynamic = 10;
+        cfg.gravity = Vec3::ZERO;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let (a, b, c) = (entity(1), entity(2), entity(3));
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        // a:单格(距观察者 9.1,最远);b:6 格复合体(距 1.03);c:6 格复合体(距 5.02)。
+        let mk_shape = || {
+            types::CompoundShape::new(vec![
+                types::ShapeCell {
+                    offset: [0, 0, 0],
+                    block: voxel::builtin::STONE,
+                },
+                types::ShapeCell {
+                    offset: [1, 0, 0],
+                    block: voxel::builtin::STONE,
+                },
+                types::ShapeCell {
+                    offset: [2, 0, 0],
+                    block: voxel::builtin::STONE,
+                },
+                types::ShapeCell {
+                    offset: [0, 1, 0],
+                    block: voxel::builtin::STONE,
+                },
+                types::ShapeCell {
+                    offset: [0, 0, 1],
+                    block: voxel::builtin::STONE,
+                },
+                types::ShapeCell {
+                    offset: [1, 1, 0],
+                    block: voxel::builtin::STONE,
+                },
+            ])
+            .expect("6 格")
+        };
+        let shape_b = mk_shape();
+        let shape_c = mk_shape();
+
+        s.apply_prefix(&[
+            spawn_input(1, a, Vec3::new(14.0, 0.5, 8.0)),
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: b,
+                    state: EntityState {
+                        translation: Vec3::new(6.0, 0.5, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape_b),
+                }),
+            },
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 3,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: c,
+                    state: EntityState {
+                        translation: Vec3::new(10.0, 0.5, 8.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape_c),
+                }),
+            },
+        ]);
+        let _ = s.take_activation_events();
+        let d = s.apply_activation(&[Vec3::new(5.0, 3.0, 8.0)]);
+        assert_eq!(
+            d.over_budget_freeze,
+            vec![a, c],
+            "格数和 13 > 10:由远到近淘汰 a(9.1)、c(5.1)后 12 − 6 = 6 ≤ 10"
+        );
+    }
     // ==== REQ-007 任务 03(G3 返修补齐测试)====
 
     /// 任务书测试 `sim::awaiting_terrain_enters_and_recovers`(T5):② 预算 0
@@ -7098,6 +7244,10 @@ mod tests {
     fn cohesion_sim(cap: usize) -> ShardSim {
         let mut s = destruction_sim(cap);
         s.cfg.cohesion.enabled = true;
+        // 单元 04 迁移(与总架构师对 e2e unit02 的迁移同款):本组用例按逐格
+        // 转换编写(§4.6 第 4 条的队列语义);单元 04 起按段转换(§5.5),切块
+        // 边长设 1 即每格一段、保持逐格,断言不变。
+        s.cfg.cohesion.compound_split_size = 1;
         s
     }
 
@@ -7557,6 +7707,191 @@ mod tests {
             assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?} 塌");
         }
         assert_eq!(out.detach_requests.len(), 9, "悬臂 8 格 + 落点格");
+    }
+
+    /// §5.5 的按段 sim:`cohesion_sim` 已固定 split = 1(逐格,单元 02 用例
+    /// 语义);本组用例要真实的按段行为,显式开 cohesion、用默认切块 6。
+    fn load_segment_sim(cap: usize) -> ShardSim {
+        let mut s = destruction_sim(cap);
+        s.cfg.cohesion.enabled = true;
+        s
+    }
+
+    /// §5.5 第 1–3 条(按段转换):土门楣左 6 格在同一 6 格切块 → 整段 6 格
+    /// 原子转换:同拍 6 格写 air 且全部带承载转换标记、零 `DetachRequest`、
+    /// 1 个 `CompoundRequest`(原点 = `compound_origin`,形状 canonical、
+    /// 全格在列、方块 dirt);遥测 = 1 段 1 复合体 6 格。
+    ///
+    /// 变红:整段被拆开(逐格 Detach);形状少格/方块错;原点错;遥测没计。
+    #[test]
+    fn load_segment_converts_atomically_into_compound_request() {
+        let mut s = load_segment_sim(64);
+        let lintel = build_door_lintel(&mut s, 64);
+        assert!(s.take_outbox().detach_requests.is_empty(), "满载挂得住");
+        remove_door_pillar(&mut s, 64);
+        s.step();
+        let out = s.take_outbox();
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        for c in &fell {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+        assert!(out.detach_requests.is_empty(), "≥ 2 格的段不产单格脱落请求");
+        assert_eq!(out.compound_requests.len(), 1);
+        let req = &out.compound_requests[0];
+        let origin = crate::cohesion::compound_origin(&fell);
+        assert_eq!(req.origin, origin);
+        let cells = req.shape.cells();
+        assert_eq!(cells.len(), 6, "全格在列");
+        let offsets: Vec<[i32; 3]> = cells.iter().map(|c| c.offset).collect();
+        let want: Vec<[i32; 3]> = fell
+            .iter()
+            .map(|c| [c.x - origin.x, c.y - origin.y, c.z - origin.z])
+            .collect();
+        assert_eq!(offsets, want, "canonical(偏移升序)且与段一致");
+        assert!(cells.iter().all(|c| c.block == voxel::builtin::DIRT));
+        // 转换写入:6 格全带承载转换标记(§5.5 第 3 条)。
+        let marked: Vec<BlockPos> = out
+            .block_updates
+            .iter()
+            .filter(|w| w.load_conversion)
+            .map(|w| w.pos)
+            .collect();
+        assert_eq!(marked, fell, "整段同拍写 air、全带标记");
+        // 遥测(§5.5 第 6 条)。
+        let t = out.cohesion_stats;
+        assert_eq!(
+            (t.segments, t.compounds_spawned, t.compound_cells),
+            (1, 1, 6)
+        );
+        assert_eq!(out.destruction_stats.cells_collapsed, 6, "REQ-009 口径照常");
+    }
+
+    /// §5.5 第 2 条(格数上限):切块 2、每拍 4 格、名额 64——门楣左 6 格切成
+    /// 3 段 × 2 格,每拍 2 段(4 格)整段转换,第三段下一拍;**不拆段**:第二拍
+    /// 一次转完最后 2 格(若按格数硬切,第二拍只会转 2 格中的前 2 格——这里
+    /// 段长恰 2 无法区分,用 6/6/2 的桥面形态补:2 格尾段不被拆成单格)。
+    ///
+    /// 变红:格数上限没生效(3 段一拍全转,当拍 6 格 > 4);上限把段拆开。
+    #[test]
+    fn load_segment_cells_budget_stops_midway_without_splitting() {
+        let mut s = load_segment_sim(64);
+        // 切块 2、每拍 4 格。
+        s.cfg.cohesion.compound_split_size = 2;
+        s.cfg.cohesion.max_converted_cells_per_tick = 4;
+        let lintel = build_door_lintel(&mut s, 64);
+        s.take_outbox();
+        remove_door_pillar(&mut s, 64);
+        s.step();
+        let out = s.take_outbox();
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        // 段界:x 60..=61、62..=63、64..=65(div_euclid 偶切块)。前 2 段(4 格)本拍。
+        assert_eq!(out.cohesion_stats.segments, 3);
+        assert_eq!(out.cohesion_stats.compounds_spawned, 2);
+        assert_eq!(out.cohesion_stats.compound_cells, 4);
+        assert_eq!(out.compound_requests.len(), 2);
+        for c in &fell[..4] {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+        for c in &fell[4..] {
+            assert_eq!(
+                s.voxel().get_block(*c),
+                voxel::builtin::DIRT,
+                "{c:?} 整段留下"
+            );
+        }
+        assert_eq!(out.cohesion_stats.load_pending, 2);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.compound_requests.len(), 1, "最后一段整段转换");
+        assert_eq!(out.cohesion_stats.compound_cells, 2);
+        for c in &fell[4..] {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+    }
+
+    /// §5.5 第 2 条(放不下即停,不跳段):门楣塌落段 6 格(首格 60 在前)+
+    /// 2 格沙各自成 1 格段(B = 0,首格 67、68 在后),cells = 4——石段放不下
+    /// → **整拍停止**,后面放得下的沙段也不转(变异"跳过放不下的段续转小段"
+    /// 当拍就会转沙)。
+    ///
+    /// 变红:cells 不足时 continue 跳段(沙当拍转换);或门楣段被拆开。
+    #[test]
+    fn load_segment_stops_at_unfit_segment_without_skipping() {
+        let mut s = load_segment_sim(64);
+        // cells = 4 < 门楣段 6 格。
+        s.cfg.cohesion.max_converted_cells_per_tick = 4;
+        build_door_lintel(&mut s, 64);
+        s.take_outbox();
+        // 门楣塌落段 60..=65(dirt)+ 沙 67、68(与门楣第 7 格 B = 0、沙沙 B = 0,
+        // 各自 1 格段且首格在后)。
+        remove_door_pillar(&mut s, 64);
+        let sand = [
+            setblock_input(300, BlockPos::new(67, -55, 64), voxel::builtin::SAND),
+            setblock_input(301, BlockPos::new(68, -55, 64), voxel::builtin::SAND),
+        ];
+        // 沙直接悬空放置即成触发(放置 = 实心变化,自己就是种子)。
+        s.apply_prefix(&sand);
+        s.step();
+        let out = s.take_outbox();
+        // 段 = [门楣 60..=65(6 格), 沙 67(1), 沙 68(1)];首段 6 格 > 4 cells → 停。
+        assert_eq!(out.cohesion_stats.segments, 3);
+        assert_eq!(out.compound_requests.len(), 0, "门楣段放不下,不产出");
+        assert_eq!(out.detach_requests.len(), 0, "放得下的沙段也不转(不跳段)");
+        let fell: Vec<BlockPos> = (60..=65).map(|x| BlockPos::new(x, -55, 64)).collect();
+        let sand_pos = [BlockPos::new(67, -55, 64), BlockPos::new(68, -55, 64)];
+        for c in fell.iter().chain(sand_pos.iter()) {
+            let want = if fell.contains(c) {
+                voxel::builtin::DIRT
+            } else {
+                voxel::builtin::SAND
+            };
+            assert_eq!(s.voxel().get_block(*c), want, "{c:?} 原样(整拍停止)");
+        }
+        assert_eq!(
+            out.cohesion_stats.load_pending, 8,
+            "门楣 6 格 + 沙 2 格全留队"
+        );
+        // 下一拍:cells 恢复 4,仍不够门楣段 6 格 → 继续停(队列不丢、不重新求值)。
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.load_pending, 8);
+        assert!(out.compound_requests.is_empty() && out.detach_requests.is_empty());
+        // 把 cells 提到 6(下一拍生效配置):门楣段整段转换,沙段随 cells 余 0 停。
+        s.cfg.cohesion.max_converted_cells_per_tick = 6;
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.compound_requests.len(), 1, "门楣段 6 格整段转换");
+        assert_eq!(out.cohesion_stats.compound_cells, 6);
+        for c in &fell {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+        assert_eq!(out.cohesion_stats.load_pending, 2, "沙段整段留下");
+    }
+
+    /// §5.5 第 2 条(名额与格数都从零起算,与同拍爆炸共用实体名额):名额 1、
+    /// 弹坑拍 + 门楣塌——爆炸 24 请求占满名额,承载转换当拍 1 个名额也没有,
+    /// 6 格整段留下;下一拍名额 1 仍不够 1 段吗——够(每段 1 个实体名额),
+    /// 整段 6 格一次转换(格数上限 1024 不设障)。
+    ///
+    /// 变红:复合体不占/多占实体名额;爆炸名额没被扣(当拍就转)。
+    #[test]
+    fn load_segment_quota_shared_with_detaches() {
+        let mut s = load_segment_sim(24);
+        build_door_lintel(&mut s, 64);
+        s.take_outbox();
+        let inputs = vec![detonate_input(200, Vec3::new(64.0, -59.5, 96.0), 12.0, 8.0)];
+        remove_door_pillar(&mut s, 64);
+        s.apply_prefix(&inputs);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 24, "弹坑 24 占满名额");
+        assert!(out.compound_requests.is_empty(), "名额 0:整段留下");
+        assert_eq!(out.cohesion_stats.load_pending, 6);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.compound_requests.len(), 1, "每段 1 个实体名额");
+        assert_eq!(out.cohesion_stats.compound_cells, 6);
+        assert!(out.detach_requests.is_empty(), "复合体不是脱落请求");
     }
 
     /// §6.2.1/§7 名额共用(风险 4 前半):爆炸在拍首已用掉的名额要扣掉——

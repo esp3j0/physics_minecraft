@@ -1631,23 +1631,66 @@ impl Scheduler {
             events.closure_deferred += shard_events.closure_deferred;
             events.contact_wake_skipped_no_terrain += shard_events.contact_wake_skipped_no_terrain;
             events.actor_motion_capped += shard_events.actor_motion_capped;
-            // 涌现生成盖章(REQ-009 §7;单元 03):本分片的脱落请求按
-            // `BlockPos` 升序(sim 侧已排序,此处钉住不变量)依次分配
-            // `EntityId::from_parts(EMERGENT_ORIGIN, seq)`(用后 +1,u32
-            // 用尽 = 内部错误 fail-stop),`detach_spawn` 得生成状态与描述,
-            // 盖章 N+1 生效的 `SpawnDynamic`(来源 `InputSource::SCHEDULER`;
-            // 序列号用 seq——全局唯一、单调,canonical 序 = 分配序)。分配
-            // 只依赖 canonical 序:results 是 BTreeMap,按 ShardId 升序迭代,
-            // 与 worker 回传完成顺序无关(风险 1)。生成输入不进外部命令日志
-            //(回放时由模拟重新产生),挂起待 N+1 并入目的分片前缀。
-            let mut requests = std::mem::take(&mut outbox.detach_requests);
-            requests.sort_by_key(|req| req.cell);
-            for req in requests {
+            // 涌现生成盖章(REQ-009 §7;单元 03;REQ-010 §5.5 第 4 条):本分片的
+            // 单格脱落请求与复合体请求放在一起分配涌现 ID——片内按"实体的最小格"
+            // 升序(单格 = 该格;复合体 = 原点 + 首格偏移,形状 canonical 序保证
+            // 首格偏移最小且偏移字典序与 BlockPos 序一致),分片之间按 ShardId
+            // 升序(results 是 BTreeMap,迭代天然升序,与 worker 回传完成顺序
+            // 无关,风险 1)。依次分配 `EntityId::from_parts(EMERGENT_ORIGIN, seq)`
+            // (用后 +1,u32 用尽 = 内部错误 fail-stop),单格走 `detach_spawn`,
+            // 复合体 = 原点格中心、零速度、单位旋转、
+            // `EntityDesc::compound(DEBRIS_HALF_SIZE, shape)`,盖章 N+1 生效的
+            // `SpawnDynamic`(来源 `InputSource::SCHEDULER`;序列号用 seq——全局
+            // 唯一、单调,canonical 序 = 分配序)。分配只依赖 canonical 序。生成
+            // 输入不进外部命令日志(回放时由模拟重新产生),挂起待 N+1 并入目的
+            // 分片前缀。
+            let mut detach = std::mem::take(&mut outbox.detach_requests);
+            detach.sort_by_key(|req| req.cell);
+            let compound = std::mem::take(&mut outbox.compound_requests);
+            enum SpawnReq {
+                Detach(physics_sim::destruction::DetachRequest),
+                Compound(physics_sim::cohesion::CompoundRequest),
+            }
+            let mut requests: Vec<(types::BlockPos, SpawnReq)> = detach
+                .into_iter()
+                .map(|req| (req.cell, SpawnReq::Detach(req)))
+                .chain(compound.into_iter().map(|req| {
+                    let min_cell = req.shape.cells().first().expect("形状至少 2 格(构造保证)");
+                    (
+                        types::BlockPos::new(
+                            req.origin.x + min_cell.offset[0],
+                            req.origin.y + min_cell.offset[1],
+                            req.origin.z + min_cell.offset[2],
+                        ),
+                        SpawnReq::Compound(req),
+                    )
+                }))
+                .collect();
+            requests.sort_by_key(|(min_cell, _)| *min_cell);
+            for (_, req) in requests {
                 let seq = self.next_emergent_seq;
                 self.next_emergent_seq = seq.checked_add(1).unwrap_or_else(|| {
                     panic!("涌现 ID 计数器溢出(u32 用尽,seq = {seq}):内部错误 fail-stop")
                 });
-                let (state, desc) = physics_sim::destruction::detach_spawn(&req);
+                let (state, desc) = match &req {
+                    SpawnReq::Detach(r) => physics_sim::destruction::detach_spawn(r),
+                    SpawnReq::Compound(r) => (
+                        types::EntityState {
+                            translation: types::glam::Vec3::new(
+                                r.origin.x as f32 + 0.5,
+                                r.origin.y as f32 + 0.5,
+                                r.origin.z as f32 + 0.5,
+                            ),
+                            rotation: types::glam::Quat::IDENTITY,
+                            linvel: types::glam::Vec3::ZERO,
+                            angvel: types::glam::Vec3::ZERO,
+                        },
+                        types::EntityDesc::compound(
+                            physics_sim::destruction::DEBRIS_HALF_SIZE,
+                            r.shape.clone(),
+                        ),
+                    ),
+                };
                 self.pending_emergent_spawns.push((
                     shard,
                     StampedInput {
@@ -6217,6 +6260,135 @@ mod tests {
             physics_sim::cohesion::CohesionStats::default(),
             "下一拍归零"
         );
+        sched.shutdown();
+    }
+
+    /// REQ-010 §5.5 第 4 条(单元 04):屏障阶段把单格脱落请求与复合体请求
+    /// 放在一起按"实体的最小格"分配涌现 ID;复合体的生成状态 = 原点格中心、
+    /// 零速、单位旋转,描述 = `EntityDesc::compound`(形状 canonical、≥ 2 格、
+    /// 偏移相对原点);生成请求进调度器快照。
+    ///
+    /// 变红:单格与复合体分开编号;复合体状态/描述错(非原点格中心、速度非
+    /// 零、形状缺格);生成输入不进快照(恢复线少实体);形状丢偏移原点。
+    #[test]
+    fn emergent_compound_spawns_interleaved_by_min_cell_and_survive_snapshot() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let shard = shard_id(0, 0);
+        let sim = cohesion_sim_centered(0, 0);
+        // 切块 6(默认):门楣 x0..=x0+6 的左 6 格在同一 6 格切块(x0 = 60 落在
+        // [60, 66) 切块),整段成 1 个复合体。
+        sched.register(sim);
+        let x0 = 60i32;
+        let (stone, dirt) = (voxel::builtin::STONE, voxel::builtin::DIRT);
+        let build: Vec<(types::BlockPos, types::BlockId)> = (-60..=-56)
+            .flat_map(|y| {
+                [
+                    (types::BlockPos::new(x0, y, 64), stone),
+                    (types::BlockPos::new(x0 + 6, y, 64), stone),
+                ]
+            })
+            .chain((x0..=x0 + 6).map(|x| (types::BlockPos::new(x, -55, 64), dirt)))
+            .collect();
+        for (seq, (pos, block)) in build.into_iter().enumerate() {
+            sched
+                .submit(
+                    shard,
+                    cmd_input(
+                        InputSource(1),
+                        seq as u64,
+                        Tick::ZERO,
+                        messaging::SimCommand::SetBlock { pos, block },
+                    ),
+                )
+                .expect("收件箱未满");
+        }
+        // 搭建拍。
+        sched.tick();
+        // 拆左柱(迟到输入 fail-stop:提交在拍 1,apply_at = 1)。
+        for y in -60..=-56 {
+            sched
+                .submit(
+                    shard,
+                    cmd_input(
+                        InputSource(1),
+                        100 + (y + 60) as u64,
+                        Tick(1),
+                        messaging::SimCommand::SetBlock {
+                            pos: types::BlockPos::new(x0, y, 64),
+                            block: voxel::builtin::AIR,
+                        },
+                    ),
+                )
+                .expect("收件箱未满");
+        }
+        sched.tick();
+        // 屏障后:恰 1 条盖章输入 = 6 格复合体(seq = 1)。
+        assert_eq!(sched.pending_emergent_spawns.len(), 1);
+        let (_spawn_dest, spawn_entity, spawn_state, spawn_desc) = {
+            let (dest, input) = &sched.pending_emergent_spawns[0];
+            let InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity,
+                state,
+                desc,
+            }) = &input.payload
+            else {
+                panic!("应为 SpawnDynamic:实际 {input:?}");
+            };
+            assert_eq!(*dest, shard);
+            assert_eq!(input.apply_at, Tick(2), "N+1 生效(拆柱在拍 1 执行)");
+            assert_eq!(*entity, EntityId::from_parts(types::EMERGENT_ORIGIN, 1));
+            (*dest, *entity, *state, desc.clone())
+        };
+        {
+            let origin = types::BlockPos::new(x0 + 2, -55, 64);
+            assert_eq!(
+                spawn_state.translation,
+                types::glam::Vec3::new(62.5, -54.5, 64.5),
+                "平移 = 原点格中心"
+            );
+            assert_eq!(
+                spawn_state.rotation,
+                types::glam::Quat::IDENTITY,
+                "单位旋转"
+            );
+            assert_eq!(spawn_state.linvel, types::glam::Vec3::ZERO, "零初速");
+            assert_eq!(spawn_state.angvel, types::glam::Vec3::ZERO);
+            let shape = spawn_desc.shape().expect("复合体描述带形状");
+            let cells = shape.cells();
+            assert_eq!(cells.len(), 6, "全格在列");
+            assert_eq!(
+                cells[0].offset,
+                [x0 - origin.x, -55 - origin.y, 64 - origin.z],
+                "首格偏移 = 段首格 − 原点"
+            );
+            let offsets: Vec<[i32; 3]> = cells.iter().map(|c| c.offset).collect();
+            let mut sorted = offsets.clone();
+            sorted.sort();
+            assert_eq!(offsets, sorted, "canonical(偏移升序)");
+            assert!(cells.iter().all(|c| c.block == dirt), "方块 dirt");
+        }
+        // 生成请求进快照:待生效输入随 SchedulerSnapshot 走。
+        let snap = sched.snapshot_state();
+        assert_eq!(snap.pending_emergent_spawns.len(), 1);
+        assert_eq!(
+            snap.pending_emergent_spawns[0].1.payload,
+            {
+                let (_dest, input) = &sched.pending_emergent_spawns[0];
+                input.payload.clone()
+            },
+            "快照携带盖章输入"
+        );
+        drop(snap);
+        // 下一拍(生成拍):实体出现,描述 = 盖章时的描述。
+        sched.tick();
+        let emergent: Vec<_> = sched
+            .entity_states(shard)
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == types::EMERGENT_ORIGIN)
+            .collect();
+        assert_eq!(emergent.len(), 1, "N+1 只生成复合体 1 个实体");
+        assert_eq!(emergent[0].0, spawn_entity);
         sched.shutdown();
     }
 

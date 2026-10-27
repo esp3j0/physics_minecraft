@@ -2067,7 +2067,6 @@ mod unit04 {
     ///
     /// 会变红的实现:仍逐格生成 6 个碎块;原点不按包围盒中心取整;复合体的描述没带形状;遥测没接线。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c4_door_lintel_falls_as_one_compound() {
         let mut s = session(64, 6, 1024);
         let mut log = CommandLog::new();
@@ -2107,7 +2106,6 @@ mod unit04 {
     ///
     /// 会变红的实现:切块网格按 F 自身的包围盒对齐;2 格的段被当成单格碎块;ID 不按最小格排序。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c4_bridge_splits_into_grid_segments() {
         let mut s = session(64, 6, 1024);
         let mut log = CommandLog::new();
@@ -2142,7 +2140,6 @@ mod unit04 {
     ///
     /// 会变红的实现:沙子并进了复合体;单格与复合体分开编号(先发完一种再发另一种)。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c4_sand_stays_single_and_ids_interleave() {
         let mut s = session(64, 6, 1024);
         let mut log = CommandLog::new();
@@ -2175,7 +2172,6 @@ mod unit04 {
     ///
     /// 会变红的实现:段被拆开转换;名额不足时跳过大段先转后面的小段;格数上限没生效。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c4_segment_quota_is_atomic() {
         let air_xs = |s: &Session| -> Vec<i32> {
             (60..=79)
@@ -2215,7 +2211,6 @@ mod unit04 {
     ///
     /// 会变红的实现:复合体生成请求不进调度器快照(回放线没有这个实体);回放时形状丢失。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c12_compound_request_survives_snapshot() {
         let mut a = session(64, 6, 1024);
         let mut log = CommandLog::new();
@@ -2256,7 +2251,6 @@ mod unit04 {
     ///
     /// 会变红的实现:仍按实体个数计(3 个 < 10,不淘汰);淘汰顺序不是由远到近;多淘汰了。
     #[test]
-    #[ignore = "REQ-010 单元 04 待实施方解除"]
     fn acc_c11_awake_budget_counts_cells() {
         let ctl = ActivationController::new(ActivationConfig {
             max_awake_dynamic: 10,

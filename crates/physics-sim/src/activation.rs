@@ -281,7 +281,10 @@ impl ActivationController {
         tickets: &[crate::tickets::TicketView],
         loaded: &[ChunkPos],
         collider_loaded: &[ChunkPos],
-        entities: &[(EntityId, Vec3, bool, bool, bool)],
+        // (实体, 位置, 已冻结, 是否常驻(actor), 是否被承载, 格数)
+        // 格数(REQ-010 §5.5 第 5 条):醒体预算按格数计——单格 1、复合体 =
+        // 格数;超预算淘汰按格数之和比较(调用方从描述取,单格传 1)。
+        entities: &[(EntityId, Vec3, bool, bool, bool, u32)],
         now: Tick,
         region: ChunkRegion,
         blocked: &BTreeSet<ChunkPos>,
@@ -547,7 +550,8 @@ impl ActivationController {
         // 占区域票;每中心带自己的半径;无中心 = 距离 +∞,全体冻结)----
         let mut wake: Vec<(EntityId, f32)> = Vec::new();
         let mut freeze: Vec<(EntityId, f32)> = Vec::new();
-        let mut awake: Vec<(EntityId, f32)> = Vec::new();
+        // 醒体预算按格数(REQ-010 §5.5 第 5 条):(实体, 超预算排序距离, 格数)。
+        let mut awake: Vec<(EntityId, f32, u32)> = Vec::new();
         // 超预算淘汰距离中心(04a 细则 7):到最近**占区域票锚点**(观察者 +
         // 区域票,不限 WakeSpec)——预算排序是成本面不是唤醒面,仅装载的
         // 区域票锚点同样参与"谁离服务区最远"的判定。
@@ -555,7 +559,7 @@ impl ActivationController {
         // 判定口径:任一中心 ≤ 该中心 load → 进;所有中心 > 各自 unload → 出;
         // 混合滞回带(多中心带宽重叠才出现)保持。仅观察者票时
         // (load/unload = cfg.awake_* 同源)与任务 01 数值等价。
-        for &(id, pos, frozen, actor, carried) in entities {
+        for &(id, pos, frozen, actor, carried, cells) in entities {
             let dist =
                 nearest_observer_distance(&wake_centers, pos, false).unwrap_or(f32::INFINITY);
             // 超预算排序距离(独立于滞回距离;无占区域票 → +∞)。
@@ -585,7 +589,7 @@ impl ActivationController {
             };
             if !frozen {
                 // 超预算排序距离 = 到最近占区域票锚点(细则 7;非滞回距离)。
-                awake.push((id, budget_dist));
+                awake.push((id, budget_dist, cells));
             }
             if wake_it && self.entity_cooled(&id, now) {
                 wake.push((id, dist));
@@ -593,27 +597,41 @@ impl ActivationController {
                 freeze.push((id, dist));
             }
         }
-        // 超预算(§9.4):当前醒数超限 → 距离降序立即冻结超出者,不受冷却。
-        // 溢出计数 = 醒数 − 预算 − **本拍已被滞回决策冻结的醒体数**(决策即簿记:
-        // 这些名额已被占,plan 落实后醒数即达标)——否则「近处全体唤醒」后同拍
-        // 滞回淘汰最远者时,会把距离序近处的醒体也多余冻结(超出 §9.4「冻结
-        // 超出者」最小集)。pool 仍排除已决策者(避免重复);条目仍记簿记
-        // (唤醒须等冷却)。扣减后本拍不再需要额外淘汰 → 不产出。
-        if awake.len() > self.cfg.max_awake_dynamic {
+        // 超预算(§9.4;REQ-010 §5.5 第 5 条起按**格数**口径):醒着实体的格数
+        // 之和超限 → 距离降序立即冻结超出者,不受冷却。溢出计数 = 格数和 − 预算
+        // − **本拍已被滞回决策冻结的醒体格数**(决策即簿记:这些名额已被占,
+        // plan 落实后醒数即达标)——否则「近处全体唤醒」后同拍滞回淘汰最远者时,
+        // 会把距离序近处的醒体也多余冻结(超出 §9.4「冻结超出者」最小集)。
+        // pool 仍排除已决策者(避免重复);条目仍记簿记(唤醒须等冷却)。
+        // 扣减后本拍不再需要额外淘汰 → 不产出。
+        let awake_cells: u64 = awake.iter().map(|(_, _, cells)| u64::from(*cells)).sum();
+        if awake_cells > self.cfg.max_awake_dynamic as u64 {
             let decided: BTreeSet<EntityId> = freeze.iter().map(|(id, _)| *id).collect();
-            let already_frozen = freeze.len();
-            let overflow = awake
-                .len()
-                .saturating_sub(already_frozen)
-                .saturating_sub(self.cfg.max_awake_dynamic);
+            let cells_by_id: BTreeMap<EntityId, u64> = entities
+                .iter()
+                .map(|(id, _, _, _, _, c)| (*id, u64::from(*c)))
+                .collect();
+            let frozen_cells: u64 = freeze
+                .iter()
+                .map(|(id, _)| cells_by_id.get(id).copied().unwrap_or(1))
+                .sum();
+            let overflow = awake_cells
+                .saturating_sub(frozen_cells)
+                .saturating_sub(self.cfg.max_awake_dynamic as u64);
             if overflow > 0 {
-                let mut pool: Vec<(EntityId, f32)> = awake
+                let mut pool: Vec<(EntityId, f32, u64)> = awake
                     .iter()
-                    .copied()
-                    .filter(|(id, _)| !decided.contains(id))
+                    .filter(|(id, _, _)| !decided.contains(id))
+                    .map(|(id, dist, cells)| (*id, *dist, u64::from(*cells)))
                     .collect();
-                pool.sort_by(cmp_entity_desc);
-                for (id, dist) in pool.into_iter().take(overflow) {
+                // 距离降序,同距按 EntityId 升序(确定性;§5.5 第 5 条口径)。
+                pool.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                let mut over = overflow;
+                for (id, dist, cells) in pool {
+                    if over == 0 {
+                        break;
+                    }
+                    over = over.saturating_sub(cells);
                     d.over_budget_freeze.push(id);
                     freeze.push((id, dist));
                 }
@@ -632,38 +650,52 @@ impl ActivationController {
         d
     }
 
-    /// 预算强制(§9.12 命令唤醒路径):醒数超限时按距离降序给出应冻结者。
-    /// 独立于 plan 的冷却(显式命令触及 = 立即生效)。
-    /// 醒体预算按格数计(REQ-010 §5.5 第 5 条):`awake` 的第三项是实体格数(单格 1、复合体 = 格数);
-    /// 格数之和超过 `max_awake_dynamic` 时,按到最近观察者距离降序(同距按 `EntityId` 升序)淘汰,直到格数之和
-    /// 不超过上限;返回被淘汰者(淘汰顺序)。`plan` 与命令唤醒后的强制都按此口径。
-    ///
-    /// **总架构师接口桩(REQ-010 单元 04)**:由实施方实现,并让 `plan` 与 `enforce_budget` 的调用方改用格数口径。
+    /// 预算强制(§9.12 命令唤醒路径;REQ-010 §5.5 第 5 条起按**格数**口径):
+    /// 醒着实体的格数之和超过 `max_awake_dynamic` 时,按到最近观察者距离降序
+    /// (同距按 `EntityId` 升序)淘汰,直到格数之和不超过上限;返回被淘汰者
+    /// (淘汰顺序)。`awake` 的第三项是实体格数(单格 1、复合体 = 格数);
+    /// `plan` 的超预算淘汰与命令唤醒后的强制都按此口径。
     pub fn enforce_budget_cells(
         &self,
         observers: &[Vec3],
         awake: &[(EntityId, Vec3, u32)],
     ) -> Vec<EntityId> {
-        let _ = (observers, awake);
-        Vec::new()
-    }
-
-    pub fn enforce_budget(&self, observers: &[Vec3], awake: &[(EntityId, Vec3)]) -> Vec<EntityId> {
-        if awake.len() <= self.cfg.max_awake_dynamic {
+        let total: u64 = awake.iter().map(|(_, _, cells)| u64::from(*cells)).sum();
+        let budget = self.cfg.max_awake_dynamic as u64;
+        if total <= budget {
             return Vec::new();
         }
-        let overflow = awake.len() - self.cfg.max_awake_dynamic;
-        let mut pool: Vec<(EntityId, f32)> = awake
+        let mut pool: Vec<(EntityId, f32, u64)> = awake
             .iter()
-            .map(|(id, pos)| {
+            .map(|(id, pos, cells)| {
                 (
                     *id,
                     nearest_observer_distance(observers, *pos, false).unwrap_or(f32::INFINITY),
+                    u64::from(*cells),
                 )
             })
             .collect();
-        pool.sort_by(cmp_entity_desc);
-        pool.into_iter().take(overflow).map(|(id, _)| id).collect()
+        // 距离降序,同距按 EntityId 升序(确定性)。
+        pool.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let mut over = total - budget;
+        let mut evicted = Vec::new();
+        for (id, _, cells) in pool {
+            if over == 0 {
+                break;
+            }
+            over = over.saturating_sub(cells);
+            evicted.push(id);
+        }
+        evicted
+    }
+
+    /// 预算强制(格数口径,单格实体 = 1 格;委托 [`ActivationController::
+    /// enforce_budget_cells`],与复合体同一比较器——保留供既有调用方与
+    /// 单元测试逐位不变)。
+    pub fn enforce_budget(&self, observers: &[Vec3], awake: &[(EntityId, Vec3)]) -> Vec<EntityId> {
+        let cells: Vec<(EntityId, Vec3, u32)> =
+            awake.iter().map(|(id, pos)| (*id, *pos, 1)).collect();
+        self.enforce_budget_cells(observers, &cells)
     }
 
     /// chunk 冷却是否已过(首见视为可换)。
@@ -843,8 +875,8 @@ mod tests {
             &[],
             &[],
             &[
-                (eid(1), Vec3::new(33.0, 0.0, 8.0), false, true, false),
-                (eid(2), Vec3::new(33.0, 0.0, 8.0), true, true, false),
+                (eid(1), Vec3::new(33.0, 0.0, 8.0), false, true, false, 1),
+                (eid(2), Vec3::new(33.0, 0.0, 8.0), true, true, false, 1),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1078,9 +1110,9 @@ mod tests {
             &[],
             &[],
             &[
-                (e1, Vec3::new(5.0, 0.0, 0.0), true, true, false),
-                (e2, Vec3::new(15.0, 0.0, 0.0), true, true, false),
-                (e3, Vec3::new(20.0, 0.0, 0.0), true, true, false),
+                (e1, Vec3::new(5.0, 0.0, 0.0), true, true, false, 1),
+                (e2, Vec3::new(15.0, 0.0, 0.0), true, true, false, 1),
+                (e3, Vec3::new(20.0, 0.0, 0.0), true, true, false, 1),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1095,9 +1127,9 @@ mod tests {
             &[],
             &[],
             &[
-                (e1, Vec3::new(5.0, 0.0, 0.0), false, true, false),
-                (e2, Vec3::new(15.0, 0.0, 0.0), false, true, false),
-                (e3, Vec3::new(20.0, 0.0, 0.0), false, true, false),
+                (e1, Vec3::new(5.0, 0.0, 0.0), false, true, false, 1),
+                (e2, Vec3::new(15.0, 0.0, 0.0), false, true, false, 1),
+                (e3, Vec3::new(20.0, 0.0, 0.0), false, true, false, 1),
             ],
             Tick(1),
             wide_region(),
@@ -1129,8 +1161,8 @@ mod tests {
             &[],
             &[],
             &[
-                (near, Vec3::new(5.0, 0.0, 0.0), false, true, false),
-                (far, Vec3::new(100.0, 0.0, 0.0), false, true, false),
+                (near, Vec3::new(5.0, 0.0, 0.0), false, true, false, 1),
+                (far, Vec3::new(100.0, 0.0, 0.0), false, true, false, 1),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1154,7 +1186,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(near, Vec3::new(5.0, 0.0, 0.0), false, true, false)],
+            &[(near, Vec3::new(5.0, 0.0, 0.0), false, true, false, 1)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1177,9 +1209,9 @@ mod tests {
             &[],
             &[],
             &[
-                (near, Vec3::new(5.0, 0.0, 0.0), false, true, false),
-                (eid(3), Vec3::new(15.0, 0.0, 0.0), false, true, false),
-                (eid(4), Vec3::new(20.0, 0.0, 0.0), false, true, false),
+                (near, Vec3::new(5.0, 0.0, 0.0), false, true, false, 1),
+                (eid(3), Vec3::new(15.0, 0.0, 0.0), false, true, false, 1),
+                (eid(4), Vec3::new(20.0, 0.0, 0.0), false, true, false, 1),
             ],
             Tick::ZERO,
             wide_region(),
@@ -1205,7 +1237,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true, true, false)],
+            &[(eid(3), Vec3::new(24.0, 0.0, 0.0), true, true, false, 1)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1217,7 +1249,7 @@ mod tests {
             &obs_tickets(&obs),
             &[],
             &[],
-            &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false, true, false)],
+            &[(eid(4), Vec3::new(32.0, 0.0, 0.0), false, true, false, 1)],
             Tick::ZERO,
             wide_region(),
             &std::collections::BTreeSet::new(),
@@ -1229,8 +1261,8 @@ mod tests {
         // 完整滞回弧。
         let mut c = ActivationController::new(ActivationConfig::default());
         let e = eid(1);
-        let near = (e, Vec3::new(20.0, 0.0, 0.0), true, true, false);
-        let far = (e, Vec3::new(40.0, 0.0, 0.0), false, true, false);
+        let near = (e, Vec3::new(20.0, 0.0, 0.0), true, true, false, 1);
+        let far = (e, Vec3::new(40.0, 0.0, 0.0), false, true, false, 1);
         let d = c.plan(
             &obs_tickets(&obs),
             &[],
@@ -1357,8 +1389,8 @@ mod tests {
             ChunkPos::new(3, 1),
         ];
         let ents = [
-            (e1, Vec3::new(8.0, 0.0, 8.0), true, true, false), // 冻、距 ≈11.3 ≤ 24 → 唤
-            (e2, Vec3::new(100.0, 0.0, 0.0), false, true, false), // 醒、距 100 > 32 → 冻
+            (e1, Vec3::new(8.0, 0.0, 8.0), true, true, false, 1), // 冻、距 ≈11.3 ≤ 24 → 唤
+            (e2, Vec3::new(100.0, 0.0, 0.0), false, true, false, 1), // 醒、距 100 > 32 → 冻
         ];
         let mut c = ActivationController::new(ActivationConfig::default());
         // REQ-007 任务 01:plan 需要 ①/② 两档状态输入;调用方执行决策后把
@@ -1511,6 +1543,207 @@ mod tests {
         assert!(
             c.enforce_budget(&[Vec3::ZERO], &awake[..2]).is_empty(),
             "预算内 → 不淘汰"
+        );
+    }
+
+    // ==== REQ-010 单元 04(§5.5 第 5 条:醒体预算按格数)====
+
+    /// `enforce_budget_cells` 纯函数分支:格数和 ≤ 上限 → 空;超限按距离降序
+    /// 逐个淘汰到 ≤ 上限(淘汰可以是复合体多格一击出局多个名额);同距按
+    /// `EntityId` 升序;单格委托 `enforce_budget` 与 cells=1 同结果。
+    ///
+    /// 变红:仍按实体个数计(3 个 ≤ 10 不淘汰);由近到远淘汰;同距序错。
+    #[test]
+    fn enforce_budget_cells_compares_cell_sums_and_evicts_farthest() {
+        let c = ActivationController::new(ActivationConfig {
+            max_awake_dynamic: 10,
+            ..ActivationConfig::default()
+        });
+        let (a, b, d) = (eid(1), eid(2), eid(4));
+        // 三个单格 = 3 格 ≤ 10 → 不淘汰(实体个数口径会误判?不,3 < 10 同样
+        // 不淘汰;真正的判别在下方格和超限)。
+        let single = [
+            (a, Vec3::new(5.0, 0.0, 0.0), 1),
+            (b, Vec3::new(6.0, 0.0, 0.0), 1),
+            (d, Vec3::new(7.0, 0.0, 0.0), 1),
+        ];
+        assert!(c.enforce_budget_cells(&[Vec3::ZERO], &single).is_empty());
+        // 6 + 6 = 12 > 10 → 只淘汰较远者(按个数口径 2 ≤ 10 不淘汰)。
+        let pair = [
+            (a, Vec3::new(5.0, 0.0, 0.0), 6),
+            (b, Vec3::new(50.0, 0.0, 0.0), 6),
+        ];
+        assert_eq!(
+            c.enforce_budget_cells(&[Vec3::ZERO], &pair),
+            vec![b],
+            "格数和 12 > 10:淘汰较远者"
+        );
+        // 三个 6 格 = 18 > 10 → 由远到近淘汰到 ≤ 10:先 50.0(6,余 2)、
+        // 再 20.0(6,余 0)停;近者 5.0 保住。
+        let three = [
+            (a, Vec3::new(5.0, 0.0, 0.0), 6),
+            (b, Vec3::new(50.0, 0.0, 0.0), 6),
+            (d, Vec3::new(20.0, 0.0, 0.0), 6),
+        ];
+        assert_eq!(
+            c.enforce_budget_cells(&[Vec3::ZERO], &three),
+            vec![b, d],
+            "由远到近逐个淘汰"
+        );
+        // 同距(都到 1e7 之外):ID 升序淘汰。
+        let tied = [
+            (eid(9), Vec3::new(30.0, 0.0, 0.0), 6),
+            (eid(2), Vec3::new(-30.0, 0.0, 0.0), 6),
+        ];
+        assert_eq!(
+            c.enforce_budget_cells(&[Vec3::ZERO], &tied),
+            vec![eid(2)],
+            "同距按 EntityId 升序"
+        );
+        // 单格委托:同一比较器(cells = 1)与按个数同结果。
+        let four = [
+            (eid(1), Vec3::new(5.0, 0.0, 0.0)),
+            (eid(2), Vec3::new(10.0, 0.0, 0.0)),
+            (eid(3), Vec3::new(15.0, 0.0, 0.0)),
+            (eid(4), Vec3::new(20.0, 0.0, 0.0)),
+        ];
+        assert_eq!(
+            c.enforce_budget(&[Vec3::ZERO], &four[..3]),
+            c.enforce_budget_cells(
+                &[Vec3::ZERO],
+                &four[..3]
+                    .iter()
+                    .map(|(id, p)| (*id, *p, 1))
+                    .collect::<Vec<_>>()
+            ),
+            "委托同一比较器(格数恒 1)"
+        );
+    }
+
+    /// plan 的超预算淘汰按格数口径(§5.5 第 5 条):上限 10,两个 6 格复合体
+    /// 醒着(格数和 12 > 10)→ 较远者立即冻结(按个数口径 2 ≤ 10 不淘汰);
+    /// 6 格 + 4 个单格 = 10 格恰不淘汰。
+    ///
+    /// 变红:plan 仍按个数比较(12 格 2 个 ≤ 10 不淘汰);淘汰序不是距离降序。
+    #[test]
+    fn plan_over_budget_evicts_by_cell_count() {
+        let obs = [Vec3::ZERO];
+        let mut c = ActivationController::new(ActivationConfig {
+            max_awake_dynamic: 10,
+            ..ActivationConfig::default()
+        });
+        let (a, b) = (eid(1), eid(2));
+        // 拍 0:两只冻结、全在唤醒半径 → 全醒(簿记 flip@0)。近者 6 格、远者 6 格。
+        let d0 = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[
+                (a, Vec3::new(5.0, 0.0, 0.0), true, true, false, 6),
+                (b, Vec3::new(20.0, 0.0, 0.0), true, true, false, 6),
+            ],
+            Tick::ZERO,
+            wide_region(),
+            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(d0.entities_to_wake, vec![a, b]);
+        assert!(d0.over_budget_freeze.is_empty(), "拍 0 从冻结起,不超预算");
+        // 拍 1:12 格 > 10 → 淘汰远者 b(距离降序);按实体个数是 2 ≤ 10 不淘汰。
+        let d1 = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[
+                (a, Vec3::new(5.0, 0.0, 0.0), false, true, false, 6),
+                (b, Vec3::new(20.0, 0.0, 0.0), false, true, false, 6),
+            ],
+            Tick(1),
+            wide_region(),
+            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(d1.over_budget_freeze, vec![b], "格数和 12 > 10:淘汰远者");
+        assert_eq!(d1.entities_to_freeze, vec![b]);
+        // 边界:6 + 4×1 = 10 恰不淘汰(逐格扣减到 ≤ 上限即停)。
+        let mut c2 = ActivationController::new(ActivationConfig {
+            max_awake_dynamic: 10,
+            ..ActivationConfig::default()
+        });
+        let d0 = c2.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[
+                (a, Vec3::new(5.0, 0.0, 0.0), true, true, false, 6),
+                (b, Vec3::new(20.0, 0.0, 0.0), true, true, false, 4),
+            ],
+            Tick::ZERO,
+            wide_region(),
+            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(d0.entities_to_wake, vec![a, b]);
+        let d1 = c2.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[
+                (a, Vec3::new(5.0, 0.0, 0.0), false, true, false, 6),
+                (b, Vec3::new(20.0, 0.0, 0.0), false, true, false, 4),
+            ],
+            Tick(1),
+            wide_region(),
+            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(
+            d1.over_budget_freeze.is_empty() && d1.entities_to_freeze.is_empty(),
+            "10 格 ≤ 10:不淘汰"
+        );
+    }
+
+    /// plan 的超预算溢出要扣**本拍已被滞回决策冻结的醒体格数**(决策即簿记;
+    /// §5.5 第 5 条起按格数):a、b(6+4 格)保持醒,e(6 格)同拍被滞回冻结
+    /// ——醒 16 格 > 10,但扣掉 e 的 6 格 = 10 ≤ 10 不淘汰;变异"不扣已冻结
+    /// 格数"会多淘汰远者 b(16 − 0 − 10 = 6 → 逐个淘汰 b、a)。
+    ///
+    /// 变红:frozen_cells 漏扣(多淘汰 b);扣减按实体个数而非格数(单格场景
+    /// 等价,复合体场景才分叉)。
+    #[test]
+    fn plan_over_budget_deducts_same_tick_hysteresis_frozen_cells() {
+        let obs = [Vec3::ZERO];
+        let mut c = ActivationController::new(ActivationConfig {
+            max_awake_dynamic: 10,
+            ..ActivationConfig::default()
+        });
+        let (a, b, e) = (eid(1), eid(2), eid(3));
+        // 单拍:a、b 在 load(24)内醒着(无决策);e 醒着出 unload(50 > 32)
+        // → 滞回冻结条目(e 无翻转簿记,冷却放行)。
+        let d = c.plan(
+            &obs_tickets(&obs),
+            &[],
+            &[],
+            &[
+                (a, Vec3::new(5.0, 0.0, 0.0), false, true, false, 6),
+                (b, Vec3::new(20.0, 0.0, 0.0), false, true, false, 4),
+                (e, Vec3::new(50.0, 0.0, 0.0), false, true, false, 6),
+            ],
+            Tick::ZERO,
+            wide_region(),
+            &std::collections::BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert!(d.entities_to_wake.is_empty());
+        assert_eq!(d.entities_to_freeze, vec![e], "e 出区:滞回冻结");
+        assert!(
+            d.over_budget_freeze.is_empty(),
+            "醒 16 格 − 同拍已决策冻结 6 格 = 10 ≤ 10:不淘汰"
         );
     }
 
