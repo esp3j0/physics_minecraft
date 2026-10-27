@@ -1607,3 +1607,321 @@ mod unit02 {
         assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 7);
     }
 }
+
+/// 单元 03a:复合实体形状与刚体(AC-C4 形状部分、AC-C5 运动部分、AC-C10 迁移、AC-C12;REQ-010 §5.4,修订 3)。
+// 桩阶段 `EntityDesc` 仍是 `Copy`;单元 03a 实现后不再 `Copy`,这里的 `.clone()` 才是必需的。
+#[allow(clippy::clone_on_copy)]
+mod unit03a {
+    use messaging::InputSource;
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig, SolidifyConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EntityDesc, EntityId, EntityState,
+        ShapeCell, ShapeError, ShardId, ShardPos, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+
+    fn shard(x: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, 0))
+    }
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn cell(offset: [i32; 3], block: BlockId) -> ShapeCell {
+        ShapeCell { offset, block }
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 关闭破坏与凝固的会话(复合体的凝固由单元 05 接入;这里只看刚体运动)。
+    fn session(shards: &[i32], cx: std::ops::RangeInclusive<i32>) -> Session {
+        let mut s = Session::new(cfg());
+        for &x in shards {
+            let mut c = ShardSimConfig::new(shard(x));
+            c.destruction = DestructionConfig {
+                enabled: false,
+                ..DestructionConfig::default()
+            };
+            c.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            let mut sim = ShardSim::new(c, registry());
+            for cxx in cx.clone() {
+                for z in 2..=5 {
+                    let cp = ChunkPos::new(cxx, z);
+                    sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+                }
+            }
+            s.register(sim);
+        }
+        s
+    }
+
+    /// 6 格石梁:世界格 x = x0..x0+6、y、z,原点按 §5.1 = (x0 + 2, y, z)。返回 (原点格, 描述)。
+    fn beam(x0: i32, y: i32, z: i32) -> (BlockPos, EntityDesc) {
+        let cells: Vec<(BlockPos, BlockId)> = (x0..x0 + 6).map(|x| (p(x, y, z), STONE)).collect();
+        let origin = p(x0 + 2, y, z);
+        let shape = CompoundShape::from_world(origin, &cells).expect("6 格石梁");
+        (origin, EntityDesc::compound(DEBRIS_HALF_SIZE, shape))
+    }
+
+    fn spawn(
+        s: &mut Session,
+        log: &mut CommandLog,
+        sh: ShardId,
+        id: EntityId,
+        origin: BlockPos,
+        desc: &EntityDesc,
+        (linvel, angvel): (Vec3, Vec3),
+    ) {
+        let entry = s
+            .spawn_owned(
+                sh,
+                id,
+                EntityState {
+                    translation: Vec3::new(
+                        origin.x as f32 + 0.5,
+                        origin.y as f32 + 0.5,
+                        origin.z as f32 + 0.5,
+                    ),
+                    rotation: Quat::IDENTITY,
+                    linvel,
+                    angvel,
+                },
+                desc.clone(),
+                InputSource(7),
+            )
+            .expect("spawn");
+        log.append(entry);
+    }
+
+    /// AC-C4 形状(§5.4 第 1–2 条):按偏移升序规范化;偏移重复、少于 2 格报错;`from_world` 由原点算偏移;
+    /// 包络半径 = 最远偏移长度 + half·√3;复合体描述带形状、包络半径取形状的;单格描述没有形状、包络半径不变。
+    ///
+    /// 会变红的实现:不排序(同一形状两种写法不相等,快照与回放对不上);重复偏移被静默合并;
+    /// 包络半径漏了 half·√3;单格描述的包络半径变了(既有足迹与唤醒全部偏移)。
+    #[test]
+    #[ignore = "REQ-010 单元 03a 待实施方解除"]
+    fn acc_c4_shape_canonical_and_radius() {
+        let shape = CompoundShape::new(vec![
+            cell([3, 0, 0], STONE),
+            cell([0, 0, 0], DIRT),
+            cell([1, 0, 0], STONE),
+        ])
+        .expect("3 格");
+        assert_eq!(
+            shape.cells(),
+            &[
+                cell([0, 0, 0], DIRT),
+                cell([1, 0, 0], STONE),
+                cell([3, 0, 0], STONE)
+            ]
+        );
+        let again = CompoundShape::new(vec![
+            cell([1, 0, 0], STONE),
+            cell([3, 0, 0], STONE),
+            cell([0, 0, 0], DIRT),
+        ])
+        .expect("3 格");
+        assert_eq!(shape, again, "与输入顺序无关");
+        assert_eq!(
+            CompoundShape::new(vec![cell([1, 0, 0], STONE), cell([1, 0, 0], DIRT)]),
+            Err(ShapeError::DuplicateOffset([1, 0, 0]))
+        );
+        assert_eq!(
+            CompoundShape::new(vec![cell([0, 0, 0], STONE)]),
+            Err(ShapeError::TooFewCells)
+        );
+        assert_eq!(CompoundShape::new(Vec::new()), Err(ShapeError::TooFewCells));
+
+        let (origin, desc) = beam(0, 5, 0);
+        assert_eq!(origin, p(2, 5, 0));
+        let offsets: Vec<[i32; 3]> = desc
+            .shape()
+            .expect("复合体描述带形状")
+            .cells()
+            .iter()
+            .map(|c| c.offset)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![
+                [-2, 0, 0],
+                [-1, 0, 0],
+                [0, 0, 0],
+                [1, 0, 0],
+                [2, 0, 0],
+                [3, 0, 0]
+            ]
+        );
+        let want = 3.0 + DEBRIS_HALF_SIZE * 3f32.sqrt();
+        let shape = desc.shape().expect("形状");
+        assert!((shape.envelope_radius(DEBRIS_HALF_SIZE) - want).abs() < 1e-5);
+        assert!(
+            (desc.envelope_radius() - want).abs() < 1e-5,
+            "复合体描述的包络半径取形状的"
+        );
+        assert_eq!(desc.half_size, DEBRIS_HALF_SIZE);
+        assert_eq!(desc.clone(), desc);
+
+        let single = EntityDesc::default();
+        assert!(single.shape().is_none(), "单格实体没有形状");
+        assert!(
+            (single.envelope_radius() - 0.5 * 3f32.sqrt()).abs() < 1e-6,
+            "单格包络半径不变"
+        );
+    }
+
+    /// AC-C5 逐格碰撞体(§5.4 第 3 条):地面挖一条 4 格宽、1 格深的沟(x 61..=64),6 格石梁(x 60..=65)从 2 m 高
+    /// 平落——两端的格搭在沟沿上,整根梁停在地面高度(格中心 y ≈ −59.475:地表薄片跨在 y = −60 的面上,顶面 −59.925)、不转、不掉进沟里;描述(含形状)保持不变。
+    ///
+    /// 会变红的实现:复合体只建了原点那一个碰撞体(原点在沟正上方,整根梁掉进沟里,y ≈ −60.475);
+    /// 偏移没随刚体旋转;迁移/重建时丢了形状。
+    #[test]
+    #[ignore = "REQ-010 单元 03a 待实施方解除"]
+    fn acc_c5_compound_bridges_trench() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6);
+        let mut log = CommandLog::new();
+        for x in 61..=64 {
+            for z in 60..=68 {
+                for entry in s.set_block(sh, p(x, -61, z), builtin::AIR).expect("挖沟") {
+                    log.append(entry);
+                }
+            }
+        }
+        s.tick();
+        let id = EntityId::from_parts(0, 1);
+        let (origin, desc) = beam(60, -58, 64);
+        spawn(
+            &mut s,
+            &mut log,
+            sh,
+            id,
+            origin,
+            &desc,
+            (Vec3::ZERO, Vec3::ZERO),
+        );
+        for _ in 0..150 {
+            s.tick();
+        }
+        let state = s.entity_state(sh, id).expect("梁还是实体(本单元不凝固)");
+        assert!(
+            (state.translation.y - (-59.475)).abs() < 0.06,
+            "搭在沟沿上:原点 y ≈ −59.475,实际 {}",
+            state.translation.y
+        );
+        assert!(
+            (state.translation.x - 62.5).abs() < 0.1,
+            "没有横移:{}",
+            state.translation.x
+        );
+        assert!(
+            state.rotation.angle_between(Quat::IDENTITY) < 2f32.to_radians(),
+            "没有转动:{:?}",
+            state.rotation
+        );
+        assert_eq!(s.entity_desc(sh, id), Some(desc), "描述(含形状)不变");
+        s.shutdown();
+    }
+
+    /// AC-C10 迁移(§5.4 第 6 条):6 格石梁从 x = 118.5 以 8 m/s 横飞、边飞边落,原点越过 x = 128 后归分片 (1,0);
+    /// 目的分片里的描述(含形状)与出生时相同,源分片不再持有它。
+    ///
+    /// 会变红的实现:迁移信封丢了形状(目的分片重建成单格);按单格包络判定迁移余量导致提前或滞后迁移出错。
+    #[test]
+    #[ignore = "REQ-010 单元 03a 待实施方解除"]
+    fn acc_c10_compound_migrates_with_shape() {
+        let mut s = session(&[0, 1], 6..=9);
+        let mut log = CommandLog::new();
+        let id = EntityId::from_parts(0, 1);
+        let (origin, desc) = beam(116, -40, 64);
+        spawn(
+            &mut s,
+            &mut log,
+            shard(0),
+            id,
+            origin,
+            &desc,
+            (Vec3::new(8.0, 0.0, 0.0), Vec3::ZERO),
+        );
+        for _ in 0..100 {
+            s.tick();
+        }
+        let state = s.entity_state(shard(1), id).expect("已迁到分片 (1,0)");
+        assert!(
+            state.translation.x > 128.0,
+            "原点越过边界:{}",
+            state.translation.x
+        );
+        assert_eq!(
+            s.entity_desc(shard(1), id),
+            Some(desc),
+            "目的分片的描述带形状"
+        );
+        assert!(s.entity_state(shard(0), id).is_none(), "源分片不再持有");
+        s.shutdown();
+    }
+
+    /// AC-C12 快照与回放(§5.4 第 6 条):带角速度下落中的复合体,在第 10 拍取世界快照并回放,两线再跑 60 拍,
+    /// 状态与描述逐位相同。
+    ///
+    /// 会变红的实现:实体快照不带形状(回放线重建成单格,轨迹分叉);形状的规范顺序在快照往返后变了。
+    #[test]
+    #[ignore = "REQ-010 单元 03a 待实施方解除"]
+    fn acc_c12_compound_snapshot_replay() {
+        let sh = shard(0);
+        let mut a = session(&[0], 2..=6);
+        let mut log = CommandLog::new();
+        let id = EntityId::from_parts(0, 1);
+        let (origin, desc) = beam(60, -50, 64);
+        spawn(
+            &mut a,
+            &mut log,
+            sh,
+            id,
+            origin,
+            &desc,
+            (Vec3::new(0.5, 0.0, 0.3), Vec3::new(0.4, 1.1, -0.7)),
+        );
+        for _ in 0..10 {
+            a.tick();
+        }
+        let world = a.world_snapshot();
+        let mut b = sim_api::replay::replay_world(&world, &log, cfg(), registry).expect("回放");
+        for _ in 0..60 {
+            a.tick();
+            b.tick();
+        }
+        assert_eq!(
+            a.entity_state(sh, id),
+            b.entity_state(sh, id),
+            "回放线状态逐位相同"
+        );
+        assert_eq!(b.entity_desc(sh, id), Some(desc), "回放线的描述带形状");
+        a.shutdown();
+        b.shutdown();
+    }
+}

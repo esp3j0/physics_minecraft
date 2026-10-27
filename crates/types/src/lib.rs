@@ -19,7 +19,7 @@ pub use ids::{
     BlockId, DimensionId, EMERGENT_ORIGIN, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId,
     WorldSeed,
 };
-pub use state::{EntityDesc, EntityState};
+pub use state::{CompoundShape, EntityDesc, EntityState, ShapeCell, ShapeError};
 pub use tick::Tick;
 
 /// 数学库唯一转发入口(蓝图 §2):其他 crate `use types::glam`。
