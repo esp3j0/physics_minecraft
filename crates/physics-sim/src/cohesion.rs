@@ -504,6 +504,44 @@ pub fn fracture_pieces(
         .collect()
 }
 
+/// 复合体一格在爆炸中的结果(REQ-010 §6.1 第 1 条)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CellBlast {
+    /// 完好;`impulse` = 作用在该格世界中心的冲量(`d ≥ r` 时为 `None`)。
+    Intact { impulse: Option<types::glam::Vec3> },
+    /// 粉碎(消失)。
+    Pulverize,
+    /// 脱落成单格碎块,`impulse` = `P·dir'`。
+    Detach { impulse: types::glam::Vec3 },
+}
+
+/// 爆炸对复合体的逐格求值(纯函数,REQ-010 §6.1 第 1 条):返回各格结果(形状格序)。`terrain_at` 给出地形
+/// (`None` = 未装载,穿过时不衰减)。
+///
+/// **总架构师接口桩(REQ-010 单元 07)**:由实施方实现。
+#[allow(clippy::too_many_arguments)]
+pub fn compound_blast(
+    state: &types::EntityState,
+    shape: &types::CompoundShape,
+    center: types::glam::Vec3,
+    power: f32,
+    radius: f32,
+    attenuation: f32,
+    terrain_at: &dyn Fn(BlockPos) -> Option<BlockId>,
+    registry: &dyn BlockRegistry,
+) -> Vec<CellBlast> {
+    let _ = (
+        state,
+        center,
+        power,
+        radius,
+        attenuation,
+        terrain_at,
+        registry,
+    );
+    vec![CellBlast::Intact { impulse: None }; shape.cells().len()]
+}
+
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
 /// 任一侧不是实心方块(空气、非实心、未知 ID)为 0。
 pub fn bond_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId) -> u32 {

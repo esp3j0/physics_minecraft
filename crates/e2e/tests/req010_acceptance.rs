@@ -3058,3 +3058,266 @@ mod unit06 {
         assert!(crushed_together, "8 m 那根脚下 6 格土同一拍一起脱落");
     }
 }
+
+/// 单元 07:爆炸对复合体(AC-C9;REQ-010 §6.1,修订 8)。
+#[allow(clippy::clone_on_copy)]
+mod unit07 {
+    use messaging::InputSource;
+    use physics_sim::cohesion::{CellBlast, CohesionConfig, compound_blast};
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig, SolidifyConfig};
+    use shard::SchedulerConfig;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EMERGENT_ORIGIN, EntityDesc,
+        EntityId, EntityState, ShapeCell, ShardId, ShardPos, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+    const AIR: BlockId = builtin::AIR;
+
+    fn beam(block: BlockId) -> CompoundShape {
+        CompoundShape::new(
+            (-2..=3)
+                .map(|x| ShapeCell {
+                    offset: [x, 0, 0],
+                    block,
+                })
+                .collect(),
+        )
+        .expect("6 格梁")
+    }
+
+    fn near(a: Vec3, b: Vec3) -> bool {
+        (a - b).length() < 1e-3
+    }
+
+    fn intact(fate: CellBlast) -> Option<Vec3> {
+        match fate {
+            CellBlast::Intact { impulse } => impulse,
+            other => panic!("期望完好,实得 {other:?}"),
+        }
+    }
+
+    fn detach(fate: CellBlast) -> Vec3 {
+        match fate {
+            CellBlast::Detach { impulse } => impulse,
+            other => panic!("期望脱落,实得 {other:?}"),
+        }
+    }
+
+    /// AC-C9 逐格求值(§6.1 第 1 条):6 格梁各格中心 x = 60.5..=65.5,爆心在 x = 59.0(同一高度),power 12、radius 8 →
+    /// 各格 P = 12·(1 − d/8) = 9.75、8.25、6.75、5.25、3.75、2.25:
+    /// - 石梁(R 6、k 2):前 3 格脱落(冲量 P·dir',dir' = normalize(0.4, 1, 0)),后 3 格完好、受 (P, 0, 0) 的冲量——第 2 格的 P
+    ///   没有被前面的格衰减(复合体自身的格不挡);
+    /// - 土梁(R 2):前 4 格粉碎,后 2 格脱落;
+    /// - 爆心与梁之间隔一格石头地形(x = 58):最近那格 P = 6.75 − 6 = 0.75,完好;冲量照单格公式不受遮挡;
+    /// - 爆心在 20 m 外:全部完好、没有冲量。
+    ///
+    /// 会变红的实现:复合体自身的格也参与衰减;脱落冲量没按"向上为主"的方向;冲量用了压力而不是单格公式。
+    #[test]
+    #[ignore = "REQ-010 单元 07 待实施方解除"]
+    fn acc_c9_compound_blast_rules() {
+        let reg = SimpleRegistry::builtin();
+        let state = EntityState {
+            translation: Vec3::new(62.5, 10.5, 64.5),
+            ..EntityState::default()
+        };
+        let open = |_: BlockPos| Some(AIR);
+        let center = Vec3::new(59.0, 10.5, 64.5);
+        let pressures = [9.75f32, 8.25, 6.75, 5.25, 3.75, 2.25];
+        let up = Vec3::new(0.4, 1.0, 0.0).normalize();
+
+        let stone = compound_blast(&state, &beam(STONE), center, 12.0, 8.0, 1.0, &open, &reg);
+        assert_eq!(stone.len(), 6);
+        for (i, fate) in stone.iter().enumerate() {
+            if i < 3 {
+                assert!(near(detach(*fate), up * pressures[i]), "石梁第 {i} 格脱落");
+            } else {
+                let imp = intact(*fate).expect("半径内有冲量");
+                assert!(
+                    near(imp, Vec3::new(pressures[i], 0.0, 0.0)),
+                    "石梁第 {i} 格冲量 {imp:?}"
+                );
+            }
+        }
+
+        let dirt = compound_blast(&state, &beam(DIRT), center, 12.0, 8.0, 1.0, &open, &reg);
+        for (i, fate) in dirt.iter().enumerate() {
+            if i < 4 {
+                assert_eq!(*fate, CellBlast::Pulverize, "土梁第 {i} 格粉碎");
+            } else {
+                assert!(near(detach(*fate), up * pressures[i]), "土梁第 {i} 格脱落");
+            }
+        }
+
+        let wall = |q: BlockPos| {
+            Some(if q == BlockPos::new(58, 10, 64) {
+                STONE
+            } else {
+                AIR
+            })
+        };
+        let behind = Vec3::new(57.0, 10.5, 64.5);
+        let shielded = compound_blast(&state, &beam(STONE), behind, 12.0, 8.0, 1.0, &wall, &reg);
+        let imp = intact(shielded[0]).expect("半径内有冲量");
+        assert!(
+            near(imp, Vec3::new(6.75, 0.0, 0.0)),
+            "被地形挡住的格完好,冲量照单格公式:{imp:?}"
+        );
+
+        let far = compound_blast(
+            &state,
+            &beam(STONE),
+            Vec3::new(40.0, 10.5, 64.5),
+            12.0,
+            8.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        assert!(
+            far.iter()
+                .all(|f| *f == CellBlast::Intact { impulse: None }),
+            "半径外"
+        );
+    }
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    /// 零重力会话(破坏与本 REQ 开启、凝固关闭),梁悬在 y = −40 附近,离地面 > 20 m(爆炸不碰地形)。
+    fn session() -> Session {
+        let mut c = ShardSimConfig::new(shard());
+        c.gravity = Vec3::ZERO;
+        c.destruction = DestructionConfig {
+            enabled: true,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: true,
+            ..CohesionConfig::default()
+        };
+        c.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        let mut sim = ShardSim::new(
+            c,
+            Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>,
+        );
+        for x in 2..=6 {
+            for z in 2..=5 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        s.register(sim);
+        s
+    }
+
+    fn spawn_beam(s: &mut Session) -> EntityId {
+        let id = EntityId::from_parts(0, 1);
+        s.spawn_owned(
+            shard(),
+            id,
+            EntityState {
+                translation: Vec3::new(62.5, -39.5, 64.5),
+                ..EntityState::default()
+            },
+            EntityDesc::compound(DEBRIS_HALF_SIZE, beam(STONE)),
+            InputSource(7),
+        )
+        .expect("spawn");
+        s.tick();
+        s.tick();
+        id
+    }
+
+    /// AC-C9 炸碎复合体(§6.1 第 3 条):零重力里悬着的石梁,爆心在左端外 1.5 m(power 12、radius 8)→ 原实体当拍删除、
+    /// 计移除 3 格;下一拍出现 4 个新实体:先是剩下 3 格组成的复合体(形状 −1..=1、原点在 x ≈ 64.5,带着冲量向 +x 飞,
+    /// 速度 ≈ 11.25 / 2.187 ≈ 5.1 m/s),再是 3 个脱落的单格碎块(不带形状、向上飞)。
+    ///
+    /// 会变红的实现:爆炸对复合体只在中心施一次冲量、不破坏;破坏后没有拆分;剩余部分丢了冲量;编号顺序不对。
+    #[test]
+    #[ignore = "REQ-010 单元 07 待实施方解除"]
+    fn acc_c9_blast_breaks_compound_into_pieces() {
+        let mut s = session();
+        let id = spawn_beam(&mut s);
+        s.detonate(Vec3::new(59.0, -39.5, 64.5), 12.0, 8.0)
+            .expect("引爆");
+        let n = s.tick();
+        assert_eq!(n.cohesion.blast_removed_cells, 3);
+        assert!(s.entity_state(shard(), id).is_none(), "原实体当拍删除");
+        s.tick();
+        let mut got: Vec<(EntityId, EntityState)> = s
+            .entity_states(shard())
+            .expect("分片")
+            .into_iter()
+            .filter(|(e, _)| e.origin_shard() == EMERGENT_ORIGIN)
+            .collect();
+        got.sort_by_key(|(e, _)| *e);
+        assert_eq!(got.len(), 4, "1 个剩余复合体 + 3 个脱落碎块");
+        let (first, rest) = (got[0], &got[1..]);
+        let desc = s.entity_desc(shard(), first.0).expect("描述");
+        let offsets: Vec<[i32; 3]> = desc
+            .shape()
+            .expect("剩余部分是复合体")
+            .cells()
+            .iter()
+            .map(|c| c.offset)
+            .collect();
+        assert_eq!(offsets, vec![[-1, 0, 0], [0, 0, 0], [1, 0, 0]]);
+        assert!(
+            (first.1.translation.x - 64.5).abs() < 0.3,
+            "{:?}",
+            first.1.translation
+        );
+        assert!(
+            first.1.linvel.x > 4.0,
+            "剩余部分带着冲量:{:?}",
+            first.1.linvel
+        );
+        for (e, st) in rest {
+            let d = s.entity_desc(shard(), *e).expect("描述");
+            assert!(d.shape().is_none(), "脱落格是单格碎块");
+            assert_eq!(d.block, STONE);
+            assert!(st.linvel.y > 0.0, "脱落碎块向上飞:{:?}", st.linvel);
+        }
+    }
+
+    /// AC-C9 冲量产生力矩(§6.1 第 2 条,D6):爆心在梁左端的左下方,power 4(各格压力 ≤ 2.75 < R 6,不破坏)→ 梁还是同一个
+    /// 实体,形状不变,并绕 z 轴转起来(估算 ω_z ≈ −0.52 rad/s)。
+    ///
+    /// 会变红的实现:只在中心施一次冲量(没有力矩,角速度为 0)。
+    #[test]
+    #[ignore = "REQ-010 单元 07 待实施方解除"]
+    fn acc_c9_blast_spins_intact_compound() {
+        let mut s = session();
+        let id = spawn_beam(&mut s);
+        s.detonate(Vec3::new(59.0, -41.5, 64.5), 4.0, 8.0)
+            .expect("引爆");
+        s.tick();
+        s.tick();
+        let st = s
+            .entity_state(shard(), id)
+            .expect("没有被破坏,还是同一个实体");
+        assert_eq!(
+            s.entity_desc(shard(), id),
+            Some(EntityDesc::compound(DEBRIS_HALF_SIZE, beam(STONE)))
+        );
+        assert!(st.angvel.z < -0.2, "绕 z 轴转起来:{:?}", st.angvel);
+        assert!(st.rotation != Quat::IDENTITY || st.angvel.length() > 0.2);
+    }
+}
