@@ -47,6 +47,10 @@ pub enum ViewEvent {
     Blocks { updates: Vec<(BlockPos, BlockId)> },
     /// 服务端分配的外部生成 ID(REQ-006 任务 02)。
     Spawned { entity: EntityId },
+    /// 复合实体形状(REQ-010 §10 修订 4)。
+    Shapes {
+        shapes: Vec<(EntityId, types::CompoundShape)>,
+    },
     /// 断连(对端 Bye/EOF/IO 失败;reason = 尽力还原的说明)。
     Disconnected { reason: String },
 }
@@ -138,6 +142,8 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
         S2C::Spawned { entity } => Some(ViewEvent::Spawned { entity }),
         S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
         S2C::Pong => None,
+        // REQ-010 单元 03b 接口桩:由实施方映射到 `ViewEvent::Shapes`。
+        S2C::EntityShapes { .. } => None,
     }
 }
 

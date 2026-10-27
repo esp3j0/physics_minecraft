@@ -795,6 +795,129 @@ async fn acn4_incremental_matches_full() {
 }
 
 // ---------------------------------------------------------------------------
+// REQ-010 AC-C14 复合实体形状先于状态(单元 03b;总架构师编写,实施方只许删 #[ignore])
+// ---------------------------------------------------------------------------
+
+/// 外部生成一个复合实体(6 格梁),等 Spawned 回执。
+async fn spawn_compound(
+    c: &mut TestClient,
+    rx: &mut mpsc::UnboundedReceiver<S2C>,
+    translation: Vec3,
+    shape: &types::CompoundShape,
+) -> EntityId {
+    c.send(&C2S::Spawn {
+        state: EntityState {
+            translation,
+            ..EntityState::default()
+        },
+        desc: EntityDesc::compound(0.45, shape.clone()),
+    })
+    .await
+    .expect("Spawn 写入");
+    for _ in 0..300 {
+        match next_frame(rx).await {
+            Some(S2C::Spawned { entity }) => return entity,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    panic!("300 软窗内未收到 Spawned 回执");
+}
+
+/// 读帧直到某个 EntityStates 含 `id`(`want_full` 为 `Some` 时还要求全量标记相符),返回此前同一流里最近一次 EntityShapes 是否含 `id`
+/// 及其形状;途中任何 EntityShapes 里出现 `single`(单格实体)即失败。
+async fn shapes_before_states(
+    rx: &mut mpsc::UnboundedReceiver<S2C>,
+    id: EntityId,
+    single: EntityId,
+    want_full: Option<bool>,
+    budget: u32,
+) -> Option<types::CompoundShape> {
+    let mut last: Option<types::CompoundShape> = None;
+    for _ in 0..budget {
+        match next_frame(rx).await {
+            Some(S2C::EntityShapes { shapes }) => {
+                assert!(
+                    shapes.iter().all(|(e, _)| *e != single),
+                    "单格实体不出现在 EntityShapes 里"
+                );
+                assert!(
+                    shapes.windows(2).all(|w| w[0].0 < w[1].0),
+                    "EntityShapes 按 EntityId 升序"
+                );
+                last = shapes.into_iter().find(|(e, _)| *e == id).map(|(_, s)| s);
+            }
+            Some(S2C::EntityStates { states, full, .. })
+                if want_full.is_none_or(|f| f == full) && states.iter().any(|(e, _)| *e == id) =>
+            {
+                return last;
+            }
+            Some(S2C::EntityStates { .. }) => last = None,
+            Some(_) => {}
+            None => {}
+        }
+    }
+    panic!("预算内没等到含该复合体的状态包(want_full = {want_full:?})");
+}
+
+/// AC-C14(§10 修订 4 第 2 条):复合体第一次出现在某个客户端的状态流里之前,同一流里紧挨着先到一个含它形状的
+/// `EntityShapes`;之后的全量包前同样重发;晚加入的客户端首个(全量)状态包前也先收到形状;单格实体从不出现在
+/// `EntityShapes` 里。
+///
+/// 会变红的实现:不发形状;形状包排在状态包之后;只在实体出生时全局广播一次(晚加入的客户端永远收不到);
+/// 全量包前不重发;单格实体也发形状。
+#[tokio::test(start_paused = true)]
+#[ignore = "REQ-010 单元 03b 待实施方解除"]
+async fn acn7_compound_shape_precedes_states() {
+    let h = harness(base_config(), PumpConfig::default(), (2, 60), true).await;
+    let (mut a, mut rx_a) = client(h.addr).await;
+    join(&mut a, &mut rx_a, 2).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, 3.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    advance_ticks(4).await;
+
+    let shape = types::CompoundShape::new(
+        (-2..=3)
+            .map(|x| types::ShapeCell {
+                offset: [x, 0, 0],
+                block: BlockId(1),
+            })
+            .collect(),
+    )
+    .expect("6 格梁");
+    let single = spawn_entity(&mut a, &mut rx_a, Vec3::new(4.0, 3.0, 4.0)).await;
+    let beam = spawn_compound(&mut a, &mut rx_a, Vec3::new(10.5, 3.5, 10.5), &shape).await;
+    assert_eq!(
+        shapes_before_states(&mut rx_a, beam, single, None, 300).await,
+        Some(shape.clone()),
+        "首次出现前先到形状"
+    );
+    advance_ticks(70).await;
+    assert_eq!(
+        shapes_before_states(&mut rx_a, beam, single, Some(true), 400).await,
+        Some(shape.clone()),
+        "全量包前重发形状"
+    );
+
+    let (mut b, mut rx_b) = client(h.addr).await;
+    join(&mut b, &mut rx_b, 2).await;
+    b.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, 3.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    assert_eq!(
+        shapes_before_states(&mut rx_b, beam, single, Some(true), 300).await,
+        Some(shape),
+        "晚加入的客户端首个全量包前收到形状"
+    );
+    shutdown(h).await;
+}
+
+// ---------------------------------------------------------------------------
 // AC-N5 背压
 // ---------------------------------------------------------------------------
 

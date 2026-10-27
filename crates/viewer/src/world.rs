@@ -18,6 +18,17 @@ use types::glam::Vec3;
 use types::{BlockId, BlockPos, ChunkPos, EntityId};
 
 use crate::client::ViewEvent;
+
+/// 复合实体各格中心(纯函数,REQ-010 §10 修订 4):`position + rotation × offset`;`shape` 为 `None` 时只有原点。
+/// **接口桩(单元 03b)**:桩阶段一律按单格。
+pub fn cube_centers(
+    position: Vec3,
+    rotation: types::glam::Quat,
+    shape: Option<&types::CompoundShape>,
+) -> Vec<Vec3> {
+    let _ = (rotation, shape);
+    vec![position]
+}
 use crate::script::WorldQuery;
 
 /// viewer 的世界状态。
@@ -95,8 +106,16 @@ impl WorldState {
                 }
             }
             ViewEvent::Spawned { entity } => self.spawned.push(entity),
+            // REQ-010 单元 03b 接口桩:由实施方按 §10 修订 4 记录形状。
+            ViewEvent::Shapes { .. } => {}
             ViewEvent::Disconnected { .. } => {}
         }
+    }
+
+    /// 实体各格的中心(服务器位姿,不是渲染插值;REQ-010 §10 修订 4):原点 + 旋转 × 偏移,形状未知按单格;
+    /// 实体不存在为 `None`。**接口桩(单元 03b)**:桩阶段一律按单格。
+    pub fn entity_cube_centers(&self, id: EntityId) -> Option<Vec<Vec3>> {
+        self.entities.get(&id).map(|p| vec![*p])
     }
 
     /// 最新服务器拍号。

@@ -79,6 +79,11 @@ pub enum S2C {
     Spawned {
         entity: EntityId,
     },
+    /// 复合实体形状(REQ-010 §10 修订 4):先于该玩家第一次看到这些复合体的状态包、以及每个全量包发出;
+    /// 按 `EntityId` 升序;单格实体从不出现。**枚举只追加**(REQ-003)。
+    EntityShapes {
+        shapes: Vec<(EntityId, types::CompoundShape)>,
+    },
 }
 
 /// 单帧字节上限(REQ-003 §4.1;超限断连)。
