@@ -10,6 +10,7 @@
 //! 图纸:[docs/design/codebase-layout.md §3 physics-sim](../../docs/design/codebase-layout.md)
 
 pub mod activation;
+pub mod cohesion;
 pub mod collider_build;
 pub mod destruction;
 pub mod explosion;

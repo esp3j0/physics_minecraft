@@ -15,7 +15,9 @@ mod edit;
 mod generator;
 mod world;
 
-pub use block::{BlockRegistry, Material, SimpleRegistry, SimpleRegistryError, Support, builtin};
+pub use block::{
+    BOND_INFINITE, BlockRegistry, Material, SimpleRegistry, SimpleRegistryError, Support, builtin,
+};
 pub use chunk::{CHUNK_X, CHUNK_Y, CHUNK_Z, Chunk};
 pub use edit::VoxelEdit;
 pub use generator::{SeededScatter, Superflat, WorldGenerator};

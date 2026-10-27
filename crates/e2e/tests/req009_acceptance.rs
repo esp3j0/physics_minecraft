@@ -8,14 +8,19 @@
 mod unit01 {
     use app::config::{Config, WorldKind};
     use types::{BlockId, ChunkPos};
-    use voxel::{BlockRegistry, Material, SimpleRegistry, SimpleRegistryError, Support, builtin};
+    use voxel::{
+        BOND_INFINITE, BlockRegistry, Material, SimpleRegistry, SimpleRegistryError, Support,
+        builtin,
+    };
 
-    fn mat(resistance: f32, impact_threshold: f32, support: Support) -> Material {
+    /// REQ-010 迁移:`Material` 追加承载粘结 `bond`,本表随之带上 REQ-010 §3.2 的值,REQ-009 的字段与断言不变。
+    fn mat(resistance: f32, impact_threshold: f32, support: Support, bond: u32) -> Material {
         Material {
             resistance,
             impact_threshold,
             support,
             pulverize_factor: 2.0,
+            bond,
         }
     }
 
@@ -34,25 +39,30 @@ mod unit01 {
                 builtin::STONE,
                 "stone",
                 true,
-                Some(mat(6.0, 18.0, Support::Connected)),
+                Some(mat(6.0, 18.0, Support::Connected, 8)),
             ),
             (
                 builtin::DIRT,
                 "dirt",
                 true,
-                Some(mat(2.0, 7.0, Support::Connected)),
+                Some(mat(2.0, 7.0, Support::Connected, 3)),
             ),
             (
                 builtin::BEDROCK,
                 "bedrock",
                 true,
-                Some(mat(f32::INFINITY, f32::INFINITY, Support::Anchor)),
+                Some(mat(
+                    f32::INFINITY,
+                    f32::INFINITY,
+                    Support::Anchor,
+                    BOND_INFINITE,
+                )),
             ),
             (
                 builtin::SAND,
                 "sand",
                 true,
-                Some(mat(2.0, 4.0, Support::NeedsBelow)),
+                Some(mat(2.0, 4.0, Support::NeedsBelow, 0)),
             ),
         ];
         for (id, name, solid, material) in table {
@@ -79,11 +89,16 @@ mod unit01 {
         assert_eq!(reg.material(x), Some(Material::INDESTRUCTIBLE));
         assert_eq!(
             Material::INDESTRUCTIBLE,
-            mat(f32::INFINITY, f32::INFINITY, Support::Connected)
+            mat(
+                f32::INFINITY,
+                f32::INFINITY,
+                Support::Connected,
+                BOND_INFINITE
+            )
         );
         assert_eq!(reg.material(y), None, "非实心没有材料");
 
-        let glass = mat(1.0, 3.0, Support::Connected);
+        let glass = mat(1.0, 3.0, Support::Connected, 5);
         let z = reg.register_with_material("glass", glass).expect("注册");
         assert_eq!(z, BlockId(3));
         assert!(reg.is_solid(z), "带材料注册的方块是实心");

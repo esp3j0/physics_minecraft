@@ -30,7 +30,10 @@ pub enum Support {
     Anchor,
 }
 
-/// 方块材料(REQ-009 §3.1)。
+/// 承载粘结的"∞"(REQ-010 §3.1):不会被拉断。
+pub const BOND_INFINITE: u32 = u32::MAX;
+
+/// 方块材料(REQ-009 §3.1;REQ-010 §3.1 追加 `bond`)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Material {
     /// 抗爆强度 R,与爆炸压力同单位;`f32::INFINITY` = 不可破坏。
@@ -40,6 +43,9 @@ pub struct Material {
     pub support: Support,
     /// 粉碎倍数 k:爆炸压力 > k·R 粉碎,R < 压力 ≤ k·R 脱落。
     pub pulverize_factor: f32,
+    /// 承载粘结 B(REQ-010 §3.1):一个共面连接能传递的静载,单位为格重 `W0`;
+    /// [`BOND_INFINITE`] = 不会被拉断。两格之间取较小值。
+    pub bond: u32,
 }
 
 impl Material {
@@ -50,6 +56,7 @@ impl Material {
         impact_threshold: f32::INFINITY,
         support: Support::Connected,
         pulverize_factor: 2.0,
+        bond: BOND_INFINITE,
     };
 }
 
@@ -128,7 +135,7 @@ impl SimpleRegistry {
 
     /// 内置方块表(REQ-009 §3.2,ID 只追加):air(0)、stone(1, R6/I18)、
     /// dirt(2, R2/I7)、bedrock(3, ∞/∞, Anchor)、sand(4, R2/I4, NeedsBelow);
-    /// 全部材料 k = 2。
+    /// 全部材料 k = 2。承载粘结 B(REQ-010 §3.2):stone 8、dirt 3、bedrock ∞、sand 0。
     pub fn builtin() -> Self {
         let mut reg = Self::new();
         let mut add = |name: &str, material: Material| {
@@ -142,6 +149,7 @@ impl SimpleRegistry {
                 impact_threshold: 18.0,
                 support: Support::Connected,
                 pulverize_factor: 2.0,
+                bond: 8,
             },
         );
         add(
@@ -151,6 +159,7 @@ impl SimpleRegistry {
                 impact_threshold: 7.0,
                 support: Support::Connected,
                 pulverize_factor: 2.0,
+                bond: 3,
             },
         );
         add(
@@ -160,6 +169,7 @@ impl SimpleRegistry {
                 impact_threshold: f32::INFINITY,
                 support: Support::Anchor,
                 pulverize_factor: 2.0,
+                bond: BOND_INFINITE,
             },
         );
         add(
@@ -169,6 +179,7 @@ impl SimpleRegistry {
                 impact_threshold: 4.0,
                 support: Support::NeedsBelow,
                 pulverize_factor: 2.0,
+                bond: 0,
             },
         );
         reg
@@ -290,6 +301,7 @@ mod tests {
             impact_threshold: 3.0,
             support: Support::Connected,
             pulverize_factor: 2.0,
+            bond: 5,
         };
         let id = reg.register_with_material("glass", glass).unwrap();
         assert_eq!(id, BlockId(1));
