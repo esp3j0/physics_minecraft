@@ -330,8 +330,6 @@ pub fn compound_forced_landing(
 /// 碎裂断键(纯函数,REQ-010 §7.3 第 3 条):`total_impulse` = 本拍接近速度 ≥ 1 m/s 的接触点冲量合计;`contacts` = 各接触格
 /// (形状格序号, 受力方向:世界坐标、指向本体内部、已归一化);`rotation` = 刚体旋转。返回断开的粘结
 /// (形状格序号对,小者在前)。
-///
-/// **总架构师接口桩(REQ-010 单元 06)**:由实施方实现。
 pub fn fracture_bonds(
     shape: &types::CompoundShape,
     rotation: types::glam::Quat,
@@ -339,31 +337,171 @@ pub fn fracture_bonds(
     contacts: &[(usize, types::glam::Vec3)],
     registry: &dyn BlockRegistry,
 ) -> BTreeSet<(usize, usize)> {
-    let _ = (shape, rotation, total_impulse, contacts, registry);
-    BTreeSet::new()
+    let cells = shape.cells();
+    if contacts.is_empty() {
+        return BTreeSet::new();
+    }
+    // 均摊(§7.1):每格承担合计的 1/|接触格|——分母是本拍有过滤后接触点的
+    // 格数,不是形状格数(§7.3 风险 1)。
+    let j_c = total_impulse / contacts.len() as f32;
+    // 压向豁免阈:从 c 指向 m 的世界方向与受力方向点积 ≥ cos 45° = "m 在
+    // 受力背后",撞击只是把 c 压向 m(与承载"压不限量"一致,§7.1)。
+    let cos_press = std::f32::consts::FRAC_1_SQRT_2;
+    let mut broken = BTreeSet::new();
+    for &(ci, n) in contacts {
+        let dir_n = n.normalize_or_zero();
+        let c = &cells[ci];
+        for (mi, m) in cells.iter().enumerate() {
+            if mi == ci {
+                continue;
+            }
+            let d = [
+                m.offset[0] - c.offset[0],
+                m.offset[1] - c.offset[1],
+                m.offset[2] - c.offset[2],
+            ];
+            // 只有共面的格之间有粘结,共棱、共角不算(§3.1)。
+            if d[0].abs() + d[1].abs() + d[2].abs() != 1 {
+                continue;
+            }
+            if j_c < impact_bond_between(registry, c.block, m.block) {
+                continue;
+            }
+            // c → m 的世界方向(粘结方向随刚体旋转);点积在同一条世界坐标轴
+            // 上进行(§7.3 风险 2)。
+            let to_m = rotation * types::glam::Vec3::new(d[0] as f32, d[1] as f32, d[2] as f32);
+            if to_m.dot(dir_n) >= cos_press {
+                continue; // 压向:豁免
+            }
+            broken.insert((ci.min(mi), ci.max(mi)));
+        }
+    }
+    broken
 }
 
 /// 断键后的连通分量(纯函数,REQ-010 §7.3 第 4 条):按未断的共面连接划分形状格序号;分量内升序、各分量按首格升序。
-///
-/// **总架构师接口桩(REQ-010 单元 06)**:桩阶段恒为一个分量。
 pub fn fracture_components(
     shape: &types::CompoundShape,
     broken: &BTreeSet<(usize, usize)>,
 ) -> Vec<Vec<usize>> {
-    let _ = broken;
-    vec![(0..shape.cells().len()).collect()]
+    let cells = shape.cells();
+    let n = cells.len();
+    // 未断的共面连接 = 剩余粘结(§7.2:断键后按剩余粘结求连通分量)。
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (a, b) = (cells[i].offset, cells[j].offset);
+            let manhattan = (a[0] - b[0]).abs() + (a[1] - b[1]).abs() + (a[2] - b[2]).abs();
+            if manhattan == 1 && !broken.contains(&(i, j)) {
+                adj[i].push(j);
+                adj[j].push(i);
+            }
+        }
+    }
+    // 从格序号升序出发 BFS:分量内升序、各分量按首格(最小序号)升序。
+    let mut seen = vec![false; n];
+    let mut out = Vec::new();
+    for start in 0..n {
+        if seen[start] {
+            continue;
+        }
+        let mut comp: Vec<usize> = Vec::new();
+        let mut queue = VecDeque::from([start]);
+        seen[start] = true;
+        while let Some(v) = queue.pop_front() {
+            comp.push(v);
+            for &w in &adj[v] {
+                if !seen[w] {
+                    seen[w] = true;
+                    queue.push_back(w);
+                }
+            }
+        }
+        comp.sort_unstable();
+        out.push(comp);
+    }
+    out
 }
 
 /// 各分量的新实体(纯函数,REQ-010 §7.3 第 5 条):返回 (状态, 描述),顺序同 `components`。
 ///
-/// **总架构师接口桩(REQ-010 单元 06)**:由实施方实现。
+/// ≥ 2 格的分量:原点偏移 = `compound_origin(分量偏移)`,形状偏移相对新原点,
+/// 平移 = 原平移 + 旋转 × 原点偏移;1 格分量:普通单格碎块,平移 = 该格世界
+/// 中心。旋转同原刚体;线速度 = `v + ω × (分量质心 − 原质心)`(各格等质量,
+/// 质心 = 格中心的平均;`r` 旋转到世界坐标后再叉乘),角速度 = `ω`。
 pub fn fracture_pieces(
     state: &types::EntityState,
     desc: &types::EntityDesc,
     components: &[Vec<usize>],
 ) -> Vec<(types::EntityState, types::EntityDesc)> {
-    let _ = (state, desc, components);
-    Vec::new()
+    let Some(shape) = desc.shape() else {
+        return Vec::new(); // 单格实体没有内部粘结,不碎裂(调用侧保证)
+    };
+    let cells = shape.cells();
+    // 格中心在刚体系 = 偏移;质心 = 各格中心的平均(等质量)。
+    let center = |i: usize| {
+        let [x, y, z] = cells[i].offset;
+        types::glam::Vec3::new(x as f32, y as f32, z as f32)
+    };
+    let com = (0..cells.len()).map(center).sum::<types::glam::Vec3>() / cells.len() as f32;
+    components
+        .iter()
+        .map(|comp| {
+            let comp_com =
+                comp.iter().map(|&i| center(i)).sum::<types::glam::Vec3>() / comp.len() as f32;
+            let r = state.rotation * (comp_com - com);
+            let linvel = state.linvel + state.angvel.cross(r);
+            if comp.len() == 1 {
+                let i = comp[0];
+                (
+                    types::EntityState {
+                        translation: state.translation + state.rotation * center(i),
+                        rotation: state.rotation,
+                        linvel,
+                        angvel: state.angvel,
+                    },
+                    types::EntityDesc {
+                        half_size: DEBRIS_HALF_SIZE,
+                        block: cells[i].block,
+                        shape: None,
+                    },
+                )
+            } else {
+                let world: Vec<BlockPos> = comp
+                    .iter()
+                    .map(|&i| {
+                        let [x, y, z] = cells[i].offset;
+                        BlockPos::new(x, y, z)
+                    })
+                    .collect();
+                let origin = compound_origin(&world);
+                let origin_v =
+                    types::glam::Vec3::new(origin.x as f32, origin.y as f32, origin.z as f32);
+                let new_shape = types::CompoundShape::new(
+                    comp.iter()
+                        .map(|&i| types::ShapeCell {
+                            offset: [
+                                cells[i].offset[0] - origin.x,
+                                cells[i].offset[1] - origin.y,
+                                cells[i].offset[2] - origin.z,
+                            ],
+                            block: cells[i].block,
+                        })
+                        .collect(),
+                )
+                .expect("分量 ≥ 2 格");
+                (
+                    types::EntityState {
+                        translation: state.translation + state.rotation * origin_v,
+                        rotation: state.rotation,
+                        linvel,
+                        angvel: state.angvel,
+                    },
+                    types::EntityDesc::compound(desc.half_size, new_shape),
+                )
+            }
+        })
+        .collect()
 }
 
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
@@ -1334,6 +1472,257 @@ mod tests {
                 ]
             },
             "落点 = 世界底实心格之上"
+        );
+    }
+
+    // ------------------------------------------------------------------ fracture(§7.3,单元 06)
+
+    use types::glam::Quat;
+
+    fn beam6(block: BlockId) -> types::CompoundShape {
+        types::CompoundShape::new(
+            (0..6)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block,
+                })
+                .collect(),
+        )
+        .expect("6 格")
+    }
+
+    fn cell_contacts(idxs: &[usize]) -> Vec<(usize, Vec3)> {
+        idxs.iter().map(|&i| (i, Vec3::Y)).collect()
+    }
+
+    /// 断键均摊(§7.3 第 3 条):分母 = 接触格数,不是形状格数——3 格接触、
+    /// 合计 54(每格 18)恰好全断;同一合计摊到 6 格(每格 9 < 18)一根不断;
+    /// 逐格相加(不均摊)会在 3 格 54 时每格按 54 算,全部翻倍。
+    ///
+    /// 变红:分母用 shape.cells().len();每格都按合计算(不均摊)。
+    #[test]
+    fn fracture_bonds_amortizes_over_contact_cells() {
+        let reg = SimpleRegistry::builtin();
+        let shape = beam6(builtin::STONE);
+        // 恰好压线:每格 18 ≥ 18 → 全断(5 根)。
+        let broken = fracture_bonds(
+            &shape,
+            Quat::IDENTITY,
+            54.0,
+            &cell_contacts(&[0, 2, 4]),
+            &reg,
+        );
+        assert_eq!(
+            broken,
+            [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5)]
+                .into_iter()
+                .collect(),
+            "每格 18 ≥ 18:5 根全断"
+        );
+        // 同一合计摊到 6 格:每格 9 < 18 → 不断。
+        assert!(
+            fracture_bonds(
+                &shape,
+                Quat::IDENTITY,
+                54.0,
+                &cell_contacts(&[0, 1, 2, 3, 4, 5]),
+                &reg
+            )
+            .is_empty(),
+            "分母是接触格数:6 格摊 54,每格 9 < 18"
+        );
+        // 压线下一点:17.9 不断(≥ 判定)。
+        assert!(
+            fracture_bonds(
+                &shape,
+                Quat::IDENTITY,
+                53.7,
+                &cell_contacts(&[0, 2, 4]),
+                &reg
+            )
+            .is_empty(),
+            "每格 17.9 < 18:不断"
+        );
+    }
+
+    /// 压向豁免用世界坐标点积(§7.3 风险 2):梁绕 z 转 90° 竖立,底格向上
+    /// 那根粘结的世界方向 = 旋转 × (+x) = +y,与受力方向(+y)点积 1 ≥
+    /// cos 45° → 压向,冲量再大不断。变异:点积用本体坐标(+x · +y = 0 <
+    /// cos 45°)会误断;删掉豁免同样误断。
+    #[test]
+    fn fracture_bonds_press_toward_exempt_in_world_frame() {
+        let reg = SimpleRegistry::builtin();
+        let shape = beam6(builtin::STONE);
+        let upright = Quat::from_rotation_z(90f32.to_radians());
+        assert!(
+            fracture_bonds(&shape, upright, 1000.0, &[(0, Vec3::Y)], &reg).is_empty(),
+            "竖落:底格向上那根粘结是压向(世界系判定)"
+        );
+        // 同一形状平放时同一根是横向粘结,照常可断(对照)。
+        assert_eq!(
+            fracture_bonds(&shape, Quat::IDENTITY, 1000.0, &[(0, Vec3::Y)], &reg),
+            [(0, 1)].into_iter().collect(),
+            "平放:同一根粘结横向,不断键豁免"
+        );
+    }
+
+    /// 拆分按剩余粘结求连通(§7.3 第 4 条):环断一根仍是一个分量(不拆);
+    /// 断两根拆成两个;分量内升序、按首格升序。
+    ///
+    /// 变红:把断键两端的格各自单独拆出(环断一根拆成 4 段);分量不排序。
+    #[test]
+    fn fracture_components_ring_stays_connected_through_one_break() {
+        // 2×2 方环(canonical 序:0 (0,0) 1 (0,1) 2 (1,0) 3 (1,1)),四条侧边粘结:
+        // 0-1(x=0 列)、2-3(x=1 列)、0-2(y=0 行)、1-3(y=1 行)。
+        let ring = types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: builtin::STONE,
+            },
+            types::ShapeCell {
+                offset: [0, 1, 0],
+                block: builtin::STONE,
+            },
+            types::ShapeCell {
+                offset: [1, 0, 0],
+                block: builtin::STONE,
+            },
+            types::ShapeCell {
+                offset: [1, 1, 0],
+                block: builtin::STONE,
+            },
+        ])
+        .expect("4 格");
+        // 断 0-1:0-2-3-1 仍连通 → 1 个分量(不变)。
+        assert_eq!(
+            fracture_components(&ring, &[(0, 1)].into_iter().collect()),
+            vec![vec![0, 1, 2, 3]],
+            "环断一根仍连成一块"
+        );
+        // 再断 2-3:只剩 0-2 与 1-3 两段,各内升序、按首格升序。
+        assert_eq!(
+            fracture_components(&ring, &[(0, 1), (2, 3)].into_iter().collect()),
+            vec![vec![0, 2], vec![1, 3]],
+            "断两根拆成两段"
+        );
+    }
+
+    /// 分块(§7.3 第 5 条)带旋转:4 格梁绕 z 转 90°,v = (1, 2, 3)、
+    /// ω = (0, 0, 4),拆成 [0,1] 与 [2,3]——新原点偏移 0 与 2(包围盒中心),
+    /// 平移 = 原平移 + 旋转 × 原点偏移,速度 = v + ω × r(r 世界系)。
+    ///
+    /// 变红:平移不随旋转转原点偏移(第二段停在原平移);速度只给 v 不加
+    /// ω × r;新原点不是包围盒中心。
+    #[test]
+    fn fracture_pieces_rotated_translates_and_spins_components() {
+        let shape = types::CompoundShape::new(
+            (0..4)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("4 格");
+        let rotation = Quat::from_rotation_z(90f32.to_radians());
+        let state = types::EntityState {
+            translation: Vec3::new(5.5, 2.5, 1.5),
+            rotation,
+            linvel: Vec3::new(1.0, 2.0, 3.0),
+            angvel: Vec3::new(0.0, 0.0, 4.0),
+        };
+        let desc = types::EntityDesc::compound(DEBRIS_HALF_SIZE, shape);
+        let pieces = fracture_pieces(&state, &desc, &[vec![0, 1], vec![2, 3]]);
+        assert_eq!(pieces.len(), 2);
+        let seg = |lo: i32| {
+            types::EntityDesc::compound(
+                DEBRIS_HALF_SIZE,
+                types::CompoundShape::new(
+                    (lo..lo + 2)
+                        .map(|x| types::ShapeCell {
+                            offset: [x, 0, 0],
+                            block: builtin::STONE,
+                        })
+                        .collect(),
+                )
+                .expect("段"),
+            )
+        };
+        // 段 [0,1]:原点偏移 0(rot × 0 = 0)→ 平移不变;质心 0.5,r = 旋转 ×
+        // (0.5 − 1.5) = (0,−1,0),ω × r = (4,0,0) → 速度 (5,2,3)。
+        let (st, d) = &pieces[0];
+        assert_eq!(d, &seg(0), "形状偏移相对新原点(未动)");
+        assert!((st.translation - Vec3::new(5.5, 2.5, 1.5)).length() < 1e-5);
+        assert!(
+            (st.linvel - Vec3::new(5.0, 2.0, 3.0)).length() < 1e-5,
+            "{:?}",
+            st.linvel
+        );
+        assert_eq!(st.rotation, rotation, "旋转同原刚体");
+        assert!((st.angvel - Vec3::new(0.0, 0.0, 4.0)).length() < 1e-6);
+        // 段 [2,3]:原点偏移 2,旋转 90° 后 = (0,2,0) → 平移 +y 2;质心 2.5,
+        // r = 旋转 × (1,0,0) = (0,1,0),ω × r = (−4,0,0) → 速度 (−3,2,3)。
+        let (st, d) = &pieces[1];
+        assert_eq!(d, &seg(0), "段内偏移各自相对新原点");
+        assert!((st.translation - Vec3::new(5.5, 4.5, 1.5)).length() < 1e-5);
+        assert!(
+            (st.linvel - Vec3::new(-3.0, 2.0, 3.0)).length() < 1e-5,
+            "{:?}",
+            st.linvel
+        );
+    }
+
+    /// 单格分量(§7.3 第 5 条):普通单格碎块(无形状、`DEBRIS_HALF_SIZE`、
+    /// 该格方块),平移 = 该格世界中心(随刚体旋转),速度含 ω × r。
+    ///
+    /// 变红:单格分量仍带形状;平移用本体偏移不旋转。
+    #[test]
+    fn fracture_pieces_single_cell_is_plain_debris_at_world_center() {
+        let shape = types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: builtin::DIRT,
+            },
+            types::ShapeCell {
+                offset: [1, 0, 0],
+                block: builtin::STONE,
+            },
+        ])
+        .expect("2 格");
+        let rotation = Quat::from_rotation_z(90f32.to_radians());
+        let state = types::EntityState {
+            translation: Vec3::new(5.5, 2.5, 1.5),
+            rotation,
+            linvel: Vec3::new(1.0, 2.0, 3.0),
+            angvel: Vec3::new(0.0, 0.0, 4.0),
+        };
+        let desc = types::EntityDesc::compound(DEBRIS_HALF_SIZE, shape);
+        let pieces = fracture_pieces(&state, &desc, &[vec![0], vec![1]]);
+        let (st, d) = &pieces[0];
+        assert!(d.shape().is_none(), "单格分量是普通单格碎块");
+        assert_eq!((d.half_size, d.block), (DEBRIS_HALF_SIZE, builtin::DIRT));
+        assert!(
+            (st.translation - Vec3::new(5.5, 2.5, 1.5)).length() < 1e-5,
+            "格 0 世界中心 = 原平移(旋转 × 零偏移)"
+        );
+        // r = 旋转 × (0 − 0.5,0,0) = (0,−0.5,0),ω × r = (2,0,0)。
+        assert!(
+            (st.linvel - Vec3::new(3.0, 2.0, 3.0)).length() < 1e-5,
+            "{:?}",
+            st.linvel
+        );
+        let (st, d) = &pieces[1];
+        assert!(d.shape().is_none());
+        assert_eq!(d.block, builtin::STONE);
+        assert!(
+            (st.translation - Vec3::new(5.5, 3.5, 1.5)).length() < 1e-5,
+            "格 1 世界中心 = 原平移 + 旋转 × (1,0,0)"
+        );
+        // r = 旋转 × (0.5,0,0) = (0,0.5,0),ω × r = (−2,0,0)。
+        assert!(
+            (st.linvel - Vec3::new(-1.0, 2.0, 3.0)).length() < 1e-5,
+            "{:?}",
+            st.linvel
         );
     }
 }

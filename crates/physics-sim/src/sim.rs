@@ -882,6 +882,9 @@ impl ShardSim {
         // 撞击破坏(REQ-009 §5,单元 06):物理步进之后、坍塌求值之前——本步
         // 解算写入的接触冲量在此采样,破坏格进入本拍坍塌的触发集。
         self.evaluate_impacts();
+        // 碎裂(REQ-010 §7.3,单元 06):物理步进之后、凝固桥之前——同一拍
+        // 先碎;碎了的复合体已删除,凝固段自然不再判整块凝固(§7.3 风险 4)。
+        self.evaluate_fractures();
 
         let ids: Vec<EntityId> = self.entities.keys().copied().collect();
         // 支撑判定(§4.4.1;一次计算,凝固前提 + 承载产出共用)。
@@ -2776,16 +2779,21 @@ impl ShardSim {
         if !self.cfg.destruction.enabled {
             return;
         }
-        // collider → 实体(1:1;同 collect_contact_wake_compensation 的键口径)
-        // 与地形 collider 表(chunk 固定体;实体↔实体、实体↔冻结体不参与,风险 3)。
-        let collider_to_entity: BTreeMap<(u32, u32), EntityId> = self
-            .entities
-            .iter()
-            .map(|(id, rec)| {
-                let idx = rec.collider.into_raw_parts();
-                ((idx.0, idx.1), *id)
-            })
-            .collect();
+        // collider → 实体:单格 = 代表 collider(1:1,原键集合逐位不变);复合体
+        // = 全部格 collider(REQ-010 §7.3 第 7 条:砸地形按均摊口径,须采样
+        // 每格的接触点)。键取 handle 的 (index, generation)。
+        let mut collider_to_entity: BTreeMap<(u32, u32), EntityId> = BTreeMap::new();
+        for (id, rec) in &self.entities {
+            let idx = rec.collider.into_raw_parts();
+            collider_to_entity.insert((idx.0, idx.1), *id);
+            if rec.desc.shape().is_some() {
+                let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                for ch in body.colliders() {
+                    let idx = ch.into_raw_parts();
+                    collider_to_entity.insert((idx.0, idx.1), *id);
+                }
+            }
+        }
         if collider_to_entity.is_empty() {
             return;
         }
@@ -2809,7 +2817,7 @@ impl ShardSim {
 
         // 每格累计(先收进 BTreeMap 再排序,接触对遍历顺序不确定,风险 4):
         // `impulse` = 各点冲量之和;`dir` = 最大点冲量的撞击方向(并列取字典序
-        // 小者,结果与采样顺序无关)。
+        // 小者,结果与采样顺序无关)。单格实体走这一路径(REQ-009 §5 原口径)。
         #[derive(Default)]
         struct Sample {
             impulse: f32,
@@ -2817,6 +2825,15 @@ impl ShardSim {
             dir: Vec3,
         }
         let mut samples: BTreeMap<BlockPos, Sample> = BTreeMap::new();
+        // 复合体(REQ-010 §7.3 第 7 条):每实体的接触点冲量合计与被触及的
+        // 地形格集合 T,均摊 `J_T / |T|` 逐格判 I——多点接触时求解器把冲量
+        // 分给各点的方式不唯一,逐格相加会让平落的复合体随机砸穿脚下某一格。
+        #[derive(Default)]
+        struct CompoundImpact {
+            total: f32,
+            cells: BTreeSet<BlockPos>,
+        }
+        let mut compound_impacts: BTreeMap<EntityId, CompoundImpact> = BTreeMap::new();
         for pair in self.phys.narrow_phase.contact_pairs() {
             let key1 = pair.collider1.into_raw_parts();
             let key2 = pair.collider2.into_raw_parts();
@@ -2846,6 +2863,9 @@ impl ShardSim {
             {
                 continue;
             }
+            // 复合体走均摊口径(§7.3 第 7 条;开关同 §7.3 第 1 条,关闭时按
+            // REQ-009 的逐格口径);单格逐格相加(REQ-009 原口径,逐位不变)。
+            let is_compound = self.load_enabled() && rec.desc.shape().is_some();
             // 地形一侧 = 非实体的那一侧;其接触点 = local_p1(地形是 1)或
             // local_p2(地形是 2)。
             let (terrain_collider, terrain_is_1) = if entity_is_1 {
@@ -2901,6 +2921,12 @@ impl ShardSim {
                     if cell.x < min.x || cell.x >= max_x || cell.z < min.z || cell.z >= max_z {
                         continue;
                     }
+                    if is_compound {
+                        let e = compound_impacts.entry(id).or_default();
+                        e.total += pt.data.impulse;
+                        e.cells.insert(cell);
+                        continue;
+                    }
                     let s = samples.entry(cell).or_default();
                     s.impulse += pt.data.impulse;
                     if pt.data.impulse > s.best
@@ -2913,18 +2939,46 @@ impl ShardSim {
                 }
             }
         }
-        // 阈值判定(范围 2):J ≥ 该格材料的 `impact_threshold`(∞ 自然不破);
-        // 非实心/未装载/界外的格无材料,整体忽略(界外 get_block = AIR)。
-        let mut candidates: Vec<(BlockPos, f32, Vec3, BlockId, f32)> = Vec::new();
+        // 阈值判定(范围 2):单格 = 逐格冲量和 J ≥ 该格材料的 `impact_threshold`
+        // (REQ-009 §5 原口径);复合体 = 均摊 `J_T / |T|` 逐格判 I(§7.3 第 7 条;
+        // ∞ 自然不破)。非实心/未装载/界外的格无材料,整体忽略(界外 get_block = AIR)。
+        // 同一地形格多来源(单格与复合体、多个复合体)取冲量最大者——保持
+        // "一格至多一个候选"的既有不变量(脱落请求不重复)。
+        let mut best: BTreeMap<BlockPos, (f32, BlockId, f32)> = BTreeMap::new();
         for (cell, s) in samples {
             let block = self.voxels.get_block(cell);
             let Some(m) = self.registry.material(block) else {
                 continue;
             };
             if s.impulse >= m.impact_threshold {
-                candidates.push((cell, s.impulse, s.dir, block, m.impact_threshold));
+                best.insert(cell, (s.impulse, block, m.impact_threshold));
             }
         }
+        for e in compound_impacts.into_values() {
+            if e.cells.is_empty() {
+                continue;
+            }
+            let j = e.total / e.cells.len() as f32;
+            for cell in e.cells {
+                let block = self.voxels.get_block(cell);
+                let Some(m) = self.registry.material(block) else {
+                    continue;
+                };
+                if j >= m.impact_threshold {
+                    best.entry(cell)
+                        .and_modify(|cur| {
+                            if j > cur.0 {
+                                *cur = (j, block, m.impact_threshold);
+                            }
+                        })
+                        .or_insert((j, block, m.impact_threshold));
+                }
+            }
+        }
+        let mut candidates: Vec<(BlockPos, f32, Vec3, BlockId, f32)> = best
+            .into_iter()
+            .map(|(cell, (j, block, threshold))| (cell, j, Vec3::ZERO, block, threshold))
+            .collect();
         if candidates.is_empty() {
             return;
         }
@@ -2976,6 +3030,182 @@ impl ShardSim {
         }
         // 与同拍爆炸的脱落请求拼接后,保持整个 outbox 的 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
+    }
+
+    /// 碎裂采样与拆分(REQ-010 §7.3,单元 06;调用点 = `step` 内撞击采样之后、
+    /// 凝固桥之前)。开关与承载判定相同(§7.3 第 1 条)。对每个醒着的复合体
+    /// (§7.3 第 2 条:本步之前的动态醒体、有形状;对方可以是地形或其他实体)
+    /// 取接近速度 ≥ 1 m/s 的接触点,累计冲量合计 J 与各接触格的受力方向(指向
+    /// 本体内部的接触法向之和,归一化);本步开始后新生的实体不在
+    /// `pre_impulse_vels`,本拍不采样。上限与顺序(§7.3 第 6 条):每拍最多
+    /// 处理 `max_fractures_per_tick` 个复合体,按 `J_c = J/|接触格|` 降序、同值
+    /// `EntityId` 升序,其余本拍不断。处理(§7.3 第 3–5 条):`fracture_bonds`
+    /// 断键 → `fracture_components` 拆分 → 多于 1 个分量时原实体本拍删除,
+    /// `fracture_pieces` 产出分块请求(`index` = 分量序号)经调度器 N+1 生成
+    /// (复用单元 05 路径);碎了即删除,凝固段自然不再判整块凝固。遥测
+    /// (§7.3 第 8 条):`bonds_broken`、`fracture_components`(仅拆分计)。
+    fn evaluate_fractures(&mut self) {
+        if !self.load_enabled() {
+            return;
+        }
+        // collider → 实体(单格 = 代表 collider;复合体 = 全部格 collider)与
+        // 复合体 collider → 形状格序号(局部平移 = 偏移,按偏移匹配,不依赖
+        // colliders() 的插入顺序)。
+        let mut collider_to_entity: BTreeMap<(u32, u32), EntityId> = BTreeMap::new();
+        let mut collider_to_cell: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        for (id, rec) in &self.entities {
+            let idx = rec.collider.into_raw_parts();
+            collider_to_entity.insert((idx.0, idx.1), *id);
+            let Some(shape) = rec.desc.shape() else {
+                continue;
+            };
+            let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+            let by_offset: BTreeMap<[i32; 3], usize> = shape
+                .cells()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.offset, i))
+                .collect();
+            for ch in body.colliders() {
+                let idx = ch.into_raw_parts();
+                collider_to_entity.insert((idx.0, idx.1), *id);
+                if let Some(col) = self.phys.colliders.get(*ch) {
+                    let t = col
+                        .position_wrt_parent()
+                        .map_or(Vec3::ZERO, |p| p.translation);
+                    let off = [t.x.round() as i32, t.y.round() as i32, t.z.round() as i32];
+                    if let Some(&i) = by_offset.get(&off) {
+                        collider_to_cell.insert((idx.0, idx.1), i);
+                    }
+                }
+            }
+        }
+        // 采样资格(§7.3 第 2 条):醒着的复合体;速度基准 = 本步之前的线速度。
+        let eligible: BTreeMap<EntityId, Vec3> = self
+            .pre_impulse_vels
+            .iter()
+            .filter(|(id, _)| {
+                let Some(rec) = self.entities.get(id) else {
+                    return false;
+                };
+                rec.desc.shape().is_some()
+                    && self
+                        .phys
+                        .bodies
+                        .get(rec.handle)
+                        .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
+            })
+            .map(|(id, v)| (*id, *v))
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+        struct FractureSample {
+            total: f32,
+            cells: BTreeMap<usize, Vec3>,
+        }
+        let mut samples: BTreeMap<EntityId, FractureSample> = BTreeMap::new();
+        for pair in self.phys.narrow_phase.contact_pairs() {
+            let key1 = pair.collider1.into_raw_parts();
+            let key2 = pair.collider2.into_raw_parts();
+            for m in pair.manifolds() {
+                // 法向为 world 系、以碰撞体 1 → 2 为正:对 1 侧"指向本体内部"
+                // = −normal,对 2 侧 = +normal(与撞击采样"撞击方向"互为反向量)。
+                for (key, dir_into) in [(key1, -m.data.normal), (key2, m.data.normal)] {
+                    let Some(&id) = collider_to_entity.get(&key) else {
+                        continue;
+                    };
+                    let Some(&cell) = collider_to_cell.get(&key) else {
+                        continue;
+                    };
+                    let Some(pre_vel) = eligible.get(&id) else {
+                        continue;
+                    };
+                    // 接近速度(REQ-009 §5 修订 9 同口径):本步前线速度沿接触
+                    // 法向**朝对方**的分量 ≥ 1 m/s 才计入;受力方向指向本体
+                    // 内部,与接近方向互为反向量。
+                    if (-pre_vel).dot(dir_into) < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
+                        continue;
+                    }
+                    let s = samples.entry(id).or_insert(FractureSample {
+                        total: 0.0,
+                        cells: BTreeMap::new(),
+                    });
+                    for pt in &m.points {
+                        if pt.data.impulse <= 0.0 {
+                            continue;
+                        }
+                        s.total += pt.data.impulse;
+                        *s.cells.entry(cell).or_insert(Vec3::ZERO) += dir_into;
+                    }
+                }
+            }
+        }
+        // 上限与顺序(§7.3 第 6 条):J_c 降序、同值 EntityId 升序。
+        // 候选 = (J_c, 实体, 冲量合计, 各接触格及受力方向)。
+        type FractureCandidate = (f32, EntityId, f32, Vec<(usize, Vec3)>);
+        let mut candidates: Vec<FractureCandidate> = samples
+            .into_iter()
+            .filter(|(_, s)| !s.cells.is_empty())
+            .map(|(id, s)| {
+                let j_c = s.total / s.cells.len() as f32;
+                let contacts: Vec<(usize, Vec3)> = s
+                    .cells
+                    .into_iter()
+                    .map(|(i, d)| (i, d.normalize_or_zero()))
+                    .collect();
+                (j_c, id, s.total, contacts)
+            })
+            .collect();
+        candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, id, total, contacts) in candidates
+            .into_iter()
+            .take(self.cfg.cohesion.max_fractures_per_tick)
+        {
+            let prepared = self.entities.get(&id).and_then(|rec| {
+                let shape = rec.desc.shape()?;
+                Some((
+                    rec.handle,
+                    shape.clone(),
+                    rec.desc.clone(),
+                    self.read_state(rec),
+                ))
+            });
+            let Some((handle, shape, desc, state)) = prepared else {
+                continue;
+            };
+            let broken = crate::cohesion::fracture_bonds(
+                &shape,
+                state.rotation,
+                total,
+                &contacts,
+                self.registry.as_ref(),
+            );
+            if broken.is_empty() {
+                continue;
+            }
+            let components = crate::cohesion::fracture_components(&shape, &broken);
+            self.outbox.cohesion_stats.bonds_broken += broken.len() as u64;
+            if components.len() <= 1 {
+                continue;
+            }
+            // 拆分(§7.3 第 5 条):原实体本拍删除,分量 N+1 出现(index = 分量序号)。
+            let pieces = crate::cohesion::fracture_pieces(&state, &desc, &components);
+            for (index, (piece_state, piece_desc)) in pieces.into_iter().enumerate() {
+                self.outbox
+                    .piece_requests
+                    .push(crate::cohesion::PieceRequest {
+                        parent: id,
+                        index: index as u32,
+                        state: piece_state,
+                        desc: piece_desc,
+                    });
+            }
+            self.entities.remove(&id).expect("存在");
+            self.phys.remove_body(handle);
+            self.outbox.despawned.push(id);
+            self.outbox.cohesion_stats.fracture_components += components.len() as u64;
+        }
     }
 
     /// 坍塌接入(REQ-009 §6.2.1,单元 04b;step 末调用 = 物理步进之后、交出
@@ -6294,6 +6524,377 @@ mod tests {
         assert!(s.entity_state(b).is_some(), "前置条件不满足:推迟、实体保留");
         assert!(s.forced_pending.contains(&b), "留在待执行集合");
         assert!(s.take_outbox().block_updates.is_empty(), "未写任何格");
+    }
+    // ==== REQ-010 单元 06(§7.3:碎裂与复合体砸地形)====
+
+    /// 顶格为一层 dirt、其下整柱 stone 的 chunk(砸地形用:土 I = 7、
+    /// 石 I = 18;土层接地,破坏两格不会触发整体坍塌)。
+    fn dirt_on_stone_chunk() -> Chunk {
+        let mut ch = Chunk::air();
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                ch.set(x, 64, z, voxel::builtin::DIRT);
+                for y in 0..64 {
+                    ch.set(x, y, z, types::BlockId(1));
+                }
+            }
+        }
+        ch
+    }
+
+    /// n 格方块梁 spawn 输入(位置/速度自定;实心层顶在 world y = 1,
+    /// `gap` = 底面离顶面的缝隙)。
+    fn beam_spawn_input(
+        seq: u64,
+        id: EntityId,
+        x: f32,
+        gap: f32,
+        vy: f32,
+        block: types::BlockId,
+        n: i32,
+    ) -> StampedInput {
+        let shape = types::CompoundShape::new(
+            (0..n)
+                .map(|i| types::ShapeCell {
+                    offset: [i, 0, 0],
+                    block,
+                })
+                .collect(),
+        )
+        .expect("梁 ≥ 2 格");
+        compound_spawn_input(
+            seq,
+            id,
+            EntityState {
+                translation: Vec3::new(x, 1.0 + crate::destruction::DEBRIS_HALF_SIZE + gap, 8.5),
+                linvel: Vec3::new(0.0, vy, 0.0),
+                ..EntityState::default()
+            },
+            shape,
+        )
+    }
+
+    /// §7.3 第 9 条(demo 问题 7):逐格碰撞体的接触点冲量与法向可读——复合体
+    /// **每一格**的 collider(不只代表 collider)与地形的接触对里,普通流形的
+    /// 点带 solver 解算冲量(> 0),法向是 world 系 ±Y。
+    ///
+    /// 变红:plain 流形不再回写冲量(rapier 升级回归);复合体 collider 不在
+    /// body.colliders() 里(挂法改变)。
+    #[test]
+    fn per_cell_contact_impulse_and_normal_are_readable() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        // 6 格石梁、v = −8 m/s(每格 ≈ 5.8 < 18:不碎、不砸穿石面,纯读接触)。
+        s.apply_prefix(&[beam_spawn_input(
+            1,
+            id,
+            10.5,
+            0.1,
+            -8.0,
+            voxel::builtin::STONE,
+            6,
+        )]);
+        // 地形 collider 键表(chunk 固定体)。
+        let terrain: std::collections::BTreeSet<(u32, u32)> = s
+            .chunk_bodies
+            .values()
+            .filter_map(|h| s.phys.bodies.get(*h))
+            .flat_map(|b| b.colliders().iter().copied())
+            .map(|c| {
+                let (g, i) = c.into_raw_parts();
+                (g, i)
+            })
+            .collect();
+        // 找到撞击拍:多格(含非首格的 collider)同时出现冲量 > 0 的接触点。
+        // 求解器会把个别接触点的冲量分到恰为 0(超静定分配,§7.1 的均摊根因),
+        // 所以断言"≥ 2 格可读、且覆盖非首格",不要求全部格同拍非零。
+        for _ in 0..10 {
+            s.step();
+            let Some(rec) = s.entities.get(&id) else {
+                panic!("石梁不应碎裂(每格 5.8 < 18):碎裂阈值接线错误");
+            };
+            let body = s.phys.bodies.get(rec.handle).expect("handle 有效");
+            let mut per_cell: std::collections::BTreeMap<[i32; 3], f32> =
+                std::collections::BTreeMap::new();
+            let mut normal_y_ok = true;
+            for ch in body.colliders() {
+                let key = ch.into_raw_parts();
+                let Some(col) = s.phys.colliders.get(*ch) else {
+                    continue;
+                };
+                let t = col
+                    .position_wrt_parent()
+                    .map_or(Vec3::ZERO, |p| p.translation);
+                let off = [t.x.round() as i32, t.y.round() as i32, t.z.round() as i32];
+                for pair in s.phys.narrow_phase.contact_pairs() {
+                    let k1 = pair.collider1.into_raw_parts();
+                    let k2 = pair.collider2.into_raw_parts();
+                    let other = if (k1.0, k1.1) == (key.0, key.1) {
+                        (k2.0, k2.1)
+                    } else if (k2.0, k2.1) == (key.0, key.1) {
+                        (k1.0, k1.1)
+                    } else {
+                        continue;
+                    };
+                    if !terrain.contains(&other) {
+                        continue;
+                    }
+                    for m in pair.manifolds() {
+                        // 法向断言只看带冲量的流形:侧面对挤的流形(法向 ±X)
+                        // 冲量恒 0,不参与撞击。
+                        let has_impulse = m.points.iter().any(|p| p.data.impulse > 0.0);
+                        if has_impulse && m.data.normal.y.abs() < 0.99 {
+                            normal_y_ok = false;
+                        }
+                        for pt in &m.points {
+                            if pt.data.impulse > 0.0 {
+                                let cur = per_cell.get(&off).copied().unwrap_or(0.0);
+                                per_cell.insert(off, cur.max(pt.data.impulse));
+                            }
+                        }
+                    }
+                }
+            }
+            if per_cell.len() >= 2 && per_cell.keys().any(|off| off[0] > 0) {
+                for (off, j) in per_cell {
+                    assert!(j > 0.0, "格 {off:?} 的接触点冲量可读且 > 0");
+                }
+                assert!(normal_y_ok, "接触法向是 world 系 ±Y");
+                return;
+            }
+        }
+        panic!(
+            "10 拍内没有出现多格(含非首格)的接触冲量:逐格接触不可读(demo 问题 7 的 Rust 侧前提)"
+        );
+    }
+
+    /// 碎裂接线(§7.3 第 3–5、8 条):6 格土梁以 −12 m/s 撞实心层,接触格均摊
+    /// ≈ 8.9 ≥ 7 → 5 根横向粘结全断 → 6 个分量;原实体本拍删除,每个分量产出
+    /// 分块请求(单格碎块、无形状、index = 分量序号、平移 = 原格世界中心、
+    /// 角速度同刚体),遥测 `bonds_broken` = 5、`fracture_components` = 6。
+    ///
+    /// 变红:碎裂没接线;只采代表 collider(只断 1 根);分块带形状;index 不
+    /// 是分量序号;遥测没接线;断键阈值误用承载 B(土 B = 3 早两倍就断)。
+    #[test]
+    fn dirt_compound_fractures_on_hard_landing() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        s.apply_prefix(&[beam_spawn_input(
+            1,
+            id,
+            10.5,
+            0.1,
+            -12.0,
+            voxel::builtin::DIRT,
+            6,
+        )]);
+        for _ in 0..3 {
+            s.step();
+        }
+        assert!(s.entity_state(id).is_none(), "碎裂后原实体删除");
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.bonds_broken, 5, "5 根横向粘结全断");
+        assert_eq!(out.cohesion_stats.fracture_components, 6, "拆成 6 个分量");
+        assert_eq!(out.piece_requests.len(), 6, "每个分量一个分块请求");
+        for (k, piece) in out.piece_requests.iter().enumerate() {
+            assert_eq!(piece.parent, id, "分块的母实体");
+            assert_eq!(piece.index, k as u32, "index = 分量序号");
+            assert!(piece.desc.shape().is_none(), "单格分量是普通单格碎块");
+            assert_eq!(piece.desc.block, voxel::builtin::DIRT);
+            assert_eq!(piece.desc.half_size, crate::destruction::DEBRIS_HALF_SIZE);
+            assert!(
+                (piece.state.translation.x - (10.5 + k as f32)).abs() < 0.05
+                    && (piece.state.translation.z - 8.5).abs() < 0.05,
+                "单格分量平移 = 该格世界中心(x 随分量序;撞击拍允许求解器位置修正的微小漂移):{:?}",
+                piece.state.translation
+            );
+            assert!(
+                piece
+                    .state
+                    .rotation
+                    .abs_diff_eq(types::glam::Quat::IDENTITY, 1e-2),
+                "旋转 ≈ 恒等(撞击力矩的微小扰动):{:?}",
+                piece.state.rotation
+            );
+            assert!(
+                piece.state.linvel.y.abs() < 13.0,
+                "线速度 = v + ω × r,不超过撞击速度量级(含弹回):{:?}",
+                piece.state.linvel
+            );
+            if k > 0 {
+                let spacing = out.piece_requests[k].state.translation.x
+                    - out.piece_requests[k - 1].state.translation.x;
+                assert!(
+                    (spacing - 1.0).abs() < 1e-3,
+                    "相邻分量间距 = 格宽:{spacing}"
+                );
+            }
+        }
+        // 石垫没被砸穿(每格 8.9 < 18),土也没写回体素。
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(10, 0, 8)),
+            types::BlockId(1)
+        );
+        assert!(
+            out.block_updates.is_empty(),
+            "碎裂当拍不写体素(散开同款,N+1 分块自己凝固)"
+        );
+    }
+
+    /// 砸地形均摊口径接线(§7.3 第 7 条):2 格石质复合体以 −10 m/s 砸土层,
+    /// `J_T / |T|` ≈ 7.3 ≥ 7 → 脚下两格土**同一拍**写 air(Emergent、零初速
+    /// 脱落请求、`cells_impacted`/`detached` 计 2);对照 −6 m/s 时每格 ≈ 4.4
+    /// < 7,一格都不掉。石梁自身不断键(横向粘结是压向豁免)。
+    ///
+    /// 变红:复合体接触没接进撞击采样(只采代表 collider → 只断一格);阈值
+    /// 判定用逐格相加;遥测没接线。
+    #[test]
+    fn compound_terrain_impact_amortized_breaks_and_counts() {
+        let drop = |vy: f32| {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            cfg.cohesion.enabled = true;
+            let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let id = entity(1);
+            s.apply_prefix(&[beam_spawn_input(
+                1,
+                id,
+                10.5,
+                0.1,
+                vy,
+                voxel::builtin::STONE,
+                2,
+            )]);
+            for _ in 0..3 {
+                s.step();
+            }
+            (s, id)
+        };
+        // −10 m/s:均摊 7.3 ≥ 7 → 两格土同拍脱落。
+        let (mut s, id) = drop(-10.0);
+        assert!(s.entity_state(id).is_some(), "石梁不碎(压向豁免)");
+        for x in 10..=11 {
+            assert_eq!(
+                s.voxels.get_block(BlockPos::new(x, 0, 8)),
+                voxel::builtin::AIR,
+                "({x},0,8) 被砸落"
+            );
+        }
+        let out = s.take_outbox();
+        assert_eq!(out.destruction_stats.cells_impacted, 2, "两格土同一拍脱落");
+        assert_eq!(out.destruction_stats.detached, 2);
+        assert_eq!(out.cohesion_stats.bonds_broken, 0, "石梁自身不断键");
+        assert_eq!(out.detach_requests.len(), 2, "每格一个脱落请求");
+        assert!(
+            out.detach_requests.iter().all(|r| r.impulse == Vec3::ZERO),
+            "脱落碎块零初速(REQ-009 §5 修订 8 同款)"
+        );
+        assert_eq!(
+            out.block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent && w.block == voxel::builtin::AIR)
+                .count(),
+            2,
+            "两格都经 Emergent 写 air"
+        );
+        // −6 m/s:均摊 ≈ 4.4 < 7 → 一格都不掉。
+        let (mut s2, _) = drop(-6.0);
+        for x in 10..=11 {
+            assert_eq!(
+                s2.voxels.get_block(BlockPos::new(x, 0, 8)),
+                voxel::builtin::DIRT,
+                "({x},0,8) 低于阈值不脱落"
+            );
+        }
+        assert_eq!(s2.take_outbox().destruction_stats.cells_impacted, 0);
+    }
+
+    /// 竖落豁免接线(§7.1 压向豁免、§7.3 风险 2 的生产路径):6 格石梁绕 z
+    /// 竖起、以 −8 m/s 竖直砸在石面上——只有底格接触,均摊冲量 ≈ 35 ≥ 18,
+    /// 但"底格向上那根粘结"是压向(世界系 +y,与受力方向点积 1 ≥ cos 45°),
+    /// 一根不断、实体保留。
+    ///
+    /// 变红:受力方向取反(压向被误判横向);点积用本体坐标(+x · +y = 0);
+    /// 豁免被删——三种实现 j_c ≥ 18 都会断底格那一根。
+    #[test]
+    fn upright_compound_landing_press_bond_exempt() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        let shape = types::CompoundShape::new(
+            (0..6)
+                .map(|i| types::ShapeCell {
+                    offset: [i, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格");
+        // 绕 z 转 90°:形状沿 +x 的格竖立为沿 +y;底格中心 y = 1.55。
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(10.5, 1.55, 8.5),
+                rotation: types::glam::Quat::from_rotation_z(90f32.to_radians()),
+                linvel: Vec3::new(0.0, -8.0, 0.0),
+                ..EntityState::default()
+            },
+            shape,
+        )]);
+        for _ in 0..60 {
+            s.step();
+        }
+        assert!(s.entity_state(id).is_some(), "竖落不断键,实体保留");
+        assert_eq!(
+            s.take_outbox().cohesion_stats.bonds_broken,
+            0,
+            "压向豁免:底格向上那根粘结一根不断"
+        );
+    }
+
+    /// 每拍上限与顺序(§7.3 第 6 条):`max_fractures_per_tick` = 1,两根土梁
+    /// 同拍撞击(A −13 m/s、B −11 m/s,J_c 都过阈)——按 J_c 降序只有 A 本拍
+    /// 碎,B 完好(它的撞击已被采样,轮空后本拍不断);`bonds_broken` 只计 A。
+    /// 两梁都放在 chunk 中部(离边界面 ≥ 2 格):贴边的格会与边界薄片成
+    /// 多流形对,solver 聚簇后 plain 流形读不到冲量(REQ-009 §5 已知现象)。
+    ///
+    /// 变红:上限不生效(B 同拍也碎);排序升序(B 先碎);上限后实体没删。
+    #[test]
+    fn fracture_cap_processes_highest_jc_first() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        cfg.cohesion.max_fractures_per_tick = 1;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let (a, b) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            beam_spawn_input(1, a, 10.5, 0.1, -13.0, voxel::builtin::DIRT, 2),
+            beam_spawn_input(2, b, 6.5, 0.1, -11.0, voxel::builtin::DIRT, 2),
+        ]);
+        for _ in 0..3 {
+            s.step();
+        }
+        assert!(s.entity_state(a).is_none(), "J_c 更大的 A 本拍碎");
+        assert!(s.entity_state(b).is_some(), "轮空的 B 本拍不断、实体保留");
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.bonds_broken, 1, "只处理了 A(1 根粘结)");
+        assert_eq!(out.cohesion_stats.fracture_components, 2);
+        assert_eq!(out.piece_requests.len(), 2);
+        assert!(out.piece_requests.iter().all(|p| p.parent == a));
     }
     // ==== REQ-007 任务 03(G3 返修补齐测试)====
 

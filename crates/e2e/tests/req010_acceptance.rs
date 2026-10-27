@@ -2725,7 +2725,6 @@ mod unit06 {
     ///
     /// 会变红的实现:不均摊(每格都按合计算,石梁平落 46.8 就全断);不豁免压向(竖落必断底格);压向判定用了本体坐标。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_fracture_bond_rules() {
         let reg = SimpleRegistry::builtin();
         let all: Vec<(usize, Vec3)> = (0..6).map(|i| (i, UP)).collect();
@@ -2778,7 +2777,6 @@ mod unit06 {
     ///
     /// 会变红的实现:分量顺序不按首格;把断开粘结两端的格都单独拆出来。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_fracture_components_rules() {
         let stone = beam(STONE);
         assert_eq!(
@@ -2813,7 +2811,6 @@ mod unit06 {
     ///
     /// 会变红的实现:分量直接沿用原平移(各段叠在一起);速度只给 v 不加 ω × r;单格分量仍带形状。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_fracture_pieces_rules() {
         let state = EntityState {
             translation: Vec3::new(10.5, 5.5, 3.5),
@@ -2978,7 +2975,6 @@ mod unit06 {
     ///
     /// 会变红的实现:逐格相加而不均摊(求解器把冲量集中在一格,5 m 就断)。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_stone_beam_flat_5m_stays_whole() {
         let (mut s, mut log) = session(true);
         drop_beam(&mut s, &mut log, 1, 64.5, 5.0, STONE, Quat::IDENTITY);
@@ -2997,7 +2993,6 @@ mod unit06 {
     ///
     /// 会变红的实现:碎裂没接线;拆分后丢格。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_dirt_beam_flat_8m_shatters() {
         let (mut s, mut log) = session(true);
         drop_beam(&mut s, &mut log, 1, 64.5, 8.0, DIRT, Quat::IDENTITY);
@@ -3022,7 +3017,6 @@ mod unit06 {
     ///
     /// 会变红的实现:压向豁免写反(所有粘结都被当成压向)。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c6_corner_first_stone_beam_breaks() {
         let (mut s, mut log) = session(true);
         drop_beam(
@@ -3045,7 +3039,6 @@ mod unit06 {
     ///
     /// 会变红的实现:复合体仍按单格口径逐地形格相加(桩上实测:8 m 那根脚下的 6 格不会同拍一起脱落);阈值或均摊分母算错。
     #[test]
-    #[ignore = "REQ-010 单元 06 待实施方解除"]
     fn acc_c5_compound_terrain_impact_averaged() {
         let (mut s, mut log) = session(false);
         drop_beam(&mut s, &mut log, 1, 64.5, 2.0, STONE, Quat::IDENTITY);
