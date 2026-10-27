@@ -119,6 +119,14 @@ impl CohesionStats {
     }
 }
 
+/// 复合体生成请求(REQ-010 §5.5):承载塌落的一段(≥ 2 格)转换成一个复合实体。
+/// 原点 = `compound_origin(段)`,形状 = `CompoundShape::from_world(origin, 段)`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompoundRequest {
+    pub origin: BlockPos,
+    pub shape: types::CompoundShape,
+}
+
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
 /// 任一侧不是实心方块(空气、非实心、未知 ID)为 0。
 pub fn bond_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId) -> u32 {

@@ -634,6 +634,20 @@ impl ActivationController {
 
     /// 预算强制(§9.12 命令唤醒路径):醒数超限时按距离降序给出应冻结者。
     /// 独立于 plan 的冷却(显式命令触及 = 立即生效)。
+    /// 醒体预算按格数计(REQ-010 §5.5 第 5 条):`awake` 的第三项是实体格数(单格 1、复合体 = 格数);
+    /// 格数之和超过 `max_awake_dynamic` 时,按到最近观察者距离降序(同距按 `EntityId` 升序)淘汰,直到格数之和
+    /// 不超过上限;返回被淘汰者(淘汰顺序)。`plan` 与命令唤醒后的强制都按此口径。
+    ///
+    /// **总架构师接口桩(REQ-010 单元 04)**:由实施方实现,并让 `plan` 与 `enforce_budget` 的调用方改用格数口径。
+    pub fn enforce_budget_cells(
+        &self,
+        observers: &[Vec3],
+        awake: &[(EntityId, Vec3, u32)],
+    ) -> Vec<EntityId> {
+        let _ = (observers, awake);
+        Vec::new()
+    }
+
     pub fn enforce_budget(&self, observers: &[Vec3], awake: &[(EntityId, Vec3)]) -> Vec<EntityId> {
         if awake.len() <= self.cfg.max_awake_dynamic {
             return Vec::new();

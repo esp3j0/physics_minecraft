@@ -1070,8 +1070,10 @@ mod unit02 {
             max_detach_per_tick: cap,
             ..DestructionConfig::default()
         };
+        // 单元 04 迁移:本模块的用例按逐格转换编写;单元 04 起按段转换(§5.5),切块边长设为 1 即每格一段、保持逐格。
         c.cohesion = CohesionConfig {
             enabled: cohesion,
+            compound_split_size: 1,
             ..CohesionConfig::default()
         };
         c
@@ -1922,5 +1924,362 @@ mod unit03a {
         assert_eq!(b.entity_desc(sh, id), Some(desc), "回放线的描述带形状");
         a.shutdown();
         b.shutdown();
+    }
+}
+
+/// 单元 04:塌落按段生成复合体(AC-C3、AC-C4、AC-C11;REQ-010 §5.5,修订 5)。
+// 桩阶段 `EntityDesc` 的比较依赖 `Clone`;与 unit03a 同理。
+#[allow(clippy::clone_on_copy)]
+mod unit04 {
+    use physics_sim::activation::{ActivationConfig, ActivationController};
+    use physics_sim::cohesion::CohesionConfig;
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EMERGENT_ORIGIN, EntityDesc,
+        EntityId, EntityState, ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+    const SAND: BlockId = builtin::SAND;
+    const AIR: BlockId = builtin::AIR;
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn column(x: i32, ys: std::ops::RangeInclusive<i32>, z: i32) -> Vec<BlockPos> {
+        ys.map(|y| p(x, y, z)).collect()
+    }
+
+    fn row(xs: std::ops::RangeInclusive<i32>, y: i32, z: i32) -> Vec<BlockPos> {
+        xs.map(|x| p(x, y, z)).collect()
+    }
+
+    fn eid(k: u32) -> EntityId {
+        EntityId::from_parts(EMERGENT_ORIGIN, k)
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 单分片会话(chunk x 2..=6、z 2..=5);破坏与本 REQ 开启,`slots` = 每拍实体名额,`split` = 切块边长,
+    /// `cells` = 每拍转换格数上限。
+    fn session(slots: usize, split: i32, cells: usize) -> Session {
+        let mut c = ShardSimConfig::new(shard());
+        c.destruction = DestructionConfig {
+            enabled: true,
+            max_detach_per_tick: slots,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: true,
+            compound_split_size: split,
+            max_converted_cells_per_tick: cells,
+            ..CohesionConfig::default()
+        };
+        let mut sim = ShardSim::new(c, registry());
+        for x in 2..=6 {
+            for z in 2..=5 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(shard(), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn block(s: &Session, q: BlockPos) -> BlockId {
+        let cp = q.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (q.x - cp.x * 16) as usize,
+            (q.y - WORLD_Y_MIN) as usize,
+            (q.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn emergent(s: &Session) -> Vec<(EntityId, EntityState)> {
+        s.entity_states(shard())
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    fn center_of(q: BlockPos) -> Vec3 {
+        Vec3::new(q.x as f32 + 0.5, q.y as f32 + 0.5, q.z as f32 + 0.5)
+    }
+
+    /// 期望的复合体描述:由世界格与 §5.1 的原点规则得出。
+    fn compound(cells: &[BlockPos], block: BlockId, origin: BlockPos) -> EntityDesc {
+        let world: Vec<(BlockPos, BlockId)> = cells.iter().map(|c| (*c, block)).collect();
+        EntityDesc::compound(
+            DEBRIS_HALF_SIZE,
+            CompoundShape::from_world(origin, &world).expect("≥ 2 格"),
+        )
+    }
+
+    /// 20 格石桥面 x 60..=79、y = −55、z = 72,石柱在 x = 60、70、79(y −60..=−56;两段净跨 9 与 8,都挂得住)。
+    /// 返回 (柱格, 桥面)。
+    fn bridge(s: &mut Session, log: &mut CommandLog) -> (Vec<BlockPos>, Vec<BlockPos>) {
+        let pillars: Vec<BlockPos> = [60, 70, 79]
+            .into_iter()
+            .flat_map(|x| column(x, -60..=-56, 72))
+            .collect();
+        let deck = row(60..=79, -55, 72);
+        set(s, log, &pillars, STONE);
+        set(s, log, &deck, STONE);
+        (pillars, deck)
+    }
+
+    /// AC-C4 门楣整块落下:土门楣左 6 格(x 60..=65,同一个 6 格切块)→ N 拍 6 格写 air、计 1 段 1 个复合体 6 格;
+    /// N+1 只生成 1 个实体——复合体,原点 (62, −55, 64)、偏移 −2..=3、方块 dirt,出生在原点格中心附近。
+    ///
+    /// 会变红的实现:仍逐格生成 6 个碎块;原点不按包围盒中心取整;复合体的描述没带形状;遥测没接线。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c4_door_lintel_falls_as_one_compound() {
+        let mut s = session(64, 6, 1024);
+        let mut log = CommandLog::new();
+        set(
+            &mut s,
+            &mut log,
+            &[column(60, -60..=-56, 64), column(66, -60..=-56, 64)].concat(),
+            STONE,
+        );
+        set(&mut s, &mut log, &row(60..=66, -55, 64), DIRT);
+        s.tick();
+        set(&mut s, &mut log, &column(60, -60..=-56, 64), AIR);
+        let n = s.tick();
+        let fell = row(60..=65, -55, 64);
+        for c in &fell {
+            assert_eq!(block(&s, *c), AIR, "N 拍 {c:?} 写 air");
+        }
+        assert_eq!(n.cohesion.segments, 1);
+        assert_eq!(n.cohesion.compounds_spawned, 1);
+        assert_eq!(n.cohesion.compound_cells, 6);
+        assert_eq!(n.destruction.cells_collapsed, 6);
+        s.tick();
+        let got = emergent(&s);
+        assert_eq!(got.len(), 1, "只生成一个实体");
+        let (id, state) = got[0];
+        assert_eq!(id, eid(1));
+        let origin = p(62, -55, 64);
+        assert!((state.translation - center_of(origin)).length() < 0.35);
+        assert_eq!(
+            s.entity_desc(shard(), id),
+            Some(compound(&fell, DIRT, origin))
+        );
+    }
+
+    /// AC-C3/C4 切块:20 格石桥面三根柱子同拍移走 → F = 20 格,按世界对齐的 6 格网格落成 4 段(6/6/6/2),
+    /// N+1 生成 4 个复合体,ID 按各段最小格升序依次为 1..=4,原点分别是 x = 62、68、74、78。
+    ///
+    /// 会变红的实现:切块网格按 F 自身的包围盒对齐;2 格的段被当成单格碎块;ID 不按最小格排序。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c4_bridge_splits_into_grid_segments() {
+        let mut s = session(64, 6, 1024);
+        let mut log = CommandLog::new();
+        let (pillars, deck) = bridge(&mut s, &mut log);
+        s.tick();
+        assert!(emergent(&s).is_empty(), "三根柱子撑着挂得住");
+        set(&mut s, &mut log, &pillars, AIR);
+        let n = s.tick();
+        assert_eq!(n.cohesion.segments, 4);
+        assert_eq!(n.cohesion.compounds_spawned, 4);
+        assert_eq!(n.cohesion.compound_cells, 20);
+        s.tick();
+        let got = emergent(&s);
+        let segs: [(std::ops::RangeInclusive<i32>, i32); 4] =
+            [(60..=65, 62), (66..=71, 68), (72..=77, 74), (78..=79, 78)];
+        assert_eq!(got.len(), 4);
+        for (k, (xs, ox)) in segs.into_iter().enumerate() {
+            let (id, state) = got[k];
+            assert_eq!(id, eid(k as u32 + 1), "第 {k} 段的 ID");
+            let origin = p(ox, -55, 72);
+            assert!((state.translation - center_of(origin)).length() < 0.35);
+            let cells: Vec<BlockPos> = deck.iter().copied().filter(|c| xs.contains(&c.x)).collect();
+            assert_eq!(
+                s.entity_desc(shard(), id),
+                Some(compound(&cells, STONE, origin))
+            );
+        }
+    }
+
+    /// AC-C3/C4 材料分段与 ID 交错:石柱顶上 2 格石头(x 90..=91)、右格上压 1 格沙;移走石柱 → 2 格石头成一个复合体、
+    /// 沙子单独成单格碎块(沙没有粘结);两者的 ID 按最小格升序:复合体 (90, −58) 在前,沙 (91, −57) 在后。
+    ///
+    /// 会变红的实现:沙子并进了复合体;单格与复合体分开编号(先发完一种再发另一种)。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c4_sand_stays_single_and_ids_interleave() {
+        let mut s = session(64, 6, 1024);
+        let mut log = CommandLog::new();
+        let pillar = column(90, -60..=-59, 80);
+        set(&mut s, &mut log, &pillar, STONE);
+        set(&mut s, &mut log, &[p(90, -58, 80), p(91, -58, 80)], STONE);
+        set(&mut s, &mut log, &[p(91, -57, 80)], SAND);
+        s.tick();
+        set(&mut s, &mut log, &pillar, AIR);
+        let n = s.tick();
+        assert_eq!(n.cohesion.segments, 2);
+        assert_eq!(n.cohesion.compounds_spawned, 1);
+        s.tick();
+        let got = emergent(&s);
+        assert_eq!(got.len(), 2);
+        let pair = [p(90, -58, 80), p(91, -58, 80)];
+        assert_eq!(
+            s.entity_desc(shard(), eid(1)),
+            Some(compound(&pair, STONE, p(90, -58, 80)))
+        );
+        let sand = s.entity_desc(shard(), eid(2)).expect("沙子碎块");
+        assert!(sand.shape().is_none(), "沙子是单格碎块");
+        assert_eq!(sand.block, SAND);
+    }
+
+    /// AC-C4 名额与原子性(§5.5 第 2 条):
+    /// - 每拍 2 个实体名额:桥面 4 段 → N 拍转换前 2 段(x 60..=71),后 2 段整段留下(x 72..=79 仍是石头,待转换 8 格);
+    ///   N+1 转换其余;最终 4 个复合体;
+    /// - 切块边长 2、每拍 8 格:10 段 × 2 格 → 每拍 4 段,N、N+1、N+2 依次转换 x 60..=67、68..=75、76..=79。
+    ///
+    /// 会变红的实现:段被拆开转换;名额不足时跳过大段先转后面的小段;格数上限没生效。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c4_segment_quota_is_atomic() {
+        let air_xs = |s: &Session| -> Vec<i32> {
+            (60..=79)
+                .filter(|x| block(s, p(*x, -55, 72)) == AIR)
+                .collect()
+        };
+        let mut s = session(2, 6, 1024);
+        let mut log = CommandLog::new();
+        let (pillars, _) = bridge(&mut s, &mut log);
+        s.tick();
+        set(&mut s, &mut log, &pillars, AIR);
+        let n = s.tick();
+        assert_eq!(
+            air_xs(&s),
+            (60..=71).collect::<Vec<_>>(),
+            "N 拍整段转换前 2 段"
+        );
+        assert_eq!(n.cohesion.load_pending, 8);
+        s.tick();
+        assert_eq!(air_xs(&s), (60..=79).collect::<Vec<_>>(), "N+1 拍转换其余");
+        s.tick();
+        assert_eq!(emergent(&s).len(), 4);
+
+        let mut s = session(64, 2, 8);
+        let mut log = CommandLog::new();
+        let (pillars, _) = bridge(&mut s, &mut log);
+        s.tick();
+        set(&mut s, &mut log, &pillars, AIR);
+        for want in [60..=67, 60..=75, 60..=79] {
+            s.tick();
+            assert_eq!(air_xs(&s), want.collect::<Vec<_>>(), "每拍至多 8 格");
+        }
+    }
+
+    /// AC-C12 生成请求进快照:门楣塌落的 N 拍与 N+1 之间取世界快照并回放,两线各跑 2 拍,生成的复合体
+    /// (ID、状态、描述)逐位相同。
+    ///
+    /// 会变红的实现:复合体生成请求不进调度器快照(回放线没有这个实体);回放时形状丢失。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c12_compound_request_survives_snapshot() {
+        let mut a = session(64, 6, 1024);
+        let mut log = CommandLog::new();
+        set(
+            &mut a,
+            &mut log,
+            &[column(60, -60..=-56, 64), column(66, -60..=-56, 64)].concat(),
+            STONE,
+        );
+        set(&mut a, &mut log, &row(60..=66, -55, 64), DIRT);
+        a.tick();
+        set(&mut a, &mut log, &column(60, -60..=-56, 64), AIR);
+        a.tick();
+        let world = a.world_snapshot();
+        let mut b = sim_api::replay::replay_world(&world, &log, cfg(), registry).expect("回放");
+        for _ in 0..2 {
+            a.tick();
+            b.tick();
+        }
+        let (ea, eb) = (emergent(&a), emergent(&b));
+        assert_eq!(ea.len(), 1);
+        assert_eq!(ea, eb, "回放线逐位相同");
+        assert_eq!(
+            a.entity_desc(shard(), ea[0].0),
+            b.entity_desc(shard(), eb[0].0)
+        );
+        assert!(
+            b.entity_desc(shard(), eb[0].0)
+                .and_then(|d| d.shape().cloned())
+                .is_some()
+        );
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// AC-C11 醒体预算按格数计(§5.5 第 5 条):上限 10 格。近处 6 格复合体 + 近处单格 = 7 格,不淘汰;
+    /// 再加远处 6 格复合体 = 13 格 → 只淘汰最远的那个;三个 6 格复合体(18 格)→ 由远到近淘汰两个。
+    ///
+    /// 会变红的实现:仍按实体个数计(3 个 < 10,不淘汰);淘汰顺序不是由远到近;多淘汰了。
+    #[test]
+    #[ignore = "REQ-010 单元 04 待实施方解除"]
+    fn acc_c11_awake_budget_counts_cells() {
+        let ctl = ActivationController::new(ActivationConfig {
+            max_awake_dynamic: 10,
+            ..ActivationConfig::default()
+        });
+        let obs = [Vec3::ZERO];
+        let (a, b, c) = (eid(1), eid(2), eid(3));
+        let near6 = (a, Vec3::new(5.0, 0.0, 0.0), 6);
+        let far6 = (b, Vec3::new(50.0, 0.0, 0.0), 6);
+        let near1 = (c, Vec3::new(3.0, 0.0, 0.0), 1);
+        assert!(
+            ctl.enforce_budget_cells(&obs, &[near6, near1]).is_empty(),
+            "7 格不超"
+        );
+        assert_eq!(
+            ctl.enforce_budget_cells(&obs, &[near6, far6, near1]),
+            vec![b]
+        );
+        let mid6 = (c, Vec3::new(20.0, 0.0, 0.0), 6);
+        assert_eq!(
+            ctl.enforce_budget_cells(&obs, &[near6, far6, mid6]),
+            vec![b, c],
+            "由远到近淘汰到 ≤ 10 格"
+        );
     }
 }
