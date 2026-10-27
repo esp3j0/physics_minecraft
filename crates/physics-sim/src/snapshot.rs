@@ -82,6 +82,11 @@ struct ShardSimSnapshot {
     /// 已转换的格;checkpoint 落在推迟与再求值之间时恢复线不得丢(acc_d7)。
     /// 随快照走。**布局变化**:更早时点的 v6 档解码失败——需清 data_dir。
     collapse_deferred: BTreeSet<types::BlockPos>,
+    /// 承载判定的待转换队列(REQ-010 §4.6 第 4 条,单元 02;v7 追加):推迟
+    /// 的转换按 `BlockPos` 升序直接执行、不重新求值;checkpoint 落在推迟与
+    /// 转换之间时恢复线不得丢(acc_c2_pending)。随快照走。**布局变化**:
+    /// v6 档解码失败——需清 data_dir(REQ-010 §4.6 第 8 条)。
+    load_pending: BTreeSet<types::BlockPos>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -169,6 +174,7 @@ impl ShardSim {
             observed: self.observed.clone(),
             wake_centers: self.wake_centers.clone(),
             collapse_deferred: self.collapse_deferred.clone(),
+            load_pending: self.load_pending.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -234,6 +240,9 @@ impl ShardSim {
             wake_centers: snap.wake_centers,
             collapse_triggers: BTreeSet::new(),
             collapse_deferred: snap.collapse_deferred,
+            load_pending: snap.load_pending,
+            // 承载转换记录不入快照(拍内表,两拍之间必为空,§9)。
+            load_conversion_records: BTreeMap::new(),
             // 撞击接近速度基准不入快照(拍内表,两拍之间必为空)。
             pre_impulse_vels: BTreeMap::new(),
         })

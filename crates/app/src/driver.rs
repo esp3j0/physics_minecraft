@@ -448,7 +448,12 @@ pub struct DriverOutcome {
 /// 单元 02 时点的 v6 档解码必失败,同样必须清 `data_dir`;单元 04b 追加
 /// 分片快照的坍塌推迟队列(`ShardSimSnapshot.collapse_deferred`,REQ-009
 /// §6.2.1)——单元 03 时点的 v6 档解码必失败,同样必须清 `data_dir`。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 6;
+/// **v7**(REQ-010 单元 02,#19):分片快照追加承载判定的待转换队列
+/// (`ShardSimSnapshot.load_pending`,§4.6 第 4 条)、出站写入与信封增承载
+/// 转换标记(`BlockWrite::load_conversion`)——v6 及更早档解码必失败/版本
+/// 拒绝,必须清 `data_dir`;单元 03 在 v7 内追加形状,单元之间不保证 v7
+/// 检查点互通(§4.6 第 8 条)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 7;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -2855,12 +2860,12 @@ mod tests {
     }
 
     /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
-    /// 常量已升 6(REQ-009 单元 02;#17 D2 时曾为 5);v3 编码(bundle 形状
-    /// 同构、版本号 3)必须显式版本拒绝。与 `old_checkpoint_version_rejected`
-    /// ⑤ 相互独立:一个锚行为,一个锚常量。
+    /// 常量已升 7(REQ-010 单元 02;#17 D2 时曾为 5、REQ-009 单元 02 起 6);
+    /// v3 编码(bundle 形状同构、版本号 3)必须显式版本拒绝。与
+    /// `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 6, "REQ-009 单元 02 起 = v6");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 7, "REQ-010 单元 02 起 = v7");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -2899,7 +2904,7 @@ mod tests {
         };
         let v6 = mk(CHECKPOINT_FORMAT_VERSION);
         let bytes = encode_checkpoint(&v6);
-        assert_eq!(bytes[0], 6, "前缀 = 未压缩 varint 版本(6 = 单字节)");
+        assert_eq!(bytes[0], 7, "前缀 = 未压缩 varint 版本(7 = 单字节)");
         assert!(
             bytes.len() < 50_000,
             "1 MB 全零日志应被压缩,实为 {} 字节",

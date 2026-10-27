@@ -1190,7 +1190,6 @@ mod unit02 {
     /// 会变红的实现:开启后仍走 `find_collapse`(土门楣经右柱锚定,不塌);承载判定推迟到下一拍;
     /// 遥测没接线或合计漏了分片;承载判定也计进了 `collapse_evaluations`。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c2_door_lintel_end_to_end() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, true, 64);
@@ -1263,7 +1262,6 @@ mod unit02 {
     ///
     /// 会变红的实现:放置不触发;只登记"实心变空";材料替换不触发;放上去的格不进 F。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c2_placement_and_replacement_trigger() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, true, 64);
@@ -1299,7 +1297,6 @@ mod unit02 {
     ///
     /// 会变红的实现:凝固写入不登记触发。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c2_solidify_triggers_load_check() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6, true, true, 64);
@@ -1338,7 +1335,6 @@ mod unit02 {
     ///
     /// 会变红的实现:推迟时重新求值(剩下 3 格永远悬空);待转换集合不进快照(回放线少塌 3 格);超出名额的格丢失。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c2_pending_conversions_survive_without_reevaluation() {
         let sh = shard(0);
         let mut a = session(&[0], 2..=6, true, true, 3);
@@ -1380,7 +1376,6 @@ mod unit02 {
     ///
     /// 会变红的实现:承载判定不看 `destruction.enabled`;关闭时仍登记"加重"的触发;遥测在关闭时计数。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c16_switches() {
         for (destruction, cohesion) in [(true, false), (false, true)] {
             let sh = shard(0);
@@ -1470,7 +1465,6 @@ mod unit02 {
     /// 会变红的实现:不看标记(永远只求写入后的一次,门楣残余永远悬空);把邻片本体区的格也转换了;
     /// 本片的转换写入没带标记(下游分片又会漏判)。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c10_neighbor_conversion_evaluated_before_and_after() {
         for marked in [true, false] {
             let mut sim = shard_sim(1);
@@ -1518,20 +1512,23 @@ mod unit02 {
         }
     }
 
-    /// AC-C10 "写入后"那次不能省(§9):石桥面 112..=133 贴着分片 (1,0) 视图的边缘(x = 111 未装载 → 有地基)。
+    /// AC-C10 "写入后"那次不能省(§9):桥面 112..=133 用 `register` 注册的方块(未指定材料,B = ∞),贴着分片 (1,0)
+    /// 视图的边缘——x = 111 未装载,只有 x = 112 那格连汇点 ∞,但 ∞ 粘结能把整条桥面的重量都传过去,搭好时稳定。
     /// 只收到带标记的 112..=127 写 air:"转换前"那次把视图外当地基、判稳定;"写入后"那次剩下 128..=133 无支撑 → 转换 6 格。
     ///
     /// 会变红的实现:有标记时只求"转换前"那一次。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c10_after_write_evaluation_still_needed() {
-        let mut sim = shard_sim(1);
+        let mut reg = SimpleRegistry::builtin();
+        let beam = reg.register("beam", true).expect("注册");
+        let mut sim = ShardSim::new(sim_cfg(1, true, true, 64), Box::new(reg));
+        load(&mut sim, 7..=9, 3..=4);
         let deck = row(112..=133, -55, 64);
-        command(&mut sim, &deck, STONE);
+        command(&mut sim, &deck, beam);
         sim.step();
         assert!(
             sim.take_outbox().detach_requests.is_empty(),
-            "贴着未装载 chunk:按有地基"
+            "∞ 粘结的桥面贴着未装载 chunk:挂得住"
         );
         envelopes(&mut sim, &[], &row(112..=127, -55, 64));
         sim.step();
@@ -1549,7 +1546,6 @@ mod unit02 {
     ///
     /// 会变红的实现:调度器没把标记带进信封;接收方不求"转换前"那次(128..=130 永远悬空);凝固不触发。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c10_cross_shard_lintel_end_to_end() {
         let (s0, s1) = (shard(0), shard(1));
         let mut s = session(&[0, 1], 6..=9, true, true, 64);
@@ -1607,7 +1603,6 @@ mod unit02 {
     ///
     /// 会变红的实现:信封、出站写入与待转换集合的格式变了却没升版本。
     #[test]
-    #[ignore = "REQ-010 单元 02 待实施方解除"]
     fn acc_c12_checkpoint_version_is_v7() {
         assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 7);
     }

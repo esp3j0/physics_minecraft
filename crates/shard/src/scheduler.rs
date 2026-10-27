@@ -1608,6 +1608,8 @@ impl Scheduler {
         // 地形破坏遥测合计(REQ-009 §8,单元 05):屏障阶段把各分片的
         // `Outbox::destruction_stats` 相加(outbox 每拍取走即清,计数按拍归零)。
         let mut destruction = physics_sim::destruction::DestructionStats::default();
+        // 粘结与整块塌落遥测合计(REQ-010 §11,单元 02):同款逐分片相加。
+        let mut cohesion = physics_sim::cohesion::CohesionStats::default();
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
@@ -1616,6 +1618,8 @@ impl Scheduler {
         for (shard, (sim, mut outbox, shard_events)) in results {
             // 地形破坏遥测(REQ-009 §8):本分片本拍计数并入合计(加法可交换)。
             destruction.add(&outbox.destruction_stats);
+            // 粘结与整块塌落遥测(REQ-010 §11):同款并入合计。
+            cohesion.add(&outbox.cohesion_stats);
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -2088,7 +2092,7 @@ impl Scheduler {
             stepped_shards,
             migrations_admitted,
             destruction,
-            cohesion: physics_sim::cohesion::CohesionStats::default(),
+            cohesion,
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -6088,6 +6092,129 @@ mod tests {
         assert_eq!(
             t2.destruction,
             physics_sim::destruction::DestructionStats::default(),
+            "下一拍归零"
+        );
+        sched.shutdown();
+    }
+
+    /// 粘结开启的同相对分片(装载与 `destruction_sim_centered` 同款;`cfg`
+    /// 是 crate 私有,这里独立构造:破坏 + 粘结都开,承载判定接管坍塌求值)。
+    fn cohesion_sim_centered(x: i32, z: i32) -> ShardSim {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.destruction.enabled = true;
+        cfg.cohesion.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let (bx, bz) = (x * 8, z * 8); // min_chunk
+        for cx in bx + 2..=bx + 6 {
+            for cz in bz + 2..=bz + 6 {
+                let cp = types::ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s
+    }
+
+    /// REQ-010 §11(单元 02):屏障阶段把**全部分片**的 `Outbox::cohesion_stats`
+    /// 合计进 `TickSummary::cohesion`;计数每拍归零(outbox 取走即清)。
+    ///
+    /// 变红:合计没接线(summary 恒默认);只取某一个分片的计数(减半);
+    /// 跨拍累计;承载判定误计入 REQ-009 的 `collapse_*`。
+    #[test]
+    fn tick_summary_aggregates_cohesion_stats() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let (a, b) = (shard_id(0, 0), shard_id(1, 0));
+        sched.register(cohesion_sim_centered(0, 0));
+        sched.register(cohesion_sim_centered(1, 0));
+        // 各分片搭一根柱(x0、y −60..=−56)+ 5 格土门楣(x0..=x0+4,两端柱顶
+        // 出口 3+3 ≥ 中间 3,恰好稳);x0 = 本体区内相对 60 的绝对 x。
+        let pillar_lintel = |shard: types::ShardId| -> Vec<(types::BlockPos, types::BlockId)> {
+            let x0 = shard.pos.x * 128 + 60;
+            let (stone, dirt) = (voxel::builtin::STONE, voxel::builtin::DIRT);
+            let mut cells: Vec<(types::BlockPos, types::BlockId)> = (-60..=-56)
+                .flat_map(|y| {
+                    [(x0, y), (x0 + 4, y)].map(|(x, yy)| (types::BlockPos::new(x, yy, 64), stone))
+                })
+                .collect();
+            cells.extend((x0..=x0 + 4).map(|x| (types::BlockPos::new(x, -55, 64), dirt)));
+            cells
+        };
+        for (k, &shard) in [a, b].iter().enumerate() {
+            for (seq, (pos, block)) in pillar_lintel(shard).into_iter().enumerate() {
+                sched
+                    .submit(
+                        shard,
+                        cmd_input(
+                            InputSource(1),
+                            (k * 100 + seq) as u64,
+                            Tick::ZERO,
+                            messaging::SimCommand::SetBlock { pos, block },
+                        ),
+                    )
+                    .expect("收件箱未满");
+            }
+        }
+        // 第一拍(搭建):两分片各求值一次、F = ∅。
+        let t = sched.tick();
+        assert_eq!(
+            (t.cohesion.load_evaluations, t.cohesion.load_falling),
+            (2, 0),
+            "两分片各一次承载求值,满载门楣稳定"
+        );
+        assert_eq!(t.destruction.collapse_evaluations, 0, "不计 REQ-009 求值");
+        // 第二拍(拆左柱):每分片 F = 门楣 x0..=x0+3 共 4 格(右端格仍压在
+        // 右柱顶上,接地不塌),转换 4 格。提交在拍 1 之后,apply_at = 当前拍
+        //(迟到输入 fail-stop)。
+        for (k, &shard) in [a, b].iter().enumerate() {
+            let x0 = shard.pos.x * 128 + 60;
+            for (seq, y) in (-60..=-56).enumerate() {
+                sched
+                    .submit(
+                        shard,
+                        cmd_input(
+                            InputSource(1),
+                            (500 + k * 100 + seq) as u64,
+                            Tick(1),
+                            messaging::SimCommand::SetBlock {
+                                pos: types::BlockPos::new(x0, y, 64),
+                                block: voxel::builtin::AIR,
+                            },
+                        ),
+                    )
+                    .expect("收件箱未满");
+            }
+        }
+        let t = sched.tick();
+        assert_eq!(
+            (
+                t.cohesion.load_evaluations,
+                t.cohesion.load_visited,
+                t.cohesion.load_falling
+            ),
+            (2, 8, 8),
+            "两分片各 1 次求值 / 4 格 / 塌 4 格,合计逐字段相加"
+        );
+        assert_eq!(
+            (t.destruction.cells_collapsed, t.destruction.detached),
+            (8, 8),
+            "转换照常计入 REQ-009 口径"
+        );
+        // 第三拍(转换拍的触发):每分片各一次求值、F = ∅(右端格仍压在
+        // 右柱上,接地),不再塌。
+        let t3 = sched.tick();
+        assert_eq!(
+            (t3.cohesion.load_evaluations, t3.cohesion.load_falling),
+            (2, 0),
+            "转换写入触发下一拍求值"
+        );
+        // 第四拍:计数归零,不跨拍累计。
+        let t4 = sched.tick();
+        assert_eq!(
+            t4.cohesion,
+            physics_sim::cohesion::CohesionStats::default(),
             "下一拍归零"
         );
         sched.shutdown();

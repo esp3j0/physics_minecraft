@@ -374,6 +374,15 @@ pub struct ShardSim {
     /// 原样 ∪ 上一拍已转换的格;每拍求值输入之一。随分片快照走(checkpoint
     /// 落在推迟与再求值之间时恢复线不得丢,acc_d7)。
     pub(crate) collapse_deferred: BTreeSet<BlockPos>,
+    /// 承载判定的待转换队列(REQ-010 §4.6 第 4 条;v7 快照追加):F 中本体区
+    /// 内、当时仍实心的格;每拍按 `BlockPos` 升序**直接转换、不重新求值**(承载
+    /// 判定不单调——重新求值会让土门楣的残余恰好被单键容量托住而永远悬空),
+    /// 数量受本拍剩余名额约束;轮到时已不是实心的格丢弃。随分片快照走。
+    pub(crate) load_pending: BTreeSet<BlockPos>,
+    /// 本拍收到的邻片承载转换写入的"写入前方块"记录(REQ-010 §9):拍首应用
+    /// 时记下、拍末求两次的"转换前"求值取走后清空——记录只在本拍有效,不进
+    /// 快照(checkpoint 落在两拍之间时必为空,同 [`ShardSim::collapse_triggers`])。
+    pub(crate) load_conversion_records: BTreeMap<BlockPos, BlockId>,
 }
 
 impl ShardSim {
@@ -409,6 +418,8 @@ impl ShardSim {
             wake_centers: None,
             collapse_triggers: BTreeSet::new(),
             collapse_deferred: BTreeSet::new(),
+            load_pending: BTreeSet::new(),
+            load_conversion_records: BTreeMap::new(),
             pre_impulse_vels: BTreeMap::new(),
         }
     }
@@ -612,15 +623,18 @@ impl ShardSim {
                     // (owner/holder 才会被盖章为收件人;未装载 = 内部一致性
                     // 违规 fail-stop),写体素 + 重建边界 collider;**不推
                     // `outbox.block_updates`**(防广播回环)。
-                    EnvelopePayload::BlockWrite { pos, block, .. } => {
+                    EnvelopePayload::BlockWrite {
+                        pos,
+                        block,
+                        load_conversion,
+                    } => {
                         assert!(
                             self.voxels.get_chunk(pos.chunk_of()).is_some(),
                             "BlockWrite 信封落到未装载 chunk {pos:?}(owner/holder 必然\
                              装载着该 chunk,内部一致性违规,fail-stop)"
                         );
-                        // 坍塌触发要判断"由实心变为非实心",先取写入前的实心性。
-                        let old_solid =
-                            self.registry.material(self.voxels.get_block(pos)).is_some();
+                        // 触发登记与承载转换记录都要写前的方块(§4.6 第 2/3 条)。
+                        let old_block = self.voxels.get_block(pos);
                         if self.voxels.set_block(pos, block).is_ok() {
                             // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                             for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
@@ -631,10 +645,16 @@ impl ShardSim {
                             // holder 侧同样登记(04c 风险 4):边界附近的
                             // holder 侧冻结实体失去支撑也须醒来。
                             self.register_terrain_write(pos);
+                            // 承载转换记录(REQ-010 §9):带标记的写入记下写入前
+                            // 的方块,拍末"转换前"求值把该格换回这个方块;只在本
+                            // 拍有效,同拍多条取第一条(写入前状态)。
+                            if load_conversion && self.load_enabled() {
+                                self.load_conversion_records.entry(pos).or_insert(old_block);
+                            }
                             // 坍塌触发(REQ-009 §6.2.1 风险 1):邻片 owner 的
                             // 涌现写入同样登记——漏了它,跨分片悬空块的另一半
                             // 会因"没看到"而永远悬空(§6.3,acc_d6)。
-                            self.register_collapse_trigger(pos, old_solid, block);
+                            self.register_collapse_trigger(pos, old_block, block);
                         }
                     }
                 },
@@ -882,6 +902,7 @@ impl ShardSim {
                     disp > cfg.max_snap_blocks || ang_err > cfg.max_snap_angle_deg.to_radians();
                 if !too_far || is_sleeping {
                     // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
+                    let old_block = self.voxels.get_block(cell);
                     if self.voxels.set_block(cell, desc.block).is_ok() {
                         // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                         for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
@@ -905,6 +926,11 @@ impl ShardSim {
                         // 涌现写入同样登记地形变更唤醒(04c;验收
                         // acc_04c_solidify_write_wakes_adjacent_frozen_actor)。
                         self.register_terrain_write(cell);
+                        // 凝固写入触发承载判定(REQ-010 §4.6 第 2 条、D8):
+                        // 梁凝固在悬臂上可能把它压断;step 中段的写入在本拍拍末
+                        // 的求值里生效(风险 4)。REQ-009 口径(关闭时)下
+                        // air→实心不登记,行为不变。
+                        self.register_collapse_trigger(cell, old_block, desc.block);
                         continue;
                     }
                 }
@@ -2241,6 +2267,7 @@ impl ShardSim {
             };
             // 落点写块(Emergent)+ despawn(与凝固桥同产出;复用 REQ-005
             // 广播持久化)。
+            let old_block = self.voxels.get_block(landing);
             let _ = self.voxels.set_block(landing, block_desc.block);
             for ncp in expand_boundary([landing.chunk_of()], &self.voxels) {
                 if self.built_colliders.contains(&ncp) {
@@ -2253,7 +2280,10 @@ impl ShardSim {
                 kind: BlockWriteKind::Emergent,
                 load_conversion: false,
             });
-            // 强制落地的落点写入同样登记(04c 风险 1:四路全覆盖)。
+            // 强制落地的落点写入同样登记(04c 风险 1:四路全覆盖);触发承载
+            // 判定(REQ-010 §4.6 第 2 条、D8)。lifecycle 在 step 之后执行,
+            // 触发落在下一拍的求值里。
+            self.register_collapse_trigger(landing, old_block, block_desc.block);
             self.register_terrain_write(landing);
             self.entities.remove(&id).expect("存在");
             self.phys.remove_body(handle);
@@ -2344,22 +2374,39 @@ impl ShardSim {
         self.pending_terrain_wakes.insert(cell);
     }
 
-    /// 坍塌触发登记(REQ-009 §6.2.1 范围 1):仅当写入把**实心格变为非实心**
-    /// (`old_solid` 且新方块无材料 = air、非实心或未知 ID)才登记;总开关关闭
-    /// 时不收集(范围 5)。四路写入中三路走本出口(SetBlock 命令、BlockWrite
-    /// 信封、爆炸写 air),第四路(坍塌转换)在 `evaluate_collapse` 内直接并入
-    /// 推迟队列。
+    /// 坍塌/承载触发登记(REQ-009 §6.2.1、REQ-010 §4.6 第 2 条):写入前后
+    /// 方块**不同**、且**至少一侧是实心方块**才登记。承载判定开启
+    /// (`destruction.enabled` ∧ `cohesion.enabled`,见 [`ShardSim::load_enabled`])时
+    /// "加重"的写入(放置、凝固桥、强制落地、实心换实心的材料替换)同样登记;
+    /// 关闭时保持 REQ-009 口径——仅实心 → 非实心登记、总开关关闭不收集。
+    /// 六路写入统一走本出口:SetBlock 命令、BlockWrite 信封、爆炸、撞击、凝固
+    /// 桥、强制落地(后两路此前只写实心、不走该出口,REQ-010 起也登记)。
     ///
-    /// **守卫用例的变异点**:`evaluate_collapse` 不再重复判开关——关闭时触发集
-    /// 恒空、求值入口首行即返回,天然"不收集、不求值";若在本出口再放一道闸,
-    /// 单一变异无法让守卫用例 `acc_d5_disabled_no_collapse` 变红(纪律 12)。
-    fn register_collapse_trigger(&mut self, pos: BlockPos, old_solid: bool, new_block: BlockId) {
-        if !old_solid || !self.cfg.destruction.enabled {
+    /// **守卫用例的变异点(保持)**:REQ-009 路径的开关闸仍在登记出口,
+    /// `evaluate_collapse` 的 REQ-009 分支不重复判开关——关闭时触发集恒空、
+    /// 求值入口按空触发集早退,守卫用例的单一变异语义不变。
+    fn register_collapse_trigger(&mut self, pos: BlockPos, old_block: BlockId, new_block: BlockId) {
+        if old_block == new_block {
             return;
         }
-        if self.registry.material(new_block).is_none() {
+        let old_solid = self.registry.material(old_block).is_some();
+        let new_solid = self.registry.material(new_block).is_some();
+        if !(old_solid || new_solid) {
+            return;
+        }
+        if self.load_enabled() {
+            self.collapse_triggers.insert(pos);
+            return;
+        }
+        if old_solid && !new_solid && self.cfg.destruction.enabled {
             self.collapse_triggers.insert(pos);
         }
+    }
+
+    /// 承载判定是否接管坍塌求值(REQ-010 §4.6 第 1 条):两个开关同时开启;
+    /// 任一关闭时走 REQ-009 原路径,行为逐位不变(含触发口径与推迟队列)。
+    fn load_enabled(&self) -> bool {
+        self.cfg.destruction.enabled && self.cfg.cohesion.enabled
     }
 
     /// 撞击破坏采样与落写(REQ-009 §5,单元 06;调用点 = `step` 内
@@ -2549,7 +2596,7 @@ impl ShardSim {
             self.outbox.destruction_stats.cells_impacted += 1;
             self.outbox.destruction_stats.detached += 1;
             // 撞击写入进入本拍坍塌的触发集(范围 3;实心 → air)。
-            self.register_collapse_trigger(cell, true, BlockId::AIR);
+            self.register_collapse_trigger(cell, block, BlockId::AIR);
             self.outbox.block_updates.push(BlockWrite {
                 pos: cell,
                 block: BlockId::AIR,
@@ -2581,15 +2628,21 @@ impl ShardSim {
     }
 
     /// 坍塌接入(REQ-009 §6.2.1,单元 04b;step 末调用 = 物理步进之后、交出
-    /// outbox 之前)。触发集 = 本拍实心→非实心写入 ∪ 推迟队列(上一拍触发集
-    /// 原样 + 上一拍已转换的格);对**本分片体素**求值 `find_collapse` 后,只
-    /// 转换本体区内的 `falling` 格(`BlockPos` 升序,find_collapse 已排序),
-    /// 受本拍剩余名额 `max_detach_per_tick − 本拍已有脱落请求数` 约束;转换 =
+    /// outbox 之前)。承载判定开启时由 [`ShardSim::evaluate_load_tick`] 取代
+    /// (REQ-010 §4.6 第 1 条);否则走 REQ-009 原路径。触发集 = 本拍实心→非
+    /// 实心写入 ∪ 推迟队列(上一拍触发集原样 + 上一拍已转换的格);对**本分片
+    /// 体素**求值 `find_collapse` 后,只转换本体区内的 `falling` 格(`BlockPos`
+    /// 升序,find_collapse 已排序),受本拍剩余名额
+    /// `max_detach_per_tick − 本拍已有脱落请求数` 约束;转换 =
     /// 写 air、`Emergent` 写入、§4.11 唤醒、重建 collider、追加冲量为 0 的
     /// `DetachRequest`(生成走单元 03 的调度器路径,N+1 生效)。名额不足且
     /// 本体区内还有悬空格未转换时,整个触发集原样连同已转换格一起推迟到下一拍
     /// (不只留没转换的格——名额为 0 的那一拍不能丢触发,风险 4)。
     fn evaluate_collapse(&mut self) {
+        if self.load_enabled() {
+            self.evaluate_load_tick();
+            return;
+        }
         let mut removed: BTreeSet<BlockPos> = std::mem::take(&mut self.collapse_triggers);
         removed.extend(std::mem::take(&mut self.collapse_deferred));
         if removed.is_empty() {
@@ -2690,11 +2743,155 @@ impl ShardSim {
         self.collapse_deferred = carry;
     }
 
+    /// 承载判定接入(REQ-010 §4.6、§9;step 末调用,**取代** REQ-009 的
+    /// `find_collapse`,不计 `collapse_*` 遥测)。流程:
+    /// 1. `changed` = 本拍登记的触发格(§4.4:写入前后方块不同、至少一侧实心,
+    ///    六路来源);非空时对当前视图求一次 F(接地按柱记忆化,§4.2);
+    /// 2. 本拍应用过邻片的承载转换写入(记录非空)时,把记录格换回写入前的
+    ///    方块再求一次"转换前"的 F(接地判定同世界——恢复的格可能让上方的格
+    ///    重新接地),两次取并集。根因:承载判定不单调,只按写入后的视图会把
+    ///    残余部分"减负"后误判挂得住(§9);
+    /// 3. F ∩ 本体区 ∩ 当前仍实心 并入待转换集合;按 `BlockPos` 升序**直接
+    ///    转换、不重新求值**,数量受本拍剩余名额约束,轮到时已不是实心的格丢弃
+    ///    (§4.6 第 4 条);
+    /// 4. 转换 = 写 air、带承载转换标记的 `Emergent` 写入、§4.11 唤醒、重建
+    ///    collider、冲量 0 的脱落请求(逐格单格碎块,同 REQ-009);转换的格登记
+    ///    为下一拍的触发(§4.4 连锁断裂)。遥测:判定计 `CohesionStats::load_*`,
+    ///    转换照常计 REQ-009 的 `cells_collapsed`/`detached`。
+    fn evaluate_load_tick(&mut self) {
+        let changed: Vec<BlockPos> = std::mem::take(&mut self.collapse_triggers)
+            .into_iter()
+            .collect();
+        let records = std::mem::take(&mut self.load_conversion_records);
+        let min = self.cfg.shard.pos.min_chunk().block_min();
+        let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
+        let max_z = min.z + SHARD_CHUNKS * CHUNK_SIZE;
+        let in_core = |p: BlockPos| p.x >= min.x && p.x < max_x && p.z >= min.z && p.z < max_z;
+        let block_at = |p: BlockPos| -> Option<BlockId> {
+            if !(types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&p.y) {
+                // 世界高度范围之外按空气,不是未装载(同 REQ-009 口径)。
+                return Some(BlockId::AIR);
+            }
+            // 所在 chunk 未装载 → None(保守:看不见的地方当作有地基)。
+            self.voxels.get_chunk(p.chunk_of())?;
+            Some(self.voxels.get_block(p))
+        };
+
+        let mut falling: BTreeSet<BlockPos> = BTreeSet::new();
+        if !changed.is_empty() {
+            // ① 写入后的世界(§4.3;接地按柱记忆化,§4.2 修订 2)。
+            let grounded =
+                crate::cohesion::grounded_by_column_memo(&block_at, self.registry.as_ref());
+            let after = crate::cohesion::evaluate_load(
+                &block_at,
+                &grounded,
+                self.registry.as_ref(),
+                &changed,
+                self.cfg.cohesion.load_max_cells,
+            );
+            {
+                let stats = &mut self.outbox.cohesion_stats;
+                stats.load_evaluations += 1;
+                stats.load_visited += after.visited as u64;
+                stats.load_budget_stable += after.budget_stable as u64;
+            }
+            falling.extend(after.falling);
+            if !records.is_empty() {
+                // ② "转换前"的世界(§9):记录格换回写入前的方块,接地同世界。
+                let block_before = |p: BlockPos| -> Option<BlockId> {
+                    records.get(&p).copied().or_else(|| block_at(p))
+                };
+                let grounded =
+                    crate::cohesion::grounded_by_column_memo(&block_before, self.registry.as_ref());
+                let before = crate::cohesion::evaluate_load(
+                    &block_before,
+                    &grounded,
+                    self.registry.as_ref(),
+                    &changed,
+                    self.cfg.cohesion.load_max_cells,
+                );
+                let stats = &mut self.outbox.cohesion_stats;
+                stats.load_evaluations += 1;
+                stats.load_double_evaluations += 1;
+                stats.load_visited += before.visited as u64;
+                stats.load_budget_stable += before.budget_stable as u64;
+                falling.extend(before.falling);
+            }
+            self.outbox.cohesion_stats.load_falling += falling.len() as u64;
+        }
+
+        // 待转换集合:F ∩ 本体区 ∩ 当前仍实心(§4.6 第 4 条;"转换前"F 里的
+        // 格可能刚被邻片转换成 air,本体区外的格由其 owner 转换)。
+        for &cell in &falling {
+            if !in_core(cell) {
+                continue;
+            }
+            let solid = block_at(cell).is_some_and(|b| self.registry.material(b).is_some());
+            if solid {
+                self.load_pending.insert(cell);
+            }
+        }
+
+        // 转换:待转换队列按 BlockPos 升序,直接转换、不重新求值(§4.6 第 4
+        // 条);数量受本拍剩余名额(爆炸等拍内已用掉的扣掉)约束。
+        let mut quota = self
+            .cfg
+            .destruction
+            .max_detach_per_tick
+            .saturating_sub(self.outbox.detach_requests.len());
+        let queue: Vec<BlockPos> = self.load_pending.iter().copied().collect();
+        let mut dirty: Vec<ChunkPos> = Vec::new();
+        for cell in queue {
+            if quota == 0 {
+                break;
+            }
+            let block = self.voxels.get_block(cell);
+            if self.registry.material(block).is_none() {
+                // 轮到时已不是实心(同拍爆炸/撞击已写掉):丢弃,不占名额。
+                self.load_pending.remove(&cell);
+                continue;
+            }
+            let _ = self.voxels.set_block(cell, BlockId::AIR);
+            self.load_pending.remove(&cell);
+            quota -= 1;
+            // 遥测(§4.6 第 7 条):转换的格照常计入 REQ-009 的口径。
+            self.outbox.destruction_stats.cells_collapsed += 1;
+            self.outbox.destruction_stats.detached += 1;
+            self.outbox.block_updates.push(BlockWrite {
+                pos: cell,
+                block: BlockId::AIR,
+                kind: BlockWriteKind::Emergent,
+                load_conversion: true,
+            });
+            // §4.11 统一出口:脚下被掏空的冻结体下一拍被唤醒。
+            self.register_terrain_write(cell);
+            self.outbox
+                .detach_requests
+                .push(crate::destruction::DetachRequest {
+                    cell,
+                    block,
+                    impulse: Vec3::ZERO,
+                });
+            // 转换的写入登记为下一拍的触发(§4.4 连锁断裂自然发生)。
+            self.collapse_triggers.insert(cell);
+            dirty.push(cell.chunk_of());
+        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 REQ-009 转换)。
+        for cp in expand_boundary(dirty, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
+        // 与同拍爆炸/撞击的脱落请求拼接后,保持 BlockPos 升序不变量。
+        self.outbox.detach_requests.sort_by_key(|req| req.cell);
+        self.outbox.cohesion_stats.load_pending = self.load_pending.len() as u64;
+    }
+
     fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
         match cmd {
             SimCommand::SetBlock { pos, block } => {
-                // 坍塌触发要判断"由实心变为非实心",先取写入前的实心性。
-                let old_solid = self.registry.material(self.voxels.get_block(pos)).is_some();
+                // 触发登记要写前的方块(实心性与方块比较都用它)。
+                let old_block = self.voxels.get_block(pos);
                 let edit = VoxelEdit::new().set(pos, block);
                 match edit.apply(&mut self.voxels) {
                     Ok(dirty) => {
@@ -2715,8 +2912,8 @@ impl ShardSim {
                             load_conversion: false,
                         });
                         self.register_terrain_write(pos);
-                        // 坍塌触发(REQ-009 §6.2.1):实心→非实心的写入。
-                        self.register_collapse_trigger(pos, old_solid, block);
+                        // 坍塌/承载触发(REQ-009 §6.2.1、REQ-010 §4.6 第 2 条)。
+                        self.register_collapse_trigger(pos, old_block, block);
                     }
                     Err(e) => panic!("SetBlock 越界(fail-stop):{e}"),
                 }
@@ -2991,7 +3188,7 @@ impl ShardSim {
             }
             let _ = self.voxels.set_block(cell.pos, BlockId::AIR);
             // 坍塌触发(REQ-009 §6.2.1):爆炸破坏格由实心变 air。
-            self.register_collapse_trigger(cell.pos, true, BlockId::AIR);
+            self.register_collapse_trigger(cell.pos, cell.block, BlockId::AIR);
             self.outbox.block_updates.push(BlockWrite {
                 pos: cell.pos,
                 block: BlockId::AIR,
@@ -6772,6 +6969,472 @@ mod tests {
         for c in &deck {
             assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE, "{c:?} 不塌");
         }
+    }
+
+    // ---- 承载判定接入分片(REQ-010 §4.6,单元 02)----
+
+    /// 开启破坏 + 粘结的单分片平地(chunk 2..=6 平方,超平坦;名额 = cap)。
+    fn cohesion_sim(cap: usize) -> ShardSim {
+        let mut s = destruction_sim(cap);
+        s.cfg.cohesion.enabled = true;
+        s
+    }
+
+    /// 石墙(x 40..=42、y −60..=−55、z−2..=z+2)伸出 8 格石悬臂 x 43..=50、
+    /// y = −55、同 z。满载(8 ≤ B)挂得住。返回悬臂格。
+    fn build_cantilever(s: &mut ShardSim, z: i32) -> Vec<BlockPos> {
+        let wall: Vec<BlockPos> = (40..=42)
+            .flat_map(|x| {
+                (z - 2..=z + 2)
+                    .flat_map(move |zz| (-60..=-55).map(move |y| BlockPos::new(x, y, zz)))
+            })
+            .collect();
+        let arm: Vec<BlockPos> = (43..=50).map(|x| BlockPos::new(x, -55, z)).collect();
+        let build: Vec<StampedInput> = [&wall[..], &arm[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| setblock_input(k as u64, *p, voxel::builtin::STONE))
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        arm
+    }
+
+    /// 土门框(与验收同形):柱 x = 60、66(y −60..=−56,z)石,门楣 x 60..=66、
+    /// y = −55、同 z 土,7 格恰好满载(两端柱顶出口 3 + 3 ≥ 中间 5)。返回门楣。
+    fn build_door_lintel(s: &mut ShardSim, z: i32) -> Vec<BlockPos> {
+        let pa: Vec<BlockPos> = (-60..=-56).map(|y| BlockPos::new(60, y, z)).collect();
+        let pb: Vec<BlockPos> = (-60..=-56).map(|y| BlockPos::new(66, y, z)).collect();
+        let lintel: Vec<BlockPos> = (60..=66).map(|x| BlockPos::new(x, -55, z)).collect();
+        let build: Vec<StampedInput> = [&pa[..], &pb[..], &lintel[..]]
+            .concat()
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                setblock_input(
+                    k as u64,
+                    *p,
+                    if lintel.contains(p) {
+                        voxel::builtin::DIRT
+                    } else {
+                        voxel::builtin::STONE
+                    },
+                )
+            })
+            .collect();
+        s.apply_prefix(&build);
+        s.step();
+        lintel
+    }
+
+    /// §4.6 第 2 条(开启时触发口径):放置(空→实心)与实心换实心的材料
+    /// 替换都登记——加重压断悬臂、降键断根。悬臂满载 8:末端放 1 格 → 9 > 8
+    /// 整根连同放置格塌(9 条脱落);根部 stone 换 dirt → 键降到 3 < 8 整根断。
+    ///
+    /// 变红:放置不触发(只登记"实心变空",悬臂不塌);材料替换不触发;
+    /// 放置格不进 F(只塌 8 格)。
+    #[test]
+    fn load_trigger_placement_and_replacement_when_enabled() {
+        let mut s = cohesion_sim(64);
+        let arm_a = build_cantilever(&mut s, 64);
+        let arm_b = build_cantilever(&mut s, 74);
+        assert!(
+            s.take_outbox().detach_requests.is_empty(),
+            "两条满载悬臂都挂得住"
+        );
+        // 放置加重(D8):悬臂末端放 1 格石头。
+        let weight = BlockPos::new(50, -54, 64);
+        s.apply_prefix(&[setblock_input(1, weight, voxel::builtin::STONE)]);
+        s.step();
+        let out = s.take_outbox();
+        for c in arm_a.iter().chain([&weight]) {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?} 塌");
+        }
+        for c in &arm_b {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE, "{c:?} 不塌");
+        }
+        assert_eq!(out.detach_requests.len(), 9, "悬臂 8 格 + 放置格");
+        assert_eq!(out.cohesion_stats.load_falling, 9);
+        // 材料替换(D8):根部 stone → dirt,键 8 降到 3。
+        let root = BlockPos::new(42, -55, 74);
+        s.apply_prefix(&[setblock_input(2, root, voxel::builtin::DIRT)]);
+        s.step();
+        let out = s.take_outbox();
+        for c in &arm_b {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?} 断下");
+        }
+        assert_eq!(
+            s.voxel().get_block(root),
+            voxel::builtin::DIRT,
+            "换上的土格是接地的墙,不动"
+        );
+        assert_eq!(out.detach_requests.len(), 8);
+    }
+
+    /// §4.6 第 1 条(关闭 = REQ-009,风险 1):cohesion 关闭时放置与替换都
+    /// 不登记(REQ-009 只登记实心→非实心)、悬臂不塌;destruction 关闭而
+    /// cohesion 开启时同样什么都不发生、cohesion 遥测恒零。
+    ///
+    /// 变红:关闭时也登记"加重"的触发(悬臂塌、REQ-009 行为被改);关闭时
+    /// 计 cohesion 遥测。
+    #[test]
+    fn load_trigger_disabled_matches_req009_and_zero_telemetry() {
+        // destruction 开、cohesion 关:REQ-009 口径。
+        let mut s = destruction_sim(64);
+        let arm = build_cantilever(&mut s, 64);
+        s.apply_prefix(&[setblock_input(
+            1,
+            BlockPos::new(50, -54, 64),
+            voxel::builtin::STONE,
+        )]);
+        s.step();
+        s.apply_prefix(&[setblock_input(
+            2,
+            BlockPos::new(42, -55, 64),
+            voxel::builtin::DIRT,
+        )]);
+        s.step();
+        assert!(
+            s.take_outbox().detach_requests.is_empty(),
+            "关闭时放置与替换都不触发"
+        );
+        for c in &arm {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE, "{c:?} 不塌");
+        }
+        // destruction 关、cohesion 开:两开关不同时开 → 承载判定不接管。
+        let mut s = destruction_sim(64);
+        s.cfg.destruction.enabled = false;
+        s.cfg.cohesion.enabled = true;
+        let arm = build_cantilever(&mut s, 64);
+        s.apply_prefix(&[
+            setblock_input(1, BlockPos::new(50, -54, 64), voxel::builtin::STONE),
+            setblock_input(2, BlockPos::new(42, -55, 64), voxel::builtin::DIRT),
+        ]);
+        s.step();
+        let out = s.take_outbox();
+        assert!(out.detach_requests.is_empty());
+        assert_eq!(
+            out.cohesion_stats,
+            crate::cohesion::CohesionStats::default()
+        );
+        assert_eq!(out.destruction_stats.collapse_evaluations, 0);
+        for c in &arm {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::STONE, "{c:?} 不塌");
+        }
+    }
+
+    /// 拆除门框左柱(5 格 SetBlock air)。
+    fn remove_door_pillar(s: &mut ShardSim, z: i32) {
+        let inputs: Vec<StampedInput> = (-60..=-56)
+            .map(|y| {
+                setblock_input(
+                    100 + (y + 60) as u64,
+                    BlockPos::new(60, y, z),
+                    voxel::builtin::AIR,
+                )
+            })
+            .collect();
+        s.apply_prefix(&inputs);
+    }
+
+    /// §4.6 第 4 条(名额约束):名额 0 时 F 全部入队、不转换、不丢失——
+    /// 连跑两拍队列原样、零脱落请求。
+    ///
+    /// 变红:名额 0 时丢队列(下一拍名额恢复也没得转);不判 F 就不入队。
+    #[test]
+    fn load_pending_stays_when_quota_zero() {
+        let mut s = cohesion_sim(0);
+        let lintel = build_door_lintel(&mut s, 64);
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        remove_door_pillar(&mut s, 64);
+        s.step();
+        let out = s.take_outbox();
+        assert!(out.detach_requests.is_empty(), "名额 0:当拍不转换");
+        assert_eq!(out.cohesion_stats.load_falling, 6, "F = 门楣左 6 格");
+        assert_eq!(out.cohesion_stats.load_pending, 6, "全部入队");
+        for c in &fell {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::DIRT, "{c:?} 原样");
+        }
+        s.step();
+        let out = s.take_outbox();
+        assert!(out.detach_requests.is_empty());
+        assert_eq!(out.cohesion_stats.load_pending, 6, "队列不丢");
+    }
+
+    /// §4.6 第 4 条(升序 + 丢弃):名额 2,F = 6 → 当拍升序转换前 2 格;
+    /// 队列里的一格被同拍外部写入空气后,轮到时丢弃且**不占名额**——同拍
+    /// 名额 2 全部用在后两格上;最后 1 格下一拍直转(不重新求值:重求会判
+    /// 剩余格挂得住)。
+    ///
+    /// 变红:丢弃格占名额(当拍只转 1 格);推迟时重新求值(剩余格永远悬空);
+    /// 转换不按升序。
+    #[test]
+    fn load_pending_discards_gone_cell_without_consuming_quota() {
+        let mut s = cohesion_sim(2);
+        let lintel = build_door_lintel(&mut s, 64);
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        remove_door_pillar(&mut s, 64);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests
+                .iter()
+                .map(|r| r.cell)
+                .collect::<Vec<_>>(),
+            &fell[..2],
+            "升序转换前 2 格"
+        );
+        assert_eq!(out.cohesion_stats.load_pending, 4);
+        // 队列首位被外部写掉(模拟同拍爆炸):轮到时丢弃、不占名额。
+        s.apply_prefix(&[setblock_input(200, fell[2], voxel::builtin::AIR)]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests
+                .iter()
+                .map(|r| r.cell)
+                .collect::<Vec<_>>(),
+            vec![fell[3], fell[4]],
+            "丢弃格不占名额:名额 2 全用在后两格"
+        );
+        assert_eq!(out.cohesion_stats.load_pending, 1);
+        assert_eq!(
+            s.voxel().get_block(fell[5]),
+            voxel::builtin::DIRT,
+            "末格未轮到"
+        );
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests
+                .iter()
+                .map(|r| r.cell)
+                .collect::<Vec<_>>(),
+            vec![fell[5]],
+            "下一拍直转,不重新求值"
+        );
+        assert_eq!(out.cohesion_stats.load_pending, 0);
+        for c in &fell {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+    }
+
+    /// §4.6 第 4 条(快照,v7):待转换队列随分片快照走——名额 2 判出 F = 6
+    /// 当拍转 2,取快照恢复,两线各续两拍,脱落请求逐位一致、6 格全清。
+    ///
+    /// 变红:快照丢队列(恢复线首拍无触发,少塌 4 格)。
+    #[test]
+    fn load_pending_queue_survives_snapshot() {
+        let mut a = cohesion_sim(2);
+        let lintel = build_door_lintel(&mut a, 64);
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        remove_door_pillar(&mut a, 64);
+        a.step();
+        assert_eq!(a.take_outbox().detach_requests.len(), 2, "首拍 2 格");
+        let bytes = a.snapshot();
+        let mut b = ShardSim::restore(&bytes, Box::new(voxel::SimpleRegistry::builtin()))
+            .expect("自有快照必可解码");
+        for _ in 0..2 {
+            a.step();
+            b.step();
+            let (oa, ob) = (a.take_outbox(), b.take_outbox());
+            assert_eq!(
+                oa.detach_requests, ob.detach_requests,
+                "恢复线脱落请求逐位一致"
+            );
+        }
+        for c in &fell {
+            assert_eq!(a.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+            assert_eq!(b.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+    }
+
+    /// §4.6 第 4 条(名额共用):爆炸在拍首已占的名额要扣掉——名额 28、
+    /// 标准弹坑脱落 24 → 承载转换当拍只剩 4 个名额:门楣 F = 6 转前 4 格、
+    /// 2 格入队下一拍续转。
+    ///
+    /// 变红:名额不减本拍已有脱落请求(6 格全转换,当拍 30 > 28)。
+    #[test]
+    fn load_quota_shared_with_explosion() {
+        let mut s = cohesion_sim(28);
+        let lintel = build_door_lintel(&mut s, 64);
+        let fell: Vec<BlockPos> = lintel[..6].to_vec();
+        assert!(s.take_outbox().detach_requests.is_empty(), "满载挂得住");
+        // 同拍:标准弹坑(z = 96,远离门楣)+ 拆左柱。
+        let inputs = vec![detonate_input(200, Vec3::new(64.0, -59.5, 96.0), 12.0, 8.0)];
+        remove_door_pillar(&mut s, 64);
+        s.apply_prefix(&inputs);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests.len(),
+            28,
+            "弹坑 24 + 门楣当拍转换 4 = 名额 28"
+        );
+        assert_eq!(out.cohesion_stats.load_falling, 6, "F = 门楣左 6 格");
+        assert_eq!(out.cohesion_stats.load_pending, 2, "名额不足推迟 2 格");
+        for c in &fell[..4] {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?}");
+        }
+        for c in &fell[4..] {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::DIRT, "{c:?} 推迟");
+        }
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 2, "下一拍续 2 格");
+        assert_eq!(out.cohesion_stats.load_pending, 0);
+    }
+
+    /// §9(单分片级,记录时效):同拍收到邻片的 plain 写 air(拆柱)与带标记
+    /// 写 air(转换门楣 61..=64)→ "转换前"按写入前方块判出完整门楣的 F =
+    /// 60..=65(6 格)、"写入后"残余挂得住;并集里当前仍实心的只有 60、65
+    /// (61..=64 已被标记写入写空)→ 只转换这 2 格、写入带标记;**记录只在
+    /// 本拍有效**:下一拍求值不带"转换前"(double = 0)。
+    ///
+    /// 变红:标记不记录(只求写入后,不塌);记录跨拍存活(下一拍凭空多求
+    /// 一次并多塌);转换写入没带标记;并集里已空的格也转换。
+    #[test]
+    fn load_conversion_record_is_single_tick() {
+        let mut s = cohesion_sim(64);
+        let lintel = build_door_lintel(&mut s, 64);
+        assert!(s.take_outbox().detach_requests.is_empty(), "满载挂得住");
+        let mut inputs: Vec<StampedInput> = (-60..=-56)
+            .map(|y| {
+                envelope_input(
+                    100 + (y + 60) as u64,
+                    shard_id(1, 0),
+                    EnvelopePayload::BlockWrite {
+                        pos: BlockPos::new(60, y, 64),
+                        block: voxel::builtin::AIR,
+                        load_conversion: false,
+                    },
+                )
+            })
+            .collect();
+        inputs.extend((61..=64).map(|x| {
+            envelope_input(
+                200 + x as u64,
+                shard_id(1, 0),
+                EnvelopePayload::BlockWrite {
+                    pos: BlockPos::new(x, -55, 64),
+                    block: voxel::builtin::AIR,
+                    load_conversion: true,
+                },
+            )
+        }));
+        s.apply_prefix(&inputs);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.detach_requests
+                .iter()
+                .map(|r| r.cell)
+                .collect::<Vec<_>>(),
+            [lintel[0], lintel[5]],
+            "并集 F = 60..=65;仍实心的只有两端 2 格"
+        );
+        assert_eq!(out.cohesion_stats.load_falling, 6, "含已空的标记格");
+        assert_eq!(out.cohesion_stats.load_evaluations, 2, "求两次");
+        assert_eq!(out.cohesion_stats.load_double_evaluations, 1);
+        assert!(
+            out.block_updates
+                .iter()
+                .filter(|w| w.load_conversion)
+                .map(|w| w.pos)
+                .collect::<Vec<_>>()
+                == vec![lintel[0], lintel[5]],
+            "转换写入带标记"
+        );
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.cohesion_stats.load_double_evaluations, 0,
+            "记录只在本拍有效"
+        );
+        assert_eq!(out.cohesion_stats.load_evaluations, 1, "转换写入触发下一拍");
+    }
+
+    /// §4.4(连锁断裂):转换的写入登记为下一拍的触发——加重塌落拍之后,
+    /// 无外部输入的下一拍仍有一次承载求值(F = ∅,不再塌)。
+    ///
+    /// 变红:转换的格不登记触发(下一拍零求值,后续连锁断裂丢失)。
+    #[test]
+    fn load_converted_cells_trigger_next_evaluation() {
+        let mut s = cohesion_sim(64);
+        let arm = build_cantilever(&mut s, 64);
+        s.take_outbox();
+        s.apply_prefix(&[setblock_input(
+            1,
+            BlockPos::new(50, -54, 64),
+            voxel::builtin::STONE,
+        )]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.detach_requests.len(), 9, "加重塌 9 格");
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(
+            out.cohesion_stats.load_evaluations, 1,
+            "无外部输入的下一拍仍求值(转换格是触发)"
+        );
+        assert_eq!(out.cohesion_stats.load_falling, 0, "不再塌");
+        assert!(out.detach_requests.is_empty());
+        for c in &arm {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR);
+        }
+    }
+
+    /// §4.6 第 2 条(强制落地带触发,风险 4):实体被强制落到满载悬臂末端
+    /// 上方 → 落点写入(lifecycle,step 之后)登记触发,**下一拍**求值把悬臂
+    /// 连同落点格判塌。
+    ///
+    /// 变红:强制落地写入不登记触发(悬臂永远不塌);当拍就塌(时序错)。
+    #[test]
+    fn load_forced_landing_write_triggers_next_tick() {
+        let mut s = cohesion_sim(64);
+        let arm = build_cantilever(&mut s, 64);
+        assert!(s.take_outbox().detach_requests.is_empty(), "满载挂得住");
+        let e = EntityId::from_parts(1, 1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: InputSource(1),
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: EntityState {
+                    translation: Vec3::new(50.5, -53.55, 64.5),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: crate::destruction::DEBRIS_HALF_SIZE,
+                    block: voxel::builtin::STONE,
+                },
+            }),
+        }]);
+        // 白盒:直接入队强制落地(正常路径 = 调度器 7.5/超预算淘汰)。
+        s.forced_pending.insert(e);
+        s.forced_reasons.insert(e, ForcedLandingReason::Deadline);
+        s.run_transient_lifecycle();
+        let landing = BlockPos::new(50, -54, 64);
+        assert_eq!(
+            s.voxel().get_block(landing),
+            voxel::builtin::STONE,
+            "强制落地已写块"
+        );
+        for c in &arm {
+            assert_eq!(
+                s.voxel().get_block(*c),
+                voxel::builtin::STONE,
+                "{c:?} 触发生效在下一拍,本拍不塌"
+            );
+        }
+        s.step();
+        let out = s.take_outbox();
+        for c in arm.iter().chain([&landing]) {
+            assert_eq!(s.voxel().get_block(*c), voxel::builtin::AIR, "{c:?} 塌");
+        }
+        assert_eq!(out.detach_requests.len(), 9, "悬臂 8 格 + 落点格");
     }
 
     /// §6.2.1/§7 名额共用(风险 4 前半):爆炸在拍首已用掉的名额要扣掉——

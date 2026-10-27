@@ -99,9 +99,23 @@ pub struct CohesionStats {
 }
 
 impl CohesionStats {
-    /// 逐字段相加(调度器合计全部分片)。**接口桩**:由实施方实现。
+    /// 逐字段相加(调度器合计用)。
     pub fn add(&mut self, other: &Self) {
-        let _ = other;
+        self.load_evaluations += other.load_evaluations;
+        self.load_visited += other.load_visited;
+        self.load_budget_stable += other.load_budget_stable;
+        self.load_double_evaluations += other.load_double_evaluations;
+        self.load_falling += other.load_falling;
+        self.load_pending += other.load_pending;
+        self.compounds_spawned += other.compounds_spawned;
+        self.compound_cells += other.compound_cells;
+        self.segments += other.segments;
+        self.bonds_broken += other.bonds_broken;
+        self.fracture_components += other.fracture_components;
+        self.compounds_solidified += other.compounds_solidified;
+        self.tilt_scattered += other.tilt_scattered;
+        self.forced_landing_fallbacks += other.forced_landing_fallbacks;
+        self.blast_removed_cells += other.blast_removed_cells;
     }
 }
 
@@ -146,6 +160,44 @@ pub fn is_grounded_by_scan(
             return true;
         }
         q.y -= 1;
+    }
+}
+
+/// 接地判定(生产路径,REQ-010 §4.2 修订 2):一次判定之内**按柱记忆化**——
+/// 从查询格沿柱向下扫描,得出结论前途经的连续实心格(含得出结论的那格)与
+/// 结论同判并缓存;后续查询命中缓存即返回,每段被查询到的连续实心格只向下
+/// 扫描一次。判定语义与 [`is_grounded_by_scan`] 逐格一致(未装载 → true、
+/// 非实心 → false、`Support::Anchor` 或 `WORLD_Y_MIN` → true);缓存只活在本
+/// 次判定之内(返回的闭包持有,不跨拍)。
+pub fn grounded_by_column_memo<'a>(
+    block_at: &'a dyn Fn(BlockPos) -> Option<BlockId>,
+    registry: &'a dyn BlockRegistry,
+) -> impl Fn(BlockPos) -> bool + 'a {
+    let cache: std::cell::RefCell<BTreeMap<BlockPos, bool>> =
+        std::cell::RefCell::new(BTreeMap::new());
+    move |start: BlockPos| -> bool {
+        let mut cache = cache.borrow_mut();
+        let mut chain: Vec<BlockPos> = Vec::new();
+        let mut q = start;
+        let grounded = loop {
+            // 命中缓存:链上各格都在 q 正上方且连续实心,与 q 同判。
+            if let Some(&known) = cache.get(&q) {
+                break known;
+            }
+            chain.push(q);
+            let Some(b) = block_at(q) else {
+                break true; // 未装载的 chunk:看不见的地方当作有地基
+            };
+            let Some(m) = registry.material(b) else {
+                break false; // 途经非实心格:上方悬空
+            };
+            if m.support == Support::Anchor || q.y == WORLD_Y_MIN {
+                break true;
+            }
+            q = BlockPos::new(q.x, q.y - 1, q.z);
+        };
+        cache.extend(chain.iter().map(|&c| (c, grounded)));
+        grounded
     }
 }
 
@@ -372,24 +424,38 @@ impl Dinic {
     }
 
     /// 在分层图中沿一条增广路推送;返回推送量(0 = 当前分层图已无增广路)。
-    fn send(&mut self, v: usize, t: usize, f: u64, next: &mut [usize]) -> u64 {
-        if v == t {
-            return f;
-        }
-        while next[v] < self.adj[v].len() {
-            let e = self.adj[v][next[v]];
-            let u = self.to[e];
-            if self.cap[e] > 0 && self.level[u] == self.level[v].map(|lv| lv + 1) {
-                let pushed = self.send(u, t, f.min(self.cap[e]), next);
-                if pushed > 0 {
-                    self.cap[e] -= pushed;
-                    self.cap[e ^ 1] += pushed;
-                    return pushed;
+    /// 显式边栈迭代(单元 01 遗留):分层深度可达格数(2048 格一字长链约
+    /// 2050 层),shard worker 线程是默认栈,递归版有爆栈风险;推进/回退
+    /// 与递归版逐位等价(成功弧不推 `next`,死端连同其弧一起跳过)。
+    fn send(&mut self, s: usize, t: usize, f: u64, next: &mut [usize]) -> u64 {
+        let mut path: Vec<usize> = Vec::new();
+        let mut v = s;
+        'advance: while v != t {
+            while next[v] < self.adj[v].len() {
+                let e = self.adj[v][next[v]];
+                let u = self.to[e];
+                if self.cap[e] > 0 && self.level[u] == self.level[v].map(|lv| lv + 1) {
+                    path.push(e);
+                    v = u;
+                    continue 'advance;
                 }
+                next[v] += 1;
             }
-            next[v] += 1;
+            // v 已无可用弧:回退到本条边的起点并跳过它(递归版返回 0 的展开)。
+            match path.pop() {
+                Some(e) => {
+                    v = self.to[e ^ 1];
+                    next[v] += 1;
+                }
+                None => return 0,
+            }
         }
-        0
+        let pushed = f.min(path.iter().map(|&e| self.cap[e]).min().unwrap_or(f));
+        for &e in &path {
+            self.cap[e] -= pushed;
+            self.cap[e ^ 1] += pushed;
+        }
+        pushed
     }
 
     /// 残量网络中从 `s` 出发沿剩余容量可达的节点。
@@ -582,8 +648,102 @@ mod tests {
         assert!(!g(p(0, 5, 0)), "起点是空气");
     }
 
-    // ------------------------------------------------------------------ evaluate_load
+    /// `CohesionStats::add`:15 个字段逐一相加(调度器合计用)。
+    ///
+    /// 变红:漏加任一字段(合计比两分片之和小)。
+    #[test]
+    fn cohesion_stats_add_sums_every_field() {
+        // 第 i 个字段 = i·k(1..=15):mk(1) + mk(100) = mk(101) 当且仅当
+        // 每个字段都被加过一次。
+        let mk = |k: u64| CohesionStats {
+            load_evaluations: k,
+            load_visited: 2 * k,
+            load_budget_stable: 3 * k,
+            load_double_evaluations: 4 * k,
+            load_falling: 5 * k,
+            load_pending: 6 * k,
+            compounds_spawned: 7 * k,
+            compound_cells: 8 * k,
+            segments: 9 * k,
+            bonds_broken: 10 * k,
+            fracture_components: 11 * k,
+            compounds_solidified: 12 * k,
+            tilt_scattered: 13 * k,
+            forced_landing_fallbacks: 14 * k,
+            blast_removed_cells: 15 * k,
+        };
+        let (a, b) = (mk(1), mk(100));
+        let mut sum = a;
+        sum.add(&b);
+        assert_eq!(sum, mk(101), "逐字段相加,一个不漏");
+    }
 
+    /// 按柱记忆化的接地判定与逐格扫描逐格一致:浮空 dirt、悬空基岩、未装载
+    /// 格(含柱中段)、世界底、非实心格全部覆盖;判定过一遍后重查零次体素读
+    /// (每段被查询到的连续实心格只向下扫描一次)。
+    ///
+    /// 变红:记忆化串格(不同柱共享结论/链上格未随结论标记);缓存命中乱返;
+    /// 途经非实心格误判接地。
+    #[test]
+    fn grounded_memo_matches_scan_and_scans_each_segment_once() {
+        let reg = SimpleRegistry::builtin();
+        // x=0:dirt(-61..=-59)浮空(正下方是洞)、stone(-56)、悬空基岩(-55);
+        // x=2:整列实心到世界底;x=4:stone(-57..=-56)下方一格未装载;
+        // x=5:下半实心、(-60..=-50)未装载。
+        let base: BTreeMap<BlockPos, BlockId> = [
+            (p(0, -61, 0), builtin::DIRT),
+            (p(0, -60, 0), builtin::DIRT),
+            (p(0, -59, 0), builtin::DIRT),
+            (p(0, -56, 0), builtin::STONE),
+            (p(0, -55, 0), builtin::BEDROCK),
+            (p(2, WORLD_Y_MIN, 0), builtin::BEDROCK),
+            (p(2, -63, 0), builtin::DIRT),
+            (p(2, -62, 0), builtin::DIRT),
+            (p(2, -61, 0), builtin::DIRT),
+            (p(4, -57, 0), builtin::STONE),
+            (p(4, -56, 0), builtin::STONE),
+            (p(5, WORLD_Y_MIN, 0), builtin::BEDROCK),
+            (p(5, -63, 0), builtin::DIRT),
+            (p(5, -62, 0), builtin::DIRT),
+            (p(5, -61, 0), builtin::DIRT),
+        ]
+        .into_iter()
+        .collect();
+        let unloaded: BTreeSet<BlockPos> = (-60..=-50)
+            .map(|y| p(5, y, 0))
+            .chain((-60..=-58).map(|y| p(4, y, 0)))
+            .collect();
+        let lookup = |q: BlockPos| -> Option<BlockId> {
+            if unloaded.contains(&q) {
+                return None;
+            }
+            Some(base.get(&q).copied().unwrap_or(builtin::AIR))
+        };
+        let reads = std::cell::Cell::new(0u64);
+        let counted = |q: BlockPos| -> Option<BlockId> {
+            reads.set(reads.get() + 1);
+            lookup(q)
+        };
+        let memo = grounded_by_column_memo(&counted, &reg);
+        let scan = |q: BlockPos| is_grounded_by_scan(&lookup, &reg, q);
+        for x in -1..=6 {
+            for y in -70..=-50 {
+                let q = p(x, y, 0);
+                assert_eq!(memo(q), scan(q), "({x},{y}) 记忆化与扫描不一致");
+            }
+        }
+        // 缓存命中:同片重查一遍,体素读数为 0(首查已把查询到的段全部缓存)。
+        let after_first = reads.get();
+        for x in -1..=6 {
+            for y in -70..=-50 {
+                let q = p(x, y, 0);
+                assert_eq!(memo(q), scan(q), "({x},{y}) 重查不一致");
+            }
+        }
+        assert_eq!(reads.get(), after_first, "命中缓存的查询不再读体素");
+    }
+
+    // ------------------------------------------------------------------ evaluate_load
     /// 预算边界:悬挑块恰好 `max_cells` 时照常求值(全塌),超一格按稳定且计 1 次。
     #[test]
     fn load_budget_boundary_exactly_max_cells() {
