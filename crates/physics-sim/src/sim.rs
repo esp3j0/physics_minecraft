@@ -3761,6 +3761,11 @@ impl ShardSim {
             if body.is_kinematic() {
                 continue;
             }
+            // ---- 复合体:逐格求值(REQ-010 §6.1,D6;开关同承载)----
+            if self.load_enabled() && rec.desc.shape().is_some() {
+                self.detonate_compound(id, center, power, radius);
+                continue;
+            }
             let pos = conv::rapier_to_vec3(body.translation());
             let Some(impulse) = crate::explosion::explosion_impulse(center, power, radius, pos)
             else {
@@ -3777,6 +3782,184 @@ impl ShardSim {
         if self.cfg.destruction.enabled {
             self.detonate_terrain(center, power, radius);
         }
+    }
+
+    /// 爆炸对复合体(REQ-010 §6.1,单元 07;开关 = `load_enabled`)。逐格求值
+    /// [`cohesion::compound_blast`] 之后:
+    /// - **没有格被破坏**(§6.1 第 2 条):各冲量按施力点作用在原刚体上
+    ///   ([`apply_impulse_at_point`],产生力矩,D6——爆炸能把复合体掀翻、转起来);
+    /// - **有格被破坏**(§6.1 第 3 条):原实体本拍删除;剩余完好格按共面连接
+    ///   求连通分量,经 [`cohesion::fracture_pieces`] 求各分量状态,线速度再加
+    ///   上该分量各格所受冲量之和 / 分量质量(力矩忽略,角速度沿用原 ω);脱落
+    ///   格成单格碎块,速度 = 该点刚体速度 `v + ω × r` + 冲量 / 0.729;粉碎格
+    ///   消失。分块请求的 `index`:先各分量(按首格),再各脱落格(按形状格序)
+    ///   ——经调度器单元 05 路径 N+1 生成(与地形脱落共用"先脱落/复合体请求,
+    ///   再分块请求"的涌现 ID 分配顺序,§6.1 风险 4)。
+    ///
+    /// 遥测(§6.1 第 5 条):`blast_removed_cells` = 粉碎 + 脱落的格数。
+    fn detonate_compound(&mut self, id: EntityId, center: Vec3, power: f32, radius: f32) {
+        let (handle, shape, desc) = {
+            let rec = self.entities.get(&id).expect("存在");
+            (
+                rec.handle,
+                rec.desc.shape().expect("复合体").clone(),
+                rec.desc.clone(),
+            )
+        };
+        let state = self.read_state(self.entities.get(&id).expect("存在"));
+        let block_at = |p: BlockPos| -> Option<BlockId> {
+            if !(types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&p.y)
+                || self.voxels.get_chunk(p.chunk_of()).is_none()
+            {
+                return None;
+            }
+            Some(self.voxels.get_block(p))
+        };
+        let fates = crate::cohesion::compound_blast(
+            &state,
+            &shape,
+            center,
+            power,
+            radius,
+            self.cfg.destruction.attenuation,
+            &block_at,
+            self.registry.as_ref(),
+        );
+        // 各格结果与所受冲量(完好格 = 单格公式冲量;脱落格 = P·dir')。
+        let cells = shape.cells();
+        let mut broken = false;
+        let mut impulses: Vec<Vec3> = Vec::with_capacity(cells.len());
+        let mut removed_cells: u64 = 0;
+        for (fate, _cell) in fates.iter().zip(cells.iter()) {
+            match *fate {
+                crate::cohesion::CellBlast::Intact { impulse } => {
+                    impulses.push(impulse.unwrap_or(Vec3::ZERO));
+                }
+                crate::cohesion::CellBlast::Detach { impulse } => {
+                    broken = true;
+                    removed_cells += 1;
+                    impulses.push(impulse);
+                }
+                crate::cohesion::CellBlast::Pulverize => {
+                    broken = true;
+                    removed_cells += 1;
+                    impulses.push(Vec3::ZERO);
+                }
+            }
+        }
+        if !broken {
+            // §6.1 第 2 条:无破坏 → 逐格按施力点施加(产生力矩,不用中心合成)。
+            for (cell, impulse) in cells.iter().zip(impulses.iter()) {
+                if impulse != &Vec3::ZERO {
+                    let w = state.translation
+                        + state.rotation
+                            * Vec3::new(
+                                cell.offset[0] as f32,
+                                cell.offset[1] as f32,
+                                cell.offset[2] as f32,
+                            );
+                    self.phys
+                        .bodies
+                        .get_mut(handle)
+                        .expect("handle 有效")
+                        .apply_impulse_at_point(
+                            conv::vec3_to_rapier(*impulse),
+                            conv::vec3_to_rapier(w),
+                            true,
+                        );
+                }
+            }
+            return;
+        }
+        // §6.1 第 3 条:有破坏 → 删除原实体,剩余格按共面连接拆分。
+        // 破坏格集合(形状格序号);完好格上"被破坏的共面连接" = 断键。
+        let removed: std::collections::BTreeSet<usize> = fates
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| !matches!(f, crate::cohesion::CellBlast::Intact { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        let mut broken_bonds: std::collections::BTreeSet<(usize, usize)> =
+            std::collections::BTreeSet::new();
+        for (i, a) in cells.iter().enumerate() {
+            for (j, b) in cells.iter().enumerate() {
+                if i >= j {
+                    continue;
+                }
+                let d = [
+                    a.offset[0] - b.offset[0],
+                    a.offset[1] - b.offset[1],
+                    a.offset[2] - b.offset[2],
+                ];
+                if d[0].abs() + d[1].abs() + d[2].abs() == 1
+                    && (removed.contains(&i) || removed.contains(&j))
+                {
+                    broken_bonds.insert((i, j));
+                }
+            }
+        }
+        let components = crate::cohesion::fracture_components(&shape, &broken_bonds);
+        // §6.1 第 3 条:拆的是"剩余**完好**格"——`fracture_components` 以空断键集
+        // 求出的分量里,只由被破坏格组成的(脱落形成的孤立格)不算分量,丢弃。
+        let components: Vec<Vec<usize>> = components
+            .into_iter()
+            .filter(|comp| comp.iter().any(|&i| !removed.contains(&i)))
+            .collect();
+        let pieces = crate::cohesion::fracture_pieces(&state, &desc, &components);
+        let mut requests: Vec<crate::cohesion::PieceRequest> = Vec::new();
+        // 分量(按首格;fracture_components 已按首格升序):状态 = 原刚体在分量
+        // 质心处的状态,线速度再加 Σ 冲量 / 分量质量(各格等质量,分量质量 =
+        // 格数 × 0.729);角速度沿用原 ω(力矩忽略)。
+        for (piece_state, piece_desc) in pieces {
+            let comp = components[requests.len()].clone();
+            let sum: Vec3 = comp.iter().map(|&i| impulses[i]).sum();
+            let comp_mass = comp.len() as f32 * crate::destruction::DEBRIS_MASS;
+            let mut st = piece_state;
+            st.linvel += sum / comp_mass;
+            requests.push(crate::cohesion::PieceRequest {
+                parent: id,
+                index: requests.len() as u32,
+                state: st,
+                desc: piece_desc,
+            });
+        }
+        // 脱落格(按形状格序):单格碎块,速度 = 该点刚体速度 `v + ω × r` +
+        // 冲量 / 0.729,旋转/角速度同原刚体。
+        for (i, cell) in cells.iter().enumerate() {
+            if !matches!(fates[i], crate::cohesion::CellBlast::Detach { .. }) {
+                continue;
+            }
+            let r = state.rotation
+                * Vec3::new(
+                    cell.offset[0] as f32,
+                    cell.offset[1] as f32,
+                    cell.offset[2] as f32,
+                );
+            requests.push(crate::cohesion::PieceRequest {
+                parent: id,
+                index: requests.len() as u32,
+                state: EntityState {
+                    translation: state.translation + r,
+                    rotation: state.rotation,
+                    linvel: state.linvel
+                        + state.angvel.cross(r)
+                        + impulses[i] / crate::destruction::DEBRIS_MASS,
+                    angvel: state.angvel,
+                },
+                desc: EntityDesc {
+                    half_size: crate::destruction::DEBRIS_HALF_SIZE,
+                    block: cell.block,
+                    shape: None,
+                },
+            });
+        }
+        // 请求统一盖章为 (parent, index) 升序(分量序已在前),交给调度器。
+        requests.sort_by_key(|req| (req.parent, req.index));
+        self.outbox.piece_requests.extend(requests);
+        self.entities.remove(&id).expect("存在");
+        self.phys.remove_body(handle);
+        self.outbox.despawned.push(id);
+        self.outbox.cohesion_stats.blast_removed_cells += removed_cells;
     }
 
     /// 爆炸的地形求值与落写(REQ-009 §4.1–§4.3;纯函数 `evaluate_blast`,
@@ -6896,6 +7079,530 @@ mod tests {
         assert_eq!(out.piece_requests.len(), 2);
         assert!(out.piece_requests.iter().all(|p| p.parent == a));
     }
+
+    // ==== REQ-010 单元 07:爆炸对复合体(§6.1;AC-C9)====
+
+    /// 逐格求值·粉碎/脱落/完好分界(§6.1 第 1 条):3 格土质梁(R 2、k 2)。
+    /// 场景 A 三格全 P > 4 粉碎;场景 B 三格全 P ∈ (2, 4] 脱落、冲量 = P·dir';
+    /// 场景 C 全完好且冲量 = 单格公式的斜向冲量;场景 D 衰减系数生效
+    /// (P − R·attenuation 跨过脱落阈);末尾半径外全完好无冲量。
+    ///
+    /// 变红:阈值判反;脱落冲量没按 dir'(向上为主);完好格冲量用压力
+    /// P 而非单格公式(方向应为斜向背离爆心);d ≥ r 的格没给无冲量完好;
+    /// 衰减漏乘 attenuation。
+    #[test]
+    fn compound_blast_pulverize_detach_intact_thresholds() {
+        let reg = voxel::SimpleRegistry::builtin();
+        let shape = beam_shape(3)
+            .cells()
+            .iter()
+            .map(|c| types::ShapeCell {
+                offset: c.offset,
+                block: voxel::builtin::DIRT,
+            })
+            .collect();
+        let dirt_beam = types::CompoundShape::new(shape).expect("3 格");
+        let state = EntityState {
+            translation: Vec3::new(8.5, 0.5, 8.5),
+            ..EntityState::default()
+        };
+        let open = |_: BlockPos| Some(voxel::builtin::AIR);
+        // 场景 A(粉碎):贴面格 P = 9 > 4。
+        let a = crate::cohesion::compound_blast(
+            &state,
+            &dirt_beam,
+            Vec3::new(8.0, -0.9, 8.0),
+            10.0,
+            12.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        // d₁ = 1.4 → P = 10·(1 − 1.4/12) ≈ 8.83 > 4 粉碎;d₂ = √(1 + 1.96)
+        // ≈ 1.72 → P ≈ 8.56 > 4 粉碎;d₃ = √(4 + 1.96) ≈ 2.44 → P ≈ 7.97
+        // > 4 粉碎。
+        assert!(
+            a.iter()
+                .all(|f| *f == crate::cohesion::CellBlast::Pulverize),
+            "三格全粉碎:{a:?}"
+        );
+        // 场景 B(脱落):远端格 P ∈ (2, 4]。爆心 z 偏移使 d₃ 最大:
+        // 爆心 (7.0, 0.5, 8.5),power 4、radius 12 → d₁ = 1.5 → P = 3.5 ∈ (2, 4]
+        // 脱落;d₂ = 2.5 → P ≈ 3.17 脱落;d₃ = 3.5 → P ≈ 2.83 脱落。
+        let b = crate::cohesion::compound_blast(
+            &state,
+            &dirt_beam,
+            Vec3::new(7.0, 0.5, 8.5),
+            4.0,
+            12.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        // u 对三格都是 (1,0,0)(爆心在梁正左侧同高度)→ dir' 同向。
+        let dir = Vec3::new(0.4, 1.0, 0.0).normalize();
+        for (i, f) in b.iter().enumerate() {
+            let imp = detach(*f);
+            let expect = 4.0 * (1.0 - (1.5 + i as f32) / 12.0);
+            assert!(
+                imp.abs_diff_eq(expect * dir, 1e-4),
+                "第 {i} 格脱落冲量 = P·dir':{imp:?}(期望 {expect}·{dir:?})"
+            );
+        }
+        // 场景 C(完好 + 半径外):爆心在梁正下方 1 m(power 2、radius 4)→
+        // 各格 P ≤ 2 完好、冲量沿"背离爆心"的斜向(不是纯 +x——它必须来自
+        // 单格公式,而不是压力本身)。
+        let c_center = Vec3::new(8.0, -0.5, 8.5);
+        let c = crate::cohesion::compound_blast(
+            &state, &dirt_beam, c_center, 2.0, 4.0, 1.0, &open, &reg,
+        );
+        // d_i = √((0.5+i)² + 1) ≈ 1.118、1.803、2.693 < 4;
+        // P_i = 2·(1 − d_i/4) ≈ 1.441、1.098、0.653,全部 ≤ 2 完好。
+        for (i, f) in c.iter().enumerate() {
+            let w = Vec3::new(8.5 + i as f32, 0.5, 8.5);
+            let expect =
+                crate::explosion::explosion_impulse(c_center, 2.0, 4.0, w).expect("半径内必有冲量");
+            let imp = intact_impulse(*f).expect("完好带冲量");
+            assert!(
+                imp.abs_diff_eq(expect, 1e-5) && imp.y > 0.0 && imp.x > 0.0,
+                "第 {i} 格完好冲量 = 单格公式(斜向):{imp:?}(期望 {expect:?})"
+            );
+        }
+        let far = crate::cohesion::compound_blast(
+            &state,
+            &dirt_beam,
+            Vec3::new(8.0, 0.5, 20.0),
+            2.0,
+            4.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        assert!(
+            far.iter()
+                .all(|f| *f == crate::cohesion::CellBlast::Intact { impulse: None }),
+            "半径外全部完好、无冲量:{far:?}"
+        );
+        // 场景 D(衰减系数):土梁与爆心之间隔一块石头,attenuation = 0.75 →
+        // 第一格 P = 7.333 − 6·0.75 ≈ 2.833 ∈ (2, 4] 脱落;漏乘系数(P − 6 ≈
+        // 1.333 ≤ 2)会给完好。
+        let wall = |q: BlockPos| {
+            Some(if q == BlockPos::new(7, 0, 8) {
+                voxel::builtin::STONE
+            } else {
+                voxel::builtin::AIR
+            })
+        };
+        let d_att = crate::cohesion::compound_blast(
+            &state,
+            &dirt_beam,
+            Vec3::new(7.5, 0.5, 8.5),
+            8.0,
+            12.0,
+            0.75,
+            &wall,
+            &reg,
+        );
+        detach(d_att[0]);
+        detach(d_att[1]);
+        assert!(
+            matches!(d_att[2], crate::cohesion::CellBlast::Intact { .. }),
+            "第三格 P = 6 − 4.5 = 1.5 ≤ 2 完好:{:?}",
+            d_att[2]
+        );
+    }
+
+    /// n 格土质方块梁(全部 DIRT;R 2 阈值低,便于构造全粉碎)。
+    fn dirt_beam_shape(n: i32) -> types::CompoundShape {
+        types::CompoundShape::new(
+            (0..n)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("梁 ≥ 2 格")
+    }
+
+    fn detach(f: crate::cohesion::CellBlast) -> Vec3 {
+        match f {
+            crate::cohesion::CellBlast::Detach { impulse } => impulse,
+            other => panic!("期望脱落,实得 {other:?}"),
+        }
+    }
+
+    fn intact_impulse(f: crate::cohesion::CellBlast) -> Option<Vec3> {
+        match f {
+            crate::cohesion::CellBlast::Intact { impulse } => impulse,
+            other => panic!("期望完好,实得 {other:?}"),
+        }
+    }
+
+    /// 逐格求值·地形衰减与半径封顶(§6.1 第 1 条):格与爆心之间隔一格石头
+    /// (R 6)→ P = 3.75 − 6 ≤ 0 完好;对照空气衰减 0;radius 1000 按 16 求值
+    /// (40 m 外的格不受影响 = 封顶生效;同爆心 power 下未封顶会给远处格冲量)。
+    ///
+    /// 变红:衰减公式漏乘 R 或 attenuation;复合体自身格被塞进衰减(把梁的
+    /// 格写进体素后结果会变);封顶没用 min(1000 直接按 1000 求值 → 远格有压差)。
+    #[test]
+    fn compound_blast_terrain_attenuation_and_radius_cap() {
+        let reg = voxel::SimpleRegistry::builtin();
+        let state = EntityState {
+            translation: Vec3::new(8.5, 0.5, 8.5),
+            ..EntityState::default()
+        };
+        let open = |_: BlockPos| Some(voxel::builtin::AIR);
+        // 挡板:爆心所在格 (7, 0, 8) 一块石头 → 射线第一步就穿它。
+        let wall = |q: BlockPos| {
+            Some(if q == BlockPos::new(7, 0, 8) {
+                voxel::builtin::STONE
+            } else {
+                voxel::builtin::AIR
+            })
+        };
+        let blocked = crate::cohesion::compound_blast(
+            &state,
+            &beam_shape(3),
+            Vec3::new(7.5, 0.5, 8.5),
+            8.0,
+            12.0,
+            1.0,
+            &wall,
+            &reg,
+        );
+        // 第一格中心 (8.5, 0.5, 8.5),d = 1 → 无遮挡 P = 8·(1 − 1/12) ≈ 7.33;
+        // 射线穿 (7,0,8)(石,R 6):衰减 6 → P ≈ 1.33 ≤ 6 完好。
+        let imp = intact_impulse(blocked[0]).expect("衰减后完好");
+        assert!(
+            imp.abs_diff_eq(
+                crate::explosion::explosion_impulse(
+                    Vec3::new(7.5, 0.5, 8.5),
+                    8.0,
+                    12.0,
+                    Vec3::new(8.5, 0.5, 8.5)
+                )
+                .unwrap(),
+                1e-5
+            ),
+            "被挡格完好,冲量照单格公式(不受遮挡影响):{imp:?}"
+        );
+        // 对照:无挡板时同格 P ≈ 7.33 > 6 → 脱落。
+        let unblocked = crate::cohesion::compound_blast(
+            &state,
+            &beam_shape(3),
+            Vec3::new(7.5, 0.5, 8.5),
+            8.0,
+            12.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        detach(unblocked[0]);
+        // 半径封顶:radius 1000 → 有效 16;爆心在 40 m 外的格不受影响。
+        // (封顶失效时 P = 1000·(1 − 40/1000) ≈ 960 会远超阈值。)
+        let capped = crate::cohesion::compound_blast(
+            &state,
+            &beam_shape(1 + 39),
+            Vec3::new(0.5, 0.5, 8.5),
+            1000.0,
+            1000.0,
+            1.0,
+            &open,
+            &reg,
+        );
+        assert_eq!(
+            intact_impulse(capped[39]),
+            None,
+            "40 m 外在 16 m 封顶外:无冲量(封顶失效时 P = 1000·(1−47/1000)              ≈ 953 会是粉碎)"
+        );
+        assert_eq!(
+            capped[0],
+            crate::cohesion::CellBlast::Pulverize,
+            "近格在封顶半径内:power 1000 直接粉碎"
+        );
+    }
+
+    /// 逐格求值·带旋转与衰减过未装载 chunk(§6.1 风险 1/合同):绕 z 转 90°
+    /// 的梁,第一格中心 = 平移 + 旋转 × 偏移;`terrain_at = None`(未装载)不衰减。
+    ///
+    /// 变红:格中心没乘 rotation(平放姿态公式);未装载被当成实心衰减。
+    #[test]
+    fn compound_blast_rotated_cells_and_unloaded_no_attenuation() {
+        let reg = voxel::SimpleRegistry::builtin();
+        let rot = types::glam::Quat::from_rotation_z(90f32.to_radians());
+        let state = EntityState {
+            translation: Vec3::new(8.5, 0.5, 8.5),
+            rotation: rot,
+            ..EntityState::default()
+        };
+        // 全部未知(未装载):不衰减——P 只按距离。
+        let none = |_: BlockPos| None;
+        let fates = crate::cohesion::compound_blast(
+            &state,
+            &beam_shape(2),
+            Vec3::new(8.5, 1.5, 8.5),
+            4.0,
+            12.0,
+            1.0,
+            &none,
+            &reg,
+        );
+        // 第一格中心 = (8.5, 0.5, 8.5) + rot·(1,0,0) = (8.5, 1.5, 8.5),d = 1
+        // → P = 4·(1 − 1/12) ≈ 3.67 > 6?否,R_stone 6 → 完好;冲量 = 单格公式。
+        let imp = intact_impulse(fates[0]).expect("石 R 6 压不碎");
+        assert!(
+            imp.abs_diff_eq(
+                crate::explosion::explosion_impulse(
+                    Vec3::new(8.5, 1.5, 8.5),
+                    4.0,
+                    12.0,
+                    Vec3::new(8.5, 0.5, 8.5)
+                )
+                .unwrap(),
+                1e-5
+            ),
+            "第一格中心 = 平移(rot·(0,0,0)),冲量竖直向下:{imp:?}"
+        );
+        // 第二格中心 = (8.5, 0.5, 8.5) + rot·(1,0,0) = (8.5, 1.5, 8.5)——恰为
+        // 爆心:d = 0 → 完好、无冲量(单格公式的 d=0 语义;旋转 × 偏移生效)。
+        assert_eq!(intact_impulse(fates[1]), None, "第二格中心恰为爆心:无冲量");
+        // 对照:爆心抬高 0.5 → 第二格 d = 0.5 < 1,有冲量;第一格 d = √1.25。
+        let fates2 = crate::cohesion::compound_blast(
+            &state,
+            &beam_shape(2),
+            Vec3::new(8.5, 2.0, 8.5),
+            4.0,
+            12.0,
+            1.0,
+            &none,
+            &reg,
+        );
+        let imp1 = intact_impulse(fates2[1]).expect("d = 0.5 半径内");
+        assert!(
+            imp1.abs_diff_eq(
+                crate::explosion::explosion_impulse(
+                    Vec3::new(8.5, 2.0, 8.5),
+                    4.0,
+                    12.0,
+                    Vec3::new(8.5, 1.5, 8.5)
+                )
+                .unwrap(),
+                1e-5
+            ),
+            "第二格冲量 = 单格公式(中心已随旋转移):{imp1:?}"
+        );
+    }
+
+    /// 爆炸接线·无破坏按点施冲量(§6.1 第 2 条,D6;生产路径):零重力石梁,
+    /// 爆心在梁左端的左下方、power 4(各格压力 < R 6 不破坏)→ 同一实体、
+    /// 形状不变,获得向右上方的线动量与绕 z 的角动量(按点施加 ≠ 中心合成:
+    /// 中心合成的角速度为 0)。
+    ///
+    /// 变红:只在中心施一次冲量(ω_z = 0);冲量直接改速度没走 rapier
+    /// (位置/旋转不更新);开关关了还走复合体分支(单格公式,ω ≠ 期望)。
+    #[test]
+    fn detonate_intact_compound_applies_point_impulses() {
+        let mut cfg = zero_g_cfg();
+        cfg.destruction.enabled = true;
+        cfg.cohesion.enabled = true;
+        cfg.solidify.enabled = false;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        let id = entity(1);
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(10.5, 0.5, 8.5),
+                ..EntityState::default()
+            },
+            beam_shape(6),
+        )]);
+        s.apply_prefix(&[detonate_input(2, Vec3::new(9.0, -1.0, 8.5), 4.0, 12.0)]);
+        s.step();
+        let st = s.entity_state(id).expect("无破坏不删除");
+        assert!(
+            st.linvel.x > 0.5 && st.linvel.y > 0.5,
+            "各格冲量合成的线动量向右上:{:?}",
+            st.linvel
+        );
+        assert!(
+            st.angvel.z < -0.05,
+            "偏心施力产生绕 z 的力矩(左端受力更大 → 顺时针):{:?}",
+            st.angvel
+        );
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.blast_removed_cells, 0, "无破坏不计数");
+        assert!(out.piece_requests.is_empty(), "无破坏不产分块");
+        assert!(out.despawned.is_empty());
+        // 对照:载荷关闭(cohesion off)→ 单格公式只在质心施一次,同爆心下
+        // ω_z 为 0(同一拍、同一爆心的确定性对照)。
+        let mut cfg2 = zero_g_cfg();
+        cfg2.destruction.enabled = true;
+        cfg2.cohesion.enabled = false;
+        cfg2.solidify.enabled = false;
+        let mut s2 = ShardSim::new(cfg2, Box::new(voxel::SimpleRegistry::builtin()));
+        let id2 = entity(1);
+        s2.apply_prefix(&[compound_spawn_input(
+            1,
+            id2,
+            EntityState {
+                translation: Vec3::new(10.5, 0.5, 8.5),
+                ..EntityState::default()
+            },
+            beam_shape(6),
+        )]);
+        s2.apply_prefix(&[detonate_input(2, Vec3::new(9.0, -1.0, 8.5), 4.0, 12.0)]);
+        s2.step();
+        let st2 = s2.entity_state(id2).expect("实体保留");
+        assert!(
+            st2.angvel.z.abs() < 1e-4,
+            "载荷关闭:单格路径质心施冲量,无角速度:{:?}",
+            st2.angvel
+        );
+    }
+
+    /// 爆炸接线·炸碎复合体(§6.1 第 3 条;生产路径):零重力 6 格石梁,爆心
+    /// 在左端外(power 12、radius 8)→ 前 2 格脱落(6 < P ≤ 12)、第 3 格 P = 6
+    /// 恰不破坏、其余完好;原实体当拍删除、`blast_removed_cells` = 2;分块
+    /// 请求 = 4 个完好格分量(复合体,index 0)+ 2 个脱落碎块(index 1..3,
+    /// 单格碎块、不带形状),分量线速度带 Σ 冲量 / 质量。
+    ///
+    /// 变红:不破坏(只施冲量);分量丢冲量;脱落格速度漏 ω × r 项或质量
+    /// 用错;index 顺序不先分量后脱落;遥测不接线。
+    #[test]
+    fn detonate_breaks_compound_into_components_then_detached() {
+        let mut cfg = zero_g_cfg();
+        cfg.destruction.enabled = true;
+        cfg.cohesion.enabled = true;
+        cfg.solidify.enabled = false;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        let id = entity(1);
+        // 梁沿 +x,原点平移 = 格 −2..=3 的中心 − 2 → 各格世界中心 x = 8.5..13.5。
+        let shape = types::CompoundShape::new(
+            (-2..=3)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格");
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(10.5, 0.5, 8.5),
+                ..EntityState::default()
+            },
+            shape,
+        )]);
+        // 爆心 (6.5, 0.5, 8.5):d_i = 2..=7 → P = 12·(1 − d/8) =
+        // 9、7.5、6、4.5、3、1.5;石 R 6:P > 6 脱落(前两格),P = 6 恰在阈值
+        // 上不破坏(第 3 格),其余完好。
+        s.apply_prefix(&[detonate_input(2, Vec3::new(6.5, 0.5, 8.5), 12.0, 8.0)]);
+        s.step();
+        assert!(s.entity_state(id).is_none(), "原实体当拍删除");
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.blast_removed_cells, 2, "脱落 2 格");
+        assert_eq!(out.piece_requests.len(), 3, "1 个剩余分量 + 2 个脱落格");
+        // 分量(完整):4 个完好格相连(d = 4 的格 P = 6 恰不破坏)→ 1 个
+        // 分量;后 2 个 = 脱落格。
+        let comp = &out.piece_requests[0];
+        assert!(
+            comp.desc.shape().is_some(),
+            "完好格相连成分量复合体:{:?}",
+            comp.desc.shape().map(|s| s.cells().len())
+        );
+        assert_eq!(comp.index, 0);
+        // 脱落格单格碎块,速度 = v + ω × r + 冲量 / 0.729;v = ω = 0 → 纯冲量。
+        for (k, piece) in out.piece_requests[1..].iter().enumerate() {
+            assert!(piece.desc.shape().is_none(), "脱落格 = 单格碎块");
+            assert_eq!(piece.desc.block, voxel::builtin::STONE);
+            assert_eq!(piece.index, (k + 1) as u32, "index 分量先、脱落格后");
+            let d = (2 + k) as f32;
+            let p = 12.0 * (1.0 - d / 8.0);
+            let dir = Vec3::new(0.4, 1.0, 0.0).normalize();
+            let expect = Vec3::new(8.5 + k as f32, 0.5, 8.5);
+            assert!(
+                (piece.state.translation.x - expect.x).abs() < 1e-4
+                    && (piece.state.translation.y - expect.y).abs() < 1e-4,
+                "脱落格位置 = 该格世界中心:{:?}",
+                piece.state.translation
+            );
+            assert!(
+                piece.state.linvel.abs_diff_eq(p * dir / 0.729, 1e-3),
+                "脱落格速度 = 冲量 / 0.729:{:?}(期望 {p}·{dir:?}/0.729)",
+                piece.state.linvel
+            );
+        }
+        // 分量速度 = Σ(完好格冲量)/ (4 × 0.729):完好格冲量 = 单格公式
+        // d = 4,5,6,7 → 沿 +x 的 6、4.5、3、1.5;Σ = 15 → /(4·0.729) ≈ 5.144。
+        assert!(
+            comp.state
+                .linvel
+                .abs_diff_eq(Vec3::new(15.0 / 2.916, 0.0, 0.0), 1e-3),
+            "分量线速度带 Σ 冲量 / 分量质量:{:?}",
+            comp.state.linvel
+        );
+        assert!(out.despawned.contains(&id));
+    }
+
+    /// 爆炸接线·粉碎格消失、冻结节外(§6.1 第 3/4 条):土梁被高压力爆炸全 6
+    /// 格粉碎(P 全 > 4)→ 原实体删除、`blast_removed_cells` = 6、零分块请求;
+    /// 冻结(kinematic)复合体同一爆心下完全免疫(状态位级不变)。
+    ///
+    /// 变红:粉碎格也产碎块;粉碎不计数;冻结体不免疫。
+    #[test]
+    fn detonate_pulverize_whole_and_frozen_immune() {
+        // 全粉碎:6 格土梁(R 2、k 2 → P > 4 粉碎),power 30、radius 8,
+        // 爆心 (9.5, 0.5, 8.5) → d = 1..=6,P = 30·(1 − d/8) =
+        // 26.25、22.5、18.75、15、11.25、7.5 → 全 > 4 全粉碎。
+        let run = |frozen: bool| {
+            let mut cfg = zero_g_cfg();
+            cfg.destruction.enabled = true;
+            cfg.cohesion.enabled = true;
+            cfg.solidify.enabled = false;
+            let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+            let id = entity(1);
+            s.apply_prefix(&[compound_spawn_input(
+                1,
+                id,
+                EntityState {
+                    translation: Vec3::new(10.5, 0.5, 8.5),
+                    ..EntityState::default()
+                },
+                dirt_beam_shape(6),
+            )]);
+            if frozen {
+                // 冻结 = kinematic:绕过激活,直接改 body 类型。
+                let rec = s.entities.get(&id).expect("在表");
+                s.phys
+                    .bodies
+                    .get_mut(rec.handle)
+                    .expect("handle 有效")
+                    .set_body_type(RigidBodyType::KinematicPositionBased, true);
+            }
+            s.apply_prefix(&[detonate_input(2, Vec3::new(9.5, 0.5, 8.5), 30.0, 8.0)]);
+            s.step();
+            (s, id)
+        };
+        let (mut s, id) = run(false);
+        assert!(s.entity_state(id).is_none(), "全粉碎也删原实体");
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.blast_removed_cells, 6, "6 格全计");
+        assert!(
+            out.piece_requests.is_empty(),
+            "全粉碎没有剩余分量、没有脱落格:{:?}",
+            out.piece_requests.len()
+        );
+        let (mut s2, id2) = run(true);
+        let st = s2.entity_state(id2).expect("冻结体保留");
+        let out2 = s2.take_outbox();
+        assert_eq!(out2.cohesion_stats.blast_removed_cells, 0, "免疫不计数");
+        assert_eq!(st.linvel, Vec3::ZERO, "冻结体对爆炸免疫(§9.12),速度不变");
+    }
+
     // ==== REQ-007 任务 03(G3 返修补齐测试)====
 
     /// 任务书测试 `sim::awaiting_terrain_enters_and_recovers`(T5):② 预算 0

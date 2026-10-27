@@ -3119,7 +3119,6 @@ mod unit07 {
     ///
     /// 会变红的实现:复合体自身的格也参与衰减;脱落冲量没按"向上为主"的方向;冲量用了压力而不是单格公式。
     #[test]
-    #[ignore = "REQ-010 单元 07 待实施方解除"]
     fn acc_c9_compound_blast_rules() {
         let reg = SimpleRegistry::builtin();
         let state = EntityState {
@@ -3251,7 +3250,6 @@ mod unit07 {
     ///
     /// 会变红的实现:爆炸对复合体只在中心施一次冲量、不破坏;破坏后没有拆分;剩余部分丢了冲量;编号顺序不对。
     #[test]
-    #[ignore = "REQ-010 单元 07 待实施方解除"]
     fn acc_c9_blast_breaks_compound_into_pieces() {
         let mut s = session();
         let id = spawn_beam(&mut s);
@@ -3302,7 +3300,6 @@ mod unit07 {
     ///
     /// 会变红的实现:只在中心施一次冲量(没有力矩,角速度为 0)。
     #[test]
-    #[ignore = "REQ-010 单元 07 待实施方解除"]
     fn acc_c9_blast_spins_intact_compound() {
         let mut s = session();
         let id = spawn_beam(&mut s);

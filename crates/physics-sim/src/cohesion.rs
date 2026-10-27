@@ -515,10 +515,17 @@ pub enum CellBlast {
     Detach { impulse: types::glam::Vec3 },
 }
 
-/// 爆炸对复合体的逐格求值(纯函数,REQ-010 §6.1 第 1 条):返回各格结果(形状格序)。`terrain_at` 给出地形
-/// (`None` = 未装载,穿过时不衰减)。
+/// 爆炸对复合体的逐格求值(纯函数,REQ-010 §6.1 第 1 条):返回各格结果(形状格序)。
 ///
-/// **总架构师接口桩(REQ-010 单元 07)**:由实施方实现。
+/// 格 i 的世界中心 `w_i = 平移 + 旋转 × 偏移_i`,`d_i = |w_i − 爆心|`;有效半径
+/// `r = min(radius, MAX_TERRAIN_BLAST_RADIUS)`;`d_i ≥ r` → 完好、无冲量;否则压力
+/// `P_i = power·(1 − d_i/r) − Σ R(segment_cells(爆心, w_i) 中的地形实心格)·attenuation`
+/// ——只有地形格衰减,复合体自身的格不在体素里,天然不挡(§6.1 风险 1);
+/// `P_i > k·R_i` → 粉碎;`R_i < P_i ≤ k·R_i` → 脱落,冲量 `P_i·dir'`,
+/// `dir' = normalize(0.4·u_x, 1, 0.4·u_z)`、`u = (w_i − 爆心)/d_i`;其余完好,在
+/// `w_i` 处受冲量 `explosion_impulse(爆心, power, radius, w_i)`(与单格实体同式,
+/// 用**原始** `radius`,不封顶、不受地形遮挡影响)。`terrain_at` 给出地形
+/// (`None` = 未装载,穿过时不衰减)。
 #[allow(clippy::too_many_arguments)]
 pub fn compound_blast(
     state: &types::EntityState,
@@ -530,16 +537,65 @@ pub fn compound_blast(
     terrain_at: &dyn Fn(BlockPos) -> Option<BlockId>,
     registry: &dyn BlockRegistry,
 ) -> Vec<CellBlast> {
-    let _ = (
-        state,
-        center,
-        power,
-        radius,
-        attenuation,
-        terrain_at,
-        registry,
-    );
-    vec![CellBlast::Intact { impulse: None }; shape.cells().len()]
+    // 有效半径封顶(同 `evaluate_blast` §4.1);压力全程 f64(REQ-009 §4.2 同口径)。
+    let r = radius.min(crate::destruction::MAX_TERRAIN_BLAST_RADIUS) as f64;
+    let c = [center.x as f64, center.y as f64, center.z as f64];
+    let cells = shape.cells();
+    let mut out: Vec<CellBlast> = Vec::with_capacity(cells.len());
+    for cell in cells {
+        let offset = state.rotation
+            * types::glam::Vec3::new(
+                cell.offset[0] as f32,
+                cell.offset[1] as f32,
+                cell.offset[2] as f32,
+            );
+        let w = state.translation + offset;
+        let wc = [w.x as f64, w.y as f64, w.z as f64];
+        let (dx, dy, dz) = (wc[0] - c[0], wc[1] - c[1], wc[2] - c[2]);
+        let d = (dx * dx + dy * dy + dz * dz).sqrt();
+        if d >= r {
+            out.push(CellBlast::Intact { impulse: None });
+            continue;
+        }
+        let mut pressure = power as f64 * (1.0 - d / r);
+        // 射线衰减:穿过的格 = 全段去掉最后一个(目标格自身);未装载格不衰减,
+        // 实心地形格按其材料 R 扣减(§4.2)。
+        let through = crate::destruction::segment_cells(c, wc);
+        for &q in &through[..through.len() - 1] {
+            if let Some(m) = terrain_at(q).and_then(|b| registry.material(b)) {
+                pressure -= m.resistance as f64 * attenuation as f64;
+            }
+        }
+        match registry.material(cell.block) {
+            Some(m) if pressure > m.pulverize_factor as f64 * m.resistance as f64 => {
+                out.push(CellBlast::Pulverize);
+            }
+            Some(m) if pressure > m.resistance as f64 => {
+                // 脱落冲量方向(REQ-009 §4.3 同式);爆心恰在格中心 u 无定义 →
+                // 竖直向上(与单格口径一致)。
+                let u = if d > 0.0 {
+                    types::glam::Vec3::new(dx as f32, dy as f32, dz as f32) / d as f32
+                } else {
+                    types::glam::Vec3::ZERO
+                };
+                let dir = types::glam::Vec3::new(
+                    crate::destruction::DEBRIS_SPREAD * u.x,
+                    1.0,
+                    crate::destruction::DEBRIS_SPREAD * u.z,
+                )
+                .normalize_or_zero();
+                out.push(CellBlast::Detach {
+                    impulse: pressure as f32 * dir,
+                });
+            }
+            _ => {
+                out.push(CellBlast::Intact {
+                    impulse: crate::explosion::explosion_impulse(center, power, radius, w),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
