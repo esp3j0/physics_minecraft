@@ -1452,14 +1452,14 @@ pub(crate) mod tests {
                 radius: 5.0,
             },
         ];
-        for cmd in whitelist {
-            let outcome = translate(InputSource(3), C2S::Command(cmd));
-            let expected_shard = command_shard(&cmd).expect("白名单命令必有路由");
+        for cmd in &whitelist {
+            let outcome = translate(InputSource(3), C2S::Command(cmd.clone()));
+            let expected_shard = command_shard(cmd).expect("白名单命令必有路由");
             assert_eq!(
                 outcome,
                 TranslateOutcome::Send(DriverCommand::Send {
                     shard: expected_shard,
-                    command: cmd,
+                    command: cmd.clone(),
                 }),
                 "白名单命令 {cmd:?} 透传为 Send"
             );
@@ -1808,7 +1808,7 @@ pub(crate) mod tests {
             block: types::BlockId(1),
         };
         assert_eq!(
-            translate(player, C2S::Command(set_block)),
+            translate(player, C2S::Command(set_block.clone())),
             TranslateOutcome::Send(DriverCommand::Send {
                 shard: types::ShardId::new(
                     types::WorldId(0),
@@ -1859,7 +1859,7 @@ pub(crate) mod tests {
             radius: 5.0,
         };
         assert_eq!(
-            translate(player, C2S::Command(detonate)),
+            translate(player, C2S::Command(detonate.clone())),
             TranslateOutcome::Send(DriverCommand::Send {
                 shard: types::ShardId::new(
                     types::WorldId(0),

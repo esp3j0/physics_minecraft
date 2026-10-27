@@ -281,7 +281,7 @@ mod tests {
             },
         ];
         for cmd in &whitelist {
-            let c2s = C2S::Command(*cmd);
+            let c2s = C2S::Command(cmd.clone());
             let decoded = decode_c2s_frame(&encode_c2s_frame(&c2s)).expect("命令包往返");
             assert_eq!(decoded, c2s, "白名单命令包 {cmd:?} 帧往返相等");
         }

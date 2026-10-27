@@ -18,7 +18,8 @@ impl InputSource {
 
 /// 外部命令:模拟状态只能因它改变(REQ-001 共识 1)。
 /// 变体只允许**追加**(序号即 canonical 排序的类型序号,§9.6)。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// REQ-010 §5.4:SpawnDynamic 的 `EntityDesc` 不再 `Copy`,本枚举随之只有 `Clone`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SimCommand {
     SetBlock {
         pos: BlockPos,
@@ -82,7 +83,7 @@ pub enum SimCommand {
 
 impl SimCommand {
     /// 枚举声明序(canonical 类型序号的低位)。
-    pub const fn ordinal(self) -> u16 {
+    pub const fn ordinal(&self) -> u16 {
         match self {
             Self::SetBlock { .. } => 0,
             Self::SpawnDynamic { .. } => 1,

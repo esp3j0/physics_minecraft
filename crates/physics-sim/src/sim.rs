@@ -97,9 +97,6 @@ pub enum LocomotionState {
 /// (每 tick step 后采一个点,首尾相距 20 tick;任务书 01 接口设计)。
 pub(crate) const DISPLACEMENT_WINDOW_LEN: usize = 21;
 
-/// 旋转包络系数(stable 无 f32::consts::SQRT_3;wake.rs 同款常量)。
-const SQRT3: f32 = 1.732_050_8;
-
 /// 单分片配置。可序列化(快照,任务书 01 细则 2:gravity 为 glam Vec3,
 /// types 的 glam 已开 serde)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,13 +449,59 @@ impl ShardSim {
     ///
     /// **总架构师接口桩(REQ-009 单元 03)**:由实施方实现。
     pub fn entity_desc(&self, id: EntityId) -> Option<EntityDesc> {
-        self.entities.get(&id).map(|rec| rec.desc)
+        self.entities.get(&id).map(|rec| rec.desc.clone())
     }
 
     /// 实体当前状态;不存在(已迁移/已凝固)返回 None。
     pub fn entity_state(&self, id: EntityId) -> Option<EntityState> {
         let rec = self.entities.get(&id)?;
         Some(self.read_state(rec))
+    }
+
+    /// 实体质量(kg;观察输出,REQ-010 单元 03a 测试观测口):单格 = 0.729,
+    /// 复合体 = 格数 × 0.729(rapier 按逐格 cuboid collider × 密度 1.0 算)。
+    /// 不存在 → None。rapier 类型不出 crate。
+    pub fn entity_mass(&self, id: EntityId) -> Option<f32> {
+        let rec = self.entities.get(&id)?;
+        Some(self.phys.bodies.get(rec.handle)?.mass())
+    }
+
+    /// 实体是否醒着(非 kinematic;REQ-010 单元 03a 测试观测口:地形变更
+    /// 唤醒的分叉点验证用)。不存在 → false。
+    pub fn entity_awake(&self, id: EntityId) -> bool {
+        self.entities
+            .get(&id)
+            .and_then(|rec| self.phys.bodies.get(rec.handle))
+            .is_some_and(|b| !b.is_kinematic())
+    }
+
+    /// 冻结实体(REQ-010 单元 03a 测试观测口:与 plan 决策落实同式,清速度
+    /// 后切 KinematicPositionBased;测试直接构造冻结态,验证唤醒分叉)。
+    /// 实体不存在时无操作(与既有冻结落实同语义)。
+    pub fn freeze_entity_for_test(&mut self, id: EntityId) {
+        let Some(rec) = self.entities.get(&id) else {
+            return;
+        };
+        let handle = rec.handle;
+        if let Some(body) = self.phys.bodies.get_mut(handle) {
+            body.set_linvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+            body.set_angvel(conv::vec3_to_rapier(Vec3::ZERO), true);
+            body.set_body_type(RigidBodyType::KinematicPositionBased, true);
+        }
+    }
+
+    /// 写入一个体素并登记地形变更唤醒(REQ-010 单元 03a 测试观测口:不经
+    /// apply_command,直接驱动 §4.11 的生产路径)。越界/未装载 → None。
+    pub fn write_voxel_for_test(&mut self, pos: BlockPos, block: BlockId) -> Option<()> {
+        let edit = voxel::VoxelEdit::new().set(pos, block);
+        let dirty = edit.apply(&mut self.voxels).ok()?;
+        for cp in expand_boundary(dirty, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
+        self.register_terrain_write(pos);
+        Some(())
     }
 
     /// 全实体表(观察输出用,REQ-003 §4.4):`(EntityId, EntityState)` 列表,
@@ -588,14 +631,14 @@ impl ShardSim {
         let mut sorted: Vec<&StampedInput> = inputs.iter().collect();
         sorted.sort_by_key(|i| i.canonical_key());
         for input in sorted {
-            match input.payload {
-                InputPayload::Command(cmd) => self.apply_command(cmd, input.source),
+            match &input.payload {
+                InputPayload::Command(cmd) => self.apply_command(cmd.clone(), input.source),
                 InputPayload::Event(CrossEvent::Detonate {
                     center,
                     power,
                     radius,
-                }) => self.detonate(center, power, radius),
-                InputPayload::Envelope(e) => match e.payload {
+                }) => self.detonate(*center, *power, *radius),
+                InputPayload::Envelope(e) => match &e.payload {
                     EnvelopePayload::MigrateEntity {
                         entity,
                         state,
@@ -604,11 +647,11 @@ impl ShardSim {
                         source,
                         actor_motion_ticks,
                     } => {
-                        self.spawn_entity(entity, state, desc, source, actor);
+                        self.spawn_entity(*entity, *state, desc.clone(), *source, *actor);
                         // 常驻运动票触顶标记随迁移载荷走(04a 遗留返修):
                         // 目的分片 claim 后计数连续,不借迁移绕过上限。
-                        if let Some(rec) = self.entities.get_mut(&entity) {
-                            rec.actor_motion_ticks = actor_motion_ticks;
+                        if let Some(rec) = self.entities.get_mut(entity) {
+                            rec.actor_motion_ticks = *actor_motion_ticks;
                         }
                     }
                     // 涌现事件(REQ-005 任务 03):共享参数本地求值,复用同一
@@ -618,7 +661,7 @@ impl ShardSim {
                         center,
                         power,
                         radius,
-                    }) => self.detonate(center, power, radius),
+                    }) => self.detonate(*center, *power, *radius),
                     // 涌现 block write(REQ-005 任务 03):目标 chunk 必已装载
                     // (owner/holder 才会被盖章为收件人;未装载 = 内部一致性
                     // 违规 fail-stop),写体素 + 重建边界 collider;**不推
@@ -634,8 +677,8 @@ impl ShardSim {
                              装载着该 chunk,内部一致性违规,fail-stop)"
                         );
                         // 触发登记与承载转换记录都要写前的方块(§4.6 第 2/3 条)。
-                        let old_block = self.voxels.get_block(pos);
-                        if self.voxels.set_block(pos, block).is_ok() {
+                        let old_block = self.voxels.get_block(*pos);
+                        if self.voxels.set_block(*pos, *block).is_ok() {
                             // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
                             for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
                                 if self.built_colliders.contains(&cp) {
@@ -644,17 +687,19 @@ impl ShardSim {
                             }
                             // holder 侧同样登记(04c 风险 4):边界附近的
                             // holder 侧冻结实体失去支撑也须醒来。
-                            self.register_terrain_write(pos);
+                            self.register_terrain_write(*pos);
                             // 承载转换记录(REQ-010 §9):带标记的写入记下写入前
                             // 的方块,拍末"转换前"求值把该格换回这个方块;只在本
                             // 拍有效,同拍多条取第一条(写入前状态)。
-                            if load_conversion && self.load_enabled() {
-                                self.load_conversion_records.entry(pos).or_insert(old_block);
+                            if *load_conversion && self.load_enabled() {
+                                self.load_conversion_records
+                                    .entry(*pos)
+                                    .or_insert(old_block);
                             }
                             // 坍塌触发(REQ-009 §6.2.1 风险 1):邻片 owner 的
                             // 涌现写入同样登记——漏了它,跨分片悬空块的另一半
                             // 会因"没看到"而永远悬空(§6.3,acc_d6)。
-                            self.register_collapse_trigger(pos, old_block, block);
+                            self.register_collapse_trigger(*pos, old_block, *block);
                         }
                     }
                 },
@@ -725,10 +770,12 @@ impl ShardSim {
         while let Some(cur) = stack.pop() {
             to_freeze.push(cur);
             let Some((cc, ch)) = self.entities.get(&cur).and_then(|rec| {
-                self.phys
-                    .bodies
-                    .get(rec.handle)
-                    .map(|b| (conv::rapier_to_vec3(b.translation()), rec.desc.half_size))
+                self.phys.bodies.get(rec.handle).map(|b| {
+                    (
+                        conv::rapier_to_vec3(b.translation()),
+                        rec.desc.envelope_radius(),
+                    )
+                })
             }) else {
                 continue;
             };
@@ -741,10 +788,12 @@ impl ShardSim {
                     if b.is_kinematic() {
                         return None; // 已冻结的不重复处理(已在组里)
                     }
-                    let (oc, oh) = (conv::rapier_to_vec3(b.translation()), orec.desc.half_size);
-                    let overlap = |a: f32, ha: f32, c: f32, hc: f32| {
-                        (a - c).abs() <= ha * SQRT3 + hc * SQRT3 + skin
-                    };
+                    let (oc, oh) = (
+                        conv::rapier_to_vec3(b.translation()),
+                        orec.desc.envelope_radius(),
+                    );
+                    let overlap =
+                        |a: f32, ha: f32, c: f32, hc: f32| (a - c).abs() <= ha + hc + skin;
                     // 在上方(中心更高)且三轴贴靠。
                     if oc.y > cc.y
                         && overlap(cc.x, ch, oc.x, oh)
@@ -837,7 +886,7 @@ impl ShardSim {
                 continue;
             };
             let (handle, desc, slow_ticks_base, source) =
-                (rec.handle, rec.desc, rec.slow_ticks, rec.source);
+                (rec.handle, rec.desc.clone(), rec.slow_ticks, rec.source);
             let actor_motion_ticks = rec.actor_motion_ticks;
             let state = self.read_state(rec);
             let is_sleeping = self
@@ -888,8 +937,13 @@ impl ShardSim {
             };
             // 凝固前提修订(§4.7/任务 03):本拍无实体支撑(被承载瞬态不凝固,
             // §4.4.2)。零重力不判定支撑 → 前提恒真(既有零重力用例不变,§9-6)。
+            // 复合体(REQ-010 §5.4 第 5 条,单元 05 接入前)跳过凝固:
+            // 不报错、不散开;低速计数照常记录,迁移检测照常(§5.3 按原点
+            // 归属——不能因跳凝固连迁移一起跳过)。
+            let is_compound = desc.shape().is_some();
             let no_entity_support = !entity_supported.get(&id).copied().unwrap_or(false);
-            if cfg.enabled
+            if !is_compound
+                && cfg.enabled
                 && !actor
                 && no_entity_support
                 && gate_passes
@@ -1116,7 +1170,7 @@ impl ShardSim {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 crate::settle::current_footprint(
                     conv::rapier_to_vec3(b.translation()),
-                    rec.desc.half_size,
+                    envelope_half(&rec.desc),
                     self.cfg.activation.terrain_guard_m,
                 )
             })
@@ -1279,7 +1333,7 @@ impl ShardSim {
                     (
                         *id,
                         conv::rapier_to_vec3(b.translation()),
-                        rec.desc.half_size,
+                        envelope_half(&rec.desc),
                     )
                 })
                 .collect();
@@ -1333,7 +1387,7 @@ impl ShardSim {
                 (
                     *id,
                     conv::rapier_to_vec3(b.translation()),
-                    rec.desc.half_size,
+                    envelope_half(&rec.desc),
                 )
             })
             .collect();
@@ -1389,7 +1443,7 @@ impl ShardSim {
             let pos = conv::rapier_to_vec3(b.translation());
             for cp in crate::settle::current_footprint(
                 pos,
-                rec.desc.half_size,
+                envelope_half(&rec.desc),
                 self.cfg.activation.terrain_guard_m,
             ) {
                 if region.contains(cp) && !self.built_colliders.contains(&cp) {
@@ -1527,7 +1581,7 @@ impl ShardSim {
             })
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
-                let h = rec.desc.half_size;
+                let h = envelope_half(&rec.desc);
                 (
                     *id,
                     conv::rapier_to_vec3(b.translation()),
@@ -1552,10 +1606,11 @@ impl ShardSim {
             })
             .map(|(id, rec)| {
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let h = envelope_half(&rec.desc);
                 (
                     *id,
                     conv::rapier_to_vec3(b.translation()),
-                    Vec3::new(rec.desc.half_size, rec.desc.half_size, rec.desc.half_size),
+                    Vec3::new(h, h, h),
                 )
             })
             .collect();
@@ -1862,7 +1917,7 @@ impl ShardSim {
             let pos = conv::rapier_to_vec3(body.translation());
             for cp in crate::settle::current_footprint(
                 pos,
-                rec.desc.half_size,
+                envelope_half(&rec.desc),
                 self.cfg.activation.terrain_guard_m,
             ) {
                 if !region.contains(cp) {
@@ -1892,7 +1947,7 @@ impl ShardSim {
             let is_kinematic = body.is_kinematic();
             let footprint = crate::settle::current_footprint(
                 pos,
-                rec.desc.half_size,
+                envelope_half(&rec.desc),
                 self.cfg.activation.terrain_guard_m,
             );
             let missing_collider: BTreeSet<ChunkPos> = footprint
@@ -2218,7 +2273,15 @@ impl ShardSim {
                 self.forced_pending.remove(&id);
                 continue;
             };
-            let (handle, block_desc) = (rec.handle, rec.desc);
+            let (handle, block_desc) = (rec.handle, rec.desc.clone());
+            // 复合体(REQ-010 §5.4 第 5 条,单元 05 接入前)跳过强制落地:
+            // 不报错、不散开、出队不做(瞬态票到期/超预算的整块落地规则在
+            // 单元 05 的 §8.2 实现;直接退出本拍处理,不阻其他实体)。
+            if block_desc.shape().is_some() {
+                self.forced_pending.remove(&id);
+                self.forced_reasons.remove(&id);
+                continue;
+            }
             let body = self.phys.bodies.get(handle).expect("handle 有效");
             let pos = conv::rapier_to_vec3(body.translation());
             let cell = crate::settle::cell_of(pos.x, pos.y, pos.z);
@@ -2315,7 +2378,7 @@ impl ShardSim {
             let pos = conv::rapier_to_vec3(body.translation());
             for cp in crate::settle::current_footprint(
                 pos,
-                rec.desc.half_size,
+                envelope_half(&rec.desc),
                 self.cfg.activation.terrain_guard_m,
             ) {
                 if region.contains(cp) {
@@ -3026,16 +3089,58 @@ impl ShardSim {
             "实体重复 spawn(fail-stop):{id:?}"
         );
         let h = desc.half_size;
-        let (handle, collider) = self.phys.insert(
-            RigidBodyBuilder::dynamic()
-                .pose(conv::pose_to_rapier(state.translation, state.rotation))
-                .linvel(conv::vec3_to_rapier(state.linvel))
-                .angvel(conv::vec3_to_rapier(state.angvel)),
-            ColliderBuilder::cuboid(h, h, h)
-                .density(1.0)
-                .friction(0.6)
-                .restitution(0.1),
-        );
+        // 复合体(REQ-010 §5.4 第 3 条):一个动态刚体,每格一个半边长
+        // `half_size` 的 cuboid collider,局部平移 = 偏移(刚体平移 = 原点,
+        // 质心/惯量由 rapier 按碰撞体算);密度/摩擦/弹性同单格。单格路径
+        // (shape = None)逐位不变。
+        let (handle, collider) = match desc.shape() {
+            None => self.phys.insert(
+                RigidBodyBuilder::dynamic()
+                    .pose(conv::pose_to_rapier(state.translation, state.rotation))
+                    .linvel(conv::vec3_to_rapier(state.linvel))
+                    .angvel(conv::vec3_to_rapier(state.angvel)),
+                ColliderBuilder::cuboid(h, h, h)
+                    .density(1.0)
+                    .friction(0.6)
+                    .restitution(0.1),
+            ),
+            Some(shape) => {
+                let body = RigidBodyBuilder::dynamic()
+                    .pose(conv::pose_to_rapier(state.translation, state.rotation))
+                    .linvel(conv::vec3_to_rapier(state.linvel))
+                    .angvel(conv::vec3_to_rapier(state.angvel));
+                // 首格经 insert 建体拿 collider 句柄(支撑判定的接触对键,
+                // 1:1 约定保持"每实体一个代表 collider");其余格挂同一刚体。
+                let first = shape.cells().first().expect("形状至少 2 格(构造保证)");
+                let (handle, collider) = self.phys.insert(
+                    body,
+                    ColliderBuilder::cuboid(h, h, h)
+                        .density(1.0)
+                        .friction(0.6)
+                        .restitution(0.1)
+                        .translation(conv::vec3_to_rapier(Vec3::new(
+                            first.offset[0] as f32,
+                            first.offset[1] as f32,
+                            first.offset[2] as f32,
+                        ))),
+                );
+                for cell in shape.cells().iter().skip(1) {
+                    let _ = self.phys.insert_collider(
+                        ColliderBuilder::cuboid(h, h, h)
+                            .density(1.0)
+                            .friction(0.6)
+                            .restitution(0.1)
+                            .translation(conv::vec3_to_rapier(Vec3::new(
+                                cell.offset[0] as f32,
+                                cell.offset[1] as f32,
+                                cell.offset[2] as f32,
+                            ))),
+                        Some(handle),
+                    );
+                }
+                (handle, collider)
+            }
+        };
         self.entities.insert(
             id,
             EntityRecord {
@@ -3227,6 +3332,18 @@ impl ShardSim {
             && pos.x < max_x as f32
             && pos.z >= min.z as f32
             && pos.z < max_z as f32
+    }
+}
+
+/// 包络半高换算成 wake/footprint 纯函数预期的"half_size"口径(REQ-010 §5.4
+/// 第 4 条的分叉点):单格 = `half_size` 原样(纯函数内部自乘 √3,浮点路径
+/// 逐位不变);复合体 = 包络半径 ρ ÷ √3(还原成"等效 half_size",纯函数乘
+/// 回 √3 即 ρ;保守包络 AABB)。凡按 half·√3 推算实体包络的调用点统一走它。
+fn envelope_half(desc: &EntityDesc) -> f32 {
+    if desc.shape().is_some() {
+        desc.envelope_radius() / crate::settle::SQRT_3
+    } else {
+        desc.half_size
     }
 }
 
@@ -3985,16 +4102,16 @@ mod tests {
         // despawn 生命周期事件(旧身/迁移身);最终表已无实体。
         assert_eq!(out.despawned, vec![e, e], "Teleport + 迁移各记一次 despawn");
         assert_eq!(out.migrations.len(), 1);
-        match out.migrations[0].payload {
+        match &out.migrations[0].payload {
             EnvelopePayload::MigrateEntity {
                 entity,
                 actor,
                 source,
                 ..
             } => {
-                assert_eq!(entity, e);
-                assert!(actor, "actor 随迁移 payload");
-                assert_eq!(source, Some(InputSource(7)), "source 随迁移 payload");
+                assert_eq!(*entity, e);
+                assert!(*actor, "actor 随迁移 payload");
+                assert_eq!(*source, Some(InputSource(7)), "source 随迁移 payload");
             }
             other => panic!("期望 MigrateEntity,实得 {other:?}"),
         }
@@ -6547,6 +6664,7 @@ mod tests {
         let desc = EntityDesc {
             half_size: 0.45,
             block: voxel::builtin::DIRT,
+            shape: None,
         };
         s.apply_prefix(&[StampedInput {
             apply_at: Tick::ZERO,
@@ -6555,7 +6673,7 @@ mod tests {
             payload: InputPayload::Command(SimCommand::SpawnDynamic {
                 entity: id,
                 state: EntityState::default(),
-                desc,
+                desc: desc.clone(),
             }),
         }]);
         assert_eq!(s.entity_desc(id), Some(desc), "透传生成时的描述");
@@ -7409,6 +7527,7 @@ mod tests {
                 desc: EntityDesc {
                     half_size: crate::destruction::DEBRIS_HALF_SIZE,
                     block: voxel::builtin::STONE,
+                    shape: None,
                 },
             }),
         }]);
@@ -7613,6 +7732,7 @@ mod tests {
                 desc: EntityDesc {
                     half_size: 0.45,
                     block: voxel::builtin::STONE,
+                    shape: None,
                 },
             }),
         }

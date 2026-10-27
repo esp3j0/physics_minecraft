@@ -10,7 +10,9 @@ use types::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos};
 use types::{WORLD_Y_MAX, WORLD_Y_MIN};
 
 /// √3(half_size 旋转包络系数;stable 工具链无 `f32::consts::SQRT_3`)。
-const SQRT_3: f32 = 1.732_050_8;
+/// crate 内可见(sim.rs 的调用点把 `envelope_radius` 还原成 half_size 再进
+/// `current_footprint`:ρ 已含 half·√3 项,除回 √3 即"等效 half_size")。
+pub(crate) const SQRT_3: f32 = 1.732_050_8;
 
 /// 实体所在格(与凝固桥同口径:中心取 floor)。
 pub fn cell_of(x: f32, y: f32, z: f32) -> BlockPos {

@@ -736,6 +736,7 @@ mod unit03 {
             EntityDesc {
                 half_size: DEBRIS_HALF_SIZE,
                 block: builtin::DIRT,
+                shape: None,
             }
         );
     }
@@ -766,6 +767,7 @@ mod unit03 {
                 Some(EntityDesc {
                     half_size: DEBRIS_HALF_SIZE,
                     block: builtin::DIRT,
+                    shape: None,
                 })
             );
             assert!(s.entities_of(shard()).contains(id), "归属本分片");
@@ -1292,7 +1294,8 @@ mod unit04b {
                 s.entity_desc(sh, *id),
                 Some(EntityDesc {
                     half_size: DEBRIS_HALF_SIZE,
-                    block: builtin::STONE
+                    block: builtin::STONE,
+                    shape: None
                 })
             );
         }
@@ -1849,6 +1852,7 @@ mod unit06 {
                 desc: EntityDesc {
                     half_size: 0.45,
                     block: builtin::STONE,
+                    shape: None,
                 },
             },
         )

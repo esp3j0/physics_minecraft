@@ -52,7 +52,8 @@ pub enum ViewEvent {
 }
 
 /// 控制端(主循环 → 连接循环):观察者移动与主动离场。
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// REQ-010 §5.4:Command/Spawn 的载荷不再 `Copy`,本枚举随之只有 `Clone`。
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Control {
     /// 观察者位姿(渲染节流后送达;连接循环原样发 `C2S::MoveObserver`)。
     Move(Vec3),

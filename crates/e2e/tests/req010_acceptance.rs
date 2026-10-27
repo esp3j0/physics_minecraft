@@ -1235,7 +1235,8 @@ mod unit02 {
                 s.entity_desc(sh, *id),
                 Some(EntityDesc {
                     half_size: DEBRIS_HALF_SIZE,
-                    block: DIRT
+                    block: DIRT,
+                    shape: None
                 })
             );
         }
@@ -1313,6 +1314,7 @@ mod unit02 {
             EntityDesc {
                 half_size: DEBRIS_HALF_SIZE,
                 block: STONE,
+                shape: None,
             },
             InputSource(7),
         )
@@ -1567,6 +1569,7 @@ mod unit02 {
             EntityDesc {
                 half_size: DEBRIS_HALF_SIZE,
                 block: DIRT,
+                shape: None,
             },
             InputSource(7),
         )
@@ -1723,7 +1726,6 @@ mod unit03a {
     /// 会变红的实现:不排序(同一形状两种写法不相等,快照与回放对不上);重复偏移被静默合并;
     /// 包络半径漏了 half·√3;单格描述的包络半径变了(既有足迹与唤醒全部偏移)。
     #[test]
-    #[ignore = "REQ-010 单元 03a 待实施方解除"]
     fn acc_c4_shape_canonical_and_radius() {
         let shape = CompoundShape::new(vec![
             cell([3, 0, 0], STONE),
@@ -1800,7 +1802,6 @@ mod unit03a {
     /// 会变红的实现:复合体只建了原点那一个碰撞体(原点在沟正上方,整根梁掉进沟里,y ≈ −60.475);
     /// 偏移没随刚体旋转;迁移/重建时丢了形状。
     #[test]
-    #[ignore = "REQ-010 单元 03a 待实施方解除"]
     fn acc_c5_compound_bridges_trench() {
         let sh = shard(0);
         let mut s = session(&[0], 2..=6);
@@ -1852,7 +1853,6 @@ mod unit03a {
     ///
     /// 会变红的实现:迁移信封丢了形状(目的分片重建成单格);按单格包络判定迁移余量导致提前或滞后迁移出错。
     #[test]
-    #[ignore = "REQ-010 单元 03a 待实施方解除"]
     fn acc_c10_compound_migrates_with_shape() {
         let mut s = session(&[0, 1], 6..=9);
         let mut log = CommandLog::new();
@@ -1890,7 +1890,6 @@ mod unit03a {
     ///
     /// 会变红的实现:实体快照不带形状(回放线重建成单格,轨迹分叉);形状的规范顺序在快照往返后变了。
     #[test]
-    #[ignore = "REQ-010 单元 03a 待实施方解除"]
     fn acc_c12_compound_snapshot_replay() {
         let sh = shard(0);
         let mut a = session(&[0], 2..=6);

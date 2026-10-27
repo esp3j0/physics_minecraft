@@ -13,7 +13,8 @@ use crate::event::CrossEvent;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 8192;
 
 /// 信封载荷。变体只允许**追加**。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// REQ-010 §5.4:MigrateEntity 的 `EntityDesc` 不再 `Copy`,本枚举随之只有 `Clone`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EnvelopePayload {
     /// 实体迁移(REQ-001 §4.2 (b)):tick N 末提取的四向量状态 + 实体描述 +
     /// 政策状态(REQ-006:actor/source 必须随迁移保留)。
@@ -44,7 +45,7 @@ pub enum EnvelopePayload {
 
 impl EnvelopePayload {
     /// 枚举声明序(canonical 类型序号的低位)。
-    pub const fn ordinal(self) -> u16 {
+    pub const fn ordinal(&self) -> u16 {
         match self {
             Self::MigrateEntity { .. } => 0,
             Self::Event(_) => 1,
@@ -54,14 +55,14 @@ impl EnvelopePayload {
 }
 
 /// 分片产出的跨片意图(未经调度器盖章,分片内部不可投递)。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Intent {
     pub destination: ShardId,
     pub payload: EnvelopePayload,
 }
 
 /// 盖章后的信封。`apply_at ≡ produced_at + 1`(恒下一拍,v2 语义)。
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub produced_at: Tick,
     pub apply_at: Tick,
@@ -184,7 +185,7 @@ impl CrossShardQueue {
     /// 升序输出——桶内已 canonical(take_batch 同键),跨桶再排一次即全序;
     /// 恢复后的 take_batch 行为与原队逐位一致。
     pub fn snapshot(&self) -> Vec<Envelope> {
-        let mut all: Vec<Envelope> = self.buckets.values().flatten().copied().collect();
+        let mut all: Vec<Envelope> = self.buckets.values().flatten().cloned().collect();
         all.sort_by_key(|e| {
             (
                 e.destination,

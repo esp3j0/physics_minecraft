@@ -89,9 +89,9 @@ impl Router {
         intents: &[Intent],
         produced_at: Tick,
     ) -> Result<(), AdmitError> {
-        for &intent in intents {
+        for intent in intents {
             let seq = self.sequences.entry(source).or_insert(0);
-            let envelope = Envelope::stamp(source, intent, produced_at, *seq);
+            let envelope = Envelope::stamp(source, intent.clone(), produced_at, *seq);
             *seq += 1;
             self.queue.admit(envelope)?;
         }

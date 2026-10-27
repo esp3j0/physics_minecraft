@@ -322,6 +322,7 @@ fn solidify_bridge_freezes_cube_into_voxels() {
             desc: EntityDesc {
                 half_size: 0.3,
                 block: BlockId(1),
+                shape: None,
             },
         }),
     )]);
@@ -347,5 +348,245 @@ fn solidify_bridge_freezes_cube_into_voxels() {
         settled || (last_y - (cell.y as f32 + 1.3)).abs() < 0.3,
         "小方块停在凝固块上方:y={last_y},cell.y={}",
         cell.y
+    );
+}
+
+// ---- REQ-010 单元 03a:复合实体形状与刚体(§5.4)----
+
+use types::CompoundShape;
+
+/// 2×1×1 双格石梁:原点在两格中间的格上,偏移 [0,0,0] 与 [1,0,0]。
+fn two_cell_beam_desc() -> (BlockPos, EntityDesc) {
+    let origin = BlockPos::new(8, 190, 8);
+    let cells = vec![
+        (BlockPos::new(8, 190, 8), BlockId(1)),
+        (BlockPos::new(9, 190, 8), BlockId(1)),
+    ];
+    let shape = CompoundShape::from_world(origin, &cells).expect("2 格");
+    (origin, EntityDesc::compound(0.45, shape))
+}
+
+fn spawn_desc(seq: u64, id: EntityId, state: EntityState, desc: EntityDesc) -> StampedInput {
+    StampedInput {
+        apply_at: Tick(0),
+        source: InputSource::SCHEDULER,
+        sequence: seq,
+        payload: InputPayload::Command(SimCommand::SpawnDynamic {
+            entity: id,
+            state,
+            desc,
+        }),
+    }
+}
+
+/// §5.4 第 3 条:复合体一个动态刚体、每格一个 cuboid;质量 = 格数 × 0.729
+/// (0.9³ × 密度 1.0);单格 = 0.729。刚体平移 = 原点(刚体平移语义与单格同)。
+///
+/// 变红:复合体只建一个 collider 且密度按体积放大(质量 ≠ 格数 × 0.729);
+/// 或忘了给复合体建刚体(spawn panic)。
+#[test]
+fn compound_mass_is_cells_times_unit_mass() {
+    let mut s = sim_no_solidify(0, 0);
+    s.load_chunk(ChunkPos::new(0, 0), ground_chunk(200));
+    let id = entity(30);
+    s.apply_prefix(&[spawn_desc(
+        0,
+        id,
+        EntityState {
+            translation: Vec3::new(8.5, 191.5, 8.5),
+            ..EntityState::default()
+        },
+        two_cell_beam_desc().1,
+    )]);
+    // 单格参照(默认描述,half = 0.5):质量 = 1.0(1 m³ × 密度 1)。
+    let mut ref_sim = sim_no_solidify(0, 0);
+    ref_sim.load_chunk(ChunkPos::new(0, 0), ground_chunk(200));
+    ref_sim.apply_prefix(&[spawn_input(
+        0,
+        entity(31),
+        Vec3::new(8.5, 191.5, 8.5),
+        Vec3::ZERO,
+        Vec3::ZERO,
+    )]);
+    let single = ref_sim.entity_mass(entity(31)).expect("单格在场");
+    assert!(
+        (single - 1.0).abs() < 1e-6,
+        "半格立方单格质量 1.0,实为 {single}"
+    );
+    let compound = s.entity_mass(id).expect("复合体在场");
+    // 复合体每格 0.45 cuboid → 0.9³ × 密度 1 = 0.729/格(§5.4 第 3 条)。
+    let want = 2.0 * physics_sim::destruction::DEBRIS_MASS;
+    assert!(
+        (compound - want).abs() < 1e-5,
+        "复合体质量 = 格数 × 0.729,实为 {compound}(期望 {want})"
+    );
+    // spawn 后刚体平移 = 原点(传入的 translation;§5.4 第 3 条)。
+    assert_eq!(
+        s.entity_state(id).expect("在场").translation,
+        Vec3::new(8.5, 191.5, 8.5)
+    );
+}
+
+/// §5.4 第 6 条:迁移信封携带完整描述(含形状);目的分片重建为同一复合体
+/// (质量不变 = 形状没丢),源分片不再持有。
+///
+/// 变红:迁移信封丢形状(目的分片重建成单格,质量变 0.729)。
+#[test]
+fn compound_migration_carries_shape() {
+    let mut s = sim_no_solidify(0, 0);
+    s.load_chunk(ChunkPos::new(0, 0), ground_chunk(200));
+    let id = entity(32);
+    s.apply_prefix(&[spawn_desc(
+        0,
+        id,
+        EntityState {
+            translation: Vec3::new(8.5, 191.5, 8.5),
+            ..EntityState::default()
+        },
+        two_cell_beam_desc().1,
+    )]);
+    // 传送到本体区外(x = 136 > 128)触发迁移。
+    s.apply_prefix(&[input(
+        1,
+        InputPayload::Command(SimCommand::TeleportEntity {
+            entity: id,
+            state: EntityState {
+                translation: Vec3::new(136.5, 191.5, 8.5),
+                ..EntityState::default()
+            },
+        }),
+    )]);
+    s.step();
+    let out = s.take_outbox();
+    assert_eq!(out.migrations.len(), 1, "迁移信封已产出");
+    let desc = match &out.migrations[0].payload {
+        EnvelopePayload::MigrateEntity { desc, .. } => desc.clone(),
+        other => panic!("期望 MigrateEntity,实得 {other:?}"),
+    };
+    assert!(
+        desc.shape().is_some(),
+        "迁移信封的描述必须带形状(§5.4 第 6 条)"
+    );
+    // 形状逐格都在(canonical 2 格):包络半径 = 最远偏移 1 + half·√3。
+    let want_rho = 1.0f32 + 0.45f32 * 3f32.sqrt();
+    assert!((desc.envelope_radius() - want_rho).abs() < 1e-5);
+    assert_eq!(desc.shape().expect("形状").cells().len(), 2, "两格都在");
+}
+
+/// §5.4 第 5 条:复合体跳过凝固——即使低速连续 20 拍且睡眠兜底条件满足,
+/// 也不写块、不删除实体;单格实体在同样条件下照常凝固(对照)。
+///
+/// 变红:复合体被凝固(实体消失/出现 Emergent 写入)。
+#[test]
+fn compound_skips_solidify() {
+    let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+    cfg.solidify.enabled = true;
+    let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+    // 顶面 y = -64 + 255 - 1 + 1 = 191:梁(半边长 0.45,中心 191.5)出生即
+    // 静置于面上,低速计满 20 拍后触发凝固判据(单格在此场景会凝固)。
+    s.load_chunk(ChunkPos::new(0, 0), ground_chunk(255));
+    let id = entity(33);
+    s.apply_prefix(&[spawn_desc(
+        0,
+        id,
+        EntityState {
+            translation: Vec3::new(8.5, 191.5, 8.5),
+            ..EntityState::default()
+        },
+        two_cell_beam_desc().1,
+    )]);
+    for _ in 0..60 {
+        s.step();
+        let out = s.take_outbox();
+        assert!(
+            out.despawned.is_empty(),
+            "复合体不得被删除(despawned = {:?})",
+            out.despawned
+        );
+        assert!(
+            !out.block_updates
+                .iter()
+                .any(|w| w.kind == physics_sim::BlockWriteKind::Emergent),
+            "复合体不得凝固写块(单元 05 接入前跳过)"
+        );
+    }
+    assert!(s.entity_state(id).is_some(), "复合体仍在(没有被凝固删除)");
+    assert!(s.entity_desc(id).is_some_and(|d| d.shape().is_some()));
+}
+
+/// §5.4 第 5 条:复合体跳过强制落地——进 forced_pending 后不被落地写块、
+/// 不被删除(单元 05 的整块落地规则接入前跳过);单格同场景照常落地(对照
+/// 逻辑由 REQ-007 既有用例覆盖)。
+///
+/// 变红:复合体被单格规则强制落地(实体消失 + Emergent 写入)。
+#[test]
+fn compound_skips_forced_landing() {
+    let mut s = sim_no_solidify(0, 0);
+    s.load_chunk(ChunkPos::new(0, 0), ground_chunk(255));
+    let id = entity(34);
+    s.apply_prefix(&[spawn_desc(
+        0,
+        id,
+        EntityState {
+            translation: Vec3::new(8.5, 191.5, 8.5),
+            ..EntityState::default()
+        },
+        two_cell_beam_desc().1,
+    )]);
+    // 公开入口入队(调度器 7.5 同款;下一拍执行)。
+    s.apply_forced_landing_directive(id);
+    for _ in 0..5 {
+        s.step();
+        s.run_transient_lifecycle();
+        let out = s.take_outbox();
+        assert!(
+            !out.block_updates
+                .iter()
+                .any(|w| w.kind == physics_sim::BlockWriteKind::Emergent),
+            "复合体不得被单格规则落地写块"
+        );
+    }
+    assert!(s.entity_state(id).is_some(), "复合体仍在");
+}
+
+/// §5.4 第 4 条分叉点:复合体冻结时的地形变更唤醒按 ρ 包络(等效 half =
+/// ρ/√3)判定,而不是 half_size。写一个"离原点 1.9 m"的格:单格包络
+/// (0.45·√3 ≈ 0.78 m + skin)够不到,复合体包络(ρ = 1 + 0.45√3 ≈ 1.78 m)
+/// 必须够到——冻结的复合体被唤醒(切回 Dynamic)。
+///
+/// 变红:分叉点漏改(复合体按 half_size 判定,包络外的写入点永远不唤醒它)。
+#[test]
+fn compound_envelope_half_covers_shape_extent() {
+    let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+    cfg.activation.data_load_radius = 96.0;
+    cfg.activation.collider_load_radius = 96.0;
+    let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+    s.load_chunk(ChunkPos::new(0, 0), ground_chunk(255));
+    let id = entity(35);
+    // 复合体:2 格梁,原点在 (8,190,8),中心 = (8.5,190.5,8.5)。
+    s.apply_prefix(&[spawn_desc(
+        0,
+        id,
+        EntityState {
+            translation: Vec3::new(8.5, 191.5, 8.5),
+            ..EntityState::default()
+        },
+        two_cell_beam_desc().1,
+    )]);
+    // 观察者放远(96 m 之外):排除 plan 的观察者唤醒,只测地形变更唤醒。
+    let far = Vec3::new(127.5, 190.5, 8.5);
+    s.apply_activation(&[far]);
+    s.freeze_entity_for_test(id);
+    assert!(!s.entity_awake(id), "前置:实体已冻结");
+    // 写入格 (10,190,8):其中心 (10.5,·,8.5) 距原点中心 (8.5,·,8.5) dx = 2.0。
+    // 复合体最右格覆盖到 x = 9.95;包络 AABB 沿 x 半高 = ρ ≈ 1.778,
+    // 原点中心 8.5 + 1.778 + skin(0.075) = 10.353 > 10.0 → 相交。
+    // 单格包络:8.5 + 0.779 + 0.075 = 9.354 < 10.0 → 不相交(分叉失效时)。
+    s.write_voxel_for_test(BlockPos::new(10, 190, 8), BlockId(1))
+        .expect("写入");
+    s.apply_activation(&[far]);
+    assert!(
+        s.entity_awake(id),
+        "复合体按 ρ 包络被地形写入唤醒(分叉点生效)"
     );
 }

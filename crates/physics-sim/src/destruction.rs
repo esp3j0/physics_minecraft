@@ -161,6 +161,7 @@ pub fn detach_spawn(req: &DetachRequest) -> (types::EntityState, types::EntityDe
     let desc = types::EntityDesc {
         half_size: DEBRIS_HALF_SIZE,
         block: req.block,
+        shape: None,
     };
     (state, desc)
 }
@@ -818,6 +819,7 @@ mod tests {
             types::EntityDesc {
                 half_size: DEBRIS_HALF_SIZE,
                 block: builtin::DIRT,
+                shape: None,
             },
             "描述 = 半边长 0.45 + 原方块"
         );

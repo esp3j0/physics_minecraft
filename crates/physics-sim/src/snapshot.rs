@@ -145,7 +145,7 @@ impl ShardSim {
                         SnapshotEntityRecord {
                             handle: rec.handle,
                             collider: rec.collider,
-                            desc: rec.desc,
+                            desc: rec.desc.clone(),
                             slow_ticks: rec.slow_ticks,
                             actor: rec.actor,
                             source: rec.source,

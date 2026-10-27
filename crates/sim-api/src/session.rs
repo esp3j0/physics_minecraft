@@ -118,7 +118,7 @@ impl Session {
                 apply_at: tick,
                 source,
                 sequence,
-                payload: InputPayload::Command(command),
+                payload: InputPayload::Command(command.clone()),
             },
         )?;
         self.next_sequence += 1;
@@ -158,8 +158,8 @@ impl Session {
         owner: ShardId,
         command: SimCommand,
     ) -> Result<Vec<LogEntry>, SessionError> {
-        let pos = match command {
-            SimCommand::SetBlock { pos, .. } => pos,
+        let pos = match &command {
+            SimCommand::SetBlock { pos, .. } => *pos,
             _ => return Err(SessionError::Rejected("不支持的广播命令(仅 SetBlock)")),
         };
         let chunk = pos.chunk_of();
@@ -182,7 +182,7 @@ impl Session {
             apply_at: tick,
             source,
             sequence,
-            payload: InputPayload::Command(command),
+            payload: InputPayload::Command(command.clone()),
         };
         let targets: Vec<ShardId> = targets.into_iter().collect();
         self.scheduler.submit_batch(&targets, stamped)?;
@@ -194,7 +194,7 @@ impl Session {
                 dest,
                 source,
                 sequence,
-                command,
+                command: command.clone(),
             })
             .collect())
     }
@@ -247,7 +247,7 @@ impl Session {
             apply_at: tick,
             source,
             sequence,
-            payload: InputPayload::Command(command),
+            payload: InputPayload::Command(command.clone()),
         };
         self.scheduler.submit_batch(&targets, stamped)?;
         self.next_sequence += 1;
@@ -258,7 +258,7 @@ impl Session {
                 dest,
                 source,
                 sequence,
-                command,
+                command: command.clone(),
             })
             .collect())
     }
@@ -828,7 +828,7 @@ mod tests {
             block: types::BlockId(1),
         };
         for expected in 0..3u64 {
-            let entry = session.send(shard, cmd).expect("收件箱未满");
+            let entry = session.send(shard, cmd.clone()).expect("收件箱未满");
             assert_eq!(entry.sequence, expected, "sequence 每 session 单调");
             assert_eq!(entry.source, InputSource(1));
         }
@@ -841,7 +841,7 @@ mod tests {
         };
         let mut other = Session::new(cfg);
         other.register(sim(0, 0));
-        let entry = other.send(shard, cmd).expect("收件箱未满");
+        let entry = other.send(shard, cmd.clone()).expect("收件箱未满");
         assert_eq!(entry.sequence, 0, "source 不同 → 计数独立,不受他处影响");
         assert_eq!(entry.source, InputSource(7));
         other.shutdown();

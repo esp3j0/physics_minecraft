@@ -117,7 +117,9 @@ fn ace2_commands_rejected_in_migration_window() {
     assert!(session.entity_owner(e).is_none(), "迁移窗口 owner=None");
     let remove = SimCommand::RemoveEntity { entity: e };
     assert!(
-        session.send_to_entity(InputSource(7), e, remove).is_err(),
+        session
+            .send_to_entity(InputSource(7), e, remove.clone())
+            .is_err(),
         "迁移窗口 send_to_entity 必须拒绝"
     );
     assert!(
