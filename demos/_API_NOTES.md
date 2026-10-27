@@ -93,3 +93,29 @@ world.step()       # 推进一步;固定步长,默认 dt 见下
   builder 侧 `can_sleep(bool)` 可用。
 - 复合体几何:`r.Collider.compound([(r.Isometry3.from_translation(x,y,z), r.SharedShape.cuboid(hx,hy,hz)), ...])`;
   `Isometry3` 不可下标访问(要分量请存构造前的元组)。
+
+## 复合体与逐格冲量(REQ-010 任务 00 实测,2026-10-26)
+
+- **逐格冲量的可靠做法(强烈推荐)**:一个刚体 + **每格一个 primitive collider**
+  (`colliders=[Collider.cuboid(...).translation(off), ...]` 列表即多 collider),
+  地形同理用**固定体 + 多 primitive 薄片**(不要 `Collider.compound`)。
+  此时 dynamic↔static 的 `point.impulse` 精确:静置全格合计 = m·g·dt(实测 0.715149 vs
+  0.715149,偏差 0.00%);撞击峰值拍合计 vs 动量差分偏差 3.1%。复合体质量 = 格数×0.729
+  实测吻合(6/7/8/9 格 → 4.374/5.103/5.832/6.561);把格合并成长方体(密度 1)质量相同。
+- **补充(对 2026-10-25 记录的修正)**:单个 `Collider.compound` 参与的接触对,本次静置
+  实测读到了 0.119192(非 0)——"复合 collider 冲量恒 0"的缺陷**没有在此构型复现**,
+  触发条件比原记录更窄(原记录为 16×16 chunk 级复合地形)。生产走 Rust 不受影响
+  (REQ-009 撞击 spike 已证 Rust 侧复合体可读);Python 侧请一律用多 primitive 路线。
+- **collider 运行时读取**:`world.colliders.handles()` 按创建序产出;`world.colliders.get(h)`
+  有 `.translation`(= **世界**坐标,含 body 位姿)与 `.parent`(→ `RigidBodyHandle`)。
+  collider→格映射最稳的做法:创建时刻用 `body_pos + R·offset` 逐格按世界位置匹配。
+- `pair.total_impulse()` 返回 **Vec3**(存根未标注),取 `.norm()`;逐点求和用
+  `sum(pt.impulse for m in pair.manifolds for pt in m.points)` 即可。
+- `Rotation3.transform_vector(v)` 可直接把局部向量变换到世界系(与 `to_matrix()` 行主序、
+  world = M·local 的约定一致,builder.rotation 的缩放轴角与 Rodrigues 公式吻合)。
+  **`np.array(Vec3)` 不行**(退化成对象数组),要 `np.array(tuple(v), dtype=float)` 中转。
+- 生产口径"薄片跨面(半厚 0.075)× 0.9 立方内缩 0.05"的初始重叠 = 0.025:不会把复合体
+  弹开(水平速度 0.149 m/s);墙面摩擦使沿面下滑减速 ~25%(不粘死)。
+- 生成复合体必须把原点放在**格中心**(合法网格位姿):偶数尺寸形状的原点规则
+  (包围盒中心同距取小)天然落在半格偏置上,若再把原点生成在非格中心处,
+  全体格的 snap 误差会被系统性抬高 0.5 格。
