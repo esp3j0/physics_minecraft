@@ -477,7 +477,13 @@ fn compound_migration_carries_shape() {
 /// 也不写块、不删除实体;单格实体在同样条件下照常凝固(对照)。
 ///
 /// 变红:复合体被凝固(实体消失/出现 Emergent 写入)。
+///
+/// **单元 05 起 ignore**:本测试钉的"单元 05 之前跳过"过渡条款已被修订 6
+/// (§8.3 第 8 条"单元 03a 的'复合体跳过凝固与强制落地'随之取消")取代;
+/// 断言未改,待总架构师裁定删除或改写。新行为由 `sim::tests::
+/// compound_solidifies_whole_and_counts_telemetry` 等新单测覆盖。
 #[test]
+#[ignore = "钉的 §5.4 第 5 条过渡条款被修订 6(§8.3 第 8 条)取消;待总架构师处置"]
 fn compound_skips_solidify() {
     let mut cfg = ShardSimConfig::new(shard_id(0, 0));
     cfg.solidify.enabled = true;
@@ -519,7 +525,12 @@ fn compound_skips_solidify() {
 /// 逻辑由 REQ-007 既有用例覆盖)。
 ///
 /// 变红:复合体被单格规则强制落地(实体消失 + Emergent 写入)。
+///
+/// **单元 05 起 ignore**:过渡条款已被修订 6(§8.3 第 8 条)取消;断言未改,
+/// 待总架构师裁定。新行为由 `sim::tests::compound_forced_landing_lands_whole_
+/// on_budget_eviction` 等新单测覆盖。
 #[test]
+#[ignore = "钉的 §5.4 第 5 条过渡条款被修订 6(§8.3 第 8 条)取消;待总架构师处置"]
 fn compound_skips_forced_landing() {
     let mut s = sim_no_solidify(0, 0);
     s.load_chunk(ChunkPos::new(0, 0), ground_chunk(255));

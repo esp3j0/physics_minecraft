@@ -944,55 +944,188 @@ impl ShardSim {
             };
             // 凝固前提修订(§4.7/任务 03):本拍无实体支撑(被承载瞬态不凝固,
             // §4.4.2)。零重力不判定支撑 → 前提恒真(既有零重力用例不变,§9-6)。
-            // 复合体(REQ-010 §5.4 第 5 条,单元 05 接入前)跳过凝固:
-            // 不报错、不散开;低速计数照常记录,迁移检测照常(§5.3 按原点
-            // 归属——不能因跳凝固连迁移一起跳过)。
-            let is_compound = desc.shape().is_some();
+            // 复合体不再跳过(REQ-010 §8.3 第 8 条,修订 6):同一套判据,对
+            // 整个刚体判定;迁移检测照常(§5.3 按原点归属——凝固/散开删除实体
+            // 后才 continue,不因凝固分支连迁移一起跳过)。
             let no_entity_support = !entity_supported.get(&id).copied().unwrap_or(false);
-            if !is_compound
-                && cfg.enabled
+            if cfg.enabled
                 && !actor
                 && no_entity_support
                 && gate_passes
                 && (slow_ticks >= cfg.consecutive_ticks || is_sleeping)
             {
-                let snapped = solidify::nearest_orientation(state.rotation, &orients);
-                let (cell, _center, disp) = solidify::snap_position(state.translation);
-                let ang_err = solidify::snap_angle_error(state.rotation, snapped);
-                let too_far =
-                    disp > cfg.max_snap_blocks || ang_err > cfg.max_snap_angle_deg.to_radians();
-                if !too_far || is_sleeping {
-                    // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
-                    let old_block = self.voxels.get_block(cell);
-                    if self.voxels.set_block(cell, desc.block).is_ok() {
-                        // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
-                        for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
-                            if self.built_colliders.contains(&cp) {
-                                self.rebuild_chunk_collider(cp);
+                if let Some(shape) = desc.shape() {
+                    // ---- 复合体:整块凝固(REQ-010 §8.1、§8.3 第 1、2 条)。
+                    // "被占" = 目标格是地形实心,或与其他实体的碰撞体重叠——
+                    // 实体的格集合 = 各格中心所在格(单格 = 中心格,复合体 =
+                    // 每格;与强制落地的 overlaps 同口径)。
+                    let snap = {
+                        let others: std::collections::BTreeSet<BlockPos> = self
+                            .entities
+                            .iter()
+                            .filter(|(other, _)| **other != id)
+                            .flat_map(|(_, orec)| {
+                                let ob = self.phys.bodies.get(orec.handle).expect("handle 有效");
+                                let op = conv::rapier_to_vec3(ob.translation());
+                                let orot = conv::rapier_to_quat(ob.rotation());
+                                match orec.desc.shape() {
+                                    Some(s) => s
+                                        .cells()
+                                        .iter()
+                                        .map(|c| {
+                                            let r = orot
+                                                * types::glam::Vec3::new(
+                                                    c.offset[0] as f32,
+                                                    c.offset[1] as f32,
+                                                    c.offset[2] as f32,
+                                                );
+                                            crate::settle::cell_of(
+                                                op.x + r.x,
+                                                op.y + r.y,
+                                                op.z + r.z,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    None => vec![crate::settle::cell_of(op.x, op.y, op.z)],
+                                }
+                            })
+                            .collect();
+                        let occupied = |p: BlockPos| -> bool {
+                            // 未装载 chunk 不算占(写不进去另判);地形实心或其他实体。
+                            self.voxels
+                                .get_chunk(p.chunk_of())
+                                .is_some_and(|_| !self.voxels.get_block(p).is_air())
+                                || others.contains(&p)
+                        };
+                        crate::cohesion::compound_snap(
+                            state.translation,
+                            state.rotation,
+                            shape,
+                            cfg.max_snap_blocks,
+                            cfg.max_snap_angle_deg,
+                            self.cfg.cohesion.compound_snap_lift,
+                            &occupied,
+                        )
+                    };
+                    match snap {
+                        crate::cohesion::CompoundSnap::Write { cells, .. } => {
+                            // 同一拍写入全部格(`Emergent`,登记触发,D8);目标格
+                            // 所在 chunk 未装载 → 本拍不凝固(继续等;set_block 会
+                            // 静默新建空 chunk,不能拿它兜底)。
+                            if cells
+                                .iter()
+                                .all(|(c, _)| self.voxels.get_chunk(c.chunk_of()).is_some())
+                            {
+                                for (cell, block) in &cells {
+                                    let old_block = self.voxels.get_block(*cell);
+                                    let _ = self.voxels.set_block(*cell, *block);
+                                    self.outbox.block_updates.push(BlockWrite {
+                                        pos: *cell,
+                                        block: *block,
+                                        kind: BlockWriteKind::Emergent,
+                                        load_conversion: false,
+                                    });
+                                    self.register_terrain_write(*cell);
+                                    self.register_collapse_trigger(*cell, old_block, *block);
+                                }
+                                let dirty: Vec<ChunkPos> =
+                                    cells.iter().map(|(c, _)| c.chunk_of()).collect();
+                                for cp in expand_boundary(dirty, &self.voxels) {
+                                    if self.built_colliders.contains(&cp) {
+                                        self.rebuild_chunk_collider(cp);
+                                    }
+                                }
+                                self.entities.remove(&id).expect("存在");
+                                self.phys.remove_body(handle);
+                                self.outbox.despawned.push(id);
+                                // 遥测(§8.3 第 7 条):整块凝固数。
+                                self.outbox.cohesion_stats.compounds_solidified += 1;
+                                continue;
                             }
                         }
-                        self.entities.remove(&id).expect("存在");
-                        self.phys.remove_body(handle);
-                        self.outbox.despawned.push(id);
-                        // 涌现写入(REQ-005 任务 03):凝固桥经 block_updates 的
-                        // `Emergent` 出片——调度器 tick 末发布产生者 + 对
-                        // owner/holders 盖 `EnvelopePayload::BlockWrite`
-                        // (apply_at = N+1);`solidified` 兼容字段自本任务恒空。
-                        self.outbox.block_updates.push(BlockWrite {
-                            pos: cell,
-                            block: desc.block,
-                            kind: BlockWriteKind::Emergent,
-                            load_conversion: false,
-                        });
-                        // 涌现写入同样登记地形变更唤醒(04c;验收
-                        // acc_04c_solidify_write_wakes_adjacent_frozen_actor)。
-                        self.register_terrain_write(cell);
-                        // 凝固写入触发承载判定(REQ-010 §4.6 第 2 条、D8):
-                        // 梁凝固在悬臂上可能把它压断;step 中段的写入在本拍拍末
-                        // 的求值里生效(风险 4)。REQ-009 口径(关闭时)下
-                        // air→实心不登记,行为不变。
-                        self.register_collapse_trigger(cell, old_block, desc.block);
-                        continue;
+                        crate::cohesion::CompoundSnap::Tilted => {
+                            // ---- 倾斜散开(§8.3 第 3 条,D5):本拍删除复合体,
+                            // 每格按形状格序产出分块请求(普通单格碎块,不带
+                            // 形状——否则会再被当成复合体判倾斜),N+1 出现;
+                            // 状态 = 该格当前的世界位姿,速度 = v + ω × r。
+                            // 散开当拍不写体素:格子由各分块之后自己凝固。
+                            let pieces: Vec<crate::cohesion::PieceRequest> = shape
+                                .cells()
+                                .iter()
+                                .enumerate()
+                                .map(|(index, cell)| {
+                                    let r = state.rotation
+                                        * types::glam::Vec3::new(
+                                            cell.offset[0] as f32,
+                                            cell.offset[1] as f32,
+                                            cell.offset[2] as f32,
+                                        );
+                                    crate::cohesion::PieceRequest {
+                                        parent: id,
+                                        index: index as u32,
+                                        state: EntityState {
+                                            translation: state.translation + r,
+                                            rotation: state.rotation,
+                                            linvel: state.linvel + state.angvel.cross(r),
+                                            angvel: state.angvel,
+                                        },
+                                        desc: EntityDesc {
+                                            half_size: crate::destruction::DEBRIS_HALF_SIZE,
+                                            block: cell.block,
+                                            shape: None,
+                                        },
+                                    }
+                                })
+                                .collect();
+                            self.outbox.piece_requests.extend(pieces);
+                            self.entities.remove(&id).expect("存在");
+                            self.phys.remove_body(handle);
+                            self.outbox.despawned.push(id);
+                            // 遥测(§8.3 第 7 条):倾斜散开数。
+                            self.outbox.cohesion_stats.tilt_scattered += 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    // ---- 单格凝固(原路径,逐位不变)----
+                    let snapped = solidify::nearest_orientation(state.rotation, &orients);
+                    let (cell, _center, disp) = solidify::snap_position(state.translation);
+                    let ang_err = solidify::snap_angle_error(state.rotation, snapped);
+                    let too_far =
+                        disp > cfg.max_snap_blocks || ang_err > cfg.max_snap_angle_deg.to_radians();
+                    if !too_far || is_sleeping {
+                        // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
+                        let old_block = self.voxels.get_block(cell);
+                        if self.voxels.set_block(cell, desc.block).is_ok() {
+                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
+                            for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
+                                if self.built_colliders.contains(&cp) {
+                                    self.rebuild_chunk_collider(cp);
+                                }
+                            }
+                            self.entities.remove(&id).expect("存在");
+                            self.phys.remove_body(handle);
+                            self.outbox.despawned.push(id);
+                            // 涌现写入(REQ-005 任务 03):凝固桥经 block_updates 的
+                            // `Emergent` 出片——调度器 tick 末发布产生者 + 对
+                            // owner/holders 盖 `EnvelopePayload::BlockWrite`
+                            // (apply_at = N+1);`solidified` 兼容字段自本任务恒空。
+                            self.outbox.block_updates.push(BlockWrite {
+                                pos: cell,
+                                block: desc.block,
+                                kind: BlockWriteKind::Emergent,
+                                load_conversion: false,
+                            });
+                            // 涌现写入同样登记地形变更唤醒(04c;验收
+                            // acc_04c_solidify_write_wakes_adjacent_frozen_actor)。
+                            self.register_terrain_write(cell);
+                            // 凝固写入触发承载判定(REQ-010 §4.6 第 2 条、D8):
+                            // 梁凝固在悬臂上可能把它压断;step 中段的写入在本拍拍末
+                            // 的求值里生效(风险 4)。REQ-009 口径(关闭时)下
+                            // air→实心不登记,行为不变。
+                            self.register_collapse_trigger(cell, old_block, desc.block);
+                            continue;
+                        }
                     }
                 }
             }
@@ -2284,12 +2417,157 @@ impl ShardSim {
                 continue;
             };
             let (handle, block_desc) = (rec.handle, rec.desc.clone());
-            // 复合体(REQ-010 §5.4 第 5 条,单元 05 接入前)跳过强制落地:
-            // 不报错、不散开、出队不做(瞬态票到期/超预算的整块落地规则在
-            // 单元 05 的 §8.2 实现;直接退出本拍处理,不阻其他实体)。
-            if block_desc.shape().is_some() {
-                self.forced_pending.remove(&id);
-                self.forced_reasons.remove(&id);
+            // 复合体不再跳过(REQ-010 §8.3 第 8 条,修订 6):整块强制落地
+            // (§8.2、§8.3 第 5、6 条)——朝向与目标格同凝固的吸附;前置条件
+            // (所有柱 ① 在内存)不满足 → Defer(同单格,推迟留队);
+            // Fallback → 按形状格序逐格用单格规则落地。
+            if let Some(shape) = block_desc.shape() {
+                let body = self.phys.bodies.get(handle).expect("handle 有效");
+                let pos = conv::rapier_to_vec3(body.translation());
+                let rot = conv::rapier_to_quat(body.rotation());
+                let landing = {
+                    let solid = |p: BlockPos| -> Option<bool> {
+                        self.voxels.get_chunk(p.chunk_of())?;
+                        Some(!self.voxels.get_block(p).is_air())
+                    };
+                    crate::cohesion::compound_forced_landing(
+                        pos,
+                        rot,
+                        shape,
+                        self.cfg.cohesion.compound_snap_lift,
+                        &solid,
+                    )
+                };
+                match landing {
+                    crate::cohesion::CompoundLanding::Defer => {
+                        continue; // 前置不满足:推迟(留在 forced_pending,同单格柱缺)
+                    }
+                    crate::cohesion::CompoundLanding::Write { cells } => {
+                        // 整块平移后的落点同拍写入(Emergent + 触发 + 唤醒)。
+                        for (cell, block) in &cells {
+                            let old_block = self.voxels.get_block(*cell);
+                            let _ = self.voxels.set_block(*cell, *block);
+                            self.outbox.block_updates.push(BlockWrite {
+                                pos: *cell,
+                                block: *block,
+                                kind: BlockWriteKind::Emergent,
+                                load_conversion: false,
+                            });
+                            self.register_terrain_write(*cell);
+                            self.register_collapse_trigger(*cell, old_block, *block);
+                        }
+                        let dirty: Vec<ChunkPos> =
+                            cells.iter().map(|(c, _)| c.chunk_of()).collect();
+                        for ncp in expand_boundary(dirty, &self.voxels) {
+                            if self.built_colliders.contains(&ncp) {
+                                self.rebuild_chunk_collider(ncp);
+                            }
+                        }
+                        self.entities.remove(&id).expect("存在");
+                        self.phys.remove_body(handle);
+                        self.locomotion.remove(&id);
+                        self.outbox.despawned.push(id);
+                        self.outbox.forced_landings.push((id, cells[0].0));
+                        self.forced_pending.remove(&id);
+                        // 06c 遥测:按原因分计(§4.16),同单格。
+                        match self.forced_reasons.remove(&id) {
+                            Some(ForcedLandingReason::Budget) => {
+                                self.activation_events.forced_landings_budget += 1;
+                            }
+                            _ => self.activation_events.forced_landings_deadline += 1,
+                        }
+                    }
+                    crate::cohesion::CompoundLanding::Fallback => {
+                        // 退化为逐格(§8.3 第 6 条):按形状格序逐格用 REQ-007
+                        // §4.8 的单格规则落地;先落的格写入体素,对后落的格算
+                        // 占用;柱下没有实心的格虚空消失(不写)。整块强制落地
+                        // 退化一次计 1(§8.3 第 7 条)。
+                        for cell in shape.cells() {
+                            let r = rot
+                                * types::glam::Vec3::new(
+                                    cell.offset[0] as f32,
+                                    cell.offset[1] as f32,
+                                    cell.offset[2] as f32,
+                                );
+                            let start =
+                                crate::settle::cell_of(pos.x + r.x, pos.y + r.y, pos.z + r.z);
+                            let landing = {
+                                let column = |x: i32, by: i32| -> Option<BlockId> {
+                                    Some(self.voxels.get_block(BlockPos::new(x, by, start.z)))
+                                };
+                                let overlaps = |b: BlockPos| -> bool {
+                                    self.entities.iter().any(|(other, orec)| {
+                                        *other != id && {
+                                            let ob = self
+                                                .phys
+                                                .bodies
+                                                .get(orec.handle)
+                                                .expect("handle 有效");
+                                            let op = conv::rapier_to_vec3(ob.translation());
+                                            crate::settle::cell_of(op.x, op.y, op.z) == b
+                                        }
+                                    })
+                                };
+                                crate::settle::forced_landing_cell(
+                                    &column,
+                                    start.x,
+                                    start.y,
+                                    start.z,
+                                    types::WORLD_Y_MIN,
+                                    types::WORLD_Y_MAX,
+                                    &overlaps,
+                                )
+                            };
+                            let Some(landing) = landing else {
+                                continue; // 柱下没有实心:该格虚空消失
+                            };
+                            let old_block = self.voxels.get_block(landing);
+                            let _ = self.voxels.set_block(landing, cell.block);
+                            self.outbox.block_updates.push(BlockWrite {
+                                pos: landing,
+                                block: cell.block,
+                                kind: BlockWriteKind::Emergent,
+                                load_conversion: false,
+                            });
+                            self.register_terrain_write(landing);
+                            self.register_collapse_trigger(landing, old_block, cell.block);
+                        }
+                        let dirty: Vec<ChunkPos> = shape
+                            .cells()
+                            .iter()
+                            .map(|c| {
+                                let r = rot
+                                    * types::glam::Vec3::new(
+                                        c.offset[0] as f32,
+                                        c.offset[1] as f32,
+                                        c.offset[2] as f32,
+                                    );
+                                crate::settle::cell_of(pos.x + r.x, pos.y + r.y, pos.z + r.z)
+                                    .chunk_of()
+                            })
+                            .collect();
+                        for ncp in expand_boundary(dirty, &self.voxels) {
+                            if self.built_colliders.contains(&ncp) {
+                                self.rebuild_chunk_collider(ncp);
+                            }
+                        }
+                        self.entities.remove(&id).expect("存在");
+                        self.phys.remove_body(handle);
+                        self.locomotion.remove(&id);
+                        self.outbox.despawned.push(id);
+                        self.outbox
+                            .forced_landings
+                            .push((id, crate::settle::cell_of(pos.x, pos.y, pos.z)));
+                        self.forced_pending.remove(&id);
+                        self.outbox.cohesion_stats.forced_landing_fallbacks += 1;
+                        match self.forced_reasons.remove(&id) {
+                            Some(ForcedLandingReason::Budget) => {
+                                self.activation_events.forced_landings_budget += 1;
+                            }
+                            _ => self.activation_events.forced_landings_deadline += 1,
+                        }
+                    }
+                }
                 continue;
             }
             let body = self.phys.bodies.get(handle).expect("handle 有效");
@@ -5714,6 +5992,308 @@ mod tests {
             vec![a, c],
             "格数和 13 > 10:由远到近淘汰 a(9.1)、c(5.1)后 12 − 6 = 6 ≤ 10"
         );
+    }
+    // ==== REQ-010 单元 05(§8:整块凝固、倾斜散开、强制落地)====
+
+    /// n 格石梁形状(偏移 x = 0..n,STONE)。
+    fn beam_shape(n: i32) -> types::CompoundShape {
+        types::CompoundShape::new(
+            (0..n)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("梁 ≥ 2 格")
+    }
+
+    /// 复合体 spawn 输入(desc 带形状,状态自定)。
+    fn compound_spawn_input(
+        seq: u64,
+        id: EntityId,
+        state: EntityState,
+        shape: types::CompoundShape,
+    ) -> StampedInput {
+        StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state,
+                desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
+            }),
+        }
+    }
+
+    /// 零重力 + 凝固开启(判据:低速 20 拍;零重力 → 无实体支撑前提恒真)。
+    fn solidify_zero_g_sim() -> ShardSim {
+        ShardSim::new(
+            ShardSimConfig {
+                gravity: Vec3::ZERO,
+                ..ShardSimConfig::new(shard_id(0, 0))
+            },
+            Box::new(voxel::SimpleRegistry::builtin()),
+        )
+    }
+
+    /// 整块凝固(§8.1、§8.3 第 1、2 条):悬空静止的 6 格石梁在 slow_ticks 满 20 拍
+    /// 后经 `compound_snap` 判 Write → 同一拍写入全部格(Emergent)、删除实体、
+    /// 计 1 次整块凝固;不散开、不逐格。
+    ///
+    /// 变红:复合体仍跳过凝固(实体还在);只写原点一格;写入不是 Emergent;
+    /// 遥测没接线。
+    #[test]
+    fn compound_solidifies_whole_and_counts_telemetry() {
+        let mut s = solidify_zero_g_sim();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        let shape = beam_shape(6);
+        // 原点格 (8,3,8),目标格 (8..=13, 3, 8) 全空气(chunk 实心层在 world y = 0)。
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(8.5, 3.5, 8.5),
+                ..EntityState::default()
+            },
+            shape.clone(),
+        )]);
+        for _ in 0..24 {
+            s.step();
+        }
+        assert!(s.entity_state(id).is_none(), "整块凝固后实体删除");
+        for x in 8..=13 {
+            assert_eq!(
+                s.voxels.get_block(BlockPos::new(x, 3, 8)),
+                voxel::builtin::STONE,
+                "({x},3,8) 随整块凝固写入"
+            );
+        }
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.compounds_solidified, 1, "计 1 次凝固");
+        assert_eq!(out.cohesion_stats.tilt_scattered, 0, "没有散开");
+        let emergent: Vec<_> = out
+            .block_updates
+            .iter()
+            .filter(|w| w.kind == BlockWriteKind::Emergent)
+            .collect();
+        assert_eq!(emergent.len(), 6, "全部格经 Emergent 写入");
+    }
+
+    /// 倾斜散开(§8.3 第 3 条,D5):误差超限(末端格偏离 > 0.5 格)→ 本拍删除
+    /// 复合体、当拍不写体素;每格按形状格序产出分块请求——普通单格碎块(描述
+    /// 不带形状、半边 0.45、该格方块),状态 = 该格世界位姿,速度 = v + ω × r、
+    /// 角速度 = ω。
+    ///
+    /// 变红:倾斜时强行整块吸附(写格);分块仍带形状;速度公式丢了 ω × r 项;
+    /// index 不是形状格序;遥测没接线。
+    #[test]
+    fn tilted_compound_scatters_pieces_without_voxel_writes() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        // 角速度要低于 slow 判据阈值(0.05):0.04 rad/s 的慢转足以让
+        // "速度 = v + ω × r" 的 r 项可测(删掉 cross 项即差 ~0.1 m/s)。
+        let angvel = Vec3::new(0.0, 0.0, 0.04);
+        cfg.solidify.displacement_gate_m = 0.0; // 慢转使原点画小圆,关门直通
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        let shape = beam_shape(6);
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(8.5, 3.5, 8.5),
+                rotation: types::glam::Quat::from_rotation_z(20f32.to_radians()),
+                angvel,
+                ..EntityState::default()
+            },
+            shape.clone(),
+        )]);
+        // slow_ticks 满 20 的那一拍触发判据 → compound_snap 判 Tilted。
+        for _ in 0..20 {
+            s.step();
+        }
+        assert!(s.entity_state(id).is_none(), "散开当拍删除复合体");
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.tilt_scattered, 1, "计 1 次散开");
+        assert_eq!(out.cohesion_stats.compounds_solidified, 0);
+        assert!(
+            out.block_updates
+                .iter()
+                .all(|w| w.kind != BlockWriteKind::Emergent),
+            "散开当拍不写体素(格子由各分块之后自己凝固)"
+        );
+        assert_eq!(out.piece_requests.len(), 6, "每格一个分块请求");
+        for (k, piece) in out.piece_requests.iter().enumerate() {
+            let cell = shape.cells()[k];
+            assert_eq!(piece.parent, id, "分块的母实体");
+            assert_eq!(piece.index, k as u32, "index = 形状格序");
+            assert!(piece.desc.shape().is_none(), "分块是普通单格碎块(不带形状)");
+            assert_eq!(piece.desc.half_size, crate::destruction::DEBRIS_HALF_SIZE);
+            assert_eq!(piece.desc.block, cell.block, "分块 = 该格方块");
+            // 零重力下 v 恒 0、ω 恒定:速度公式 v + ω × r 用分块自带的旋转
+            // (= 散开拍的刚体旋转)自洽核对——ω × r 项缺失即红。
+            let off = types::glam::Vec3::new(
+                cell.offset[0] as f32,
+                cell.offset[1] as f32,
+                cell.offset[2] as f32,
+            );
+            let r = piece.state.rotation * off;
+            let want = angvel.cross(r);
+            assert!(
+                (piece.state.linvel - want).length() < 1e-3,
+                "分块 {k} 速度 = v + ω × r:{:?} vs {:?}",
+                piece.state.linvel,
+                want
+            );
+            assert!(
+                (piece.state.angvel - angvel).length() < 1e-5,
+                "分块角速度 = 刚体角速度"
+            );
+        }
+    }
+
+    /// 整块强制落地(§8.2、§8.3 第 5 条):瞬态体超预算淘汰 → 整块吸附后落到
+    /// "到下方第一个实心格之上"——所有格同一落点高度(整块平移),Emergent
+    /// 写入、删除实体、按原因分计预算;不散开、不计 Fallback。
+    ///
+    /// 变红:复合体仍跳过强制落地;逐格各自落到自己的柱底;写入缺 Emergent;
+    /// 预算归因丢失。
+    #[test]
+    fn compound_forced_landing_lands_whole_on_budget_eviction() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.enabled = false; // 不让凝固抢先
+        cfg.activation.max_awake_dynamic = 1;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let (a, b) = (entity(1), entity(2));
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        s.apply_prefix(&[
+            spawn_input(1, a, Vec3::new(8.0, 0.5, 8.0)),
+            compound_spawn_input(
+                2,
+                b,
+                EntityState {
+                    translation: Vec3::new(13.5, 3.5, 8.5),
+                    ..EntityState::default()
+                },
+                beam_shape(2),
+            ),
+        ]);
+        let _ = s.take_activation_events();
+        // 醒体格数 1 + 2 = 3 > 1 → 由远到近淘汰远者 b(复合体)。
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.over_budget_freeze, vec![b], "远者复合体被 plan 淘汰");
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(b).is_none(), "整块强制落地后实体删除");
+        // 目标格 (13,3,8)、(14,3,8) 全空气;d = 3 − 0 − 1 = 2 → 整块落 y = 1。
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(13, 1, 8)),
+            voxel::builtin::STONE,
+            "整块平移后的落点(所有格同高)"
+        );
+        assert_eq!(
+            s.voxels.get_block(BlockPos::new(14, 1, 8)),
+            voxel::builtin::STONE
+        );
+        let out = s.take_outbox();
+        assert_eq!(
+            out.cohesion_stats.forced_landing_fallbacks, 0,
+            "走了整块落地,不算退化"
+        );
+        assert_eq!(
+            out.block_updates
+                .iter()
+                .filter(|w| w.kind == BlockWriteKind::Emergent)
+                .count(),
+            2,
+            "全部格 Emergent 写入"
+        );
+        let events = s.take_activation_events();
+        assert_eq!(events.forced_landings_budget, 1, "按原因分计:预算");
+        assert!(s.entity_state(a).is_some(), "近者保留");
+    }
+
+    /// 强制落地退化为逐格(§8.3 第 6 条):所有柱下方都没有实心 → `Fallback`
+    /// → 按形状格序逐格用单格规则;每柱都无底 → 全部格虚空消失(不写格),
+    /// 计 1 次退化。
+    ///
+    /// 变红:Fallback 时整块硬写;退化计数没接线;虚空格被写了。
+    #[test]
+    fn compound_forced_landing_fallback_per_cell_counts() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.enabled = false;
+        cfg.activation.max_awake_dynamic = 1;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        // 已装载但全空:实心判定 Some(false) 一路到世界底 → Fallback。
+        s.load_chunk(ChunkPos::new(0, 0), Chunk::air());
+        let (a, b) = (entity(1), entity(2));
+        let _ = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        s.apply_prefix(&[
+            spawn_input(1, a, Vec3::new(8.0, 0.5, 8.0)),
+            compound_spawn_input(
+                2,
+                b,
+                EntityState {
+                    translation: Vec3::new(13.5, 3.5, 8.5),
+                    ..EntityState::default()
+                },
+                beam_shape(2),
+            ),
+        ]);
+        let _ = s.take_activation_events();
+        let d = s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        assert_eq!(d.over_budget_freeze, vec![b]);
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(b).is_none(), "逐格退化后实体删除");
+        let out = s.take_outbox();
+        assert_eq!(
+            out.cohesion_stats.forced_landing_fallbacks, 1,
+            "计 1 次退化"
+        );
+        assert!(
+            out.block_updates
+                .iter()
+                .all(|w| w.kind != BlockWriteKind::Emergent),
+            "每柱都无底:全部格虚空消失,不写格"
+        );
+        assert!(s.entity_state(a).is_some(), "近者保留");
+    }
+
+    /// 强制落地推迟(§8.3 第 6 条):复合体覆盖的柱 ① 不在内存 → `Defer`
+    /// ——实体保留、留在待执行集合、不写格(与单格柱缺同款)。
+    ///
+    /// 变红:未装载被当空气一路落穿(写进未装载 chunk 静默新建的空层)。
+    #[test]
+    fn compound_forced_landing_defers_and_stays_pending_when_column_unloaded() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify.enabled = false;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        // 复合体悬在未装载 chunk (1,0) 的柱上(x = 20..=21)。
+        let b = entity(2);
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            b,
+            EntityState {
+                translation: Vec3::new(20.5, 3.5, 8.5),
+                ..EntityState::default()
+            },
+            beam_shape(2),
+        )]);
+        // 手动进入待执行强制落地(瞬态票到期入口的等价态)。
+        s.forced_pending.insert(b);
+        s.forced_reasons.insert(b, ForcedLandingReason::Deadline);
+        s.run_transient_lifecycle();
+        assert!(s.entity_state(b).is_some(), "前置条件不满足:推迟、实体保留");
+        assert!(s.forced_pending.contains(&b), "留在待执行集合");
+        assert!(s.take_outbox().block_updates.is_empty(), "未写任何格");
     }
     // ==== REQ-007 任务 03(G3 返修补齐测试)====
 

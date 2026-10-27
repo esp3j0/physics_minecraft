@@ -151,9 +151,45 @@ pub enum CompoundSnap {
     Tilted,
 }
 
+/// 目标姿态(§8.3 第 1 条,凝固与强制落地共用):目标朝向 = 24 个轴对齐朝向中
+/// 最近的一个;原点格 = 平移所在的格(格中心取整,`floor`);每格的目标格 =
+/// 原点格 + 目标朝向 × 偏移(轴对齐朝向下乘积是符号置换,`round` 去浮点噪声)。
+fn snap_targets(
+    translation: types::glam::Vec3,
+    rotation: types::glam::Quat,
+    shape: &types::CompoundShape,
+) -> (types::glam::Quat, Vec<(BlockPos, BlockId)>) {
+    let orients = crate::solidify::axis_aligned_orientations();
+    let snapped = crate::solidify::nearest_orientation(rotation, &orients);
+    let origin = crate::settle::cell_of(translation.x, translation.y, translation.z);
+    let targets = shape
+        .cells()
+        .iter()
+        .map(|cell| {
+            let off = types::glam::Vec3::new(
+                cell.offset[0] as f32,
+                cell.offset[1] as f32,
+                cell.offset[2] as f32,
+            );
+            let spun = snapped * off;
+            (
+                BlockPos::new(
+                    origin.x + spun.x.round() as i32,
+                    origin.y + spun.y.round() as i32,
+                    origin.z + spun.z.round() as i32,
+                ),
+                cell.block,
+            )
+        })
+        .collect();
+    (snapped, targets)
+}
+
 /// 整块凝固的吸附判定(纯函数,REQ-010 §8.3 第 1 条)。`occupied(p)` = 格 p 被地形实心或其他实体占用。
 ///
-/// **总架构师接口桩(REQ-010 单元 05)**:由实施方实现。
+/// 误差 = 各格"实际中心(`translation + rotation × 偏移`)→ 目标格中心"距离的
+/// 最大值,以及旋转与目标朝向的夹角——**都在上移之前算**(上移只解决被占,
+/// 不放宽误差);超过 `max_snap_blocks` 或 `max_snap_angle_deg` → `Tilted`。
 pub fn compound_snap(
     translation: types::glam::Vec3,
     rotation: types::glam::Quat,
@@ -163,15 +199,47 @@ pub fn compound_snap(
     max_lift: i32,
     occupied: &dyn Fn(BlockPos) -> bool,
 ) -> CompoundSnap {
-    let _ = (
-        translation,
-        rotation,
-        shape,
-        max_snap_blocks,
-        max_snap_angle_deg,
-        max_lift,
-        occupied,
-    );
+    let (snapped, targets) = snap_targets(translation, rotation, shape);
+    let mut max_disp = 0.0_f32;
+    for cell in shape.cells() {
+        let off = types::glam::Vec3::new(
+            cell.offset[0] as f32,
+            cell.offset[1] as f32,
+            cell.offset[2] as f32,
+        );
+        let actual = translation + rotation * off;
+        // 目标格中心:floor(平移) + round(旋转后偏移) + 0.5,与 snap_targets
+        // 的取整逐位一致。
+        let spun = snapped * off;
+        let center = types::glam::Vec3::new(
+            translation.x.floor() + spun.x.round() + 0.5,
+            translation.y.floor() + spun.y.round() + 0.5,
+            translation.z.floor() + spun.z.round() + 0.5,
+        );
+        max_disp = max_disp.max((actual - center).length());
+    }
+    let angle = crate::solidify::snap_angle_error(rotation, snapped);
+    if max_disp > max_snap_blocks || angle > max_snap_angle_deg.to_radians() {
+        return CompoundSnap::Tilted;
+    }
+    // 从上移 0 格起到 `max_lift`:取第一个所有目标格都没被占的上移量;都被占
+    // → Tilted。格按 `BlockPos` 升序。
+    for lift in 0..=max_lift {
+        if targets
+            .iter()
+            .all(|(t, _)| !occupied(BlockPos::new(t.x, t.y + lift, t.z)))
+        {
+            let mut cells: Vec<(BlockPos, BlockId)> = targets
+                .iter()
+                .map(|(t, b)| (BlockPos::new(t.x, t.y + lift, t.z), *b))
+                .collect();
+            cells.sort();
+            return CompoundSnap::Write {
+                cells,
+                lifted: lift,
+            };
+        }
+    }
     CompoundSnap::Tilted
 }
 
@@ -189,7 +257,11 @@ pub enum CompoundLanding {
 /// 整块强制落地(纯函数,REQ-010 §8.3 第 5 条)。`solid(p)`:`Some(true)` 实心、`Some(false)` 非实心、`None` 未装载;
 /// 向下扫描到 `WORLD_Y_MIN` 为止。
 ///
-/// **总架构师接口桩(REQ-010 单元 05)**:由实施方实现。
+/// 目标姿态与 [`compound_snap`] 同构;先找最小上移量 `k ∈ 0..=max_lift` 使目标格
+/// 都不是实心(期间查到未装载 → `Defer`;找不到 → `Fallback`),再整块向下平移
+/// `d` 格——d = 各格所在柱"到下方第一个实心格之上"的距离的最小值(整块一个
+/// 平移量,不是各格各落各的;扫描期间查到未装载 → `Defer`;所有柱下方都没有
+/// 实心 → `Fallback`)。`Write` 的格按 `BlockPos` 升序。
 pub fn compound_forced_landing(
     translation: types::glam::Vec3,
     rotation: types::glam::Quat,
@@ -197,8 +269,62 @@ pub fn compound_forced_landing(
     max_lift: i32,
     solid: &dyn Fn(BlockPos) -> Option<bool>,
 ) -> CompoundLanding {
-    let _ = (translation, rotation, shape, max_lift, solid);
-    CompoundLanding::Fallback
+    let (_, targets) = snap_targets(translation, rotation, shape);
+    let mut lift = None;
+    for k in 0..=max_lift {
+        let mut deferred = false;
+        let free = targets
+            .iter()
+            .all(|(t, _)| match solid(BlockPos::new(t.x, t.y + k, t.z)) {
+                Some(s) => !s,
+                None => {
+                    deferred = true;
+                    false
+                }
+            });
+        if deferred {
+            return CompoundLanding::Defer;
+        }
+        if free {
+            lift = Some(k);
+            break;
+        }
+    }
+    let Some(k) = lift else {
+        // 上移到上限仍与实心重叠 → 退化为逐格。
+        return CompoundLanding::Fallback;
+    };
+    let mut drop: Option<i32> = None;
+    for (t, _) in &targets {
+        // 该柱上严格低于目标格的最高实心格 s:落点 = s.y + 1,d = 落点与目标格的距离。
+        let mut y = t.y + k - 1;
+        let mut found = None;
+        while y >= WORLD_Y_MIN {
+            match solid(BlockPos::new(t.x, y, t.z)) {
+                None => return CompoundLanding::Defer,
+                Some(true) => {
+                    found = Some(t.y + k - y - 1);
+                    break;
+                }
+                Some(false) => y -= 1,
+            }
+        }
+        drop = match (drop, found) {
+            (Some(b), Some(f)) => Some(b.min(f)),
+            (None, f) => f,
+            (d, None) => d,
+        };
+    }
+    let Some(d) = drop else {
+        // 所有柱下方都没有实心 → 退化为逐格(逐格时空柱虚空的格自行消失)。
+        return CompoundLanding::Fallback;
+    };
+    let mut cells: Vec<(BlockPos, BlockId)> = targets
+        .iter()
+        .map(|(t, b)| (BlockPos::new(t.x, t.y + k - d, t.z), *b))
+        .collect();
+    cells.sort();
+    CompoundLanding::Write { cells }
 }
 
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
@@ -1027,6 +1153,148 @@ mod tests {
         assert!(
             (r - (3.0_f32.sqrt() + half)).abs() < 1e-4,
             "对角格 ρ = √3 + 0.45√3:{r}"
+        );
+    }
+
+    // ------------------------------------------------------------------ compound_snap / forced_landing(§8.3,单元 05)
+
+    use types::glam::Vec3;
+
+    fn pair() -> types::CompoundShape {
+        types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: builtin::STONE,
+            },
+            types::ShapeCell {
+                offset: [1, 0, 0],
+                block: builtin::STONE,
+            },
+        ])
+        .expect("2 格")
+    }
+
+    /// `compound_snap`:lift = 0 时目标格被占 → 直接 `Tilted`(上移从 0 起、
+    /// 上限 0 即无路可走)。变异:上移循环从 1 起(跳过 lift 0)会给出上移 1
+    /// 的 Write。
+    #[test]
+    fn compound_snap_lift_zero_occupied_is_tilted() {
+        let shape = pair();
+        let occupied = |q: BlockPos| q == p(3, 5, 0);
+        let out = compound_snap(
+            Vec3::new(3.5, 5.5, 0.5),
+            types::glam::Quat::IDENTITY,
+            &shape,
+            0.5,
+            45.0,
+            0,
+            &occupied,
+        );
+        assert_eq!(out, CompoundSnap::Tilted, "上限 0 且被占:无路可走");
+    }
+
+    /// `compound_snap`:误差超限优先于上移——倾斜 20°(末端格偏离 > 0.5 格)
+    /// 即使全部目标格空闲也 `Tilted`,不是"先上移成功就当能落"。变异:把误差
+    /// 检查挪到上移成功之后,本例会错误地返回 lift 0 的 Write。
+    #[test]
+    fn compound_snap_error_precedes_lift() {
+        // 两格间距 3:旋转 20° 后末端格偏离 3·sin20° ≈ 1.03 > 0.5。
+        let shape = types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: builtin::STONE,
+            },
+            types::ShapeCell {
+                offset: [3, 0, 0],
+                block: builtin::STONE,
+            },
+        ])
+        .expect("2 格");
+        let free = |_: BlockPos| false;
+        let out = compound_snap(
+            Vec3::new(3.5, 5.5, 0.5),
+            types::glam::Quat::from_rotation_z(20f32.to_radians()),
+            &shape,
+            0.5,
+            45.0,
+            2,
+            &free,
+        );
+        assert_eq!(out, CompoundSnap::Tilted, "误差超限:不上移、不写");
+    }
+
+    /// `compound_forced_landing`:部分柱下方全空、部分柱有实心时仍 `Write`
+    /// ——d 取有底柱的最小下降量,整块停在那一柱的高度上("所有柱**都**没有
+    /// 实心才 Fallback")。变异:任一柱无实心就 Fallback 即红。
+    #[test]
+    fn forced_landing_partial_void_columns_still_write() {
+        let shape = pair();
+        // 柱 x = 3 有底(world 底),柱 x = 4 全空。
+        let solid = |q: BlockPos| -> Option<bool> { Some(q.y <= -64 && q.x == 3) };
+        let out = compound_forced_landing(
+            Vec3::new(3.5, 5.5, 0.5),
+            types::glam::Quat::IDENTITY,
+            &shape,
+            2,
+            &solid,
+        );
+        assert_eq!(
+            out,
+            CompoundLanding::Write {
+                cells: vec![
+                    (p(3, -63, 0), builtin::STONE),
+                    (p(4, -63, 0), builtin::STONE)
+                ]
+            },
+            "整块停在有底柱的那层(x=4 的格悬空挂着)"
+        );
+    }
+
+    /// `compound_forced_landing`:目标格所在柱未装载 → `Defer`(不是当空气
+    /// 一路落穿)。变异:把 None 当 false 继续,会给出穿到世界底的 Write。
+    #[test]
+    fn forced_landing_defers_on_unloaded_target_column() {
+        let shape = pair();
+        let solid = |q: BlockPos| -> Option<bool> {
+            if q.x == 4 {
+                None // x = 4 柱未装载
+            } else {
+                Some(q.y <= -64)
+            }
+        };
+        let out = compound_forced_landing(
+            Vec3::new(3.5, 5.5, 0.5),
+            types::glam::Quat::IDENTITY,
+            &shape,
+            2,
+            &solid,
+        );
+        assert_eq!(out, CompoundLanding::Defer, "前置条件不满足 → 推迟");
+    }
+
+    /// `compound_forced_landing`:向下扫描到 `WORLD_Y_MIN` 为止——底格只在
+    /// 世界底那一层的柱,落点 = `WORLD_Y_MIN + 1`。变异:扫描漏掉世界底层
+    /// (少扫一层)会把这柱判成无底。
+    #[test]
+    fn forced_landing_scans_down_to_world_y_min() {
+        let shape = pair();
+        let solid = |q: BlockPos| -> Option<bool> { Some(q.y == types::WORLD_Y_MIN) };
+        let out = compound_forced_landing(
+            Vec3::new(3.5, 5.5, 0.5),
+            types::glam::Quat::IDENTITY,
+            &shape,
+            2,
+            &solid,
+        );
+        assert_eq!(
+            out,
+            CompoundLanding::Write {
+                cells: vec![
+                    (p(3, types::WORLD_Y_MIN + 1, 0), builtin::STONE),
+                    (p(4, types::WORLD_Y_MIN + 1, 0), builtin::STONE)
+                ]
+            },
+            "落点 = 世界底实心格之上"
         );
     }
 }

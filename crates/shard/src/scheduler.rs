@@ -1705,6 +1705,31 @@ impl Scheduler {
                     },
                 ));
             }
+            // 分块请求(REQ-010 §8.3 第 4 条;单元 05:倾斜散开,单元 06、07 复用):
+            // 在脱落/复合体请求之后,按 (`parent`, `index`) 升序分配涌现 ID、
+            // N+1 生成(状态与描述由分片给好,调度器只盖章)。随
+            // `pending_emergent_spawns` 进调度器快照。
+            let mut pieces = std::mem::take(&mut outbox.piece_requests);
+            pieces.sort_by_key(|req| (req.parent, req.index));
+            for piece in pieces {
+                let seq = self.next_emergent_seq;
+                self.next_emergent_seq = seq.checked_add(1).unwrap_or_else(|| {
+                    panic!("涌现 ID 计数器溢出(u32 用尽,seq = {seq}):内部错误 fail-stop")
+                });
+                self.pending_emergent_spawns.push((
+                    shard,
+                    StampedInput {
+                        apply_at: Tick(at.0 + 1),
+                        source: InputSource::SCHEDULER,
+                        sequence: u64::from(seq),
+                        payload: InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                            entity: EntityId::from_parts(types::EMERGENT_ORIGIN, seq),
+                            state: piece.state,
+                            desc: piece.desc,
+                        }),
+                    },
+                ));
+            }
             match self.router.collect_intents(shard, &outbox.migrations, at) {
                 Ok(()) => migrations_admitted += outbox.migrations.len(),
                 // TODO(反压):队列满当前的策略是 fail-stop;后续轮次接入
@@ -6543,6 +6568,155 @@ mod tests {
             a.iter()
                 .any(|(id, _)| *id == EntityId::from_parts(types::EMERGENT_ORIGIN, 25)),
             "新 ID 从 25 接着编"
+        );
+        sched.shutdown();
+        sched2.shutdown();
+    }
+
+    // ==== REQ-010 单元 05(§8.3 第 4 条:分块请求的编号与生成)====
+
+    /// 零重力 + 凝固默认开启 + chunk 已装载:倾斜复合体悬空静止,低速判据
+    /// 满足后整块散开(piece_requests)。
+    fn piece_sim() -> ShardSim {
+        use voxel::WorldGenerator;
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.gravity = Vec3::ZERO;
+        let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = types::ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        s
+    }
+
+    /// 分块请求(REQ-010 §8.3 第 4 条,单元 05):同一分片在脱落/复合体请求
+    /// 之后,按 (`parent`, `index`) 升序分配涌现 ID、盖章 N+1 生效的
+    /// `SpawnDynamic`;随 `pending_emergent_spawns` 进调度器快照(恢复线同样
+    /// 生成);N+1 出现的是普通单格碎块(描述不带形状)。
+    ///
+    /// 变红:分块请求不编号(N+1 无实体);按父实体分组编号(index 乱序);
+    /// 不进快照(恢复线 0 个实体);生成时重建出了形状(会被再判倾斜)。
+    #[test]
+    fn piece_requests_stamped_next_tick_and_survive_snapshot() {
+        let shard = shard_id(0, 0);
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(piece_sim());
+        // 石/土交替:分块的方块序列按形状格序钉住编号顺序(全同方块测不出
+        // 编号反序)。
+        let shape = types::CompoundShape::new(
+            (-2..=3)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: if x % 2 == 0 {
+                        voxel::builtin::STONE
+                    } else {
+                        voxel::builtin::DIRT
+                    },
+                })
+                .collect(),
+        )
+        .expect("6 格梁");
+        let parent = EntityId::from_parts(1, 9);
+        sched
+            .submit(
+                shard,
+                cmd_input(
+                    InputSource(1),
+                    0,
+                    Tick::ZERO,
+                    SimCommand::SpawnDynamic {
+                        entity: parent,
+                        state: types::EntityState {
+                            translation: Vec3::new(64.5, -55.5, 64.5),
+                            rotation: types::glam::Quat::from_rotation_z(20f32.to_radians()),
+                            ..types::EntityState::default()
+                        },
+                        desc: types::EntityDesc::compound(
+                            physics_sim::destruction::DEBRIS_HALF_SIZE,
+                            shape,
+                        ),
+                    },
+                ),
+            )
+            .expect("收件箱未满");
+        // 悬空静止 → 低速判据满足(零重力:无实体支撑前提恒真;睡眠兜底约
+        // 30 拍,慢速计数 20 拍先到)→ 散开。上限 40 拍等它发生。
+        let mut scatter_tick = 0;
+        for k in 1..=40 {
+            sched.tick();
+            if !sched.pending_emergent_spawns.is_empty() {
+                scatter_tick = k;
+                break;
+            }
+        }
+        assert!(scatter_tick > 0, "40 拍内没有散开");
+        assert_eq!(sched.pending_emergent_spawns.len(), 6, "每格一个分块请求");
+        for (k, (dest, input)) in sched.pending_emergent_spawns.iter().enumerate() {
+            assert_eq!(*dest, shard, "发回产出分片");
+            assert_eq!(input.apply_at, Tick(scatter_tick as u64), "N+1 生效");
+            assert_eq!(input.source, InputSource::SCHEDULER, "调度器来源");
+            assert_eq!(
+                input.sequence,
+                u64::from(k as u32 + 1),
+                "在脱落/复合体之后接续编号"
+            );
+            let InputPayload::Command(SimCommand::SpawnDynamic {
+                entity,
+                state,
+                desc,
+            }) = &input.payload
+            else {
+                panic!("应为 SpawnDynamic:{input:?}");
+            };
+            assert_eq!(
+                *entity,
+                EntityId::from_parts(types::EMERGENT_ORIGIN, k as u32 + 1),
+                "按 (parent, index) 升序从 1 起编"
+            );
+            assert!(desc.shape().is_none(), "分块 = 普通单格碎块(不带形状)");
+            let want_block = if (k as i32 - 2) % 2 == 0 {
+                voxel::builtin::STONE
+            } else {
+                voxel::builtin::DIRT
+            };
+            assert_eq!(desc.block, want_block, "分块 {k} = 该格方块(石/土交替)");
+            assert_eq!(
+                desc.half_size,
+                physics_sim::destruction::DEBRIS_HALF_SIZE,
+                "半边长 0.45"
+            );
+            assert_eq!(state.angvel, Vec3::ZERO, "散开时刚体零角速度");
+        }
+        // 快照往返:分块请求随 pending_emergent_spawns 进调度器快照,恢复线
+        // 在 N+1 生成逐位相同的实体。
+        let sim_bytes = sched.snapshot_shard(shard).expect("分片已注册");
+        let snap = sched.snapshot_state();
+        assert_eq!(snap.pending_emergent_spawns.len(), 6, "分块请求在快照里");
+        let mut sched2 = Scheduler::new(SchedulerConfig {
+            start_tick: snap.tick,
+            ..sched_cfg(2)
+        });
+        sched2.register(
+            ShardSim::restore(&sim_bytes, Box::new(SimpleRegistry::builtin()))
+                .expect("自有快照必可恢复"),
+        );
+        sched2.restore_state(snap);
+        sched.tick();
+        sched2.tick();
+        let a = sched.entity_states(shard).expect("分片已注册");
+        let b = sched2.entity_states(shard).expect("分片已注册");
+        assert_eq!(a, b, "恢复线生成逐位相同的分块实体");
+        assert_eq!(
+            a.iter()
+                .filter(|(id, _)| id.origin_shard() == types::EMERGENT_ORIGIN)
+                .count(),
+            6,
+            "N+1 六个单格碎块"
         );
         sched.shutdown();
         sched2.shutdown();

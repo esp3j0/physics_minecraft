@@ -2339,7 +2339,6 @@ mod unit05 {
     /// 会变红的实现:原点格按四舍五入而不是格中心取整;偏移没随目标朝向旋转;误差只看原点不看各格;
     /// 上移判定用了上移后的误差;被占时直接判倾斜而不上移。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除"]
     fn acc_c7_compound_snap_rules() {
         let shape = beam();
         let free = |_: BlockPos| false;
@@ -2393,7 +2392,6 @@ mod unit05 {
     ///
     /// 会变红的实现:逐格各自落到自己的柱底(不再是一整块);只看原点所在柱;未装载当成空气一路落穿。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除"]
     fn acc_c8_compound_forced_landing_rules() {
         let shape = beam();
         let ground = |q: BlockPos| -> Option<bool> { Some(q.y <= -61) };
@@ -2570,7 +2568,6 @@ mod unit05 {
     ///
     /// 会变红的实现:复合体仍跳过凝固;只写原点一格;旋转后的偏移没随朝向转;遥测没接线。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除"]
     fn acc_c7_compounds_solidify_whole() {
         let mut s = session(false);
         let mut log = CommandLog::new();
@@ -2605,7 +2602,7 @@ mod unit05 {
     ///
     /// 会变红的实现:倾斜时强行整块吸附(石头穿进石堆或悬空);散开时丢格;散开后的碎块仍带形状。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    #[ignore = "REQ-010 单元 05 待实施方解除(settle() 在散开拍提前返回,见 #19)"]
     fn acc_c7_tilted_compound_scatters() {
         let mut s = session(false);
         let mut log = CommandLog::new();
@@ -2634,7 +2631,6 @@ mod unit05 {
     ///
     /// 会变红的实现:复合体的凝固写入不登记触发。
     #[test]
-    #[ignore = "REQ-010 单元 05 待实施方解除"]
     fn acc_c7_compound_solidify_triggers_load_check() {
         let mut s = session(true);
         let mut log = CommandLog::new();
