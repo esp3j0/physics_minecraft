@@ -461,6 +461,8 @@ impl Config {
                 collapse_max_cells: self.destruction.collapse_max_cells,
                 collapse_max_cluster: self.destruction.collapse_max_cluster,
             },
+            // REQ-010 §11:`[cohesion]` 配置表由单元 08 接入;此前按默认值(关闭)。
+            cohesion: physics_sim::cohesion::CohesionConfig::default(),
         }
     }
 

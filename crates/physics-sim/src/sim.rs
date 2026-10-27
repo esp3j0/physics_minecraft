@@ -112,6 +112,8 @@ pub struct ShardSimConfig {
     pub activation: crate::activation::ActivationConfig,
     /// 地形破坏(REQ-009;实施期间默认关闭,单元 07 改为开启)。
     pub destruction: crate::destruction::DestructionConfig,
+    /// 粘结与整块塌落(REQ-010 §4.6;单元 08 之前默认关闭)。
+    pub cohesion: crate::cohesion::CohesionConfig,
 }
 
 impl ShardSimConfig {
@@ -123,6 +125,7 @@ impl ShardSimConfig {
             solidify: SolidifyConfig::default(),
             activation: crate::activation::ActivationConfig::default(),
             destruction: crate::destruction::DestructionConfig::default(),
+            cohesion: crate::cohesion::CohesionConfig::default(),
         }
     }
 }
@@ -144,6 +147,9 @@ pub struct BlockWrite {
     pub pos: BlockPos,
     pub block: BlockId,
     pub kind: BlockWriteKind,
+    /// 承载转换标记(REQ-010 §4.6、§9):F 中的格被转换成实体时写 air 的那条 `Emergent` 写入为 `true`,
+    /// 其余一律 `false`;调度器盖章时带进 `EnvelopePayload::BlockWrite`。
+    pub load_conversion: bool,
 }
 
 /// 本 tick 产出(调度器消费):迁移意图、collider 重建过的 chunk、凝固记录。
@@ -170,6 +176,8 @@ pub struct Outbox {
     pub detach_requests: Vec<crate::destruction::DetachRequest>,
     /// 本拍地形破坏遥测(REQ-009 §8;单元 05 接线)。
     pub destruction_stats: crate::destruction::DestructionStats,
+    /// 本拍粘结与整块塌落遥测(REQ-010 §11;单元 02 起接线)。
+    pub cohesion_stats: crate::cohesion::CohesionStats,
     /// 涌现事件生产口(REQ-005 任务 03):分片内部语义(撞击触发等)未来把
     /// `CrossEvent` 推入此处,调度器 tick 末经 `broadcast_event` 广播(目标
     /// 分片 apply_at = N+1 本地求值)。本任务模拟核不主动产事件,字段恒空,
@@ -604,7 +612,7 @@ impl ShardSim {
                     // (owner/holder 才会被盖章为收件人;未装载 = 内部一致性
                     // 违规 fail-stop),写体素 + 重建边界 collider;**不推
                     // `outbox.block_updates`**(防广播回环)。
-                    EnvelopePayload::BlockWrite { pos, block } => {
+                    EnvelopePayload::BlockWrite { pos, block, .. } => {
                         assert!(
                             self.voxels.get_chunk(pos.chunk_of()).is_some(),
                             "BlockWrite 信封落到未装载 chunk {pos:?}(owner/holder 必然\
@@ -892,6 +900,7 @@ impl ShardSim {
                             pos: cell,
                             block: desc.block,
                             kind: BlockWriteKind::Emergent,
+                            load_conversion: false,
                         });
                         // 涌现写入同样登记地形变更唤醒(04c;验收
                         // acc_04c_solidify_write_wakes_adjacent_frozen_actor)。
@@ -2242,6 +2251,7 @@ impl ShardSim {
                 pos: landing,
                 block: block_desc.block,
                 kind: BlockWriteKind::Emergent,
+                load_conversion: false,
             });
             // 强制落地的落点写入同样登记(04c 风险 1:四路全覆盖)。
             self.register_terrain_write(landing);
@@ -2544,6 +2554,7 @@ impl ShardSim {
                 pos: cell,
                 block: BlockId::AIR,
                 kind: BlockWriteKind::Emergent,
+                load_conversion: false,
             });
             // §4.11 统一出口:被撞掉的格下一拍唤醒压在其上的冻结体。
             self.register_terrain_write(cell);
@@ -2644,6 +2655,7 @@ impl ShardSim {
                 pos: cell,
                 block: BlockId::AIR,
                 kind: BlockWriteKind::Emergent,
+                load_conversion: false,
             });
             // §4.11 统一出口:脚下被掏空的冻结体下一拍被唤醒。
             self.register_terrain_write(cell);
@@ -2700,6 +2712,7 @@ impl ShardSim {
                             pos,
                             block,
                             kind: BlockWriteKind::External,
+                            load_conversion: false,
                         });
                         self.register_terrain_write(pos);
                         // 坍塌触发(REQ-009 §6.2.1):实心→非实心的写入。
@@ -2983,6 +2996,7 @@ impl ShardSim {
                 pos: cell.pos,
                 block: BlockId::AIR,
                 kind: BlockWriteKind::Emergent,
+                load_conversion: false,
             });
             // §4.11 统一出口:冻结体脚下的格被炸掉 → 下一拍被唤醒。
             self.register_terrain_write(cell.pos);
@@ -3857,6 +3871,7 @@ mod tests {
                 pos,
                 block: types::BlockId(2),
                 kind: BlockWriteKind::External,
+                load_conversion: false,
             }],
             "SetBlock 成功 → outbox 恰一条 External 写入"
         );
@@ -3937,6 +3952,7 @@ mod tests {
             EnvelopePayload::BlockWrite {
                 pos,
                 block: types::BlockId(2),
+                load_conversion: false,
             },
         )]);
         // 体素已写入(信封直接应用)。
@@ -3987,6 +4003,7 @@ mod tests {
                 EnvelopePayload::BlockWrite {
                     pos,
                     block: types::BlockId(7),
+                    load_conversion: false,
                 },
             )]);
             let outbox = s.take_outbox();
@@ -4083,6 +4100,7 @@ mod tests {
             EnvelopePayload::BlockWrite {
                 pos: BlockPos::new(200, 5, 200),
                 block: types::BlockId(1),
+                load_conversion: false,
             },
         )]);
     }
@@ -4962,6 +4980,7 @@ mod tests {
                 payload: EnvelopePayload::BlockWrite {
                     pos: BlockPos::new(56, 65, 56),
                     block: types::BlockId(1),
+                    load_conversion: false,
                 },
             }),
         }]);
@@ -6674,6 +6693,7 @@ mod tests {
             EnvelopePayload::BlockWrite {
                 pos: BlockPos::new(40, 9, 40),
                 block: voxel::builtin::AIR,
+                load_conversion: false,
             },
         )]);
         s.step();

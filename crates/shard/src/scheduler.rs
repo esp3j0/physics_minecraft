@@ -109,6 +109,9 @@ pub struct TickSummary {
     /// 地形破坏遥测(REQ-009 §8):全部分片的 `Outbox::destruction_stats` 合计。
     /// **总架构师接口桩(REQ-009 单元 05)**:字段已加,合计由实施方接线(桩阶段恒为默认)。
     pub destruction: physics_sim::destruction::DestructionStats,
+    /// 粘结与整块塌落遥测(REQ-010 §11):全部分片的 `Outbox::cohesion_stats` 合计。
+    /// **总架构师接口桩(REQ-010 单元 02)**:字段已加,合计由实施方接线(桩阶段恒为默认)。
+    pub cohesion: physics_sim::cohesion::CohesionStats,
 }
 
 /// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
@@ -1728,6 +1731,7 @@ impl Scheduler {
                                 payload: messaging::EnvelopePayload::BlockWrite {
                                     pos: write.pos,
                                     block: write.block,
+                                    load_conversion: write.load_conversion,
                                 },
                             })
                             .collect();
@@ -2084,6 +2088,7 @@ impl Scheduler {
             stepped_shards,
             migrations_admitted,
             destruction,
+            cohesion: physics_sim::cohesion::CohesionStats::default(),
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -2382,6 +2387,7 @@ mod tests {
                 migrations_admitted: 0,
                 telemetry: ActivationTelemetry::default(),
                 destruction: physics_sim::destruction::DestructionStats::default(),
+                cohesion: physics_sim::cohesion::CohesionStats::default(),
             }
         );
         sched.shutdown();

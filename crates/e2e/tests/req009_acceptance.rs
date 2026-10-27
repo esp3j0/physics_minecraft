@@ -578,9 +578,11 @@ mod unit02 {
     /// checkpoint 格式升到 v6(ShardSimConfig 追加 `destruction`,快照布局变化;REQ-005 D8 版本记录)。
     ///
     /// 会变红的实现:布局变了却没升版本(旧档按 v5 解码会读出错位数据或报非版本错误)。
+    ///
+    /// REQ-010 迁移:单元 02 起升到 v7(REQ-010 §4.6),本条改为"不低于 v6";v7 本身由 REQ-010 的用例钉住。
     #[test]
     fn acc_d10_checkpoint_version_is_v6() {
-        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 6);
+        const { assert!(app::driver::CHECKPOINT_FORMAT_VERSION >= 6) };
     }
 }
 

@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use serde::{Deserialize, Serialize};
 use types::{BlockId, BlockPos, WORLD_Y_MIN};
 use voxel::{BOND_INFINITE, BlockRegistry, Support};
 
@@ -26,6 +27,83 @@ const DOWN: (i32, i32, i32) = (0, -1, 0);
 /// "正下方、未装载 chunk、[`BOND_INFINITE`]" 共用的不限量容量:远大于任何合法格数,
 /// 参与加减不会溢出(不拿 `u32::MAX` 直接参与运算)。
 const INF: u64 = u64::MAX / 4;
+
+/// 粘结与整块塌落配置(REQ-010 §11;`ShardSimConfig::cohesion`)。
+///
+/// **总架构师接口桩(REQ-010 单元 02)**:键与默认值固定。`enabled` 在单元 08 之前默认 `false`(D9 由单元 08 打开)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CohesionConfig {
+    /// 总开关(D9);与 `destruction.enabled` 同时为真才生效(§4.6),关闭时行为与 REQ-009 完全一致。
+    pub enabled: bool,
+    /// 单个悬挑连通块的格数上限(2048,§4.2)。
+    pub load_max_cells: usize,
+    /// 切块网格边长 S(6,§5.2;单元 04 使用)。
+    pub compound_split_size: i32,
+    /// 每分片每拍转换成实体的格数上限(1024,§5.2;单元 04 使用)。
+    pub max_converted_cells_per_tick: usize,
+    /// 每分片每拍处理碎裂的复合体数(16,§7.1;单元 06 使用)。
+    pub max_fractures_per_tick: usize,
+    /// 整块凝固 / 强制落地时最多上移的格数(2,§8;单元 05 使用)。
+    pub compound_snap_lift: i32,
+}
+
+impl Default for CohesionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            load_max_cells: 2048,
+            compound_split_size: 6,
+            max_converted_cells_per_tick: 1024,
+            max_fractures_per_tick: 16,
+            compound_snap_lift: 2,
+        }
+    }
+}
+
+/// 粘结与整块塌落遥测(REQ-010 §11):分片每拍计数(经 `Outbox::cohesion_stats` 交出),调度器全部分片合计进
+/// `TickSummary::cohesion`。纯计数、每拍重算、不入快照。
+///
+/// **总架构师接口桩(REQ-010 单元 02)**:字段固定;单元 02 接线 `load_*` 六项与 `add`,其余由后续单元接线(此前恒为 0)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CohesionStats {
+    /// 承载判定次数(一次 `evaluate_load` 调用计 1;"转换前"那次另计)。
+    pub load_evaluations: u64,
+    /// 承载判定访问的悬挑格数(`LoadOutcome::visited` 之和)。
+    pub load_visited: u64,
+    /// 因超过 `load_max_cells` 判为稳定的连通块数(`LoadOutcome::budget_stable` 之和)。
+    pub load_budget_stable: u64,
+    /// 收到邻片承载转换而多求一次"转换前"F 的次数(§9)。
+    pub load_double_evaluations: u64,
+    /// 本拍判定出的 F 的格数(两次求值取并集后,含本体区外的格)。
+    pub load_falling: u64,
+    /// 本拍末仍留在待转换集合里的格数(§4.6)。
+    pub load_pending: u64,
+    /// 生成的复合体数(单元 04)。
+    pub compounds_spawned: u64,
+    /// 生成的复合体的格数之和(单元 04)。
+    pub compound_cells: u64,
+    /// 切块产生的段数(单元 04)。
+    pub segments: u64,
+    /// 碎裂断开的粘结数(单元 06)。
+    pub bonds_broken: u64,
+    /// 碎裂生成的分量数(单元 06)。
+    pub fracture_components: u64,
+    /// 整块凝固数(单元 05)。
+    pub compounds_solidified: u64,
+    /// 倾斜搁置散成单格的复合体数(单元 05)。
+    pub tilt_scattered: u64,
+    /// 强制落地退化为逐格的复合体数(单元 05)。
+    pub forced_landing_fallbacks: u64,
+    /// 爆炸从复合体上移除的格数(单元 07)。
+    pub blast_removed_cells: u64,
+}
+
+impl CohesionStats {
+    /// 逐字段相加(调度器合计全部分片)。**接口桩**:由实施方实现。
+    pub fn add(&mut self, other: &Self) {
+        let _ = other;
+    }
+}
 
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
 /// 任一侧不是实心方块(空气、非实心、未知 ID)为 0。

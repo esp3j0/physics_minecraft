@@ -1005,3 +1005,610 @@ mod unit01 {
         );
     }
 }
+
+/// 单元 02:承载判定接入分片(AC-C2 生产路径、AC-C10 的转换部分;REQ-010 §4.6、§9,修订 2)。
+mod unit02 {
+    use messaging::{
+        Envelope, EnvelopePayload, InputPayload, InputSource, Intent, SimCommand, StampedInput,
+    };
+    use physics_sim::cohesion::{CohesionConfig, CohesionStats};
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{BlockWriteKind, ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use std::collections::BTreeSet;
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EMERGENT_ORIGIN, EntityDesc, EntityId,
+        EntityState, ShardId, ShardPos, Tick, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+    const AIR: BlockId = builtin::AIR;
+
+    fn shard(x: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, 0))
+    }
+
+    fn owner(q: BlockPos) -> ShardId {
+        shard(if q.x < 128 { 0 } else { 1 })
+    }
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn column(x: i32, ys: std::ops::RangeInclusive<i32>, z: i32) -> Vec<BlockPos> {
+        ys.map(|y| p(x, y, z)).collect()
+    }
+
+    fn row(xs: std::ops::RangeInclusive<i32>, y: i32, z: i32) -> Vec<BlockPos> {
+        xs.map(|x| p(x, y, z)).collect()
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    fn sim_cfg(x: i32, destruction: bool, cohesion: bool, cap: usize) -> ShardSimConfig {
+        let mut c = ShardSimConfig::new(shard(x));
+        c.destruction = DestructionConfig {
+            enabled: destruction,
+            max_detach_per_tick: cap,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: cohesion,
+            ..CohesionConfig::default()
+        };
+        c
+    }
+
+    fn load(
+        sim: &mut ShardSim,
+        cx: std::ops::RangeInclusive<i32>,
+        cz: std::ops::RangeInclusive<i32>,
+    ) {
+        for x in cx {
+            for z in cz.clone() {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+    }
+
+    /// 会话:`shards` 中每个分片都装载 chunk x ∈ `cx`、z ∈ 2..=5 的平地(地表 y = −61,其上为空气)。
+    fn session(
+        shards: &[i32],
+        cx: std::ops::RangeInclusive<i32>,
+        destruction: bool,
+        cohesion: bool,
+        cap: usize,
+    ) -> Session {
+        let mut s = Session::new(cfg());
+        for &x in shards {
+            let mut sim = ShardSim::new(sim_cfg(x, destruction, cohesion, cap), registry());
+            load(&mut sim, cx.clone(), 2..=5);
+            s.register(sim);
+        }
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(owner(c), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn block(s: &Session, sh: ShardId, q: BlockPos) -> BlockId {
+        let cp = q.chunk_of();
+        s.voxel_chunk(sh, cp).expect("chunk 已装载").get(
+            (q.x - cp.x * 16) as usize,
+            (q.y - WORLD_Y_MIN) as usize,
+            (q.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn emergent(s: &Session, sh: ShardId) -> Vec<(EntityId, EntityState)> {
+        s.entity_states(sh)
+            .expect("分片已注册")
+            .into_iter()
+            .filter(|(id, _)| id.origin_shard() == EMERGENT_ORIGIN)
+            .collect()
+    }
+
+    fn center_of(q: BlockPos) -> Vec3 {
+        Vec3::new(q.x as f32 + 0.5, q.y as f32 + 0.5, q.z as f32 + 0.5)
+    }
+
+    /// 跑到给定分片都没有涌现实体为止(上限 900 拍)。
+    fn settle(s: &mut Session, shards: &[ShardId]) -> bool {
+        for _ in 0..900 {
+            s.tick();
+            if shards.iter().all(|sh| emergent(s, *sh).is_empty()) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 门框:柱 x = `xa`、`xb`(y −60..=−56),门楣 x = xa..=xb、y = −55,同在 z。返回 (左柱, 右柱, 门楣)。
+    fn door(xa: i32, xb: i32, z: i32) -> (Vec<BlockPos>, Vec<BlockPos>, Vec<BlockPos>) {
+        (
+            column(xa, -60..=-56, z),
+            column(xb, -60..=-56, z),
+            row(xa..=xb, -55, z),
+        )
+    }
+
+    fn build_door(
+        s: &mut Session,
+        log: &mut CommandLog,
+        xa: i32,
+        xb: i32,
+        z: i32,
+        lintel: BlockId,
+    ) {
+        let (pa, pb, top) = door(xa, xb, z);
+        set(s, log, &[pa, pb].concat(), STONE);
+        set(s, log, &top, lintel);
+    }
+
+    /// 石墙(x 40..=42、y −60..=−55、z−2..=z+2)伸出 8 格石悬臂 x 43..=50、y = −55。返回悬臂格。
+    fn build_cantilever(s: &mut Session, log: &mut CommandLog, z: i32) -> Vec<BlockPos> {
+        let wall: Vec<BlockPos> = (40..=42)
+            .flat_map(|x| (z - 2..=z + 2).flat_map(move |zz| column(x, -60..=-55, zz)))
+            .collect();
+        set(s, log, &wall, STONE);
+        let arm = row(43..=50, -55, z);
+        set(s, log, &arm, STONE);
+        arm
+    }
+
+    // ================================================================== 单分片
+
+    /// AC-C2 门框(生产路径):并排两个门框,土门楣与石门楣;同一拍移走两个左柱 → N 拍土门楣左 6 格写 air
+    /// (石门楣不动),N+1 生成 6 个单格碎块(方块 = dirt、BlockPos 升序);落定后石门楣完好,土块落回地面。
+    /// 承载判定只计入 `TickSummary::cohesion`:1 次求值、访问 12 格、F = 6、无待转换;不计 REQ-009 的坍塌求值,
+    /// 转换照常计入 `cells_collapsed`。
+    ///
+    /// 会变红的实现:开启后仍走 `find_collapse`(土门楣经右柱锚定,不塌);承载判定推迟到下一拍;
+    /// 遥测没接线或合计漏了分片;承载判定也计进了 `collapse_evaluations`。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c2_door_lintel_end_to_end() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, true, 64);
+        let mut log = CommandLog::new();
+        build_door(&mut s, &mut log, 60, 66, 64, DIRT);
+        build_door(&mut s, &mut log, 60, 66, 70, STONE);
+        s.tick();
+        assert!(emergent(&s, sh).is_empty(), "搭好时两个门框都稳定");
+        set(&mut s, &mut log, &column(60, -60..=-56, 64), AIR);
+        set(&mut s, &mut log, &column(60, -60..=-56, 70), AIR);
+        let n = s.tick();
+        let fell = row(60..=65, -55, 64);
+        for c in &fell {
+            assert_eq!(block(&s, sh, *c), AIR, "N 拍土门楣 {c:?} 已写 air");
+        }
+        assert_eq!(block(&s, sh, p(66, -55, 64)), DIRT, "右柱顶上那格不动");
+        for c in row(60..=66, -55, 70) {
+            assert_eq!(block(&s, sh, c), STONE, "石门楣挂得住 {c:?}");
+        }
+        assert_eq!(n.cohesion.load_evaluations, 1);
+        assert_eq!(n.cohesion.load_visited, 12);
+        assert_eq!(n.cohesion.load_falling, 6);
+        assert_eq!(n.cohesion.load_pending, 0);
+        assert_eq!(n.cohesion.load_double_evaluations, 0);
+        assert_eq!(
+            n.destruction.collapse_evaluations, 0,
+            "承载判定不计 REQ-009 的坍塌求值"
+        );
+        assert_eq!(
+            n.destruction.cells_collapsed, 6,
+            "转换照常计入 cells_collapsed"
+        );
+        assert!(emergent(&s, sh).is_empty(), "N 拍还没有实体");
+        s.tick();
+        let got = emergent(&s, sh);
+        assert_eq!(got.len(), 6);
+        for ((id, state), cell) in got.iter().zip(&fell) {
+            assert!(
+                (state.translation - center_of(*cell)).length() < 0.35,
+                "{id:?} 在 {cell:?} 附近"
+            );
+            assert_eq!(
+                s.entity_desc(sh, *id),
+                Some(EntityDesc {
+                    half_size: DEBRIS_HALF_SIZE,
+                    block: DIRT
+                })
+            );
+        }
+        assert!(settle(&mut s, &[sh]), "900 拍内全部凝固");
+        for c in row(60..=66, -55, 70) {
+            assert_eq!(block(&s, sh, c), STONE);
+        }
+        let mut dirt_on_ground = 0;
+        for x in 54..=72 {
+            for y in -60..=-56 {
+                for z in 58..=68 {
+                    if block(&s, sh, p(x, y, z)) == DIRT {
+                        dirt_on_ground += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(dirt_on_ground, 6, "6 格土落回地面");
+        s.shutdown();
+    }
+
+    /// AC-C2 加重与换材料(D8,§4.6 第 2 条):8 格石悬臂末端放 1 格石头 → N 拍悬臂连同放上去的格(9 格)写 air,
+    /// N+1 生成 9 个碎块;把另一根悬臂根部的墙格从 stone 换成 dirt(实心 → 实心)→ 粘结降到 3,整根 8 格断下。
+    ///
+    /// 会变红的实现:放置不触发;只登记"实心变空";材料替换不触发;放上去的格不进 F。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c2_placement_and_replacement_trigger() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, true, 64);
+        let mut log = CommandLog::new();
+        let arm_a = build_cantilever(&mut s, &mut log, 64);
+        let arm_b = build_cantilever(&mut s, &mut log, 74);
+        s.tick();
+        assert!(emergent(&s, sh).is_empty(), "8 格石悬臂挂得住");
+        let weight = p(50, -54, 64);
+        set(&mut s, &mut log, &[weight], STONE);
+        let n = s.tick();
+        for c in arm_a.iter().chain([&weight]) {
+            assert_eq!(block(&s, sh, *c), AIR, "{c:?}");
+        }
+        assert_eq!(n.cohesion.load_falling, 9);
+        s.tick();
+        assert_eq!(emergent(&s, sh).len(), 9, "N+1 生成 9 个碎块");
+
+        set(&mut s, &mut log, &[p(42, -55, 74)], DIRT);
+        s.tick();
+        for c in &arm_b {
+            assert_eq!(block(&s, sh, *c), AIR, "根部换成土后整根断下 {c:?}");
+        }
+        assert_eq!(
+            block(&s, sh, p(42, -55, 74)),
+            DIRT,
+            "换上的土格是接地的墙,不动"
+        );
+        s.shutdown();
+    }
+
+    /// AC-C2 凝固触发(D8):一个方块实体落在满载的 8 格石悬臂末端并凝固 → 凝固写入触发承载判定,悬臂连同凝固的格断下。
+    ///
+    /// 会变红的实现:凝固写入不登记触发。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c2_solidify_triggers_load_check() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6, true, true, 64);
+        let mut log = CommandLog::new();
+        let arm = build_cantilever(&mut s, &mut log, 84);
+        s.tick();
+        s.spawn_owned(
+            sh,
+            EntityId::from_parts(0, 1),
+            EntityState {
+                translation: Vec3::new(50.5, -52.5, 84.5),
+                ..EntityState::default()
+            },
+            EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: STONE,
+            },
+            InputSource(7),
+        )
+        .expect("spawn");
+        let mut broke = false;
+        for _ in 0..600 {
+            s.tick();
+            if arm.iter().all(|c| block(&s, sh, *c) == AIR) {
+                broke = true;
+                break;
+            }
+        }
+        assert!(broke, "实体凝固在悬臂上后,600 拍内整根悬臂断下");
+        s.shutdown();
+    }
+
+    /// AC-C2 待转换队列(§4.6 第 4 条):名额 3,土门楣 F = 6 → N 拍按 BlockPos 升序转换前 3 格、3 格留在队列
+    /// (`load_pending` = 3);之后直接转换剩下 3 格,不重新求值(重新求值会判剩下 3 格挂得住)。在 N 与 N+1 之间
+    /// 取世界快照并回放,两线继续,生成的 6 个实体逐位相同、ID 不重复。
+    ///
+    /// 会变红的实现:推迟时重新求值(剩下 3 格永远悬空);待转换集合不进快照(回放线少塌 3 格);超出名额的格丢失。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c2_pending_conversions_survive_without_reevaluation() {
+        let sh = shard(0);
+        let mut a = session(&[0], 2..=6, true, true, 3);
+        let mut log = CommandLog::new();
+        build_door(&mut a, &mut log, 60, 66, 64, DIRT);
+        a.tick();
+        set(&mut a, &mut log, &column(60, -60..=-56, 64), AIR);
+        let n = a.tick();
+        let fell = row(60..=65, -55, 64);
+        let air: Vec<BlockPos> = fell
+            .iter()
+            .copied()
+            .filter(|c| block(&a, sh, *c) == AIR)
+            .collect();
+        assert_eq!(air, fell[..3], "N 拍按 BlockPos 升序转换前 3 格");
+        assert_eq!(n.cohesion.load_falling, 6);
+        assert_eq!(n.cohesion.load_pending, 3);
+
+        let world = a.world_snapshot();
+        let mut b = sim_api::replay::replay_world(&world, &log, cfg(), registry).expect("回放");
+        for _ in 0..3 {
+            a.tick();
+            b.tick();
+        }
+        for c in &fell {
+            assert_eq!(block(&a, sh, *c), AIR, "剩下的格也转换了 {c:?}");
+        }
+        let ea = emergent(&a, sh);
+        assert_eq!(ea.len(), 6);
+        let ids: BTreeSet<EntityId> = ea.iter().map(|e| e.0).collect();
+        assert_eq!(ids.len(), 6, "ID 不重复");
+        assert_eq!(ea, emergent(&b, sh), "回放线逐位相同");
+        a.shutdown();
+        b.shutdown();
+    }
+
+    /// AC-C16 开关(§4.6 第 1 条):本 REQ 关闭时与 REQ-009 一致——土门楣经右柱锚定不塌、加重不触发,坍塌走
+    /// `find_collapse` 并计 REQ-009 遥测;破坏关闭而本 REQ 开启时同样什么都不塌。两种情况 `cohesion` 遥测全为 0。
+    ///
+    /// 会变红的实现:承载判定不看 `destruction.enabled`;关闭时仍登记"加重"的触发;遥测在关闭时计数。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c16_switches() {
+        for (destruction, cohesion) in [(true, false), (false, true)] {
+            let sh = shard(0);
+            let mut s = session(&[0], 2..=6, destruction, cohesion, 64);
+            let mut log = CommandLog::new();
+            build_door(&mut s, &mut log, 60, 66, 64, DIRT);
+            let arm = build_cantilever(&mut s, &mut log, 80);
+            s.tick();
+            set(&mut s, &mut log, &column(60, -60..=-56, 64), AIR);
+            set(&mut s, &mut log, &[p(50, -54, 80)], STONE);
+            let n = s.tick();
+            s.tick();
+            for c in row(61..=66, -55, 64).iter().chain(&arm) {
+                assert_ne!(
+                    block(&s, sh, *c),
+                    AIR,
+                    "destruction={destruction} cohesion={cohesion}:{c:?} 不塌"
+                );
+            }
+            assert_eq!(n.cohesion, CohesionStats::default());
+            assert_eq!(
+                n.destruction.collapse_evaluations,
+                u64::from(destruction),
+                "只有破坏开启时走 REQ-009 的坍塌求值"
+            );
+            assert!(emergent(&s, sh).is_empty());
+            s.shutdown();
+        }
+    }
+
+    // ================================================================== 跨分片
+
+    fn shard_sim(x: i32) -> ShardSim {
+        let mut sim = ShardSim::new(sim_cfg(x, true, true, 64), registry());
+        load(&mut sim, 7..=9, 3..=4);
+        sim
+    }
+
+    fn command(sim: &mut ShardSim, cells: &[BlockPos], block: BlockId) {
+        let inputs: Vec<StampedInput> = cells
+            .iter()
+            .enumerate()
+            .map(|(k, &pos)| StampedInput {
+                apply_at: Tick(0),
+                source: InputSource::SCHEDULER,
+                sequence: k as u64,
+                payload: InputPayload::Command(SimCommand::SetBlock { pos, block }),
+            })
+            .collect();
+        sim.apply_prefix(&inputs);
+    }
+
+    /// 邻片 (0,0) 发来的写 air 信封;`marked` 中的格带承载转换标记。
+    fn envelopes(sim: &mut ShardSim, plain: &[BlockPos], marked: &[BlockPos]) {
+        let inputs: Vec<StampedInput> = plain
+            .iter()
+            .map(|c| (*c, false))
+            .chain(marked.iter().map(|c| (*c, true)))
+            .enumerate()
+            .map(|(k, (pos, load_conversion))| StampedInput {
+                apply_at: Tick(0),
+                source: InputSource::SCHEDULER,
+                sequence: k as u64,
+                payload: InputPayload::Envelope(Envelope::stamp(
+                    shard(0),
+                    Intent {
+                        destination: shard(1),
+                        payload: EnvelopePayload::BlockWrite {
+                            pos,
+                            block: AIR,
+                            load_conversion,
+                        },
+                    },
+                    Tick(0),
+                    k as u64,
+                )),
+            })
+            .collect();
+        sim.apply_prefix(&inputs);
+    }
+
+    /// AC-C10 求两次取并集(§9,分片级):门框柱 x = 124(邻片 (0,0) 的本体区)与 131,土门楣 124..=131。
+    /// 分片 (1,0) 同一拍收到邻片的写入:左柱写 air(不带标记,模拟邻片的涌现破坏)+ 门楣 124..=127 写 air(带承载
+    /// 转换标记)。"转换前"那次看到完整门楣 → F = 124..=130 共 7 格 → 本片转换 128..=130,写入带标记,计 2 次求值、
+    /// 1 次两次求值;同样的写入若不带标记,只按写入后的视图求值,剩下 3 格恰好挂住、不转换。
+    ///
+    /// 会变红的实现:不看标记(永远只求写入后的一次,门楣残余永远悬空);把邻片本体区的格也转换了;
+    /// 本片的转换写入没带标记(下游分片又会漏判)。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c10_neighbor_conversion_evaluated_before_and_after() {
+        for marked in [true, false] {
+            let mut sim = shard_sim(1);
+            let (pa, pb, top) = door(124, 131, 64);
+            command(&mut sim, &[pa.clone(), pb].concat(), STONE);
+            command(&mut sim, &top, DIRT);
+            sim.step();
+            assert!(sim.take_outbox().detach_requests.is_empty(), "搭好时稳定");
+            let left = row(124..=127, -55, 64);
+            if marked {
+                envelopes(&mut sim, &pa, &left);
+            } else {
+                envelopes(&mut sim, &[pa.clone(), left].concat(), &[]);
+            }
+            sim.step();
+            let out = sim.take_outbox();
+            let detached: Vec<BlockPos> = out.detach_requests.iter().map(|r| r.cell).collect();
+            if marked {
+                assert_eq!(
+                    detached,
+                    row(128..=130, -55, 64),
+                    "本片转换自己本体区内的 3 格"
+                );
+                let flagged: Vec<BlockPos> = out
+                    .block_updates
+                    .iter()
+                    .filter(|w| w.load_conversion)
+                    .map(|w| w.pos)
+                    .collect();
+                assert_eq!(flagged, row(128..=130, -55, 64), "本片的转换写入带标记");
+                assert!(
+                    out.block_updates
+                        .iter()
+                        .filter(|w| w.load_conversion)
+                        .all(|w| w.kind == BlockWriteKind::Emergent && w.block == AIR)
+                );
+                assert_eq!(out.cohesion_stats.load_evaluations, 2);
+                assert_eq!(out.cohesion_stats.load_double_evaluations, 1);
+                assert_eq!(out.cohesion_stats.load_falling, 7);
+            } else {
+                assert!(detached.is_empty(), "不带标记:剩下 3 格被单键容量 3 托住");
+                assert_eq!(out.cohesion_stats.load_evaluations, 1);
+                assert_eq!(out.cohesion_stats.load_double_evaluations, 0);
+            }
+        }
+    }
+
+    /// AC-C10 "写入后"那次不能省(§9):石桥面 112..=133 贴着分片 (1,0) 视图的边缘(x = 111 未装载 → 有地基)。
+    /// 只收到带标记的 112..=127 写 air:"转换前"那次把视图外当地基、判稳定;"写入后"那次剩下 128..=133 无支撑 → 转换 6 格。
+    ///
+    /// 会变红的实现:有标记时只求"转换前"那一次。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c10_after_write_evaluation_still_needed() {
+        let mut sim = shard_sim(1);
+        let deck = row(112..=133, -55, 64);
+        command(&mut sim, &deck, STONE);
+        sim.step();
+        assert!(
+            sim.take_outbox().detach_requests.is_empty(),
+            "贴着未装载 chunk:按有地基"
+        );
+        envelopes(&mut sim, &[], &row(112..=127, -55, 64));
+        sim.step();
+        let out = sim.take_outbox();
+        let detached: Vec<BlockPos> = out.detach_requests.iter().map(|r| r.cell).collect();
+        assert_eq!(detached, row(128..=133, -55, 64));
+        assert_eq!(out.cohesion_stats.load_double_evaluations, 1);
+    }
+
+    /// AC-C10 端到端(调度器带标记):门框柱 x = 124(分片 (0,0))与 131(分片 (1,0)),土门楣 124..=131 恰好满载
+    /// (中间 6 格、两端容量 3 + 3)。一个土块实体落在门楣 x = 126 上并凝固(分片 (0,0) 的涌现写入,邻片晚一拍才看到)
+    /// → 分片 (0,0) 判 F = 门楣中间 6 格 + 凝固的那格,转换自己的 4 格;分片 (1,0) 晚一拍收到凝固写入与带标记的转换写入,
+    /// 按"转换前"判出同一个 F,转换 128..=130。落定后两边视图里门楣中间 6 格都是 air,两端各剩 1 格土;
+    /// 期间某一拍的 `TickSummary::cohesion.load_double_evaluations` ≥ 1。
+    ///
+    /// 会变红的实现:调度器没把标记带进信封;接收方不求"转换前"那次(128..=130 永远悬空);凝固不触发。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c10_cross_shard_lintel_end_to_end() {
+        let (s0, s1) = (shard(0), shard(1));
+        let mut s = session(&[0, 1], 6..=9, true, true, 64);
+        let mut log = CommandLog::new();
+        build_door(&mut s, &mut log, 124, 131, 64, DIRT);
+        s.tick();
+        s.tick();
+        assert!(
+            emergent(&s, s0).is_empty() && emergent(&s, s1).is_empty(),
+            "满载的门楣挂得住"
+        );
+        s.spawn_owned(
+            s0,
+            EntityId::from_parts(0, 1),
+            EntityState {
+                translation: Vec3::new(126.5, -53.4, 64.5),
+                ..EntityState::default()
+            },
+            EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: DIRT,
+            },
+            InputSource(7),
+        )
+        .expect("spawn");
+        let mut doubled = false;
+        let mut broke = false;
+        for _ in 0..600 {
+            let summary = s.tick();
+            doubled |= summary.cohesion.load_double_evaluations >= 1;
+            if block(&s, s1, p(129, -55, 64)) == AIR {
+                broke = true;
+                break;
+            }
+        }
+        assert!(broke, "分片 (1,0) 视图里门楣的右半段在 600 拍内塌下");
+        assert!(settle(&mut s, &[s0, s1]), "900 拍内全部凝固");
+        for sh in [s0, s1] {
+            for c in row(125..=130, -55, 64) {
+                assert_eq!(block(&s, sh, c), AIR, "{sh:?} 视图里 {c:?}");
+            }
+            assert_eq!(block(&s, sh, p(124, -55, 64)), DIRT, "{sh:?} 左柱顶上那格");
+            assert_eq!(block(&s, sh, p(131, -55, 64)), DIRT, "{sh:?} 右柱顶上那格");
+            assert_eq!(
+                block(&s, sh, p(126, -54, 64)),
+                AIR,
+                "{sh:?} 凝固的那格随门楣落下"
+            );
+        }
+        assert!(doubled, "TickSummary 合计到了邻片的两次求值");
+        s.shutdown();
+    }
+
+    /// AC-C12:checkpoint 自本单元起为 v7(§4.6 第 8 条)。
+    ///
+    /// 会变红的实现:信封、出站写入与待转换集合的格式变了却没升版本。
+    #[test]
+    #[ignore = "REQ-010 单元 02 待实施方解除"]
+    fn acc_c12_checkpoint_version_is_v7() {
+        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 7);
+    }
+}

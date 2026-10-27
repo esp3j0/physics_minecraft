@@ -34,7 +34,12 @@ pub enum EnvelopePayload {
     Event(CrossEvent),
     /// 涌现 block write(REQ-005 §4.3.3):owner + holders 应用;apply_at = N+1;
     /// 应用后不再产 `block_updates`(防广播回环)。
-    BlockWrite { pos: BlockPos, block: BlockId },
+    BlockWrite {
+        pos: BlockPos,
+        block: BlockId,
+        /// 承载转换标记(REQ-010 §9):接收方据此在本拍多求一次"转换前"的 F。
+        load_conversion: bool,
+    },
 }
 
 impl EnvelopePayload {
@@ -279,6 +284,7 @@ mod tests {
         let write = EnvelopePayload::BlockWrite {
             pos: types::BlockPos::ZERO,
             block: types::BlockId(1),
+            load_conversion: false,
         };
         assert_eq!(event.ordinal(), 1, "Event = 追加序 1(任务 03)");
         assert_eq!(write.ordinal(), 2, "BlockWrite = 追加序 2(任务 03)");
