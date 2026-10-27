@@ -2277,3 +2277,390 @@ mod unit04 {
         );
     }
 }
+
+/// 单元 05:整块凝固、倾斜散开与强制落地(AC-C7、AC-C8;REQ-010 §8.3,修订 6)。
+#[allow(clippy::clone_on_copy)]
+mod unit05 {
+    use messaging::InputSource;
+    use physics_sim::cohesion::{
+        CohesionConfig, CompoundLanding, CompoundSnap, compound_forced_landing, compound_snap,
+    };
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EntityDesc, EntityId, EntityState,
+        ShapeCell, ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const AIR: BlockId = builtin::AIR;
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn row(xs: std::ops::RangeInclusive<i32>, y: i32, z: i32) -> Vec<BlockPos> {
+        xs.map(|x| p(x, y, z)).collect()
+    }
+
+    fn stones(cells: &[BlockPos]) -> Vec<(BlockPos, BlockId)> {
+        let mut v: Vec<(BlockPos, BlockId)> = cells.iter().map(|c| (*c, STONE)).collect();
+        v.sort();
+        v
+    }
+
+    /// 6 格石梁的形状:偏移 x = −2..=3。
+    fn beam() -> CompoundShape {
+        CompoundShape::new(
+            (-2..=3)
+                .map(|x| ShapeCell {
+                    offset: [x, 0, 0],
+                    block: STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格梁")
+    }
+
+    fn rot_y(deg: f32) -> Quat {
+        Quat::from_rotation_y(deg.to_radians())
+    }
+
+    // ------------------------------------------------------------------ 纯函数
+
+    /// AC-C7 吸附判定(§8.3 第 1 条):平放 → 写在原点格那一行;绕 y 转 90° → 偏移随朝向旋转;5° 小偏差 → 吸附到
+    /// 轴对齐朝向;倾斜 20° → 末端格偏离超过 0.5 格,判倾斜;目标格被占 → 上移 1 格;上移到上限仍被占 → 倾斜。
+    ///
+    /// 会变红的实现:原点格按四舍五入而不是格中心取整;偏移没随目标朝向旋转;误差只看原点不看各格;
+    /// 上移判定用了上移后的误差;被占时直接判倾斜而不上移。
+    #[test]
+    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    fn acc_c7_compound_snap_rules() {
+        let shape = beam();
+        let free = |_: BlockPos| false;
+        let rest = Vec3::new(62.5, -59.475, 64.5);
+        let snap = |t: Vec3, r: Quat, lift: i32, occ: &dyn Fn(BlockPos) -> bool| {
+            compound_snap(t, r, &shape, 0.5, 45.0, lift, occ)
+        };
+        let flat = CompoundSnap::Write {
+            cells: stones(&row(60..=65, -60, 64)),
+            lifted: 0,
+        };
+        assert_eq!(snap(rest, Quat::IDENTITY, 2, &free), flat, "平放");
+        assert_eq!(
+            snap(rest, rot_y(5.0), 2, &free),
+            flat,
+            "5° 小偏差吸附到轴对齐"
+        );
+        let turned: Vec<BlockPos> = (61..=66).map(|z| p(62, -60, z)).collect();
+        assert_eq!(
+            snap(rest, rot_y(90.0), 2, &free),
+            CompoundSnap::Write {
+                cells: stones(&turned),
+                lifted: 0
+            },
+            "绕 y 转 90°:+x 偏移转到 −z"
+        );
+        assert_eq!(
+            snap(rest, Quat::from_rotation_z(20f32.to_radians()), 2, &free),
+            CompoundSnap::Tilted,
+            "倾斜 20°:末端格偏离 > 0.5 格"
+        );
+        let one = |q: BlockPos| q == p(63, -60, 64);
+        assert_eq!(
+            snap(rest, Quat::IDENTITY, 2, &one),
+            CompoundSnap::Write {
+                cells: stones(&row(60..=65, -59, 64)),
+                lifted: 1
+            },
+            "目标格被占:上移 1 格"
+        );
+        let two = |q: BlockPos| q == p(63, -60, 64) || q == p(63, -59, 64);
+        assert_eq!(
+            snap(rest, Quat::IDENTITY, 1, &two),
+            CompoundSnap::Tilted,
+            "上移到上限仍被占 → 倾斜"
+        );
+    }
+
+    /// AC-C8 强制落地(§8.3 第 5 条):空中的梁整块落到地面;一根柱子上多一格石头 → 整块停在它上面(所有格同高);
+    /// 起点与实心重叠 → 先上移再落;涉及的柱有未装载 → 推迟;下方全空 → 退化为逐格;上移到上限仍重叠 → 退化为逐格。
+    ///
+    /// 会变红的实现:逐格各自落到自己的柱底(不再是一整块);只看原点所在柱;未装载当成空气一路落穿。
+    #[test]
+    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    fn acc_c8_compound_forced_landing_rules() {
+        let shape = beam();
+        let ground = |q: BlockPos| -> Option<bool> { Some(q.y <= -61) };
+        let land = |t: Vec3, lift: i32, solid: &dyn Fn(BlockPos) -> Option<bool>| {
+            compound_forced_landing(t, Quat::IDENTITY, &shape, lift, solid)
+        };
+        let high = Vec3::new(62.5, -50.5, 64.5);
+        assert_eq!(
+            land(high, 2, &ground),
+            CompoundLanding::Write {
+                cells: stones(&row(60..=65, -60, 64))
+            },
+            "落到地面"
+        );
+        let bump = |q: BlockPos| -> Option<bool> { Some(q.y <= -61 || q == p(65, -60, 64)) };
+        assert_eq!(
+            land(high, 2, &bump),
+            CompoundLanding::Write {
+                cells: stones(&row(60..=65, -59, 64))
+            },
+            "整块停在最高的那一柱上"
+        );
+        let low = Vec3::new(62.5, -59.5, 64.5);
+        let inside = |q: BlockPos| -> Option<bool> { Some(q.y <= -61 || q == p(63, -60, 64)) };
+        assert_eq!(
+            land(low, 2, &inside),
+            CompoundLanding::Write {
+                cells: stones(&row(60..=65, -59, 64))
+            },
+            "起点重叠:上移 1 格"
+        );
+        let unloaded = |q: BlockPos| -> Option<bool> {
+            if q.x == 60 && q.y < -55 {
+                None
+            } else {
+                Some(q.y <= -61)
+            }
+        };
+        assert_eq!(
+            land(high, 2, &unloaded),
+            CompoundLanding::Defer,
+            "未装载 → 推迟"
+        );
+        let void = |_: BlockPos| -> Option<bool> { Some(false) };
+        assert_eq!(
+            land(high, 2, &void),
+            CompoundLanding::Fallback,
+            "下方全空 → 逐格"
+        );
+        let wall = |q: BlockPos| -> Option<bool> { Some(q.y <= -61 || (q.x == 63 && q.y <= -58)) };
+        assert_eq!(
+            land(low, 1, &wall),
+            CompoundLanding::Fallback,
+            "上移到上限仍重叠 → 逐格"
+        );
+    }
+
+    // ------------------------------------------------------------------ 端到端
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 单分片会话(chunk x 2..=6、z 2..=5;凝固开启)。`load` = 破坏与本 REQ 是否开启。
+    fn session(load: bool) -> Session {
+        let mut c = ShardSimConfig::new(shard());
+        c.destruction = DestructionConfig {
+            enabled: load,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: load,
+            ..CohesionConfig::default()
+        };
+        let mut sim = ShardSim::new(c, registry());
+        for x in 2..=6 {
+            for z in 2..=5 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(shard(), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn block(s: &Session, q: BlockPos) -> BlockId {
+        let cp = q.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (q.x - cp.x * 16) as usize,
+            (q.y - WORLD_Y_MIN) as usize,
+            (q.z - cp.z * 16) as usize,
+        )
+    }
+
+    fn spawn_beam(
+        s: &mut Session,
+        log: &mut CommandLog,
+        k: u32,
+        translation: Vec3,
+        rotation: Quat,
+    ) {
+        let entry = s
+            .spawn_owned(
+                shard(),
+                EntityId::from_parts(0, k),
+                EntityState {
+                    translation,
+                    rotation,
+                    ..EntityState::default()
+                },
+                EntityDesc::compound(DEBRIS_HALF_SIZE, beam()),
+                InputSource(7),
+            )
+            .expect("spawn");
+        log.append(entry);
+    }
+
+    /// 跑到分片里没有任何实体为止(上限 900 拍),返回期间 `TickSummary::cohesion` 的累计值。
+    fn settle(s: &mut Session) -> (bool, physics_sim::cohesion::CohesionStats) {
+        let mut total = physics_sim::cohesion::CohesionStats::default();
+        for _ in 0..900 {
+            let n = s.tick();
+            total.add(&n.cohesion);
+            if s.entity_states(shard()).expect("分片").is_empty() {
+                return (true, total);
+            }
+        }
+        (false, total)
+    }
+
+    fn count_stone(
+        s: &Session,
+        xs: std::ops::RangeInclusive<i32>,
+        zs: std::ops::RangeInclusive<i32>,
+    ) -> usize {
+        let mut n = 0;
+        for x in xs {
+            for y in -60..=-50 {
+                for z in zs.clone() {
+                    if block(s, p(x, y, z)) == STONE {
+                        n += 1;
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// AC-C7 整块凝固(§8.3 第 2 条):一根平放、一根绕 y 转 90° 的 6 格石梁从 2 m 高落下,停稳后同一拍整块写回地形,
+    /// 实体消失——前者占 x 60..=65(z 64),后者占 z 61..=66(x 80);期间计 2 次整块凝固。
+    ///
+    /// 会变红的实现:复合体仍跳过凝固;只写原点一格;旋转后的偏移没随朝向转;遥测没接线。
+    #[test]
+    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    fn acc_c7_compounds_solidify_whole() {
+        let mut s = session(false);
+        let mut log = CommandLog::new();
+        spawn_beam(
+            &mut s,
+            &mut log,
+            1,
+            Vec3::new(62.5, -57.5, 64.5),
+            Quat::IDENTITY,
+        );
+        spawn_beam(
+            &mut s,
+            &mut log,
+            2,
+            Vec3::new(80.5, -57.5, 64.5),
+            rot_y(90.0),
+        );
+        let (done, total) = settle(&mut s);
+        assert!(done, "900 拍内两根梁都凝固");
+        for c in row(60..=65, -60, 64) {
+            assert_eq!(block(&s, c), STONE, "{c:?}");
+        }
+        for z in 61..=66 {
+            assert_eq!(block(&s, p(80, -60, z)), STONE, "转过的梁 z = {z}");
+        }
+        assert_eq!(total.compounds_solidified, 2);
+        assert_eq!(total.tilt_scattered, 0);
+    }
+
+    /// AC-C7 倾斜散开(§8.3 第 3 条,D5):6 格石梁的一端落在 2 格高的石堆上,停稳时倾斜约 23°(末端格偏离约 1.2 格,
+    /// 已用 rapier demo 核过)→ 整块散成 6 个单格碎块,各自落定凝固;最终区域里正好多出 6 格石头,计 1 次散开。
+    ///
+    /// 会变红的实现:倾斜时强行整块吸附(石头穿进石堆或悬空);散开时丢格;散开后的碎块仍带形状。
+    #[test]
+    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    fn acc_c7_tilted_compound_scatters() {
+        let mut s = session(false);
+        let mut log = CommandLog::new();
+        set(&mut s, &mut log, &[p(65, -60, 72), p(65, -59, 72)], STONE);
+        s.tick();
+        spawn_beam(
+            &mut s,
+            &mut log,
+            1,
+            Vec3::new(62.5, -57.275, 72.5),
+            Quat::IDENTITY,
+        );
+        let (done, total) = settle(&mut s);
+        assert!(done, "散开的碎块 900 拍内都凝固");
+        assert_eq!(total.tilt_scattered, 1);
+        assert_eq!(total.compounds_solidified, 0);
+        assert_eq!(
+            count_stone(&s, 54..=72, 66..=78),
+            2 + 6,
+            "石堆 2 格 + 碎块 6 格"
+        );
+    }
+
+    /// AC-C7 凝固触发承载判定(§8.3 第 2 条、D8):6 格石梁轻轻落在满载的 8 格石悬臂上(下落 0.075 m,撞击远低于 I)
+    /// 并整块凝固 → 写入登记触发 → 悬臂超载,从根部整根断下。
+    ///
+    /// 会变红的实现:复合体的凝固写入不登记触发。
+    #[test]
+    #[ignore = "REQ-010 单元 05 待实施方解除"]
+    fn acc_c7_compound_solidify_triggers_load_check() {
+        let mut s = session(true);
+        let mut log = CommandLog::new();
+        let wall: Vec<BlockPos> = (40..=42)
+            .flat_map(|x| (82..=86).flat_map(move |z| (-60..=-55).map(move |y| p(x, y, z))))
+            .collect();
+        set(&mut s, &mut log, &wall, STONE);
+        let arm = row(43..=50, -55, 84);
+        set(&mut s, &mut log, &arm, STONE);
+        s.tick();
+        assert_eq!(block(&s, p(50, -55, 84)), STONE, "8 格石悬臂挂得住");
+        spawn_beam(
+            &mut s,
+            &mut log,
+            1,
+            Vec3::new(47.5, -53.4, 84.5),
+            Quat::IDENTITY,
+        );
+        let mut broke = false;
+        for _ in 0..600 {
+            s.tick();
+            if arm.iter().all(|c| block(&s, *c) == AIR) {
+                broke = true;
+                break;
+            }
+        }
+        assert!(broke, "梁凝固在悬臂上后,悬臂整根断下");
+    }
+}

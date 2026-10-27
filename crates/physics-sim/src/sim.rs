@@ -174,6 +174,8 @@ pub struct Outbox {
     /// 本拍承载塌落产生的复合体生成请求(REQ-010 §5.5;单元 04 起)。调度器与 `detach_requests` 一起分配涌现 ID、
     /// N+1 生成;对应格已在本拍写为 air。
     pub compound_requests: Vec<crate::cohesion::CompoundRequest>,
+    /// 本拍的分块请求(REQ-010 §8.3;单元 05 起:倾斜散开;单元 06、07 复用)。
+    pub piece_requests: Vec<crate::cohesion::PieceRequest>,
     /// 本拍地形破坏遥测(REQ-009 §8;单元 05 接线)。
     pub destruction_stats: crate::destruction::DestructionStats,
     /// 本拍粘结与整块塌落遥测(REQ-010 §11;单元 02 起接线)。

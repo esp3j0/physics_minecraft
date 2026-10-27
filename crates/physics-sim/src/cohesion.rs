@@ -127,6 +127,80 @@ pub struct CompoundRequest {
     pub shape: types::CompoundShape,
 }
 
+/// 分块请求(REQ-010 §8.3 第 3 条;单元 06、07 复用):一个实体在本拍被删除,其一部分在 N+1 作为新实体出现。
+/// 调度器在同一分片的脱落与复合体请求之后,按 (`parent`, `index`) 升序分配涌现 ID。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PieceRequest {
+    /// 被删除的原实体。
+    pub parent: types::EntityId,
+    /// 该分块在原实体里的序号(散开时 = 形状格序)。
+    pub index: u32,
+    pub state: types::EntityState,
+    pub desc: types::EntityDesc,
+}
+
+/// 整块凝固的吸附判定结果(REQ-010 §8.3 第 1 条)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompoundSnap {
+    /// 写入这些格(世界格, 方块;`BlockPos` 升序);`lifted` = 上移的格数。
+    Write {
+        cells: Vec<(BlockPos, BlockId)>,
+        lifted: i32,
+    },
+    /// 误差超限,或上移到上限仍被占 → 倾斜处理(散成单格)。
+    Tilted,
+}
+
+/// 整块凝固的吸附判定(纯函数,REQ-010 §8.3 第 1 条)。`occupied(p)` = 格 p 被地形实心或其他实体占用。
+///
+/// **总架构师接口桩(REQ-010 单元 05)**:由实施方实现。
+pub fn compound_snap(
+    translation: types::glam::Vec3,
+    rotation: types::glam::Quat,
+    shape: &types::CompoundShape,
+    max_snap_blocks: f32,
+    max_snap_angle_deg: f32,
+    max_lift: i32,
+    occupied: &dyn Fn(BlockPos) -> bool,
+) -> CompoundSnap {
+    let _ = (
+        translation,
+        rotation,
+        shape,
+        max_snap_blocks,
+        max_snap_angle_deg,
+        max_lift,
+        occupied,
+    );
+    CompoundSnap::Tilted
+}
+
+/// 整块强制落地的结果(REQ-010 §8.3 第 5 条)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompoundLanding {
+    /// 写入这些格(`BlockPos` 升序)。
+    Write { cells: Vec<(BlockPos, BlockId)> },
+    /// 涉及的柱有未装载的格 → 推迟。
+    Defer,
+    /// 上移到上限仍与实心重叠,或所有柱下方都没有实心 → 退化为逐格。
+    Fallback,
+}
+
+/// 整块强制落地(纯函数,REQ-010 §8.3 第 5 条)。`solid(p)`:`Some(true)` 实心、`Some(false)` 非实心、`None` 未装载;
+/// 向下扫描到 `WORLD_Y_MIN` 为止。
+///
+/// **总架构师接口桩(REQ-010 单元 05)**:由实施方实现。
+pub fn compound_forced_landing(
+    translation: types::glam::Vec3,
+    rotation: types::glam::Quat,
+    shape: &types::CompoundShape,
+    max_lift: i32,
+    solid: &dyn Fn(BlockPos) -> Option<bool>,
+) -> CompoundLanding {
+    let _ = (translation, rotation, shape, max_lift, solid);
+    CompoundLanding::Fallback
+}
+
 /// 两个共面实心格之间的承载粘结 `B(a,b) = min(B_a, B_b)`(REQ-010 §3.1);
 /// 任一侧不是实心方块(空气、非实心、未知 ID)为 0。
 pub fn bond_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId) -> u32 {
