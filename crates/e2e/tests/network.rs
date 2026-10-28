@@ -313,10 +313,18 @@ struct Harness {
 }
 
 /// 测试通用配置:2 worker、checkpoint 疏(600,终末必写)、其余默认。
+///
+/// REQ-010 §12.1 第 3 条迁移:本套件按 REQ-009 及更早语义编写(悬空 SetBlock
+/// 保持原样——方块广播与位级静止断言),与默认开启的承载判定冲突(悬空写入
+/// 会被转换塌落)→ 装配处显式关闭本开关,断言不变。
 fn base_config() -> Config {
     Config {
         worker_count: 2,
         checkpoint_interval_ticks: 600,
+        cohesion: app::config::CohesionConfig {
+            enabled: false,
+            ..app::config::CohesionConfig::default()
+        },
         ..Config::default()
     }
 }

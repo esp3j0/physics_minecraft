@@ -445,6 +445,8 @@ mod unit02 {
             enabled,
             ..DestructionConfig::default()
         };
+        // REQ-010 §12.1 第 3 条迁移:REQ-009 语义套件在装配处显式关闭承载判定,断言不变。
+        cfg.cohesion.enabled = false;
         let mut sim = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
         for &(cx, cz) in chunks {
             let cp = ChunkPos::new(cx, cz);
@@ -660,6 +662,9 @@ mod unit03 {
             max_detach_per_tick: cap,
             ..DestructionConfig::default()
         };
+        // REQ-010 §12.1 第 3 条迁移:本套件按 REQ-009 语义编写(连通即锚定、
+        // 逐格塌落),与默认开启的承载判定冲突 → 装配处显式关闭,断言不变。
+        sim_cfg.cohesion.enabled = false;
         let mut sim = ShardSim::new(sim_cfg, registry());
         for cx in 2..=6 {
             for cz in 2..=6 {
@@ -1157,6 +1162,9 @@ mod unit04b {
                 max_detach_per_tick: cap,
                 ..DestructionConfig::default()
             };
+            // REQ-010 §12.1 第 3 条迁移:同 `session(cap)`——REQ-009 语义套件
+            // 在装配处显式关闭承载判定,断言不变。
+            sim_cfg.cohesion.enabled = false;
             let mut sim = ShardSim::new(sim_cfg, registry());
             for x in cx.clone() {
                 for z in 2..=5 {
@@ -1528,6 +1536,8 @@ mod unit05 {
     fn session(tweak: impl Fn(&mut physics_sim::destruction::DestructionConfig)) -> Session {
         let mut sim_cfg = ShardSimConfig::new(shard());
         sim_cfg.destruction.enabled = true;
+        // REQ-010 §12.1 第 3 条迁移:REQ-009 语义套件在装配处显式关闭承载判定,断言不变。
+        sim_cfg.cohesion.enabled = false;
         tweak(&mut sim_cfg.destruction);
         let mut sim = ShardSim::new(sim_cfg, registry());
         for x in 2..=6 {
@@ -1818,6 +1828,8 @@ mod unit06 {
     fn session(tweak: impl Fn(&mut physics_sim::destruction::DestructionConfig)) -> Session {
         let mut sim_cfg = ShardSimConfig::new(shard());
         sim_cfg.destruction.enabled = true;
+        // REQ-010 §12.1 第 3 条迁移:REQ-009 语义套件在装配处显式关闭承载判定,断言不变。
+        sim_cfg.cohesion.enabled = false;
         tweak(&mut sim_cfg.destruction);
         let mut sim = ShardSim::new(sim_cfg, Box::new(SimpleRegistry::builtin()));
         for x in 2..=6 {
@@ -2032,10 +2044,10 @@ mod unit07 {
             ..SessionConfig::default()
         });
         for &(sx, sz) in shards {
-            let mut sim = ShardSim::new(
-                ShardSimConfig::new(shard2(sx, sz)),
-                Box::new(SimpleRegistry::builtin()),
-            );
+            let mut sim_cfg = ShardSimConfig::new(shard2(sx, sz));
+            // REQ-010 §12.1 第 3 条迁移:REQ-009 语义套件在装配处显式关闭承载判定,断言不变。
+            sim_cfg.cohesion.enabled = false;
+            let mut sim = ShardSim::new(sim_cfg, Box::new(SimpleRegistry::builtin()));
             for x in cx.clone() {
                 for z in cz.clone() {
                     let cp = ChunkPos::new(x, z);

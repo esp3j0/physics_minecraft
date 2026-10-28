@@ -9,6 +9,12 @@ world_seed = 7
 [server.destruction]
 enabled = true
 
+# REQ-010 §12.1 第 3 条迁移:同 req009-crater——大弹坑的悬挑土层按 REQ-009
+# 语义(连通即锚定)保持坑形态,默认开启的承载判定下会整片塌落 → 显式关闭
+# 本开关,断言与截图期望不变。
+[server.cohesion]
+enabled = false
+
 [[step]]
 label = "相机就位(俯视)"
 camera = { pos = [8.0, -42.0, 30.0], yaw = -90.0, pitch = -40.0 }

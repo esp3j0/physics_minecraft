@@ -83,6 +83,11 @@ struct Harness {
 /// start_paused 下是**虚拟** 10s 会误踢——取舍同 network.rs 模块头,
 /// keepalive 语义本体由 REQ-003 任务 01 覆盖)。
 async fn harness(config: Config, pump: PumpConfig, observe: (u64, u64), zero_g: bool) -> Harness {
+    // REQ-010 §12.1 第 3 条迁移(总架构师裁定):本文件用例按 REQ-009 语义编写
+    // (悬空 SetBlock 保持原样),与默认开启的承载判定冲突(悬空写入会被承载
+    // 转换塌落)→ 装配处显式关闭本开关,断言不变。
+    let mut config = config;
+    config.cohesion.enabled = false;
     let net_cfg = NetConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         read_timeout_secs: 600,

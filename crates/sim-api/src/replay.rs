@@ -134,6 +134,15 @@ mod tests {
         }
     }
 
+    /// REQ-010 §12.1 第 3 条迁移:本模块用例按 REQ-009 及更早语义编写(悬空
+    /// SetBlock 保持原样),与默认开启的承载判定冲突 → 装配处显式关闭本开关,
+    /// 断言不变。
+    fn sim_cfg(shard: types::ShardId) -> physics_sim::ShardSimConfig {
+        let mut cfg = physics_sim::ShardSimConfig::new(shard);
+        cfg.cohesion.enabled = false;
+        cfg
+    }
+
     fn registry_factory() -> Box<dyn BlockRegistry> {
         Box::new(SimpleRegistry::builtin())
     }
@@ -162,7 +171,7 @@ mod tests {
         // 真快照:建会话注册分片跑 20 拍后取(保证 register_snapshot 可解码)。
         let mut original = Session::new(session_cfg());
         original.register(physics_sim::ShardSim::new(
-            physics_sim::ShardSimConfig::new(shard),
+            sim_cfg(shard),
             registry_factory(),
         ));
         for _ in 0..20 {
@@ -206,7 +215,7 @@ mod tests {
         let shard = shard_id(0, 0);
         let mut original = Session::new(session_cfg());
         original.register(physics_sim::ShardSim::new(
-            physics_sim::ShardSimConfig::new(shard),
+            sim_cfg(shard),
             registry_factory(),
         ));
         for _ in 0..7 {
@@ -242,7 +251,7 @@ mod tests {
         // 原线:注册分片 → 3 拍 → 快照(拍 3 = 已完成拍数)。
         let mut original = Session::new(session_cfg());
         original.register(physics_sim::ShardSim::new(
-            physics_sim::ShardSimConfig::new(shard),
+            sim_cfg(shard),
             registry_factory(),
         ));
         for _ in 0..3 {

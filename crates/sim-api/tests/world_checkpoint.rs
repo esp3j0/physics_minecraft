@@ -25,8 +25,17 @@ fn entity(n: u32) -> EntityId {
 }
 
 /// 凝固桥关闭的虚空分片(调度器/sim-api 测试同款)。
+///
+/// REQ-010 §12.1 第 3 条迁移:本文件用例按 REQ-009 及更早语义编写(悬空
+/// SetBlock 保持原样),与默认开启的承载判定冲突 → 装配处显式关闭本开关,
+/// 断言不变。两个构造器共用。
+fn cohesion_off(mut cfg: ShardSimConfig) -> ShardSimConfig {
+    cfg.cohesion.enabled = false;
+    cfg
+}
+
 fn sim(x: i32, z: i32) -> ShardSim {
-    let mut cfg = ShardSimConfig::new(shard_id(x, z));
+    let mut cfg = cohesion_off(ShardSimConfig::new(shard_id(x, z)));
     cfg.solidify = SolidifyConfig {
         enabled: false,
         ..SolidifyConfig::default()
@@ -36,7 +45,7 @@ fn sim(x: i32, z: i32) -> ShardSim {
 
 /// 带地面 chunk 的分片(顶面 world y = 136;long_replay.rs 同款口径)。
 fn ground_sim(x: i32, chunk_xs: std::ops::Range<i32>) -> ShardSim {
-    let mut cfg = ShardSimConfig::new(shard_id(x, 0));
+    let mut cfg = cohesion_off(ShardSimConfig::new(shard_id(x, 0)));
     cfg.solidify = SolidifyConfig {
         enabled: false,
         ..SolidifyConfig::default()

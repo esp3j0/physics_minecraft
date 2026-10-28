@@ -1685,20 +1685,34 @@ mod tests {
     }
 
     /// 凝固桥关闭的虚空分片(session 测试同款:不关心桥行为)。
+    ///
+    /// REQ-010 §12.1 第 3 条迁移:本模块用例按 REQ-009 及更早语义编写(悬空
+    /// SetBlock 保持原样),与默认开启的承载判定冲突 → 装配处显式关闭本开关,
+    /// 断言不变(test_config 同因,见其注释)。
     fn sim(x: i32, z: i32) -> ShardSim {
         let mut cfg = ShardSimConfig::new(shard_id(x, z));
         cfg.solidify = SolidifyConfig {
             enabled: false,
             ..SolidifyConfig::default()
         };
+        cfg.cohesion.enabled = false;
         ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
     }
 
     /// 测试配置:2 worker、checkpoint 间隔可覆写、dt 保持默认 1/60。
+    ///
+    /// REQ-010 §12.1 第 3 条迁移:本模块用例按 REQ-009 及更早语义编写(悬空
+    /// SetBlock 保持原样——外部编辑门卫、outbox 广播、持久化归属等管线断言),
+    /// 与默认开启的承载判定冲突(悬空写入会被转换塌落)→ 装配处显式关闭本
+    /// 开关,断言不变。
     fn test_config(checkpoint_interval_ticks: u64) -> Config {
         Config {
             worker_count: 2,
             checkpoint_interval_ticks,
+            cohesion: crate::config::CohesionConfig {
+                enabled: false,
+                ..crate::config::CohesionConfig::default()
+            },
             ..Config::default()
         }
     }

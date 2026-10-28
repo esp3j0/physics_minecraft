@@ -2429,6 +2429,10 @@ mod tests {
             enabled: false,
             ..SolidifyConfig::default()
         };
+        // REQ-010 §12.1 第 3 条迁移:本模块用例按 REQ-009 及更早语义编写(悬空
+        // 放置的方块保持原样——广播/持久化/遥测等管线断言),与默认开启的承载
+        // 判定冲突 → 装配处显式关闭本开关,断言不变。
+        cfg.cohesion.enabled = false;
         ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
     }
 
@@ -5301,6 +5305,9 @@ mod tests {
             let mut cfg = physics_sim::ShardSimConfig::new(shard);
             cfg.gravity = Vec3::ZERO;
             cfg.solidify.displacement_gate_m = 0.0;
+            // REQ-010 §12.1 第 3 条迁移:凝固写入的悬空格随后会被承载判定转走,
+            // 本辅助按凝固桥语义产出 Emergent → 装配处显式关闭,断言不变。
+            cfg.cohesion.enabled = false;
             ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
         };
         sim.apply_prefix(&[StampedInput {
@@ -6098,6 +6105,8 @@ mod tests {
         use voxel::WorldGenerator;
         let mut cfg = ShardSimConfig::new(shard_id(x, z));
         cfg.destruction.enabled = true;
+        // REQ-010 §12.1 第 3 条迁移:REQ-009 坍塌语义用例在装配处显式关闭承载判定,断言不变。
+        cfg.cohesion.enabled = false;
         let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
         let (bx, bz) = (x * 8, z * 8); // min_chunk
         for cx in bx + 2..=bx + 6 {

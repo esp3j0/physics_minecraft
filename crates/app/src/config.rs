@@ -146,8 +146,6 @@ impl Default for DestructionConfig {
 
 /// 粘结与整块塌落配置表 `[cohesion]`(REQ-010 §11、§12.1)。键与默认值同 `physics_sim::cohesion::CohesionConfig`;
 /// **`enabled` 自单元 08 起默认 `true`(D9)**。校验见 §12.1 第 2 条。
-///
-/// **总架构师接口桩(REQ-010 单元 08)**:结构与默认值来源已给出;校验与到 `shard_sim_config` 的映射由实施方实现。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CohesionConfig {
@@ -380,6 +378,51 @@ impl Config {
                 d.collapse_max_cells, d.collapse_max_cluster
             )));
         }
+        // 粘结与整块塌落(REQ-010 §12.1 第 2 条):`load_max_cells ≥ 1`;
+        // `compound_split_size ≥ 1` 且 `(S/2)·√3 + 1.65 ≤ margin_meters / 2`(余量按
+        // `margin_meters` 算,放行评论风险 3,不是常数 16);`max_converted_cells_per_tick ≥ S³`;
+        // `max_fractures_per_tick ≥ 1`;`compound_snap_lift ≥ 0`。
+        let c = &self.cohesion;
+        if c.load_max_cells < 1 {
+            return Err(ConfigError::Validate(format!(
+                "load_max_cells ({}) 须 ≥ 1",
+                c.load_max_cells
+            )));
+        }
+        if c.compound_split_size < 1 {
+            return Err(ConfigError::Validate(format!(
+                "compound_split_size ({}) 须 ≥ 1",
+                c.compound_split_size
+            )));
+        }
+        // 包络上界(REQ-010 §5.3):(S/2)·√3 + 1.65;S = 6 → 6.85、S = 7 → 7.71、S = 8 → 8.58。
+        let envelope = c.compound_split_size as f64 / 2.0 * 3.0f64.sqrt() + 1.65;
+        let margin_half = self.margin_meters as f64 / 2.0;
+        if envelope > margin_half {
+            return Err(ConfigError::Validate(format!(
+                "compound_split_size ({}) 的包络上界 {:.2} 超过分片余量的一半 {:.2}(margin_meters = {})",
+                c.compound_split_size, envelope, margin_half, self.margin_meters
+            )));
+        }
+        let s_cubed = (c.compound_split_size as i64).pow(3);
+        if (c.max_converted_cells_per_tick as i64) < s_cubed {
+            return Err(ConfigError::Validate(format!(
+                "max_converted_cells_per_tick ({}) 须 ≥ compound_split_size³ ({s_cubed})",
+                c.max_converted_cells_per_tick
+            )));
+        }
+        if c.max_fractures_per_tick < 1 {
+            return Err(ConfigError::Validate(format!(
+                "max_fractures_per_tick ({}) 须 ≥ 1",
+                c.max_fractures_per_tick
+            )));
+        }
+        if c.compound_snap_lift < 0 {
+            return Err(ConfigError::Validate(format!(
+                "compound_snap_lift ({}) 不得为负",
+                c.compound_snap_lift
+            )));
+        }
         Ok(())
     }
 
@@ -493,8 +536,15 @@ impl Config {
                 collapse_max_cells: self.destruction.collapse_max_cells,
                 collapse_max_cluster: self.destruction.collapse_max_cluster,
             },
-            // REQ-010 §11:`[cohesion]` 配置表由单元 08 接入;此前按默认值(关闭)。
-            cohesion: physics_sim::cohesion::CohesionConfig::default(),
+            // REQ-010 §12.1:`[cohesion]` 配置表 1:1 直传(单元 08;字段同构)。
+            cohesion: physics_sim::cohesion::CohesionConfig {
+                enabled: self.cohesion.enabled,
+                load_max_cells: self.cohesion.load_max_cells,
+                compound_split_size: self.cohesion.compound_split_size,
+                max_converted_cells_per_tick: self.cohesion.max_converted_cells_per_tick,
+                max_fractures_per_tick: self.cohesion.max_fractures_per_tick,
+                compound_snap_lift: self.cohesion.compound_snap_lift,
+            },
         }
     }
 
@@ -1128,6 +1178,129 @@ unload_radius = 64
             Config::from_toml_str(
                 "[destruction]\nmax_debris_per_explosion = 1\nmax_detach_per_tick = 1\n\
                  max_impact_breaks_per_tick = 1\ncollapse_max_cells = 8\ncollapse_max_cluster = 8\n",
+            )
+            .is_ok(),
+            "边界值合法"
+        );
+    }
+
+    /// REQ-010 §11/§12.1(单元 08):`[cohesion]` 默认值与核内同值(单元 08 起
+    /// `enabled = true`,D9);部分键其余取默认;覆写 6 键全给逐字段映射进
+    /// `shard_sim_config`;覆写实例 toml 往返无损。
+    ///
+    /// 变红:表没接进 shard_sim_config(分片仍用核内默认);映射漏字段或写成
+    /// 核内默认;部分键解析失败。
+    #[test]
+    fn cohesion_config_partial_keys_and_mapping() {
+        // 默认 = 核内默认,逐字段锚定(enabled 单元 08 起 true,D9)。
+        let d = Config::default().cohesion;
+        let core = physics_sim::cohesion::CohesionConfig::default();
+        assert!(d.enabled, "单元 08 起默认开启(D9)");
+        assert_eq!(d.load_max_cells, core.load_max_cells);
+        assert_eq!(d.compound_split_size, core.compound_split_size);
+        assert_eq!(
+            d.max_converted_cells_per_tick,
+            core.max_converted_cells_per_tick
+        );
+        assert_eq!(d.max_fractures_per_tick, core.max_fractures_per_tick);
+        assert_eq!(d.compound_snap_lift, core.compound_snap_lift);
+        assert_eq!(
+            Config::default().shard_sim_config(shard_id(0, 0)).cohesion,
+            core,
+            "默认映射 = 核内默认"
+        );
+
+        // 部分键:给了的生效,没给的取默认。
+        let partial =
+            Config::from_toml_str("[cohesion]\nload_max_cells = 100\n").expect("部分键合法");
+        assert_eq!(partial.cohesion.load_max_cells, 100, "覆写生效");
+        assert!(partial.cohesion.enabled, "未给的键取默认");
+        assert_eq!(
+            partial.cohesion.compound_split_size, core.compound_split_size,
+            "未给的键取默认"
+        );
+
+        // 覆写:6 键全给,逐字段映射进分片配置。
+        let c = Config::from_toml_str(
+            "[cohesion]\nenabled = true\nload_max_cells = 900\ncompound_split_size = 4\n\
+             max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n",
+        )
+        .expect("合法");
+        let m = c.shard_sim_config(shard_id(0, 0)).cohesion;
+        assert_eq!(
+            (
+                m.enabled,
+                m.load_max_cells,
+                m.compound_split_size,
+                m.max_converted_cells_per_tick,
+                m.max_fractures_per_tick,
+                m.compound_snap_lift
+            ),
+            (true, 900, 4, 64, 3, 1),
+            "覆写逐字段直传"
+        );
+
+        // 往返:覆写实例无损(新表真实走序列化)。
+        assert_eq!(
+            Config::from_toml_str(&c.to_toml_string()).expect("往返后仍合法"),
+            c,
+            "[cohesion] 往返不丢字段"
+        );
+    }
+
+    /// REQ-010 §12.1 第 2 条校验:`load_max_cells = 0`、`compound_split_size`
+    /// 为 0 或超出余量(默认 16 m 下 S = 8 被拒、S = 7 相容;余量按
+    /// `margin_meters` 算,margin 8 m 下 S = 6 被拒)、
+    /// `max_converted_cells_per_tick < S³`、`max_fractures_per_tick = 0`、负的
+    /// `compound_snap_lift`、未知键都被拒绝且错误信息点名键。
+    ///
+    /// 变红:漏掉某条校验(对应键不再被点名);余量改成常数 16(margin 8 时
+    /// S = 6 应拒却过)。
+    #[test]
+    fn cohesion_config_validation_rules() {
+        for (toml, key) in [
+            ("[cohesion]\nfoo = 1\n", "foo"),
+            ("[cohesion]\nload_max_cells = 0\n", "load_max_cells"),
+            (
+                "[cohesion]\ncompound_split_size = 0\n",
+                "compound_split_size",
+            ),
+            (
+                "[cohesion]\ncompound_split_size = 8\n",
+                "compound_split_size",
+            ),
+            (
+                "margin_meters = 8\n[cohesion]\ncompound_split_size = 6\n",
+                "compound_split_size",
+            ),
+            (
+                "[cohesion]\ncompound_split_size = 6\nmax_converted_cells_per_tick = 215\n",
+                "max_converted_cells_per_tick",
+            ),
+            (
+                "[cohesion]\nmax_fractures_per_tick = 0\n",
+                "max_fractures_per_tick",
+            ),
+            (
+                "[cohesion]\ncompound_snap_lift = -1\n",
+                "compound_snap_lift",
+            ),
+        ] {
+            match Config::from_toml_str(toml) {
+                Ok(_) => panic!("非法配置应被拒绝:{toml}"),
+                Err(e) => assert!(e.to_string().contains(key), "错误信息应点名 {key}:{e}"),
+            }
+        }
+        // 边界合法:S = 7 与默认余量相容((7/2)·√3 + 1.65 ≈ 7.71 ≤ 8,
+        // 1024 ≥ 343);各下限恰 1。
+        assert!(
+            Config::from_toml_str("[cohesion]\ncompound_split_size = 7\n").is_ok(),
+            "S = 7 与默认余量相容"
+        );
+        assert!(
+            Config::from_toml_str(
+                "[cohesion]\nload_max_cells = 1\ncompound_split_size = 1\n\
+                 max_converted_cells_per_tick = 1\nmax_fractures_per_tick = 1\n",
             )
             .is_ok(),
             "边界值合法"

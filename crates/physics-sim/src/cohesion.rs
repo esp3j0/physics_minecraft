@@ -29,11 +29,10 @@ const DOWN: (i32, i32, i32) = (0, -1, 0);
 const INF: u64 = u64::MAX / 4;
 
 /// 粘结与整块塌落配置(REQ-010 §11;`ShardSimConfig::cohesion`)。
-///
-/// **总架构师接口桩(REQ-010 单元 02)**:键与默认值固定。`enabled` 在单元 08 之前默认 `false`(D9 由单元 08 打开)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CohesionConfig {
-    /// 总开关(D9);与 `destruction.enabled` 同时为真才生效(§4.6),关闭时行为与 REQ-009 完全一致。
+    /// 总开关(D9,单元 08 起默认 `true`);与 `destruction.enabled` 同时为真才生效(§4.6),
+    /// 关闭时行为与 REQ-009 完全一致。
     pub enabled: bool,
     /// 单个悬挑连通块的格数上限(2048,§4.2)。
     pub load_max_cells: usize,
@@ -50,7 +49,7 @@ pub struct CohesionConfig {
 impl Default for CohesionConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             load_max_cells: 2048,
             compound_split_size: 6,
             max_converted_cells_per_tick: 1024,

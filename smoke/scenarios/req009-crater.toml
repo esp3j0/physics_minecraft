@@ -9,6 +9,12 @@ world_seed = 7
 [server.destruction]
 enabled = true
 
+# REQ-010 §12.1 第 3 条迁移:本场景按 REQ-009 语义编写(弹坑边缘的悬挑土层
+# 靠连通性挂着,截图期望按 REQ-009 的坑形态断言),默认开启的承载判定下弹坑
+# 悬挑会按承载整片塌落,形态改变 → 显式关闭本开关,断言与截图期望不变。
+[server.cohesion]
+enabled = false
+
 [[step]]
 label = "相机就位"
 camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }

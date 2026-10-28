@@ -4458,17 +4458,20 @@ mod tests {
     fn zero_g_cfg() -> ShardSimConfig {
         let mut c = ShardSimConfig::new(shard_id(0, 0));
         c.gravity = Vec3::ZERO;
+        // REQ-010 §12.1 第 3 条迁移:本模块 REQ-009 及更早语义的用例(悬空放置、
+        // 单格凝固落位)与默认开启的承载判定冲突 → 装配处显式关闭,断言不变。
+        c.cohesion.enabled = false;
         c
     }
 
     fn zero_g_sim_at(shard: ShardId) -> ShardSim {
-        ShardSim::new(
-            ShardSimConfig {
-                gravity: Vec3::ZERO,
-                ..ShardSimConfig::new(shard)
-            },
-            Box::new(voxel::SimpleRegistry::builtin()),
-        )
+        let mut cfg = ShardSimConfig {
+            gravity: Vec3::ZERO,
+            ..ShardSimConfig::new(shard)
+        };
+        // REQ-010 §12.1 第 3 条迁移:同 zero_g_cfg,REQ-009 语义用例装配处关闭。
+        cfg.cohesion.enabled = false;
+        ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
     }
 
     fn zero_g_sim() -> ShardSim {
@@ -6442,13 +6445,14 @@ mod tests {
 
     /// 零重力 + 凝固开启(判据:低速 20 拍;零重力 → 无实体支撑前提恒真)。
     fn solidify_zero_g_sim() -> ShardSim {
-        ShardSim::new(
-            ShardSimConfig {
-                gravity: Vec3::ZERO,
-                ..ShardSimConfig::new(shard_id(0, 0))
-            },
-            Box::new(voxel::SimpleRegistry::builtin()),
-        )
+        let mut cfg = ShardSimConfig {
+            gravity: Vec3::ZERO,
+            ..ShardSimConfig::new(shard_id(0, 0))
+        };
+        // REQ-010 §12.1 第 3 条迁移:凝固写入的悬空格随后会被承载判定转走,
+        // 本用例按凝固桥语义编写 → 装配处显式关闭,断言不变。
+        cfg.cohesion.enabled = false;
+        ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
     }
 
     /// 整块凝固(§8.1、§8.3 第 1、2 条):悬空静止的 6 格石梁在 slow_ticks 满 20 拍
@@ -8813,6 +8817,9 @@ mod tests {
         use voxel::WorldGenerator;
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.destruction.enabled = true;
+        // REQ-010 §12.1 第 3 条迁移:REQ-009 坍塌语义用例(连通即锚定、逐格塌落)
+        // 在装配处显式关闭承载判定,断言不变。
+        cfg.cohesion.enabled = false;
         cfg.destruction.max_detach_per_tick = cap;
         cfg.destruction.collapse_max_cells = max_cells;
         cfg.destruction.collapse_max_cluster = max_cluster;

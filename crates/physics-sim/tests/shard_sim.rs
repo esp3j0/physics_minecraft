@@ -28,6 +28,9 @@ fn sim(x: i32, z: i32) -> ShardSim {
 fn sim_no_solidify(x: i32, z: i32) -> ShardSim {
     let mut cfg = ShardSimConfig::new(shard_id(x, z));
     cfg.solidify.enabled = false;
+    // REQ-010 §12.1 第 3 条迁移:悬空 SetBlock 的旧语义用例(悬空放方块后测
+    // 实体停在其上),与默认开启的承载判定冲突 → 装配处显式关闭,断言不变。
+    cfg.cohesion.enabled = false;
     ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
 }
 

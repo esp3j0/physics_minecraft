@@ -757,12 +757,17 @@ mod tests {
     }
 
     /// 凝固桥关闭的虚空分片(调度器测试同款:不关心桥行为)。
+    ///
+    /// REQ-010 §12.1 第 3 条迁移:本模块用例按 REQ-009 及更早语义编写(悬空
+    /// 放置的方块保持原样),与默认开启的承载判定冲突 → 装配处显式关闭本
+    /// 开关,断言不变。
     fn sim(x: i32, z: i32) -> ShardSim {
         let mut cfg = ShardSimConfig::new(shard_id(x, z));
         cfg.solidify = SolidifyConfig {
             enabled: false,
             ..SolidifyConfig::default()
         };
+        cfg.cohesion.enabled = false;
         ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
     }
 
@@ -1086,6 +1091,9 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.gravity = Vec3::ZERO;
         cfg.solidify.displacement_gate_m = 0.0;
+        // REQ-010 §12.1 第 3 条迁移:凝固写入的悬空格随后会被承载判定转走,
+        // 本用例按凝固桥语义编写 → 装配处显式关闭,断言不变。
+        cfg.cohesion.enabled = false;
         let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
         let e = EntityId::from_parts(1, 1);
         sim0.apply_prefix(&[StampedInput {
@@ -2010,6 +2018,9 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard_id(x, z));
         cfg.gravity = Vec3::ZERO;
         cfg.solidify.displacement_gate_m = 0.0;
+        // REQ-010 §12.1 第 3 条迁移:凝固写入的悬空格随后会被承载判定转走,
+        // 本用例按凝固桥语义编写 → 装配处显式关闭,断言不变。
+        cfg.cohesion.enabled = false;
         ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()))
     }
 

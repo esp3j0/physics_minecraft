@@ -3335,7 +3335,6 @@ mod unit08 {
     ///
     /// 会变红的实现:只改了某一层的默认值。
     #[test]
-    #[ignore = "REQ-010 单元 08 待实施方解除"]
     fn acc_c16_default_on() {
         assert!(CohesionConfig::default().enabled);
         assert!(ShardSimConfig::new(shard()).cohesion.enabled);
@@ -3350,7 +3349,6 @@ mod unit08 {
     ///
     /// 会变红的实现:映射漏字段或写成默认值;校验缺项;余量没按 `margin_meters` 算。
     #[test]
-    #[ignore = "REQ-010 单元 08 待实施方解除"]
     fn acc_c13_cohesion_config_table() {
         let d = Config::default().cohesion;
         assert_eq!(
