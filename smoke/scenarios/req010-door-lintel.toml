@@ -73,7 +73,7 @@ wait_ticks = { n = 20 }
 check = { block = { pos = [9, -55, 14], is = "dirt" } }
 
 [[step]]
-screenshot = { name = "built", expect = "两个并排的门框:灰色石柱;前面一个的门楣是棕色土,后面一个的门楣是灰色石头,都横在两根柱子顶上" }
+screenshot = { name = "built", expect = "两个并排的门框:灰色石柱;离相机近的一个门楣是灰色石头,远的一个门楣是棕色土,都横在两根柱子顶上" }
 
 [[step]]
 label = "移走两个左柱"
@@ -89,7 +89,7 @@ wait_until = { block = { pos = [9, -55, 14], is = "air" }, timeout_ticks = 120 }
 wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "falling", expect = "前面门框的土门楣左边一长条变成一整根连在一起的蓝色横条,在原门楣高度附近下落(是一根,不是一串分开的方块);后面的灰色石门楣仍横挂在右侧石柱上,左端悬空" }
+screenshot = { name = "falling", expect = "远处门框的土门楣左边一长条变成一整根连在一起的蓝色横条,在原门楣高度附近下落(是一根,不是一串分开的方块);近处的灰色石门楣仍横挂在右侧石柱上,左端悬空" }
 
 [[step]]
 wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
@@ -110,4 +110,4 @@ check = { block = { pos = [6, -55, 14], is = "air" } }
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "settled", expect = "后面的灰色石门楣仍完整地横在石柱顶上(左端悬空);前面门框只剩右柱顶上一格棕色土,原来门楣的位置空了,地面上散落着一些棕色土块;空中没有蓝色立方体" }
+screenshot = { name = "settled", expect = "近处的灰色石门楣仍完整地横在石柱顶上(左端悬空);远处门框只剩右柱顶上一格棕色土,原来门楣的位置空了,地面上散落着一些棕色土块;空中没有蓝色立方体" }

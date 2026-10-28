@@ -6,6 +6,12 @@ timeout_secs = 240
 [server]
 world_seed = 7
 
+# REQ-010 §12.1 第 3 条迁移(终审追加):本场景按 REQ-007 语义编写(飞回落定后
+# 空中无蓝色立方体)。默认开启的承载判定会把落定回填中的悬空格再次转成实体
+# (2026-10-28 实测 return 截图时刻 live_entities = 1)→ 显式关闭本开关。
+[server.cohesion]
+enabled = false
+
 [[step]]
 label = "就位"
 camera = { pos = [8.0, -50.0, 30.0], yaw = -90.0, pitch = -20.0 }
