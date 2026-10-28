@@ -379,32 +379,36 @@ fn save_screenshot(request: &ScreenshotRequest, out: &Path) {
     macroquad::prelude::get_screen_data().export_png(&path.display().to_string());
 }
 
-/// 把引擎命令转发给服务器(Spawn → control.spawn;Detonate/SetBlock → control.command)。
+/// 把引擎命令转发给服务器:同帧命令打成**一条 Batch 消息**(REQ-010 终审
+/// 返修 1——一次 fill 的逐格 SetBlock 是一次原子编辑,单条消息入队、单次
+/// TCP 写发出;Spawn 逐条不混批,服务端分配 ID 的回执语义按条对应)。
 fn forward_commands(commands: &[EngineCommand], control: &crate::client::ControlHandle) {
+    let mut batch: Vec<SimCommand> = Vec::new();
     for command in commands {
         match command {
             EngineCommand::Spawn { state } => {
+                // 批内若有 Spawn:先把已积累的批发出(保序),Spawn 单发。
+                if !batch.is_empty() {
+                    control.command_batch(std::mem::take(&mut batch));
+                }
                 control.spawn(*state, EntityDesc::default());
             }
             EngineCommand::Detonate {
                 center,
                 power,
                 radius,
-            } => {
-                control.command(SimCommand::Detonate {
-                    center: *center,
-                    power: *power,
-                    radius: *radius,
-                });
-            }
-            EngineCommand::SetBlock { pos, block } => {
-                control.command(SimCommand::SetBlock {
-                    pos: *pos,
-                    block: *block,
-                });
-            }
+            } => batch.push(SimCommand::Detonate {
+                center: *center,
+                power: *power,
+                radius: *radius,
+            }),
+            EngineCommand::SetBlock { pos, block } => batch.push(SimCommand::SetBlock {
+                pos: *pos,
+                block: *block,
+            }),
         }
     }
+    control.command_batch(batch);
 }
 
 /// 脚本模式观察者上报:耦合开启时,相机较上次上报变化超过 1 m 立即上报,

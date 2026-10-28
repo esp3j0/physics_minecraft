@@ -1096,7 +1096,34 @@ impl ShardSim {
                     let ang_err = solidify::snap_angle_error(state.rotation, snapped);
                     let too_far =
                         disp > cfg.max_snap_blocks || ang_err > cfg.max_snap_angle_deg.to_radians();
-                    if !too_far || is_sleeping {
+                    // 凝固落点须有支撑邻接(REQ-010 终审返修 1,**仅在承载判定
+                    // 开启时**):目标格 6 邻中至少一个实心格(未装载 chunk 与
+                    // 世界底按有地基,同接地口径)。悬浮在坑/洞上的落点(正下方
+                    // 是尚未凝固的活实体,体素视角为空气)写入后立即被承载判定
+                    // 判悬空、转回实体——实体落下砸到下面实体又重置其凝固门控,
+                    // 凝固↔塌落振荡不收敛(碎块弹上门楣场景 15/15 复现);这种
+                    // 落点等实体层稳定后再写。承载判定关闭时保持无条件凝固
+                    // (REQ-006/008"真静止即凝固"语义逐位不变,零重力空世界用例
+                    // `removed_reported_on_solidify_and_removal` 仍成立)。
+                    let has_support_neighbor = (0..6).any(|i| {
+                        let (dx, dy, dz) = [
+                            (1, 0, 0),
+                            (-1, 0, 0),
+                            (0, 1, 0),
+                            (0, -1, 0),
+                            (0, 0, 1),
+                            (0, 0, -1),
+                        ][i];
+                        let q = BlockPos::new(cell.x + dx, cell.y + dy, cell.z + dz);
+                        if q.y < types::WORLD_Y_MIN {
+                            return true; // 世界底:有地基
+                        }
+                        match self.voxels.get_chunk(q.chunk_of()) {
+                            None => true, // 未装载:看不见的地方当作有地基
+                            Some(_) => self.registry.material(self.voxels.get_block(q)).is_some(),
+                        }
+                    });
+                    if (!too_far || is_sleeping) && (!self.load_enabled() || has_support_neighbor) {
                         // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
                         let old_block = self.voxels.get_block(cell);
                         if self.voxels.set_block(cell, desc.block).is_ok() {

@@ -1152,6 +1152,9 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard);
         cfg.gravity = Vec3::ZERO;
         cfg.solidify.displacement_gate_m = 0.0;
+        // REQ-010 §12.1 第 3 条迁移:凝固写入的悬空格随后会被承载判定转走,
+        // 本用例按凝固桥语义编写 → 装配处显式关闭,断言不变。
+        cfg.cohesion.enabled = false;
         let mut sim0 = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
         let e = EntityId::from_parts(1, 1);
         sim0.apply_prefix(&[StampedInput {

@@ -64,6 +64,13 @@ pub(crate) enum Control {
     /// 白名单命令(引爆等;连接循环发 `C2S::Command`,翻译层在服务器侧)。
     /// ACV4 ③④ 的交互入口(评审后补,Refs #6)。
     Command(messaging::SimCommand),
+    /// 同帧命令批(REQ-010 终审返修 1):脚本引擎一帧产出的一组命令(一次
+    /// fill 的逐格 SetBlock 展开)是**一次原子编辑**——通道一条消息即天然的
+    /// 批边界,连接循环一次 `write_all` 发出,服务器同一轮 read 收全、同一拍
+    /// 落地。拆成多条 Command 会在桥线程搬运与 socket 写之间被打断,批裂开
+    /// 后中间拍看到半个结构,承载判定对不完整视图求值误判塌落(door-lintel
+    /// 石门楣间歇性塌落的根因之一)。
+    Batch(Vec<messaging::SimCommand>),
     /// 外部生成请求(连接循环发 `C2S::Spawn`;服务端分配 ID 并回
     /// [`ViewEvent::Spawned`])。
     Spawn {
@@ -92,6 +99,14 @@ impl ControlHandle {
     /// 发白名单命令(引爆;ACV4 ③④ 交互入口)。
     pub fn command(&self, command: messaging::SimCommand) {
         let _ = self.tx.try_send(Control::Command(command));
+    }
+
+    /// 发同帧命令批(REQ-010 终审返修 1):一次 fill 的逐格 SetBlock 是一次
+    /// 原子编辑,须单条消息入队、单次 TCP 写发出。空批不占通道。
+    pub fn command_batch(&self, commands: Vec<messaging::SimCommand>) {
+        if !commands.is_empty() {
+            let _ = self.tx.try_send(Control::Batch(commands));
+        }
     }
 
     /// 发外部生成请求(REQ-006 任务 02:服务端分配 ID,客户端不选 ID)。
@@ -291,6 +306,19 @@ async fn run_connection(
                 Some(Control::Command(command)) => {
                     let frame = encode_c2s_frame(&C2S::Command(command));
                     if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
+                Some(Control::Batch(commands)) => {
+                    // 同帧命令批一次写(REQ-010 终审返修 1):Batch 消息在
+                    // 生产侧(forward_commands)组装,一条消息 = 一次原子
+                    // 编辑;这里拼帧后单次 `write_all`,服务器一轮 read 收全、
+                    // 驱动同一轮 try_recv 排空盖同一 apply_at,不会跨拍。
+                    let mut batch: Vec<u8> = Vec::with_capacity(commands.len() * 16);
+                    for command in &commands {
+                        batch.extend_from_slice(&encode_c2s_frame(&C2S::Command(command.clone())));
+                    }
+                    if write_all(&mut stream, &batch).await.is_err() {
                         break 'read;
                     }
                 }
