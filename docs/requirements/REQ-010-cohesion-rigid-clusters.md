@@ -1,6 +1,7 @@
 # REQ-010:方块粘结与整块塌落——粘结强度、承载判定、悬空结构作为一个复合实体下落与碎裂
 
-- 状态:**已定稿**(2026-10-26 用户拍板 D1–D9 全部按推荐;同日修订 1 按 demo 回写默认值与条文:承载能力速算 §4.5、
+- 状态:**已完成**(2026-10-28 总架构师终审通过——含终审返修 1,见文末迁移清单;以下为定稿与修订记录:
+  2026-10-26 用户拍板 D1–D9 全部按推荐;同日修订 1 按 demo 回写默认值与条文:承载能力速算 §4.5、
   碎裂改为均摊冲量并豁免压向粘结 §7.1、复合体砸地形同口径 §5.3、跨分片收到邻片承载转换时求两次取并集 §9,见文末 demo 记录;
   同日修订 2 补齐单元 02 的接入细则 §4.6:接地按柱记忆化、触发口径、待转换队列、承载转换标记、配置与遥测、checkpoint v7;
   2026-10-27 修订 3 补齐单元 03 的形状细则 §5.4,并把单元 03 拆成 03a/03b;同日修订 4 补齐单元 03b 的协议与 viewer 细则 §10;同日修订 5 补齐单元 04 的按段转换细则 §5.5;同日修订 6 补齐单元 05 的凝固、散开与强制落地细则 §8.3;同日修订 7 补齐单元 06 的碎裂与砸地形细则 §7.3;同日修订 8 补齐单元 07 的爆炸细则 §6.1;同日修订 9 补齐单元 08 的默认开启、配置校验与迁移细则 §12.1)
@@ -618,6 +619,59 @@ F 的性质(验收依据):
 
 ## 迁移清单(阶段 3 填写)
 
-- [ ] 验收标准逐条落成测试
-- [ ] `cargo test --workspace` / clippy / fmt 全绿
-- [ ] 图形冒烟场景经 `cargo xtask smoke` 机器检查全部通过,报告经总架构师复核
+- [x] 验收标准逐条落成测试:57 条(e2e `crates/e2e/tests/req010_acceptance.rs` 53 条、
+  viewer `crates/viewer/tests/req010_acceptance.rs` 3 条、跨需求前向兼容
+  `crates/e2e/tests/network.rs` 1 条,记入 §18 之外的 REQ-011 预留),对应关系:
+
+  | AC | 用例 |
+  | --- | --- |
+  | AC-C1 材料对粘结 | `acc_c1_builtin_bonds`、`acc_c1_pairwise_min`(u01) |
+  | AC-C2 承载求值 | u01 12 条:`acc_c2_grounded_scan`、`acc_c2_door_lintel`、`acc_c2_cantilever_limit_equals_bond`、`acc_c2_tbeam_and_two_end_beam`、`acc_c2_arch`、`acc_c2_weight_and_tower`、`acc_c2_sand`、`acc_c2_point_supported_platform_collapses`、`acc_c2_rooms_and_tunnels`、`acc_c2_budget_unloaded_and_crater`、`acc_c2_infinite_bonds_match_find_collapse`、`acc_c2_random_structures_match_reference`;u02 4 条:`acc_c2_door_lintel_end_to_end`、`acc_c2_placement_and_replacement_trigger`、`acc_c2_solidify_triggers_load_check`、`acc_c2_pending_conversions_survive_without_reevaluation` |
+  | AC-C3 分组与切块 | `acc_c3_split_segments`、`acc_c3_platform_segments_bounded`、`acc_c3_origin_and_radius`(u01) |
+  | AC-C4 形状与整块转换 | `acc_c4_shape_canonical_and_radius`(u03a);`acc_c4_door_lintel_falls_as_one_compound`、`acc_c4_bridge_splits_into_grid_segments`、`acc_c4_sand_stays_single_and_ids_interleave`、`acc_c4_segment_quota_is_atomic`(u04) |
+  | AC-C5 悬空复合体 | `acc_c5_compound_bridges_trench`(u03a)、`acc_c5_compound_terrain_impact_averaged`(u06) |
+  | AC-C6 碎裂 | `acc_c6_fracture_bond_rules`、`acc_c6_fracture_components_rules`、`acc_c6_fracture_pieces_rules`、`acc_c6_stone_beam_flat_5m_stays_whole`、`acc_c6_dirt_beam_flat_8m_shatters`、`acc_c6_corner_first_stone_beam_breaks`(u06) |
+  | AC-C7 整块凝固与散开 | `acc_c7_compound_snap_rules`、`acc_c7_compounds_solidify_whole`、`acc_c7_tilted_compound_scatters`、`acc_c7_compound_solidify_triggers_load_check`(u05) |
+  | AC-C8 强制落地 | `acc_c8_compound_forced_landing_rules`(u05) |
+  | AC-C9 爆炸 | `acc_c9_compound_blast_rules`、`acc_c9_blast_breaks_compound_into_pieces`、`acc_c9_blast_spins_intact_compound`(u07) |
+  | AC-C10 触发与迁移 | `acc_c10_neighbor_conversion_evaluated_before_and_after`、`acc_c10_after_write_evaluation_still_needed`、`acc_c10_cross_shard_lintel_end_to_end`(u02)、`acc_c10_compound_migrates_with_shape`(u03a) |
+  | AC-C11 醒体预算 | `acc_c11_awake_budget_counts_cells`(u04) |
+  | AC-C12 checkpoint v7 | `acc_c12_checkpoint_version_is_v7`(u02)、`acc_c12_compound_snapshot_replay`(u03a)、`acc_c12_compound_request_survives_snapshot`(u04) |
+  | AC-C13 配置表 | `acc_c13_cohesion_config_table`(u08) |
+  | AC-C14 协议与 viewer | viewer `acc_c14_shapes_event_mapping`、`acc_c14_cube_centers_rotate_offsets`、`acc_c14_world_state_tracks_shapes`(u03b) |
+  | AC-C15 图形冒烟 | `req010-beam-whole`、`req010-cantilever`、`req010-door-lintel`、`req010-shatter` 四场景机器检查 + AI 审图(见下) |
+  | AC-C16 开关 | `acc_c16_switches`(u02)、`acc_c16_default_on`(u08) |
+  | 跨需求(REQ-011 预留) | network `acn7_compound_shape_precedes_states` |
+
+- [x] `cargo test --workspace` / clippy / fmt 全绿(单元 08 [d0dcfb5](https://github.com/esp3j0/physics_minecraft/commit/d0dcfb5)
+  CI [40629582931](https://github.com/esp3j0/physics_minecraft/actions/runs/40629582931);终审返修 1 后
+  [022326f](https://github.com/esp3j0/physics_minecraft/commit/022326f) 本机 `--no-fail-fast`
+  950 通过 / 0 失败、clippy 0 警告、fmt 干净,CI
+  [40734641811](https://github.com/esp3j0/physics_minecraft/actions/runs/40734641811) 全绿)
+- [x] §12.1 第 3 条迁移共 15 处:测试装配处 11(`d0dcfb5` 10 处 + 返修 1 补
+  `sim-api` session `solidified_survives_via_session`,断言均零改动)+ 冒烟场景 4
+  (`req009-bedrock/bridge-collapse/crater` 按旧语义关闭、`req007-explode-fly-away`
+  终审追加关闭,复跑 return 截图 live=0);req010 自有 4 场景显式 `enabled = true`
+  钉住默认开启
+- [x] 图形冒烟场景经 `cargo xtask smoke` 机器检查全部通过,报告经总架构师复核
+  (2026-10-27 总架构师本机 `--no-ai` 全套 11 场景复跑与实施方两轮一致,
+  run 20261028-052713,AI 审图校准 5/5 判对;终审返修 1 后 2026-10-28 复跑
+  run 20261028-171536 全绿 + 补审 8 张——见下"终审返修 1")
+
+### 终审返修 1(2026-10-28,[issuecomment-6467855956](https://github.com/esp3j0/physics_minecraft/issues/19#issuecomment-6467855956) → [issuecomment-6475735767](https://github.com/esp3j0/physics_minecraft/issues/19#issuecomment-6475735767),提交 [022326f](https://github.com/esp3j0/physics_minecraft/commit/022326f))
+
+独立复跑发现 `req010-door-lintel` 石门楣(悬臂 6 ≤ B(石)=8,§4.2–4.3 上永不塌)
+间歇塌落(5/15),违反"F 为世界状态的纯函数、与写入顺序无关"。两路根因与修复:
+
+1. **同帧命令拆写**(协议层):viewer 一帧 fill 展开的逐格 SetBlock 旧实现逐条 TCP 写,
+   服务器分拍应用 → 中间拍出现 10 格悬空簇(需求 10 > 单边粘结 8)被误判整簇塌落。
+   修复:`Control::Batch` 单消息单写,服务器一轮 read 收全、驱动同轮 `try_recv`
+   排空盖同一 `apply_at`;
+2. **凝固落点悬空**(单格凝固路径):碎块弹上门楣后落点正下方是活实体(体素视角
+   空气),写入即被承载判定转回实体 → 凝固↔塌落振荡。修复:凝固落点须 6 邻之一
+   实心,且仅在 `load_enabled()` 时生效——承载判定关闭时保持 REQ-006/008
+   "真静止即凝固"语义逐位不变。
+
+验收:A=错拍探针 10/10、B=door-lintel 15/15、C=全量绿(数字见上);探针场景
+`tmp-probe-*` 验收后删除。返修由 GLM 起草、两次派发会话因系统内存不足被收割后,
+经用户批准由总架构师接手收尾(分工破坏已在 issue 声明)。
