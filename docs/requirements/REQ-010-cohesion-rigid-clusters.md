@@ -499,7 +499,12 @@ F 的性质(验收依据):
 3. **`req010-cantilever`**(承载上限):同一面石墙伸出两根石悬臂,长 6 格与 12 格,末端各有一根临时支柱;移走两根
    支柱 → 等待 → `check`:6 格的悬臂仍在;12 格的悬臂从根部断下(按切块落成两到三段,石材平落不碎);截图对照;
 4. **`req010-shatter`**(碎裂):离地 ≥ 8 m 的土平台失去支撑,平落后碎成多块(§3.2:土 5 m 平落即碎)→ 截图(期望:地面上散落若干土块,
-   不是一整块);`check`:`live_entities eq 0`、`no_floating`。
+   不是一整块);`check`:`live_entities eq 0`、`no_floating`;
+5. **`req010-impact-corner`**(终审后补充,2026-10-29 用户追加;REQ-009 撞击破坏 + REQ-010 承载整段转换端到端):石门框去掉左柱成
+   7 字悬臂;一颗带初速的方块撞上门楣-柱顶拐角接缝 → 截图"impact"(期望:拐角缺格、蓝色碎块)→ 截图"bar-falling"(期望:剩余
+   三格门楣作为一根一字复合条整段掉落)→ 落定后 `check`:门楣三格 air(承载判定接管,只有拐角真被撞断才可能发生)、柱底 stone
+   (地上插着一小半)、`no_floating`。`compound_split_size = 4` 使残段整段成一根条(默认 2 会按世界网格切成 2+1);撞击碎块
+   零初速(§5 修订 8)落回柱顶重凝固,终态不钉柱顶两格。
 
 ## 14. 非目标
 
@@ -639,7 +644,7 @@ F 的性质(验收依据):
   | AC-C12 checkpoint v7 | `acc_c12_checkpoint_version_is_v7`(u02)、`acc_c12_compound_snapshot_replay`(u03a)、`acc_c12_compound_request_survives_snapshot`(u04) |
   | AC-C13 配置表 | `acc_c13_cohesion_config_table`(u08) |
   | AC-C14 协议与 viewer | viewer `acc_c14_shapes_event_mapping`、`acc_c14_cube_centers_rotate_offsets`、`acc_c14_world_state_tracks_shapes`(u03b) |
-  | AC-C15 图形冒烟 | `req010-beam-whole`、`req010-cantilever`、`req010-door-lintel`、`req010-shatter` 四场景机器检查 + AI 审图(见下) |
+  | AC-C15 图形冒烟 | `req010-beam-whole`、`req010-cantilever`、`req010-door-lintel`、`req010-shatter`、`req010-impact-corner` 五场景机器检查 + AI 审图(见下) |
   | AC-C16 开关 | `acc_c16_switches`(u02)、`acc_c16_default_on`(u08) |
   | 跨需求(REQ-011 预留) | network `acn7_compound_shape_precedes_states` |
 
@@ -675,3 +680,18 @@ F 的性质(验收依据):
 验收:A=错拍探针 10/10、B=door-lintel 15/15、C=全量绿(数字见上);探针场景
 `tmp-probe-*` 验收后删除。返修由 GLM 起草、两次派发会话因系统内存不足被收割后,
 经用户批准由总架构师接手收尾(分工破坏已在 issue 声明)。
+
+### 终审后补充场景(2026-10-29,用户追加,`req010-impact-corner`)
+
+用户追加"7 字悬臂被方块撞拐角"图形冒烟(§13 第 5 条),覆盖 REQ-009 撞击破坏
+与 REQ-010 承载整段转换的端到端串联:拐角两格被撞碎(碎块零初速竖直落下,§5
+修订 8)→ 剩余三格门楣失去地基,同拍承载判定接管,按 `compound_split_size = 4`
+整段转成一根一字复合条掉落、落地凝固;柱底残留一格站立,撞击碎块落回柱顶重新
+凝固。总架构师编写并本机验收:机器检查通过(run 20261029-093919,viewer 退出码
+0、服务器无 panic),AI 审图校准 5/5 判对、4 张截图全部通过(置信度 0.78–0.85,
+0 张待复核)。调参记录(REQ-009 §5 撞击采样的已知几何特性,非缺陷):1 格立方
+齐平侧撞 1 格面时,接触流形地形侧角点 floor() 落入相邻空气格,约 3/4 冲量分配
+不进实心格(实测 J≈39.2 → 石格仅 9.3 < I(石)=18,不破坏、干净弹开);场景
+spawn 以 z 错半格、瞄两行实心接缝、v=40(单格份额 ≈ J/4 ≥ 18)规避。该退化工况
+只出现在投射物中心与被撞行列完全对齐的纯侧撞;平落不受影响(ε 穿透使角点落在
+面下方)。

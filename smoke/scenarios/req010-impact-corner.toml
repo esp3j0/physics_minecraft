@@ -1,0 +1,99 @@
+name = "req010-impact-corner"
+req = "REQ-010"
+description = "石门框去掉左柱成 7 字形悬臂;一颗带初速的方块撞上门楣-柱顶拐角接缝:拐角两格被撞碎(碎块竖直落下,§5 修订 8 零初速),石柱底部残留一格站立,剩余三格门楣失去地基,作为一根一字复合刚体整段掉落、落地凝固"
+timeout_secs = 240
+
+[server]
+world_seed = 11
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+# 门楣残段 3 格整段成一根复合条(默认 2 会按世界网格切成 2 格条 + 1 格碎块)。
+compound_split_size = 4
+
+[[step]]
+label = "相机就位"
+camera = { pos = [9.0, -52.0, 36.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [7.0, -58.0, 17.0] }
+
+[[step]]
+wait_until = { block = { pos = [9, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "两根石柱(y=-60..-59)与石门楣(y=-58,x=5..8)"
+fill = { from = [5, -60, 20], to = [5, -59, 20], block = "stone" }
+
+[[step]]
+fill = { from = [8, -60, 20], to = [8, -59, 20], block = "stone" }
+
+[[step]]
+fill = { from = [5, -58, 20], to = [8, -58, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [5, -58, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+label = "去掉左柱 → 7 字形(悬臂 3 ≤ B(石)=8,挂得住)"
+fill = { from = [5, -60, 20], to = [5, -59, 20], block = "air" }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+check = { block = { pos = [5, -58, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [8, -59, 20], is = "stone" } }
+
+[[step]]
+screenshot = { name = "seven-shape", expect = "一个 7 字形石结构:右侧一根两格高石柱站在地上,柱顶向左横伸出一根四格长石门楣,门楣左端悬空;空中没有蓝色立方体" }
+
+[[step]]
+label = "发射方块撞门楣-柱顶拐角接缝(瞄准跨 (8,-58) 与 (8,-59) 两行石头,避开 1 格齐平取样的格界对齐)"
+spawn = { at = [14.0, -57.4, 20.2], count = 1, velocity = [-40.0, -7.0, 0.0], label = "projectile" }
+
+[[step]]
+wait_ticks = { n = 10 }
+
+[[step]]
+screenshot = { name = "impact", expect = "蓝色投射物方块已到达或正飞向 7 字形结构的右端拐角;若已撞击,拐角(门楣右端与柱顶交接处)缺了至少一格,附近空中有一个或几个蓝色碎块方块;石柱仍在地上立着" }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "bar-falling", expect = "一根蓝色一字横条(剩余门楣转成的三格复合刚体)在原门楣高度下方下落(也可能已落到地面);拐角附近可能有一个或两个蓝色碎块方块(被撞落的拐角格,竖直下落或被弹开的投射物推开);石柱底部仍立在原位" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1200 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+label = "剩余门楣格已整段转走(承载判定接管;只有拐角被撞断才可能发生)"
+check = { block = { pos = [5, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [6, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [7, -58, 20], is = "air" } }
+
+[[step]]
+label = "石柱底部残留仍站立(地上插着一小半)"
+check = { block = { pos = [8, -60, 20], is = "stone" } }
+
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, -60, 20], is = "stone" } }
+
+[[step]]
+screenshot = { name = "settled", expect = "石柱底部一格立在原地(被撞落的拐角碎块可能落回柱顶重新凝固,也可能被弹开的投射物推落到近旁地面);原门楣三格已变成一根凝固的灰色一字横条躺在门楣原位置下方的地面上;发射方块凝固在结构右旁地面;空中没有蓝色立方体" }
