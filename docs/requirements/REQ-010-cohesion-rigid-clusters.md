@@ -298,7 +298,10 @@ F 的性质(验收依据):
    单点以保真力矩),全部施加后读回 linvel/angvel,按 `load_knockback_max_speed` / `load_knockback_max_ang_speed`
    clamp 后写回。1 格的段(单格碎块)与撞击碎块**维持 REQ-009 §5 修订 8 零冲量,逐位不变**;
 4. **配置**(§11 表同步):`load_knockback_factor`(β,初值 0.5;= 0 即关闭本特性)、`load_knockback_max_speed`
-   (v_max,初值 8.0 m/s)、`load_knockback_max_ang_speed`(ω_max,初值 6.0 rad/s);校验三者 ≥ 0;默认值以
+   (v_max,初值 8.0 m/s)、`load_knockback_max_ang_speed`(ω_max,初值 6.0 rad/s);校验三者 ≥ 0;**v_max / ω_max
+   取 0 语义 = 钉死为零**(击退速度/角速度完全抑制;0 不是"不设限"的哨兵,不设限用足够大的数值表达——
+   否则配 0 想关击退的人会得到无界飞散,裁定 2026-10-30)——K02 曾按"≤ 0 不设限"交付(本语义当时未规定,
+   属实现自行填充),单元 K03 改正并补测试;默认值以
    `req010-impact-corner` 为基准标定("明显位移与翻滚、落地后仍可辨认,或按标定接受散开"),单元 K03 提交标定
    记录,终审定值;
 5. **落地语义**:C7 现有"snap 容差内贴格凝固 / 超容差散开(§8.1)"原样适用,不为旋转新增规则;
@@ -313,7 +316,9 @@ F 的性质(验收依据):
    |v| ≤ v_max、|ω| ≤ ω_max;K2 无撞击来源(移柱/爆炸)的转换 linvel = angvel = 0(回归);K3 撞击碎块与
    单格转换脱落冲量仍为零(修订 8 逐位不变);K4 三键解析/校验、factor = 0 时与现状逐位一致;K5 共线撞击
    (撞击格与质心同轴)angvel ≈ 0、偏轴撞击 angvel ≠ 0(验证 Δω 确来自 r×J);K6 小惯性大冲量工况 clamp
-   生效;K7 impact-corner 双跑逐拍一致;K8 impact-corner 期望改写后机器检查 + AI 审图通过,burst 连拍可见
+   生效,K6 补(K03):v_max / ω_max = 0 时施加后 linvel / angvel 钉零(裁定语义的行为锚);K7 impact-corner
+   双跑逐拍一致;另 K03 补(K02 迁移遗留):SpawnCompound 生成初态显式断言——平移 = 原点格中心、旋转 =
+   单位四元数(原由调度器侧测试 incidental 钉住,状态构造挪到 sim 消费臂后失锚);K8 impact-corner 期望改写后机器检查 + AI 审图通过,burst 连拍可见
    水平漂移与翻滚;K9 门禁三连 + 全量冒烟回归。
 
 ## 6. 爆炸对复合体(D6)
