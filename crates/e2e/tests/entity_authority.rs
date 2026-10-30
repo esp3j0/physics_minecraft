@@ -300,3 +300,34 @@ fn ace3_spawn_owned_rejects_duplicate_and_wrong_shard() {
     ));
     session.shutdown();
 }
+
+/// REQ-010 §5.6(K02):SpawnCompound 是调度器专用生成命令,外部缝一律拒绝
+/// (commands 通道 hostil 来源与网络玩家同拒;防御层与 net::command_shard 同口径)。
+#[test]
+fn k02_spawn_compound_rejected_on_external_path() {
+    let mut session = Session::new(session_cfg());
+    session.register(sim(0, 0));
+    let shape = types::CompoundShape::from_world(
+        types::BlockPos::new(1, 2, 3),
+        &[
+            (types::BlockPos::new(1, 2, 3), voxel::builtin::STONE),
+            (types::BlockPos::new(2, 2, 3), voxel::builtin::STONE),
+        ],
+    )
+    .expect("两格形状");
+    let cmd = SimCommand::SpawnCompound {
+        entity: EntityId::from_parts(0, 1),
+        origin: types::BlockPos::new(1, 2, 3),
+        shape,
+        impulses: Vec::new(),
+    };
+    assert!(
+        validate_external_command(&session, Some(InputSource(7)), shard_id(0, 0), &cmd).is_err(),
+        "网络玩家来源 → 拒绝"
+    );
+    assert!(
+        validate_external_command(&session, None, shard_id(0, 0), &cmd).is_err(),
+        "commands 通道(本地权威)→ 同拒(SpawnCompound 无内部投递路径)"
+    );
+    session.shutdown();
+}

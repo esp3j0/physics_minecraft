@@ -181,11 +181,14 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
 ///   计数,不投模拟:hostile 输入不得触发 fail-stop panic,评审修复①)。
 /// - `SpawnDynamic` → `None`(REQ-006 任务 02:外部只能用 `C2S::Spawn`，
 ///   由服务端分配 ID;内部/测试仍可直用 SimCommand);
+/// - `SpawnCompound` → `None`(K02 §5.6:调度器专用内部命令——生成请求从
+///   模拟产出再注入,外部不可伪造;同 SpawnDynamic 口径拒绝);
 /// - `MarkActor`/`SetObserverPosition` → `None`(非白名单,README 决策 1)。
 pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
     let shard_pos = match command {
         SimCommand::SetBlock { pos, .. } => pos.chunk_of().shard_of(),
         SimCommand::SpawnDynamic { .. } => return None,
+        SimCommand::SpawnCompound { .. } => return None,
         SimCommand::Detonate { center, .. } => point_shard_of(*center),
         SimCommand::RemoveEntity { entity } | SimCommand::TeleportEntity { entity, .. } => {
             // origin 是分片的 u32 序号(注册表分配),不是 x/z 坐标——没有
@@ -1491,6 +1494,46 @@ pub(crate) mod tests {
                 TranslateOutcome::Reject(_)
             ),
             "外部 SpawnDynamic → Reject"
+        );
+        // SpawnCompound(K02 §5.6)同口径:调度器专用生成命令,外部不可伪造。
+        assert_eq!(
+            command_shard(&SimCommand::SpawnCompound {
+                entity: EntityId::from_parts(1, 1),
+                origin: BlockPos::new(1, 2, 3),
+                shape: types::CompoundShape::from_world(
+                    BlockPos::new(1, 2, 3),
+                    &[
+                        (BlockPos::new(1, 2, 3), voxel::builtin::STONE),
+                        (BlockPos::new(2, 2, 3), voxel::builtin::STONE),
+                    ],
+                )
+                .expect("两格形状"),
+                impulses: Vec::new(),
+            }),
+            None,
+            "SpawnCompound 无路由(白名单外)"
+        );
+        assert!(
+            matches!(
+                translate(
+                    InputSource(1),
+                    C2S::Command(SimCommand::SpawnCompound {
+                        entity: EntityId::from_parts(1, 1),
+                        origin: BlockPos::new(1, 2, 3),
+                        shape: types::CompoundShape::from_world(
+                            BlockPos::new(1, 2, 3),
+                            &[
+                                (BlockPos::new(1, 2, 3), voxel::builtin::STONE),
+                                (BlockPos::new(2, 2, 3), voxel::builtin::STONE),
+                            ],
+                        )
+                        .expect("两格形状"),
+                        impulses: Vec::new(),
+                    })
+                ),
+                TranslateOutcome::Reject(_)
+            ),
+            "外部 SpawnCompound → Reject"
         );
         // 非白名单:MarkActor、SetObserverPosition(观察者走 MoveObserver 专用包)。
         assert!(

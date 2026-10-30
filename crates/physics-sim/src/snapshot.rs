@@ -245,6 +245,8 @@ impl ShardSim {
             load_conversion_records: BTreeMap::new(),
             // 撞击接近速度基准不入快照(拍内表,两拍之间必为空)。
             pre_impulse_vels: BTreeMap::new(),
+            // 撞击冲量表不入快照(K02 §5.6 第 1 条;拍内表,两拍之间必为空)。
+            impact_impulses: BTreeMap::new(),
         })
     }
 }

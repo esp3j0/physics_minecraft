@@ -203,6 +203,10 @@ impl ShardSim {
             .into_iter()
             .collect();
         let records = std::mem::take(&mut self.load_conversion_records);
+        // 冲量表(K02 §5.6 第 1 条):本拍撞击路径的带冲量触发格,取走即清——
+        // 每拍重建/清空,不跨拍残留;只有撞击路径写入(evaluate_impacts),
+        // 爆炸/放置等其余来源不带。本拍采样、本拍转换,同拍生效。
+        let impact_impulses = std::mem::take(&mut self.impact_impulses);
         let min = self.cfg.shard.pos.min_chunk().block_min();
         let max_x = min.x + SHARD_CHUNKS * CHUNK_SIZE;
         let max_z = min.z + SHARD_CHUNKS * CHUNK_SIZE;
@@ -332,6 +336,16 @@ impl ShardSim {
                     segment.iter().map(|&c| (c, solid_blocks[&c])).collect();
                 let shape = types::CompoundShape::from_world(origin, &world)
                     .expect("段内 ≥ 2 格、偏移不重复(划分保证)");
+                // 邻接继承(K02 §5.6 第 2 条):段内存在格与本拍带冲量触发格
+                // 6 邻邻接 ⟺ 继承;对每段,取其邻接的去重后每个带冲量触发格,
+                // 生成一条 (β·J, 触发格中心)(β 构造时乘入);不做经空气的
+                // 远距传播;多个失载段各继承全额(逐段独立调用)。无撞击来源
+                // 的拍冲量表为空 → impulses 恒空,零速不变(AC-K2)。
+                let impulses = crate::cohesion::inherit_impulses(
+                    &segment,
+                    &impact_impulses,
+                    self.cfg.cohesion.load_knockback_factor,
+                );
                 for &cell in &segment {
                     self.convert_load_cell(cell, &mut dirty);
                 }
@@ -343,9 +357,7 @@ impl ShardSim {
                     .push(crate::cohesion::CompoundRequest {
                         origin,
                         shape,
-                        // §5.6 第 1 条:只有撞击路径的写入带冲量;移柱等承载转换
-                        // 默认空(K02 接邻接继承)。
-                        impulses: Vec::new(),
+                        impulses,
                     });
             }
             for &cell in &segment {

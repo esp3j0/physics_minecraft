@@ -1637,13 +1637,12 @@ impl Scheduler {
             // 首格偏移最小且偏移字典序与 BlockPos 序一致),分片之间按 ShardId
             // 升序(results 是 BTreeMap,迭代天然升序,与 worker 回传完成顺序
             // 无关,风险 1)。依次分配 `EntityId::from_parts(EMERGENT_ORIGIN, seq)`
-            // (用后 +1,u32 用尽 = 内部错误 fail-stop),单格走 `detach_spawn`,
-            // 复合体 = 原点格中心、零速度、单位旋转、
-            // `EntityDesc::compound(DEBRIS_HALF_SIZE, shape)`,盖章 N+1 生效的
-            // `SpawnDynamic`(来源 `InputSource::SCHEDULER`;序列号用 seq——全局
-            // 唯一、单调,canonical 序 = 分配序)。分配只依赖 canonical 序。生成
-            // 输入不进外部命令日志(回放时由模拟重新产生),挂起待 N+1 并入目的
-            // 分片前缀。
+            // (用后 +1,u32 用尽 = 内部错误 fail-stop),单格走 `detach_spawn`
+            // 盖章 `SpawnDynamic`,复合体(K02 §5.6)盖章 `SpawnCompound`(请求
+            // 原样传递,初态/施加/clamp 在 sim 侧消费臂)——来源都是
+            // `InputSource::SCHEDULER`;序列号用 seq——全局唯一、单调,canonical
+            // 序 = 分配序。分配只依赖 canonical 序。生成输入不进外部命令日志
+            // (回放时由模拟重新产生),挂起待 N+1 并入目的分片前缀。
             let mut detach = std::mem::take(&mut outbox.detach_requests);
             detach.sort_by_key(|req| req.cell);
             let compound = std::mem::take(&mut outbox.compound_requests);
@@ -1672,24 +1671,28 @@ impl Scheduler {
                 self.next_emergent_seq = seq.checked_add(1).unwrap_or_else(|| {
                     panic!("涌现 ID 计数器溢出(u32 用尽,seq = {seq}):内部错误 fail-stop")
                 });
-                let (state, desc) = match &req {
-                    SpawnReq::Detach(r) => physics_sim::destruction::detach_spawn(r),
-                    SpawnReq::Compound(r) => (
-                        types::EntityState {
-                            translation: types::glam::Vec3::new(
-                                r.origin.x as f32 + 0.5,
-                                r.origin.y as f32 + 0.5,
-                                r.origin.z as f32 + 0.5,
-                            ),
-                            rotation: types::glam::Quat::IDENTITY,
-                            linvel: types::glam::Vec3::ZERO,
-                            angvel: types::glam::Vec3::ZERO,
-                        },
-                        types::EntityDesc::compound(
-                            physics_sim::destruction::DEBRIS_HALF_SIZE,
-                            r.shape.clone(),
-                        ),
-                    ),
+                // 单格走 `detach_spawn` → `SpawnDynamic`;复合体(K02 §5.6 第
+                // 3/7 条)走 `SpawnCompound`:请求原样装进命令(origin/shape/
+                // impulses),零速单位旋转的初态与施加/clamp 都在 sim 侧该命令
+                // 的消费臂(与单格同款 N+1;生成输入不进外部命令日志,回放由
+                // 模拟重新产生)。分配只依赖 canonical 序,两路同拍混排不变。
+                let payload = match &req {
+                    SpawnReq::Detach(r) => {
+                        let (state, desc) = physics_sim::destruction::detach_spawn(r);
+                        InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                            entity: EntityId::from_parts(types::EMERGENT_ORIGIN, seq),
+                            state,
+                            desc,
+                        })
+                    }
+                    SpawnReq::Compound(r) => {
+                        InputPayload::Command(messaging::SimCommand::SpawnCompound {
+                            entity: EntityId::from_parts(types::EMERGENT_ORIGIN, seq),
+                            origin: r.origin,
+                            shape: r.shape.clone(),
+                            impulses: r.impulses.clone(),
+                        })
+                    }
                 };
                 self.pending_emergent_spawns.push((
                     shard,
@@ -1697,11 +1700,7 @@ impl Scheduler {
                         apply_at: Tick(at.0 + 1),
                         source: InputSource::SCHEDULER,
                         sequence: u64::from(seq),
-                        payload: InputPayload::Command(messaging::SimCommand::SpawnDynamic {
-                            entity: EntityId::from_parts(types::EMERGENT_ORIGIN, seq),
-                            state,
-                            desc,
-                        }),
+                        payload,
                     },
                 ));
             }
@@ -6356,39 +6355,30 @@ mod tests {
                 .expect("收件箱未满");
         }
         sched.tick();
-        // 屏障后:恰 1 条盖章输入 = 6 格复合体(seq = 1)。
+        // 屏障后:恰 1 条盖章输入 = 6 格复合体(seq = 1;K02 起复合体走
+        // `SpawnCompound`——请求原样传递,零速单位旋转的初态在 sim 侧消费臂)。
         assert_eq!(sched.pending_emergent_spawns.len(), 1);
-        let (_spawn_dest, spawn_entity, spawn_state, spawn_desc) = {
+        let (_spawn_dest, spawn_entity, spawn_origin, spawn_shape) = {
             let (dest, input) = &sched.pending_emergent_spawns[0];
-            let InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+            let InputPayload::Command(messaging::SimCommand::SpawnCompound {
                 entity,
-                state,
-                desc,
+                origin,
+                shape,
+                impulses,
             }) = &input.payload
             else {
-                panic!("应为 SpawnDynamic:实际 {input:?}");
+                panic!("应为 SpawnCompound:实际 {input:?}");
             };
             assert_eq!(*dest, shard);
             assert_eq!(input.apply_at, Tick(2), "N+1 生效(拆柱在拍 1 执行)");
             assert_eq!(*entity, EntityId::from_parts(types::EMERGENT_ORIGIN, 1));
-            (*dest, *entity, *state, desc.clone())
+            assert!(impulses.is_empty(), "无撞击来源:impulses 默认空(AC-K2)");
+            (*dest, *entity, *origin, shape.clone())
         };
         {
             let origin = types::BlockPos::new(x0 + 2, -55, 64);
-            assert_eq!(
-                spawn_state.translation,
-                types::glam::Vec3::new(62.5, -54.5, 64.5),
-                "平移 = 原点格中心"
-            );
-            assert_eq!(
-                spawn_state.rotation,
-                types::glam::Quat::IDENTITY,
-                "单位旋转"
-            );
-            assert_eq!(spawn_state.linvel, types::glam::Vec3::ZERO, "零初速");
-            assert_eq!(spawn_state.angvel, types::glam::Vec3::ZERO);
-            let shape = spawn_desc.shape().expect("复合体描述带形状");
-            let cells = shape.cells();
+            assert_eq!(spawn_origin, origin, "原点 = compound_origin(段)");
+            let cells = spawn_shape.cells();
             assert_eq!(cells.len(), 6, "全格在列");
             assert_eq!(
                 cells[0].offset,

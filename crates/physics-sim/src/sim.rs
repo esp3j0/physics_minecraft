@@ -389,6 +389,13 @@ pub struct ShardSim {
     /// 时记下、拍末求两次的"转换前"求值取走后清空——记录只在本拍有效,不进
     /// 快照(checkpoint 落在两拍之间时必为空,同 [`ShardSim::collapse_triggers`])。
     pub(crate) load_conversion_records: BTreeMap<BlockPos, BlockId>,
+    /// 撞击冲量表(REQ-010 §5.6 第 1 条,K02):本拍撞击路径写入 air 的触发格
+    /// → J 矢量(该格各接触点冲量 × 撞击方向的和;只有撞击路径写入,爆炸/
+    /// 放置等其余来源不带)。`evaluate_impacts` 破坏落写时登记,拍末
+    /// `evaluate_load_tick` 开头 `std::mem::take` 取走——每拍重建/清空,不跨拍
+    /// 残留;checkpoint 只在两拍之间取,拍内表只在同拍内被读,不入快照(同
+    /// [`ShardSim::pre_impulse_vels`])。
+    pub(crate) impact_impulses: BTreeMap<BlockPos, Vec3>,
 }
 
 impl ShardSim {
@@ -427,6 +434,7 @@ impl ShardSim {
             load_pending: BTreeSet::new(),
             load_conversion_records: BTreeMap::new(),
             pre_impulse_vels: BTreeMap::new(),
+            impact_impulses: BTreeMap::new(),
         }
     }
 
@@ -2848,20 +2856,26 @@ impl ShardSim {
 
         // 每格累计(先收进 BTreeMap 再排序,接触对遍历顺序不确定,风险 4):
         // `impulse` = 各点冲量之和;`dir` = 最大点冲量的撞击方向(并列取字典序
-        // 小者,结果与采样顺序无关)。单格实体走这一路径(REQ-009 §5 原口径)。
+        // 小者,结果与采样顺序无关);`vec` = 各点冲量 × 撞击方向的矢量和
+        // (K02 §5.6 第 1 条的 J 矢量:加法可交换,与采样顺序无关)。单格实体
+        // 走这一路径(REQ-009 §5 原口径)。
         #[derive(Default)]
         struct Sample {
             impulse: f32,
             best: f32,
             dir: Vec3,
+            vec: Vec3,
         }
         let mut samples: BTreeMap<BlockPos, Sample> = BTreeMap::new();
         // 复合体(REQ-010 §7.3 第 7 条):每实体的接触点冲量合计与被触及的
         // 地形格集合 T,均摊 `J_T / |T|` 逐格判 I——多点接触时求解器把冲量
         // 分给各点的方式不唯一,逐格相加会让平落的复合体随机砸穿脚下某一格。
+        // `vec` = 各点冲量 × 撞击方向的矢量和(K02 §5.6 第 1 条:均摊冲量的
+        // 方向基准,`total` 同基准均摊)。
         #[derive(Default)]
         struct CompoundImpact {
             total: f32,
+            vec: Vec3,
             cells: BTreeSet<BlockPos>,
         }
         let mut compound_impacts: BTreeMap<EntityId, CompoundImpact> = BTreeMap::new();
@@ -2955,11 +2969,13 @@ impl ShardSim {
                     if is_compound {
                         let e = compound_impacts.entry(id).or_default();
                         e.total += pt.data.impulse;
+                        e.vec += dir * pt.data.impulse;
                         e.cells.insert(cell);
                         continue;
                     }
                     let s = samples.entry(cell).or_default();
                     s.impulse += pt.data.impulse;
+                    s.vec += dir * pt.data.impulse;
                     if pt.data.impulse > s.best
                         || (pt.data.impulse == s.best
                             && (dir.x, dir.y, dir.z) < (s.dir.x, s.dir.y, s.dir.z))
@@ -2974,15 +2990,16 @@ impl ShardSim {
         // (REQ-009 §5 原口径);复合体 = 均摊 `J_T / |T|` 逐格判 I(§7.3 第 7 条;
         // ∞ 自然不破)。非实心/未装载/界外的格无材料,整体忽略(界外 get_block = AIR)。
         // 同一地形格多来源(单格与复合体、多个复合体)取冲量最大者——保持
-        // "一格至多一个候选"的既有不变量(脱落请求不重复)。
-        let mut best: BTreeMap<BlockPos, (f32, BlockId, f32)> = BTreeMap::new();
+        // "一格至多一个候选"的既有不变量(脱落请求不重复)。J 矢量随判过者
+        // 记下(K02 §5.6 第 1 条:破坏落写时入冲量表)。
+        let mut best: BTreeMap<BlockPos, (f32, Vec3, BlockId, f32)> = BTreeMap::new();
         for (cell, s) in samples {
             let block = self.voxels.get_block(cell);
             let Some(m) = self.registry.material(block) else {
                 continue;
             };
             if s.impulse >= m.impact_threshold {
-                best.insert(cell, (s.impulse, block, m.impact_threshold));
+                best.insert(cell, (s.impulse, s.vec, block, m.impact_threshold));
             }
         }
         for e in compound_impacts.into_values() {
@@ -2990,6 +3007,10 @@ impl ShardSim {
                 continue;
             }
             let j = e.total / e.cells.len() as f32;
+            // 均摊冲量的方向 = 总矢量方向(矢量和方向与均摊同基准);总矢量为
+            // 零(多点对向接触恰好抵消)时无击退方向,记零矢量(继承生成零冲
+            // 量,无行为)。
+            let dir_v = e.vec.normalize_or_zero() * j;
             for cell in e.cells {
                 let block = self.voxels.get_block(cell);
                 let Some(m) = self.registry.material(block) else {
@@ -2999,16 +3020,16 @@ impl ShardSim {
                     best.entry(cell)
                         .and_modify(|cur| {
                             if j > cur.0 {
-                                *cur = (j, block, m.impact_threshold);
+                                *cur = (j, dir_v, block, m.impact_threshold);
                             }
                         })
-                        .or_insert((j, block, m.impact_threshold));
+                        .or_insert((j, dir_v, block, m.impact_threshold));
                 }
             }
         }
         let mut candidates: Vec<(BlockPos, f32, Vec3, BlockId, f32)> = best
             .into_iter()
-            .map(|(cell, (j, block, threshold))| (cell, j, Vec3::ZERO, block, threshold))
+            .map(|(cell, (j, vec, block, threshold))| (cell, j, vec, block, threshold))
             .collect();
         if candidates.is_empty() {
             return;
@@ -3026,11 +3047,17 @@ impl ShardSim {
         // 冲量降序,同值 BlockPos 升序(范围 2)。
         candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         let mut dirty: Vec<ChunkPos> = Vec::new();
-        for (cell, _j, _dir, block, _threshold) in candidates.into_iter().take(budget) {
+        for (cell, _j, vec, block, _threshold) in candidates.into_iter().take(budget) {
             let _ = self.voxels.set_block(cell, BlockId::AIR);
             // 遥测(范围 4):撞击破坏的格与产出的脱落请求。
             self.outbox.destruction_stats.cells_impacted += 1;
             self.outbox.destruction_stats.detached += 1;
+            // 冲量表(K02 §5.6 第 1 条):撞击路径写入 air 的格带 (J, d̂) 采样
+            // 的 J 矢量——该格冲量和 × 受力方向(d̂ = 撞击方向"压向地形" =
+            // 来袭方向,被撞断的结构沿它被打飞,拍末承载转换的邻接段据此继承
+            // 击退)。爆炸/放置等其余来源的写入不经过这里,天然不带。每拍由
+            // evaluate_load_tick 取走重建。
+            self.impact_impulses.insert(cell, vec);
             // 撞击写入进入本拍坍塌的触发集(范围 3;实心 → air)。
             self.register_collapse_trigger(cell, block, BlockId::AIR);
             self.outbox.block_updates.push(BlockWrite {
@@ -3230,6 +3257,36 @@ impl ShardSim {
                 };
                 self.spawn_entity(entity, state, desc, owner_source, false);
             }
+            SimCommand::SpawnCompound {
+                entity,
+                origin,
+                shape,
+                impulses,
+            } => {
+                // 承载转换复合体生成(REQ-010 §5.6 第 3 条,K02;调度器屏障盖章
+                // N+1 的专用命令,外部路径不可达——net 白名单与
+                // validate_external_command 都拒绝):初态与 K01 之前完全一致
+                // (原点格中心、零速、单位旋转、DEBRIS_HALF_SIZE 复合描述);
+                // impulses 非空时生成后逐条 `apply_impulse_at_point`(不合并,
+                // 保真力矩),全部施加完读回 linvel/angvel 按
+                // `load_knockback_max_speed`/`load_knockback_max_ang_speed` 对
+                // 模长 clamp(方向不变)后写回。β 已在构造侧乘入(§5.6 第 2 条);
+                // β = 0 时施加零冲量是数值 no-op(apply_impulse 对零冲量直接
+                // 短路),行为与零速路径逐位一致(AC-K4 已钉)。
+                let state = EntityState {
+                    translation: Vec3::new(
+                        origin.x as f32 + 0.5,
+                        origin.y as f32 + 0.5,
+                        origin.z as f32 + 0.5,
+                    ),
+                    rotation: types::glam::Quat::IDENTITY,
+                    linvel: Vec3::ZERO,
+                    angvel: Vec3::ZERO,
+                };
+                let desc = EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape);
+                self.spawn_entity(entity, state, desc, None, false);
+                self.apply_knockback(entity, impulses);
+            }
             SimCommand::RemoveEntity { entity } => {
                 // 幂等(REQ-007 任务 03 生产接入后):实体可能已在本拍前的
                 // 生命周期段合法终结(凝固/强制落地/虚空)——不存在 = 无操作,
@@ -3393,6 +3450,51 @@ impl ShardSim {
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
         self.outbox.spawned.push(id);
+    }
+
+    /// 撞击击退的施加与上限(REQ-010 §5.6 第 3 条,K02):刚体生成后逐条
+    /// `apply_impulse_at_point`(**不合并条目**,保真力矩——合并会改变 r×J 的
+    /// 合力矩);全部施加完读回 linvel/angvel,按
+    /// `load_knockback_max_speed`/`load_knockback_max_ang_speed` 对**模长**
+    /// clamp(方向不变)后写回。冲量表为空 = no-op(不移速不 wake);
+    /// clamp 上限 ≤ 0 视为不设限(与校验"≥ 0"自洽,0 上限会把速度钉死为零,
+    /// 等价关闭——语义由配置校验层保证不出现)。
+    fn apply_knockback(&mut self, id: EntityId, impulses: Vec<(Vec3, Vec3)>) {
+        if impulses.is_empty() {
+            return;
+        }
+        let (handle, v_max, w_max) = {
+            let rec = self
+                .entities
+                .get(&id)
+                .expect("SpawnCompound 刚生成,fail-stop");
+            (
+                rec.handle,
+                self.cfg.cohesion.load_knockback_max_speed,
+                self.cfg.cohesion.load_knockback_max_ang_speed,
+            )
+        };
+        {
+            let body = self.phys.bodies.get_mut(handle).expect("handle 有效");
+            for (impulse, point) in &impulses {
+                body.apply_impulse_at_point(
+                    conv::vec3_to_rapier(*impulse),
+                    conv::vec3_to_rapier(*point),
+                    true,
+                );
+            }
+        }
+        let body = self.phys.bodies.get_mut(handle).expect("handle 有效");
+        let mut linvel = conv::rapier_to_vec3(body.linvel());
+        let mut angvel = conv::rapier_to_vec3(body.angvel());
+        if v_max > 0.0 && linvel.length() > v_max {
+            linvel = linvel.normalize() * v_max;
+        }
+        if w_max > 0.0 && angvel.length() > w_max {
+            angvel = angvel.normalize() * w_max;
+        }
+        body.set_linvel(conv::vec3_to_rapier(linvel), true);
+        body.set_angvel(conv::vec3_to_rapier(angvel), true);
     }
 
     /// 删除实体(迁移/传送/凝固),返回最后状态、描述与政策状态。
@@ -3807,6 +3909,7 @@ fn expand_boundary(
 mod tests {
     use super::*;
     use types::{DimensionId, ShardPos, WorldId};
+    use voxel::WorldGenerator;
 
     fn shard_id(x: i32, z: i32) -> ShardId {
         ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
@@ -9481,6 +9584,448 @@ mod tests {
             "撞击碎块零初速(修订 8,AC-K3)"
         );
         assert!(out.compound_requests.is_empty());
+    }
+
+    // ---- 单元 K02:撞击击退(REQ-010 §5.6,修订 10;AC-K1/K5/K6/K7)----
+
+    /// K02 端到端最小场景:撞击格(覆土 dirt)被撞碎(撞击路径登记冲量表),
+    /// 同拍其正下方的两格 dirt 悬空段失载成 2 格复合体(邻接继承)。
+    ///
+    /// 几何(Superflat::classic = y −64 bedrock + y −63…−61 dirt;chunk 已装载):
+    ///
+    /// - 撞击格 `hit = (64, −61, 64)`:地表覆土层,撞击落写把它挖成 air;
+    /// - 失载段 `seg = (64, −62, 64)、(65, −62, 64)`:撞击格正下 + 侧下,
+    ///   六邻支撑(除 hit)预先清空,除与 hit 的邻接外无任何粘结路径——
+    ///   hit 写 air 后两格无汇流,整段失载。
+    ///
+    /// 返回 (场景 sim,撞击格,失载段)。
+    fn knockback_scene() -> (ShardSim, BlockPos, Vec<BlockPos>) {
+        use voxel::WorldGenerator;
+        let mut s = load_segment_sim(64);
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                s.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        // 失载段四周六邻预先清空(air→air 与空挖不触发承载的格自身保留):
+        // 两格 dirt 悬空挂住(未触发);一旦触发登记(撞击格被撞碎 = 触发),
+        // 承载判定从邻接种子出发,悬空的 dirt 段失载。
+        let seg = vec![BlockPos::new(64, -62, 64), BlockPos::new(65, -62, 64)];
+        let mut pit: Vec<BlockPos> = Vec::new();
+        for c in &seg {
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                pit.push(BlockPos::new(c.x + dx, c.y + dy, c.z + dz));
+            }
+        }
+        let hit = BlockPos::new(64, -61, 64);
+        let seg_set: std::collections::BTreeSet<BlockPos> = seg.iter().copied().collect();
+        pit.retain(|c| !seg_set.contains(c) && *c != hit);
+        let clears: Vec<StampedInput> = pit
+            .iter()
+            .enumerate()
+            .map(|(k, c)| setblock_input(k as u64, *c, voxel::builtin::AIR))
+            .collect();
+        s.apply_prefix(&clears);
+        s.take_outbox();
+        (s, hit, seg)
+    }
+
+    /// AC-K1:构造邻接撞击场景,断言生成复合体的 linvel/angvel 与"同形状
+    /// 刚体施加同组 impulse@point"的理论值一致(ε 内),且 |v| ≤ v_max、
+    /// |ω| ≤ ω_max(§5.6 第 3 条 + AC-K1)。参照体 = 同配置 ShardSim 里的
+    /// 同形状实体施加同组冲量(同 rapier 质量属性,闭式一致)。
+    ///
+    /// 变红:施加未逐条(力矩失真 → angvel 偏)、clamp 方向被改、β 没乘入。
+    #[test]
+    fn knockback_k02_compound_inherits_impulse_theory_match() {
+        let (mut s, _hit, _seg) = knockback_scene();
+        // 白盒注入冲量表(构造侧 β 乘入后的形态;触发格 = 撞击格,与段格
+        // 64,−62 邻接)。
+        s.impact_impulses
+            .insert(BlockPos::new(64, -61, 64), Vec3::new(4.0, -2.0, 1.0));
+        // 撞击落写的白盒等价:SetBlock 挖掉撞击格(实心→air,登记触发;真实
+        // 路径里 evaluate_impacts 同款写入并登记冲量表)。写入后视图里 hit =
+        // air,种子 = 其正下两格悬空段,无侧向粘结路径 → 整段失载。
+        s.apply_prefix(&[setblock_input(
+            400,
+            BlockPos::new(64, -61, 64),
+            voxel::builtin::AIR,
+        )]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.compound_requests.len(), 1, "失载段整段转换");
+        let req = &out.compound_requests[0];
+        assert_eq!(req.impulses.len(), 1, "一个邻接触发格一条冲量");
+        let (j, point) = req.impulses[0];
+        assert!(
+            (j - Vec3::new(2.0, -1.0, 0.5)).length() < 1e-6,
+            "β = 0.5 构造时乘入:{j:?}"
+        );
+        assert_eq!(point, Vec3::new(64.5, -60.5, 64.5), "point = 触发格中心");
+        // N+1 生成:调度器盖章 SpawnCompound(单分片直用 sim,这里手工走
+        // 同一命令路径)。
+        let e = entity(9);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 500,
+            payload: InputPayload::Command(SimCommand::SpawnCompound {
+                entity: e,
+                origin: req.origin,
+                shape: req.shape.clone(),
+                impulses: req.impulses.clone(),
+            }),
+        }]);
+        let state = s.entity_state(e).expect("复合体已生成");
+        // 参照体:同配置 sim、同形状同位置、施加同组 (J, point)。
+        let mut r = load_segment_sim(64);
+        for cx in 2..=6i32 {
+            for cz in 2..=6i32 {
+                let cp = ChunkPos::new(cx, cz);
+                r.load_chunk(
+                    cp,
+                    voxel::Superflat::classic().generate(types::WorldSeed(7), cp),
+                );
+            }
+        }
+        r.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: e,
+                state: types::EntityState {
+                    translation: Vec3::new(
+                        req.origin.x as f32 + 0.5,
+                        req.origin.y as f32 + 0.5,
+                        req.origin.z as f32 + 0.5,
+                    ),
+                    rotation: types::glam::Quat::IDENTITY,
+                    linvel: Vec3::ZERO,
+                    angvel: Vec3::ZERO,
+                },
+                desc: types::EntityDesc::compound(
+                    crate::destruction::DEBRIS_HALF_SIZE,
+                    req.shape.clone(),
+                ),
+            }),
+        }]);
+        {
+            let rec = r.entities.get(&e).expect("参照体在场");
+            let handle = rec.handle;
+            let body = r.phys.bodies.get_mut(handle).expect("handle 有效");
+            for (imp, pt) in &req.impulses {
+                body.apply_impulse_at_point(
+                    conv::vec3_to_rapier(*imp),
+                    conv::vec3_to_rapier(*pt),
+                    true,
+                );
+            }
+        }
+        let want = r.entity_state(e).expect("参照体状态");
+        let v_max = s.cfg.cohesion.load_knockback_max_speed;
+        let w_max = s.cfg.cohesion.load_knockback_max_ang_speed;
+        assert!(
+            (state.linvel - want.linvel).length() < 1e-4,
+            "linvel 与理论值一致:got {:?} want {:?}",
+            state.linvel,
+            want.linvel
+        );
+        assert!(
+            (state.angvel - want.angvel).length() < 1e-4,
+            "angvel 与理论值一致(逐条施加,力矩保真):got {:?} want {:?}",
+            state.angvel,
+            want.angvel
+        );
+        assert!(state.linvel.length() <= v_max + 1e-4, "|v| ≤ v_max");
+        assert!(state.angvel.length() <= w_max + 1e-4, "|ω| ≤ ω_max");
+        assert!(state.linvel.length() > 0.1, "击退非零(打击感):有初速");
+        assert!(state.angvel.length() > 0.01, "偏轴工况有翻滚(r×J 非零)");
+    }
+
+    /// AC-K5:共线工况(触发格中心在过质心且平行 J 的直线上)angvel ≈ 0;
+    /// 偏轴工况 angvel ≠ 0——Δω 确来自 r×J(§5.6 第 2/3 条)。
+    ///
+    /// 变红:施加被合并到质心(共线与偏轴 angvel 都 ≈ 0);或方向搞错。
+    #[test]
+    fn knockback_k02_collinear_zero_angvel_offset_axis_nonzero() {
+        let build = |impulses: Vec<(Vec3, Vec3)>| {
+            let mut s = load_segment_sim(64);
+            let e = entity(1);
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnCompound {
+                    entity: e,
+                    origin: BlockPos::new(64, -62, 64),
+                    shape: types::CompoundShape::from_world(
+                        BlockPos::new(64, -62, 64),
+                        &[
+                            (BlockPos::new(64, -62, 64), voxel::builtin::STONE),
+                            (BlockPos::new(65, -62, 64), voxel::builtin::STONE),
+                        ],
+                    )
+                    .expect("两格"),
+                    impulses,
+                }),
+            }]);
+            s.entity_state(e).expect("已生成")
+        };
+        // 共线:两格横条质心 = (65.0, −61.5, 64.5)(两格中心均值);触发格
+        // (64,−62,64) 中心 (64.5,−61.5,64.5),r = (−0.5,0,0) 平行 J = (2,0,0)
+        // ⟹ r×J = 0。Δv = J/M,Δω = 0。
+        let st = build(vec![(
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(64.5, -61.5, 64.5),
+        )]);
+        assert!(
+            st.angvel.length() < 1e-5,
+            "共线工况 angvel ≈ 0:{:?}",
+            st.angvel
+        );
+        assert!((st.linvel.length() - 2.0 / (2.0 * 0.729)).abs() < 1e-4);
+        // 偏轴:同冲量但 point 抬高 1 m ⟹ r 有竖直分量,r×J ≠ 0。
+        let st = build(vec![(
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(64.5, -60.5, 64.5),
+        )]);
+        assert!(
+            st.angvel.length() > 0.1,
+            "偏轴工况 angvel ≠ 0(Δω 确来自 r×J):{:?}",
+            st.angvel
+        );
+    }
+
+    /// AC-K6:小惯性 + 大冲量 clamp 生效(贴 v_max / ω_max 上限,方向不变;
+    /// §5.6 第 3 条)。2 格段(质量 1.458,惯量小)+ 200 N·s 斜向冲量:
+    /// 无 clamp 时 |v| ≈ 137 m/s、|ω| ≈ 92 rad/s,远超 8.0/6.0 上限。
+    ///
+    /// 变红:clamp 没实现(速度超限);clamp 改方向(分量符号翻转);
+    /// 上限取错键。
+    #[test]
+    fn knockback_k02_clamp_caps_speed_and_ang_speed() {
+        let mut s = load_segment_sim(64);
+        let e = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnCompound {
+                entity: e,
+                origin: BlockPos::new(64, -62, 64),
+                shape: types::CompoundShape::from_world(
+                    BlockPos::new(64, -62, 64),
+                    &[
+                        (BlockPos::new(64, -62, 64), voxel::builtin::STONE),
+                        (BlockPos::new(65, -62, 64), voxel::builtin::STONE),
+                    ],
+                )
+                .expect("两格"),
+                impulses: vec![(Vec3::new(120.0, 120.0, 40.0), Vec3::new(64.5, -60.5, 64.5))],
+            }),
+        }]);
+        let st = s.entity_state(e).expect("已生成");
+        let v_max = s.cfg.cohesion.load_knockback_max_speed;
+        let w_max = s.cfg.cohesion.load_knockback_max_ang_speed;
+        assert!(
+            (st.linvel.length() - v_max).abs() < 1e-4,
+            "线速度贴 v_max 上限:{:?} vs {v_max}",
+            st.linvel.length()
+        );
+        assert!(
+            (st.angvel.length() - w_max).abs() < 1e-4,
+            "角速度贴 ω_max 上限:{:?} vs {w_max}",
+            st.angvel.length()
+        );
+        assert!(st.linvel.x > 0.0 && st.linvel.y > 0.0, "clamp 方向不变");
+        assert!(st.angvel.length() > 0.0 && st.angvel.z != 0.0, "翻滚保持");
+    }
+
+    /// AC-K7:impact-corner 同款几何双跑逐拍一致(outbox 遥测逐拍相同;
+    /// §5.6 第 6 条确定性)。门框 = 石柱两根 + 门楣 4 格(split 4),去掉左柱,
+    /// 高速方块撞拐角;两跑 sim 配置/输入序列逐位相同,断言每拍
+    /// `cells_impacted/compounds_spawned/compound_cells` 与实体终态表一致。
+    ///
+    /// 变红:冲量表跨拍残留(第二跑继承了第一跑的拍间状态差异——白盒同源
+    /// 构造下只有非确定实现才会分叉);clamp 读回写回不确定。
+    #[test]
+    fn knockback_k02_impact_corner_double_run_bitwise_identical() {
+        let build = || {
+            let mut s = load_segment_sim(64);
+            s.cfg.cohesion.compound_split_size = 4;
+            // 门框(smoke/scenarios/req010-impact-corner 同款,平移到本 sim
+            // 坐标:x 60..67,y −60..−58,z = 64):两根石柱 y −60..−59,门楣
+            // y = −58。
+            let mut inputs: Vec<StampedInput> = Vec::new();
+            let mut seq = 0u64;
+            for x in [60i32, 63] {
+                for y in [-60i32, -59] {
+                    inputs.push(setblock_input(
+                        seq,
+                        BlockPos::new(x, y, 64),
+                        voxel::builtin::STONE,
+                    ));
+                    seq += 1;
+                }
+            }
+            for x in 60..=63i32 {
+                inputs.push(setblock_input(
+                    seq,
+                    BlockPos::new(x, -58, 64),
+                    voxel::builtin::STONE,
+                ));
+                seq += 1;
+            }
+            s.apply_prefix(&inputs);
+            s.take_outbox();
+            // 去左柱。
+            for y in [-60i32, -59] {
+                s.apply_prefix(&[setblock_input(
+                    seq,
+                    BlockPos::new(60, y, 64),
+                    voxel::builtin::AIR,
+                )]);
+                seq += 1;
+            }
+            s.take_outbox();
+            // 高速投射物撞门楣-柱顶拐角接缝(瞄准 (63,−58) 附近,速度斜向)。
+            s.apply_prefix(&[impact_drop_input(900, entity(77), 63, -50.0, 64, -30.0)]);
+            s
+        };
+        let mut a = build();
+        let mut b = build();
+        for tick in 0..80 {
+            a.step();
+            b.step();
+            let (oa, ob) = (a.take_outbox(), b.take_outbox());
+            assert_eq!(
+                oa.destruction_stats.cells_impacted, ob.destruction_stats.cells_impacted,
+                "tick {tick}:撞击数一致"
+            );
+            assert_eq!(
+                oa.cohesion_stats.compounds_spawned, ob.cohesion_stats.compounds_spawned,
+                "tick {tick}:复合体数一致"
+            );
+            assert_eq!(oa.compound_requests, ob.compound_requests, "tick {tick}");
+            assert_eq!(oa.block_updates, ob.block_updates, "tick {tick}");
+        }
+        let ea: Vec<_> = a.entity_states();
+        let eb: Vec<_> = b.entity_states();
+        assert_eq!(ea, eb, "80 拍后实体表逐位一致");
+        assert!(
+            ea.len() <= 3,
+            "终局凝固/散落后实体收敛(双跑同终态即确定性):{ea:?}"
+        );
+    }
+
+    /// §5.6 第 4 条(AC-K4 回归,K01 钉的 factor = 0 逐位绿在行为级复核):
+    /// β = 0(下一拍生效配置)时同款邻接撞击场景的复合体请求 impulses 仍是
+    /// 非空零冲量条目、生成后 linvel = angvel = 0(零冲量施加数值 no-op);
+    /// 单格脱落与撞击碎块路径不受影响。
+    ///
+    /// 变红:β = 0 被当成"跳过继承"(请求为空——构造约定破坏);零冲量
+    /// 施加意外改变状态(wake/浮点扰动)。
+    #[test]
+    fn knockback_k02_zero_factor_yields_zero_velocity() {
+        let (mut s, hit, _seg) = knockback_scene();
+        s.cfg.cohesion.load_knockback_factor = 0.0;
+        s.impact_impulses.insert(hit, Vec3::new(4.0, -2.0, 1.0));
+        // 撞击落写的白盒等价(同 K1):SetBlock 挖掉撞击格。
+        s.apply_prefix(&[setblock_input(400, hit, voxel::builtin::AIR)]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.compound_requests.len(), 1);
+        let req = &out.compound_requests[0];
+        assert_eq!(req.impulses.len(), 1, "条目仍在(构造约定:去重邻接表)");
+        assert_eq!(req.impulses[0].0, Vec3::ZERO, "β = 0:冲量为零");
+        let e = entity(9);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 500,
+            payload: InputPayload::Command(SimCommand::SpawnCompound {
+                entity: e,
+                origin: req.origin,
+                shape: req.shape.clone(),
+                impulses: req.impulses.clone(),
+            }),
+        }]);
+        let st = s.entity_state(e).expect("已生成");
+        assert_eq!(st.linvel, Vec3::ZERO, "零冲量施加 = 数值 no-op");
+        assert_eq!(st.angvel, Vec3::ZERO);
+    }
+
+    /// §5.6 第 1/2 条(接线,AC-K1 的生产路径半边):真实撞击路径(17 m/s
+    /// 落体砸穿覆土)登记的冲量表,在拍末承载转换处被邻接段继承——撞击格
+    /// 正下方悬空的 2 格 dirt 段,其请求 impulses 恰含 (β·J, 撞击格中心)。
+    ///
+    /// 变红:evaluate_impacts 没登记表;登记了但方向/格错;表被隔拍消费。
+    #[test]
+    fn knockback_k02_impact_path_feeds_inheritance() {
+        let (mut s, hit, seg) = knockback_scene();
+        // 17 m/s 落体砸 hit(撞击速度基准 15 m/s > 1 m/s 接近门槛;D(dirt)
+        // 阈值 7 N·s,采样深度 0.1 m 回到 hit 格)。
+        s.apply_prefix(&[impact_drop_input(1, entity(1), hit.x, -50.0, hit.z, -15.0)]);
+        // 冲量表先于 step(白盒核对):撞击拍内 evaluate_impacts 登记。
+        let mut found = None;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.destruction_stats.cells_impacted > 0 {
+                found = Some(out);
+                break;
+            }
+        }
+        let out = found.expect("17 m/s 应撞碎覆土");
+        assert_eq!(out.destruction_stats.cells_impacted, 1);
+        assert!(
+            out.compound_requests.len() == 1,
+            "同拍邻接失载段整段转换:{:?}",
+            out.compound_requests.len()
+        );
+        let req = &out.compound_requests[0];
+        let seg_set: std::collections::BTreeSet<BlockPos> = seg.iter().copied().collect();
+        let cells: Vec<BlockPos> = req
+            .shape
+            .cells()
+            .iter()
+            .map(|c| {
+                BlockPos::new(
+                    req.origin.x + c.offset[0],
+                    req.origin.y + c.offset[1],
+                    req.origin.z + c.offset[2],
+                )
+            })
+            .collect();
+        assert_eq!(
+            cells
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            seg_set,
+            "转换的正是悬空段"
+        );
+        assert_eq!(req.impulses.len(), 1, "只继承撞击格一条");
+        let (j, point) = req.impulses[0];
+        assert_eq!(
+            point,
+            Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5)
+        );
+        assert!(j.length() > 0.0, "冲量非零(真实采样):{j:?}");
+        // 表已取走:下一拍不再有冲量(不跨拍残留)。
+        assert!(s.impact_impulses.is_empty(), "冲量表每拍清空");
     }
 
     /// §5.5 第 2 条(名额与格数都从零起算,与同拍爆炸共用实体名额):名额 1、

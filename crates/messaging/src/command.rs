@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, Tick};
+use types::{BlockId, BlockPos, CompoundShape, EntityDesc, EntityId, EntityState, Tick};
 
 /// 输入来源:外部命令 = 连接/会话序号(app 层分配);内部 = 分片序号(shard 注册表)。
 /// 0 保留给调度器注入的输入;`u32` 高位段自 `u32::MAX` 向左为调度器
@@ -79,6 +79,21 @@ pub enum SimCommand {
     RemoveAreaTicket {
         id: u64,
     },
+    /// 复合体生成(REQ-010 §5.6 第 3/7 条,K02;调度器专用):承载塌落段的
+    /// 复合体生成请求整体盖章 N+1 生成(取代此前"`SpawnDynamic` 携带零速
+    /// EntityState"的路径——撞击冲量必须跨屏障传递,sim 侧在刚体生成后逐条
+    /// `apply_impulse_at_point` 并 clamp)。字段与 `CompoundRequest` 同形
+    /// (messaging 不反依赖 physics-sim;`origin/shape/impulses` 都是 types
+    /// 类型)。**不进 C2S 白名单**(`command_shard` 返回 `None` → translate
+    /// 拒绝;`validate_external_command` 同口径拒绝——生成请求是调度器从模拟
+    /// 产出再注入的瞬态内部载荷,外部不得伪造)。回放:与脱落请求同源,生成
+    /// 输入不进外部命令日志(调度器重新产生)。
+    SpawnCompound {
+        entity: EntityId,
+        origin: BlockPos,
+        shape: CompoundShape,
+        impulses: Vec<(Vec3, Vec3)>,
+    },
 }
 
 impl SimCommand {
@@ -95,6 +110,7 @@ impl SimCommand {
             Self::RemoveObserver => 7,
             Self::SetAreaTicket { .. } => 8,
             Self::RemoveAreaTicket { .. } => 9,
+            Self::SpawnCompound { .. } => 10,
         }
     }
 }
@@ -221,6 +237,30 @@ mod tests {
         assert_eq!(SimCommand::RemoveAreaTicket { id: 1 }.ordinal(), 9);
         assert_eq!(cmd_set().ordinal(), 0, "旧 0 不变");
         assert_eq!(cmd_detonate().ordinal(), 4, "旧 4 不变");
+        // REQ-010 K02:SpawnCompound 追加在尾(ordinal = 10),旧 0–9 不变;
+        // 旧编码可解(只追加枚举:新变体追加在尾,反序列化旧字节不受影响)。
+        let two_cells = types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: types::BlockId(1),
+            },
+            types::ShapeCell {
+                offset: [1, 0, 0],
+                block: types::BlockId(1),
+            },
+        ])
+        .expect("两格形状合法");
+        assert_eq!(
+            SimCommand::SpawnCompound {
+                entity: EntityId::from_parts(1, 1),
+                origin: BlockPos::ZERO,
+                shape: two_cells,
+                impulses: Vec::new(),
+            }
+            .ordinal(),
+            10,
+            "SpawnCompound = 追加序 10(枚举只许追加,REQ-010 §5.6 K02)"
+        );
         // 旧编码可解:bincode 依赖不在本 crate(日志层 sim-api 覆盖);此处
         // 锚"只追加"的结构前提——新变体只追加在尾、ordinal 单调,旧字节解码
         // 不受影响(旧 0–7 断言已在上方)。

@@ -1039,6 +1039,39 @@ pub fn compound_origin(cells: &[BlockPos]) -> BlockPos {
     )
 }
 
+/// 撞击击退的邻接继承(纯函数,REQ-010 §5.6 第 2 条,K02):段内存在格与某
+/// 带冲量触发格 6 邻邻接 ⟺ 该段继承;对每段,取其邻接的**去重后**每个带冲量
+/// 触发格,生成一条 `(β·J, 触发格中心)`(β = `load_knockback_factor`,**构造时
+/// 乘入**;point = 触发格中心世界坐标)。不做经空气的远距传播;多个失载段各
+/// 继承全额、不分摊(每段独立调本函数,天然全额)。顺序:先按 `cells` 迭代序
+/// (BFS 派生的 `BTreeSet` 升序)收集各触发格(每格至多一条——同段同格去重),
+/// 输出顺序确定;`impact_impulses` 的键序确定性由调用方的 BTreeMap 保证。
+/// `β = 0` 时冲量全为零(条目仍在——施加零冲量是数值 no-op,行为与关闭一致)。
+pub fn inherit_impulses(
+    cells: &[BlockPos],
+    impact_impulses: &BTreeMap<BlockPos, types::glam::Vec3>,
+    factor: f32,
+) -> Vec<(types::glam::Vec3, types::glam::Vec3)> {
+    let mut out: Vec<(types::glam::Vec3, types::glam::Vec3)> = Vec::new();
+    let mut taken: BTreeSet<BlockPos> = BTreeSet::new();
+    for &c in cells {
+        for &(dx, dy, dz) in &NEIGHBOR_DELTAS {
+            let n = BlockPos::new(c.x + dx, c.y + dy, c.z + dz);
+            if taken.contains(&n) {
+                continue;
+            }
+            if let Some(&j) = impact_impulses.get(&n) {
+                taken.insert(n);
+                out.push((
+                    types::glam::Vec3::new(j.x * factor, j.y * factor, j.z * factor),
+                    types::glam::Vec3::new(n.x as f32 + 0.5, n.y as f32 + 0.5, n.z as f32 + 0.5),
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// 包络半径 ρ(REQ-010 §5.1):各格中心到原点格中心的最大距离 + `DEBRIS_HALF_SIZE·√3`。
 pub fn envelope_radius(cells: &[BlockPos], origin: BlockPos) -> f32 {
     let farthest = cells
@@ -1830,6 +1863,55 @@ mod tests {
             (st.linvel - Vec3::new(-1.0, 2.0, 3.0)).length() < 1e-5,
             "{:?}",
             st.linvel
+        );
+    }
+
+    // ------------------------------------------------------- inherit_impulses
+
+    /// §5.6 第 2 条(K02,AC-K5 几何前提 + 继承规则):6 邻邻接才继承;
+    /// 非邻接(隔 1 格)不继承(不做经空气的传播);邻接触发格去重、
+    /// 每格一条;冲量 = β·J 构造时乘入,point = 触发格中心。
+    #[test]
+    fn inherit_impulses_adjacency_dedup_and_factor() {
+        // 段 = 两格横条 (0,0,0)-(1,0,0);触发格 = (0,1,0)(邻接段格 0)与
+        // (5,0,0)(远离,不邻接)。
+        let segment = vec![p(0, 0, 0), p(1, 0, 0)];
+        let mut impacts: BTreeMap<BlockPos, Vec3> = BTreeMap::new();
+        impacts.insert(p(0, 1, 0), Vec3::new(2.0, 0.0, 0.0));
+        impacts.insert(p(5, 0, 0), Vec3::new(9.0, 9.0, 9.0));
+        let out = inherit_impulses(&segment, &impacts, 0.5);
+        assert_eq!(out.len(), 1, "只继承邻接的 (0,1,0);远格不传(无空气传播)");
+        assert!(
+            (out[0].0 - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6,
+            "冲量 = β·J:{:?}",
+            out[0].0
+        );
+        assert!(
+            (out[0].1 - Vec3::new(0.5, 1.5, 0.5)).length() < 1e-6,
+            "point = 触发格中心:{:?}",
+            out[0].1
+        );
+        // 同段两个格邻接同一触发格:去重,一条;β = 0 → 零冲量条目仍在。
+        let two = vec![p(0, 0, 0), p(0, 0, 1)];
+        let mut one: BTreeMap<BlockPos, Vec3> = BTreeMap::new();
+        one.insert(p(0, 1, 0), Vec3::new(4.0, 0.0, -2.0));
+        let out = inherit_impulses(&two, &one, 0.5);
+        assert_eq!(out.len(), 1, "同段两格同邻一触发格:去重一条");
+        let out = inherit_impulses(&two, &one, 0.0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, Vec3::ZERO, "β = 0:零冲量条目仍在(数值 no-op)");
+        // 空冲量表(无撞击来源):恒空。
+        assert!(inherit_impulses(&segment, &BTreeMap::new(), 0.5).is_empty());
+        // 两个不同触发格都邻接:两条,按 cells 迭代序 × NEIGHBOR_DELTAS 序确定。
+        let mut two_hits: BTreeMap<BlockPos, Vec3> = BTreeMap::new();
+        two_hits.insert(p(0, 1, 0), Vec3::X);
+        two_hits.insert(p(1, -1, 0), Vec3::Y);
+        let out = inherit_impulses(&segment, &two_hits, 1.0);
+        assert_eq!(out.len(), 2, "两个不同触发格各一条");
+        assert!(
+            (out[0].1 - Vec3::new(0.5, 1.5, 0.5)).length() < 1e-6
+                && (out[1].1 - Vec3::new(1.5, -0.5, 0.5)).length() < 1e-6,
+            "顺序 = cells 升序 × 邻居固定序:{out:?}"
         );
     }
 }

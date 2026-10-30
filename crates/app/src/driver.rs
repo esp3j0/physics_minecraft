@@ -227,6 +227,9 @@ pub fn validate_external_command(
                 Ok(())
             }
         }
+        // 复合体生成(K02 §5.6):调度器从模拟产出再注入的专用内部载荷,
+        // 外部一律拒绝(无论来源;防御层与 net::command_shard 同口径)。
+        messaging::SimCommand::SpawnCompound { .. } => Err("SpawnCompound 是调度器专用命令"),
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
