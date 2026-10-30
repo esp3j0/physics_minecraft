@@ -29,7 +29,8 @@ const DOWN: (i32, i32, i32) = (0, -1, 0);
 const INF: u64 = u64::MAX / 4;
 
 /// 粘结与整块塌落配置(REQ-010 §11;`ShardSimConfig::cohesion`)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// K01(修订 10)起含 f32 击退参数,`Eq` 由 `PartialEq` 取代。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct CohesionConfig {
     /// 总开关(D9,单元 08 起默认 `true`);与 `destruction.enabled` 同时为真才生效(§4.6),
     /// 关闭时行为与 REQ-009 完全一致。
@@ -44,6 +45,12 @@ pub struct CohesionConfig {
     pub max_fractures_per_tick: usize,
     /// 整块凝固 / 强制落地时最多上移的格数(2,§8;单元 05 使用)。
     pub compound_snap_lift: i32,
+    /// 撞击击退冲量缩放 β(0.5,§5.6;修订 10;= 0 关闭本特性;单元 K02 使用)。
+    pub load_knockback_factor: f32,
+    /// 击退后线速度上限 m/s(8.0,§5.6;单元 K02 使用)。
+    pub load_knockback_max_speed: f32,
+    /// 击退后角速度上限 rad/s(6.0,§5.6;单元 K02 使用)。
+    pub load_knockback_max_ang_speed: f32,
 }
 
 impl Default for CohesionConfig {
@@ -55,6 +62,9 @@ impl Default for CohesionConfig {
             max_converted_cells_per_tick: 1024,
             max_fractures_per_tick: 16,
             compound_snap_lift: 2,
+            load_knockback_factor: 0.5,
+            load_knockback_max_speed: 8.0,
+            load_knockback_max_ang_speed: 6.0,
         }
     }
 }
@@ -124,6 +134,10 @@ impl CohesionStats {
 pub struct CompoundRequest {
     pub origin: BlockPos,
     pub shape: types::CompoundShape,
+    /// 撞击击退冲量(REQ-010 §5.6 第 3 条;(impulse, point),point = 触发格中心,
+    /// 世界坐标)。默认空 = 无撞击来源(移柱/爆炸),零初速不变;消费(逐条
+    /// `apply_impulse_at_point` + clamp)在单元 K02 接线。
+    pub impulses: Vec<(types::glam::Vec3, types::glam::Vec3)>,
 }
 
 /// 分块请求(REQ-010 §8.3 第 3 条;单元 06、07 复用):一个实体在本拍被删除,其一部分在 N+1 作为新实体出现。

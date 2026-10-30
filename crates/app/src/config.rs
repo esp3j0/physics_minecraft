@@ -155,6 +155,9 @@ pub struct CohesionConfig {
     pub max_converted_cells_per_tick: usize,
     pub max_fractures_per_tick: usize,
     pub compound_snap_lift: i32,
+    pub load_knockback_factor: f32,
+    pub load_knockback_max_speed: f32,
+    pub load_knockback_max_ang_speed: f32,
 }
 
 impl Default for CohesionConfig {
@@ -167,6 +170,9 @@ impl Default for CohesionConfig {
             max_converted_cells_per_tick: c.max_converted_cells_per_tick,
             max_fractures_per_tick: c.max_fractures_per_tick,
             compound_snap_lift: c.compound_snap_lift,
+            load_knockback_factor: c.load_knockback_factor,
+            load_knockback_max_speed: c.load_knockback_max_speed,
+            load_knockback_max_ang_speed: c.load_knockback_max_ang_speed,
         }
     }
 }
@@ -423,6 +429,19 @@ impl Config {
                 c.compound_snap_lift
             )));
         }
+        // 撞击击退(REQ-010 §5.6 第 4 条、§11):三键 ≥ 0(β = 0 即关闭)。
+        for (name, v) in [
+            ("load_knockback_factor", c.load_knockback_factor),
+            ("load_knockback_max_speed", c.load_knockback_max_speed),
+            (
+                "load_knockback_max_ang_speed",
+                c.load_knockback_max_ang_speed,
+            ),
+        ] {
+            if v < 0.0 {
+                return Err(ConfigError::Validate(format!("{name} ({v}) 不得为负")));
+            }
+        }
         Ok(())
     }
 
@@ -544,6 +563,9 @@ impl Config {
                 max_converted_cells_per_tick: self.cohesion.max_converted_cells_per_tick,
                 max_fractures_per_tick: self.cohesion.max_fractures_per_tick,
                 compound_snap_lift: self.cohesion.compound_snap_lift,
+                load_knockback_factor: self.cohesion.load_knockback_factor,
+                load_knockback_max_speed: self.cohesion.load_knockback_max_speed,
+                load_knockback_max_ang_speed: self.cohesion.load_knockback_max_ang_speed,
             },
         }
     }
@@ -1190,6 +1212,8 @@ unload_radius = 64
     ///
     /// 变红:表没接进 shard_sim_config(分片仍用核内默认);映射漏字段或写成
     /// 核内默认;部分键解析失败。
+    ///
+    /// K01(修订 10):击退三键补默认值锚定与映射锚定(§5.6 第 4 条)。
     #[test]
     fn cohesion_config_partial_keys_and_mapping() {
         // 默认 = 核内默认,逐字段锚定(enabled 单元 08 起 true,D9)。
@@ -1204,6 +1228,21 @@ unload_radius = 64
         );
         assert_eq!(d.max_fractures_per_tick, core.max_fractures_per_tick);
         assert_eq!(d.compound_snap_lift, core.compound_snap_lift);
+        assert_eq!(d.load_knockback_factor, core.load_knockback_factor);
+        assert_eq!(d.load_knockback_max_speed, core.load_knockback_max_speed);
+        assert_eq!(
+            d.load_knockback_max_ang_speed,
+            core.load_knockback_max_ang_speed
+        );
+        assert_eq!(
+            (
+                core.load_knockback_factor,
+                core.load_knockback_max_speed,
+                core.load_knockback_max_ang_speed
+            ),
+            (0.5, 8.0, 6.0),
+            "§5.6 修订 10 初值"
+        );
         assert_eq!(
             Config::default().shard_sim_config(shard_id(0, 0)).cohesion,
             core,
@@ -1223,7 +1262,9 @@ unload_radius = 64
         // 覆写:6 键全给,逐字段映射进分片配置。
         let c = Config::from_toml_str(
             "[cohesion]\nenabled = true\nload_max_cells = 900\ncompound_split_size = 4\n\
-             max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n",
+             max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n\
+             load_knockback_factor = 0.5\nload_knockback_max_speed = 8.0\n\
+             load_knockback_max_ang_speed = 6.0\n",
         )
         .expect("合法");
         let m = c.shard_sim_config(shard_id(0, 0)).cohesion;
@@ -1234,9 +1275,12 @@ unload_radius = 64
                 m.compound_split_size,
                 m.max_converted_cells_per_tick,
                 m.max_fractures_per_tick,
-                m.compound_snap_lift
+                m.compound_snap_lift,
+                m.load_knockback_factor,
+                m.load_knockback_max_speed,
+                m.load_knockback_max_ang_speed
             ),
-            (true, 900, 4, 64, 3, 1),
+            (true, 900, 4, 64, 3, 1, 0.5, 8.0, 6.0),
             "覆写逐字段直传"
         );
 
@@ -1285,6 +1329,18 @@ unload_radius = 64
                 "[cohesion]\ncompound_snap_lift = -1\n",
                 "compound_snap_lift",
             ),
+            (
+                "[cohesion]\nload_knockback_factor = -0.5\n",
+                "load_knockback_factor",
+            ),
+            (
+                "[cohesion]\nload_knockback_max_speed = -1.0\n",
+                "load_knockback_max_speed",
+            ),
+            (
+                "[cohesion]\nload_knockback_max_ang_speed = -1.0\n",
+                "load_knockback_max_ang_speed",
+            ),
         ] {
             match Config::from_toml_str(toml) {
                 Ok(_) => panic!("非法配置应被拒绝:{toml}"),
@@ -1292,7 +1348,7 @@ unload_radius = 64
             }
         }
         // 边界合法:S = 7 与默认余量相容((7/2)·√3 + 1.65 ≈ 7.71 ≤ 8,
-        // 1024 ≥ 343);各下限恰 1。
+        // 1024 ≥ 343);各下限恰 1;击退三键 = 0 合法(β = 0 即关闭,§5.6)。
         assert!(
             Config::from_toml_str("[cohesion]\ncompound_split_size = 7\n").is_ok(),
             "S = 7 与默认余量相容"
@@ -1300,7 +1356,9 @@ unload_radius = 64
         assert!(
             Config::from_toml_str(
                 "[cohesion]\nload_max_cells = 1\ncompound_split_size = 1\n\
-                 max_converted_cells_per_tick = 1\nmax_fractures_per_tick = 1\n",
+                 max_converted_cells_per_tick = 1\nmax_fractures_per_tick = 1\n\
+                 load_knockback_factor = 0.0\nload_knockback_max_speed = 0.0\n\
+                 load_knockback_max_ang_speed = 0.0\n",
             )
             .is_ok(),
             "边界值合法"

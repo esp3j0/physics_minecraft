@@ -9431,6 +9431,58 @@ mod tests {
         assert_eq!(out.cohesion_stats.load_pending, 2, "沙段整段留下");
     }
 
+    /// §5.6 第 1/3 条(K01 回归,AC-K2/K3):无撞击来源的承载转换不携带冲量——
+    /// 移柱塌落的复合体段请求 `impulses` 为空(零初速不变,K02 起才接邻接继承),
+    /// 同拍的单格段(沙)脱落请求冲量仍为零;撞击碎块(REQ-009 §5 路径)的
+    /// 脱落请求冲量维持零(修订 8 逐位不变)。
+    ///
+    /// 变红:承载转换默认带上撞击冲量(K02 提前)或构造点漏填 impulses;
+    /// 撞击/单格路径被改带非零冲量。
+    #[test]
+    fn knockback_k01_conversions_without_impact_carry_zero_impulse() {
+        // 复合体段 + 单格段同拍:门楣 6 格(dirt)+ 沙 1 格,移柱触发。
+        let mut s = load_segment_sim(64);
+        build_door_lintel(&mut s, 64);
+        s.take_outbox();
+        remove_door_pillar(&mut s, 64);
+        let sand = setblock_input(300, BlockPos::new(67, -55, 64), voxel::builtin::SAND);
+        s.apply_prefix(&[sand]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.cohesion_stats.segments, 2, "门楣段 + 沙 1 格段");
+        assert_eq!(out.compound_requests.len(), 1);
+        assert!(
+            out.compound_requests[0].impulses.is_empty(),
+            "无撞击来源:复合体请求 impulses 默认空(AC-K2)"
+        );
+        assert_eq!(out.detach_requests.len(), 1, "沙 1 格段走单格脱落");
+        assert_eq!(
+            out.detach_requests[0].impulse,
+            Vec3::ZERO,
+            "单格转换脱落冲量为零(AC-K3)"
+        );
+        // 撞击碎块路径(REQ-009 §5):17 m/s 落体撞坏 dirt,碎块零初速(修订 8)。
+        let mut s = destruction_sim(64);
+        s.apply_prefix(&[impact_drop_input(1, entity(1), 64, -55.0, 64, -15.0)]);
+        let mut hit = None;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.destruction_stats.cells_impacted > 0 {
+                hit = Some(out);
+                break;
+            }
+        }
+        let out = hit.expect("17 m/s 应撞坏 dirt");
+        assert_eq!(out.detach_requests.len(), 1);
+        assert_eq!(
+            out.detach_requests[0].impulse,
+            Vec3::ZERO,
+            "撞击碎块零初速(修订 8,AC-K3)"
+        );
+        assert!(out.compound_requests.is_empty());
+    }
+
     /// §5.5 第 2 条(名额与格数都从零起算,与同拍爆炸共用实体名额):名额 1、
     /// 弹坑拍 + 门楣塌——爆炸 24 请求占满名额,承载转换当拍 1 个名额也没有,
     /// 6 格整段留下;下一拍名额 1 仍不够 1 段吗——够(每段 1 个实体名额),

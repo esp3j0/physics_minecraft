@@ -340,7 +340,13 @@ impl ShardSim {
                 self.outbox.cohesion_stats.compound_cells += segment.len() as u64;
                 self.outbox
                     .compound_requests
-                    .push(crate::cohesion::CompoundRequest { origin, shape });
+                    .push(crate::cohesion::CompoundRequest {
+                        origin,
+                        shape,
+                        // §5.6 第 1 条:只有撞击路径的写入带冲量;移柱等承载转换
+                        // 默认空(K02 接邻接继承)。
+                        impulses: Vec::new(),
+                    });
             }
             for &cell in &segment {
                 self.load_pending.remove(&cell);

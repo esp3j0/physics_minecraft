@@ -3346,6 +3346,7 @@ mod unit08 {
     /// 校验拒绝未知键、`load_max_cells = 0`、`compound_split_size` 为 0 或超出余量(默认 16 m 下 S = 8 → 8.58 > 8;
     /// margin 8 m 下 S = 6 → 6.85 > 4)、`max_converted_cells_per_tick < S³`、`max_fractures_per_tick = 0`、负的上移格数;
     /// S = 7 与默认余量相容(7.71 ≤ 8,1024 ≥ 343)。
+    /// K01(修订 10,AC-K4):击退三键默认 0.5/8.0/6.0、直传与 ≥ 0 校验;0 合法(β = 0 即关闭)。
     ///
     /// 会变红的实现:映射漏字段或写成默认值;校验缺项;余量没按 `margin_meters` 算。
     #[test]
@@ -3357,12 +3358,17 @@ mod unit08 {
                 d.compound_split_size,
                 d.max_converted_cells_per_tick,
                 d.max_fractures_per_tick,
-                d.compound_snap_lift
+                d.compound_snap_lift,
+                d.load_knockback_factor,
+                d.load_knockback_max_speed,
+                d.load_knockback_max_ang_speed
             ),
-            (2048, 6, 1024, 16, 2)
+            (2048, 6, 1024, 16, 2, 0.5, 8.0, 6.0)
         );
         let text = "[cohesion]\nenabled = false\nload_max_cells = 900\ncompound_split_size = 4\n\
-                    max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n";
+                    max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n\
+                    load_knockback_factor = 0.5\nload_knockback_max_speed = 8.0\n\
+                    load_knockback_max_ang_speed = 6.0\n";
         let c = Config::from_toml_str(text).expect("合法");
         assert_eq!(
             c.shard_sim_config(shard()).cohesion,
@@ -3373,15 +3379,28 @@ mod unit08 {
                 max_converted_cells_per_tick: 64,
                 max_fractures_per_tick: 3,
                 compound_snap_lift: 1,
+                load_knockback_factor: 0.5,
+                load_knockback_max_speed: 8.0,
+                load_knockback_max_ang_speed: 6.0,
             }
         );
         assert_eq!(Config::from_toml_str(&c.to_toml_string()).expect("往返"), c);
         let partial = Config::from_toml_str("[cohesion]\nload_max_cells = 100\n").expect("部分键");
-        assert_eq!(partial.cohesion.load_max_cells, 100);
-        assert_eq!(partial.cohesion.compound_split_size, 6, "未写的键取默认");
+        assert_eq!(
+            partial.cohesion.load_knockback_factor, 0.5,
+            "未写的键取默认"
+        );
         assert!(
             Config::from_toml_str("[cohesion]\ncompound_split_size = 7\n").is_ok(),
             "S = 7 与默认余量相容"
+        );
+        assert!(
+            Config::from_toml_str(
+                "[cohesion]\nload_knockback_factor = 0.0\nload_knockback_max_speed = 0.0\n\
+                 load_knockback_max_ang_speed = 0.0\n",
+            )
+            .is_ok(),
+            "击退三键 0 合法(β = 0 即关闭,§5.6)"
         );
         for bad in [
             "[cohesion]\nfoo = 1\n",
@@ -3392,6 +3411,9 @@ mod unit08 {
             "[cohesion]\ncompound_split_size = 6\nmax_converted_cells_per_tick = 215\n",
             "[cohesion]\nmax_fractures_per_tick = 0\n",
             "[cohesion]\ncompound_snap_lift = -1\n",
+            "[cohesion]\nload_knockback_factor = -0.5\n",
+            "[cohesion]\nload_knockback_max_speed = -1.0\n",
+            "[cohesion]\nload_knockback_max_ang_speed = -1.0\n",
         ] {
             assert!(Config::from_toml_str(bad).is_err(), "应拒绝:{bad}");
         }
