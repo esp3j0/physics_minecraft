@@ -47,9 +47,9 @@ pub struct CohesionConfig {
     pub compound_snap_lift: i32,
     /// 撞击击退冲量缩放 β(0.5,§5.6;修订 10;= 0 关闭本特性;单元 K02 使用)。
     pub load_knockback_factor: f32,
-    /// 击退后线速度上限 m/s(8.0,§5.6;单元 K02 使用)。
+    /// 击退后线速度上限 m/s(8.0,§5.6;取 0 = 钉死为零,裁定 2026-10-30;单元 K02 使用)。
     pub load_knockback_max_speed: f32,
-    /// 击退后角速度上限 rad/s(6.0,§5.6;单元 K02 使用)。
+    /// 击退后角速度上限 rad/s(6.0,§5.6;取 0 = 钉死为零,裁定 2026-10-30;单元 K02 使用)。
     pub load_knockback_max_ang_speed: f32,
 }
 

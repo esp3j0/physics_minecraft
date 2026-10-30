@@ -3452,13 +3452,13 @@ impl ShardSim {
         self.outbox.spawned.push(id);
     }
 
-    /// 撞击击退的施加与上限(REQ-010 §5.6 第 3 条,K02):刚体生成后逐条
-    /// `apply_impulse_at_point`(**不合并条目**,保真力矩——合并会改变 r×J 的
-    /// 合力矩);全部施加完读回 linvel/angvel,按
-    /// `load_knockback_max_speed`/`load_knockback_max_ang_speed` 对**模长**
-    /// clamp(方向不变)后写回。冲量表为空 = no-op(不移速不 wake);
-    /// clamp 上限 ≤ 0 视为不设限(与校验"≥ 0"自洽,0 上限会把速度钉死为零,
-    /// 等价关闭——语义由配置校验层保证不出现)。
+    /// 撞击击退的施加与上限(REQ-010 §5.6 第 3 条,K02;上限语义裁定
+    /// 2026-10-30):刚体生成后逐条 `apply_impulse_at_point`(**不合并条目**,
+    /// 保真力矩——合并会改变 r×J 的合力矩);全部施加完读回 linvel/angvel,
+    /// 按 `load_knockback_max_speed`/`load_knockback_max_ang_speed` 对**模长**
+    /// clamp(方向不变)后写回。冲量表为空 = no-op(不移速不 wake);上限
+    /// 无"不设限"哨兵——**取 0 语义 = 钉死为零**(长度超上限即 clamp,0 上限
+    /// 自然把速度/角速度钉零;想不设限用足够大的数值表达,§5.6 第 4 条)。
     fn apply_knockback(&mut self, id: EntityId, impulses: Vec<(Vec3, Vec3)>) {
         if impulses.is_empty() {
             return;
@@ -3487,10 +3487,10 @@ impl ShardSim {
         let body = self.phys.bodies.get_mut(handle).expect("handle 有效");
         let mut linvel = conv::rapier_to_vec3(body.linvel());
         let mut angvel = conv::rapier_to_vec3(body.angvel());
-        if v_max > 0.0 && linvel.length() > v_max {
+        if linvel.length() > v_max {
             linvel = linvel.normalize() * v_max;
         }
-        if w_max > 0.0 && angvel.length() > w_max {
+        if angvel.length() > w_max {
             angvel = angvel.normalize() * w_max;
         }
         body.set_linvel(conv::vec3_to_rapier(linvel), true);
@@ -9853,6 +9853,48 @@ mod tests {
         assert!(st.angvel.length() > 0.0 && st.angvel.z != 0.0, "翻滚保持");
     }
 
+    /// AC-K6 补(K03):上限取 0 语义 = 钉死为零,不是"不设限"——施加非零
+    /// 冲量后 linvel = Vec3::ZERO(ω_max 保持默认,角速度不受该裁定路径影响
+    /// 仍被正常 clamp)。§5.6 第 4 条(裁定 2026-10-30)。
+    ///
+    /// 变红:clamp 恢复 `> 0.0` 守卫(0 上限被当"不设限",速度无界)。
+    #[test]
+    fn knockback_k03_zero_max_speed_pins_linvel_to_zero() {
+        let mut s = load_segment_sim(64);
+        s.cfg.cohesion.load_knockback_max_speed = 0.0;
+        let e = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnCompound {
+                entity: e,
+                origin: BlockPos::new(64, -62, 64),
+                shape: types::CompoundShape::from_world(
+                    BlockPos::new(64, -62, 64),
+                    &[
+                        (BlockPos::new(64, -62, 64), voxel::builtin::STONE),
+                        (BlockPos::new(65, -62, 64), voxel::builtin::STONE),
+                    ],
+                )
+                .expect("两格"),
+                impulses: vec![(Vec3::new(120.0, 120.0, 40.0), Vec3::new(64.5, -60.5, 64.5))],
+            }),
+        }]);
+        let st = s.entity_state(e).expect("已生成");
+        assert_eq!(
+            st.linvel,
+            Vec3::ZERO,
+            "v_max = 0:线速度钉死为零(不是不设限)"
+        );
+        let w_max = s.cfg.cohesion.load_knockback_max_ang_speed;
+        assert!(
+            st.angvel.length() <= w_max + 1e-4 && st.angvel.length() > 0.0,
+            "ω_max 默认 6.0 不受影响:角速度仍正常 clamp 且非零:{:?}",
+            st.angvel
+        );
+    }
+
     /// AC-K7:impact-corner 同款几何双跑逐拍一致(outbox 遥测逐拍相同;
     /// §5.6 第 6 条确定性)。门框 = 石柱两根 + 门楣 4 格(split 4),去掉左柱,
     /// 高速方块撞拐角;两跑 sim 配置/输入序列逐位相同,断言每拍
@@ -9965,6 +10007,22 @@ mod tests {
         let st = s.entity_state(e).expect("已生成");
         assert_eq!(st.linvel, Vec3::ZERO, "零冲量施加 = 数值 no-op");
         assert_eq!(st.angvel, Vec3::ZERO);
+        // SpawnCompound 生成初态显式断言(AC-K 补,K03;K02 迁移遗留的失锚):
+        // 平移 = origin 格中心(各 +0.5)、旋转 = 单位四元数。
+        assert_eq!(
+            st.translation,
+            Vec3::new(
+                req.origin.x as f32 + 0.5,
+                req.origin.y as f32 + 0.5,
+                req.origin.z as f32 + 0.5,
+            ),
+            "平移 = 原点格中心(各 +0.5)"
+        );
+        assert_eq!(
+            st.rotation,
+            types::glam::Quat::IDENTITY,
+            "旋转 = 单位四元数"
+        );
     }
 
     /// §5.6 第 1/2 条(接线,AC-K1 的生产路径半边):真实撞击路径(17 m/s
