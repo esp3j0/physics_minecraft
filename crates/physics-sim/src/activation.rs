@@ -63,7 +63,8 @@ pub struct ActivationConfig {
     pub actor_motion_max_ticks: u64,
     /// 支撑判定法向阈值(默认 0.7)。
     pub support_normal_min: f32,
-    /// 接触/贴靠唤醒外扩 m(REQ-007 §4.10/§4.9;默认 0.075 = 站立面容差;
+    /// 接触/贴靠唤醒外扩 m(REQ-007 §4.10/§4.9;默认 0.075 = 贴靠容差
+    /// [D15 内缩后薄片外表面即格面,不再补偿薄片伸出量,原称"站立面容差"];
     /// 支撑闭包邻接判定共用)。
     pub contact_wake_skin_m: f32,
     /// 撞前预测扫掠拍数(REQ-007 §4.10.2;默认 2)。

@@ -4,7 +4,8 @@
 //! collider,否则分片接缝会产生确定性但可感知的轨迹分叉(0.26m 实测)。
 //!
 //! 体素约定(demo C/B):格 (x,y,z) 覆盖 [x,x+1)³,体素中心 (x+0.5, y+0.5, z+0.5)。
-//! 暴露面 = 6 邻居判据;面 cuboid 为薄片(half 厚 `FACE_HALF_THICKNESS`),跨在面上。
+//! 暴露面 = 6 邻居判据;面 cuboid 为薄片(half 厚 `FACE_HALF_THICKNESS`),**内缩在实心格内,
+//! 外表面落在格面上**(D15,REQ-010 §5.7.10)——碰撞几何与体素一致,1 格洞净宽恢复 1.0。
 
 use types::glam::Vec3;
 use types::{BlockId, ChunkPos, WORLD_Y_MIN};
@@ -142,8 +143,14 @@ fn extract_faces(
 }
 
 /// 面(或矩形合并后的面)→ 世界坐标 cuboid。
+///
+/// `positive`:法向朝轴正方向。薄片中心从面平面 `plane_world` 向实心格一侧移
+/// `FACE_HALF_THICKNESS`(正法向面减、负法向面加,REQ-010 §5.7.10),
+/// 外表面恰好落在格面上。
+#[allow(clippy::too_many_arguments)]
 fn face_box(
     axis: usize,
+    positive: bool,
     plane_world: f32,
     r1: usize,
     r2: usize,
@@ -166,7 +173,11 @@ fn face_box(
     let e2 = (c2 - c1 + 1) as f32;
     let mut center = [0.0f32; 3];
     let mut half = [0.0f32; 3];
-    center[axis] = plane_world;
+    center[axis] = if positive {
+        plane_world - FACE_HALF_THICKNESS
+    } else {
+        plane_world + FACE_HALF_THICKNESS
+    };
     half[axis] = FACE_HALF_THICKNESS;
     center[a1] = t1_min + r1 as f32 + e1 / 2.0;
     half[a1] = e1 / 2.0;
@@ -199,7 +210,7 @@ pub fn per_face_colliders(
                 1 => (f.lx, f.lz),
                 _ => (f.lx, f.ly),
             };
-            face_box(f.axis, plane_world, r, r, c, c, cp)
+            face_box(f.axis, f.positive, plane_world, r, r, c, c, cp)
         })
         .collect()
 }
@@ -240,14 +251,14 @@ pub fn greedy_colliders(
     }
 
     let mut out = Vec::new();
-    for ((axis, _positive, plane), group) in groups {
+    for ((axis, positive, plane), group) in groups {
         for (r1, c1, r2, c2) in merge_rects(&group.mask, group.h, group.w) {
             let plane_world = match axis {
                 0 => min.x as f32 + plane as f32,
                 1 => WORLD_Y_MIN as f32 + plane as f32,
                 _ => min.z as f32 + plane as f32,
             };
-            out.push(face_box(axis, plane_world, r1, r2, c1, c2, cp));
+            out.push(face_box(axis, positive, plane_world, r1, r2, c1, c2, cp));
         }
     }
     out
@@ -322,7 +333,7 @@ mod tests {
             solid_of,
         );
         assert_eq!(boxes.len(), 6);
-        // 朝上的面:+y 面中心在格顶,薄片沿 y
+        // 朝上的面:+y 面薄片内缩在格内(中心 = 格顶 − 0.075),薄片沿 y
         let top = boxes
             .iter()
             .find(|b| b.half.y == FACE_HALF_THICKNESS)
@@ -340,20 +351,48 @@ mod tests {
             &NeighborChunks::none(),
             solid_of,
         );
-        // +y 面:面平面在 y = WORLD_Y_MIN + 1,中心 x=0.5, z=0.5
-        let top = boxes
-            .iter()
-            .find(|b| b.center.y > WORLD_Y_MIN as f32 && b.half.y == FACE_HALF_THICKNESS)
-            .expect("+y 面");
-        assert_eq!(top.center, Vec3::new(0.5, (WORLD_Y_MIN + 1) as f32, 0.5));
-        // +x 面:面平面在 x = 1(世界),中心 z = 0.5, y = WORLD_Y_MIN + 0.5
-        let px = boxes
-            .iter()
-            .find(|b| b.half.x == FACE_HALF_THICKNESS && b.center.x == 1.0)
-            .expect("+x 面");
+        // 六个面的薄片都内缩在格内:外表面在格面上,中心 = 格面 ∓ 0.075
+        // 格 (0,0,0) 世界覆盖 x∈[0,1], y∈[WORLD_Y_MIN, WORLD_Y_MIN+1], z∈[0,1]
+        let t = FACE_HALF_THICKNESS;
+        let by_half = |axis: usize| -> Vec<Vec3> {
+            let mut v: Vec<Vec3> = boxes
+                .iter()
+                .filter(|b| {
+                    let h = [b.half.x, b.half.y, b.half.z][axis];
+                    h == FACE_HALF_THICKNESS
+                })
+                .map(|b| b.center)
+                .collect();
+            v.sort_by(|a, b| {
+                (a.x, a.y, a.z)
+                    .partial_cmp(&(b.x, b.y, b.z))
+                    .expect("有限坐标")
+            });
+            v
+        };
+        // x 面:平面 x=0 与 x=1 → 中心 x = 0 + t 与 1 − t
         assert_eq!(
-            px.center,
-            Vec3::new(1.0, (WORLD_Y_MIN + 1) as f32 - 0.5, 0.5)
+            by_half(0),
+            vec![
+                Vec3::new(t, (WORLD_Y_MIN + 1) as f32 - 0.5, 0.5),
+                Vec3::new(1.0 - t, (WORLD_Y_MIN + 1) as f32 - 0.5, 0.5),
+            ]
+        );
+        // y 面:平面 WORLD_Y_MIN 与 WORLD_Y_MIN+1 → 中心 y = WORLD_Y_MIN + t 与 WORLD_Y_MIN+1 − t
+        assert_eq!(
+            by_half(1),
+            vec![
+                Vec3::new(0.5, WORLD_Y_MIN as f32 + t, 0.5),
+                Vec3::new(0.5, (WORLD_Y_MIN + 1) as f32 - t, 0.5),
+            ]
+        );
+        // z 面:平面 z=0 与 z=1 → 中心 z = t 与 1 − t
+        assert_eq!(
+            by_half(2),
+            vec![
+                Vec3::new(0.5, (WORLD_Y_MIN + 1) as f32 - 0.5, t),
+                Vec3::new(0.5, (WORLD_Y_MIN + 1) as f32 - 0.5, 1.0 - t),
+            ]
         );
     }
 
@@ -400,11 +439,17 @@ mod tests {
         );
         let alone_px = boxes_alone
             .iter()
-            .filter(|b| b.half.x == FACE_HALF_THICKNESS && b.center.x == CHUNK_X as f32)
+            .filter(|b| {
+                b.half.x == FACE_HALF_THICKNESS
+                    && b.center.x == CHUNK_X as f32 - FACE_HALF_THICKNESS
+            })
             .count();
         let with_px = boxes_with_px
             .iter()
-            .filter(|b| b.half.x == FACE_HALF_THICKNESS && b.center.x == CHUNK_X as f32)
+            .filter(|b| {
+                b.half.x == FACE_HALF_THICKNESS
+                    && b.center.x == CHUNK_X as f32 - FACE_HALF_THICKNESS
+            })
             .count();
         assert!(alone_px > 0, "无邻居时边界生成保守面");
         assert_eq!(with_px, 0, "实心邻居抑制边界面(接缝两侧一致的关键)");
@@ -435,14 +480,30 @@ mod tests {
         assert_eq!(per.len(), 16);
         // 顶/底各合并为 1;+x/-x/+z/-z 各 1(高 1 宽 2)→ 共 6
         assert_eq!(greedy.len(), 6);
-        // 合并后的顶面盖住整个 2×2
+        // 合并后的顶面盖住整个 2×2(+y 面:取 center.y 最大的 y 向薄片)
         let top = greedy
             .iter()
-            .find(|b| b.half.y == FACE_HALF_THICKNESS && b.center.y > 0.0)
+            .filter(|b| b.half.y == FACE_HALF_THICKNESS)
+            .max_by(|a, b| a.center.y.partial_cmp(&b.center.y).expect("有限坐标"))
             .expect("顶面");
         assert_eq!(top.half, Vec3::new(1.0, FACE_HALF_THICKNESS, 1.0));
         assert_eq!(top.center.x, 1.0);
         assert_eq!(top.center.z, 1.0);
+        // 内缩:顶面薄片外表面在 chunk 顶格面(WORLD_Y_MIN + CHUNK_Y)上
+        assert_eq!(
+            top.center.y,
+            (WORLD_Y_MIN + CHUNK_Y as i32) as f32 - FACE_HALF_THICKNESS
+        );
+        // 底面薄片同规则:外表面在 chunk 底格所在平面(WORLD_Y_MIN + 383)上,中心 + t
+        let bottom = greedy
+            .iter()
+            .filter(|b| b.half.y == FACE_HALF_THICKNESS)
+            .min_by(|a, b| a.center.y.partial_cmp(&b.center.y).expect("有限坐标"))
+            .expect("底面");
+        assert_eq!(
+            bottom.center.y,
+            (WORLD_Y_MIN + CHUNK_Y as i32) as f32 - 1.0 + FACE_HALF_THICKNESS
+        );
     }
 
     #[test]

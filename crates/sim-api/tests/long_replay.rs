@@ -203,6 +203,26 @@ impl Line {
             .expect("e1 必须随后在目的片出现") as u64
             + self.offset
     }
+
+    /// e1 的跨界次数:目的片归属的连续段数(Some(dst) 段;迁移在途的双 None 拍
+    /// 不断开段)。跨片剧情完整 = e1 出源片后在目的片稳定存在,不回穿。
+    fn e1_crossing_count(&self) -> usize {
+        let mut crossings = 0usize;
+        let mut in_dst = false;
+        for s in &self.samples {
+            match (s.dst_e1.is_some(), s.src_e1.is_some()) {
+                (true, _) => {
+                    if !in_dst {
+                        crossings += 1;
+                        in_dst = true;
+                    }
+                }
+                (false, true) => in_dst = false,
+                (false, false) => {} // 迁移在途(信封拍):保持当前段
+            }
+        }
+        crossings
+    }
 }
 
 fn send_log(session: &mut Session, log: &mut CommandLog, shard: ShardId, command: SimCommand) {
@@ -341,12 +361,21 @@ fn ac8_long_replay_600_ticks_bitwise() {
     );
     assert_eq!(orig.tick_now, FINAL_TICK);
 
-    // 非退化①:迁移恰好一次,先于快照拍(快照完整携带迁移后态)。
-    let produced = orig.admitted_ticks();
-    assert_eq!(produced.len(), 1, "场景恰一次迁移:{produced:?}");
+    // 非退化①:e1 恰跨片一次,先于快照拍(快照完整携带迁移后态)。
+    // D15 内缩迁移说明:爆炸(拍 320)把地面碎块抛向东侧,内缩后碎块能滚过
+    // chunk 接缝(跨面口径被薄片檐口挡住),`migrations_admitted` 含碎块迁移
+    // (实测 19 = e1 的 1 + 碎块 18)——碎块跨界是合法行为,与考察点(快照
+    // 携带 e1 迁移后态 + 日志重放爆炸)无关;改数 e1 自身的跨界次数(采样序
+    // 列 src/dst 归属翻转),非退化语义不变。
+    let e1_crossings = orig.e1_crossing_count();
+    assert_eq!(e1_crossings, 1, "e1 恰跨片一次(跨后不回头)");
     let vanish = orig.vanish_tick();
     let appear = orig.appear_tick();
-    assert_eq!(vanish, produced[0].0, "消失拍 = 盖章入队拍");
+    let produced = orig.admitted_ticks();
+    assert!(
+        produced.contains(&Tick(vanish)),
+        "消失拍 {vanish} 是某次迁移的盖章拍:{produced:?}"
+    );
     assert_eq!(appear, vanish + 1, "信封在 produced+1 拍重建");
     assert!(
         appear <= SNAPSHOT_TICK,

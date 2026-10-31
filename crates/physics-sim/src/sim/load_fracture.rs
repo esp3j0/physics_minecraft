@@ -83,7 +83,12 @@ impl ShardSim {
         for pair in self.phys.narrow_phase.contact_pairs() {
             let key1 = pair.collider1.into_raw_parts();
             let key2 = pair.collider2.into_raw_parts();
-            for m in pair.manifolds() {
+            // 读解算器实际使用的流形(REQ-010 §5.7.10 末条、AC-F17;同
+            // `evaluate_impacts`):多流形对被 contact clustering 合并解算,
+            // 冲量只回写在簇上,plain 流形恒 0。簇的 `subshape_pos = None`、
+            // 接触点已折算到碰撞体坐标系——本采样只按 collider(格)聚合,
+            // 不用子形状位姿,不受影响。
+            for m in pair.solver_manifolds() {
                 // 法向为 world 系、以碰撞体 1 → 2 为正:对 1 侧"指向本体内部"
                 // = −normal,对 2 侧 = +normal(与撞击采样"撞击方向"互为反向量)。
                 for (key, dir_into) in [(key1, -m.data.normal), (key2, m.data.normal)] {

@@ -160,8 +160,8 @@ fn cube_rests_on_voxel_terrain() {
         s.step();
     }
     let y = s.entity_state(entity(1)).expect("实体仍在").translation.y;
-    // 顶面 136 + 薄片半厚 0.075(暴露面跨在面平面上)+ 半格 0.5
-    assert!((y - 136.575).abs() < 0.05, "静止在顶面薄片上:y={y}");
+    // 顶面 136 + 半格 0.5(D15 内缩:薄片外表面贴在格面上,不再 +0.075 垫高)
+    assert!((y - 136.5).abs() < 0.05, "静止在顶面薄片上:y={y}");
 }
 
 /// SetBlock → 该 chunk collider 重建:空中新方块挡住下落路径。
@@ -187,10 +187,10 @@ fn set_block_rebuilds_chunk_collider() {
         s.step();
     }
     let y = s.entity_state(entity(1)).expect("实体仍在").translation.y;
-    // 新方块顶面 141 + 薄片半厚 0.075 + 半格 0.5 = 141.575;未重建会落到 136.575
+    // 新方块顶面 141 + 半格 0.5 = 141.5(D15 内缩);未重建会落到 136.5
     assert!(
-        (y - 141.575).abs() < 0.05,
-        "停在新放的方块上:y={y}(未重建则 =136.575)"
+        (y - 141.5).abs() < 0.05,
+        "停在新放的方块上:y={y}(未重建则 =136.5)"
     );
 }
 

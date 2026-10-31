@@ -2806,8 +2806,10 @@ impl ShardSim {
     /// `phys.step()` 与补偿收集之后——接触冲量是本步解算写入的,随后凝固/
     /// 迁移删掉的实体不影响本拍已采到的冲量)。遍历"醒着的动态实体 ↔ 地形
     /// chunk 复合体"接触对:对每个 `data.impulse > 0` 的接触点,取地形一侧的
-    /// 位置,沿"指向实体"的法向**反方向**退 [`IMPACT_SAMPLE_DEPTH`](越过薄片
-    /// 半厚)取所在格;同一格的冲量相加(方块平落时冲量分摊在 4 个角点)。
+    /// 位置,沿"指向实体"的法向**反方向**退 [`IMPACT_SAMPLE_DEPTH`] 取所在格
+    /// (0.1 m 覆盖斜交法向与棱角接触的采样余量;D15 内缩后接触点已落在实心格
+    /// 表面,不再需要越过伸出的薄片,余量更大);同一格的冲量相加(方块平落时
+    /// 冲量分摊在 4 个角点)。
     /// J ≥ 材料的 `impact_threshold` → 脱落(不粉碎),脱落冲量 `(J − I)·d`
     /// (`d` = 撞击方向,把碎块压向地形,§5 风险 5 允许再撞)。上限 =
     /// `max_impact_breaks_per_tick` 与每拍剩余名额取小,按冲量降序(同值
@@ -2924,12 +2926,15 @@ impl ShardSim {
                 .get(terrain_collider)
                 .expect("地形 collider 在场")
                 .position();
-            // §5 口径 = `ContactManifold` 的每个点(pair.manifolds())。解算器
-            // 对多流形对(碎块嵌在坑里同时贴 4 面坑壁)启用 contact clustering,
-            // 冲量只写进 solver 簇、plain 流形不再回写——那些冲量是出生碎块与
-            // 坑壁薄片重叠的退插伪冲量,不该当撞击(§5 自激风险的边界);平面
-            // 落体是单流形对,plain 流形直接持有解算冲量,与 spike 逐位一致。
-            for m in pair.manifolds() {
+            // §5 口径 = 解算器实际使用的流形(`pair.solver_manifolds()`;REQ-010
+            // §5.7.10 末条、AC-F17)。地形 chunk 是复合形状:一对碰撞体多于 1 个
+            // 流形时 rapier 的 contact clustering 把同法向流形合并成簇、只对簇
+            // 解算,冲量只回写在簇上(plain `pair.manifolds()` 恒 0)——多流形
+            // 对读 plain 会丢冲量(D15 内缩前即存在的潜在缺陷,单流形的平面落体
+            // 不受影响)。REQ-009 旧口径读 plain 并非"恰排伪冲量"的设计:坑内
+            // 对挤的伪冲量由修订 9 接近速度过滤排除。未聚簇时该访问器就是
+            // plain 流形,单流形行为逐位不变。
+            for m in pair.solver_manifolds() {
                 // 法向为 world 系、以碰撞体 1 → 2 为正(风险 1):按实体在
                 // 1/2 定"指向实体"的法向,撞击方向 d = 其反方向(压向地形)。
                 let dir = if entity_is_1 {
@@ -2958,7 +2963,8 @@ impl ShardSim {
                     } else {
                         terrain_pos * subshape * pt.local_p2
                     };
-                    // 沿"指向实体"的反方向退 0.1 m 取所在格(§5)。
+                    // 沿"指向实体"的反方向退 0.1 m 取所在格(§5;0.1 覆盖斜交
+                    // 法向与棱角接触,D15 内缩后接触点已在实心格表面)。
                     let q = p + dir * crate::destruction::IMPACT_SAMPLE_DEPTH;
                     let cell =
                         BlockPos::new(q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32);
@@ -6599,9 +6605,10 @@ mod tests {
                     if !terrain.contains(&other) {
                         continue;
                     }
-                    for m in pair.manifolds() {
+                    for m in pair.solver_manifolds() {
                         // 法向断言只看带冲量的流形:侧面对挤的流形(法向 ±X)
-                        // 冲量恒 0,不参与撞击。
+                        // 冲量恒 0,不参与撞击。(读冲量 → solver_manifolds,
+                        // AC-F17 同口径。)
                         let has_impulse = m.points.iter().any(|p| p.data.impulse > 0.0);
                         if has_impulse && m.data.normal.y.abs() < 0.99 {
                             normal_y_ok = false;
@@ -10428,6 +10435,65 @@ mod tests {
             let t = s.take_outbox().destruction_stats;
             assert_eq!(t.cells_impacted, 0, "落定后无冲量,不推迟:{t:?}");
         }
+    }
+
+    /// AC-F17(§5.7.10 末条):**同一对碰撞体两个同法向流形**的撞击采样冲量
+    /// 合计 ≈ 单流形工况(±10%)——`solver_manifolds()` 读口径下聚簇不丢冲量。
+    /// 双流形构造:平地挖 1 格宽、1 格深的坑,2 格石条横跨坑上落下——条的两半
+    /// 分别触及坑两侧的合并顶面薄片(同 chunk、法向都 +y、greedy 不合并,中间
+    /// 隔坑)→ 接触对 2 流形 → rapier 聚簇成 1 簇解算(实测 pair plain=2、
+    /// solver=1);对照 = 同一条落平地(底面压在一整块合并薄片上,plain=solver=1)。
+    /// 复合体走均摊口径(§7.3 第 7 条),25 m/s 落体均摊冲量 > dirt 阈值 7,
+    /// 两工况都撞碎。会变红的实现:读回 plain 流形(聚簇生效时 plain 恒 0 →
+    /// 骑坑工况无撞击);关掉聚簇(违反裁定,且单流形对照不再同口径)。
+    #[test]
+    fn impact_dual_manifold_seam_matches_single_manifold() {
+        // 骑坑:坑挖在 (70,-61,70);石条 2 格,质心 x=70.5(格 69/70 分界)——
+        // 两半各压坑一侧顶面;对照:质心 (66.5,·,74.5) 落平地(单流形)。
+        // 比较对象 = 撞击拍 `impact_impulses` 冲量矢量和的幅值(同表口径)。
+        let drop_bar = |cx: f32, cz: f32, dig: bool, tag: &str| -> Vec3 {
+            let mut s = destruction_sim(64);
+            if dig {
+                s.apply_prefix(&[setblock_input(
+                    1,
+                    BlockPos::new(70, -61, 70),
+                    voxel::builtin::AIR,
+                )]);
+            }
+            s.apply_prefix(&[compound_spawn_input(
+                2,
+                entity(1),
+                EntityState {
+                    translation: Vec3::new(cx, -55.0, cz),
+                    rotation: types::glam::Quat::IDENTITY,
+                    linvel: Vec3::new(0.0, -25.0, 0.0),
+                    angvel: Vec3::ZERO,
+                },
+                beam_shape(2),
+            )]);
+            let mut found = None;
+            for _ in 0..40 {
+                s.step();
+                let out = s.take_outbox();
+                if out.destruction_stats.cells_impacted > 0 {
+                    found = Some(out);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| panic!("{tag}: 应有撞击(plain 读口径下双流形丢冲量)"));
+            s.impact_impulses.values().sum()
+        };
+        let j_single = drop_bar(66.5, 74.5, false, "单流形(落平地)");
+        let j_seam = drop_bar(70.5, 70.5, true, "骑坑(两侧薄片,双流形)");
+        let single_len = j_single.length();
+        let seam_len = j_seam.length();
+        assert!(single_len > 0.0, "单流形工况冲量非零:{j_single:?}");
+        let rel = (seam_len - single_len).abs() / single_len;
+        assert!(
+            rel < 0.10,
+            "AC-F17:骑坑冲量合计 |{seam_len:.3}| vs 平地 |{single_len:.3}| 偏差 {:.1}% ≥ 10%",
+            rel * 100.0
+        );
     }
 
     /// §5 范围 5:总开关关闭不检测——同样的 17 m/s 撞击,关闭时零计数、零写入。

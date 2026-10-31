@@ -1800,7 +1800,7 @@ mod unit03a {
     }
 
     /// AC-C5 逐格碰撞体(§5.4 第 3 条):地面挖一条 4 格宽、1 格深的沟(x 61..=64),6 格石梁(x 60..=65)从 2 m 高
-    /// 平落——两端的格搭在沟沿上,整根梁停在地面高度(格中心 y ≈ −59.475:地表薄片跨在 y = −60 的面上,顶面 −59.925)、不转、不掉进沟里;描述(含形状)保持不变。
+    /// 平落——两端的格搭在沟沿上,整根梁停在地面高度(格中心 y ≈ −59.55:地表薄片内缩在 y = −60 的面下,顶面 −60,梁中心 −60 + 0.45;D15 内缩,原 +0.525)、不转、不掉进沟里;描述(含形状)保持不变。
     ///
     /// 会变红的实现:复合体只建了原点那一个碰撞体(原点在沟正上方,整根梁掉进沟里,y ≈ −60.475);
     /// 偏移没随刚体旋转;迁移/重建时丢了形状。
@@ -1833,8 +1833,8 @@ mod unit03a {
         }
         let state = s.entity_state(sh, id).expect("梁还是实体(本单元不凝固)");
         assert!(
-            (state.translation.y - (-59.475)).abs() < 0.06,
-            "搭在沟沿上:原点 y ≈ −59.475,实际 {}",
+            (state.translation.y - (-59.55)).abs() < 0.06,
+            "搭在沟沿上:原点 y ≈ −59.55,实际 {}",
             state.translation.y
         );
         assert!(
@@ -4618,5 +4618,411 @@ mod unit_f01 {
                     }
             })
             .sum::<f32>()
+    }
+}
+
+/// 单元 F05:地形薄片内缩(D15,REQ-010 §5.7.10;AC-F13–F15)。
+///
+/// - AC-F13 薄片几何(纯函数):六个方向、合并薄片、chunk 边界面、`WORLD_Y_MIN`
+///   底面——每块薄片的外表面都在格面上(中心 = 格面 ∓ `FACE_HALF_THICKNESS`,
+///   正法向面减、负法向面加),半厚 0.075 不变;
+/// - AC-F14 通过与落坑(生产路径,破坏关闭):1 格宽、2 格高门洞能穿过(跨面
+///   口径净宽 0.85,挡住 0.9 宽实体)、1 格坑能落底静止;
+/// - AC-F15 静置高度:单格、6 格条、2×2×2 复合体静置平地,中心 = 地表 + 0.45
+///   (复合体按最低格计)。
+mod unit_f05 {
+
+    use messaging::InputSource;
+    use physics_sim::collider_build::{
+        BoxCollider, FACE_HALF_THICKNESS, NeighborChunks, greedy_colliders, per_face_colliders,
+    };
+    use physics_sim::destruction::{DEBRIS_HALF_SIZE, DestructionConfig};
+    use physics_sim::{ShardSim, ShardSimConfig, SolidifyConfig};
+    use shard::SchedulerConfig;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::{Quat, Vec3};
+    use types::{
+        BlockId, BlockPos, ChunkPos, CompoundShape, DimensionId, EntityDesc, EntityId, EntityState,
+        ShardId, ShardPos, WORLD_Y_MIN, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, Chunk, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const AIR: BlockId = builtin::AIR;
+    const T: f32 = FACE_HALF_THICKNESS;
+
+    fn shard(x: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, 0))
+    }
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// 破坏与凝固关闭的会话(chunk x ∈ `cx`、z 2..=5 载 Superflat classic:
+    /// 底层 bedrock + 3 层 dirt,地表外表面 = −60)。
+    fn session(shards: &[i32], cx: std::ops::RangeInclusive<i32>) -> Session {
+        let mut s = Session::new(cfg());
+        for &x in shards {
+            let mut c = ShardSimConfig::new(shard(x));
+            c.destruction = DestructionConfig {
+                enabled: false,
+                ..DestructionConfig::default()
+            };
+            c.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            let mut sim = ShardSim::new(c, registry());
+            for cxx in cx.clone() {
+                for z in 2..=5 {
+                    let cp = ChunkPos::new(cxx, z);
+                    sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+                }
+            }
+            s.register(sim);
+        }
+        s
+    }
+
+    fn spawn_at(
+        s: &mut Session,
+        sh: ShardId,
+        id: EntityId,
+        pos: Vec3,
+        desc: &EntityDesc,
+        linvel: Vec3,
+    ) {
+        s.spawn_owned(
+            sh,
+            id,
+            EntityState {
+                translation: pos,
+                rotation: Quat::IDENTITY,
+                linvel,
+                angvel: Vec3::ZERO,
+            },
+            desc.clone(),
+            InputSource(7),
+        )
+        .expect("spawn");
+    }
+
+    /// 复合体描述:原点 = 首格(cells 按升序构造,首格即最低/最小格)。
+    fn cells_desc(cells: &[(BlockPos, BlockId)]) -> EntityDesc {
+        let origin = cells[0].0;
+        let shape = CompoundShape::from_world(origin, cells).expect("≥ 2 格");
+        EntityDesc::compound(DEBRIS_HALF_SIZE, shape)
+    }
+
+    // ------------------------------------------------------------------ AC-F13
+
+    fn chunk_with(cells: &[(usize, usize, usize)]) -> Chunk {
+        let mut c = Chunk::air();
+        for &(x, ly, z) in cells {
+            c.set(x, ly, z, STONE);
+        }
+        c
+    }
+
+    /// 按轴取该轴半长 = T 的薄片中心集(按 (x,y,z) 升序)。
+    fn centers_on_axis(boxes: &[BoxCollider], axis: usize) -> Vec<Vec3> {
+        let mut v: Vec<Vec3> = boxes
+            .iter()
+            .filter(|b| [b.half.x, b.half.y, b.half.z][axis] == T)
+            .map(|b| b.center)
+            .collect();
+        v.sort_by(|a, b| {
+            a.x.total_cmp(&b.x)
+                .then(a.y.total_cmp(&b.y))
+                .then(a.z.total_cmp(&b.z))
+        });
+        v
+    }
+
+    /// AC-F13 薄片几何(§5.7.10,纯函数):六方向面薄片、合并薄片、chunk 边界面、
+    /// `WORLD_Y_MIN` 底面——外表面都在格面上(中心 = 格面 ∓ T),半厚不变。
+    ///
+    /// 会变红的实现:薄片中心回 `plane`(跨面口径,外表面高出格面 0.075);
+    /// 内缩方向取反(薄片伸向空气侧);合并薄片与逐面薄片口径不一致;
+    /// 输出不确定(同输入两次构造不同)。
+    #[test]
+    fn acc_f13_slab_outer_surface_on_cell_face() {
+        let solid = |b: BlockId| !b.is_air();
+        let cp = ChunkPos::new(3, -2);
+        let min = cp.block_min();
+        let min_x = min.x as f32;
+        let min_z = min.z as f32;
+        let y0 = WORLD_Y_MIN as f32;
+
+        // ① 六方向:孤立方块(局部 (5,100,5)),三轴各两块薄片中心逐块核对。
+        let boxes = per_face_colliders(
+            &chunk_with(&[(5, 100, 5)]),
+            cp,
+            &NeighborChunks::none(),
+            solid,
+        );
+        assert_eq!(boxes.len(), 6, "孤立方块 6 面齐");
+        let cy = y0 + 100.5;
+        let cz = min_z + 5.5;
+        assert_eq!(
+            centers_on_axis(&boxes, 0),
+            vec![
+                Vec3::new(min_x + 5.0 + T, cy, cz),
+                Vec3::new(min_x + 6.0 - T, cy, cz),
+            ],
+            "x 面:中心 = 格面 ∓ T"
+        );
+        let cx = min_x + 5.5;
+        assert_eq!(
+            centers_on_axis(&boxes, 1),
+            vec![
+                Vec3::new(cx, y0 + 100.0 + T, cz),
+                Vec3::new(cx, y0 + 101.0 - T, cz),
+            ],
+            "y 面:中心 = 格面 ∓ T"
+        );
+        assert_eq!(
+            centers_on_axis(&boxes, 2),
+            vec![
+                Vec3::new(cx, cy, min_z + 5.0 + T),
+                Vec3::new(cx, cy, min_z + 6.0 - T),
+            ],
+            "z 面:中心 = 格面 ∓ T"
+        );
+
+        // ② 合并薄片:2×2 顶层平台(greedy)顶/底面合并为一整块,外表面仍在格面上。
+        let mut platform = Chunk::air();
+        for x in 4..=5 {
+            for z in 4..=5 {
+                platform.set(x, 100, z, STONE);
+            }
+        }
+        let greedy = greedy_colliders(&platform, cp, &NeighborChunks::none(), solid);
+        let top = greedy
+            .iter()
+            .filter(|b| b.half.y == T)
+            .max_by(|a, b| a.center.y.total_cmp(&b.center.y))
+            .expect("顶面薄片");
+        assert_eq!(top.half, Vec3::new(1.0, T, 1.0), "2×2 顶面合并为一整块");
+        assert_eq!(top.center.y, y0 + 101.0 - T, "合并薄片外表面在顶格面上");
+        let bottom = greedy
+            .iter()
+            .filter(|b| b.half.y == T)
+            .min_by(|a, b| a.center.y.total_cmp(&b.center.y))
+            .expect("底面薄片");
+        assert_eq!(bottom.center.y, y0 + 100.0 + T, "合并底面薄片同规则");
+
+        // ③ chunk 边界面与 `WORLD_Y_MIN` 底面:底层格 (6,0,6),无邻居 → 边界外按
+        // 空气,6 面齐;+x 边界面与 −y 底面外表面都在各自格面上。
+        let boxes = per_face_colliders(
+            &chunk_with(&[(6, 0, 6)]),
+            cp,
+            &NeighborChunks::none(),
+            solid,
+        );
+        assert_eq!(boxes.len(), 6, "底层孤立方块仍 6 面齐");
+        let bottom = boxes
+            .iter()
+            .filter(|b| b.half.y == T)
+            .min_by(|a, b| a.center.y.total_cmp(&b.center.y))
+            .expect("底面薄片");
+        assert_eq!(
+            bottom.center.y,
+            y0 + T,
+            "WORLD_Y_MIN 底面薄片外表面在 y = WORLD_Y_MIN 上"
+        );
+        let px = boxes
+            .iter()
+            .filter(|b| b.half.x == T)
+            .max_by(|a, b| a.center.x.total_cmp(&b.center.x))
+            .expect("+x 边界面薄片");
+        assert_eq!(
+            px.center.x,
+            min_x + 7.0 - T,
+            "+x 边界面薄片外表面在 chunk 界面上"
+        );
+
+        // ④ 确定性:同一输入两次构造逐位相等。
+        let again = per_face_colliders(
+            &chunk_with(&[(6, 0, 6)]),
+            cp,
+            &NeighborChunks::none(),
+            solid,
+        );
+        assert_eq!(boxes, again, "同输入同输出");
+    }
+
+    // ------------------------------------------------------------------ AC-F14
+
+    /// AC-F14 通过(§5.7.10):单格(0.45 半边长)以 5 m/s 贴地滑向 1 格厚墙上的
+    /// 1 格宽、2 格高门洞,能穿过去(终态越过墙面,高度不变)。内缩后洞净宽 1.0,
+    /// 0.9 宽实体两侧各余 0.05;跨面口径薄片伸进洞口各 0.075,净宽 0.85 < 0.9。
+    ///
+    /// 会变红的实现:薄片回跨面口径(实体卡在洞口,终态 x 停在墙上游)。
+    #[test]
+    fn acc_f14_doorway_passage() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6);
+        // 墙:1 格厚(x=70)、4 格高(y=-60..-57)、z 60..=68,坐落在地表上;
+        // 门洞 = 跳过 (70,-60,64) 与 (70,-59,64)(1 格宽、2 格高,洞底 = 地表)。
+        for y in -60..=-57 {
+            for z in 60..=68 {
+                if z == 64 && (-60..=-59).contains(&y) {
+                    continue;
+                }
+                s.set_block(sh, p(70, y, z), STONE).expect("砌墙");
+            }
+        }
+        s.tick();
+        let id = EntityId::from_parts(0, 1);
+        // 贴地出生(中心 = 地表 -60 + 0.45 = -59.55),紧贴洞口上游;5 m/s、摩擦
+        // 0.6 的滑行距离 ≈ 25/(2·0.6·9.81) ≈ 2.1 m,足以整体越过墙面(需 ~1.95 m)。
+        spawn_at(
+            &mut s,
+            sh,
+            id,
+            Vec3::new(69.5, -59.55, 64.5),
+            &EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: STONE,
+                shape: None,
+            },
+            Vec3::new(5.0, 0.0, 0.0),
+        );
+        for _ in 0..180 {
+            s.tick();
+        }
+        let st = s.entity_state(sh, id).expect("实体仍在");
+        assert!(
+            st.translation.x > 71.0,
+            "AC-F14:单格 5 m/s 穿过 1 格宽门洞(终态 x = {},须 > 71)",
+            st.translation.x
+        );
+        assert!(
+            (st.translation.z - 64.5).abs() < 0.2,
+            "沿门洞轴线直行:z = {}",
+            st.translation.z
+        );
+        assert!(
+            (st.translation.y - (-59.55)).abs() < 0.02,
+            "贴地穿行不翻越(y = {})",
+            st.translation.y
+        );
+        s.shutdown();
+    }
+
+    /// AC-F14 落坑(§5.7.10):单格(0.45 半边长)居中落进 1 格宽、1 格深的坑,
+    /// 静止在坑底,中心 = 坑底面 + 0.45(±0.01),不横移。坑 = 挖掉地表层
+    /// (70,-61,64),坑底面 = -61;内缩后坑净宽 1.0(跨面 0.85 卡坑口)。
+    ///
+    /// 会变红的实现:薄片回跨面口径(实体卡在坑口,中心高于坑底静置位)。
+    #[test]
+    fn acc_f14_pit_landing() {
+        let sh = shard(0);
+        let mut s = session(&[0], 2..=6);
+        s.set_block(sh, p(70, -61, 64), AIR).expect("挖坑");
+        s.tick();
+        let id = EntityId::from_parts(0, 1);
+        spawn_at(
+            &mut s,
+            sh,
+            id,
+            Vec3::new(70.5, -55.0, 64.5),
+            &EntityDesc {
+                half_size: DEBRIS_HALF_SIZE,
+                block: STONE,
+                shape: None,
+            },
+            Vec3::ZERO,
+        );
+        for _ in 0..300 {
+            s.tick();
+        }
+        let st = s.entity_state(sh, id).expect("实体仍在");
+        assert!(
+            (st.translation.y - (-60.55)).abs() < 0.01,
+            "AC-F14:落坑静止中心 = 坑底面 -61 + 0.45(实际 y = {})",
+            st.translation.y
+        );
+        assert!(
+            (st.translation.x - 70.5).abs() < 0.05 && (st.translation.z - 64.5).abs() < 0.05,
+            "居中不横移:x = {},z = {}",
+            st.translation.x,
+            st.translation.z
+        );
+        s.shutdown();
+    }
+
+    // ------------------------------------------------------------------ AC-F15
+
+    /// AC-F15 静置高度(§5.7.10):单格、6 格条、2×2×2 复合体从静置位上方 2 m
+    /// 落到平地,静止中心 = 地表 + 0.45(复合体按最低格计;±0.01)。D15 内缩:
+    /// 薄片外表面贴在格面上,静置位与体素几何一致(原跨面口径为 +0.525)。
+    ///
+    /// 会变红的实现:薄片回跨面(全体 +0.525);内缩方向取反(+0.375)。
+    #[test]
+    fn acc_f15_rest_heights_on_flat_ground() {
+        // 地表外表面 = -60(顶面实心格 y=-61 的顶面薄片贴在 -60 上)。
+        let rest_low = -60.0 + 0.45;
+        let single = EntityDesc {
+            half_size: DEBRIS_HALF_SIZE,
+            block: STONE,
+            shape: None,
+        };
+        let bar_cells: Vec<(BlockPos, BlockId)> =
+            (64..70).map(|x| (p(x, -55, 70), STONE)).collect();
+        let mut cube_cells: Vec<(BlockPos, BlockId)> = Vec::new();
+        for x in 64..66 {
+            for y in -56..=-55 {
+                for z in 69..=70 {
+                    cube_cells.push((p(x, y, z), STONE));
+                }
+            }
+        }
+        // (标签, 描述, 出生原点 x, z):原点 = 形状最低格(cells 首格),
+        // 出生原点中心在静置位上方 2 m;三种形状都落在同一块平地(chunk (4,4))。
+        let cases: Vec<(&str, EntityDesc, f32, f32)> = vec![
+            ("单格", single, 66.5, 70.5),
+            ("6 格条", cells_desc(&bar_cells), 66.5, 70.5),
+            ("2×2×2", cells_desc(&cube_cells), 64.5, 69.5),
+        ];
+        for (tag, desc, sx, sz) in &cases {
+            let sh = shard(0);
+            let mut s = session(&[0], 2..=6);
+            let id = EntityId::from_parts(0, 1);
+            spawn_at(
+                &mut s,
+                sh,
+                id,
+                Vec3::new(*sx, rest_low + 2.0, *sz),
+                desc,
+                Vec3::ZERO,
+            );
+            for _ in 0..240 {
+                s.tick();
+            }
+            let st = s.entity_state(sh, id).expect("实体仍在");
+            assert!(
+                (st.translation.y - rest_low).abs() < 0.01,
+                "AC-F15 {tag}:静置中心 = 地表 -60 + 0.45(实际 y = {})",
+                st.translation.y
+            );
+            s.shutdown();
+        }
     }
 }

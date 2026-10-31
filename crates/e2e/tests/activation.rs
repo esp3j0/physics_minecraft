@@ -276,10 +276,11 @@ fn frozen_entity_immune_to_blast_then_wakes() {
 
     // ---- 观察者移到远者一侧;冷却 180 拍后唤醒 ----
     sched.set_observers(vec![obs2]);
-    // 冷却窗:冻结簿记在拍 31(贴地驻留 ≈拍 10 后 slow_ticks 计满 20,决策
-    // +落实滞后;实测唤醒拍 212 = 31 + 180 + 1)。74..212 全程冻结,
-    // 拍 212 唤醒。
-    for k in 74..212 {
+    // 冷却窗:冻结簿记在拍 21(D15 内缩:出生 y=64.5 恰在地表格面上,无跨面
+    // 口径薄片顶上方的 0.075 下落,~拍 5 即静止、slow_ticks ≈拍 1 计满 →
+    // 决策+落实的簿记提前;跨面口径簿记 = 31。实测唤醒拍 201 = 21 + 180)。
+    // 74..201 全程冻结,拍 201 唤醒。
+    for k in 74..201 {
         sched.tick();
         assert_eq!(
             st!(far),
@@ -287,14 +288,14 @@ fn frozen_entity_immune_to_blast_then_wakes() {
             "拍 {k}:观察者已在唤醒半径内,但冷却窗(180 拍)未到 → 仍冻结"
         );
     }
-    sched.tick(); // 执行第 212 拍:激活时钟 212 - 冻结簿记 31 ≥ 180 → 唤醒
+    sched.tick(); // 执行第 201 拍:激活时钟 201 - 冻结簿记 21 ≥ 180 → 唤醒
     // 唤醒判据用状态不等:解冻后接触修正可能把 y 推高;但状态必不再恒等冻结值。
     let woke = st!(far);
     assert_ne!(
         woke, frozen_far,
         "冷却期满唤醒:动力学恢复,状态必须脱离冻结位姿(此前 180 拍位级恒等)"
     );
-    for k in 213..222 {
+    for k in 202..212 {
         sched.tick();
         assert_ne!(st!(far), frozen_far, "拍 {k}:解冻后不再悬停");
     }
@@ -312,13 +313,15 @@ fn frozen_entity_immune_to_blast_then_wakes() {
     let ne_pre = st!(near);
     // 爆心 (40, 64.0, 56) 半径 40:近者距 ≈17.6 → 冲量 ≈9(-z);
     // 远者距 ≈19 → 冲量 ≈8.3(+z 分量 ≈7.4,压过当时 ≈1.3 的下落速度)。
+    // 再爆拍随唤醒拍提前(D15 内缩,唤醒 201):唤醒后 11 拍内引爆,
+    // 避免远者醒后重新睡去(内缩贴格面静止 20+ 拍即 rapier 睡眠,睡体不响应爆炸)。
     sched
         .submit(
             shard,
-            detonate(Tick(222), 3, Vec3::new(40.0, GROUND_TOP, 56.0), 16.0, 40.0),
+            detonate(Tick(212), 3, Vec3::new(40.0, GROUND_TOP, 56.0), 16.0, 40.0),
         )
         .expect("收件箱未满");
-    sched.tick(); // 执行第 222 拍
+    sched.tick(); // 执行第 212 拍
     let fe = st!(far);
     let ne = st!(near);
     assert!(

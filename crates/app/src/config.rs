@@ -55,7 +55,8 @@ pub struct ActivationConfig {
     pub support_normal_min: f32,
     /// 撞前预测扫掠拍数。
     pub contact_wake_lookahead_ticks: u64,
-    /// 接触/贴靠唤醒外扩 m(04b 实测校准,修订 10 回写)。
+    /// 接触/贴靠唤醒外扩 m(04b 实测校准,修订 10 回写;D15 内缩后称"贴靠容差",
+    /// 不再补偿薄片伸出量,数值不变)。
     pub contact_wake_skin_m: f32,
     /// 种子与传播门槛 kg·m/s。
     pub contact_wake_min_momentum: f32,
