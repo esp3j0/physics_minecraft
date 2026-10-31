@@ -768,6 +768,7 @@ mod unit01 {
             support,
             pulverize_factor: 2.0,
             bond: BOND_INFINITE,
+            impact_crush: f32::INFINITY,
         };
         assert_eq!(
             reg.register_with_material("stone", inf(Support::Connected)),
@@ -3416,6 +3417,909 @@ mod unit08 {
             "[cohesion]\nload_knockback_max_ang_speed = -1.0\n",
         ] {
             assert!(Config::from_toml_str(bad).is_err(), "应拒绝:{bad}");
+        }
+    }
+}
+
+/// 单元 F01:材料与纯函数(AC-F1–F4 的纯函数部分;REQ-010 §5.7,修订 11)。
+/// 只写纯函数与测试,不接入 `evaluate_impacts`、不加配置键(F02)。
+mod unit_f01 {
+    use physics_sim::impact_flow::{
+        ImpactBodyProps, ImpactEvent, component_center_of_mass, distribute_momentum,
+        effective_mass, evaluate_impact_flow, min_impact, segment_velocity,
+    };
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
+    use types::glam::Vec3;
+    use types::{BlockId, BlockPos, WORLD_Y_MIN};
+    use voxel::{BlockRegistry, Material, SimpleRegistry, Support, builtin};
+
+    const STONE: BlockId = builtin::STONE;
+    const DIRT: BlockId = builtin::DIRT;
+    const SAND: BlockId = builtin::SAND;
+    const BEDROCK: BlockId = builtin::BEDROCK;
+    const AIR: BlockId = builtin::AIR;
+    const MAX_CELLS: usize = 1024;
+
+    /// 量化单位(0.001 N·s)。
+    const QUANT: u64 = 1000;
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    /// 体素世界:map 命中 = 该方块;未命中 = AIR(全域已装载、全域本体区)。
+    /// 需要未装载/本体区外的汇点时用 `partial_world` / 带 core 的世界。
+    fn world_of(
+        cells: impl IntoIterator<Item = (BlockPos, BlockId)>,
+    ) -> impl Fn(BlockPos) -> Option<BlockId> {
+        let map: BTreeMap<BlockPos, BlockId> = cells.into_iter().collect();
+        move |q| Some(map.get(&q).copied().unwrap_or(AIR))
+    }
+
+    fn all_core() -> impl Fn(BlockPos) -> bool {
+        |_| true
+    }
+
+    /// d̂ = (−1,0,0) 横撞;作用点 = 命中格中心。
+    fn side(hit: BlockPos, s: f32) -> ImpactEvent {
+        ImpactEvent {
+            supplies: vec![(hit, s)],
+            impulse: Vec3::new(-s, 0.0, 0.0),
+            point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+        }
+    }
+
+    fn cells_sorted(v: &[BlockPos]) -> Vec<BlockPos> {
+        let mut s = v.to_vec();
+        s.sort();
+        s
+    }
+
+    // ------------------------------------------------------------------ AC-F1
+
+    /// AC-F1 材料:内置 I_c 值(stone/dirt/sand = 72/28/16 = 4·I)、bedrock 与
+    /// 未指定材料 ∞、两格取较小值、I/B 与既有方块 ID 不变。
+    ///
+    /// 会变红的实现:I_c 抄错倍率;两格取了较大值;ID 顺序变化(存档兼容)。
+    #[test]
+    fn acc_f1_materials() {
+        let reg = SimpleRegistry::builtin();
+        let mat = |id: BlockId| reg.material(id).expect("内置实心方块必有材料");
+        // ID 不变(存档兼容);I 与 B 不变。
+        assert_eq!(reg.id_of("stone"), Some(STONE));
+        assert_eq!(reg.id_of("dirt"), Some(DIRT));
+        assert_eq!(reg.id_of("bedrock"), Some(BEDROCK));
+        assert_eq!(reg.id_of("sand"), Some(SAND));
+        assert_eq!(mat(STONE).impact_threshold, 18.0);
+        assert_eq!(mat(STONE).bond, 8);
+        assert_eq!(mat(DIRT).impact_threshold, 7.0);
+        assert_eq!(mat(SAND).impact_threshold, 4.0);
+        // I_c 内置值。
+        assert_eq!(mat(STONE).impact_crush, 72.0);
+        assert_eq!(mat(DIRT).impact_crush, 28.0);
+        assert_eq!(mat(SAND).impact_crush, 16.0);
+        assert_eq!(mat(BEDROCK).impact_crush, f32::INFINITY);
+        assert_eq!(Material::INDESTRUCTIBLE.impact_crush, f32::INFINITY);
+        // 两格取较小值。
+        let crush = physics_sim::cohesion::impact_crush_between;
+        assert_eq!(crush(&reg, STONE, STONE), 72.0);
+        assert_eq!(crush(&reg, STONE, DIRT), 28.0);
+        assert_eq!(crush(&reg, DIRT, SAND), 16.0);
+        assert_eq!(crush(&reg, STONE, BEDROCK), 72.0, "∞ 不拉低下界");
+        assert_eq!(crush(&reg, STONE, AIR), 0.0);
+        // 预筛阈值 = 全部材料 min(I, I_c) 的最小值 = 沙 4。
+        assert_eq!(min_impact(&reg), 4.0);
+    }
+
+    // ---------------------------------------------------------- AC-F2/F3 工况
+
+    /// §5.7.1 表的 10 个工况(F00 `flow.py` 几何;impact-corner 用总架构师
+    /// 复核后的正确几何)。返回 (世界, 命中格, d̂)。
+    /// 全部世界带完整地基:超平坦 = dirt y=−3..−1 + bedrock y=−4(F00 `flat_ground`)。
+    fn flat_ground() -> Vec<(BlockPos, BlockId)> {
+        let mut cells = Vec::new();
+        for x in -8..=8 {
+            for z in -8..=8 {
+                cells.push((p(x, -4, z), BEDROCK));
+                for y in -3..=-1 {
+                    cells.push((p(x, y, z), DIRT));
+                }
+            }
+        }
+        cells
+    }
+
+    /// 工况:名称、体素、命中格、撞击方向。
+    type Case = (&'static str, Vec<(BlockPos, BlockId)>, BlockPos, [f32; 3]);
+
+    /// 工况构造:名称 → (cells, hit, d̂)。
+    fn cases() -> Vec<Case> {
+        let mut v: Vec<Case> = Vec::new();
+        // 1. 1 格厚石墙(宽 7 高 5)正面中部横撞,立在 bedrock 上:割 = 四周 4 根剪切。
+        let mut c = flat_ground();
+        for y in 1..=3 {
+            for z in -3..=3 {
+                c.push((p(-1, -y, z), BEDROCK)); // 墙脚下换 bedrock
+            }
+        }
+        for y in 0..=4 {
+            for z in -3..=3 {
+                c.push((p(-1, y, z), STONE));
+            }
+        }
+        v.push(("1 wall-on-bedrock", c, p(-1, 2, 0), [-1.0, 0.0, 0.0]));
+        // 2. 同墙直接砌在土上(墙脚是石-土界面):割 = 墙脚 7 根 min(18,7) = 49。
+        let mut c = flat_ground();
+        for y in 0..=4 {
+            for z in -3..=3 {
+                c.push((p(-1, y, z), STONE));
+            }
+        }
+        v.push(("2 wall-on-dirt", c, p(-1, 2, 0), [-1.0, 0.0, 0.0]));
+        // 3. 3 格厚石墙(x=−3..−1、y=0..6、z=−4..4)立在 bedrock,横撞:割 = I_c + 4I。
+        let mut c = flat_ground();
+        for x in -3..=-1 {
+            for y in 0..=6 {
+                for z in -4..=4 {
+                    c.push((p(x, y, z), STONE));
+                }
+            }
+        }
+        for y in 0..=6 {
+            for z in -4..=4 {
+                c.push((p(-4, y, z), BEDROCK));
+            }
+        }
+        v.push(("3 thick-wall", c, p(-1, 3, 0), [-1.0, 0.0, 0.0]));
+        // 4. 墙角伸出的石格(F00 工况 1 几何:墙 x=−2..−1、y=0..2、z=−2..2
+        // 立在 bedrock 上,伸出格 (0,1,0)),垂直于那根粘结撞(侧敲 = 上砸):
+        // 割 = 那 1 根剪切 18。
+        let mut c = flat_ground();
+        for y in 1..=3 {
+            for z in -2..=2 {
+                c.push((p(-2, -y, z), BEDROCK));
+            }
+        }
+        for x in -2..=-1 {
+            for y in 0..=2 {
+                for z in -2..=2 {
+                    c.push((p(x, y, z), STONE));
+                }
+            }
+        }
+        c.push((p(0, 1, 0), STONE)); // 伸出格(只连 (−1,1,0))
+        v.push(("4 corner-block-side", c, p(0, 1, 0), [0.0, -1.0, 0.0]));
+        // 5. 1 格宽土桥(跨 7)中部被从上砸:割 = 两端 2 根剪切 14。
+        let mut c = flat_ground();
+        for x in [-1i32, 7] {
+            for y in 0..=3 {
+                c.push((p(x, y, 0), STONE));
+            }
+        }
+        for x in 0..=6 {
+            c.push((p(x, 3, 0), DIRT));
+        }
+        v.push(("5 dirt-bridge", c, p(3, 3, 0), [0.0, -1.0, 0.0]));
+        // 6. 碎块落在平整土地上:割 = 下方压向 + 四周剪切 = 28 + 4×7 = 56。
+        let c = flat_ground();
+        v.push(("6 flat-ground", c, p(0, -1, 0), [0.0, -1.0, 0.0]));
+        // 7. 1×1×4 石柱立在土上,侧撞柱身:割 = 柱脚石-土 7。
+        let mut c = flat_ground();
+        for y in 0..=3 {
+            c.push((p(0, y, 0), STONE));
+        }
+        v.push(("7 pillar-mid", c, p(0, 1, 0), [-1.0, 0.0, 0.0]));
+        // 8. 同柱,侧撞柱顶。
+        let mut c = flat_ground();
+        for y in 0..=3 {
+            c.push((p(0, y, 0), STONE));
+        }
+        v.push(("8 pillar-top", c, p(0, 3, 0), [-1.0, 0.0, 0.0]));
+        // 9. impact-corner(正确几何,总架构师复核 2026-10-31):石柱局部
+        // y = 0..1、门楣 y = 2(F00 demo 平移错一格已作废);横撞门楣右端:
+        // C = 7、S = 6 格(整个 7 字)。
+        let mut c = flat_ground();
+        for y in 0..=1 {
+            c.push((p(8, y, 0), STONE));
+        }
+        for x in 5..=8 {
+            c.push((p(x, 2, 0), STONE));
+        }
+        v.push(("9 impact-corner", c, p(8, 2, 0), [-0.9851, -0.1724, 0.0]));
+        // 10. 沙堆被横撞:割 = 背后压向 16 + 剪切 12 = 28。
+        let mut c = flat_ground();
+        for x in 0..=2 {
+            for z in -2..=2 {
+                c.push((p(x, 0, z), SAND));
+            }
+        }
+        for x in 0..=1 {
+            for z in -1..=1 {
+                c.push((p(x, -1, z), SAND));
+            }
+        }
+        v.push(("10 sandpile", c, p(2, 0, 0), [-1.0, 0.0, 0.0]));
+        v
+    }
+
+    /// §5.7.1 表 10 行的期望:(名称,C 量化,S 格数,显式 S)。
+    fn expected_table() -> Vec<(&'static str, u64, usize, Option<Vec<BlockPos>>)> {
+        vec![
+            ("1 wall-on-bedrock", 72_000, 1, None),
+            ("2 wall-on-dirt", 49_000, 35, None),
+            ("3 thick-wall", 144_000, 1, None),
+            ("4 corner-block-side", 18_000, 1, None),
+            ("5 dirt-bridge", 14_000, 1, None),
+            ("6 flat-ground", 56_000, 1, None),
+            ("7 pillar-mid", 7_000, 4, None),
+            ("8 pillar-top", 7_000, 4, None),
+            (
+                "9 impact-corner",
+                7_000,
+                6,
+                Some(vec![
+                    p(5, 2, 0),
+                    p(6, 2, 0),
+                    p(7, 2, 0),
+                    p(8, 0, 0),
+                    p(8, 1, 0),
+                    p(8, 2, 0),
+                ]),
+            ),
+            ("10 sandpile", 28_000, 1, None),
+        ]
+    }
+
+    /// AC-F3 §5.7.1 表 10 行:S 与 C,两侧各取 C ±1 量化单位验证"恰好不断 /
+    /// 恰好断"(整数域判定)。
+    ///
+    /// 会变红的实现:任何一行的割或 S 不对;±1 边界拿浮点直接比。
+    #[test]
+    fn acc_f3_table_rows_and_pm1() {
+        let reg = SimpleRegistry::builtin();
+        // (名称, C 期望, S 格数期望 / 显式 S)
+        let expect = expected_table();
+        for ((name, cells, hit, d), (e_name, e_c, e_s_len, e_s)) in cases().into_iter().zip(&expect)
+        {
+            assert_eq!(name, *e_name);
+            let world = world_of(cells);
+            let dhat = Vec3::new(d[0], d[1], d[2]).normalize_or_zero();
+            let probe = ImpactEvent {
+                supplies: vec![(hit, 1_000_000.0)], // 任何割都 < 供给:必然断
+                impulse: dhat * 1_000_000.0,
+                point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+            };
+            let out = evaluate_impact_flow(&world, &all_core(), &reg, &probe, MAX_CELLS);
+            assert_eq!(out.cut_q, *e_c, "{name}:C 不符(实得 {})", out.cut_q);
+            assert_eq!(out.detached.len(), *e_s_len, "{name}:|S| 不符");
+            if let Some(s) = e_s {
+                assert_eq!(cells_sorted(&out.detached), *s, "{name}:S 格集不符");
+            }
+            // ±1 量化单位:C−1 < s ≤ C ⟺ 供给 C 扛住、C+1 断(判定在整数域)。
+            let hold = evaluate_impact_flow(
+                &world,
+                &all_core(),
+                &reg,
+                &ImpactEvent {
+                    supplies: vec![(hit, (*e_c) as f32 / QUANT as f32)],
+                    impulse: dhat * (*e_c as f32 / QUANT as f32),
+                    point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+                },
+                MAX_CELLS,
+            );
+            assert!(hold.detached.is_empty(), "{name}:供给 = C({e_c})应扛住");
+            let brk = evaluate_impact_flow(
+                &world,
+                &all_core(),
+                &reg,
+                &ImpactEvent {
+                    supplies: vec![(hit, (*e_c + 1) as f32 / QUANT as f32)],
+                    impulse: dhat * ((*e_c + 1) as f32 / QUANT as f32),
+                    point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+                },
+                MAX_CELLS,
+            );
+            assert!(!brk.detached.is_empty(), "{name}:供给 = C+1 应断开");
+        }
+    }
+
+    /// AC-F3 两种最大流:生产实现(Dinic)对照测试内独立实现的 Edmonds–Karp,
+    /// §5.7.1 表全部工况的 C 与 S 全同。
+    ///
+    /// 会变红的实现:浮点最大流(逐位不等价);割不唯一时依赖遍历顺序。
+    #[test]
+    fn acc_f3_edmonds_karp_reference_agrees() {
+        let reg = SimpleRegistry::builtin();
+        for (name, cells, hit, d) in cases() {
+            let world = world_of(cells);
+            let dhat = Vec3::new(d[0], d[1], d[2]).normalize_or_zero();
+            let event = ImpactEvent {
+                supplies: vec![(hit, 1_000_000.0)],
+                impulse: dhat * 1_000_000.0,
+                point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+            };
+            let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+            let (c_ref, s_ref) = ek_reference(&world, &all_core(), &reg, &event, MAX_CELLS);
+            assert_eq!(out.cut_q, c_ref, "{name}:C 与 EK 参照不一致");
+            assert_eq!(
+                cells_sorted(&out.detached),
+                cells_sorted(&s_ref),
+                "{name}:S 与 EK 参照不一致"
+            );
+        }
+    }
+
+    /// 测试内独立的 Edmonds–Karp 参照实现(§5.7.1 逐字;复用本文件 unit01
+    /// 的思路,独立重建):返回 (C, S)。
+    fn ek_reference(
+        block_at: &dyn Fn(BlockPos) -> Option<BlockId>,
+        in_core: &dyn Fn(BlockPos) -> bool,
+        registry: &dyn BlockRegistry,
+        event: &ImpactEvent,
+        max_cells: usize,
+    ) -> (u64, Vec<BlockPos>) {
+        let d_hat = event.impulse.normalize_or_zero();
+        let mut supplies: BTreeMap<BlockPos, f32> = BTreeMap::new();
+        for &(c, s) in &event.supplies {
+            *supplies.entry(c).or_insert(0.0) += s;
+        }
+        let s_total: f32 = supplies.values().sum();
+        if s_total < min_impact(registry) {
+            return (0, Vec::new());
+        }
+        let hit = *supplies
+            .iter()
+            .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0)))
+            .unwrap()
+            .0;
+        // BFS(层序、层内升序)。
+        let solid =
+            |q: BlockPos| in_core(q) && block_at(q).is_some_and(|b| registry.material(b).is_some());
+        let mut region: Vec<BlockPos> = Vec::new();
+        let mut seen: BTreeSet<BlockPos> = BTreeSet::from([hit]);
+        let mut frontier = vec![hit];
+        while !frontier.is_empty() {
+            frontier.sort();
+            let mut next = Vec::new();
+            for c in frontier.drain(..) {
+                if region.len() >= max_cells {
+                    break;
+                }
+                region.push(c);
+                for (dx, dy, dz) in [
+                    (1, 0, 0),
+                    (-1, 0, 0),
+                    (0, 1, 0),
+                    (0, -1, 0),
+                    (0, 0, 1),
+                    (0, 0, -1),
+                ] {
+                    let n = BlockPos::new(c.x + dx, c.y + dy, c.z + dz);
+                    if seen.insert(n) && solid(n) {
+                        next.push(n);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        let idx: BTreeMap<BlockPos, usize> = region
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (*c, i + 2))
+            .collect();
+        const SRC: usize = 0;
+        const SNK: usize = 1;
+        let inf: u64 = u64::MAX / 4;
+        let quant_cap = |c: f32| {
+            if c.is_infinite() {
+                inf
+            } else {
+                (c * 1000.0).ceil() as u64
+            }
+        };
+        let mut to = Vec::new();
+        let mut cap: Vec<u64> = Vec::new();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); region.len() + 2];
+        let edge = |u: usize,
+                    v: usize,
+                    c: u64,
+                    to: &mut Vec<usize>,
+                    cap: &mut Vec<u64>,
+                    adj: &mut Vec<Vec<usize>>| {
+            adj[u].push(to.len());
+            to.push(v);
+            cap.push(c);
+            adj[v].push(to.len());
+            to.push(u);
+            cap.push(0);
+        };
+        for &a in &region {
+            let ua = idx[&a];
+            if let Some(&s) = supplies.get(&a) {
+                let q = (s * 1000.0).floor() as u64;
+                if q > 0 {
+                    edge(SRC, ua, q, &mut to, &mut cap, &mut adj);
+                }
+            }
+            let ba = block_at(a).unwrap();
+            let ma = registry.material(ba);
+            for (dx, dy, dz) in [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ] {
+                let b = BlockPos::new(a.x + dx, a.y + dy, a.z + dz);
+                let u_dot = d_hat.dot(Vec3::new(dx as f32, dy as f32, dz as f32));
+                let b_block = block_at(b);
+                if b_block.is_none() {
+                    // 未装载:汇。
+                    let cap_raw = match ma {
+                        Some(x) if u_dot >= std::f32::consts::FRAC_1_SQRT_2 => x.impact_crush,
+                        Some(x) => x.impact_threshold,
+                        None => 0.0,
+                    };
+                    edge(ua, SNK, quant_cap(cap_raw), &mut to, &mut cap, &mut adj);
+                    continue;
+                }
+                let mb = b_block.and_then(|bb| registry.material(bb));
+                if mb.is_none() {
+                    continue; // 空气:无边
+                }
+                let cap_raw = match (ma, mb) {
+                    (Some(x), Some(y)) if u_dot >= std::f32::consts::FRAC_1_SQRT_2 => {
+                        x.impact_crush.min(y.impact_crush)
+                    }
+                    (Some(x), Some(y)) => x.impact_threshold.min(y.impact_threshold),
+                    _ => 0.0,
+                };
+                let to_sink = !in_core(b) || !idx.contains_key(&b);
+                if to_sink {
+                    edge(ua, SNK, quant_cap(cap_raw), &mut to, &mut cap, &mut adj);
+                } else {
+                    edge(ua, idx[&b], quant_cap(cap_raw), &mut to, &mut cap, &mut adj);
+                }
+            }
+            if ma.is_some_and(|x| x.support == Support::Anchor) {
+                edge(ua, SNK, inf, &mut to, &mut cap, &mut adj);
+            }
+            if a.y == WORLD_Y_MIN {
+                let cap_raw = match ma {
+                    Some(x) if d_hat.y <= -std::f32::consts::FRAC_1_SQRT_2 => x.impact_crush,
+                    Some(x) => x.impact_threshold,
+                    None => 0.0,
+                };
+                edge(ua, SNK, quant_cap(cap_raw), &mut to, &mut cap, &mut adj);
+            }
+        }
+        // Edmonds–Karp。
+        loop {
+            let mut prev: Vec<Option<usize>> = vec![None; adj.len()];
+            let mut seen = vec![false; adj.len()];
+            seen[SRC] = true;
+            let mut q = VecDeque::from([SRC]);
+            'bfs: while let Some(u) = q.pop_front() {
+                for &e in &adj[u] {
+                    let v = to[e];
+                    if !seen[v] && cap[e] > 0 {
+                        seen[v] = true;
+                        prev[v] = Some(e);
+                        if v == SNK {
+                            break 'bfs;
+                        }
+                        q.push_back(v);
+                    }
+                }
+            }
+            if !seen[SNK] {
+                break;
+            }
+            let mut bottleneck = inf;
+            let mut v = SNK;
+            while let Some(e) = prev[v] {
+                bottleneck = bottleneck.min(cap[e]);
+                v = to[e ^ 1];
+            }
+            let mut v = SNK;
+            while let Some(e) = prev[v] {
+                cap[e] -= bottleneck;
+                cap[e ^ 1] += bottleneck;
+                v = to[e ^ 1];
+            }
+        }
+        let c: u64 = adj[SRC]
+            .iter()
+            .copied()
+            .filter(|e| e % 2 == 0)
+            .map(|e| cap[e ^ 1])
+            .sum();
+        // 残量可达 = S。
+        let mut reach = vec![false; adj.len()];
+        reach[SRC] = true;
+        let mut q = VecDeque::from([SRC]);
+        while let Some(u) = q.pop_front() {
+            for &e in &adj[u] {
+                let v = to[e];
+                if !reach[v] && cap[e] > 0 {
+                    reach[v] = true;
+                    q.push_back(v);
+                }
+            }
+        }
+        // 探针供给 10^6 N·s = 10^9 量化,超过即视为"没断"的退化(不发生)。
+        let s: Vec<BlockPos> = if c < 1_000_000_000 {
+            region
+                .iter()
+                .filter(|cc| reach[idx[*cc]])
+                .copied()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (c, s)
+    }
+
+    /// AC-F3 接触点顺序打乱:同一事件(同 supplies 集合,多点接触的物理等价
+    /// 拆分)的输入顺序打乱 20 次(模拟接触对遍历顺序不定),C 与 S 逐位不变。
+    ///
+    /// 会变红的实现:命中格选择依赖 Vec 顺序;判定依赖遍历顺序。
+    #[test]
+    fn acc_f3_supply_shuffle_stable() {
+        let reg = SimpleRegistry::builtin();
+        // 固定 LCG(禁 rand;确定性核同款做法)。
+        let mut seed: u64 = 0x9E3779B97F4A7C15;
+        let mut rng = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (name, cells, hit, d) in cases() {
+            let world = world_of(cells);
+            let dhat = Vec3::new(d[0], d[1], d[2]).normalize_or_zero();
+            // 供给拆到命中格 + 实心邻格(1 N·s 各格,大得足以越过任何割);
+            // 拆分固定,只打乱 Vec 顺序(接触对遍历顺序的随机化)。
+            let mut cand: Vec<BlockPos> = [
+                (1, 0, 0),
+                (-1, 0, 0),
+                (0, 1, 0),
+                (0, -1, 0),
+                (0, 0, 1),
+                (0, 0, -1),
+            ]
+            .iter()
+            .map(|&(dx, dy, dz)| BlockPos::new(hit.x + dx, hit.y + dy, hit.z + dz))
+            .filter(|&q| world(q).is_some_and(|b| reg.material(b).is_some()))
+            .collect();
+            cand.sort();
+            cand.truncate(3);
+            let mut sup: Vec<(BlockPos, f32)> = cand.iter().map(|&c| (c, 1.0)).collect();
+            sup.push((hit, 1_000_000.0 - cand.len() as f32));
+            let ev = |sup: &[(BlockPos, f32)]| {
+                let total: f32 = sup.iter().map(|(_, s)| *s).sum();
+                ImpactEvent {
+                    supplies: sup.to_vec(),
+                    impulse: dhat * total,
+                    point: Vec3::new(hit.x as f32 + 0.5, hit.y as f32 + 0.5, hit.z as f32 + 0.5),
+                }
+            };
+            let base = evaluate_impact_flow(&world, &all_core(), &reg, &ev(&sup), MAX_CELLS);
+            assert!(!base.detached.is_empty(), "{name}:基准应断开");
+            for _ in 0..20 {
+                // Fisher–Yates 打乱 Vec 顺序。
+                let mut order = sup.clone();
+                for i in (1..order.len()).rev() {
+                    let j = (rng() % (i as u64 + 1)) as usize;
+                    order.swap(i, j);
+                }
+                let out = evaluate_impact_flow(&world, &all_core(), &reg, &ev(&order), MAX_CELLS);
+                assert_eq!(out.supply_q, base.supply_q, "{name}:打乱后 supply_q 改变");
+                assert_eq!(out.cut_q, base.cut_q, "{name}:打乱后 C 改变");
+                assert_eq!(
+                    cells_sorted(&out.detached),
+                    cells_sorted(&base.detached),
+                    "{name}:打乱后 S 改变"
+                );
+            }
+        }
+    }
+
+    /// AC-F3 退化:`C < supply_q` 时 S 必非空(整数域;表 10 行的 C+1 工况全部 S 非空,
+    /// 在 acc_f3_table_rows_and_pm1 已覆盖;此处显式断言 supply_q 的口径 =
+    /// 各 s_c 向下取整后之和)。
+    ///
+    /// 会变红的实现:supply_q 用向上取整(0.5 + 0.5 → 1 但两格各 floor = 0,合计 0)。
+    #[test]
+    fn acc_f3_supply_q_floor_semantics() {
+        let reg = SimpleRegistry::builtin();
+        // 两格各 0.0004(各自 floor = 0):合计 supply_q = 0 → 无源边 → C = 0,
+        // C < s 不成立(0 ≥ 0)→ 扛住、S 空。这是"向下取整后求和"的直接结果。
+        let cells = vec![
+            (p(0, 0, 0), STONE),
+            (p(1, 0, 0), STONE),
+            (p(1, -1, 0), BEDROCK),
+        ];
+        let world = world_of(cells);
+        let out = evaluate_impact_flow(
+            &world,
+            &all_core(),
+            &reg,
+            &ImpactEvent {
+                supplies: vec![(p(0, 0, 0), 0.0004), (p(1, 0, 0), 0.0004)],
+                impulse: Vec3::new(-0.0008, 0.0, 0.0),
+                point: Vec3::new(0.5, 0.5, 0.5),
+            },
+            MAX_CELLS,
+        );
+        assert_eq!(out.supply_q, 0, "0.0004 + 0.0004 向下取整后之和 = 0");
+        assert!(out.detached.is_empty());
+    }
+
+    // ------------------------------------------------------------- AC-F4
+
+    /// 单格碎块质量(密度 1 × 0.9³)。
+    const CELL_MASS: f32 = 0.729;
+
+    /// 单格碎块对质心的惯量(解析):I = m/12 · (b²+c², …) = 0.729/12 × 1.62 = 0.098 415。
+    fn single_cell_inertia() -> f32 {
+        CELL_MASS / 12.0 * (0.81 + 0.81)
+    }
+
+    /// AC-F4 守恒:`(C/s)·J + 撞击者修正 + Σ P_k = J` 逐分量成立(误差 ≤
+    /// 量化单位 × 接触点数);共线撞击 Δω ≈ 0;所有分量法向速度 = w 且 w ≤ u。
+    ///
+    /// 会变红的实现:ρ 用 (s−C)/C;漏 M_S;P_k 不按质量比例;w 用 |J| 算。
+    #[test]
+    fn acc_f4_conservation_and_common_normal_speed() {
+        let reg = SimpleRegistry::builtin();
+        let world = world_of(acc_f4_world());
+        // 单格伸出格横撞剪切割 18:s = 25,C = 18,S = {伸出格},1 分量。
+        let s = 25.0_f32;
+        let event = side(p(0, 0, 0), s);
+        let outcome = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(outcome.cut_q, 18_000);
+        assert_eq!(outcome.detached, vec![p(0, 0, 0)]);
+        // 撞击者:单格碎块 0.729 kg,接触点在质心行进线上(共线 → m_eff = m)。
+        let impactor = ImpactBodyProps {
+            mass: CELL_MASS,
+            inv_inertia: diag(single_cell_inertia()),
+            center_of_mass: Vec3::new(3.5, 0.5, 0.5),
+        };
+        let contacts = vec![(event.point, s)];
+        let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
+        assert_eq!(comps.len(), 1);
+        let c = outcome.cut_q as f32 / QUANT as f32;
+        let j = event.impulse;
+        // 守恒(逐分量求和;残差 ≤ 量化单位 × 接触点数 = 0.001 × 1)。
+        let resid = j * (c / s) + correction + comps.iter().map(|k| k.impulse).sum::<Vec3>() - j;
+        assert!(
+            resid.abs().max_element() <= 0.001 * contacts.len() as f32,
+            "守恒残差 {resid:?}"
+        );
+        // u = 25 m/s:w = |E|/(m_eff + M_S) = (25×7/25)/(2×0.729) = 4.801…,w ≤ u。
+        let m_eff = effective_mass(&impactor, event.point, event.dir_hat());
+        assert!((m_eff - CELL_MASS).abs() < 1e-5, "共线 m_eff = m");
+        let m_s = outcome.detached.len() as f32 * CELL_MASS;
+        let w = (s - c) / (m_eff + m_s);
+        assert!(w <= s, "w ≤ u");
+        // 所有分量法向速度 = w。
+        for k in &comps {
+            let v_n = k.delta_v.dot(event.dir_hat());
+            assert!((v_n - w).abs() < 1e-4, "分量法向速度 {v_n} ≠ w = {w}");
+        }
+        // 共线(对中)撞击 Δω ≈ 0。
+        for k in &comps {
+            assert!(k.delta_w.length() < 1e-6, "共线 Δω = 0");
+        }
+    }
+
+    /// AC-F4 m_eff 与 rapier 一致:同形状刚体在物理步内施加单位冲量(质心处,
+    /// 无力矩),接触点沿 d̂ 的速度变化 = 1/m_eff(F00 实测共线 0.000%)。
+    /// 偏心:m_eff 含转动项,rapier `apply_impulse_at_point` 后接触点速度变化同式。
+    ///
+    /// 会变红的实现:漏转动项;I_w⁻¹ 用了局部系。
+    #[test]
+    fn acc_f4_effective_mass_matches_rapier() {
+        use rapier3d::prelude::*;
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        // 共线:单格碎块,冲量沿质心连线。
+        let body = RigidBodyBuilder::dynamic()
+            .translation(rapier3d::math::Vector::new(3.5, 0.5, 0.5))
+            .build();
+        let handle = bodies.insert(body);
+        let _ = colliders.insert_with_parent(
+            ColliderBuilder::cuboid(0.45, 0.45, 0.45).density(1.0),
+            handle,
+            &mut bodies,
+        );
+        let b = bodies.get(handle).unwrap();
+        let m = b.mass();
+        let com = b.center_of_mass();
+        let impactor = ImpactBodyProps {
+            mass: m,
+            inv_inertia: world_inv_inertia_diag(&bodies, handle),
+            center_of_mass: Vec3::new(com.x, com.y, com.z),
+        };
+        let d = Vec3::new(-1.0, 0.0, 0.0);
+        let point = Vec3::new(3.5, 0.5, 0.5); // 质心
+        let m_eff = effective_mass(&impactor, point, d);
+        // rapier:质心处施加单位冲量,读线速度(共线无力矩)。
+        let b = bodies.get_mut(handle).unwrap();
+        b.apply_impulse(rapier3d::math::Vector::new(1.0, 0.0, 0.0), true);
+        let lv = b.linvel();
+        assert!(
+            (lv.x.abs() - 1.0 / m_eff).abs() < 1e-5,
+            "共线:1/m_eff = {},rapier Δv = {}",
+            1.0 / m_eff,
+            lv.x.abs()
+        );
+        // 偏心:接触点 (3.5, 1.4, 0.5),r = (0, 0.9, 0),r × d̂ = (0,0,−0.9)。
+        let point2 = Vec3::new(3.5, 1.4, 0.5);
+        let m_eff2 = effective_mass(&impactor, point2, d);
+        assert!(m_eff2 < m_eff, "偏心 m_eff 更小(转动分担)");
+        // rapier:同一点施加 (0,0,−1) 的冲量?不:施加单位冲量 P = d̂ ×(修正
+        // 后的切向)——直接对比接触点速度变化:Δv_point = Δv + Δω × r;
+        // |P|/m_eff 应等于该点沿 d̂ 的速度变化。
+        let b = bodies.get_mut(handle).unwrap();
+        b.set_linvel(rapier3d::math::Vector::new(0.0, 0.0, 0.0), true);
+        b.set_angvel(rapier3d::math::Vector::new(0.0, 0.0, 0.0), true);
+        b.apply_impulse_at_point(
+            rapier3d::math::Vector::new(d.x, d.y, d.z),
+            rapier3d::math::Vector::new(point2.x, point2.y, point2.z),
+            true,
+        );
+        let lv = b.linvel();
+        let av = b.angvel();
+        let r = point2 - Vec3::new(3.5, 0.5, 0.5);
+        let dv_point = Vec3::new(lv.x, lv.y, lv.z) + Vec3::new(av.x, av.y, av.z).cross(r);
+        let dv_n = dv_point.dot(d).abs();
+        assert!(
+            (dv_n - 1.0 / m_eff2).abs() < 1e-4,
+            "偏心:1/m_eff = {},rapier 接触点 Δv_n = {}",
+            1.0 / m_eff2,
+            dv_n
+        );
+    }
+
+    /// 世界系逆惯量的对角近似(单格碎块轴对齐姿态:解析值;rapier 的
+    /// inv_principal_inertia 相同)。测试只用轴对齐刚体,交叉项为零。
+    fn world_inv_inertia_diag(
+        bodies: &rapier3d::prelude::RigidBodySet,
+        handle: rapier3d::prelude::RigidBodyHandle,
+    ) -> [[f32; 3]; 3] {
+        let b = bodies.get(handle).unwrap();
+        let inv = b.mass_properties().local_mprops.inv_principal_inertia;
+        let i = single_cell_inertia();
+        assert!((inv.x - 1.0 / i).abs() < 1e-5, "rapier 单格逆惯量 {inv:?}");
+        [[inv.x, 0.0, 0.0], [0.0, inv.y, 0.0], [0.0, 0.0, inv.z]]
+    }
+
+    fn diag(v: f32) -> [[f32; 3]; 3] {
+        [[v, 0.0, 0.0], [0.0, v, 0.0], [0.0, 0.0, v]]
+    }
+
+    /// AC-F4 世界:伸出格 + bedrock 压脚(剪切割 18)。
+    fn acc_f4_world() -> Vec<(BlockPos, BlockId)> {
+        vec![
+            (p(0, 0, 0), STONE),
+            (p(1, 0, 0), STONE),
+            (p(1, -1, 0), BEDROCK),
+        ]
+    }
+
+    /// AC-F4 偏心撞击 Δω 与 rapier 一致:同形状刚体(2×1×1 石条)在 p_k 处
+    /// `apply_impulse_at_point(P_k)`,对比解析 Δω = I_k⁻¹(r_k × P_k)。
+    ///
+    /// 会变红的实现:分量惯量没按平行轴定理平移;Δω 的 r 用了分量质心到
+    /// 事件作用点(应为 p_k)。
+    #[test]
+    fn acc_f4_angular_matches_rigid_body_formula() {
+        use rapier3d::prelude::*;
+        let reg = SimpleRegistry::builtin();
+        // 2×1×1 石条 (0,1,0)-(1,1,0) 架在两根土柱 (0,0,0)、(1,0,0) 上(土柱
+        // 立在 bedrock 上),侧敲(z 向):石-土两端各一根剪切 min(18,7) = 7
+        // → 割 = 14,S = 整根石条(2 格;§5.7.1"石结构立在土上,断在石-土界面")。
+        let cells: Vec<(BlockPos, BlockId)> = vec![
+            (p(0, 1, 0), STONE),
+            (p(1, 1, 0), STONE),
+            (p(0, 0, 0), DIRT),
+            (p(1, 0, 0), DIRT),
+            (p(0, -1, 0), BEDROCK),
+            (p(1, -1, 0), BEDROCK),
+        ];
+        let world = world_of(cells);
+        let dhat = Vec3::new(0.0, 0.0, -1.0);
+        let s = 40.0_f32;
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 1, 0), s)],
+            impulse: dhat * s,
+            point: Vec3::new(0.5, 1.5, 0.5),
+        };
+        let outcome = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(outcome.cut_q, 14_000, "石条-土两端 2 根剪切 14");
+        assert_eq!(
+            cells_sorted(&outcome.detached),
+            vec![p(0, 1, 0), p(1, 1, 0)]
+        );
+        assert_eq!(outcome.components.len(), 1, "2 格石条 1 个分量");
+        let impactor = ImpactBodyProps {
+            mass: CELL_MASS,
+            inv_inertia: diag(single_cell_inertia()),
+            center_of_mass: Vec3::new(3.5, 1.5, 0.5),
+        };
+        let contacts = vec![(Vec3::new(0.2, 1.5, 0.5), s)]; // 偏在分量一端
+        let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
+        let _ = correction;
+        assert_eq!(comps.len(), 1);
+        let k = &comps[0];
+        // rapier 参照:同形状(2×1×1 每格 0.45 半边长 cuboid)刚体在 p_k 处
+        // 施加 P_k,读角速度。
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let body = RigidBodyBuilder::dynamic()
+            .translation(rapier3d::math::Vector::new(0.0, 0.0, 0.0))
+            .build();
+        let handle = bodies.insert(body);
+        // collider 平移 = 格中心(与解析的分量质心 (1.0, 1.5, 0.5) 同系)。
+        for off in [(0.5f32, 1.5f32, 0.5f32), (1.5, 1.5, 0.5)] {
+            let _ = colliders.insert_with_parent(
+                ColliderBuilder::cuboid(0.45, 0.45, 0.45)
+                    .density(1.0)
+                    .translation(rapier3d::math::Vector::new(off.0, off.1, off.2)),
+                handle,
+                &mut bodies,
+            );
+        }
+        let b = bodies.get_mut(handle).unwrap();
+        b.apply_impulse_at_point(
+            rapier3d::math::Vector::new(k.impulse.x, k.impulse.y, k.impulse.z),
+            rapier3d::math::Vector::new(k.point.x, k.point.y, k.point.z),
+            true,
+        );
+        let av = b.angvel();
+        let rapier_w = Vec3::new(av.x, av.y, av.z);
+        assert!(
+            (rapier_w - k.delta_w).length() < 1e-4,
+            "Δω 解析 {:?} vs rapier {:?}",
+            k.delta_w,
+            rapier_w
+        );
+        // 线速度同样一致:Δv = P/M。
+        let lv = b.linvel();
+        assert!((Vec3::new(lv.x, lv.y, lv.z) - k.delta_v).length() < 1e-5);
+        // 分量质心 = 两格中心平均 (1.0, 1.5, 0.5)。
+        let com = component_center_of_mass(&k.cells);
+        assert!((com - Vec3::new(1.0, 1.5, 0.5)).length() < 1e-6);
+    }
+
+    /// AC-F4 切段速度:分量被切成多段时各段 `v_seg = Δv_k + Δω_k × (质心_seg −
+    /// 质心_k)`、`ω_seg = Δω_k`(纯函数;与 §7.3 第 5 条同口径)。
+    ///
+    /// 会变红的实现:漏 ω × r 的刚体一致性(各段同速);ω 段间不共享。
+    #[test]
+    fn acc_f4_segment_velocity() {
+        let component = physics_sim::impact_flow::ComponentMomentum {
+            cells: vec![p(0, 0, 0), p(1, 0, 0), p(2, 0, 0), p(3, 0, 0)],
+            mass: 4.0 * CELL_MASS,
+            point: Vec3::new(0.5, 0.5, 0.5),
+            impulse: Vec3::new(-2.0, 0.0, 1.0),
+            delta_v: Vec3::new(-1.0, 0.0, 0.5),
+            delta_w: Vec3::new(0.0, 0.7, 0.0),
+        };
+        let segments = vec![vec![p(0, 0, 0), p(1, 0, 0)], vec![p(2, 0, 0), p(3, 0, 0)]];
+        let vels = segment_velocity(&component, &segments);
+        assert_eq!(vels.len(), 2);
+        let com_k = component_center_of_mass(&component.cells);
+        for (seg, (v, w)) in segments.iter().zip(&vels) {
+            let expect = component.delta_v
+                + component
+                    .delta_w
+                    .cross(component_center_of_mass(seg) - com_k);
+            assert!((v - expect).length() < 1e-5, "v_seg 刚体一致");
+            assert!((w - component.delta_w).length() < 1e-7, "ω_seg = Δω_k");
         }
     }
 }

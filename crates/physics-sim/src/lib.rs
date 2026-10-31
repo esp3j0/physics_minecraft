@@ -14,6 +14,7 @@ pub mod cohesion;
 pub mod collider_build;
 pub mod destruction;
 pub mod explosion;
+pub mod impact_flow;
 pub mod settle;
 pub mod sim;
 pub mod snapshot;

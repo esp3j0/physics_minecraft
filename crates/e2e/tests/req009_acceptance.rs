@@ -14,6 +14,8 @@ mod unit01 {
     };
 
     /// REQ-010 迁移:`Material` 追加承载粘结 `bond`,本表随之带上 REQ-010 §3.2 的值,REQ-009 的字段与断言不变。
+    /// 修订 11(F01):追加压向撞击粘结 `impact_crush`——REQ-009 表的方块未指定 = ∞(§5.7.5),
+    /// 不改变本套件断言的 R/I/B 语义。
     fn mat(resistance: f32, impact_threshold: f32, support: Support, bond: u32) -> Material {
         Material {
             resistance,
@@ -21,6 +23,7 @@ mod unit01 {
             support,
             pulverize_factor: 2.0,
             bond,
+            impact_crush: f32::INFINITY,
         }
     }
 
@@ -33,19 +36,29 @@ mod unit01 {
     fn acc_d1_builtin_materials() {
         let reg = SimpleRegistry::builtin();
         assert_eq!(reg.block_count(), 5);
+        // 修订 11(F01)迁移:`Material` 追加压向撞击粘结 `impact_crush`,
+        // 内置表按 REQ-010 §5.7.5 带上 stone 72 / dirt 28 / bedrock ∞ / sand 16;
+        // 本表其余数值(REQ-009 §3.2 的 R/I/B/k)逐项不变。
+        let crush = |c: f32| c;
         let table = [
             (builtin::AIR, "air", false, None),
             (
                 builtin::STONE,
                 "stone",
                 true,
-                Some(mat(6.0, 18.0, Support::Connected, 8)),
+                Some(Material {
+                    impact_crush: crush(72.0),
+                    ..mat(6.0, 18.0, Support::Connected, 8)
+                }),
             ),
             (
                 builtin::DIRT,
                 "dirt",
                 true,
-                Some(mat(2.0, 7.0, Support::Connected, 3)),
+                Some(Material {
+                    impact_crush: crush(28.0),
+                    ..mat(2.0, 7.0, Support::Connected, 3)
+                }),
             ),
             (
                 builtin::BEDROCK,
@@ -62,7 +75,10 @@ mod unit01 {
                 builtin::SAND,
                 "sand",
                 true,
-                Some(mat(2.0, 4.0, Support::NeedsBelow, 0)),
+                Some(Material {
+                    impact_crush: crush(16.0),
+                    ..mat(2.0, 4.0, Support::NeedsBelow, 0)
+                }),
             ),
         ];
         for (id, name, solid, material) in table {

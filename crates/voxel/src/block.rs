@@ -46,6 +46,10 @@ pub struct Material {
     /// 承载粘结 B(REQ-010 §3.1):一个共面连接能传递的静载,单位为格重 `W0`;
     /// [`BOND_INFINITE`] = 不会被拉断。两格之间取较小值。
     pub bond: u32,
+    /// 压向撞击粘结 I_c(REQ-010 §5.7.5,修订 11):撞击把一格压向另一格时,
+    /// 该共面连接能传递的冲量上限,单位 kg·m/s;`f32::INFINITY` = 不可压碎。
+    /// 两格之间取较小值(§5.7.1);与 I 同口径,未指定材料的实心方块为 ∞。
+    pub impact_crush: f32,
 }
 
 impl Material {
@@ -57,6 +61,7 @@ impl Material {
         support: Support::Connected,
         pulverize_factor: 2.0,
         bond: BOND_INFINITE,
+        impact_crush: f32::INFINITY,
     };
 }
 
@@ -136,6 +141,8 @@ impl SimpleRegistry {
     /// 内置方块表(REQ-009 §3.2,ID 只追加):air(0)、stone(1, R6/I18)、
     /// dirt(2, R2/I7)、bedrock(3, ∞/∞, Anchor)、sand(4, R2/I4, NeedsBelow);
     /// 全部材料 k = 2。承载粘结 B(REQ-010 §3.2):stone 8、dirt 3、bedrock ∞、sand 0。
+    /// 压向撞击粘结 I_c(REQ-010 §5.7.5,修订 11):stone 72、dirt 28、sand 16(= 4·I)、
+    /// bedrock 与未指定材料 ∞。
     pub fn builtin() -> Self {
         let mut reg = Self::new();
         let mut add = |name: &str, material: Material| {
@@ -150,6 +157,7 @@ impl SimpleRegistry {
                 support: Support::Connected,
                 pulverize_factor: 2.0,
                 bond: 8,
+                impact_crush: 72.0,
             },
         );
         add(
@@ -160,6 +168,7 @@ impl SimpleRegistry {
                 support: Support::Connected,
                 pulverize_factor: 2.0,
                 bond: 3,
+                impact_crush: 28.0,
             },
         );
         add(
@@ -170,6 +179,7 @@ impl SimpleRegistry {
                 support: Support::Anchor,
                 pulverize_factor: 2.0,
                 bond: BOND_INFINITE,
+                impact_crush: f32::INFINITY,
             },
         );
         add(
@@ -180,6 +190,7 @@ impl SimpleRegistry {
                 support: Support::NeedsBelow,
                 pulverize_factor: 2.0,
                 bond: 0,
+                impact_crush: 16.0,
             },
         );
         reg
@@ -302,6 +313,7 @@ mod tests {
             support: Support::Connected,
             pulverize_factor: 2.0,
             bond: 5,
+            impact_crush: 12.0,
         };
         let id = reg.register_with_material("glass", glass).unwrap();
         assert_eq!(id, BlockId(1));
@@ -320,6 +332,8 @@ mod tests {
 
     /// REQ-009 §3.2 内置材料数值:stone 6/18、dirt 2/7、bedrock ∞/∞ + Anchor、
     /// sand 2/4 + NeedsBelow;全部 k = 2。
+    /// AC-F1(REQ-010 §5.7.5,修订 11):I_c 内置值 stone/dirt/sand = 72/28/16(= 4·I)、
+    /// bedrock ∞、`INDESTRUCTIBLE`(未指定材料的实心方块默认材料)∞;I、B 不变。
     #[test]
     fn builtin_materials_match_req009() {
         let reg = SimpleRegistry::builtin();
@@ -342,5 +356,11 @@ mod tests {
         for id in [BlockId(1), BlockId(2), BlockId(3), BlockId(4)] {
             assert_eq!(mat(id).pulverize_factor, 2.0, "全部材料 k = 2");
         }
+        // 修订 11:压向撞击粘结 I_c(REQ-010 §5.7.5)。I 与 B 不变(上方断言原样)。
+        assert_eq!(stone.impact_crush, 72.0);
+        assert_eq!(dirt.impact_crush, 28.0);
+        assert_eq!(sand.impact_crush, 16.0);
+        assert_eq!(bedrock.impact_crush, f32::INFINITY);
+        assert_eq!(Material::INDESTRUCTIBLE.impact_crush, f32::INFINITY);
     }
 }

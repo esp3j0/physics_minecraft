@@ -629,6 +629,16 @@ pub fn impact_bond_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId)
     }
 }
 
+/// 两个共面实心格之间的压向撞击粘结 `I_c(a,b) = min(I_c,a, I_c,b)`(REQ-010 §5.7.1,修订 11);
+/// 任一侧不是实心方块为 0.0;任一侧未指定材料(∞)按 ∞ 计——f32 的 min 自动如此,
+/// 此处显式按字面写出语义:两侧都有材料才取较小值。
+pub fn impact_crush_between(registry: &dyn BlockRegistry, a: BlockId, b: BlockId) -> f32 {
+    match (registry.material(a), registry.material(b)) {
+        (Some(x), Some(y)) => x.impact_crush.min(y.impact_crush),
+        _ => 0.0,
+    }
+}
+
 /// 接地判定的参考实现(REQ-010 §4.2,逐格向下扫描;生产路径由单元 02 换成增量维护的柱缓存,
 /// 结果必须与本函数一致):
 ///
@@ -863,7 +873,9 @@ fn falling_component(
 }
 
 /// Dinic 最大流(邻接表残量网络,全整数容量;`INF` 远大于格数,累加不溢出)。
-struct Dinic {
+/// `pub(crate)`:撞击冲量流(`impact_flow`,§5.7.1)复用同一实现——最小割唯一,
+/// 与算法无关(§4.3 同论证)。
+pub(crate) struct Dinic {
     adj: Vec<Vec<usize>>,
     to: Vec<usize>,
     cap: Vec<u64>,
@@ -871,7 +883,7 @@ struct Dinic {
 }
 
 impl Dinic {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             adj: vec![Vec::new(); n],
             to: Vec::new(),
@@ -881,7 +893,7 @@ impl Dinic {
     }
 
     /// 加一条容量 `c` 的边(同时建容量 0 的反向边)。
-    fn edge(&mut self, u: usize, v: usize, c: u64) {
+    pub(crate) fn edge(&mut self, u: usize, v: usize, c: u64) {
         self.adj[u].push(self.to.len());
         self.to.push(v);
         self.cap.push(c);
@@ -890,7 +902,17 @@ impl Dinic {
         self.cap.push(0);
     }
 
-    fn max_flow(&mut self, s: usize, t: usize) {
+    /// 最大流值 = 源点的净流出(前向边的流量之和;`max_flow` 之后调用)。
+    pub(crate) fn flow_value(&self, s: usize) -> u64 {
+        self.adj[s]
+            .iter()
+            .copied()
+            .filter(|e| e % 2 == 0)
+            .map(|e| self.cap[e ^ 1])
+            .sum()
+    }
+
+    pub(crate) fn max_flow(&mut self, s: usize, t: usize) {
         while self.leveling(s, t) {
             let mut next = vec![0usize; self.adj.len()];
             while self.send(s, t, INF, &mut next) > 0 {}
@@ -951,7 +973,7 @@ impl Dinic {
     }
 
     /// 残量网络中从 `s` 出发沿剩余容量可达的节点。
-    fn reachable(&self, s: usize) -> Vec<bool> {
+    pub(crate) fn reachable(&self, s: usize) -> Vec<bool> {
         let mut seen = vec![false; self.adj.len()];
         seen[s] = true;
         let mut q = VecDeque::from([s]);
