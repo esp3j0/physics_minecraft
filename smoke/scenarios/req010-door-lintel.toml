@@ -95,6 +95,13 @@ screenshot = { name = "falling", expect = "远处门框的土门楣左边一长�
 wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
 
 [[step]]
+label = "再等一次归零:门楣落地碎开时旧实体移除与碎块出生可能分两次到达,中间有一拍实体数为 0(10-28 起偶发,拍 150 归零、拍 170 又有 11–12 个)"
+wait_ticks = { n = 30 }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+
+[[step]]
 check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [9, -55, 20], is = "stone" } }
 
 [[step]]
