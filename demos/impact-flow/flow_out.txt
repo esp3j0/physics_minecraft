@@ -1,0 +1,182 @@
+==============================================================================
+flow.py — §5.7.1 冲量最大流纯体素验证(stone I=18/Ic=72, dirt 7/28, sand 4/16;量化 0.001 N·s)
+==============================================================================
+
+--- 0. 预筛统计(s = m·v,I_min = 4 = sand 的 min(I,I_c);s < 4 不建网直接跳过)---
+场景,速度 m/s,s (N·s),建网?
+碎块落地 1 m,4.43,3.229,否(跳过)
+碎块落地 2 m,6.26,4.567,是
+碎块落地 5 m,9.90,7.220,是
+横撞 1 m/s,1.00,0.729,否(跳过)
+横撞 2 m/s,2.00,1.458,否(跳过)
+横撞 5 m/s,5.00,3.645,否(跳过)
+
+--- 1–8. 逐工况结构与最小割 S(结构打印用供给 60 N·s,足够断开全部工况;工况 6 用实测供给 29.77)---
+
+=== 1 corner-block 石伸出格 横撞 ===
+hit=(0, 1, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=60000(60.000 N·s) ≥ s → 扛住   S格数=0 cut_bonds=0 ek/dinic同=True t_ek=0.20ms t_dinic=4.36ms
+
+=== 2a wall1-stone-on-bedrock w7h5 横撞 ===
+hit=(-1, 2, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=60000(60.000 N·s) ≥ s → 扛住   S格数=0 cut_bonds=0 ek/dinic同=True t_ek=0.17ms t_dinic=5.67ms
+
+=== 2b wall1-stone-on-dirt w7h5 横撞 ===
+hit=(-1, 2, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=49000(49.000 N·s) < s → 断开   S格数=35 cut_bonds=7 ek/dinic同=True t_ek=0.38ms t_dinic=8.96ms
+S 连通分量 1 个,尺寸 [35]
+S 剖面(x–z):
+z=+03 #
+z=+02 #
+z=+01 #
+z=+00 #
+z=-01 #
+z=-02 #
+z=-03 #
+
+=== 2c wall1-stone-on-bedrock w15 横撞 ===
+hit=(-1, 2, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=60000(60.000 N·s) ≥ s → 扛住   S格数=0 cut_bonds=0 ek/dinic同=True t_ek=0.21ms t_dinic=5.71ms
+
+=== 3 wall3-stone-on-bedrock w9h7 横撞 ===
+hit=(-1, 3, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=60000(60.000 N·s) ≥ s → 扛住   S格数=0 cut_bonds=0 ek/dinic同=True t_ek=0.46ms t_dinic=4.34ms
+
+=== 4a bridge1-dirt span7 上砸 ===
+hit=(3, 3, 0) d̂=(0.0, -1.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=14000(14.000 N·s) < s → 断开   S格数=1 cut_bonds=2 ek/dinic同=True t_ek=0.08ms t_dinic=2.07ms
+S 连通分量 1 个,尺寸 [1]
+S 剖面(x–y @z=0):
+y=+03 #
+
+=== 4b bridge3-dirt span7 上砸 ===
+hit=(3, 3, 0) d̂=(0.0, -1.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=14000(14.000 N·s) < s → 断开   S格数=21 cut_bonds=2 ek/dinic同=True t_ek=0.10ms t_dinic=2.05ms
+S 连通分量 1 个,尺寸 [21]
+S 剖面(x–z):
+z=+01 #######
+z=+00 #######
+z=-01 #######
+
+=== 5 flat-ground-dirt 上砸 ===
+hit=(0, -1, 0) d̂=(0.0, -1.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=56000(56.000 N·s) < s → 断开   S格数=1 cut_bonds=5 ek/dinic同=True t_ek=0.15ms t_dinic=4.91ms
+S 连通分量 1 个,尺寸 [1]
+S 剖面(x–y @z=0):
+y=-01 #
+
+=== 6 impact-corner 斜撞 s=29.77 ===
+hit=(8, 1, 0) d̂=(-0.985, -0.1724, 0.0) s=29.603(量化 29603) visited=1024 truncated=True
+C=18000(18.000 N·s) < s → 断开   S格数=4 cut_bonds=1 ek/dinic同=True t_ek=0.11ms t_dinic=4.19ms
+S 连通分量 1 个,尺寸 [4]
+S 剖面(x–y @z=0):
+y=+01 ####
+
+=== 7a pillar1x1x4-on-dirt 中部侧撞 ===
+hit=(0, 1, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=7000(7.000 N·s) < s → 断开   S格数=4 cut_bonds=1 ek/dinic同=True t_ek=0.05ms t_dinic=2.17ms
+S 连通分量 1 个,尺寸 [4]
+S 剖面(x–y @z=0):
+y=+03 #
+y=+02 #
+y=+01 #
+y=+00 #
+
+=== 7b pillar1x1x4-on-dirt 柱顶侧撞 ===
+hit=(0, 3, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=7000(7.000 N·s) < s → 断开   S格数=4 cut_bonds=1 ek/dinic同=True t_ek=0.04ms t_dinic=2.16ms
+S 连通分量 1 个,尺寸 [4]
+S 剖面(x–y @z=0):
+y=+03 #
+y=+02 #
+y=+01 #
+y=+00 #
+
+=== 8 sandpile 横撞 ===
+hit=(2, 0, 0) d̂=(-1.0, 0.0, 0.0) s=60.000(量化 60000) visited=1024 truncated=True
+C=28000(28.000 N·s) < s → 断开   S格数=1 cut_bonds=4 ek/dinic同=True t_ek=0.27ms t_dinic=6.96ms
+S 连通分量 1 个,尺寸 [1]
+S 剖面(x–y @z=0):
+y=+00 #
+
+==============================================================================
+9. I_c 扫描:I_c = {2,4,8}×I 与 ∞,断开阈值 s*(恰断开最小供给)与割 C
+工况,I_c,s* (N·s),C (N·s),0.729kg 速度,4.374kg 复合体速度
+1,I_c=2·I,36.001,36.000,49.4,8.2
+1,I_c=4·I,72.001,72.000,98.8,16.5
+1,I_c=8·I,144.001,144.000,197.5,32.9
+1,I_c=∞,144.001,144.000,197.5,32.9
+2a,I_c=2·I,72.001,72.000,98.8,16.5
+2a,I_c=4·I,72.001,72.000,98.8,16.5
+2a,I_c=8·I,72.001,72.000,98.8,16.5
+2a,I_c=∞,72.001,72.000,98.8,16.5
+3,I_c=2·I,108.001,108.000,148.1,24.7
+3,I_c=4·I,144.001,144.000,197.5,32.9
+3,I_c=8·I,216.001,216.000,296.3,49.4
+3,I_c=∞,216.001,216.000,296.3,49.4
+4a,I_c=2·I,14.001,14.000,19.2,3.2
+4a,I_c=4·I,14.001,14.000,19.2,3.2
+4a,I_c=8·I,14.001,14.000,19.2,3.2
+4a,I_c=∞,14.001,14.000,19.2,3.2
+5,I_c=2·I,42.001,42.000,57.6,9.6
+5,I_c=4·I,56.001,56.000,76.8,12.8
+5,I_c=8·I,84.001,84.000,115.2,19.2
+5,I_c=∞,16805.217,16805.216,23052.4,3842.1
+7a,I_c=2·I,7.001,7.000,9.6,1.6
+7a,I_c=4·I,7.001,7.000,9.6,1.6
+7a,I_c=8·I,7.001,7.000,9.6,1.6
+7a,I_c=∞,7.001,7.000,9.6,1.6
+
+==============================================================================
+10. 区域上限扫描 s=60(C、|S|、visited、truncated、单次求值耗时;60 N·s 让 2b/5/7a 全部断开)
+2b
+  max_cells=  256: C=49000 |S|=35 visited=256 truncated=True prefiltered=False t=11.94ms
+  max_cells=  512: C=49000 |S|=35 visited=512 truncated=True prefiltered=False t=25.75ms
+  max_cells= 1024: C=49000 |S|=35 visited=1024 truncated=True prefiltered=False t=40.00ms
+  max_cells= 2048: C=49000 |S|=35 visited=2048 truncated=True prefiltered=False t=57.79ms
+5
+  max_cells=  256: C=56000 |S|=1 visited=256 truncated=True prefiltered=False t=5.62ms
+  max_cells=  512: C=56000 |S|=1 visited=512 truncated=True prefiltered=False t=10.71ms
+  max_cells= 1024: C=56000 |S|=1 visited=1024 truncated=True prefiltered=False t=31.34ms
+  max_cells= 2048: C=56000 |S|=1 visited=2048 truncated=True prefiltered=False t=74.27ms
+7a
+  max_cells=  256: C=7000 |S|=4 visited=256 truncated=True prefiltered=False t=7.82ms
+  max_cells=  512: C=7000 |S|=4 visited=512 truncated=True prefiltered=False t=15.49ms
+  max_cells= 1024: C=7000 |S|=4 visited=1024 truncated=True prefiltered=False t=33.05ms
+  max_cells= 2048: C=7000 |S|=4 visited=2048 truncated=True prefiltered=False t=64.22ms
+
+==============================================================================
+接触点顺序打乱 20 次(供给 = 各工况断开阈值的 2 倍,必然断开;随机拆到命中格+邻格;断开不变 / ek=dinic)
+1 corner-block 石伸出格 横撞: break 不变 20/20,algos_agree 20/20
+2a wall1-stone-on-bedrock w7h5 横撞: break 不变 20/20,algos_agree 20/20
+2b wall1-stone-on-dirt w7h5 横撞: break 不变 20/20,algos_agree 20/20
+2c wall1-stone-on-bedrock w15 横撞: break 不变 20/20,algos_agree 20/20
+3 wall3-stone-on-bedrock w9h7 横撞: break 不变 20/20,algos_agree 20/20
+4a bridge1-dirt span7 上砸: break 不变 20/20,algos_agree 20/20
+4b bridge3-dirt span7 上砸: break 不变 20/20,algos_agree 20/20
+5 flat-ground-dirt 上砸: break 不变 20/20,algos_agree 20/20
+6 impact-corner 斜撞 s=29.77: break 不变 20/20,algos_agree 20/20
+7a pillar1x1x4-on-dirt 中部侧撞: break 不变 20/20,algos_agree 20/20
+7b pillar1x1x4-on-dirt 柱顶侧撞: break 不变 20/20,algos_agree 20/20
+8 sandpile 横撞: break 不变 20/20,algos_agree 20/20
+
+==============================================================================
+断开阈值表(默认 I_c=4·I;二分精度 0.001 N·s)
+工况,s* (N·s),最小割 C (N·s),0.729kg 速度,4.374kg 六格复合体速度
+1 corner-block 石伸出格 横撞,72.001,72.000,98.8,16.5
+2a wall1-stone-on-bedrock w7h5 横撞,72.001,72.000,98.8,16.5
+2b wall1-stone-on-dirt w7h5 横撞,49.001,49.000,67.2,11.2
+2c wall1-stone-on-bedrock w15 横撞,72.001,72.000,98.8,16.5
+3 wall3-stone-on-bedrock w9h7 横撞,144.001,144.000,197.5,32.9
+4a bridge1-dirt span7 上砸,14.001,14.000,19.2,3.2
+4b bridge3-dirt span7 上砸,14.001,14.000,19.2,3.2
+5 flat-ground-dirt 上砸,56.001,56.000,76.8,12.8
+6 impact-corner 斜撞 s=29.77,18.001,18.000,24.7,4.1
+7a pillar1x1x4-on-dirt 中部侧撞,7.001,7.000,9.6,1.6
+7b pillar1x1x4-on-dirt 柱顶侧撞,7.001,7.000,9.6,1.6
+8 sandpile 横撞,28.001,28.000,38.4,6.4
+
+==============================================================================
+耗时上界:1600 格石板(40×40,BFS 1024 截断处当汇点),供给 50 N·s 上砸
+visited=1024 truncated=True C=50000 |S|=0 t_ek=2.17ms t_dinic=7.61ms
+附:1024 格恰好封闭的悬空板(32×32,BFS 恰好吃满、无任何汇边)是极端案例:C=0 → 整板断下,语义自洽。
