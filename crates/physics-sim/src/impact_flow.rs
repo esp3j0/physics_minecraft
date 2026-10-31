@@ -12,7 +12,6 @@ use types::glam::Vec3;
 use types::{BlockId, BlockPos, WORLD_Y_MIN};
 use voxel::BlockRegistry;
 
-#[allow(unused_imports)] // 测试使用(生产接入在 F02)
 use crate::cohesion::impact_crush_between;
 use crate::cohesion::{Dinic, impact_bond_between};
 use crate::destruction::DEBRIS_HALF_SIZE;
@@ -141,8 +140,8 @@ pub struct ComponentMomentum {
     pub impulse: Vec3,
     /// 分量作为整体的刚体响应:`Δv_k = P_k / M_k`。
     pub delta_v: Vec3,
-    /// `Δω_k = I_k⁻¹ (r_k × P_k)`,`r_k = p_k − 分量质心`;分量惯量按逐格 cuboid
-    /// (半边长 0.45、密度 1)对轴对齐姿态解析计算。
+    /// `Δω_k = I_k⁻¹ (r_k × P_k)`,`r_k = p_k − 分量质心`;`I_k` 是分量的完整
+    /// 惯量张量(逐格 cuboid 半边长 0.45、密度 1、平行轴定理含惯性积,§5.7.2)。
     pub delta_w: Vec3,
 }
 
@@ -151,14 +150,17 @@ pub struct ComponentMomentum {
 /// `M_k/(m_eff + M_S)·E`。传入的 `outcome` 须为"断开"且未预筛(`detached` 非空),
 /// 否则返回空 `Vec` 与零修正(调用方按扛住处理)。
 ///
-/// `contact_points`:事件的各接触点 `(位置, 冲量)`,供 `p_k` 的冲量加权质心用;
+/// `contact_points`:事件的各接触点 `(归格, 地形侧位置, 冲量)`——**归格由调用方
+/// 按 §5.7.1 口径完成**(地形侧位置沿法向退 0.1 m 取格);纯函数里不再对接触点
+/// 坐标取整:接触点恰在格面上(例如从 +x 撞 x = 4 的格,接触点 x = 5.0)时
+/// `floor()` 会落进空气一侧的格,`p_k` 会错误地退回事件作用点(F01 验收返修 3)。
 /// 分量内没有接触点时该分量的 `p_k` 取事件作用点 p。顺序无关(加权质心按
 /// 收集序求和,浮点加法交换误差 ≤ 量化单位,验收口径允许)。
 #[allow(clippy::too_many_arguments)]
 pub fn distribute_momentum(
     event: &ImpactEvent,
     outcome: &ImpactFlowOutcome,
-    contact_points: &[(Vec3, f32)],
+    contact_points: &[(BlockPos, Vec3, f32)],
     impactor: &ImpactBodyProps,
 ) -> (Vec3, Vec<ComponentMomentum>) {
     let mut correction = Vec3::ZERO;
@@ -185,18 +187,13 @@ pub fn distribute_momentum(
         return (correction, out);
     }
     correction = excess * (m_eff / denom);
-    // 各分量的接触点(用于 p_k)。
+    // 各分量的接触点(用于 p_k):按调用方归好的格归属。
     for cells in &outcome.components {
         let mass = cells.len() as f32 * DEBRIS_MASS_PER_CELL;
         let cell_set: BTreeSet<BlockPos> = cells.iter().copied().collect();
         let mut w_sum = 0.0_f32;
         let mut p_acc = Vec3::ZERO;
-        for &(pt, imp) in contact_points {
-            let cell = BlockPos::new(
-                pt.x.floor() as i32,
-                pt.y.floor() as i32,
-                pt.z.floor() as i32,
-            );
+        for &(cell, pt, imp) in contact_points {
             if cell_set.contains(&cell) {
                 w_sum += imp;
                 p_acc += pt * imp;
@@ -211,7 +208,8 @@ pub fn distribute_momentum(
         let delta_v = impulse / mass;
         let com = component_center_of_mass(cells);
         let r_k = point - com;
-        let delta_w = component_inv_inertia(cells) * r_k.cross(impulse);
+        let inv_inertia = component_inv_inertia(cells);
+        let delta_w = inertia_mul(&inv_inertia, r_k.cross(impulse));
         out.push(ComponentMomentum {
             cells: cells.clone(),
             mass,
@@ -238,37 +236,57 @@ pub fn component_center_of_mass(cells: &[BlockPos]) -> Vec3 {
         / n
 }
 
-/// 分量的世界系逆惯量(轴对齐;逐格 cuboid 半边长 0.45、密度 1 解析计算)。
+/// 分量的世界系逆惯量张量(§5.7.2:**完整 3×3**,行主序;轴对齐姿态)。
 ///
-/// 单个 cuboid(边长 a = b = c = 0.9,质量 0.729)对质心的惯量张量
-/// `I = m/12 · diag(b²+c², a²+c², a²+b²)`;平行轴定理平移到分量质心后取逆。
-fn component_inv_inertia(cells: &[BlockPos]) -> Vec3 {
+/// 逐格 cuboid(半边长 0.45、密度 1)对自身质心的惯量张量
+/// `I = m/12 · diag(b²+c², a²+c², a²+b²)`(a = b = c = 0.9,对角、无惯性积),
+/// 平行轴定理平移到分量质心:**含惯性积** `−Σ m·dx·dy` 等——L 形、7 字等
+/// 不对称分量的惯性积不为零,只取对角会让 Δω 方向出错(F01 验收返修 2);
+/// 最后整体求逆(3×3 解析逆)。
+///
+/// 返回 `Option`:分量退化为零体积(不可能,构造保证 ≥ 1 格)时为 `None`。
+fn component_inv_inertia(cells: &[BlockPos]) -> [[f32; 3]; 3] {
     let com = component_center_of_mass(cells);
     let half = DEBRIS_HALF_SIZE;
     let cell_mass = DEBRIS_MASS_PER_CELL;
-    // 每格自身惯量(对角)。
-    let base = cell_mass / 12.0
-        * Vec3::new(
-            4.0 * half * half + 4.0 * half * half, // b²+c²
-            4.0 * half * half + 4.0 * half * half, // a²+c²
-            4.0 * half * half + 4.0 * half * half, // a²+b²
-        );
-    let mut i_diag = Vec3::ZERO;
+    // 每格自身惯量(对角;立方格三轴相等)。
+    let base = cell_mass / 12.0 * (4.0 * half * half + 4.0 * half * half);
+    // 对角与惯性积累加:I_xy = −Σ m·dx·dy 等(平行轴定理的惯性积项)。
+    let mut i = [[0.0_f32; 3]; 3];
     for c in cells {
         let d = Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5) - com;
-        let parallel = cell_mass
-            * Vec3::new(
-                d.y * d.y + d.z * d.z,
-                d.x * d.x + d.z * d.z,
-                d.x * d.x + d.y * d.y,
-            );
-        i_diag += base + parallel;
+        i[0][0] += base + cell_mass * (d.y * d.y + d.z * d.z);
+        i[1][1] += base + cell_mass * (d.x * d.x + d.z * d.z);
+        i[2][2] += base + cell_mass * (d.x * d.x + d.y * d.y);
+        i[0][1] -= cell_mass * d.x * d.y;
+        i[0][2] -= cell_mass * d.x * d.z;
+        i[1][2] -= cell_mass * d.y * d.z;
     }
-    Vec3::new(
-        if i_diag.x > 0.0 { 1.0 / i_diag.x } else { 0.0 },
-        if i_diag.y > 0.0 { 1.0 / i_diag.y } else { 0.0 },
-        if i_diag.z > 0.0 { 1.0 / i_diag.z } else { 0.0 },
-    )
+    i[1][0] = i[0][1];
+    i[2][0] = i[0][2];
+    i[2][1] = i[1][2];
+    invert_symmetric_3x3(&i)
+}
+
+/// 3×3 对称矩阵的解析逆(行主序;奇异性不可能——至少 1 格的非零惯量)。
+/// `A = [[a,b,c],[b,d,e],[c,e,f]]`,伴随 = 余子式矩阵的转置(对称同位),
+/// `det = a·C00 + b·C01 + c·C02`。
+fn invert_symmetric_3x3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let (a, b, c, d, e, f) = (m[0][0], m[0][1], m[0][2], m[1][1], m[1][2], m[2][2]);
+    let c00 = d * f - e * e;
+    let c01 = c * e - b * f;
+    let c02 = b * e - d * c;
+    let c11 = a * f - c * c;
+    let c12 = b * c - a * e;
+    let c22 = a * d - b * b;
+    let det = a * c00 + b * c01 + c * c02;
+    debug_assert!(det > 0.0, "惯量张量正定(至少 1 格)");
+    let inv_det = 1.0 / det;
+    [
+        [c00 * inv_det, c01 * inv_det, c02 * inv_det],
+        [c01 * inv_det, c11 * inv_det, c12 * inv_det],
+        [c02 * inv_det, c12 * inv_det, c22 * inv_det],
+    ]
 }
 
 /// 分量被切成多段时各段的初速度(§5.7.3 第 3 条;与 §7.3 第 5 条 `fracture_pieces`
@@ -293,11 +311,16 @@ pub fn segment_velocity(
 ///
 /// - `block_at(q) = None` = 所在 chunk 未装载(汇点);`in_core(q) = false` = 格在
 ///   本体区外(副本格,跨分片保守视为地基,汇点);
-/// - **节点** = 从供给最大的被撞格出发、经共面相邻 BFS 到达的实心格(本拍已被先前
-///   事件写成 air 的格 `block_at` 已是空气,天然不入网),至多 `max_cells` 个
-///   (BFS 按层、层内 `BlockPos` 升序,确定性);命中格 = `supplies` 中供给最大的格
-///   (同值 `BlockPos` 升序);
+/// - **节点** = 从**全部**被撞格出发(**多源 BFS**:第一层 = 全部供给格,按
+///   `BlockPos` 升序)、经共面相邻 BFS 到达的实心格(本拍已被先前事件写成 air
+///   的格 `block_at` 已是空气,天然不入网),至多 `max_cells` 个(BFS 按层、
+///   层内 `BlockPos` 升序,确定性)——复合体同时压在两处互不相连的地形上
+///   (长条架在两根柱上),两处都在网内;
 /// - **源边**:源点 → 区域内供给格 c 容量 `s_c` 的量化值(逐格向下取整);
+///   **被撞格不在区域内**(已写成 air、本体区外、未装载、超出预算)时,它的
+///   供给既不建源边也不计入 `s`——`s` 恒等于源边容量之和(代码内以
+///   `debug_assert` 钉住;F01 曾只从供给最大的格出发 BFS,不相连的被撞格的
+///   供给计入了 `s` 却没有源边,判"断开"而 S = ∅);
 /// - **格间边**:区域内相邻实心格 a → b——`u` = a 指向 b 的单位轴向量,
 ///   `u·d̂ ≥ cos 45°`(b 在 a 的受力背后,a 被压向 b)→ 压向容量
 ///   `I_c(a,b) = min(I_c,a, I_c,b)`;否则(剪、拉)→ `I(a,b) = min(I_a, I_b)`;
@@ -307,10 +330,9 @@ pub fn segment_velocity(
 ///   (相邻格无材料或 ∞ 时取 a 侧);
 /// - **整数化**:供给向下取整、容量向上取整,∞ 用哨兵;
 /// - **判定在整数域**:`C ≥ supply_q` 扛住;否则 S = 残量网络中源点可达的格
-///   (最小割的最小源侧)——`supply_q` 是各 `s_c` 向下取整后之和,与源边容量
-///   同一口径,因此 `C < supply_q` 时必有源边不饱和,S 必非空(F00 曾拿向上
-///   取整的 s 与 C 比,造出"判断开却 S = ∅"的退化情形,实现不得如此——本句
-///   是断言级规格);
+///   (最小割的最小源侧)——`supply_q` 与源边容量同一口径,因此
+///   `C < supply_q` 时必有源边不饱和,S 必非空(F00 曾拿向上取整的 s 与 C 比,
+///   造出"判断开却 S = ∅"的退化情形,实现不得如此——本句是断言级规格);
 /// - **预筛**:`s < I_min`(注册表全部材料 `min(I, I_c)` 的最小值)不建网络;
 ///   `|J| = 0` 视为无事件。
 pub fn evaluate_impact_flow(
@@ -331,29 +353,34 @@ pub fn evaluate_impact_flow(
     for &(c, s) in &event.supplies {
         *supplies.entry(c).or_insert(0.0) += s;
     }
+    // BFS 区域:多源(第一层 = 全部供给格,按 BlockPos 升序),按层、层内升序,
+    // 至多 max_cells 个实心格。
+    let (region, truncated) = bfs_region(
+        block_at,
+        in_core,
+        registry,
+        supplies.keys().copied(),
+        max_cells,
+    );
+    outcome.visited = region.len();
+    outcome.truncated = truncated;
+    // 不在区域内的被撞格:供给既不建源边也不计入 s(§5.7.1 源边条)。
+    // (空气、本体区外、未装载、超出预算的格都不在 region。)
+    let in_region_supplies: BTreeMap<BlockPos, f32> = supplies
+        .iter()
+        .filter(|(c, _)| region.contains(c))
+        .map(|(c, &s)| (*c, s))
+        .collect();
     // 预筛:s < I_min(全部材料 min(I, I_c) 的最小值)→ 任何割都比供给大,不建网。
     let i_min = min_impact(registry);
-    let s_total: f32 = supplies.values().sum();
-    outcome.supply_q = supplies
+    let s_total: f32 = in_region_supplies.values().sum();
+    outcome.supply_q = in_region_supplies
         .values()
         .map(|&s| quant_supply(s))
         .sum::<u64>()
         .min(INF_CAP);
     if s_total < i_min {
         outcome.prefiltered = true;
-        return outcome;
-    }
-    // 命中格 = 供给最大的格(同值 BlockPos 升序;BTreeMap 迭代序保证)。
-    let hit = supplies
-        .iter()
-        .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0)))
-        .map(|(c, _)| *c)
-        .expect("supplies 非空");
-    // BFS 区域:按层、层内 BlockPos 升序,至多 max_cells 个实心格。
-    let (region, truncated) = bfs_region(block_at, in_core, registry, hit, max_cells);
-    outcome.visited = region.len();
-    outcome.truncated = truncated;
-    if region.is_empty() {
         return outcome;
     }
     let idx: BTreeMap<BlockPos, usize> = region
@@ -368,7 +395,7 @@ pub fn evaluate_impact_flow(
     for &a in &region {
         let ua = idx[&a];
         // 源边:供给逐格向下取整(区域内其他格也可能有供给,多点接触)。
-        if let Some(&s) = supplies.get(&a) {
+        if let Some(&s) = in_region_supplies.get(&a) {
             let q = quant_supply(s);
             if q > 0 {
                 net.edge(SRC, ua, q);
@@ -387,16 +414,16 @@ pub fn evaluate_impact_flow(
             if !mb_none_unloaded && mb.is_none() {
                 continue; // 空气:冲量传不进,无边(先前事件写成 air 的格不入网)
             }
-            let (a_mat, b_mat) = match (ma, mb) {
-                (Some(x), Some(y)) => (Some(x), Some(y)),
-                (Some(x), None) => (Some(x), None),
-                _ => (None, None),
-            };
-            let cap_raw = match (a_mat, b_mat) {
-                (Some(x), Some(y)) if u_dot >= COS_PRESS => x.impact_crush.min(y.impact_crush),
-                (Some(x), Some(y)) => x.impact_threshold.min(y.impact_threshold),
-                (Some(x), None) if u_dot >= COS_PRESS => x.impact_crush,
-                (Some(x), None) => x.impact_threshold,
+            let cap_raw = match (ma, mb) {
+                // 两侧都有材料:压向用 I_c(a,b)、剪拉用 I(a,b)(cohesion 的
+                // 取较小值辅助,与 impact_bond_between 并列;§5.7.1)。
+                (Some(_), Some(_)) if u_dot >= COS_PRESS => {
+                    impact_crush_between(registry, ba, b_block.expect("已检查"))
+                }
+                (Some(_), Some(_)) => impact_bond_between(registry, ba, b_block.expect("已检查")),
+                // 相邻格无材料或 ∞ 时取 a 侧(§5.7.1 汇点口径)。
+                (Some(x), _) if u_dot >= COS_PRESS => x.impact_crush,
+                (Some(x), _) => x.impact_threshold,
                 _ => 0.0,
             };
             // 未装载 chunk → 汇点(容量按 a 侧材料计,§5.7.1)。
@@ -444,6 +471,18 @@ pub fn evaluate_impact_flow(
     }
     net.max_flow(SRC, SNK);
     outcome.cut_q = net.flow_value(SRC);
+    // 断言级规格:s 恒等于源边容量之和(不在区域内的被撞格不计入 s;
+    // F01 验收返修 1)。零供给的退化情形(全部被撞格都不在区域内)也满足。
+    debug_assert_eq!(
+        outcome.supply_q,
+        region
+            .iter()
+            .filter_map(|a| in_region_supplies.get(a))
+            .map(|&s| quant_supply(s))
+            .sum::<u64>()
+            .min(INF_CAP),
+        "supply_q 必须等于源边容量之和"
+    );
     let reach = net.reachable(SRC);
     if outcome.cut_q < outcome.supply_q {
         // C < s:残量网络中从源点可达的格 S 断下(必有源边不饱和,S 非空)。
@@ -485,23 +524,30 @@ fn quant_cap(c: f32) -> u64 {
     }
 }
 
-/// BFS 区域(§5.7.1):从命中格出发的实心格,按层、层内 `BlockPos` 升序,
-/// 至多 `max_cells` 个;截断 = 某层入队后预算用完仍有格未出队。
-/// 本拍已被先前事件写成 air 的格 `block_at` 已是空气,天然不入网。
+/// BFS 区域(§5.7.1,**多源**):第一层 = 全部供给格(迭代序 = `BlockPos`
+/// 升序),之后按层、层内 `BlockPos` 升序,至多 `max_cells` 个实心格;截断 =
+/// 某层入队后预算用完仍有格未出队。本拍已被先前事件写成 air 的格 `block_at`
+/// 已是空气,天然不入网;不在本体区内的供给格同样不入网(其供给不计入 s)。
 fn bfs_region(
     block_at: &dyn Fn(BlockPos) -> Option<BlockId>,
     in_core: &dyn Fn(BlockPos) -> bool,
     registry: &dyn BlockRegistry,
-    hit: BlockPos,
+    sources: impl Iterator<Item = BlockPos>,
     max_cells: usize,
 ) -> (Vec<BlockPos>, bool) {
     let solid =
         |q: BlockPos| in_core(q) && block_at(q).is_some_and(|b| registry.material(b).is_some());
-    if !solid(hit) {
-        return (Vec::new(), false);
+    let mut seen: BTreeSet<BlockPos> = BTreeSet::new();
+    let mut frontier: Vec<BlockPos> = Vec::new();
+    for c in sources {
+        // 去重 + 只进实心格(去重靠 seen:BTreeSet 先到先得,重复源天然合并)。
+        if seen.insert(c) && solid(c) {
+            frontier.push(c);
+        }
     }
-    let mut seen: BTreeSet<BlockPos> = BTreeSet::from([hit]);
-    let mut frontier = vec![hit];
+    // 第一层 = 全部供给格,按 BlockPos 升序(sources 已按 BTreeMap 迭代序给出,
+    // 此处排序兜底并保持与后续层一致)。
+    frontier.sort_unstable();
     let mut region: Vec<BlockPos> = Vec::new();
     let mut truncated = false;
     while !frontier.is_empty() {
@@ -902,7 +948,9 @@ mod tests {
         assert!(out.prefiltered, "s < I_min = 4 不建网");
         assert_eq!(out.cut_q, 0);
         assert!(out.detached.is_empty());
-        assert_eq!(out.visited, 0);
+        // visited = BFS 到达的实心格数(多源 BFS 先于预筛执行;遥测口径是
+        // "访问过的格",预筛只是不建网、不抹掉这次访问的事实)。
+        assert_eq!(out.visited, 2);
         // 恰好 = 4:建网(扛住但 visited > 0)。
         let out = evaluate_impact_flow(
             &world,
@@ -1025,7 +1073,7 @@ mod tests {
             inv_inertia: [[0.122, 0.0, 0.0], [0.0, 0.122, 0.0], [0.0, 0.0, 0.122]],
             center_of_mass: Vec3::new(3.5, 0.5, 0.5),
         };
-        let contacts = vec![(event.point, 20.0)];
+        let contacts = vec![(p(0, 0, 0), event.point, 20.0)];
         let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
         assert_eq!(comps.len(), 1);
         let s = 20.0_f32;
@@ -1083,8 +1131,8 @@ mod tests {
             center_of_mass: Vec3::new(5.5, 1.5, 0.5),
         };
         let contacts = vec![
-            (Vec3::new(0.5, 0.5, 0.5), 20.0),
-            (Vec3::new(0.5, 2.5, 0.5), 20.0),
+            (p(0, 0, 0), Vec3::new(0.5, 0.5, 0.5), 20.0),
+            (p(0, 2, 0), Vec3::new(0.5, 2.5, 0.5), 20.0),
         ];
         let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
         assert_eq!(comps.len(), 2);
@@ -1110,8 +1158,8 @@ mod tests {
         assert!((k_low.point - Vec3::new(0.5, 0.5, 0.5)).length() < 1e-6);
         // 偏心:接触点挪到格内偏角 → r_k ≠ 0 → Δω ≠ 0。
         let contacts2 = vec![
-            (Vec3::new(0.1, 0.9, 0.5), 20.0),
-            (Vec3::new(0.5, 2.5, 0.5), 20.0),
+            (p(0, 0, 0), Vec3::new(0.1, 0.9, 0.5), 20.0),
+            (p(0, 2, 0), Vec3::new(0.5, 2.5, 0.5), 20.0),
         ];
         let (_, comps2) = distribute_momentum(&event, &outcome, &contacts2, &impactor);
         let k_low2 = comps2.iter().find(|k| k.cells[0] == p(0, 0, 0)).unwrap();

@@ -3588,7 +3588,14 @@ mod unit_f01 {
             }
         }
         c.push((p(0, 1, 0), STONE)); // 伸出格(只连 (−1,1,0))
-        v.push(("4 corner-block-side", c, p(0, 1, 0), [0.0, -1.0, 0.0]));
+        v.push((
+            "4 corner-block-side",
+            c.clone(),
+            p(0, 1, 0),
+            [0.0, -1.0, 0.0],
+        ));
+        // 4b. 同一伸出格,迎面撞回墙里(d̂ = 朝墙 = −x):割 = 那 1 根压向 I_c = 72。
+        v.push(("4b corner-block-head-on", c, p(0, 1, 0), [-1.0, 0.0, 0.0]));
         // 5. 1 格宽土桥(跨 7)中部被从上砸:割 = 两端 2 根剪切 14。
         let mut c = flat_ground();
         for x in [-1i32, 7] {
@@ -3642,13 +3649,14 @@ mod unit_f01 {
         v
     }
 
-    /// §5.7.1 表 10 行的期望:(名称,C 量化,S 格数,显式 S)。
+    /// §5.7.1 表 11 行的期望(含迎面撞 72 那行;F01b 返修 4):(名称,C 量化,S 格数,显式 S)。
     fn expected_table() -> Vec<(&'static str, u64, usize, Option<Vec<BlockPos>>)> {
         vec![
             ("1 wall-on-bedrock", 72_000, 1, None),
             ("2 wall-on-dirt", 49_000, 35, None),
             ("3 thick-wall", 144_000, 1, None),
             ("4 corner-block-side", 18_000, 1, None),
+            ("4b corner-block-head-on", 72_000, 1, None),
             ("5 dirt-bridge", 14_000, 1, None),
             ("6 flat-ground", 56_000, 1, None),
             ("7 pillar-mid", 7_000, 4, None),
@@ -3670,8 +3678,8 @@ mod unit_f01 {
         ]
     }
 
-    /// AC-F3 §5.7.1 表 10 行:S 与 C,两侧各取 C ±1 量化单位验证"恰好不断 /
-    /// 恰好断"(整数域判定)。
+    /// AC-F3 §5.7.1 表全部行(11 行,含迎面撞 72):S 与 C,两侧各取 C ±1
+    /// 量化单位验证"恰好不断 / 恰好断"(整数域判定)。
     ///
     /// 会变红的实现:任何一行的割或 S 不对;±1 边界拿浮点直接比。
     #[test]
@@ -4087,7 +4095,7 @@ mod unit_f01 {
             inv_inertia: diag(single_cell_inertia()),
             center_of_mass: Vec3::new(3.5, 0.5, 0.5),
         };
-        let contacts = vec![(event.point, s)];
+        let contacts = vec![(p(0, 0, 0), event.point, s)]; // 已按 §5.7.1 口径归格
         let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
         assert_eq!(comps.len(), 1);
         let c = outcome.cut_q as f32 / QUANT as f32;
@@ -4250,7 +4258,7 @@ mod unit_f01 {
             inv_inertia: diag(single_cell_inertia()),
             center_of_mass: Vec3::new(3.5, 1.5, 0.5),
         };
-        let contacts = vec![(Vec3::new(0.2, 1.5, 0.5), s)]; // 偏在分量一端
+        let contacts = vec![(p(0, 1, 0), Vec3::new(0.2, 1.5, 0.5), s)]; // 偏在分量一端(归格 (0,1,0))
         let (correction, comps) = distribute_momentum(&event, &outcome, &contacts, &impactor);
         let _ = correction;
         assert_eq!(comps.len(), 1);
@@ -4321,5 +4329,294 @@ mod unit_f01 {
             assert!((v - expect).length() < 1e-5, "v_seg 刚体一致");
             assert!((w - component.delta_w).length() < 1e-7, "ω_seg = Δω_k");
         }
+    }
+
+    // ------------------------------------------- F01b 返修(多源 BFS / 3×3 惯量 / p_k 归格)
+
+    /// 两根 1×1×4 石柱立在土上,互不相连,柱顶各有供给:多源 BFS 把两处都
+    /// 收进区域,C = 7 + 7 = 14(两根柱脚各一条石-土剪切),S = 两根柱 8 格、
+    /// 2 个分量(F01b 返修 1;F01 只从供给最大的格出发时,另一根柱的供给
+    /// 计入了 s 却没有源边,判"断开"而 S = ∅)。
+    ///
+    /// 会变红的实现:BFS 单源(另一根柱不在网内,S = ∅ 或缺一根柱)。
+    #[test]
+    fn acc_f3_multi_source_two_pillars() {
+        let reg = SimpleRegistry::builtin();
+        // 两柱 (0,0..3,0) 与 (6,0..3,0),各自脚下 dirt(flat_ground 提供)。
+        let mut cells = flat_ground();
+        for x in [0i32, 6] {
+            for y in 0..=3 {
+                cells.push((p(x, y, 0), STONE));
+            }
+        }
+        let world = world_of(cells);
+        let dhat = Vec3::new(-1.0, 0.0, 0.0);
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 3, 0), 50.0), (p(6, 3, 0), 50.0)],
+            impulse: dhat * 100.0,
+            point: Vec3::new(3.0, 3.5, 0.5),
+        };
+        let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(out.supply_q, 100_000, "两处供给都计入 s(都在区域内)");
+        assert_eq!(out.cut_q, 14_000, "C = 7 + 7(两根柱脚石-土)");
+        assert_eq!(out.detached.len(), 8, "S = 两根柱 8 格");
+        assert_eq!(out.components.len(), 2, "互不相连 → 2 个分量");
+        let mut comp_cells: Vec<Vec<BlockPos>> = out.components.clone();
+        comp_cells.sort_by_key(|comp| comp[0]);
+        assert_eq!(
+            comp_cells[0],
+            vec![p(0, 0, 0), p(0, 1, 0), p(0, 2, 0), p(0, 3, 0)],
+            "分量内 BlockPos 升序"
+        );
+        assert_eq!(
+            comp_cells[1],
+            vec![p(6, 0, 0), p(6, 1, 0), p(6, 2, 0), p(6, 3, 0)],
+        );
+    }
+
+    /// 不在区域内的被撞格不计入 s:供给格之一是空气(或本体区外)时,
+    /// `supply_q` 只含实心在网格的供给,`supply_q` = 源边容量之和
+    /// (F01b 返修 1;断言级规格的另一半)。
+    ///
+    /// 会变红的实现:供给格的实心性/在网性不检查,空格的供给计入 s。
+    #[test]
+    fn acc_f3_supply_off_region_not_counted() {
+        let reg = SimpleRegistry::builtin();
+        // 一根石柱立在土上;供给给了柱顶 (0,3,0)(实心)和 (3,3,0)(空气)。
+        let mut cells = flat_ground();
+        for y in 0..=3 {
+            cells.push((p(0, y, 0), STONE));
+        }
+        let world = world_of(cells);
+        let dhat = Vec3::new(-1.0, 0.0, 0.0);
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 3, 0), 50.0), (p(3, 3, 0), 50.0)],
+            impulse: dhat * 100.0,
+            point: Vec3::new(1.5, 3.5, 0.5),
+        };
+        let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(
+            out.supply_q, 50_000,
+            "空气格的供给不计入 s(只有柱顶 50 在网内)"
+        );
+        assert_eq!(out.cut_q, 7_000);
+        assert_eq!(out.detached.len(), 4, "S = 单根柱");
+        // 本体区外的供给格同样不计入(in_core = false → 不入网)。
+        let core_x_le_5 = |q: BlockPos| q.x <= 5;
+        let mut cells = flat_ground();
+        for x in [0i32, 6] {
+            for y in 0..=3 {
+                cells.push((p(x, y, 0), STONE));
+            }
+        }
+        let world = world_of(cells);
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 3, 0), 50.0), (p(6, 3, 0), 50.0)],
+            impulse: dhat * 100.0,
+            point: Vec3::new(3.0, 3.5, 0.5),
+        };
+        let out = evaluate_impact_flow(&world, &core_x_le_5, &reg, &event, MAX_CELLS);
+        assert_eq!(
+            out.supply_q, 50_000,
+            "本体区外的被撞格不计入 s(x=6 那根在区外)"
+        );
+        assert_eq!(out.cut_q, 7_000, "区外柱不评估,区内柱按割 7 断");
+        assert_eq!(out.detached.len(), 4, "S 只含区内那一根柱");
+    }
+
+    /// 多源下的单侧断:两处被撞格,只有一处被打断(供给不对称:强供给超过
+    /// 一处割、弱供给不足另一处割),S 只含那一处(F01b 返修 1 第 3 例)。
+    ///
+    /// 会变红的实现:判定用了合计供给与合计割(S 把两根柱都断下)。
+    #[test]
+    fn acc_f3_multi_source_partial_break() {
+        let reg = SimpleRegistry::builtin();
+        let mut cells = flat_ground();
+        for x in [0i32, 6] {
+            for y in 0..=3 {
+                cells.push((p(x, y, 0), STONE));
+            }
+        }
+        let world = world_of(cells);
+        let dhat = Vec3::new(-1.0, 0.0, 0.0);
+        // 左柱顶供给 20(> 割 7 → 断),右柱顶供给 5(< 割 7 → 扛住)。
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 3, 0), 20.0), (p(6, 3, 0), 5.0)],
+            impulse: dhat * 25.0,
+            point: Vec3::new(3.0, 3.5, 0.5),
+        };
+        let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(out.supply_q, 25_000);
+        // C = 最大流:左柱割 7000 + 右柱源边(供给 5000 < 割 7000,饱和)= 12000。
+        assert_eq!(out.cut_q, 12_000, "C = 左柱割 7 + 右柱供给(饱和)5");
+        assert_eq!(out.detached.len(), 4, "S = 只含被打断的左柱");
+        assert_eq!(
+            cells_sorted(&out.detached),
+            vec![p(0, 0, 0), p(0, 1, 0), p(0, 2, 0), p(0, 3, 0)]
+        );
+    }
+
+    /// `p_k` 按归格口径取接触点:接触点恰在柱顶格面上(y 恰为整数,`floor()`
+    /// 会落进空气一侧),归格 (x, 顶格, z) 后,两个分量的 `p_k` 分别等于各自
+    /// 柱顶的接触点,而不是退回事件作用点(F01b 返修 3;§5.7.2 断下部分条)。
+    ///
+    /// 会变红的实现:纯函数里对接触点坐标 `floor()` 取整(归错格,p_k 退回 p)。
+    #[test]
+    fn acc_f4_point_per_component_on_cell_face() {
+        let reg = SimpleRegistry::builtin();
+        let mut cells = flat_ground();
+        for x in [0i32, 6] {
+            for y in 0..=3 {
+                cells.push((p(x, y, 0), STONE));
+            }
+        }
+        let world = world_of(cells);
+        let dhat = Vec3::new(-1.0, 0.0, 0.0);
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 3, 0), 50.0), (p(6, 3, 0), 50.0)],
+            impulse: dhat * 100.0,
+            point: Vec3::new(3.0, 4.0, 0.5), // 冲量加权的事件作用点(两接触点中点)
+        };
+        let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(out.components.len(), 2);
+        // 接触点恰在柱顶格面上(y = 4.0 = 格 (x,3,0) 的上表面);归格 = 各柱顶格。
+        // 若按 floor() 取整,y = 4.0 落进空气格 (x,4,0) → 两分量的 p_k 都退回
+        // 事件作用点 (3.0,4.0,0.5)。
+        let contacts = vec![
+            (p(0, 3, 0), Vec3::new(0.5, 4.0, 0.5), 50.0),
+            (p(6, 3, 0), Vec3::new(6.5, 4.0, 0.5), 50.0),
+        ];
+        let impactor = ImpactBodyProps {
+            mass: CELL_MASS,
+            inv_inertia: diag(single_cell_inertia()),
+            center_of_mass: Vec3::new(3.0, 6.5, 0.5),
+        };
+        let (_, comps) = distribute_momentum(&event, &out, &contacts, &impactor);
+        assert_eq!(comps.len(), 2);
+        for k in &comps {
+            let expect = if k.cells[0].x == 0 {
+                Vec3::new(0.5, 4.0, 0.5)
+            } else {
+                Vec3::new(6.5, 4.0, 0.5)
+            };
+            assert!(
+                (k.point - expect).length() < 1e-6,
+                "p_k = 分量内接触点 {:?}(不是事件作用点)",
+                k.point
+            );
+        }
+    }
+
+    /// 不对称分量(3 格 L 形)的 Δω:惯量张量含惯性积,Δω 与 rapier
+    /// `apply_impulse_at_point` 逐轴一致(≤ 1e-4),且与"只取对角"的结果
+    /// 确实不同(≥ 1e-2),否则本测试抓不住回退(F01b 返修 2;§5.7.2)。
+    ///
+    /// 会变红的实现:`component_inv_inertia` 退回只取对角(Δω 方向错);
+    /// 惯性积漏负号;3×3 求逆写错。
+    #[test]
+    fn acc_f4_angular_offdiagonal_inertia_l_shape() {
+        use rapier3d::prelude::*;
+        let reg = SimpleRegistry::builtin();
+        // L 形 3 格:(0,1,0)、(1,1,0)、(1,2,0),架在两根土柱上(土柱立在
+        // bedrock 上)。侧敲(z 向):石-土剪切 2×7 = 14,L 形整块断下。
+        let cells: Vec<(BlockPos, BlockId)> = vec![
+            (p(0, 1, 0), STONE),
+            (p(1, 1, 0), STONE),
+            (p(1, 2, 0), STONE),
+            (p(0, 0, 0), DIRT),
+            (p(1, 0, 0), DIRT),
+            (p(0, -1, 0), BEDROCK),
+            (p(1, -1, 0), BEDROCK),
+        ];
+        let world = world_of(cells);
+        let dhat = Vec3::new(0.0, 0.0, -1.0);
+        let s = 40.0_f32;
+        let event = ImpactEvent {
+            supplies: vec![(p(0, 1, 0), s)],
+            impulse: dhat * s,
+            point: Vec3::new(0.5, 1.5, 0.5),
+        };
+        let out = evaluate_impact_flow(&world, &all_core(), &reg, &event, MAX_CELLS);
+        assert_eq!(out.cut_q, 14_000);
+        assert_eq!(
+            cells_sorted(&out.detached),
+            vec![p(0, 1, 0), p(1, 1, 0), p(1, 2, 0)],
+            "L 形 3 格整块断下"
+        );
+        assert_eq!(out.components.len(), 1);
+        let impactor = ImpactBodyProps {
+            mass: CELL_MASS,
+            inv_inertia: diag(single_cell_inertia()),
+            center_of_mass: Vec3::new(4.0, 3.5, 0.5),
+        };
+        // 偏心 + 耦合方向:接触点在 L 的短臂端、冲量带 x/z 双分量。
+        let contacts = vec![(p(0, 1, 0), Vec3::new(0.2, 1.4, 0.5), s)];
+        let (correction, comps) = distribute_momentum(&event, &out, &contacts, &impactor);
+        let _ = correction;
+        assert_eq!(comps.len(), 1);
+        let k = &comps[0];
+        // rapier 参照:同形状刚体(L 形 3 个格中心处的 cuboid)在 p_k 处施加 P_k。
+        let mut bodies = RigidBodySet::new();
+        let mut colliders = ColliderSet::new();
+        let body = RigidBodyBuilder::dynamic()
+            .translation(rapier3d::math::Vector::new(0.0, 0.0, 0.0))
+            .build();
+        let handle = bodies.insert(body);
+        for off in [(0.5f32, 1.5f32, 0.5f32), (1.5, 1.5, 0.5), (1.5, 2.5, 0.5)] {
+            let _ = colliders.insert_with_parent(
+                ColliderBuilder::cuboid(0.45, 0.45, 0.45)
+                    .density(1.0)
+                    .translation(rapier3d::math::Vector::new(off.0, off.1, off.2)),
+                handle,
+                &mut bodies,
+            );
+        }
+        let b = bodies.get_mut(handle).unwrap();
+        b.apply_impulse_at_point(
+            rapier3d::math::Vector::new(k.impulse.x, k.impulse.y, k.impulse.z),
+            rapier3d::math::Vector::new(k.point.x, k.point.y, k.point.z),
+            true,
+        );
+        let av = b.angvel();
+        let rapier_w = Vec3::new(av.x, av.y, av.z);
+        assert!(
+            (rapier_w - k.delta_w).length() < 1e-4,
+            "L 形 Δω 逐轴一致:解析 {:?} vs rapier {:?}",
+            k.delta_w,
+            rapier_w
+        );
+        // 与"只取对角"确实不同(否则本测试抓不住回退;≥ 1e-2)。
+        let r_k = k.point - component_center_of_mass(&k.cells);
+        let torque = r_k.cross(k.impulse);
+        let diag_only_w = Vec3::new(
+            torque.x / diagonal_inertia(&k.cells, 0),
+            torque.y / diagonal_inertia(&k.cells, 1),
+            torque.z / diagonal_inertia(&k.cells, 2),
+        );
+        assert!(
+            (diag_only_w - k.delta_w).length() >= 1e-2,
+            "只取对角的 Δω 与完整张量的 Δω 应显著不同:{:?} vs {:?}",
+            diag_only_w,
+            k.delta_w
+        );
+    }
+
+    /// 只取对角的伪 Δω(对照用):分量对角惯量(不含惯性积)。
+    fn diagonal_inertia(cells: &[BlockPos], axis: usize) -> f32 {
+        let com = component_center_of_mass(cells);
+        let base = CELL_MASS / 12.0 * (0.81 + 0.81);
+        cells
+            .iter()
+            .map(|c| {
+                let d = Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5) - com;
+                let (dx, dy, dz) = (d.x, d.y, d.z);
+                base + CELL_MASS
+                    * match axis {
+                        0 => dy * dy + dz * dz,
+                        1 => dx * dx + dz * dz,
+                        _ => dx * dx + dy * dy,
+                    }
+            })
+            .sum::<f32>()
     }
 }
