@@ -584,7 +584,7 @@ AABB(外扩 `contact_wake_skin_m`)与 `c` 相交的冻结实体,在**下一拍**
 | `actor_motion_max_ticks` | 1200(20 s) | 常驻票上限 |
 | `support_normal_min` | 0.7(约 45°) | 支撑判定的法向阈值 |
 | `contact_wake_lookahead_ticks` | 2 | 撞前预测扫掠 |
-| `contact_wake_skin_m` | 0.075 m | 扫掠外扩 / 冻结邻接间距 / 地形变更判定外扩 / 支撑闭包贴靠判定(修订 10:任务 04b 实测校准为站立面容差,原建议 0.05) |
+| `contact_wake_skin_m` | 0.075 m | 扫掠外扩 / 冻结邻接间距 / 地形变更判定外扩 / 支撑闭包贴靠判定(修订 10:任务 04b 实测校准为站立面容差,原建议 0.05;REQ-010 D15 / §5.7.10 地形薄片内缩后,薄片外表面即格面,此值不再补偿薄片伸出量,改称"贴靠容差",数值不变) |
 | `contact_wake_min_momentum` | 1.0 kg·m/s | 种子与传播门槛(默认实体 1 kg,约 1 m/s 撞击) |
 | `contact_wake_decay` | 0.5 | 每跳动量衰减 |
 | `contact_wake_max_hops` | 4 | 传播跳数上限 |
