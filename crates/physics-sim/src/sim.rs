@@ -280,6 +280,17 @@ pub(crate) struct EntityRecord {
     pub(crate) actor_motion_ticks: Option<u64>,
 }
 
+/// 接近速度基准的角速度与世界质心快照(§5.7.9 勘误 2,本步之前):
+/// 接触点速度 = `v + ω × (p − com)`,`p` = 实体侧接触点(世界坐标)。
+/// 与 [`ShardSim::pre_impulse_vels`] 同拍刷新、同不入快照。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreImpactSpin {
+    /// 本步前角速度(世界系)。
+    pub(crate) angvel: Vec3,
+    /// 本步前世界质心。
+    pub(crate) world_com: Vec3,
+}
+
 /// 单分片模拟器(字段 crate 内可见:snapshot.rs 读写快照结构)。
 pub struct ShardSim {
     pub(crate) cfg: ShardSimConfig,
@@ -376,6 +387,11 @@ pub struct ShardSim {
     /// `step` 内 `phys.step()` 之前整表刷新;`evaluate_impacts` 只读。
     /// checkpoint 只在两拍之间取,拍内表必为空——不入快照。
     pub(crate) pre_impulse_vels: BTreeMap<EntityId, Vec3>,
+    /// 接近速度基准(§5.7.9 勘误 2):各醒着动态实体**本步之前的**角速度与
+    /// 世界质心(线速度在 [`ShardSim::pre_impulse_vels`]),与接触点同一时刻;
+    /// 接触点速度 = `v + ω × (p − com)`。`step` 内与线速度同处刷新;
+    /// `evaluate_impacts` 与 `evaluate_fractures` 只读。不入快照(同上)。
+    pub(crate) pre_impulse_spin: BTreeMap<EntityId, PreImpactSpin>,
     /// 坍塌推迟队列(§6.2.1;v6 快照追加):上一拍名额不足时 = 上一拍触发集
     /// 原样 ∪ 上一拍已转换的格;每拍求值输入之一。随分片快照走(checkpoint
     /// 落在推迟与再求值之间时恢复线不得丢,acc_d7)。
@@ -434,6 +450,7 @@ impl ShardSim {
             load_pending: BTreeSet::new(),
             load_conversion_records: BTreeMap::new(),
             pre_impulse_vels: BTreeMap::new(),
+            pre_impulse_spin: BTreeMap::new(),
             impact_impulses: BTreeMap::new(),
         }
     }
@@ -880,6 +897,8 @@ impl ShardSim {
         self.prestep_contact_wake();
         // 撞击接近速度的基准(§5 修订 9):各醒着动态实体本步之前的线速度,
         // 供 `evaluate_impacts` 使用(解算后的速度已被冲量修改)。
+        // 勘误 2(§5.7.9)追加:角速度与世界质心同拍快照——接触点速度
+        // = v + ω×(p − com),旋转体与被撞实体的门槛都按接触点算。
         self.pre_impulse_vels = self
             .entities
             .iter()
@@ -887,6 +906,24 @@ impl ShardSim {
                 let b = self.phys.bodies.get(rec.handle)?;
                 (b.is_dynamic() && !b.is_sleeping())
                     .then(|| (*id, conv::rapier_to_vec3(b.linvel())))
+            })
+            .collect();
+        // 同拍快照角速度与世界质心(§5.7.9 勘误 2;`mass_properties().world_com`
+        // 已随位姿/质量更新到本步前状态,与接触点同一时刻)。
+        self.pre_impulse_spin = self
+            .entities
+            .iter()
+            .filter_map(|(id, rec)| {
+                let b = self.phys.bodies.get(rec.handle)?;
+                (b.is_dynamic() && !b.is_sleeping()).then(|| {
+                    (
+                        *id,
+                        PreImpactSpin {
+                            angvel: conv::rapier_to_vec3(b.angvel()),
+                            world_com: conv::rapier_to_vec3(b.mass_properties().world_com),
+                        },
+                    )
+                })
             })
             .collect();
         self.phys.step();
@@ -2926,6 +2963,21 @@ impl ShardSim {
                 .get(terrain_collider)
                 .expect("地形 collider 在场")
                 .position();
+            // 实体侧碰撞体位姿(世界):接触点速度按实体侧接触点算(勘误 2:
+            // `r` = 接触点 − 本步前世界质心)。实体 collider 无子形状,簇的
+            // `local_p` 已折算到碰撞体坐标系,乘世界位姿即得。
+            let entity_collider = if entity_is_1 {
+                pair.collider1
+            } else {
+                pair.collider2
+            };
+            let entity_pos = *self
+                .phys
+                .colliders
+                .get(entity_collider)
+                .expect("实体 collider 在场")
+                .position();
+            let pre_spin = self.pre_impulse_spin.get(&id).copied();
             // §5 口径 = 解算器实际使用的流形(`pair.solver_manifolds()`;REQ-010
             // §5.7.10 末条、AC-F17)。地形 chunk 是复合形状:一对碰撞体多于 1 个
             // 流形时 rapier 的 contact clustering 把同法向流形合并成簇、只对簇
@@ -2942,10 +2994,15 @@ impl ShardSim {
                 } else {
                     -m.data.normal
                 };
-                // 接近速度(修订 9):本步前线速度沿接触法向朝地形的分量;
-                // < IMPACT_MIN_APPROACH_SPEED 的点不计——静止挤压(坑内薄片
-                // 对挤的大而相互抵消的冲量)与穿透修正不是撞击。
-                if pre_vel.dot(dir) < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
+                // 接近速度(勘误 2,§5.7.9):接触点速度 v + ω×(p − com) 沿
+                // 接触法向朝地形的分量;地形一侧为 0。流形级预筛(见上)与
+                // 逐点复核两道门槛,门槛值不变。
+                if pre_vel.dot(dir) < crate::destruction::IMPACT_MIN_APPROACH_SPEED
+                    && !pre_spin.is_some_and(|sp| {
+                        sp.angvel.length() * (entity_pos.translation - sp.world_com).length()
+                            >= crate::destruction::IMPACT_MIN_APPROACH_SPEED
+                    })
+                {
                     continue;
                 }
                 let subshape = if terrain_is_1 {
@@ -2956,6 +3013,24 @@ impl ShardSim {
                 .unwrap_or(Pose::IDENTITY);
                 for pt in &m.points {
                     if pt.data.impulse <= 0.0 {
+                        continue;
+                    }
+                    // 实体侧接触点(世界坐标):r 与接触点速度都按它算。
+                    let p_entity = if entity_is_1 {
+                        entity_pos * pt.local_p1
+                    } else {
+                        entity_pos * pt.local_p2
+                    };
+                    let contact_vel = match pre_spin {
+                        Some(sp) => {
+                            let r = p_entity - sp.world_com;
+                            pre_vel + sp.angvel.cross(r)
+                        }
+                        // 无 spin 快照(理论上与 pre_vel 同表同拍刷新,不会发生;
+                        // 防御:退化为线速度口径)。
+                        None => pre_vel,
+                    };
+                    if contact_vel.dot(dir) < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
                         continue;
                     }
                     let p = if terrain_is_1 {
@@ -3037,6 +3112,9 @@ impl ShardSim {
             .into_iter()
             .map(|(cell, (j, vec, block, threshold))| (cell, j, vec, block, threshold))
             .collect();
+        if candidates.is_empty() {
+            return;
+        }
         if candidates.is_empty() {
             return;
         }
@@ -6860,7 +6938,194 @@ mod tests {
         assert!(out.piece_requests.iter().all(|p| p.parent == a));
     }
 
-    // ==== REQ-010 单元 07:爆炸对复合体(§6.1;AC-C9)====
+    // ==== REQ-010 单元 F03:接近速度勘误(§5.7.9 勘误 2;AC-F9)====
+
+    /// AC-F9 第 1 句(旋转体):**质心不动、边缘高速**的旋转体撞地形——4 格
+    /// 石梁绕自身中心强旋(ω = 30 rad/s,左端点接触点速度 ≈ 45 m/s 向下,
+    /// 质心线速度 0),落在土层上。旧口径(只取线速度)门槛恒 0,不计;
+    /// 新口径按接触点速度 `v + ω×r` 计入 → 端点砸破脚下土格
+    /// (`cells_impacted > 0`、冲量表带该格)。
+    ///
+    /// 变红:接近速度退回"只取线速度"(旧口径,恒 0 → 无撞击)。
+    /// (变异自检:见 F03 回评——临时替换 `contact_vel` 为 `pre_vel` 本测试
+    /// 红,验证后还原。)
+    #[test]
+    fn rotating_body_impact_counts_contact_point_speed() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        // cohesion 关:走 REQ-009 单格逐格口径(本测试考察撞击采样门槛,
+        // 与碎裂无关);同时 `evaluate_collapse` 不走 load 分支,冲量表不被
+        // 拍末 take,断言可读。
+        cfg.cohesion.enabled = false;
+        // dt = 1/240:端点一步下扫 ω·r/4 ≈ 0.1 m,小于薄片厚 0.15——
+        // 避免隧穿(默认 1/60 一步 0.25 m 会直接穿过薄片,落入穿透修正,
+        // 不产生撞击冲量)。
+        cfg.dt = 1.0 / 240.0;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+        let id = entity(1);
+        // 静置高度(D15):中心 = 地表 + 0.45。ω = +16 rad/s 绕 z:左端
+        // (格 0,r = (−1.5,0,0))接触点速度 v_y = ω·1.5 = 24 m/s 向下
+        // (≥ 门槛 1);质心线速度 0(旧口径恒不计)。
+        s.apply_prefix(&[compound_spawn_input(
+            1,
+            id,
+            EntityState {
+                translation: Vec3::new(10.5, 1.4501, 8.5),
+                linvel: Vec3::ZERO,
+                angvel: Vec3::new(0.0, 0.0, 16.0),
+                ..EntityState::default()
+            },
+            beam_shape(4),
+        )]);
+        let mut broke = false;
+        let mut table = BTreeMap::new();
+        for _ in 0..160 {
+            s.step();
+            let out = s.take_outbox();
+            if out.destruction_stats.cells_impacted > 0 {
+                broke = true;
+                table = s.impact_impulses.clone();
+                break;
+            }
+        }
+        assert!(broke, "旋转端点应计入撞击并砸破土格(旧口径线速度恒 0 不计)");
+        assert!(
+            table.values().all(|j| j.length() > 0.0) && !table.is_empty(),
+            "撞击冲量表非零:{table:?}"
+        );
+        assert!(
+            s.entity_state(id).is_some(),
+            "石梁自身不断键(只考察地形撞击计入)"
+        );
+    }
+
+    /// AC-F9 第 2 句(动态对方):静止复合体被 ≥ 1 m/s 的动态投射物击中**可以
+    /// 断键**(D4 碎裂路径)——静置的 2 格土梁(旧口径下门槛看它自己的速度
+    /// = 0,永远不碎),被 −4 m/s 垂直落下的 2 格石梁砸中右端:接触点相对
+    /// 速度 = 投射物速度 ≥ 1 计入,冲量集中在右端接触格 → 断一根。
+    ///
+    /// 变红:对方速度不计(退回"本体线速度"口径——本体静止 → 门槛 0,不断)。
+    #[test]
+    fn stationary_compound_fractures_when_hit_by_projectile() {
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+        let (target, proj) = (entity(1), entity(2));
+        // 目标:2 格土梁静置(土 bond 3、I 7);投射物:2 格**石**梁(不碎、
+        // 只当锤)以 −4 m/s 落在右端正上方、错开半格压右端格——接触点相对
+        // 速度 = 投射物速度 ≥ 1 计入,冲量集中在目标右端接触格,单拍 J_c
+        // ≥ dirt bond 3 → 断右端那根(−2 m/s 时冲量被两拍摊薄,J_c < 3
+        // 不断,故取 4)。chunk (0,0) 顶面土 = 世界 y 0;静置梁中心 = 0.45。
+        let dirt_shape = types::CompoundShape::new(
+            (0..2)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("2 格");
+        let stone_shape = types::CompoundShape::new(
+            (0..2)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("2 格");
+        s.apply_prefix(&[
+            compound_spawn_input(
+                1,
+                target,
+                EntityState {
+                    translation: Vec3::new(9.5, 1.4501, 8.5),
+                    ..EntityState::default()
+                },
+                dirt_shape,
+            ),
+            compound_spawn_input(
+                2,
+                proj,
+                EntityState {
+                    translation: Vec3::new(10.5, 2.45, 8.5),
+                    linvel: Vec3::new(0.0, -4.0, 0.0),
+                    ..EntityState::default()
+                },
+                stone_shape,
+            ),
+        ]);
+        let mut broken = false;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.cohesion_stats.bonds_broken > 0 {
+                broken = true;
+                break;
+            }
+        }
+        assert!(broken, "静止复合体被投射物击中应断键(对方速度计入相对门槛)");
+    }
+
+    /// AC-F9 第 3 句(非旋转逐位一致):单格土块以 −6 m/s 落土层(非旋转、
+    /// 地形静止,旧口径下流形级与逐点门槛同值),新旧口径撞击行为**逐位一致**
+    /// ——同场景双跑:生产路径 vs 把 `pre_impulse_spin` 清空(等价旧口径,
+    /// 因旋转贡献不存在时逐点值 = 线速度值)后的对照跑,脱落格集合、脱落数、
+    /// 冲量表逐位相同。
+    ///
+    /// 变红:逐点复核的接触点取位或方向算错(非旋转工况下也会偏离线速度口径)。
+    #[test]
+    fn non_rotating_impact_matches_legacy_threshold_bitwise() {
+        let run = |clear_spin: bool| {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            // cohesion 关:同 `rotating_body_impact_counts_contact_point_speed`,
+            // 冲量表不被拍末 take,新旧口径的表可逐位比较。
+            cfg.cohesion.enabled = false;
+            // dt = 1/240:一步下扫 10/240 ≈ 0.042 m < 薄片厚 0.15,不隧穿。
+            cfg.dt = 1.0 / 240.0;
+            let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let id = entity(1);
+            s.apply_prefix(&[compound_spawn_input(
+                1,
+                id,
+                EntityState {
+                    translation: Vec3::new(10.5, 2.575, 8.5),
+                    linvel: Vec3::new(0.0, -10.0, 0.0),
+                    ..EntityState::default()
+                },
+                beam_shape(2),
+            )]);
+            let mut cells = Vec::new();
+            let mut table = BTreeMap::new();
+            for _ in 0..60 {
+                if clear_spin {
+                    // 旧口径对照:清空 spin 快照 → 逐点速度退化为线速度。
+                    s.pre_impulse_spin.clear();
+                }
+                s.step();
+                let out = s.take_outbox();
+                if out.destruction_stats.cells_impacted > 0 {
+                    cells.push(out.destruction_stats.cells_impacted);
+                    table = s.impact_impulses.clone();
+                    break;
+                }
+            }
+            (cells, table)
+        };
+        let (cells_new, table_new) = run(false);
+        let (cells_old, table_old) = run(true);
+        assert_eq!(cells_new, cells_old, "非旋转工况新旧口径脱落拍序逐位一致");
+        assert_eq!(table_new, table_old, "非旋转工况冲量表逐位一致");
+        assert!(
+            !cells_new.is_empty() && table_new.values().all(|j| j.length() > 0.0),
+            "布景自检:两格土脱落且冲量非零"
+        );
+    }
 
     /// 逐格求值·粉碎/脱落/完好分界(§6.1 第 1 条):3 格土质梁(R 2、k 2)。
     /// 场景 A 三格全 P > 4 粉碎;场景 B 三格全 P ∈ (2, 4] 脱落、冲量 = P·dir';
