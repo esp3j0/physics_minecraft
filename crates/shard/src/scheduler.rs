@@ -3596,7 +3596,16 @@ mod tests {
                 payload: InputPayload::Command(SimCommand::SpawnDynamic {
                     entity: e_solid,
                     state: types::EntityState {
-                        translation: Vec3::new(8.0, 0.5001, 8.0),
+                        // F05c 返修(裁定第 2 条):出生从格角点 (8.0,·,8.0) 改到
+                        // 格中心 (8.5,·,8.5)。角点出生是布景巧合:内缩口径下实体
+                        // 静止位漂到邻格(毫米级蠕动),snap 目标格不含出生格
+                        // → disp ≈ 0.70 > 0.5(too_far)→ 升级"等 rapier 睡眠"
+                        // 路径,实测 54 拍凝固(45 窗口不够;跨面口径同布景因
+                        // 蠕动短、睡眠早,45 拍内凝固掩盖了这一点)。格中心出生
+                        // 后静止即贴格中心(disp ≈ 0.0001),20 拍慢速直通,
+                        // 实测 23 拍凝固——不放宽任何阈值,45 窗口恢复。生产碎块
+                        // 出生于格中心附近,角点工况不出现。
+                        translation: Vec3::new(8.5, 0.5001, 8.5),
                         ..types::EntityState::default()
                     },
                     desc: types::EntityDesc::default(),
@@ -3626,15 +3635,14 @@ mod tests {
         assert!(
             sched.ticket_table().get(key_s).is_some() && sched.ticket_table().get(key_m).is_some()
         );
-        // 推进 60 拍:e_mig(x=100 距本体区边界 36 m,60 m/s → 1 m/拍)在
+        // 推进 45 拍:e_mig(x=100 距本体区边界 36 m,60 m/s → 1 m/拍)在
         // ~36 拍出本体区 → 迁移;e_solid 落稳后 20 拍凝固(位移门关,静止
         // 计数直通)。两事件近拍发生,despawned 逐实体判定(migrated 集合含
         // e_mig → 豁免;e_solid 无豁免 → End)。
-        // D15 内缩:e_solid 出生 0.5001 恰在地表格面上,无跨面口径薄片顶的
-        // 0.075 下落/穿入 → rapier 不睡眠,z 向毫米级滑移使 snap disp > 0.5
-        // (too_far)只能走"20 拍连续慢速"路径,实测 53 拍凝固(跨面 45 拍内
-        // 经睡眠兜底);窗口放宽到 60 拍,迁移(~36 拍)不受影响。
-        for _ in 0..60 {
+        // F05c 返修(裁定第 2 条):撤回 F05 的 45→60 迁移。窗口不够的根因是
+        // 布景出生在格角点(见上方出生注释),不是内缩口径本身;格中心出生后
+        // 23 拍凝固,45 拍窗口恢复(迁移 ~36 拍不受影响)。
+        for _ in 0..45 {
             sched.tick();
         }
         // 凝固:实体消失 + 落块;票 End(终结判定)。

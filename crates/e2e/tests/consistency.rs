@@ -406,26 +406,31 @@ fn acc2_boundary_edit_same_tick() {
 /// vs 裸 PhysicsWorld(生产同构:逐 chunk fixed compound body):
 /// 实体 v=(60,0,0) 跨片滚过挖洞 chunk,45 步后 translation 各分量差 **< 1e-4 m**
 /// (容差写进消息,migration.rs AC2 同口径);迁移确实发生(非退化)。
-/// D15 内缩迁移说明:洞原在边界格 (127,64,8)——跨面口径薄片檐口让实体从顶面滑过,
-/// 接触轻,单 compound 参考侧即可逐位一致;内缩后洞是净宽 1.0 的真洞,实体轧进洞口
-/// 直撞东壁(x=128 恰是分片交接拍),强接触下"逐 chunk 分组 + 交接拍重建 collider"
-/// 与"单 compound"是两种真实物理路径(实测拍 27 起分叉、45 拍位移差 10.4 m),
-/// 不是分片机制引入的差异。洞移到 chunk 7 内部格 (120,64,8):保住考察点
-/// (边界 chunk 的编辑物理生效 + 跨片滚动 + 两侧一致),实体在源片内撞洞沿、
-/// 交接拍只经顶面轻接触。参考侧同步改逐 chunk 分组(生产同构)。
+/// F05c 返修说明(裁定"F05c 第 1 条"):洞放回**分片边界格**(chunk 7 最东格,
+/// x=127,骑在分片交接面 x=128 上)。第一版测试的 `set_block` 用 (127,64,8) 是
+/// **off-by-one**:局部 y = 64−(−64) = 128 = 地面上方的空气层(挖掘 no-op),
+/// 而参考侧 chunk 编辑按注释挖局部 (15,127,8) = 世界格 (127,63,8) = 顶层地面格
+/// ——两侧挖的从来不是同一个格。跨面口径下洞口被伸入的薄片封住,错位被 <1e-4
+/// 掩盖(假绿);D15 内缩后洞是净宽 1.0 的真洞,分片侧(无洞)与参考侧(有洞)
+/// 在拍 27 实体落地弹跳处分叉(诊断实测第一分叉拍 = 27,45 拍终态差
+/// (9.74,−5.15,−0.19) m,与总架构师独立复跑逐位一致);两侧同格(SetBlock 改
+/// (127,63,8))后 45 拍全程逐位一致(含拍 29 迁移在途),C 组对照数据见 #21
+/// 回评。修复 = 消除 off-by-one(与原注释意图一致),洞仍在边界格、考察点不变;
+/// 参考侧逐 chunk 分组(生产同构)保留。
 #[test]
 fn acc2_boundary_edit_physics_vs_single_world() {
     // 走廊 = ground_chunk(128)(顶面 world y=64,migration.rs 场景)。
     const TOP_LY: usize = 128;
-    // 边界 chunk 编辑:格 (120, 64, 8)(chunk 7 局部 (8,127,8),owner (0,0))挖空。
-    let hole = BlockPos::new(120, 64, 8);
+    // 边界 chunk 编辑:格 (127, 63, 8)(chunk 7 局部 (15,127,8),owner (0,0))
+    // 挖空——顶层地面格,分片边界格(骑分片交接面 x=128)。
+    let hole = BlockPos::new(127, 63, 8);
     let mut corridor_edited: BTreeMap<ChunkPos, Chunk> = BTreeMap::new();
     let mut corridor_pristine: BTreeMap<ChunkPos, Chunk> = BTreeMap::new();
     for cx in 0..16i32 {
         let cp = ChunkPos::new(cx, 0);
         let mut g = ground_chunk(TOP_LY);
         if cx == 7 {
-            g.set(8, 127, 8, BlockId::AIR);
+            g.set(15, 127, 8, BlockId::AIR);
         }
         corridor_edited.insert(cp, g.clone());
         corridor_pristine.insert(cp, ground_chunk(TOP_LY));
@@ -499,13 +504,9 @@ fn acc2_boundary_edit_physics_vs_single_world() {
     // --- 参考侧:裸 PhysicsWorld(同 gravity/dt/刚体参数;编辑后的地面按
     // 生产同构分组 = 逐 chunk 一个 fixed compound body——分片机制不引入物理
     // 差异是本测试的考察点;spawn+挖洞命令语义 = 出生前地面已含洞)。
-    // D15 内缩迁移说明:跨面口径接缝薄片重叠,单 compound 与逐 chunk 分组的
-    // 接触拓扑天然一致;内缩后边界挖洞格成为净宽 1.0 的真洞,实体(宽 1.0,
-    // 60 m/s)轧过洞口时直撞洞沿东壁——单 compound 下该壁与洞沿同 body 解算,
-    // 逐 chunk 下分属两个 body,接触分组的解算路径不同(实测拍 27 起分叉,
-    // 45 拍位移差 10.4 m)。这是两种 collider 分组的真实物理差异,不是分片
-    // 机制引入的;参考侧改为与生产同构的逐 chunk 分组,考察点回归"分片调度/
-    // 迁移交接不引入物理差异"。
+    // F05c:参考侧逐 chunk 分组保留(生产同构);两侧同格后 45 拍全程逐位一致,
+    // 迁移在途拍(实体 GONE 一拍)后两侧仍续一致——迁移丢 warm-start/接触缓存
+    // 在本场景(实体空中弹道,无持续接触)不产生可见差异。
     use rapier3d::prelude::*;
     let cfg = ShardSimConfig::new(shard_id(0, 0));
     let mut phys = PhysicsWorld::new();

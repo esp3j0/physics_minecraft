@@ -10437,63 +10437,118 @@ mod tests {
         }
     }
 
-    /// AC-F17(§5.7.10 末条):**同一对碰撞体两个同法向流形**的撞击采样冲量
-    /// 合计 ≈ 单流形工况(±10%)——`solver_manifolds()` 读口径下聚簇不丢冲量。
-    /// 双流形构造:平地挖 1 格宽、1 格深的坑,2 格石条横跨坑上落下——条的两半
-    /// 分别触及坑两侧的合并顶面薄片(同 chunk、法向都 +y、greedy 不合并,中间
-    /// 隔坑)→ 接触对 2 流形 → rapier 聚簇成 1 簇解算(实测 pair plain=2、
-    /// solver=1);对照 = 同一条落平地(底面压在一整块合并薄片上,plain=solver=1)。
-    /// 复合体走均摊口径(§7.3 第 7 条),25 m/s 落体均摊冲量 > dirt 阈值 7,
-    /// 两工况都撞碎。会变红的实现:读回 plain 流形(聚簇生效时 plain 恒 0 →
-    /// 骑坑工况无撞击);关掉聚簇(违反裁定,且单流形对照不再同口径)。
+    /// AC-F17(§5.7.10 末条):**同一几何、同一工况**下,"聚簇 + 读
+    /// `solver_manifolds()`"(生产口径,A 组)与"不聚簇 + 读 `manifolds()`"
+    /// (B 组;不聚簇时 solver 簇为空,`solver_manifolds()` 落回 plain 流形,
+    /// 生产读取口径不变、冲量来自 plain)的撞击采样冲量合计差 **≤ 5%**;
+    /// 并断言 A 组接触对 plain 流形数 ≥ 2(布景确实产出了被聚簇的双流形)。
+    /// 两个工况:骑坑(2 格石条骑 1 格坑,两半分别触坑两侧合并顶面薄片)与
+    /// 台阶沿(石条骑 2 层台地棱,两半分别压台顶与地面,两层薄片)。
+    /// 会变红的实现:读回 plain 流形(聚簇生效时 plain 冲量恒 0 → A 组无撞击);
+    /// 聚簇把冲量并丢(A/B 偏差超限);布景退化(plain 流形数 < 2)。
     #[test]
-    fn impact_dual_manifold_seam_matches_single_manifold() {
-        // 骑坑:坑挖在 (70,-61,70);石条 2 格,质心 x=70.5(格 69/70 分界)——
-        // 两半各压坑一侧顶面;对照:质心 (66.5,·,74.5) 落平地(单流形)。
-        // 比较对象 = 撞击拍 `impact_impulses` 冲量矢量和的幅值(同表口径)。
-        let drop_bar = |cx: f32, cz: f32, dig: bool, tag: &str| -> Vec3 {
+    fn impact_dual_manifold_clustering_preserves_impulse() {
+        // 骑坑:坑挖 (70,-61,70),石条质心 x=70.5(格 69/70 分界);
+        // 台阶沿:台地 x 72..=76、y −60..−59、z=70(经典地表顶面 = −60,
+        // 叠 2 层后台顶 = −58),石条质心 (71.5,·,70.5) 骑棱——左半压地面
+        // (顶 −60)、右半压台顶(−58)。地形坐标全在已装载 chunk 区
+        // (chunk x/z 2..=6,世界 32..=111)。
+        fn run(clustering: bool, ledge: bool, tag: &str) -> (Vec3, usize) {
             let mut s = destruction_sim(64);
-            if dig {
+            if ledge {
+                let cells: Vec<BlockPos> = (72..=76)
+                    .flat_map(|x| (-60..=-59).map(move |y| BlockPos::new(x, y, 70)))
+                    .collect();
+                let build: Vec<StampedInput> = cells
+                    .iter()
+                    .enumerate()
+                    .map(|(k, p)| {
+                        setblock_input(
+                            u64::try_from(k).expect("k fits") + 1,
+                            *p,
+                            voxel::builtin::STONE,
+                        )
+                    })
+                    .collect();
+                s.apply_prefix(&build);
+            } else {
                 s.apply_prefix(&[setblock_input(
                     1,
                     BlockPos::new(70, -61, 70),
                     voxel::builtin::AIR,
                 )]);
             }
+            if !clustering {
+                // B 组:同一 sim 构造下关聚簇(tests 模块可达 crate 私有字段)。
+                s.phys.integration_parameters.contact_clustering = false;
+            }
+            let (cx, cz) = if ledge { (71.5, 70.5) } else { (70.5, 70.5) };
             s.apply_prefix(&[compound_spawn_input(
-                2,
+                100,
                 entity(1),
                 EntityState {
-                    translation: Vec3::new(cx, -55.0, cz),
+                    translation: Vec3::new(cx, -53.0, cz),
                     rotation: types::glam::Quat::IDENTITY,
                     linvel: Vec3::new(0.0, -25.0, 0.0),
                     angvel: Vec3::ZERO,
                 },
                 beam_shape(2),
             )]);
-            let mut found = None;
+            // 缓存实体 collider 键(碎裂可能当拍移除实体/碰撞体,循环内不再查表)。
+            let rec = s.entities.get(&entity(1)).expect("spawn 即在表");
+            let body = s.phys.bodies.get(rec.handle).expect("handle 有效");
+            let own: std::collections::BTreeSet<(u32, u32)> = body
+                .colliders()
+                .iter()
+                .map(|c| {
+                    let (g, i) = c.into_raw_parts();
+                    (g, i)
+                })
+                .collect();
+            let mut impulse = None;
+            let mut max_plain = 0usize;
             for _ in 0..40 {
                 s.step();
+                // 本拍实体侧接触对 plain 流形合计(逐拍重置,取峰值)。
+                let mut plain_this = 0usize;
+                for pair in s.phys.narrow_phase.contact_pairs() {
+                    let k1 = pair.collider1.into_raw_parts();
+                    let k2 = pair.collider2.into_raw_parts();
+                    if own.contains(&(k1.0, k1.1)) || own.contains(&(k2.0, k2.1)) {
+                        plain_this += pair.manifolds().len();
+                    }
+                }
+                max_plain = max_plain.max(plain_this);
                 let out = s.take_outbox();
                 if out.destruction_stats.cells_impacted > 0 {
-                    found = Some(out);
+                    impulse = Some(s.impact_impulses.values().sum());
                     break;
                 }
             }
-            found.unwrap_or_else(|| panic!("{tag}: 应有撞击(plain 读口径下双流形丢冲量)"));
-            s.impact_impulses.values().sum()
-        };
-        let j_single = drop_bar(66.5, 74.5, false, "单流形(落平地)");
-        let j_seam = drop_bar(70.5, 70.5, true, "骑坑(两侧薄片,双流形)");
-        let single_len = j_single.length();
-        let seam_len = j_seam.length();
-        assert!(single_len > 0.0, "单流形工况冲量非零:{j_single:?}");
-        let rel = (seam_len - single_len).abs() / single_len;
-        assert!(
-            rel < 0.10,
-            "AC-F17:骑坑冲量合计 |{seam_len:.3}| vs 平地 |{single_len:.3}| 偏差 {:.1}% ≥ 10%",
-            rel * 100.0
-        );
+            let j = impulse.unwrap_or_else(|| panic!("{tag}: 应有撞击(clustering={clustering})"));
+            (j, max_plain)
+        }
+        for (tag, ledge) in [("骑坑(两侧薄片,双流形)", false), ("台阶沿(两层薄片)", true)]
+        {
+            let (ja, plain_a) = run(true, ledge, tag);
+            let (jb, _) = run(false, ledge, tag);
+            assert!(
+                plain_a >= 2,
+                "AC-F17 {tag}:A 组 plain 流形数应 ≥ 2(实际 {plain_a},布景退化)"
+            );
+            let (la, lb) = (ja.length(), jb.length());
+            assert!(
+                la > 0.0 && lb > 0.0,
+                "{tag}: 两组冲量非零 A={ja:?} B={jb:?}"
+            );
+            let rel = (la - lb).abs() / lb;
+            assert!(
+                rel <= 0.05,
+                "AC-F17 {tag}:A(聚簇+solver_manifolds)|{la:.3}| vs \
+                 B(不聚簇+plain)|{lb:.3}| 偏差 {:.1}% > 5%",
+                rel * 100.0
+            );
+        }
     }
 
     /// §5 范围 5:总开关关闭不检测——同样的 17 m/s 撞击,关闭时零计数、零写入。
