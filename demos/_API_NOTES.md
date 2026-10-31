@@ -148,3 +148,26 @@ world.step()       # 推进一步;固定步长,默认 dt 见下
 - 性能坑:41×41 世界(≈5000 薄片)slab_terrain 本体 < 0.1 s;真正慢的是
   逐 collider 的 Python 级最近邻/距离计算,避免即可。1600 格石板单事件
   (BFS 1024 + 建网 + EK)Python 全流程 ≈ 5 ms。
+
+## 薄片内缩 demo 实测(F00b,2026-10-31)
+
+- **复用 F00 管线换地形口径的接法**:`momentum.Pipeline.__init__` 与
+  `process_tick`(断格重建地形)都引用它自己模块级的 `slab_terrain` 名字;
+  把 `momentum.slab_terrain` 替换为按 `w.slab_mode` 分派的包装即可双口径,
+  不用改 momentum.py(demos/inset-slab/common.py 的做法)。impact-flow 的
+  common.py 以私有名加载时,临时占住 `sys.modules["common"]` 再还原,
+  否则 momentum 顶部 `from common import ...` 会命中错误的模块。
+- **场景平移 Δy 的核对方法**(F00 impact-corner 错一格的教训):世界地表
+  **空气层** y=−60 对应局部 y=0,即格 y=−60 → 局部 0、实体格 −58(门楣)→
+  局部 2;spawn 的 y=−57.4 → 局部 2.6。每处平移逐格打印核对,不要心算。
+- **接触对出现的时序**:rapier 只在 AABB 相交后才给 contact pair;高速投射物
+  (15–20 m/s,每拍 0.25–0.33 m)接触的第一拍 pair 列表可能为空、冲量读数
+  出现在下一拍(F00 也如此)。判"是否接触过"用刚体速度突变(post_vx 骤降)
+  或位移异常,不要只看 pair 数。
+- **退距归格扫描的要点**(rest.py §4):接触点世界坐标 = 薄片 collider 平移 +
+  local_p;内缩后接触点本身落在实心格表面(跨面时在 −0.075 的薄片前缘),
+  退 0.1 m 两种口径正确率相同(对齐撞 100%、齐平侧撞 6/8,错点是棱角斜交
+  的边缘情况,与口径无关)。
+- **rapier 睡眠会把"斜靠悬空"的复合体判静止**:impact-corner 断下的 7 字
+  以 34° 斜插、最低角点与地面薄片接触(支撑冲量 0.3–0.4/拍)即 sleeping;
+  验证"是否真的被支撑"要看接触对冲量,不要只看 is_sleeping。
