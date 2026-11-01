@@ -972,6 +972,7 @@ F 的性质(验收依据):
       单格击飞、§5.6 退役;AC-F4 rapier 部分、AC-F5 含穿墙条款、AC-F6、AC-F8);
       F02a 2026-11-01 实施([9e8e829](https://github.com/esp3j0/physics_minecraft/commit/9e8e829)),验收**返修**(F02a-2):
       分片边界与双跑两条测试是空壳(关掉分派仍绿);D4 早退因资格表放宽而失效;
+      F02a-2([346ca1f](https://github.com/esp3j0/physics_minecraft/commit/346ca1f))**2026-11-01 验收通过**,F02b 随即派发;
     - **F03 接近速度勘误**(§5.7.9 勘误 2,地形撞击与 D4 碎裂两处采样;AC-F9)——不依赖 F01/F02,可与之并行;
       2026-10-31 实施([684d3b8](https://github.com/esp3j0/physics_minecraft/commit/684d3b8)),验收**返修**(F03b):判定粒度改按流形(§5.7.9 勘误 2 补充),
       AC-C6"角先着地 8 m 断开"原样恢复;旋转预筛的上界取错(碰撞体原点而非接触点);删除遗留诊断输出;
