@@ -249,6 +249,10 @@ impl ShardSim {
             pre_impulse_spin: BTreeMap::new(),
             // 撞击冲量表不入快照(K02 §5.6 第 1 条;拍内表,两拍之间必为空)。
             impact_impulses: BTreeMap::new(),
+            // 断开事件定量追踪不入快照(F02b-2 测试观测口;随 take_outbox
+            // 式清理由测试自行处理,重建后为空)。
+            #[cfg(test)]
+            impact_flow_trace: Vec::new(),
         })
     }
 }

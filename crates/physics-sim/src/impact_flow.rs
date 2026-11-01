@@ -34,7 +34,7 @@ const COS_PRESS: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
 /// 量化单位(§5.7.1):所有容量与供给按 0.001 N·s 量化为整数,使最小割唯一
 /// 且与算法无关。
-const QUANT: u64 = 1000;
+pub(crate) const QUANT: u64 = 1000;
 
 /// 容量 ∞ 的哨兵( bedrock、未指定材料;远大于任何合法供给与容量之和)。
 const INF_CAP: u64 = u64::MAX / 4;
@@ -63,6 +63,38 @@ impl ImpactEvent {
     pub fn dir_hat(&self) -> Vec3 {
         self.impulse.normalize_or_zero()
     }
+}
+
+/// 一个断开事件的定量追踪(F02b-2 验收观测口;`#[cfg(test)]` 专用):
+/// 生产路径 `step()` 内捕获,测试据此与 §5.7.2 逐式对账(守恒式、修正量、
+/// 分量 Δv/Δω、切段速度)。字段齐全,不含句柄。
+#[derive(Debug, Clone)]
+pub struct FlowEventTrace {
+    /// 事件(供给、冲量矢量 J、作用点 p)。
+    pub event: ImpactEvent,
+    /// 供给合计 `s`(量化前的浮点,`Σ s_c`)。
+    pub supply: f32,
+    /// 最大流 `C`(量化单位;与 `outcome.cut_q` 同值)。
+    pub cut_q: u64,
+    /// 量化单位(残差口径:误差 ≤ QUANT⁻¹ × 接触点数)。
+    pub quant: f32,
+    /// 撞击者修正冲量(§5.7.2)。
+    pub correction: Vec3,
+    /// 各动量分量(S 的刚体分量 k)。
+    pub momenta: Vec<ComponentMomentum>,
+    /// 修正前撞击者线速度(世界系)。
+    /// 修正前撞击者旋转(世界系;测试独立复算世界系惯量用)。
+    pub rotation_before: types::glam::Quat,
+    pub linvel_before: Vec3,
+    /// 修正前撞击者角速度(世界系)。
+    pub angvel_before: Vec3,
+    /// 修正后撞击者线速度。
+    pub linvel_after: Vec3,
+    /// 修正后撞击者角速度。
+    pub angvel_after: Vec3,
+    /// 撞击者质量属性(测试独立复算 m_eff 用;直接给原始三件套,测试不经
+    /// 生产同一函数求 m_eff)。
+    pub impactor: ImpactBodyProps,
 }
 
 /// 撞击冲量流的判定结果(纯函数输出;字段齐全,§5.7.1/§5.7.3)。
