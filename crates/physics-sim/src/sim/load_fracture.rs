@@ -88,30 +88,33 @@ impl ShardSim {
         for pair in self.phys.narrow_phase.contact_pairs() {
             let key1 = pair.collider1.into_raw_parts();
             let key2 = pair.collider2.into_raw_parts();
-            // 两侧碰撞体世界位姿(勘误 2:接触点世界坐标 = 位姿 × local_p;
+            // 碰撞体世界位姿(勘误 2:接触点世界坐标 = 位姿 × local_p;
             // 簇的 `local_p` 已折算到碰撞体坐标系,无需子形状位姿)。
-            // collider 可能已不在场(同拍碎裂删实体后残留的接触对):缺一侧
-            // 整对跳过——该对本拍不再产生有效接触。
-            let (Some(pos1), Some(pos2)) = (
-                self.phys
-                    .colliders
-                    .get(pair.collider1)
-                    .map(|c| *c.position()),
-                self.phys
-                    .colliders
-                    .get(pair.collider2)
-                    .map(|c| *c.position()),
-            ) else {
-                continue;
-            };
-            // 对方实体(动态才计其速度):本步前快照的接触点速度;对方没有
-            // 快照(本拍新出生、或本步开始后入表)时按 **0** 处理——对方的
-            // 速度未知(可能是任何值),不能默认它是静止的把相对速度当成
-            // 本体速度(勘误 2 的保守侧)。
-            let other_vel = |side1: bool| -> Option<Vec3> {
+            // **D4 采样只需要本体一侧的位姿**(地形一侧速度为 0,用不到;
+            // 对方是动态实体时用本体侧接触点加对方的本步前快照,已足够)。
+            // 同拍 `evaluate_impacts` 撞脱地形格会**重建地形 collider**,
+            // 之后本采样遍历的接触对里地形侧句柄已失效——**只在本体侧
+            // collider 缺失时才跳过该侧,不整对跳过**(整对跳过会把该对
+            // 的冲量整个丢掉:角先着地第 76 拍 32.9 的断键冲量就是这样
+            // 丢的,AC-C6 翻红)。
+            let pos1 = self
+                .phys
+                .colliders
+                .get(pair.collider1)
+                .map(|c| *c.position());
+            let pos2 = self
+                .phys
+                .colliders
+                .get(pair.collider2)
+                .map(|c| *c.position());
+            // 对方实体(动态才计其速度):本步前快照(线速度 + 角速度/质心,
+            // 接触点速度按接触点算);对方没有快照(本拍新出生、或本步开始后
+            // 入表)时返回 None,速度按 **0** 处理——对方的速度未知(可能是
+            // 任何值),不能默认它是静止的把相对速度当成本体速度(勘误 2 的
+            // 保守侧)。
+            let other_vel = |side1: bool| -> Option<(Vec3, PreImpactSpin)> {
                 let oid = collider_to_entity.get(if side1 { &key2 } else { &key1 })?;
-                let (ov, _osp) = eligible.get(oid).copied()?;
-                Some(ov)
+                eligible.get(oid).copied()
             };
             // 读解算器实际使用的流形(REQ-010 §5.7.10 末条、AC-F17;同
             // `evaluate_impacts`):多流形对被 contact clustering 合并解算,
@@ -121,6 +124,8 @@ impl ShardSim {
             for m in pair.solver_manifolds() {
                 // 法向为 world 系、以碰撞体 1 → 2 为正:对 1 侧"指向本体内部"
                 // = −normal,对 2 侧 = +normal(与撞击采样"撞击方向"互为反向量)。
+                // 逐侧取本体侧合格碰撞体(单格 = 代表 collider;复合体 = 全部
+                // 格 collider),同一流形对两侧各判一次。
                 for (key, dir_into, side1) in
                     [(key1, -m.data.normal, true), (key2, m.data.normal, false)]
                 {
@@ -133,23 +138,62 @@ impl ShardSim {
                     let Some((pre_vel, spin)) = eligible.get(&id) else {
                         continue;
                     };
-                    // 接近速度(勘误 2,§5.7.9):接触点**相对**速度沿接触法向
-                    // **朝对方**的分量 ≥ 1 m/s 才计入。本体侧接触点速度 =
-                    // v + ω×(p − com)(本步前快照);对方 = 地形时为 0,动态
-                    // 实体时同样按其接触点快照算,无快照按 0。受力方向指向
-                    // 本体内部,与接近方向互为反向量。
-                    // 门槛在流形级先以质心速度预筛(不转动的普通落体与旧口径
-                    // 同值);可能由旋转贡献的(ω×r 上限 ≥ 门槛)放行到逐点复核。
-                    // **对方是动态实体时其速度也进预筛**(勘误 2:相对速度——
-                    // 静止本体被投射物压过来,本体侧预筛必须放行到逐点)。
-                    let com_offset = pos1.translation - spin.world_com;
-                    let spin_speed_ub = spin.angvel.length() * com_offset.length();
-                    let other_v = other_vel(side1).unwrap_or(Vec3::ZERO);
-                    if (-*pre_vel).dot(dir_into) < crate::destruction::IMPACT_MIN_APPROACH_SPEED
-                        && spin_speed_ub < crate::destruction::IMPACT_MIN_APPROACH_SPEED
-                        && (other_v - *pre_vel).dot(dir_into)
-                            < crate::destruction::IMPACT_MIN_APPROACH_SPEED
-                    {
+                    // 本体侧碰撞体位姿(勘误 2:接触点世界坐标 = 位姿 × local_p;
+                    // 簇的 `local_p` 已折算到碰撞体坐标系,无需子形状位姿)。
+                    // **按本体在哪一侧取位姿**——一律用 pos1 是错的(支点错位
+                    // 会让 r 与接触点速度全错)。本体侧 collider 缺失(同拍撞击
+                    // 重建后句柄失效的是地形侧;碎裂删实体的是本体侧)→ 只跳过
+                    // 本侧,另一侧照常判。
+                    let Some(pos_self) = (if side1 { pos1 } else { pos2 }) else {
+                        continue;
+                    };
+                    // 对方 = 动态实体时按其本步前快照算接触点速度;对方没有
+                    // 快照(本拍新出生、或本步开始后入表)时按 **0** 处理——
+                    // 对方的速度未知,不能默认它是静止的把相对速度当成本体
+                    // 速度(勘误 2 的保守侧)。
+                    let other_snap = other_vel(side1);
+                    // 接近速度(§5.7.9 勘误 2,F03b 口径):**质心口径与接触
+                    // 点口径取大**——
+                    // - 质心口径(旧口径):本体本步前质心速度减对方质心速度,
+                    //   沿接触法向**朝对方**的分量;对方是地形或无快照时按 0。
+                    // - 接触点口径:流形内各点的接触点相对速度(本体侧
+                    //   v + ω×(p − com) 减对方侧同点速度)的同向分量。
+                    // 两者最大值 ≥ 门槛则整流形计入。质心口径保住"撞击分几拍
+                    // 到账"的后几拍;接触点口径覆盖旋转体;静止对挤两口径都
+                    // < 1 仍排除;非旋转体两项相等,与旧口径逐位一致。
+                    let com_speed = match other_snap {
+                        Some((ovel, _)) => (ovel - *pre_vel).dot(dir_into),
+                        None => (-*pre_vel).dot(dir_into),
+                    };
+                    let max_approach = m
+                        .points
+                        .iter()
+                        .map(|pt| {
+                            // 本体在 1 侧用 local_p1、2 侧用 local_p2(接触点
+                            // 在各自碰撞体的局部系,位姿配对取点)。
+                            let p_self = if side1 {
+                                pos_self * pt.local_p1
+                            } else {
+                                pos_self * pt.local_p2
+                            };
+                            let r_self = p_self - spin.world_com;
+                            let v_self = *pre_vel + spin.angvel.cross(r_self);
+                            let v_other = match other_snap {
+                                Some((ovel, ospin)) => {
+                                    // 对方实体侧接触点:**用本体侧接触点近似**
+                                    // (同一物理点,两侧坐标差 = 穿透深度量级,
+                                    // 远小于 r;对方侧位姿本采样不需要,地形侧
+                                    // 句柄可能已失效)。
+                                    let r_other = p_self - ospin.world_com;
+                                    ovel + ospin.angvel.cross(r_other)
+                                }
+                                // 对方是地形或无快照:速度按 0。
+                                None => Vec3::ZERO,
+                            };
+                            (v_other - v_self).dot(dir_into)
+                        })
+                        .fold(com_speed, f32::max);
+                    if max_approach < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
                         continue;
                     }
                     let s = samples.entry(id).or_insert(FractureSample {
@@ -158,39 +202,6 @@ impl ShardSim {
                     });
                     for pt in &m.points {
                         if pt.data.impulse <= 0.0 {
-                            continue;
-                        }
-                        // 逐点接触点相对速度(勘误 2):两侧接触点各自的本体
-                        // 速度差沿法向;地形一侧为 0。预筛未放行时本点不可能
-                        // 过门槛(接触点速度 ≤ 质心速度 + ω×r 上界),不重复算。
-                        let p_self = if side1 {
-                            pos1 * pt.local_p1
-                        } else {
-                            pos2 * pt.local_p2
-                        };
-                        let r_self = p_self - spin.world_com;
-                        let v_self = *pre_vel + spin.angvel.cross(r_self);
-                        let v_other = if other_v != Vec3::ZERO {
-                            // 对方实体侧接触点(同一物理点,数值上取对方坐标)。
-                            let p_other = if side1 {
-                                pos2 * pt.local_p2
-                            } else {
-                                pos1 * pt.local_p1
-                            };
-                            // 对方的速度也按它的接触点算(ω_o×r_o;快照里只存了
-                            // 本体的 ω 与 com,对方的 r_o 用同一接触点近似——
-                            // 两侧接触点差 = 穿透深度量级,远小于 r)。
-                            let oid = collider_to_entity
-                                .get(if side1 { &key2 } else { &key1 })
-                                .expect("other_vel 已验");
-                            let (ovel, ospin) = eligible.get(oid).copied().expect("other_vel 已验");
-                            let r_other = p_other - ospin.world_com;
-                            ovel + ospin.angvel.cross(r_other)
-                        } else {
-                            other_v
-                        };
-                        let approach = (v_other - v_self).dot(dir_into);
-                        if approach < crate::destruction::IMPACT_MIN_APPROACH_SPEED {
                             continue;
                         }
                         s.total += pt.data.impulse;
@@ -216,17 +227,6 @@ impl ShardSim {
             })
             .collect();
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        if std::env::var("F03_DIAG").is_ok() {
-            for (j_c, id, total, contacts) in &candidates {
-                eprintln!(
-                    "[F03J] id={:?} j_c={:.3} total={:.3} cells={:?}",
-                    id,
-                    j_c,
-                    total,
-                    contacts.len()
-                );
-            }
-        }
         for (_, id, total, contacts) in candidates
             .into_iter()
             .take(self.cfg.cohesion.max_fractures_per_tick)
