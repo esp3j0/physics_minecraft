@@ -973,6 +973,9 @@ F 的性质(验收依据):
       F02a 2026-11-01 实施([9e8e829](https://github.com/esp3j0/physics_minecraft/commit/9e8e829)),验收**返修**(F02a-2):
       分片边界与双跑两条测试是空壳(关掉分派仍绿);D4 早退因资格表放宽而失效;
       F02a-2([346ca1f](https://github.com/esp3j0/physics_minecraft/commit/346ca1f))**2026-11-01 验收通过**,F02b 随即派发;
+      F02b 2026-11-01 实施([09cd948](https://github.com/esp3j0/physics_minecraft/commit/09cd948)),验收**返修**(F02b-2):
+      穿墙条款实际已复现(实施方把尾格前面当成前缘，报成"未复现";正确口径下 10 / 15 / 20 m/s 前缘 8.12 / 9.37 / 10.70,
+      判定面 9);`ImpactBodyProps` 接线无定量测试(逆惯量置零 + 质心改刚体原点，全绿);AC-F8 布景不产生失载段;
     - **F03 接近速度勘误**(§5.7.9 勘误 2,地形撞击与 D4 碎裂两处采样;AC-F9)——不依赖 F01/F02,可与之并行;
       2026-10-31 实施([684d3b8](https://github.com/esp3j0/physics_minecraft/commit/684d3b8)),验收**返修**(F03b):判定粒度改按流形(§5.7.9 勘误 2 补充),
       AC-C6"角先着地 8 m 断开"原样恢复;旋转预筛的上界取错(碰撞体原点而非接触点);删除遗留诊断输出;
