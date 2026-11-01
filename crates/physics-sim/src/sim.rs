@@ -3320,6 +3320,59 @@ impl ShardSim {
         if events.is_empty() {
             return;
         }
+        // 牛顿封顶(§5.7.9 勘误 6,F02b-3):窄墩工况一步穿进约 0.15 m 时同时
+        // 压到侧面/顶面的内缩薄片,那些流形按勘误 2 不计入(接近速度 < 1),
+        // 但其摩擦沿撞击方向抵掉了正面流形的大部分冲量——计入的正面法向合计
+        // 于是远大于撞击者本步实际交给地形的动量,按 §5.7.2 分配会凭空造出
+        // 动量与能量(碎块与撞击者都可能比来速快)。每个事件先求撞击者本步
+        // 沿 d̂ 实际交出的冲量 N = m·((v_前 − v_后) + g·Δt)·d̂(线动量变化与
+        // 作用点无关,偏心撞击同样成立;v_后 = 物理步进后、修正前的线速度——
+        // 事件按实体互斥,先前事件的修正不影响本事件的刚体),κ =
+        // clamp(N/|J|, 0, 1),N ≥ 0.99·|J| 时取 κ = 1(吸收求解器舍入,
+        // 单一流形的墙面工况逐位不变);J 与全部 s_c 乘 κ、p 不变,之后照常
+        // 排序、预筛、整数化、判定、分配。只缩不放(κ ≤ 1)不会多断。
+        // 本表(`apply_impact_flow_events` 的调用方)按实体采样,追踪里记录
+        // κ 与 N(F02b-3 观测口)。`impact_flow = false` 的 REQ-009 §5 与
+        // §5.6 逐位不变(本函数只在冲量流路径被调用)。
+        let dt = self.phys.integration_parameters.dt;
+        let gravity = self.cfg.gravity;
+        let mut kappas: BTreeMap<EntityId, (f32, f32, Vec3)> = BTreeMap::new();
+        for (total, id, event, _contact_points) in events.iter_mut() {
+            let Some(pre_vel) = self.pre_impulse_vels.get(id).copied() else {
+                // 本步前无快照(新生的实体)不采样,防御跳过。
+                continue;
+            };
+            let Some(rec) = self.entities.get(id) else {
+                continue;
+            };
+            let Some(body) = self.phys.bodies.get(rec.handle) else {
+                continue;
+            };
+            let m = body.mass();
+            let v_post = conv::rapier_to_vec3(body.linvel());
+            let d_hat = event.dir_hat();
+            let j_len = event.impulse.length();
+            if m <= 0.0 || j_len <= 0.0 {
+                continue;
+            }
+            // N = m·((v_前 − v_后) + g·Δt)·d̂;补回重力冲量 m·g·Δt(步进期间
+            // 重力先加给了刚体,不属于撞击交给地形的动量)。
+            let n_transfer = m * ((pre_vel - v_post) + gravity * dt).dot(d_hat);
+            let mut kappa = (n_transfer / j_len).clamp(0.0, 1.0);
+            if n_transfer >= 0.99 * j_len {
+                kappa = 1.0;
+            }
+            kappas.insert(*id, (kappa, n_transfer, pre_vel));
+            if kappa < 1.0 {
+                event.impulse *= kappa;
+                *total *= kappa;
+                for (_, s) in &mut event.supplies {
+                    *s *= kappa;
+                }
+                // p 不变(contact_points 的逐格冲量权重随之自然等比,分配口径
+                // 不再重读)。
+            }
+        }
         // 选取(§5.7.4):s 降序、同值 EntityId 升序,前 N 个;其余本拍丢弃。
         events.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         events.truncate(self.cfg.cohesion.impact_flow_max_events_per_tick);
@@ -3382,6 +3435,7 @@ impl ShardSim {
                     conv::rapier_to_quat(b.rotation()),
                     conv::rapier_to_vec3(b.linvel()),
                     conv::rapier_to_vec3(b.angvel()),
+                    conv::rapier_to_vec3(b.translation()),
                 )
             };
             // 撞击者修正(§5.7.2):在事件作用点 p 处施加 `correction` 并唤醒——
@@ -3408,6 +3462,11 @@ impl ShardSim {
             {
                 let rec = self.entities.get(event_id).expect("事件实体在场");
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let (kappa, n_transfer, linvel_pre) =
+                    kappas
+                        .get(event_id)
+                        .copied()
+                        .unwrap_or((1.0, 0.0, Vec3::ZERO));
                 self.impact_flow_trace
                     .push(crate::impact_flow::FlowEventTrace {
                         event: event.clone(),
@@ -3417,10 +3476,14 @@ impl ShardSim {
                         correction,
                         momenta: momenta.clone(),
                         rotation_before: trace_before.0,
+                        translation_before: trace_before.3,
                         linvel_before: trace_before.1,
+                        linvel_pre,
                         angvel_before: trace_before.2,
                         linvel_after: conv::rapier_to_vec3(b.linvel()),
                         angvel_after: conv::rapier_to_vec3(b.angvel()),
+                        kappa,
+                        n_transfer,
                         impactor: props,
                     });
             }
@@ -12399,6 +12462,184 @@ mod tests {
         );
     }
 
+    /// AC-F4(牛顿封顶,§5.7.9 勘误 6,生产路径定量):窄墩工况下撞击者
+    /// 一步穿进墩内、同时压到侧面/顶面的内缩薄片——那些流形按勘误 2 不
+    /// 计入,但其摩擦沿撞击方向抵掉了正面流形的大部分冲量,计入的正面
+    /// 法向合计(封顶前的 |J|)远大于撞击者本步实际交给地形的动量。勘误 6:
+    /// N = m·((v_前 − v_后) + g·Δt)·d̂,κ = clamp(N/|J|, 0, 1)(N ≥ 0.99·|J|
+    /// 时 κ = 1),J 与全部 s_c 乘 κ、p 不变。
+    ///
+    /// 布景 1(窄墩):零重力悬空 1×2 土墩(bedrock 垫 (10,3,8) + 土
+    /// (10,4,8)(10,5,8)),L 形 4 格撞击者 12 m/s 打上格——断开且 κ < 1
+    /// (薄片摩擦吃掉 ~48% 冲量),封顶后 |J| = N(κ < 1 时恒等),碎块段
+    /// 速度与撞击者修正后沿 d̂ 速度都 ≤ u + 0.05(封顶后不可能超来速)。
+    /// 布景 2(墙面对照):7 宽土墙(单一流形、无薄片摩擦),κ = 1(封顶
+    /// 不触发,结果与封顶前逐位一致——κ = 1 即 J 未缩放)。
+    ///
+    /// 变红:κ 恒为 1(未封顶)——布景 1 的 κ < 1 断言与 |J| = N 对账红;
+    /// 封顶误用拍后速度(含修正)或漏重力项——N 对不上,布景 2 的 κ = 1
+    /// 破(墙面工况封顶误触发)。
+    #[test]
+    fn impact_flow_newton_cap_narrow_pier_and_wall_face() {
+        // ---- 布景 1:窄墩(L 形撞击者)----
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 8), voxel::builtin::DIRT);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 5, 8), voxel::builtin::DIRT);
+        refresh_collider(&mut s);
+        let bar = types::CompoundShape::new(
+            [[0i32, 0, 0], [-1, 0, 0], [-2, 0, 0], [0, 1, 0]]
+                .iter()
+                .map(|o| types::ShapeCell {
+                    offset: *o,
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("L 形 4 格");
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(14.5, 5.5, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, bar),
+            }),
+        }]);
+        let mut debris_vels: Vec<(Vec3, Vec3)> = Vec::new();
+        for _ in 0..20 {
+            s.step();
+            let out = s.take_outbox();
+            for r in &out.compound_requests {
+                debris_vels.push(r.velocity);
+            }
+            for r in &out.detach_requests {
+                debris_vels.push((r.impulse / crate::destruction::DEBRIS_MASS, Vec3::ZERO));
+            }
+            if !s.impact_flow_trace.is_empty() && !debris_vels.is_empty() {
+                break;
+            }
+        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("窄墩工况应断开(F02b-3 实测 κ ≈ 0.52)");
+        // κ < 1:薄片摩擦工况封顶触发。
+        assert!(
+            t.kappa < 1.0,
+            "勘误 6:窄墩薄片摩擦工况 κ < 1,实际 {}",
+            t.kappa
+        );
+        // κ < 1 时封顶后 |J| = N(κ 即 N/|J_raw|;追踪的 event.impulse 是
+        // 封顶后的)。相对 1%。
+        assert!(
+            ((t.event.impulse.length() - t.n_transfer) / t.n_transfer).abs() < 0.01,
+            "封顶后 |J| = N:got |J| = {} N = {}",
+            t.event.impulse.length(),
+            t.n_transfer
+        );
+        // N 的独立复算:m·((v_前 − v_后) + g·Δt)·d̂;零重力 g = 0,v_前 =
+        // linvel_pre(步进前快照)、v_后 = linvel_before(步进后/修正前)。
+        let d_hat = t.event.dir_hat();
+        let n_recomputed = t.impactor.mass * (t.linvel_pre - t.linvel_before).dot(d_hat);
+        assert!(
+            ((n_recomputed - t.n_transfer) / t.n_transfer).abs() < 0.02,
+            "N 独立复算(零重力 Δv 口径):got {n_recomputed} want {}",
+            t.n_transfer
+        );
+        // 封顶后碎块与撞击者都不超来速。
+        for (v_seg, _) in &debris_vels {
+            assert!(
+                v_seg.length() <= 12.0 + 0.05,
+                "封顶后碎块速度 ≤ u + 0.05:实际 {:?}",
+                v_seg
+            );
+        }
+        let v_impactor_after = t.linvel_after.dot(d_hat);
+        assert!(
+            v_impactor_after.abs() <= 12.0 + 0.05,
+            "封顶后撞击者修正后沿 d̂ 速度 ≤ u + 0.05:实际 {v_impactor_after}"
+        );
+        // ---- 布景 2:7 宽墙(单一流形正面流形,κ = 1)----
+        // 6 格石条 15 m/s 打 7 宽 1 格厚土墙的墙面中部(穿墙布景的墙面
+        // 工况):条对墙是单一正面流形(内缩薄片贴墙面,无侧/顶薄片感应),
+        // κ = 1(封顶不触发,结果与封顶前逐位一致)。
+        let mut w = flow_sim_zero_g();
+        w.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        // 1 格厚土墙 x=10、z 5..=11(7 宽)、y 2..=4(3 高),bedrock 垫 y=1。
+        for z in 5..=11 {
+            let _ = w
+                .voxels
+                .set_block(BlockPos::new(10, 1, z), voxel::builtin::BEDROCK);
+            for y in 2..=4 {
+                let _ = w
+                    .voxels
+                    .set_block(BlockPos::new(10, y, z), voxel::builtin::DIRT);
+            }
+        }
+        refresh_collider(&mut w);
+        let wall_bar = types::CompoundShape::new(
+            (0..6)
+                .map(|i| types::ShapeCell {
+                    offset: [i, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格(伸向 +x,首格在前)");
+        let wid = entity(2);
+        w.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: wid,
+                state: EntityState {
+                    translation: Vec3::new(4.5, 3.5, 8.5),
+                    linvel: Vec3::new(15.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, wall_bar),
+            }),
+        }]);
+        for _ in 0..20 {
+            w.step();
+            let out = w.take_outbox();
+            if !w.impact_flow_trace.is_empty() {
+                let _ = out;
+                break;
+            }
+        }
+        let tw = w
+            .impact_flow_trace
+            .first()
+            .expect("7 宽墙正面流形工况应有事件(条 J ≈ 40 > 割)");
+        assert!(
+            tw.kappa >= 0.99,
+            "墙面工况 κ = 1(单一流形无薄片摩擦,封顶不触发):实际 {}",
+            tw.kappa
+        );
+        assert!(
+            ((tw.event.impulse.length() - tw.n_transfer) / tw.n_transfer).abs() < 0.02,
+            "墙面工况封顶后 |J| 仍 = N(κ=1 且 N ≥ 0.99·|J|):|J| = {} N = {}",
+            tw.event.impulse.length(),
+            tw.n_transfer
+        );
+    }
+
     /// AC-F8(§5.6 退役,D12):**悬臂-支柱布景**(参照
     /// `smoke/scenarios/req010-cantilever.toml` 的 12 格悬臂,平移到本 sim
     /// 坐标系)——石墙 + 从墙伸出的悬臂 + 末端支柱;投射物撞断支柱,悬臂
@@ -12425,10 +12666,9 @@ mod tests {
             cfg.solidify.enabled = false;
             cfg.cohesion.enabled = true;
             cfg.cohesion.impact_flow = flow;
-            // 支柱 1 格 DIRT(下方空气、上方悬臂):冲击流 S 的割 = 柱顶
-            // dirt-stone 剪切 7(唯一实心邻边),J > 7 即断——60 m/s 的
-            // J ≈ 43(I_c 28 未及,不粉碎)。断言取投射物 60 m/s 是因为 12/20
-            // m/s 时支柱虽断,但布景其余行为一致;统一用同一速度跑开/关两遍。
+            // 支柱 1 格 DIRT(y=1,立在地表土层上;地表 = chunk 表面格 y=0
+            // 是 DIRT):冲击流 S 的割 = 柱底 dirt-dirt 7 + 柱顶 dirt-stone 7
+            // = 14,J > 14 才断——60 m/s 的 J ≈ 43(I_c 28 未及,不粉碎)。
             cfg.destruction.max_detach_per_tick = 8;
             let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
             s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
@@ -12679,15 +12919,19 @@ mod tests {
             .map(|o| Vec3::new(o[0] as f32, o[1] as f32, o[2] as f32))
             .sum::<Vec3>()
             / cells.len() as f32;
-        // 世界质心独立复算:com_world = translation + rotation·com_local;
-        // translation = 刚体原点(首格格心)位置——由生成几何 + 修正前
-        // 旋转反解不可靠,改用恒等式校验:生产给的 impactor.center_of_mass
-        // 与"translation + rotation·com_local"应一致,translation 从
-        // 生成形状原点格心 (16.5,5.5,8.5) 与旋转(修正前近单位)估计,
-        // 校验误差 < 0.2 m(1 拍内位移量级)后,m_eff 用**独立 com**。
+        // 世界质心独立复算:com_world = translation + rotation·com_local。
+        // F02b-3:translation 用追踪的 `translation_before`(修正前刚体原点),
+        // **不再**从 impactor.center_of_mass 反解——那样减了再加回,得到的
+        // 就是生产 center_of_mass 本身,"质心改刚体原点"的变异红不了(循环)。
+        // 先断言独立质心与生产值一致(< 1e-4),证明追踪链路对,再用独立值。
         let rot = t.rotation_before;
-        let translation_est = t.impactor.center_of_mass - rot.mul_vec3(com_local);
-        let com_world = translation_est + rot.mul_vec3(com_local);
+        let com_world = t.translation_before + rot.mul_vec3(com_local);
+        assert!(
+            (com_world - t.impactor.center_of_mass).length() < 1e-4,
+            "追踪链路自检:独立质心 = translation_before + R·com_local 与生产              center_of_mass 一致:got {:?} want {:?}",
+            com_world,
+            t.impactor.center_of_mass
+        );
         let inertia = {
             // 3×3 惯量(含惯性积),世界系 = 单位旋转 → 本体系。
             let half = 0.45f32;
@@ -12827,14 +13071,22 @@ mod tests {
             resid.abs().max_element() <= 0.1,
             "AC-F4:守恒残差 {resid:?}(J 量级 72,0.1 = 0.14%)"
         );
-        // ---- ④分量法向速度一致 + w ≤ u ----
+        // ---- ④分量法向速度一致 + w ≤ u(勘误 6 后恢复)----
         let w = e.length() / (m_eff + m_s);
-        // w ≤ u(§5.7.2)在本布景不断言:L 形杆端面多接触点,采样 J 含
-        // rapier 穿透修正 ramp(J ≈ 2.07·m·u,与 gap 无关),w 按 |E|/(m_eff+
-        // M_S) 会超 u——J 的超调是采样口径(F00 勘误 9 已按实测 J 对账),
-        // 守恒式仍精确成立(上面已断)。"w ≤ u" 由共线单格场景(F01 e2e
-        // acc_f4,J ≈ m·u 无多接触超调)钉住。
-        let _ = 12.0f32;
+        // 勘误 6 牛顿封顶后,J 不再含穿透修正 ramp 的凭空超调(|J| ≤ N ≤
+        // m·u + 重力项),共同速度 w 回到 ≤ u 的物理约束内;F02b-2 时撤下
+        // 的断言恢复(容差 0.05:量化舍入 + 重力项的 u 上浮)。
+        assert!(
+            w <= 12.0 + 0.05,
+            "AC-F4:共同速度 w ≤ u(勘误 6 封顶后),实际 {w}"
+        );
+        // 撞击者修正后沿 d̂ 的速度同样 ≤ u(封顶后修正把 rapier 多扣的还
+        // 回去,落点 ≤ w ≤ u)。
+        let v_imp = (t.linvel_after + t.angvel_after.cross(t.event.point - com_world)).dot(d_hat);
+        assert!(
+            v_imp <= 12.0 + 0.05,
+            "AC-F4:撞击者修正后 p 处沿 d̂ 速度 ≤ u(封顶后),实际 {v_imp}"
+        );
         for k in &t.momenta {
             assert!(
                 (k.delta_v.dot(d_hat) - w).abs() < 0.1,
@@ -12844,43 +13096,39 @@ mod tests {
         }
     }
 
-    /// AC-F4(偏心不对称分量的 Δω 与 rapier 参照一致;共线 Δω ≈ 0):
-    /// L 形 4 格分量被撞断,追踪里的 `P_k`、`p_k` 与零重力参照 sim 里
-    /// "同形状刚体放在同一位姿、在 p_k 处施加 P_k"的 Δv/Δω 闭式一致
-    /// (rapier 按碰撞体质量属性一次算对)。共线半边:6 格条正对质心行进
-    /// (接触点在质心线上)时 Δω ≈ 0,由
-    /// [`impact_flow_trace_conservation_and_correction_quantitative`] 的
-    /// 布景(接触点在质心线上?否——偏心)不适用,共线由 F01 的 e2e
-    /// `acc_f4_conservation_and_common_normal_speed` 钉住(单格伸出格
-    /// 共线撞击,Δω ≈ 0 断言已在);此处补 L 形参照。
+    /// AC-F4(偏心不对称分量的 Δω 与 rapier 参照一致):
+    /// S 的最大分量 = **真 L 形**(2×3 悬空土墙去掉一角,5 格)——惯性积
+    /// 非零(AC-F4"至少含一个不对称分量"的正确布景;F02b-2 用 2×3 矩形
+    /// 被总架构师退回:惯性积为零,不对称性只来自接触点偏置,不来自形状)。
+    /// 追踪里的 `P_k`、`p_k` 与零重力参照 sim 里"同形状刚体放在同位姿、
+    /// 在 p_k 处施加 P_k"的 Δv/Δω 闭式一致(rapier 按碰撞体质量属性一次
+    /// 算对)。共线 Δω ≈ 0 由
+    /// [`impact_flow_trace_collinear_impactor_zero_delta_w`](生产路径,
+    /// 1×2 土梁轴向正撞)钉住,不推给 F01。
     ///
-    /// 变红:逆惯量置零(Δω 缺角项)、质心取刚体原点(r_k 全错)。
+    /// 变红:逆惯量置零(Δω 缺角项)、质心取刚体原点(r_k 全错)、
+    /// S 退回矩形(惯性积断言红)。
     #[test]
     fn impact_flow_trace_l_shape_delta_w_matches_rapier_reference() {
-        // 布景同定量测试,但撞击者改为 6 格条、被撞结构换成会切出 L 形
-        // 分量的悬空 7 字?——直接复用定量布景:S = 上格单格,无 L 形。
-        // 换 2×3 悬空土墙(bedrock 垛在两格脚),条撞中部:S = 2×3 整块
-        // (1 分量,矩形对称——惯性积 0,但接触点在角上,r_k ≠ 0,Δω ≠ 0);
-        // 参照体 = 同形状(2×3)刚体同位姿施加同组 P_k@p_k。
+        // 悬空 **L 形 3 格**土墙(格 [(10,4,8),(10,5,8),(10,5,9)];bedrock
+        // 垫 (10,3,8) 在竖排正下方,汇点),6 格石条 12 m/s 撞格 (10,4,8):
+        // 最小割 = 7(供给格任一边),残量可达集 S = L 形 3 格(F02b-3
+        // 实测;L 形 → 惯性积 ≠ 0)。
         let mut s = flow_sim_zero_g();
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
-        // 2 宽 × 3 高土墙悬空(垫两格 bedrock 在底格正下方 2 格,BFS 不外溢)。
         let _ = s
             .voxels
-            .set_block(BlockPos::new(10, 1, 8), voxel::builtin::BEDROCK);
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
         let _ = s
             .voxels
-            .set_block(BlockPos::new(10, 1, 9), voxel::builtin::BEDROCK);
-        for y in 3..=5 {
-            for z in 8..=9 {
-                let _ = s
-                    .voxels
-                    .set_block(BlockPos::new(10, y, z), voxel::builtin::DIRT);
-            }
-        }
+            .set_block(BlockPos::new(10, 4, 8), voxel::builtin::DIRT);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 5, 8), voxel::builtin::DIRT);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 5, 9), voxel::builtin::DIRT);
         refresh_collider(&mut s);
-        // 6 格石条:撞中部行(y=4),z 对准 8.5(压向,割含土-基岩剪切?)。
-        // 供给走 12 m/s(与定量测试同)。
         let bar = types::CompoundShape::new(
             (0..6)
                 .map(|i| types::ShapeCell {
@@ -12915,13 +13163,37 @@ mod tests {
         let trace = &s.impact_flow_trace;
         assert!(!trace.is_empty(), "应有断开事件(布景自检)");
         let t = &trace[0];
-        // S 至少 2 格成 1 个分量,Δω ≠ 0(接触点偏在格角)。
+        // S = L 形 5 格(1 分量);L 形 → 惯性积 ≠ 0(真不对称,AC-F4 布景
+        // 要求;2×3 矩形惯性积全零,被 F02b-3 验收退回)。
         let k = t
             .momenta
             .iter()
             .max_by(|a, b| a.cells.len().cmp(&b.cells.len()))
             .expect("至少 1 个分量");
-        assert!(k.cells.len() >= 2, "布景自检:最大分量 ≥ 2 格(非单格)");
+        assert_eq!(k.cells.len(), 3, "布景自检:S = L 形 3 格 1 分量");
+        // 惯性积独立复算(本体系,等质量格点):
+        // I_xy = −Σ m·(x−cx)(y−cy) 等;L 形至少一个 ≠ 0。
+        {
+            let n = k.cells.len() as f32;
+            let com = crate::impact_flow::component_center_of_mass(&k.cells);
+            let mut ixy = 0.0f32;
+            let mut ixz = 0.0f32;
+            let mut iyz = 0.0f32;
+            for c in &k.cells {
+                let d = Vec3::new(
+                    c.x as f32 + 0.5 - com.x,
+                    c.y as f32 + 0.5 - com.y,
+                    c.z as f32 + 0.5 - com.z,
+                );
+                ixy -= 0.729 * d.x * d.y;
+                ixz -= 0.729 * d.x * d.z;
+                iyz -= 0.729 * d.y * d.z;
+            }
+            assert!(
+                ixy.abs() > 1e-3 || ixz.abs() > 1e-3 || iyz.abs() > 1e-3,
+                "布景自检:L 形分量惯性积非零(真不对称):{ixy} {ixz} {iyz} n={n}"
+            );
+        }
         assert!(
             k.delta_w.length() > 1e-3,
             "偏心工况 Δω ≠ 0(接触点不在分量质心线上):{:?}",
@@ -12931,7 +13203,6 @@ mod tests {
         // canonical 化后放回原位),零重力 sim,在 p_k 处施加 P_k。
         let mut ref_sim = flow_sim_zero_g();
         ref_sim.load_chunk(ChunkPos::new(0, 0), solid_chunk());
-        let comp_com = crate::impact_flow::component_center_of_mass(&k.cells);
         // 分量形状 = k.cells 相对最小格的偏移;原点 = compound_origin。
         let origin = crate::cohesion::compound_origin(&k.cells);
         let world: Vec<(BlockPos, types::BlockId)> =
@@ -12983,7 +13254,76 @@ mod tests {
             ref_st.angvel,
             k.delta_w
         );
-        let _ = comp_com;
+    }
+
+    /// AC-F4(共线 Δω ≈ 0,生产路径;F02b-3 验收要求"共线 Δω ≈ 0 在生产
+    /// 路径补一条,不推给 F01"):悬空 1×2 土梁(z 向横放,垫在 z=8 格正下
+    /// 方),单格石块 12 m/s 沿 −z **正撞梁端格 (10,4,8) 的端面**——接触点
+    /// 在分量的质心线上(质心 z = 9 与端面 z=8 的接触点共线),动量分量
+    /// (S = 梁 2 格整块)Δω ≈ 0(力臂为零)。走 step() 读追踪断言。
+    ///
+    /// 变红:动量分配误给角项(共线工况凭空出 Δω);Δv 计算含伪力臂。
+    #[test]
+    fn impact_flow_trace_collinear_impactor_zero_delta_w() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 8), voxel::builtin::DIRT);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 9), voxel::builtin::DIRT);
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(10.5, 4.5, 12.45),
+                    linvel: Vec3::new(0.0, 0.0, -12.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        for _ in 0..20 {
+            s.step();
+            let out = s.take_outbox();
+            if !out.detach_requests.is_empty() || !out.compound_requests.is_empty() {
+                break;
+            }
+        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("端面正撞应有断开事件(割 7 < 供给)");
+        // 分量 = 梁 2 格整块(承载粘结连通,1 分量)。
+        let k = &t.momenta[0];
+        assert_eq!(k.cells.len(), 2, "布景自检:分量 = 梁 2 格整块");
+        // 共线:p_k 在质心线上 → Δω ≈ 0(力臂为零)。实测离轴 ~0.015 m
+        // (内缩薄片接触点加权位置的浮点偏置),|P| ≈ 1.5 → 残余力矩 ~0.02,
+        // Δω ≈ 0.04 rad/s;容差 0.15 = 4× 实测(伪力臂变异会给出 >1)。
+        assert!(
+            k.delta_w.length() < 0.15,
+            "共线工况 Δω ≈ 0(伪力臂变异会 >1):实际 {:?}",
+            k.delta_w
+        );
+        // Δv 仍沿 d̂(z)且大小 = |P_k|/M_k。
+        assert!(
+            k.delta_v.x.abs() < 1e-3 && k.delta_v.y.abs() < 1e-3,
+            "共线 Δv 沿撞击方向:实际 {:?}",
+            k.delta_v
+        );
     }
 
     /// AC-F5(轻撞大,定量):轻投射物(单格 0.729 kg)以 12 m/s 撞悬空
@@ -12991,8 +13331,17 @@ mod tests {
     /// (m_eff/(m_eff+M_S) → 小;修正只把多扣的还回去,共同速度 w 被大
     /// M_S 摊薄)。走 step() 读追踪断言。
     ///
+    /// **停报(F02b-3,2026-11-01)**:验收要求的 `w < 0.1·u` 在"轻物撞
+    /// 地形"布景物理不可达——w = |E|/(m_eff+M_S),M_S 是断下段质量;轻物
+    /// (0.729 kg)的 J 只能断 1-2 键的小段(割 ≤ 12),M_S ≤ 1.5 kg →
+    /// w ≥ m_l·u/(m_l+M_S) ≈ 1.8(实测 12 m/s 布景 w = 1.806);要 w < 1.2
+    /// 需 M_S > 6.5 格,而断下 6.5 格段的割 ≥ 3 键 = 21 > 轻物 J。质量比
+    /// 决定下限,与容差无关。`#[ignore]` 留档待总架构师裁定(换布景口径 /
+    /// 放宽阈值 / 拆分),断言保留验收要求口径(0.1·u)。
+    ///
     /// 变红:修正误用 J 全额(轻物仍被推走)。
     #[test]
+    #[ignore = "停报:w < 0.1·u 与轻物撞地形的质量比物理上限冲突(实测 1.806),待裁定"]
     fn impact_flow_trace_light_hits_heavy_correction_near_zero() {
         let mut s = flow_sim_zero_g();
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
@@ -13103,27 +13452,25 @@ mod tests {
             let t = s
                 .impact_flow_trace
                 .first()
-                .expect("轻物撞 2×3 土墙应有断开事件(6 m/s:供给 ≥ 剪切割)");
-            // 轻物 m_eff = 0.729(单格),M_S ≥ 2 格 = 1.458 →
-            // 修正比例 ≤ 0.729/(0.729+1.458) = 1/3;法向速度增量 =
-            // |修正|/m_eff = w ≤ u·m_eff/(m_eff+M_S)·(1/m_eff)…直接断言:
-            // 修正后 p 处法向速度 ≤ u 的一半(轻物被大块摊薄,w 小)。
+                .expect("轻物撞 2×3 土墙应有断开事件(12 m/s:供给 ≥ 剪切割)");
+            // 轻物 m_eff = 0.729(单格),M_S = 2 格 × 0.729 → 修正比例
+            // m_eff/(m_eff+M_S) ≤ 1/3;共同速度 w = |E|/(m_eff+M_S)。
+            // F02b-3 收紧:w < 0.1·u(轻物被大块摊薄,共同速度远低于来速;
+            // 0.1·u = 1.2 m/s),修正后 p 处法向速度与 w 相差 0.1 以内。
             let d_hat = t.event.dir_hat();
             let com = t.impactor.center_of_mass;
             let v_after = (t.linvel_after + t.angvel_after.cross(t.event.point - com)).dot(d_hat);
-            assert!(
-                v_after.abs() < 3.0,
-                "AC-F5:轻撞大块,修正后法向速度 ≈ 0(≤ u/2),实际 {v_after}"
-            );
-            // w 定量:修正后速度 = w(E 之前的口径:修正把 rapier 多扣的
-            // 还回去,落点是共同速度 w)。
-            let m_s = t.momenta.iter().map(|k| k.mass).sum::<f32>();
+            let m_s = t.momenta.iter().map(|kk| kk.mass).sum::<f32>();
             let w = t.event.impulse.length()
                 * ((t.supply - t.cut_q as f32 / t.quant) / t.supply).clamp(0.0, 1.0)
                 / (t.impactor.mass + m_s);
             assert!(
-                (v_after - w).abs() < 1.0,
-                "修正后法向速度 ≈ w:got {v_after} want ≈{w}"
+                w < 1.2,
+                "AC-F5:共同速度 w < 0.1·u = 1.2(轻物被大块摊薄),实际 {w}"
+            );
+            assert!(
+                (v_after - w).abs() < 0.1,
+                "AC-F5:修正后法向速度 = w(封顶后落点),got {v_after} want ≈{w}"
             );
         }
     }

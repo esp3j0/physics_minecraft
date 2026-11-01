@@ -85,13 +85,24 @@ pub struct FlowEventTrace {
     /// 修正前撞击者线速度(世界系)。
     /// 修正前撞击者旋转(世界系;测试独立复算世界系惯量用)。
     pub rotation_before: types::glam::Quat,
+    /// 修正前撞击者平移(刚体原点;测试独立复算世界质心 =
+    /// `translation_before + rotation_before·com_local`——不经生产的
+    /// `center_of_mass`,否则"质心改原点"的变异红不了,F02b-3)。
+    pub translation_before: Vec3,
     pub linvel_before: Vec3,
+    /// 物理步进**前**的撞击者线速度(`pre_impulse_vels` 快照;N 的 v_前,
+    /// F02b-3 勘误 6 对账用——`linvel_before` 是步进后/修正前,v_后)。
+    pub linvel_pre: Vec3,
     /// 修正前撞击者角速度(世界系)。
     pub angvel_before: Vec3,
     /// 修正后撞击者线速度。
     pub linvel_after: Vec3,
     /// 修正后撞击者角速度。
     pub angvel_after: Vec3,
+    /// 牛顿封顶比例 κ(§5.7.9 勘误 6;1.0 = 未封顶)。
+    pub kappa: f32,
+    /// 撞击者本步沿 d̂ 实际交给地形的动量 N(封顶读数;κ 的分子)。
+    pub n_transfer: f32,
     /// 撞击者质量属性(测试独立复算 m_eff 用;直接给原始三件套,测试不经
     /// 生产同一函数求 m_eff)。
     pub impactor: ImpactBodyProps,
