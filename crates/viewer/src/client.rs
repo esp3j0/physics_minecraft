@@ -118,6 +118,14 @@ impl ControlHandle {
     pub fn goodbye(&self) {
         let _ = self.tx.try_send(Control::Goodbye);
     }
+
+    /// 测试构造(仅 viewer 内部测试):有界内存通道(容量同生产 64),收端
+    /// 原样读回 [`Control`] 消息——`forward_commands` 的发送层断言用,不起线程。
+    #[cfg(test)]
+    pub(crate) fn for_test() -> (Self, std_mpsc::Receiver<Control>) {
+        let (tx, rx) = std_mpsc::sync_channel(CONTROL_CAPACITY);
+        (Self { tx }, rx)
+    }
 }
 
 /// 协议客户端:S2C 帧 → [`ViewEvent`] 泵 + C2S 控制通道的独立线程封装。

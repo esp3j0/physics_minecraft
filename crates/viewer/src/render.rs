@@ -902,4 +902,104 @@ mod tests {
             pose2.current.x
         );
     }
+
+    /// 发送层(F04a-2):`forward_commands` 把同帧 SetBlock/Detonate 打成一条
+    /// Batch(REQ-010 终审返修 1 的原子编辑语义),Spawn 逐条不混批且
+    /// **desc 原样透传**(F04a:复合 desc 不得在发送层被换成默认单格)。
+    ///
+    /// 会变红的实现:`control.spawn` 处改回 `EntityDesc::default()`(丢复合
+    /// 形状);把 Spawn 混进 Batch(Spawned 回执按条对应语义被破坏);批序颠倒。
+    #[test]
+    fn forward_commands_batches_sets_and_forwards_spawn_descs() {
+        let (control, rx) = crate::client::ControlHandle::for_test();
+
+        let set = |x: i32| EngineCommand::SetBlock {
+            pos: types::BlockPos::new(x, 4, 6),
+            block: types::BlockId(3),
+        };
+        let compound_desc = || {
+            EntityDesc::compound(
+                0.45,
+                types::CompoundShape::new(vec![
+                    types::ShapeCell {
+                        offset: [0, 0, 0],
+                        block: types::BlockId(1),
+                    },
+                    types::ShapeCell {
+                        offset: [1, 0, 0],
+                        block: types::BlockId(1),
+                    },
+                ])
+                .unwrap(),
+            )
+        };
+        let spawn_at = |x: f32, desc: EntityDesc| EngineCommand::Spawn {
+            state: EntityState {
+                translation: types::glam::Vec3::new(x, -50.0, 0.0),
+                ..EntityState::default()
+            },
+            desc,
+        };
+
+        let commands = vec![
+            set(1),
+            set(2),
+            spawn_at(8.0, compound_desc()),
+            set(3),
+            spawn_at(12.0, EntityDesc::default()),
+        ];
+        forward_commands(&commands, &control);
+
+        // 依次:批(2 条 SetBlock)→ Spawn(复合 desc)→ 批(1 条)→ Spawn(默认 desc)。
+        let batch1 = rx.try_recv().expect("第一批(SetBlock×2)");
+        let spawn1 = rx.try_recv().expect("复合 Spawn");
+        let batch2 = rx.try_recv().expect("第二批(SetBlock×1)");
+        let spawn2 = rx.try_recv().expect("默认 Spawn");
+
+        assert_eq!(
+            batch1,
+            crate::client::Control::Batch(vec![
+                SimCommand::SetBlock {
+                    pos: types::BlockPos::new(1, 4, 6),
+                    block: types::BlockId(3),
+                },
+                SimCommand::SetBlock {
+                    pos: types::BlockPos::new(2, 4, 6),
+                    block: types::BlockId(3),
+                },
+            ]),
+            "Spawn 之前的批先发出(保序),两条 SetBlock 一条 Batch"
+        );
+        assert_eq!(
+            spawn1,
+            crate::client::Control::Spawn {
+                state: EntityState {
+                    translation: types::glam::Vec3::new(8.0, -50.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: compound_desc(),
+            },
+            "复合 desc 原样透传(F04a:发送层不得丢 shape)"
+        );
+        assert_eq!(
+            batch2,
+            crate::client::Control::Batch(vec![SimCommand::SetBlock {
+                pos: types::BlockPos::new(3, 4, 6),
+                block: types::BlockId(3),
+            }]),
+            "两个 Spawn 之间的 SetBlock 独立成批"
+        );
+        assert_eq!(
+            spawn2,
+            crate::client::Control::Spawn {
+                state: EntityState {
+                    translation: types::glam::Vec3::new(12.0, -50.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::default(),
+            },
+            "单格 desc 仍为默认(逐位不变)"
+        );
+        assert!(rx.try_recv().is_err(), "通道应已收干(恰好 4 条消息)");
+    }
 }
