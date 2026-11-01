@@ -1036,7 +1036,8 @@ F 的性质(验收依据):
     - **F04 默认开启、迁移与冒烟**:`impact_flow` 默认 `true`、既有用例显式关闭、§5.7.7 场景、标定记录与终审定值(AC-F11、AC-F12)。
       拆为 **F04a**(默认开启、既有用例与场景迁移、冒烟脚本 `spawn.shape` 以便发射复合体投射物;AC-F10 默认值、AC-F12)与
       **F04b**(总架构师在 `smoke/scenarios-pending/` 定稿 §5.7.7 场景并通过机器检查后放行:`git mv`、标定记录、终审定值;AC-F11)。
-      F04a 2026-11-01 放行;
+      F04a 2026-11-01 放行;F04a([5805bd4](https://github.com/esp3j0/physics_minecraft/commit/5805bd4))验收返修 1 条(F04a-2:`forward_commands` 发送层无测试，丢 shape 的变异是绿的),F04a-2([2d94e10](https://github.com/esp3j0/physics_minecraft/commit/2d94e10))**2026-11-01 验收通过**(变异经总架构师复跑为红;迁移清单 5 条显式关闭，其中 `boundary_edit_physics_matches_single_world` 经复核属布景前提失效——单世界参考片中实体冲出本体区被移除，非双片分歧);
+      F04b 场景定稿(总架构师，2026-11-01):`smoke/scenarios-pending/` 下 `req010-impact-punch`(6 格石条 20 m/s 撞 7×5 土墙，墙脚基岩;石条按 D4 自身断成 2+4,前段穿洞落墙后，后段停墙前——15 m/s 实测停在洞里不越面，故取 20)、`req010-impact-pillar`(4 格石柱，单格 20 m/s 侧撞，整根从柱脚断开向 +x 倒伏)、`req010-impact-corner` 改写(结构整体 +2 格平移到 x = 7..10,去掉 `compound_split_size = 4` 用默认 6:原位 x = 5..8 跨切块网格边界，按世界网格切块必把 7 字切开，§5.7.1 末行"整个 7 字飞出"无法成立;实测 6 格 L 形完整飞出、平躺落地);三场景 `--no-ai` 机器检查连跑两次全过，落点格由探针扫格实测写定;F04b 放行;
 
 ## demo 记录(阶段 2 填写)
 

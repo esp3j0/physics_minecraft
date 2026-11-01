@@ -1,0 +1,134 @@
+name = "req010-impact-pillar"
+req = "REQ-010"
+description = "4 格高石柱立在土地上,一颗方块以 20 m/s 侧撞柱身上部:石-土柱脚粘结(I = 7)是最小割,整根石柱从柱脚断开、带着撞击给的速度与角速度倾倒,落地后凝固;投射物(1 kg,远轻于 2.9 kg 的石柱)修正后几乎停在柱前(REQ-010 §5.7.1 最小割、§5.7.2 守恒分配)"
+timeout_secs = 240
+
+[server]
+world_seed = 11
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位(侧面,看柱子倒向 +x)"
+camera = { pos = [12.0, -54.0, 32.0], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [11.0, -58.0, 20.0] }
+
+[[step]]
+wait_until = { block = { pos = [9, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "石柱(x=10,z=20,y=-60..-57)立在土地上"
+fill = { from = [10, -60, 20], to = [10, -57, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [10, -57, 20], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+check = { block = { pos = [10, -57, 20], is = "stone" } }
+
+[[step]]
+screenshot = { name = "pillar", expect = "平整的棕色土地上立着一根 4 格高的灰色石柱;空中没有蓝色立方体" }
+
+[[step]]
+label = "发射方块(中心 (7.5,-57.45,20.5),20 m/s 沿 +x)撞柱身 (10,-58,20)–(10,-57,20)"
+spawn = { at = [7.5, -57.45, 20.5], count = 1, velocity = [20.0, 0.0, 0.0], label = "projectile" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-01", expect = "灰色 4 格石柱完整站立;一个蓝色投射物方块在石柱左侧,即将撞上或刚撞上柱身上部" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "石柱被撞:石柱整根变成蓝色并开始向右倾斜,柱脚与地面分开;投射物蓝色方块在石柱左侧" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-03", expect = "蓝色石柱整根继续向右倾倒,仍然是一根完整的直条;柱子原来立着的位置已空" }
+
+[[step]]
+wait_ticks = { n = 4 }
+
+[[step]]
+screenshot = { name = "burst-04", expect = "蓝色石柱斜着向右倒下,接近地面;投射物在左侧地面附近" }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+screenshot = { name = "burst-05", expect = "蓝色石柱倒在或接近倒在地上,方向朝右;原位置没有残留的柱子" }
+
+[[step]]
+wait_ticks = { n = 8 }
+
+[[step]]
+screenshot = { name = "burst-06", expect = "石柱横躺在原位置右侧的地面上(蓝色或正在凝固);投射物在左侧地面" }
+
+[[step]]
+wait_ticks = { n = 12 }
+
+[[step]]
+screenshot = { name = "burst-07", expect = "石柱横躺在地上,姿态稳定;投射物方块在其左侧" }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "burst-08", expect = "石柱横躺在地上;投射物方块在其左侧;画面里没有站立的柱子" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:原来站立的 4 格石柱已整根倒下,作为一根灰色横条躺在原位置右侧的地面上;原位置没有残留的柱脚;一个灰色方块(投射物)凝固在横条左侧的地面上;空中没有蓝色立方体" }
+
+[[step]]
+label = "全部落定、无悬浮"
+check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
+
+[[step]]
+label = "整根从柱脚断开:原位置 4 格全空"
+check = { block = { pos = [10, -60, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [10, -59, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [10, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [10, -57, 20], is = "air" } }
+
+[[step]]
+label = "石柱向撞击方向(+x)倒下,横躺在地上凝固"
+check = { block = { pos = [11, -60, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [12, -60, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [13, -60, 20], is = "stone" } }
+
+[[step]]
+check = { block = { pos = [14, -60, 20], is = "stone" } }
+
+[[step]]
+label = "投射物落定在柱子原位前方"
+check = { block = { pos = [9, -60, 21], is = "stone" } }
