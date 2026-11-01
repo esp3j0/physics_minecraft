@@ -51,6 +51,15 @@ pub struct CohesionConfig {
     pub load_knockback_max_speed: f32,
     /// 击退后角速度上限 rad/s(6.0,§5.6;取 0 = 钉死为零,裁定 2026-10-30;单元 K02 使用)。
     pub load_knockback_max_ang_speed: f32,
+    /// 撞击冲量流开关(F02a,§5.7.5;F01–F03 期间默认 `false`,F04 起默认
+    /// `true`,D14)。生效条件 = `destruction.enabled` ∧ `cohesion.enabled` ∧ 本键;
+    /// 关闭时 REQ-009 §5 与 §5.6 逐位不变。
+    pub impact_flow: bool,
+    /// 撞击冲量流的 BFS 区域格数上限(1024,§5.7.1;截断处相邻格视为地基)。
+    pub impact_flow_max_cells: usize,
+    /// 每分片每拍处理的撞击事件数上限(8,§5.7.4;按 `s` 降序、同值
+    /// `EntityId` 升序选取,其余本拍不处理、不推迟)。
+    pub impact_flow_max_events_per_tick: usize,
 }
 
 impl Default for CohesionConfig {
@@ -65,6 +74,9 @@ impl Default for CohesionConfig {
             load_knockback_factor: 0.5,
             load_knockback_max_speed: 8.0,
             load_knockback_max_ang_speed: 6.0,
+            impact_flow: false,
+            impact_flow_max_cells: 1024,
+            impact_flow_max_events_per_tick: 8,
         }
     }
 }
@@ -105,6 +117,22 @@ pub struct CohesionStats {
     pub forced_landing_fallbacks: u64,
     /// 爆炸从复合体上移除的格数(单元 07)。
     pub blast_removed_cells: u64,
+    /// 建网的撞击事件数(F02a,§5.7.8;预筛命中不建网、不计数)。
+    pub impact_flow_events: u64,
+    /// 预筛跳过的撞击事件数(F02a,§5.7.8)。
+    pub impact_flow_prefiltered: u64,
+    /// 撞击冲量流 BFS 访问的实心格数(F02a,§5.7.8)。
+    pub impact_flow_cells_visited: u64,
+    /// BFS 区域被截断的次数(F02a,§5.7.8)。
+    pub impact_flow_budget_hits: u64,
+    /// 判"断开"(`C < s`)的撞击事件数(F02a,§5.7.8)。
+    pub impact_flow_breaks: u64,
+    /// 撞击冲量流断下的格数(F02a,§5.7.8;只计实际写入的)。
+    pub impact_flow_detached_cells: u64,
+    /// 名额不足、整个事件放弃的次数(F02a,§5.7.4/§5.7.8)。
+    pub impact_flow_skipped_budget: u64,
+    /// 撞击者修正次数(F02a 恒 0——修正随 §5.7.2 在 F02b 接线)。
+    pub impact_flow_corrections: u64,
 }
 
 impl CohesionStats {
@@ -125,6 +153,14 @@ impl CohesionStats {
         self.tilt_scattered += other.tilt_scattered;
         self.forced_landing_fallbacks += other.forced_landing_fallbacks;
         self.blast_removed_cells += other.blast_removed_cells;
+        self.impact_flow_events += other.impact_flow_events;
+        self.impact_flow_prefiltered += other.impact_flow_prefiltered;
+        self.impact_flow_cells_visited += other.impact_flow_cells_visited;
+        self.impact_flow_budget_hits += other.impact_flow_budget_hits;
+        self.impact_flow_breaks += other.impact_flow_breaks;
+        self.impact_flow_detached_cells += other.impact_flow_detached_cells;
+        self.impact_flow_skipped_budget += other.impact_flow_skipped_budget;
+        self.impact_flow_corrections += other.impact_flow_corrections;
     }
 }
 
@@ -1195,12 +1231,12 @@ mod tests {
         assert!(!g(p(0, 5, 0)), "起点是空气");
     }
 
-    /// `CohesionStats::add`:15 个字段逐一相加(调度器合计用)。
+    /// `CohesionStats::add`:23 个字段逐一相加(调度器合计用)。
     ///
     /// 变红:漏加任一字段(合计比两分片之和小)。
     #[test]
     fn cohesion_stats_add_sums_every_field() {
-        // 第 i 个字段 = i·k(1..=15):mk(1) + mk(100) = mk(101) 当且仅当
+        // 第 i 个字段 = i·k(1..=23):mk(1) + mk(100) = mk(101) 当且仅当
         // 每个字段都被加过一次。
         let mk = |k: u64| CohesionStats {
             load_evaluations: k,
@@ -1218,6 +1254,14 @@ mod tests {
             tilt_scattered: 13 * k,
             forced_landing_fallbacks: 14 * k,
             blast_removed_cells: 15 * k,
+            impact_flow_events: 16 * k,
+            impact_flow_prefiltered: 17 * k,
+            impact_flow_cells_visited: 18 * k,
+            impact_flow_budget_hits: 19 * k,
+            impact_flow_breaks: 20 * k,
+            impact_flow_detached_cells: 21 * k,
+            impact_flow_skipped_budget: 22 * k,
+            impact_flow_corrections: 23 * k,
         };
         let (a, b) = (mk(1), mk(100));
         let mut sum = a;

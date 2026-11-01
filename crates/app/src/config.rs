@@ -159,6 +159,9 @@ pub struct CohesionConfig {
     pub load_knockback_factor: f32,
     pub load_knockback_max_speed: f32,
     pub load_knockback_max_ang_speed: f32,
+    pub impact_flow: bool,
+    pub impact_flow_max_cells: usize,
+    pub impact_flow_max_events_per_tick: usize,
 }
 
 impl Default for CohesionConfig {
@@ -174,6 +177,9 @@ impl Default for CohesionConfig {
             load_knockback_factor: c.load_knockback_factor,
             load_knockback_max_speed: c.load_knockback_max_speed,
             load_knockback_max_ang_speed: c.load_knockback_max_ang_speed,
+            impact_flow: c.impact_flow,
+            impact_flow_max_cells: c.impact_flow_max_cells,
+            impact_flow_max_events_per_tick: c.impact_flow_max_events_per_tick,
         }
     }
 }
@@ -443,6 +449,19 @@ impl Config {
                 return Err(ConfigError::Validate(format!("{name} ({v}) 不得为负")));
             }
         }
+        // 撞击冲量流(REQ-010 §5.7.5、§12.1 第 2 条):两个上限键 ≥ 1。
+        if c.impact_flow_max_cells < 1 {
+            return Err(ConfigError::Validate(format!(
+                "impact_flow_max_cells ({}) 须 ≥ 1",
+                c.impact_flow_max_cells
+            )));
+        }
+        if c.impact_flow_max_events_per_tick < 1 {
+            return Err(ConfigError::Validate(format!(
+                "impact_flow_max_events_per_tick ({}) 须 ≥ 1",
+                c.impact_flow_max_events_per_tick
+            )));
+        }
         Ok(())
     }
 
@@ -567,6 +586,9 @@ impl Config {
                 load_knockback_factor: self.cohesion.load_knockback_factor,
                 load_knockback_max_speed: self.cohesion.load_knockback_max_speed,
                 load_knockback_max_ang_speed: self.cohesion.load_knockback_max_ang_speed,
+                impact_flow: self.cohesion.impact_flow,
+                impact_flow_max_cells: self.cohesion.impact_flow_max_cells,
+                impact_flow_max_events_per_tick: self.cohesion.impact_flow_max_events_per_tick,
             },
         }
     }
@@ -1359,10 +1381,67 @@ unload_radius = 64
                 "[cohesion]\nload_max_cells = 1\ncompound_split_size = 1\n\
                  max_converted_cells_per_tick = 1\nmax_fractures_per_tick = 1\n\
                  load_knockback_factor = 0.0\nload_knockback_max_speed = 0.0\n\
-                 load_knockback_max_ang_speed = 0.0\n",
+                 load_knockback_max_ang_speed = 0.0\nimpact_flow_max_cells = 1\n\
+                 impact_flow_max_events_per_tick = 1\n",
             )
             .is_ok(),
             "边界值合法"
         );
+    }
+
+    /// AC-F10(F02a,§5.7.5):撞击冲量流三键——解析、默认值(false / 1024 / 8)、
+    /// `0` 被拒、roundtrip、→ ShardSimConfig 直传。
+    ///
+    /// 变红:默认值误为 true(F04 才默认开);上限键默认或校验漏掉;直传漏键。
+    #[test]
+    fn impact_flow_keys_parse_defaults_and_reject_zero() {
+        // 默认值:impact_flow = false(F01–F03 期间;F04 起才默认 true)、
+        // 上限 1024 / 8。
+        let c = Config::load(None).expect("默认配置");
+        assert!(!c.cohesion.impact_flow, "默认 false(D14:F04 才开)");
+        assert_eq!(c.cohesion.impact_flow_max_cells, 1024);
+        assert_eq!(c.cohesion.impact_flow_max_events_per_tick, 8);
+        // → ShardSimConfig 直传(同源,§12.1)。
+        let core = c.shard_sim_config(types::ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        ));
+        assert!(!core.cohesion.impact_flow);
+        assert_eq!(core.cohesion.impact_flow_max_cells, 1024);
+        assert_eq!(core.cohesion.impact_flow_max_events_per_tick, 8);
+        // 解析 + roundtrip。
+        let cfg = Config::from_toml_str(
+            "[cohesion]\nimpact_flow = true\nimpact_flow_max_cells = 33\n\
+             impact_flow_max_events_per_tick = 3\n",
+        )
+        .expect("合法覆写");
+        assert!(cfg.cohesion.impact_flow);
+        assert_eq!(cfg.cohesion.impact_flow_max_cells, 33);
+        assert_eq!(cfg.cohesion.impact_flow_max_events_per_tick, 3);
+        let rt = Config::from_toml_str(&cfg.to_toml_string()).expect("roundtrip");
+        assert_eq!(rt.cohesion.impact_flow, cfg.cohesion.impact_flow);
+        assert_eq!(
+            rt.cohesion.impact_flow_max_cells,
+            cfg.cohesion.impact_flow_max_cells
+        );
+        // 0 被拒(错误点名键)。
+        for toml in [
+            "[cohesion]\nimpact_flow_max_cells = 0\n",
+            "[cohesion]\nimpact_flow_max_events_per_tick = 0\n",
+        ] {
+            match Config::from_toml_str(toml) {
+                Ok(_) => panic!("非法配置应被拒绝:{toml}"),
+                Err(e) => {
+                    let key = toml
+                        .lines()
+                        .last()
+                        .and_then(|l| l.split('=').next())
+                        .map(str::trim)
+                        .expect("键名");
+                    assert!(e.to_string().contains(key), "错误信息应点名 {key}:{e}");
+                }
+            }
+        }
     }
 }

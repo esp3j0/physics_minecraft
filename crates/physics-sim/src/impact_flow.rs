@@ -333,7 +333,9 @@ pub fn segment_velocity(
 ///   (最小割的最小源侧)——`supply_q` 与源边容量同一口径,因此
 ///   `C < supply_q` 时必有源边不饱和,S 必非空(F00 曾拿向上取整的 s 与 C 比,
 ///   造出"判断开却 S = ∅"的退化情形,实现不得如此——本句是断言级规格);
-/// - **预筛**:`s < I_min`(注册表全部材料 `min(I, I_c)` 的最小值)不建网络;
+/// - **预筛在 BFS 之前**(§5.7.1 预筛条,F02a 挪回):`s < I_min`(注册表全部
+///   材料 `min(I, I_c)` 的最小值)不建网络,这里的 `s` 只计"本体区内、已装载、
+///   实心"的供给格(逐格查一次,不走 BFS),命中时 `visited = 0`;
 ///   `|J| = 0` 视为无事件。
 pub fn evaluate_impact_flow(
     block_at: &dyn Fn(BlockPos) -> Option<BlockId>,
@@ -353,6 +355,22 @@ pub fn evaluate_impact_flow(
     for &(c, s) in &event.supplies {
         *supplies.entry(c).or_insert(0.0) += s;
     }
+    // **预筛在 BFS 之前**(§5.7.1 预筛条,F02a):`s` 只计"本体区内、已装载、
+    // 实心"的供给格(逐格查一次,不走 BFS)——任何割都比 I_min 大时不建网,
+    // 轻微碰撞的开销只有这几次查格(F01b 曾把预筛放在 BFS 之后,每次轻碰
+    // 都要走一遍至多 `max_cells` 格的 BFS)。命中时 `visited = 0`。
+    let i_min = min_impact(registry);
+    let prefilter_s: f32 = supplies
+        .iter()
+        .filter(|(c, _)| {
+            in_core(**c) && block_at(**c).is_some_and(|b| registry.material(b).is_some())
+        })
+        .map(|(_, &s)| s)
+        .sum();
+    if prefilter_s < i_min {
+        outcome.prefiltered = true;
+        return outcome;
+    }
     // BFS 区域:多源(第一层 = 全部供给格,按 BlockPos 升序),按层、层内升序,
     // 至多 max_cells 个实心格。
     let (region, truncated) = bfs_region(
@@ -371,18 +389,11 @@ pub fn evaluate_impact_flow(
         .filter(|(c, _)| region.contains(c))
         .map(|(c, &s)| (*c, s))
         .collect();
-    // 预筛:s < I_min(全部材料 min(I, I_c) 的最小值)→ 任何割都比供给大,不建网。
-    let i_min = min_impact(registry);
-    let s_total: f32 = in_region_supplies.values().sum();
     outcome.supply_q = in_region_supplies
         .values()
         .map(|&s| quant_supply(s))
         .sum::<u64>()
         .min(INF_CAP);
-    if s_total < i_min {
-        outcome.prefiltered = true;
-        return outcome;
-    }
     let idx: BTreeMap<BlockPos, usize> = region
         .iter()
         .enumerate()
@@ -932,8 +943,11 @@ mod tests {
     }
 
     /// AC-F3 预筛:s < I_min(sand 的 min(I, I_c) = 4)不建网;|J| = 0 无事件。
+    /// 预筛在 BFS 之前(§5.7.1 预筛条,F02a 把 F01b 的顺序挪回):
+    /// 命中时 `visited = 0`。
     ///
-    /// 会变红的实现:预筛阈值取 min(I) 漏 I_c;0 冲量仍建网。
+    /// 会变红的实现:预筛阈值取 min(I) 漏 I_c;0 冲量仍建网;"先 BFS 后预筛"
+    /// (命中时 visited > 0)。
     #[test]
     fn prefilter_and_zero_impulse() {
         let reg = SimpleRegistry::builtin();
@@ -948,9 +962,9 @@ mod tests {
         assert!(out.prefiltered, "s < I_min = 4 不建网");
         assert_eq!(out.cut_q, 0);
         assert!(out.detached.is_empty());
-        // visited = BFS 到达的实心格数(多源 BFS 先于预筛执行;遥测口径是
-        // "访问过的格",预筛只是不建网、不抹掉这次访问的事实)。
-        assert_eq!(out.visited, 2);
+        // 预筛在 BFS 之前:命中时不走 BFS,visited = 0(F01b 曾是"先 BFS 后
+        // 预筛"、visited = 2,F02a 按 §5.7.1 预筛条挪回,见迁移清单)。
+        assert_eq!(out.visited, 0);
         // 恰好 = 4:建网(扛住但 visited > 0)。
         let out = evaluate_impact_flow(
             &world,

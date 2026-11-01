@@ -3369,7 +3369,8 @@ mod unit08 {
         let text = "[cohesion]\nenabled = false\nload_max_cells = 900\ncompound_split_size = 4\n\
                     max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n\
                     load_knockback_factor = 0.5\nload_knockback_max_speed = 8.0\n\
-                    load_knockback_max_ang_speed = 6.0\n";
+                    load_knockback_max_ang_speed = 6.0\nimpact_flow = false\n\
+                    impact_flow_max_cells = 1024\nimpact_flow_max_events_per_tick = 8\n";
         let c = Config::from_toml_str(text).expect("合法");
         assert_eq!(
             c.shard_sim_config(shard()).cohesion,
@@ -3383,6 +3384,9 @@ mod unit08 {
                 load_knockback_factor: 0.5,
                 load_knockback_max_speed: 8.0,
                 load_knockback_max_ang_speed: 6.0,
+                impact_flow: false,
+                impact_flow_max_cells: 1024,
+                impact_flow_max_events_per_tick: 8,
             }
         );
         assert_eq!(Config::from_toml_str(&c.to_toml_string()).expect("往返"), c);
@@ -5024,5 +5028,203 @@ mod unit_f05 {
             );
             s.shutdown();
         }
+    }
+}
+
+/// 单元 F02a:撞击冲量流生产接入(REQ-010 §5.7.1/§5.7.4/§5.7.5;AC-F7)。
+///
+/// 经调度器 tick 驱动的生产路径:`impact_flow = true` 下,
+/// - §5.7.1 表第 8 行:石/土柱立在土上被单格方块侧撞 → 整根从柱脚断下
+///   (石-土或土-土剪切 7 < s),S 按承载粘结切块成形(本单元零初速);
+/// - 同一命令日志双跑逐拍一致(全路径纯函数 + 整数最大流,§5.7.4)。
+mod unit_f02a {
+    use messaging::InputSource;
+    use physics_sim::cohesion::CohesionConfig;
+    use physics_sim::destruction::DestructionConfig;
+    use physics_sim::{ShardSim, ShardSimConfig};
+    use shard::SchedulerConfig;
+    use sim_api::log::CommandLog;
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{
+        BlockId, BlockPos, ChunkPos, DimensionId, EntityDesc, EntityId, EntityState, ShardId,
+        ShardPos, WorldId, WorldSeed,
+    };
+    use voxel::{BlockRegistry, SimpleRegistry, Superflat, WorldGenerator, builtin};
+
+    const DIRT: BlockId = builtin::DIRT;
+    const AIR: BlockId = builtin::AIR;
+
+    fn shard() -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0))
+    }
+
+    fn p(x: i32, y: i32, z: i32) -> BlockPos {
+        BlockPos::new(x, y, z)
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        }
+    }
+
+    fn registry() -> Box<dyn BlockRegistry> {
+        Box::new(SimpleRegistry::builtin())
+    }
+
+    /// `impact_flow = true` 的会话(调度器 tick 驱动):超平坦(土面 = y −60,
+    /// 土层 y −61)。整片 x 2..=6、z 2..=5 装载,柱在 chunk 中部。
+    fn session() -> Session {
+        let mut c = ShardSimConfig::new(shard());
+        c.destruction = DestructionConfig {
+            enabled: true,
+            ..DestructionConfig::default()
+        };
+        c.cohesion = CohesionConfig {
+            enabled: true,
+            impact_flow: true,
+            ..CohesionConfig::default()
+        };
+        let mut sim = ShardSim::new(c, registry());
+        for x in 2..=6 {
+            for z in 2..=5 {
+                let cp = ChunkPos::new(x, z);
+                sim.load_chunk(cp, Superflat::classic().generate(WorldSeed(7), cp));
+            }
+        }
+        let mut s = Session::new(cfg());
+        s.register(sim);
+        s
+    }
+
+    fn set(s: &mut Session, log: &mut CommandLog, cells: &[BlockPos], block: BlockId) {
+        for &c in cells {
+            for entry in s.set_block(shard(), c, block).expect("set_block") {
+                log.append(entry);
+            }
+        }
+    }
+
+    fn block(s: &Session, q: BlockPos) -> BlockId {
+        let cp = q.chunk_of();
+        s.voxel_chunk(shard(), cp).expect("chunk 已装载").get(
+            (q.x - cp.x * 16) as usize,
+            (q.y - types::WORLD_Y_MIN) as usize,
+            (q.z - cp.z * 16) as usize,
+        )
+    }
+
+    /// 单格石方块(EntityDesc::default,无 shape)以 12 m/s 沿 −x 侧撞。
+    fn spawn_projectile(s: &mut Session, log: &mut CommandLog, k: u32, x: f32, y: f32, z: f32) {
+        let entry = s
+            .spawn_owned(
+                shard(),
+                EntityId::from_parts(0, k),
+                EntityState {
+                    translation: Vec3::new(x, y, z),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                EntityDesc::default(),
+                InputSource(7),
+            )
+            .expect("spawn");
+        log.append(entry);
+    }
+
+    /// AC-F7 生产接入(§5.7.1 表第 8 行的调度器驱动版):悬空土墩(bedrock
+    /// 垫 (64,−59,64) + 土格 (64,−58,64),悬在超平坦上方一格,四周空气;
+    /// bedrock 是 Anchor 汇点),单格石方块 12 m/s 侧撞土格 → 土-基岩剪切割
+    /// 7 < s ≈ 9.2 → 土格断下写 air、经调度器 N+1 成形(本单元零初速);
+    /// bedrock 垫保留(汇点侧)。
+    ///
+    /// 会变红的实现:仍走 REQ-009 逐格比较(口径换汤不换药——但成形按逐格
+    /// 脱落请求而非冲量流结构);事件没经 evaluate_impact_flow。
+    #[test]
+    fn acc_f7_pillar_breaks_whole_via_scheduler_ticks() {
+        let mut s = session();
+        let mut log = CommandLog::default();
+        let pier_base = p(64, -59, 64);
+        let pier_dirt = p(64, -58, 64);
+        set(&mut s, &mut log, &[pier_base], builtin::BEDROCK);
+        set(&mut s, &mut log, &[pier_dirt], DIRT);
+        // 撞击者:单格石方块,中心对准土格中心(y = −57.5)、距土面 1.5 m。
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        let mut broke = false;
+        for _ in 0..300 {
+            s.tick();
+            if block(&s, pier_dirt) == AIR {
+                broke = true;
+                break;
+            }
+        }
+        assert!(broke, "侧撞悬空土墩应断下土格(割 7)");
+        assert_eq!(block(&s, pier_base), builtin::BEDROCK, "垫保留(汇点侧)");
+        // N+1 涌现:再跑几拍等生成落地,断下的土格以 1 个单格实体出现。
+        for _ in 0..5 {
+            s.tick();
+        }
+        let mut found = 0usize;
+        for id in 1u32..=16 {
+            let eid = EntityId::from_parts(types::EMERGENT_ORIGIN, id);
+            if s.entity_state(shard(), eid).is_some() {
+                found += 1;
+            }
+        }
+        assert_eq!(found, 1, "断下的土格成形为 1 个实体(格数守恒)");
+        s.shutdown();
+    }
+
+    /// AC-F7(确定性,§5.7.4):同一命令日志双跑逐拍一致——同一串命令在两个
+    /// 会话上重放,撞击断开、实体状态与体素世界逐拍相同。
+    ///
+    /// 会变红的实现:接触对遍历顺序进结果(采样未按 BTreeMap 归序/事件未按
+    /// 排序键选取);浮点最大流(割不唯一)。
+    #[test]
+    fn acc_f7_impact_flow_double_run_identical_tick_by_tick() {
+        let mut runs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        for _ in 0..2 {
+            let mut s = session();
+            let mut log = CommandLog::default();
+            let pillar: Vec<BlockPos> = (-60..=-58).map(|y| p(64, y, 64)).collect();
+            set(&mut s, &mut log, &pillar, DIRT);
+            spawn_projectile(&mut s, &mut log, 1, 67.45, -58.5, 64.5);
+            let mut states: Vec<String> = Vec::new();
+            let mut voxels: Vec<String> = Vec::new();
+            for _ in 0..40 {
+                let summary = s.tick();
+                let mut st: Vec<(EntityId, String)> = s
+                    .entity_states(shard())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(id, e)| {
+                        (
+                            id,
+                            format!(
+                                "{:.3}|{:.3}|{:.3}",
+                                e.translation.x, e.translation.y, e.translation.z
+                            ),
+                        )
+                    })
+                    .collect();
+                st.sort_by_key(|(id, _)| *id);
+                states.push(format!("{}|{:?}", summary.cohesion.impact_flow_breaks, st));
+                voxels.push(
+                    pillar
+                        .iter()
+                        .map(|&c| format!("{:?}", block(&s, c)))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            }
+            runs.push((states, voxels));
+            s.shutdown();
+        }
+        assert_eq!(runs[0], runs[1], "同一命令日志双跑逐拍一致");
     }
 }
