@@ -5146,7 +5146,6 @@ mod unit_f02a {
     /// 会变红的实现:仍走 REQ-009 逐格比较(口径换汤不换药——但成形按逐格
     /// 脱落请求而非冲量流结构);事件没经 evaluate_impact_flow。
     #[test]
-    #[ignore = "F02b-3 勘误 6 停报:牛顿封顶后悬空墩布景扛住(薄壁墩 1 格宽,归格含侧/顶薄片感应的空气格,均摊缩水后实心格供给 < 割),翻转待裁定"]
     fn acc_f7_pillar_breaks_whole_via_scheduler_ticks() {
         let mut s = session();
         let mut log = CommandLog::default();
@@ -5154,8 +5153,10 @@ mod unit_f02a {
         let pier_dirt = p(64, -58, 64);
         set(&mut s, &mut log, &[pier_base], builtin::BEDROCK);
         set(&mut s, &mut log, &[pier_dirt], DIRT);
-        // 撞击者:单格石方块,中心对准土格中心(y = −57.5)、距土面 1.5 m。
-        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        // 撞击者:单格石方块,瞄高 0.3(中心 y = −57.2,勘误 7 改归 + 单格
+        // 供给按格累计后土格独得全部供给 ≈ 封顶后 N ≈ 12.5 > 割 7;F02b-4
+        // 总架构师探针实测第 11 拍断)、距土面 1.5 m。
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.2, 64.5);
         let mut broke = false;
         for _ in 0..300 {
             s.tick();
@@ -5187,7 +5188,6 @@ mod unit_f02a {
     /// 会变红的实现:接触对遍历顺序进结果(采样未按 BTreeMap 归序/事件未按
     /// 排序键选取);浮点最大流(割不唯一);分派失效(什么都不发生也能过)。
     #[test]
-    #[ignore = "F02b-3 勘误 6 停报:牛顿封顶后悬空墩布景扛住(薄壁墩 1 格宽,归格含侧/顶薄片感应的空气格,均摊缩水后实心格供给 < 割),翻转待裁定"]
     fn acc_f7_impact_flow_double_run_identical_tick_by_tick() {
         let mut runs: Vec<(u64, usize, Vec<String>, Vec<String>)> = Vec::new();
         for _ in 0..2 {
@@ -5196,11 +5196,12 @@ mod unit_f02a {
             // 悬空土墩(bedrock 垫 (64,-59,64) + 土格 (64,-58,64),悬在超平坦
             // 上方一格):单格方块 12 m/s 侧撞土格,土-基岩剪切割 7 < s → 断。
             // spawn x = 67.55 与 acc_f7_pillar 同款(tick 相位对齐 0.1 穿透,
-            // 否则首触微脉冲弹开、不断)。
+            // 否则首触微脉冲弹开、不断);y = −57.2 瞄高 0.3(勘误 7 改归 +
+            // 单格供给按格累计后土格独得供给,F02b-4 探针实测第 11 拍断)。
             let pier: Vec<BlockPos> = vec![p(64, -59, 64), p(64, -58, 64)];
             set(&mut s, &mut log, &[pier[0]], builtin::BEDROCK);
             set(&mut s, &mut log, &[pier[1]], DIRT);
-            spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+            spawn_projectile(&mut s, &mut log, 1, 67.55, -57.2, 64.5);
             let mut states: Vec<String> = Vec::new();
             let mut voxels: Vec<String> = Vec::new();
             let mut breaks = 0u64;
@@ -5257,7 +5258,6 @@ mod unit_f02a {
     /// 会变红的实现:冲量表/速度没一路带到生成点(DetachRequest.impulse
     /// 在调度器或消费臂被丢弃/再归零);修正未计 corrections。
     #[test]
-    #[ignore = "F02b-3 勘误 6 停报:牛顿封顶后悬空墩布景扛住(薄壁墩 1 格宽,归格含侧/顶薄片感应的空气格,均摊缩水后实心格供给 < 割),翻转待裁定"]
     fn acc_f6_detached_cell_spawns_with_velocity() {
         let mut s = session();
         let mut log = CommandLog::default();
@@ -5265,7 +5265,8 @@ mod unit_f02a {
         let pier_dirt = p(64, -58, 64);
         set(&mut s, &mut log, &[pier_base], builtin::BEDROCK);
         set(&mut s, &mut log, &[pier_dirt], DIRT);
-        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        // y = −57.2 瞄高 0.3(同 acc_f7_pillar,F02b-4 探针实测)。
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.2, 64.5);
         let mut corrections = 0u64;
         let mut broke = false;
         for _ in 0..300 {
@@ -5315,7 +5316,6 @@ mod unit_f02a {
     /// 会变红的实现:调度器盖章丢 velocity(零速复合体);消费臂忽略
     /// velocity;§5.6 邻接继承仍在跑(失载段重复计账)。
     #[test]
-    #[ignore = "F02b-3 勘误 6 停报:牛顿封顶后悬空墩布景扛住(薄壁墩 1 格宽,归格含侧/顶薄片感应的空气格,均摊缩水后实心格供给 < 割),翻转待裁定"]
     fn acc_f6_compound_segment_velocity_full_chain() {
         let mut s = session();
         let mut log = CommandLog::default();
@@ -5339,36 +5339,43 @@ mod unit_f02a {
         for (c, b) in &layout {
             set(&mut s, &mut log, &[*c], *b);
         }
-        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        // y = −57.2 瞄高 0.3(同 acc_f7_pillar,F02b-4 探针实测)。
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.2, 64.5);
         // 等 S 断开 + N+1 生成 + 实体出现。
+        // 等 S 断开 + N+1 生成:逐拍查**复合体实体一出现**就读速度(它带
+        // 守恒分配的初速落地,多跑拍会被落地摩擦/凝固耗散到 0;F02b-4 瞄高
+        // 后断开提前到 ~11 拍,40 拍整除会让读数落在落地之后)。
+        let mut compound_vel: Option<types::glam::Vec3> = None;
         for _ in 0..40 {
             s.tick();
+            for id in 1u32..=16 {
+                let eid = EntityId::from_parts(types::EMERGENT_ORIGIN, id);
+                let Some(desc) = s.entity_desc(shard(), eid) else {
+                    continue;
+                };
+                let cells = desc.shape.map(|sh| sh.cells().len()).unwrap_or(0);
+                if cells == 2 {
+                    compound_vel = Some(
+                        s.entity_state(shard(), eid)
+                            .expect("描述在场状态在场")
+                            .linvel,
+                    );
+                    break;
+                }
+            }
+            if compound_vel.is_some() {
+                break;
+            }
         }
         // 涌现实体:侧挂 2 格复合体(带 velocity)与 1 格单格段——按质量
         // 区分(复合体 2 × 0.729 kg,单格 0.729 kg),**复合体实体**的速度
         // 必须非零(它只走 velocity 字段,不走 DetachRequest.impulse)。
-        let mut compound_vel: Option<types::glam::Vec3> = None;
-        let mut single_vel: Option<types::glam::Vec3> = None;
-        for id in 1u32..=16 {
-            let eid = EntityId::from_parts(types::EMERGENT_ORIGIN, id);
-            let Some(desc) = s.entity_desc(shard(), eid) else {
-                continue;
-            };
-            let st = s.entity_state(shard(), eid).expect("描述在场状态在场");
-            let cells = desc.shape.map(|sh| sh.cells().len()).unwrap_or(0);
-            if cells == 2 {
-                compound_vel = Some(st.linvel);
-            } else if cells == 0 {
-                single_vel = Some(st.linvel);
-            }
-        }
         let cv = compound_vel.expect("侧挂 2 格应成形为复合体实体(质量 1.458 kg)");
         assert!(
             cv.length() > 0.05,
             "AC-F6:复合体段带守恒分配的初速度(velocity 全链路:调度器盖章 \
              → SpawnCompound → 消费臂),实际 {cv:?}"
         );
-        let _ = single_vel;
         s.shutdown();
     }
 }

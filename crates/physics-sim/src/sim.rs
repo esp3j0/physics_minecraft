@@ -424,11 +424,13 @@ pub struct ShardSim {
 /// `total` = 各点冲量和(J_T);`vec` = J 矢量 = Σ j·d;`cells` = 被撞格 →
 /// (格上冲量和, 冲量加权地形侧位置和)——先采完本拍全部事件、后逐个写入,
 /// 事件里只有格坐标/冲量/点,没有句柄(F03 教训:写入重建地形 collider
-/// 后接触对句柄失效)。
+/// 后接触对句柄失效)。`is_compound` = 复合体(§7.3 第 7 条均摊)或单格
+/// (§5.7.1"该格各点冲量之和";单格也可同时压到几个地形格,勘误 F02b-4)。
 struct ImpactFlowSample {
     total: f32,
     vec: Vec3,
     cells: BTreeMap<BlockPos, (f32, Vec3)>,
+    is_compound: bool,
 }
 
 impl ShardSim {
@@ -3076,23 +3078,125 @@ impl ShardSim {
                     let q = p + dir * crate::destruction::IMPACT_SAMPLE_DEPTH;
                     let cell =
                         BlockPos::new(q.x.floor() as i32, q.y.floor() as i32, q.z.floor() as i32);
-                    // 只看本体区内的格(范围 2;副本格由其 owner 采样)。
+                    // 勘误 7(§5.7.9,F02b-4;只作用冲量流路径):退后所在格
+                    // c₀ 无材料、且 q 到某轴格界 < 0.05 m 时,把界另一侧列为
+                    // 候选——取各轴组合(去掉 c₀)中的**实心格**,该点冲量在
+                    // 它们之间均分(BlockPos 升序,确定性),作用点位置不变。
+                    // 齐平侧撞的流形角点(如 z = 65.0)floor 后掉进空气格丢
+                    // 供给;0.05 远小于薄片厚 0.15 与格宽,真实接触点不会落
+                    // 界外 0.05 以上。一个实心格都没有时仍归 c₀(照旧丢弃,
+                    // 采样的格子集合再查材料,与 F01 的前提一致)。
+                    // `impact_flow = false` 路径不动(REQ-009 §5 逐位不变,
+                    // 其冒烟场景已按"错半格瞄准"调参)。
+                    let mut assigned: Vec<(types::BlockPos, f32)> = vec![(cell, 1.0)];
+                    if flow_enabled
+                        && self
+                            .registry
+                            .material(self.voxels.get_block(cell))
+                            .is_none()
+                    {
+                        // 每轴的"界另一侧"偏移:小数部分用 `rem_euclid(1.0)`
+                        // (q − floor(q),恒 ∈ [0,1))——`fract()` 截断取小数,
+                        // 负坐标返回负值(e2e 世界 y < 0 时 (−57.4).fract() =
+                        // −0.4 < 0.05 被误判"贴下界")。小数 < 0.05 时另一侧在
+                        // −1(靠上界 > 0.95 时 +1);c₀ = floor(q),恰在界上时
+                        // 小数 = 0,q 属于格 [n, n+1) 的下界,另一侧 = [n−1, n)。
+                        let qc = [q.x, q.y, q.z];
+                        let offs = [
+                            qc[0].rem_euclid(1.0),
+                            qc[1].rem_euclid(1.0),
+                            qc[2].rem_euclid(1.0),
+                        ];
+                        let axes: [Option<i32>; 3] = [
+                            if offs[0] < 0.05 {
+                                Some(-1)
+                            } else if offs[0] > 1.0 - 0.05 {
+                                Some(1)
+                            } else {
+                                None
+                            },
+                            if offs[1] < 0.05 {
+                                Some(-1)
+                            } else if offs[1] > 1.0 - 0.05 {
+                                Some(1)
+                            } else {
+                                None
+                            },
+                            if offs[2] < 0.05 {
+                                Some(-1)
+                            } else if offs[2] > 1.0 - 0.05 {
+                                Some(1)
+                            } else {
+                                None
+                            },
+                        ];
+                        if axes.iter().any(|a| a.is_some()) {
+                            let mut candidates: Vec<types::BlockPos> = Vec::new();
+                            for dx in [0, 1] {
+                                for dy in [0, 1] {
+                                    for dz in [0, 1] {
+                                        let cand = BlockPos::new(
+                                            cell.x + dx * axes[0].unwrap_or(0),
+                                            cell.y + dy * axes[1].unwrap_or(0),
+                                            cell.z + dz * axes[2].unwrap_or(0),
+                                        );
+                                        if cand == cell {
+                                            continue;
+                                        }
+                                        if self
+                                            .registry
+                                            .material(self.voxels.get_block(cand))
+                                            .is_some()
+                                        {
+                                            candidates.push(cand);
+                                        }
+                                    }
+                                }
+                            }
+                            candidates.sort();
+                            candidates.dedup();
+                            if !candidates.is_empty() {
+                                let share = 1.0 / candidates.len() as f32;
+                                assigned = candidates.into_iter().map(|c| (c, share)).collect();
+                            }
+                        }
+                    }
+                    // 只看本体区内的格(范围 2;副本格由其 owner 采样)。改归的
+                    // 候选与 c₀ 同面相邻,本体区判定按 c₀ 已过,实心候选按各自
+                    // 坐标再查(见下)。
                     if cell.x < min.x || cell.x >= max_x || cell.z < min.z || cell.z >= max_z {
                         continue;
                     }
                     // 冲量流分派(F02a):按实体累计事件(单格 = 该格各点冲量之
-                    // 和;复合体成形时均摊);旧路径不跑,判废用。
+                    // 和;复合体成形时均摊);旧路径不跑,判废用。s_c 与 p_k 用
+                    // 同一归格结果(勘误 7)。
                     if flow_enabled {
                         let e = flow_samples.entry(id).or_insert(ImpactFlowSample {
                             total: 0.0,
                             vec: Vec3::ZERO,
                             cells: BTreeMap::new(),
+                            is_compound,
                         });
+                        // total/vec = 该接触点的全量冲量与方向矢量(与改归无关,
+                        // 每点只计一次);cells 的逐格冲量/加权位置按 share 分摊
+                        // (Σ share = 1),p = Σ(格, 冲量×share, 位置×冲量×share) /
+                        // total 与单格口径一致。
                         e.total += pt.data.impulse;
                         e.vec += dir * pt.data.impulse;
-                        let c = e.cells.entry(cell).or_insert((0.0, Vec3::ZERO));
-                        c.0 += pt.data.impulse;
-                        c.1 += p * pt.data.impulse;
+                        for (acell, share) in &assigned {
+                            // 改归候选也要在本体区内(与 c₀ 同格面,通常已过;
+                            // 界上撞击时防御)。
+                            if acell.x < min.x
+                                || acell.x >= max_x
+                                || acell.z < min.z
+                                || acell.z >= max_z
+                            {
+                                continue;
+                            }
+                            let c = e.cells.entry(*acell).or_insert((0.0, Vec3::ZERO));
+                            c.0 += pt.data.impulse * share;
+                            c.1 += p * (pt.data.impulse * share);
+                        }
                         continue;
                     }
                     if is_compound {
@@ -3231,7 +3335,8 @@ impl ShardSim {
     /// REQ-009 §5 的逐格比较。
     ///
     /// - **事件成形**(§5.7.1):每实体一个 [`ImpactEvent`]——单格实体
-    ///   `s_c` = 该格各点冲量之和;复合体均摊 `J_T/|T|`(§7.3 第 7 条);
+    ///   `s_c` = 该格各点冲量之和(单格也可同时压多格,勘误 F02b-4);
+    ///   复合体均摊 `J_T/|T|`(§7.3 第 7 条);
     ///   `J` = Σ j·d、`p` = 地形侧接触点按冲量加权的质心。
     /// - **顺序**(§5.7.4):先按 `s` 降序、同值 `EntityId` 升序取前
     ///   `impact_flow_max_events_per_tick` 个(其余本拍丢弃、不推迟),再按
@@ -3266,7 +3371,8 @@ impl ShardSim {
             return;
         }
         // 事件成形(§5.7.1):复合体均摊 J_T/|T|,单格 = 该格冲量和。
-        // 空事件(|J| = 0、无格)丢弃;`s` = 各格 s_c 之和(浮点,排序用)。
+        // 空事件(|J| = 0、无格)丢弃;`s` = 各格 s_c 之和(浮点,排序用;
+        // 单格口径下就是 total,复合体均摊不改变总和)。
         // `contact_points`(F02b,§5.7.2):采样逐格聚合的 `(格, 冲量加权位置/
         // 该格冲量, 该格冲量)`——归格在采样时按 §5.7.1 完成(地形侧退 0.1 m),
         // 纯函数不再对坐标取整。
@@ -3283,11 +3389,16 @@ impl ShardSim {
                 if s.cells.is_empty() || s.total <= 0.0 {
                     return None;
                 }
-                // 均摊(§7.3 第 7 条):复合体每格 s_c = J_T/|T|;单格天然
-                // |T| = 1,同一公式。
-                let per = s.total / s.cells.len() as f32;
-                let supplies: Vec<(types::BlockPos, f32)> =
-                    s.cells.iter().map(|(&c, _)| (c, per)).collect();
+                // 供给(§5.7.1):复合体均摊每格 s_c = J_T/|T|(§7.3 第 7 条;
+                // 超静定分配无物理意义);单格 = 该格各点冲量之和(cells 采样
+                // 已累计)——单格也可同时压到几个地形格(勘误 B,F02b-4:均摊
+                // 会把重压格的冲量摊给轻压格,违反逐格口径)。
+                let supplies: Vec<(types::BlockPos, f32)> = if s.is_compound {
+                    let per = s.total / s.cells.len() as f32;
+                    s.cells.iter().map(|(&c, _)| (c, per)).collect()
+                } else {
+                    s.cells.iter().map(|(&c, (j, _))| (c, *j)).collect()
+                };
                 // 作用点 p:被撞格上冲量加权的位置(均摊后每格权重 = s_c =
                 // J_T/|T| 相同,p = 各格加权位置和 / J_T;直接用采样的加权
                 // 累计量,避免浮点重排)。
@@ -12640,6 +12751,400 @@ mod tests {
         );
     }
 
+    /// AC-F5(勘误 7 格界归格,§5.7.9 第 7 条,F02b-4):齐平侧撞 1 格宽
+    /// 土墩(bedrock 垫 + 1 格土,单格 half 0.5 石块 12 m/s 打土格面)——
+    /// 流形角点恰落在 z 格界上,`floor` 会把它们归进空气格丢供给;勘误 7
+    /// 改归后**全部供给落在实心格**(没有空气格),合计 = 封顶后 |J|
+    /// (逐格 share 求和守恒)。宽墙对照(接触点都落在实心格内部,不触发
+    /// 改归)与改前逐位一致。
+    ///
+    /// 变红:去掉改归(角点掉进空气格,实心格供给 < 合计)。
+    #[test]
+    fn impact_flow_errata7_grid_boundary_reassign() {
+        // ---- 布景 1:齐平侧撞 1 格宽土墩 ----
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 8), voxel::builtin::DIRT);
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.55, 4.6, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.5,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        for _ in 0..25 {
+            s.step();
+            let out = s.take_outbox();
+            if !s.impact_flow_trace.is_empty() {
+                let _ = out;
+                break;
+            }
+        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("齐平侧撞应有断开事件(勘误 7 改归后供给 ≥ 割)");
+        // 供给全部落在实心格(土格或垫;事件已把土格写成 air,查出生集合)。
+        for (c, _) in &t.event.supplies {
+            assert!(
+                *c == BlockPos::new(10, 4, 8) || *c == BlockPos::new(10, 3, 8),
+                "勘误 7:供给格 {c:?} 必须是实心格(角点不再掉进空气格)"
+            );
+        }
+        // 逐格 share 求和守恒:合计 = 封顶后 |J|(量化舍入内)。
+        let sum: f32 = t.event.supplies.iter().map(|(_, s)| *s).sum();
+        assert!(
+            ((sum - t.event.impulse.length()) / t.event.impulse.length()).abs() < 0.01,
+            "勘误 7:供给合计 = 封顶后 |J|:sum = {sum} |J| = {}",
+            t.event.impulse.length()
+        );
+        // 断开成立(封顶后 N ≈ 12.5 > 割 7,改归前角点份额丢失则扛住)。
+        assert!(t.cut_q < (t.supply * t.quant).floor() as u64, "应断开");
+        // ---- 布景 2:宽墙(接触点落在实心格内部,不触发改归,逐位不变)----
+        // 6 格石条 15 m/s 打 7 宽 1 格厚土墙的墙面中部(F02b-3 封顶测试的
+        // 墙面工况,断开且 κ = 1);条对墙是单一正面薄片,接触点在墙面内部
+        // (z 5.05..10.95 的格心行),远离格界 → 勘误 7 不触发。
+        let mut w = flow_sim_zero_g();
+        w.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        for z in 5..=11 {
+            let _ = w
+                .voxels
+                .set_block(BlockPos::new(10, 1, z), voxel::builtin::BEDROCK);
+            for y in 2..=4 {
+                let _ = w
+                    .voxels
+                    .set_block(BlockPos::new(10, y, z), voxel::builtin::DIRT);
+            }
+        }
+        refresh_collider(&mut w);
+        let wall_bar = types::CompoundShape::new(
+            (0..6)
+                .map(|i| types::ShapeCell {
+                    offset: [i, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格(伸向 +x,首格在前)");
+        let wid = entity(2);
+        w.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: wid,
+                state: EntityState {
+                    translation: Vec3::new(4.5, 3.5, 8.5),
+                    linvel: Vec3::new(15.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, wall_bar),
+            }),
+        }]);
+        for _ in 0..25 {
+            w.step();
+            let out = w.take_outbox();
+            if !w.impact_flow_trace.is_empty() {
+                let _ = out;
+                break;
+            }
+        }
+        let tw = w.impact_flow_trace.first().expect("宽墙工况应有事件");
+        // 宽墙的供给格同样全实心、合计 = |J|(改归路径未触发,与改前一致)。
+        for (c, _) in &tw.event.supplies {
+            assert!(
+                (c.y == 2 || c.y == 3 || c.y == 4) && c.x == 10 && (5..=11).contains(&c.z),
+                "宽墙:供给格 {c:?} 必须是墙/垫实心格"
+            );
+        }
+        let sum_w: f32 = tw.event.supplies.iter().map(|(_, s)| *s).sum();
+        assert!(
+            ((sum_w - tw.event.impulse.length()) / tw.event.impulse.length()).abs() < 0.01,
+            "宽墙:供给合计 = |J|:sum = {sum_w} |J| = {}",
+            tw.event.impulse.length()
+        );
+    }
+
+    /// AC-F5(勘误 7 负坐标判界,§5.7.9 第 7 条,F02b-4 裁定缺陷 A):同
+    /// [`impact_flow_errata7_grid_boundary_reassign`] 的齐平侧撞,墩放到
+    /// **负 y**(bedrock 垫 (10,−4,8) + 土格 (10,−3,8),撞击者中心 y = −2.4
+    /// 对准土格上部)——接触点的 y 小数部分落在格中部,到格界 0.1 m 以上,
+    /// 勘误 7 的 y 轴不该参与;但截断取小数的 `fract()` 在负坐标上给负值
+    /// (如 `fract(−2.9) = −0.9 < 0.05`),把 y 轴恒判"贴下界",正下方的
+    /// bedrock 垫被误列为候选、分走供给。改 `rem_euclid(1.0)` 后供给**只落
+    /// 土格**,合计 = 封顶后 |J|,断开成立。
+    ///
+    /// 变红:改回 `fract()`(z = 9.0 角点触发改归时,y 轴误列 bedrock,
+    /// 供给落到 y = −4 的格)。
+    #[test]
+    fn impact_flow_errata7_negative_coord_boundary() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, -4, 8), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, -3, 8), voxel::builtin::DIRT);
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.55, -2.4, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.5,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        for _ in 0..25 {
+            s.step();
+            let out = s.take_outbox();
+            if !s.impact_flow_trace.is_empty() {
+                let _ = out;
+                break;
+            }
+        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("齐平侧撞应有断开事件(供给 ≥ 割 7)");
+        // 供给全部落在被撞的土格——**没有正下方 y = −4 的 bedrock**
+        // (负坐标判界缺陷会把垫误列候选)、没有 z = 9 侧的空气格。
+        for (c, _) in &t.event.supplies {
+            assert_eq!(
+                *c,
+                BlockPos::new(10, -3, 8),
+                "勘误 7 负坐标:供给格 {c:?} 必须恰是土格(下方垫/侧方空气都不是候选)"
+            );
+        }
+        assert_eq!(
+            t.event.supplies.len(),
+            1,
+            "布景自检:唯一实心候选 = 土格 1 格"
+        );
+        // 合计 = 封顶后 |J|(单候选 share = 1,量化舍入内)。
+        let sum: f32 = t.event.supplies.iter().map(|(_, s)| *s).sum();
+        assert!(
+            ((sum - t.event.impulse.length()) / t.event.impulse.length()).abs() < 0.01,
+            "供给合计 = 封顶后 |J|:sum = {sum} |J| = {}",
+            t.event.impulse.length()
+        );
+        // 断开成立(封顶后 N ≈ 12.5 > 土-垫剪切割 7)。
+        assert!(t.cut_q < (t.supply * t.quant).floor() as u64, "应断开");
+    }
+
+    /// AC-F5(§5.7.1 单格供给口径,F02b-4 裁定缺陷 B):单格撞击者**同时压
+    /// 两格**——1 格宽 2 格长的沙台(bedrock 垫 (10,3,8)/(10,3,9) + 沙格
+    /// (10,4,8)/(10,4,9);沙-沙粘结 0,两格互不连通),单格石块 18 m/s 打
+    /// 接缝 z = 9 偏一侧(接触面 z ∈ [8.75,9.75],跨两格)。§5.7.1"单格
+    /// 实体 = 该格各点法向冲量之和" → 每格 `s_c` = 该格各接触点冲量之和
+    /// (逐点对拍);均摊(F02a 缺陷,9e8e829 起)给每格 J_T/2。
+    ///
+    /// 变红:单格也均摊(两格 `s_c` 各 = J_T/2,比值 = 1)。
+    #[test]
+    fn impact_flow_single_cell_impactor_supply_per_cell() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 9), voxel::builtin::BEDROCK);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 8), voxel::builtin::SAND);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 4, 9), voxel::builtin::SAND);
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.45, 4.5, 9.25),
+                    linvel: Vec3::new(-18.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.5,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        for _ in 0..25 {
+            s.step();
+            let out = s.take_outbox();
+            if !s.impact_flow_trace.is_empty() {
+                let _ = out;
+                break;
+            }
+        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("打沙台应有断开事件(割 = 两格沙-垫剪切 4×2 = 8 < 供给)");
+        // 布景自检:两格都进了供给(单格撞击者同时压两格),S = 两格整块。
+        let mut cells: Vec<(types::BlockPos, f32)> = t.event.supplies.clone();
+        cells.sort_by_key(|(c, _)| *c);
+        assert_eq!(cells.len(), 2, "布景自检:两格沙都进供给,实际 {cells:?}");
+        assert_eq!(
+            cells[0].0,
+            BlockPos::new(10, 4, 8),
+            "供给格 1 = 接缝一侧的沙格"
+        );
+        assert_eq!(cells[1].0, BlockPos::new(10, 4, 9), "供给格 2 = 另一侧");
+        // 条文对拍(§5.7.1"单格实体 = 该格各点法向冲量之和"):逐点读
+        // solver 流形冲量,按生产同款归格(退 0.1 m、floor)按格归并,断言
+        // 每格 `s_c` = 该格归并值。均摊变异(单格也 `J_T/|T|`)给每格
+        // total/2(实测比值 1.0,逐点归并为 ≈0.94),差 ≈3% ≫ 量化误差,必红。
+        // (接触面积信息不进 rapier 的点约束:齐平接触 4 角点 dist 相同,
+        // 求解器冲量近似均分;悬殊比只在"不同法向的两簇"布景出现,单测
+        // 不追——条文对拍已把口径钉死。)
+        let mut per_cell: BTreeMap<types::BlockPos, f32> = BTreeMap::new();
+        {
+            // 事件拍已把 S 写 air,材料查询用**出生集合**(布景里实心格的
+            // 固定列表),不查当前体素世界。
+            let born: std::collections::BTreeSet<types::BlockPos> = [
+                types::BlockPos::new(10, 3, 8),
+                types::BlockPos::new(10, 3, 9),
+                types::BlockPos::new(10, 4, 8),
+                types::BlockPos::new(10, 4, 9),
+            ]
+            .into_iter()
+            .collect();
+            let ic = s.entities.get(&id).map(|r| r.collider).unwrap();
+            for pair in s.phys.narrow_phase.contact_pairs_with(ic) {
+                for m in pair.solver_manifolds() {
+                    // 归格用世界系点;诊断读数里 local_p1 恰为世界系(地形
+                    // chunk 刚体恒单位位姿、簇点已折算),与生产采样同基准。
+                    // 改归按生产同款(勘误 7):c₀ 无材料(出生集合口径)、
+                    // 到格界 < 0.05 的轴把界另一侧实心格列为候选,冲量均分。
+                    let n = m.data.normal;
+                    for pt in &m.points {
+                        if pt.data.impulse <= 0.0 {
+                            continue;
+                        }
+                        let q = Vec3::new(pt.local_p1.x, pt.local_p1.y, pt.local_p1.z)
+                            + n * -crate::destruction::IMPACT_SAMPLE_DEPTH;
+                        let cell = types::BlockPos::new(
+                            q.x.floor() as i32,
+                            q.y.floor() as i32,
+                            q.z.floor() as i32,
+                        );
+                        let mut assigned: Vec<types::BlockPos> = vec![cell];
+                        if !born.contains(&cell) {
+                            let qc = [q.x, q.y, q.z];
+                            let offs = [
+                                qc[0].rem_euclid(1.0),
+                                qc[1].rem_euclid(1.0),
+                                qc[2].rem_euclid(1.0),
+                            ];
+                            let axes: [Option<i32>; 3] = [
+                                if offs[0] < 0.05 {
+                                    Some(-1)
+                                } else if offs[0] > 0.95 {
+                                    Some(1)
+                                } else {
+                                    None
+                                },
+                                if offs[1] < 0.05 {
+                                    Some(-1)
+                                } else if offs[1] > 0.95 {
+                                    Some(1)
+                                } else {
+                                    None
+                                },
+                                if offs[2] < 0.05 {
+                                    Some(-1)
+                                } else if offs[2] > 0.95 {
+                                    Some(1)
+                                } else {
+                                    None
+                                },
+                            ];
+                            if axes.iter().any(|a| a.is_some()) {
+                                let mut cands: Vec<types::BlockPos> = Vec::new();
+                                for dx in [0, 1] {
+                                    for dy in [0, 1] {
+                                        for dz in [0, 1] {
+                                            let cand = types::BlockPos::new(
+                                                cell.x + dx * axes[0].unwrap_or(0),
+                                                cell.y + dy * axes[1].unwrap_or(0),
+                                                cell.z + dz * axes[2].unwrap_or(0),
+                                            );
+                                            if cand != cell && born.contains(&cand) {
+                                                cands.push(cand);
+                                            }
+                                        }
+                                    }
+                                }
+                                cands.sort();
+                                cands.dedup();
+                                if !cands.is_empty() {
+                                    assigned = cands;
+                                }
+                            }
+                        }
+                        let share = 1.0 / assigned.len() as f32;
+                        for c in assigned {
+                            *per_cell.entry(c).or_insert(0.0) += pt.data.impulse * share;
+                        }
+                    }
+                }
+            }
+        }
+        for (c, s_c) in &t.event.supplies {
+            let want = per_cell.get(c).copied().unwrap_or(0.0);
+            assert!(
+                (s_c - want).abs() <= 1e-3 * want.max(1.0) + 1e-4,
+                "单格 s_c = 该格各点冲量之和(§5.7.1):格 {c:?} got {s_c} want {want}(逐点归并 {per_cell:?})"
+            );
+        }
+        // 合计 = 封顶后 |J|(封顶后 supplies 乘 κ,守恒)。
+        let sum: f32 = t.event.supplies.iter().map(|(_, v)| *v).sum();
+        assert!(
+            ((sum - t.event.impulse.length()) / t.event.impulse.length()).abs() < 0.01,
+            "供给合计 = 封顶后 |J|:sum = {sum} |J| = {}",
+            t.event.impulse.length()
+        );
+        // 断开成立(割 = 两格各沙-垫剪切 4,并联 8 < 供给)。
+        assert!(t.cut_q < (t.supply * t.quant).floor() as u64, "应断开");
+    }
+
     /// AC-F8(§5.6 退役,D12):**悬臂-支柱布景**(参照
     /// `smoke/scenarios/req010-cantilever.toml` 的 12 格悬臂,平移到本 sim
     /// 坐标系)——石墙 + 从墙伸出的悬臂 + 末端支柱;投射物撞断支柱,悬臂
@@ -13097,9 +13602,10 @@ mod tests {
     }
 
     /// AC-F4(偏心不对称分量的 Δω 与 rapier 参照一致):
-    /// S 的最大分量 = **真 L 形**(2×3 悬空土墙去掉一角,5 格)——惯性积
-    /// 非零(AC-F4"至少含一个不对称分量"的正确布景;F02b-2 用 2×3 矩形
-    /// 被总架构师退回:惯性积为零,不对称性只来自接触点偏置,不来自形状)。
+    /// S 的最大分量 = **真 L 形**(3 格 [(10,4,8),(10,5,8),(10,5,9)])——
+    /// 惯性积非零(AC-F4"至少含一个不对称分量"的正确布景;F02b-2 用 2×3
+    /// 矩形被总架构师退回:惯性积为零,不对称性只来自接触点偏置,不来自
+    /// 形状)。
     /// 追踪里的 `P_k`、`p_k` 与零重力参照 sim 里"同形状刚体放在同位姿、
     /// 在 p_k 处施加 P_k"的 Δv/Δω 闭式一致(rapier 按碰撞体质量属性一次
     /// 算对)。共线 Δω ≈ 0 由
@@ -13163,7 +13669,7 @@ mod tests {
         let trace = &s.impact_flow_trace;
         assert!(!trace.is_empty(), "应有断开事件(布景自检)");
         let t = &trace[0];
-        // S = L 形 5 格(1 分量);L 形 → 惯性积 ≠ 0(真不对称,AC-F4 布景
+        // S = L 形 3 格(1 分量);L 形 → 惯性积 ≠ 0(真不对称,AC-F4 布景
         // 要求;2×3 矩形惯性积全零,被 F02b-3 验收退回)。
         let k = t
             .momenta
@@ -13312,7 +13818,7 @@ mod tests {
         assert_eq!(k.cells.len(), 2, "布景自检:分量 = 梁 2 格整块");
         // 共线:p_k 在质心线上 → Δω ≈ 0(力臂为零)。实测离轴 ~0.015 m
         // (内缩薄片接触点加权位置的浮点偏置),|P| ≈ 1.5 → 残余力矩 ~0.02,
-        // Δω ≈ 0.04 rad/s;容差 0.15 = 4× 实测(伪力臂变异会给出 >1)。
+        // Δω ≈ 0.053 rad/s(F02b-4 缺陷 B 后重测;容差 0.15 ≈ 3× 实测,伪力臂变异给出 >1)。
         assert!(
             k.delta_w.length() < 0.15,
             "共线工况 Δω ≈ 0(伪力臂变异会 >1):实际 {:?}",
@@ -13326,70 +13832,66 @@ mod tests {
         );
     }
 
-    /// AC-F5(轻撞大,定量):轻投射物(单格 0.729 kg)以 12 m/s 撞悬空
-    /// 大块(6 格复合体当"地形")——撞击者修正后沿 d̂ 的速度 ≈ 0
-    /// (m_eff/(m_eff+M_S) → 小;修正只把多扣的还回去,共同速度 w 被大
-    /// M_S 摊薄)。走 step() 读追踪断言。
+    /// AC-F5(轻撞大,定量;F02b-4 裁定布景+断言口径):零重力下 4×4 土板
+    /// (16 格,M_S ≈ 11.7 kg)只靠一条棱上的一格与基岩锚以**一根剪切键**
+    /// (7)相连,单格石块(m = 1)12 m/s 正撞板中心格——断一根键带走
+    /// **整块板**(最小割 = 锚键 7,断下质量由拓扑决定)。断言三条(AC-F5
+    /// 改口径,F02b-4 裁定:rapier 解算后的速度含穿透恢复的回弹残量,F00
+    /// 实测 15 m/s 时 7.23 vs w = 8.23,不直接断言"≈ w"):
+    /// ① `w < 0.1·u`(大 M_S 摊薄共同速度);
+    /// ② 修正后 p 处沿 d̂ 速度的**绝对值** < 0.1·u(轻物撞大块后法向速度
+    /// ≈ 0;取绝对值——回弹残量与板速反向,残量本身 < 0.1·u);
+    /// ③ 修正前后沿 d̂ 速度之差 = `|修正|/m_eff`(修正的物理定义,m_eff 由
+    /// 修正闭式反解;残量不进此项——它同时加在修正前后读数上,相减消去)。
+    /// 布景自检:S = 全部板格 1 分量、M_S ≥ 10·m。
     ///
-    /// **停报(F02b-3,2026-11-01)**:验收要求的 `w < 0.1·u` 在"轻物撞
-    /// 地形"布景物理不可达——w = |E|/(m_eff+M_S),M_S 是断下段质量;轻物
-    /// (0.729 kg)的 J 只能断 1-2 键的小段(割 ≤ 12),M_S ≤ 1.5 kg →
-    /// w ≥ m_l·u/(m_l+M_S) ≈ 1.8(实测 12 m/s 布景 w = 1.806);要 w < 1.2
-    /// 需 M_S > 6.5 格,而断下 6.5 格段的割 ≥ 3 键 = 21 > 轻物 J。质量比
-    /// 决定下限,与容差无关。`#[ignore]` 留档待总架构师裁定(换布景口径 /
-    /// 放宽阈值 / 拆分),断言保留验收要求口径(0.1·u)。
+    /// 实测(F02b-4 停报三,现口径复核):w = 0.44 < 1.2;修正后 v = +0.16
+    /// (rapier 穿透恢复弹回 +0.60,修正 −0.44);速度差 = |修正|/m_eff。
     ///
-    /// 变红:修正误用 J 全额(轻物仍被推走)。
+    /// 变红:修正误用 J 全额(轻物仍被推走,② 超 0.1·u);断下质量受割
+    /// 限制的错误实现(② 残量变大);m_eff 反解口径错(③ 出界)。
     #[test]
-    #[ignore = "停报:w < 0.1·u 与轻物撞地形的质量比物理上限冲突(实测 1.806),待裁定"]
     fn impact_flow_trace_light_hits_heavy_correction_near_zero() {
         let mut s = flow_sim_zero_g();
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
-        // "大块" = 6 格石条复合体静置悬空(零重力不掉);垫床?不需要,
-        // 零重力静置。撞击者 = 单格石方块 12 m/s 沿 −x 打条首格端面。
-        let bar = types::CompoundShape::new(
-            (0..6)
-                .map(|i| types::ShapeCell {
-                    offset: [i - 5, 0, 0],
+        // 4×4 土板悬空(x 9..12 × z 7..10,y=5);锚键 = 板格 (9,5,7) 正下方
+        // 一格 bedrock(8,4,7)——板格 (9,5,7) 与 bedrock (8,4,7) 是**对角**
+        // 相邻,不构成粘结。改用:bedrock 垫一格 (9,4,7)(在板格 (9,5,7)
+        // 正下方),剪切键 = dirt-bedrock 7,整板只此一条锚键(板内其余格
+        // 悬空;周围空气,BFS 不外溢)。
+        for x in 9..=12 {
+            for z in 7..=10 {
+                let _ = s
+                    .voxels
+                    .set_block(BlockPos::new(x, 5, z), voxel::builtin::DIRT);
+            }
+        }
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(9, 4, 7), voxel::builtin::BEDROCK);
+        refresh_collider(&mut s);
+        let id = entity(1);
+        // 单格石块(half 0.5,m = 1)12 m/s 沿 −x 正撞板中心格 (10,5,8) 的
+        // +x 面:中心对准格心 (10.5, 5.5, 8.5),距板面 1.45 m(F02b-2 布景
+        // 同款间隙,避开出生重叠)。
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.45, 5.5, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.5,
                     block: voxel::builtin::STONE,
-                })
-                .collect(),
-        )
-        .expect("6 格(伸向 −x,首格在前)");
-        let (big, light) = (entity(1), entity(2));
-        s.apply_prefix(&[
-            StampedInput {
-                apply_at: Tick::ZERO,
-                source: messaging::InputSource::SCHEDULER,
-                sequence: 1,
-                payload: InputPayload::Command(SimCommand::SpawnDynamic {
-                    entity: big,
-                    state: EntityState {
-                        translation: Vec3::new(10.5, 5.5, 8.5),
-                        ..EntityState::default()
-                    },
-                    desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, bar),
-                }),
-            },
-            StampedInput {
-                apply_at: Tick::ZERO,
-                source: messaging::InputSource::SCHEDULER,
-                sequence: 2,
-                payload: InputPayload::Command(SimCommand::SpawnDynamic {
-                    entity: light,
-                    state: EntityState {
-                        translation: Vec3::new(13.45, 5.5, 8.5),
-                        linvel: Vec3::new(-12.0, 0.0, 0.0),
-                        ..EntityState::default()
-                    },
-                    desc: EntityDesc {
-                        half_size: 0.45,
-                        block: voxel::builtin::STONE,
-                        shape: None,
-                    },
-                }),
-            },
-        ]);
+                    shape: None,
+                },
+            }),
+        }]);
         for _ in 0..20 {
             s.step();
             let out = s.take_outbox();
@@ -13398,81 +13900,54 @@ mod tests {
                 break;
             }
         }
-        // 单格投射物撞单格实体:这条路径走的是实体-实体接触,D4/冲量流
-        // 采样只采**实体-地形**对——单格投射物撞复合体不会进冲量流!
-        // (evaluate_impacts 的接触对含实体-实体,但归格查体素会 miss。)
-        // 所以追踪为空是正常的——轻撞大改用地形布景:悬空大块用**地形**
-        // (2×3 土墙),轻投射物打它。改为断言:轻物修正后法向速度 ≈ 0。
-        if s.impact_flow_trace.is_empty() {
-            // 上面的实体-实体布景不产生冲量流事件(预期);换地形布景跑。
-            let mut s = flow_sim_zero_g();
-            s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
-            // 2×3 悬空土墙(同 L 形测试的"大块")。
-            let _ = s
-                .voxels
-                .set_block(BlockPos::new(10, 1, 8), voxel::builtin::BEDROCK);
-            let _ = s
-                .voxels
-                .set_block(BlockPos::new(10, 1, 9), voxel::builtin::BEDROCK);
-            for y in 3..=5 {
-                for z in 8..=9 {
-                    let _ = s
-                        .voxels
-                        .set_block(BlockPos::new(10, y, z), voxel::builtin::DIRT);
-                }
-            }
-            refresh_collider(&mut s);
-            let light = entity(1);
-            s.apply_prefix(&[StampedInput {
-                apply_at: Tick::ZERO,
-                source: messaging::InputSource::SCHEDULER,
-                sequence: 1,
-                payload: InputPayload::Command(SimCommand::SpawnDynamic {
-                    entity: light,
-                    state: EntityState {
-                        translation: Vec3::new(13.45, 4.5, 8.5),
-                        linvel: Vec3::new(-12.0, 0.0, 0.0),
-                        ..EntityState::default()
-                    },
-                    desc: EntityDesc {
-                        half_size: 0.45,
-                        block: voxel::builtin::STONE,
-                        shape: None,
-                    },
-                }),
-            }]);
-            for _ in 0..20 {
-                s.step();
-                let out = s.take_outbox();
-                if !s.impact_flow_trace.is_empty() {
-                    let _ = out;
-                    break;
-                }
-            }
-            let t = s
-                .impact_flow_trace
-                .first()
-                .expect("轻物撞 2×3 土墙应有断开事件(12 m/s:供给 ≥ 剪切割)");
-            // 轻物 m_eff = 0.729(单格),M_S = 2 格 × 0.729 → 修正比例
-            // m_eff/(m_eff+M_S) ≤ 1/3;共同速度 w = |E|/(m_eff+M_S)。
-            // F02b-3 收紧:w < 0.1·u(轻物被大块摊薄,共同速度远低于来速;
-            // 0.1·u = 1.2 m/s),修正后 p 处法向速度与 w 相差 0.1 以内。
-            let d_hat = t.event.dir_hat();
-            let com = t.impactor.center_of_mass;
-            let v_after = (t.linvel_after + t.angvel_after.cross(t.event.point - com)).dot(d_hat);
-            let m_s = t.momenta.iter().map(|kk| kk.mass).sum::<f32>();
-            let w = t.event.impulse.length()
-                * ((t.supply - t.cut_q as f32 / t.quant) / t.supply).clamp(0.0, 1.0)
-                / (t.impactor.mass + m_s);
-            assert!(
-                w < 1.2,
-                "AC-F5:共同速度 w < 0.1·u = 1.2(轻物被大块摊薄),实际 {w}"
-            );
-            assert!(
-                (v_after - w).abs() < 0.1,
-                "AC-F5:修正后法向速度 = w(封顶后落点),got {v_after} want ≈{w}"
-            );
-        }
+        let t = s
+            .impact_flow_trace
+            .first()
+            .expect("正撞板中心应有断开事件(最小割 = 锚键 7 < 供给)");
+        // 布景自检:S = 全部板格 16 格(1 分量,断一根键带走整块),M_S ≥ 10·m。
+        let m_s = t.momenta.iter().map(|k| k.mass).sum::<f32>();
+        assert_eq!(t.momenta.len(), 1, "布景自检:S = 1 个分量(整块板)");
+        assert_eq!(
+            t.momenta[0].cells.len(),
+            16,
+            "布景自检:S = 全部板格 16 格(拓扑决定断下质量)"
+        );
+        assert!(
+            m_s >= 10.0 * t.impactor.mass,
+            "布景自检:M_S({m_s}) ≥ 10·m({})",
+            t.impactor.mass
+        );
+        // w 定量:|E|/(m_eff + M_S);m_eff 由修正闭式反解(比例 = m_eff/
+        // (m_eff+M_S)),不重复生产的 m_eff 计算(F02b-2 同法)。
+        let d_hat = t.event.dir_hat();
+        let s_q = (t.supply * t.quant).floor();
+        let rho = ((s_q - t.cut_q as f32) / s_q).clamp(0.0, 1.0);
+        let e = t.event.impulse * rho;
+        let ratio = (t.correction.length() / e.length()).clamp(0.0, 0.999);
+        let m_eff = ratio * m_s / (1.0 - ratio);
+        let w = e.length() / (m_eff + m_s);
+        // ① 共同速度 w < 0.1·u(大 M_S 摊薄)。
+        assert!(
+            w < 1.2,
+            "AC-F5:共同速度 w < 0.1·u = 1.2(大 M_S 摊薄),实际 {w}"
+        );
+        // ② 修正后 p 处沿 d̂ 速度的绝对值 < 0.1·u(轻物撞大块后法向速度
+        // ≈ 0;p 处速度含角速度项;取绝对值——回弹残量与板速反向)。
+        let com = t.impactor.center_of_mass;
+        let v_after = (t.linvel_after + t.angvel_after.cross(t.event.point - com)).dot(d_hat);
+        assert!(
+            v_after.abs() < 1.2,
+            "AC-F5:修正后法向速度的绝对值 < 0.1·u = 1.2(轻物停下),实际 {v_after}"
+        );
+        // ③ 修正前后沿 d̂ 速度之差 = |修正|/m_eff(修正的物理定义;回弹残量
+        // 同时加在前后读数上,相减消去;容差 = 守恒测试同款的 f32 舍入量级)。
+        let v_before = (t.linvel_before + t.angvel_before.cross(t.event.point - com)).dot(d_hat);
+        let dv = (v_before - v_after).abs();
+        let want_dv = t.correction.length() / m_eff;
+        assert!(
+            (dv - want_dv).abs() < 0.2,
+            "AC-F5:修正前后速度差 = |修正|/m_eff:Δv = {dv} want {want_dv}"
+        );
     }
 
     /// AC-F4(切段速度,§5.7.3 第 3 条):同一分量切成多段时,各段请求
