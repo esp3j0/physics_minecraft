@@ -11413,8 +11413,13 @@ mod tests {
     /// 测试直写体素后刷新地形 collider(生产的重建挂在同拍写入出口;测试
     /// 绕过出口直写 `voxels`,须手动重建,否则新结构无碰撞体、撞击采不到)。
     fn refresh_collider(s: &mut ShardSim) {
-        if s.built_colliders.contains(&ChunkPos::new(0, 0)) {
-            s.rebuild_chunk_collider(ChunkPos::new(0, 0));
+        refresh_collider_at(s, ChunkPos::new(0, 0));
+    }
+
+    /// 同 [`refresh_collider`],显式指定 chunk(跨界布景要刷两个)。
+    fn refresh_collider_at(s: &mut ShardSim, cp: ChunkPos) {
+        if s.built_colliders.contains(&cp) {
+            s.rebuild_chunk_collider(cp);
         }
     }
 
@@ -11887,24 +11892,31 @@ mod tests {
         );
     }
 
-    /// AC-F7(分片边界):撞在分片边界上的结构不越界断开——本体区外的格按
-    /// 汇点(地基),S 截在边界内。单分片 sim 无法构造真邻片;以"本体区外"
-    /// 口径验证:chunk 在 x 负方向超界?单 chunk (0,0) 的本体区 = x 0..64,
-    /// 柱贴 x=0 立起 → 被撞后 S 不得含 x<0 的格(没有邻格,天然成立)。
-    /// 生产语义由跨分片 e2e 覆盖;此处钉住:边界柱断下的 S ⊂ 本体区。
+    /// AC-F7(分片边界):悬空土梁**横跨本体区边界 x = 128**(SHARD_CHUNKS=8),
+    /// 区内格被撞后断开不越界——区外格(副本格)按汇点(地基),S 截在边界内。
+    /// 布景:同时装载 chunk (7,0) 与 (8,0)(后者 = 本体区外);梁 x 124..=131、
+    /// y=4、z=8,下方全空(离实心层 3 格,BFS 不外溢)。单格方块 12 m/s 沿 +z
+    /// 撞区内格(x=127):跨界竖边 u·d̂=0 → 剪切 7 < s ≈ 9.2 → 断开,S = 区内
+    /// 4 格(x 124..=127);区外格(x ≥ 128)仍是土。
     ///
-    /// 变红:S 未按 in_core 截断(理论上有越界格时写出界)。
+    /// 变红:`in_core` 恒真(区外格不再当汇点)→ 梁整根悬空、无汇点 →
+    /// C = 0、S = 整根 8 格 → x ≥ 128 的格被写 air → 本测试红。
     #[test]
     fn impact_flow_detached_stays_in_core_at_boundary() {
         let mut s = flow_sim_zero_g();
-        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
-        // 边界柱:x=0(z=8,y=2..=5,石)——本体区含 x=0(≥ min.x)。
-        for y in 2..=5 {
-            let _ = s
-                .voxels
-                .set_block(BlockPos::new(0, y, 8), voxel::builtin::STONE);
+        // 本体区 = x 0..128;(7,0) 是区内最后一个 chunk(x 112..128),(8,0)
+        // 是区外副本(x 128..144)。梁 x 124..=131 跨骑 127/128 边界。
+        s.load_chunk(ChunkPos::new(7, 0), solid_chunk());
+        s.load_chunk(ChunkPos::new(8, 0), solid_chunk());
+        // 悬空土梁横跨 x=128:x 124..=131、y=4、z=8。
+        let beam: Vec<BlockPos> = (124..=131).map(|x| BlockPos::new(x, 4, 8)).collect();
+        for &cell in &beam {
+            let _ = s.voxels.set_block(cell, voxel::builtin::DIRT);
         }
-        refresh_collider(&mut s);
+        refresh_collider_at(&mut s, ChunkPos::new(7, 0));
+        refresh_collider_at(&mut s, ChunkPos::new(8, 0));
+        // 撞击者:单格石方块 12 m/s 沿 +z 撞区内格(x=127、z=8 的 −z 面;
+        // d̂ = +z,跨界边 u = ±x 与 d̂ 垂直 → 剪切;零重力直线弹道不穿梁)。
         let id = entity(1);
         s.apply_prefix(&[StampedInput {
             apply_at: Tick::ZERO,
@@ -11913,8 +11925,8 @@ mod tests {
             payload: InputPayload::Command(SimCommand::SpawnDynamic {
                 entity: id,
                 state: EntityState {
-                    translation: Vec3::new(3.45, 3.5, 8.5),
-                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    translation: Vec3::new(127.45, 4.5, 5.55),
+                    linvel: Vec3::new(0.0, 0.0, 12.0),
                     ..EntityState::default()
                 },
                 desc: EntityDesc {
@@ -11924,28 +11936,40 @@ mod tests {
                 },
             }),
         }]);
-        let mut all_in_core = true;
+        let mut breaks = 0;
+        let mut detached: Vec<BlockPos> = Vec::new();
         for _ in 0..20 {
             s.step();
             let out = s.take_outbox();
-            let mut cells: Vec<types::BlockPos> =
-                out.detach_requests.iter().map(|r| r.cell).collect();
+            breaks += out.cohesion_stats.impact_flow_breaks;
+            for req in &out.detach_requests {
+                detached.push(req.cell);
+            }
             for r in &out.compound_requests {
                 for c in r.shape.cells() {
-                    cells.push(types::BlockPos::new(
+                    detached.push(BlockPos::new(
                         r.origin.x + c.offset[0],
                         r.origin.y + c.offset[1],
                         r.origin.z + c.offset[2],
                     ));
                 }
             }
-            for cell in cells {
-                if cell.x < 0 || cell.x >= 64 {
-                    all_in_core = false;
-                }
+            if breaks > 0 {
+                break;
             }
         }
-        assert!(all_in_core, "断下格全部落在本体区内(不越界)");
+        assert!(breaks >= 1, "区内格被撞应断开(割 = 127→128 界面剪切 7)");
+        assert!(
+            detached.iter().all(|c| c.x < 128),
+            "断下格全部在本体区内(x < 128):{detached:?}"
+        );
+        for x in 128..=131 {
+            assert_eq!(
+                s.voxels.get_block(BlockPos::new(x, 4, 8)),
+                voxel::builtin::DIRT,
+                "区外梁格 ({x},4,8) 仍是土(副本格按汇点,不越界断开)"
+            );
+        }
     }
 
     /// AC-F12(`impact_flow = false` 逐位不变):同一布景开关关/开,关闭时

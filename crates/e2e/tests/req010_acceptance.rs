@@ -5184,20 +5184,27 @@ mod unit_f02a {
     /// 会话上重放,撞击断开、实体状态与体素世界逐拍相同。
     ///
     /// 会变红的实现:接触对遍历顺序进结果(采样未按 BTreeMap 归序/事件未按
-    /// 排序键选取);浮点最大流(割不唯一)。
+    /// 排序键选取);浮点最大流(割不唯一);分派失效(什么都不发生也能过)。
     #[test]
     fn acc_f7_impact_flow_double_run_identical_tick_by_tick() {
-        let mut runs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+        let mut runs: Vec<(u64, usize, Vec<String>, Vec<String>)> = Vec::new();
         for _ in 0..2 {
             let mut s = session();
             let mut log = CommandLog::default();
-            let pillar: Vec<BlockPos> = (-60..=-58).map(|y| p(64, y, 64)).collect();
-            set(&mut s, &mut log, &pillar, DIRT);
-            spawn_projectile(&mut s, &mut log, 1, 67.45, -58.5, 64.5);
+            // 悬空土墩(bedrock 垫 (64,-59,64) + 土格 (64,-58,64),悬在超平坦
+            // 上方一格):单格方块 12 m/s 侧撞土格,土-基岩剪切割 7 < s → 断。
+            // spawn x = 67.55 与 acc_f7_pillar 同款(tick 相位对齐 0.1 穿透,
+            // 否则首触微脉冲弹开、不断)。
+            let pier: Vec<BlockPos> = vec![p(64, -59, 64), p(64, -58, 64)];
+            set(&mut s, &mut log, &[pier[0]], builtin::BEDROCK);
+            set(&mut s, &mut log, &[pier[1]], DIRT);
+            spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
             let mut states: Vec<String> = Vec::new();
             let mut voxels: Vec<String> = Vec::new();
+            let mut breaks = 0u64;
             for _ in 0..40 {
                 let summary = s.tick();
+                breaks += summary.cohesion.impact_flow_breaks;
                 let mut st: Vec<(EntityId, String)> = s
                     .entity_states(shard())
                     .unwrap_or_default()
@@ -5215,16 +5222,28 @@ mod unit_f02a {
                 st.sort_by_key(|(id, _)| *id);
                 states.push(format!("{}|{:?}", summary.cohesion.impact_flow_breaks, st));
                 voxels.push(
-                    pillar
-                        .iter()
+                    pier.iter()
                         .map(|&c| format!("{:?}", block(&s, c)))
                         .collect::<Vec<_>>()
                         .join(","),
                 );
             }
-            runs.push((states, voxels));
+            let airs = pier.iter().filter(|&&c| block(&s, c) == AIR).count();
+            runs.push((breaks, airs, states, voxels));
             s.shutdown();
         }
-        assert_eq!(runs[0], runs[1], "同一命令日志双跑逐拍一致");
+        // 先断言**发生了**冲量流断开(否则逐拍一致没有意义),再比较两次运行。
+        for (i, (breaks, airs, _, _)) in runs.iter().enumerate() {
+            assert!(
+                *breaks >= 1,
+                "第 {i} 次运行应有冲量流断开(breaks ≥ 1),否则布景失效"
+            );
+            assert!(*airs >= 1, "第 {i} 次运行土格应被打成 air,否则布景失效");
+        }
+        assert_eq!(
+            (runs[0].0, runs[0].1, &runs[0].2, &runs[0].3),
+            (runs[1].0, runs[1].1, &runs[1].2, &runs[1].3),
+            "同一命令日志双跑逐拍一致"
+        );
     }
 }

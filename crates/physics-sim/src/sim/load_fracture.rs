@@ -20,16 +20,37 @@ impl ShardSim {
         if !self.load_enabled() {
             return;
         }
-        // 采样资格(§7.3 第 2 条):醒着的复合体;速度基准 = 本步之前的线速度。
-        // 先于接触映射建表(终审审计 P3):资格构造不依赖下方映射,绝大多数拍
-        // 没有合格复合体,这里直接早退,免付全量建表。
+        // 本体资格表(§7.3 第 2 条):醒着的**复合体**;先于接触映射建表(终审
+        // 审计 P3):绝大多数拍没有合格复合体,这里直接早退,免付全量建表。
         // 资格表携带本步前线速度 + 角速度 + 世界质心(勘误 2,§5.7.9):
         // 接近速度按接触点相对速度算。
-        // 对方速度的资格表(勘误 2"对方"条,F02a):**任何醒着的动态实体**——
-        // 单格实体(玩家放出的方块等,没有 `shape`)也算,不再只认复合体
-        // (只认复合体会让单格投射物击中醒着的复合体时对方速度按 0 计,
-        // 12 m/s 单格方块实测不断)。
         let eligible: BTreeMap<EntityId, (Vec3, PreImpactSpin)> = self
+            .pre_impulse_vels
+            .iter()
+            .filter(|(id, _)| {
+                self.entities
+                    .get(id)
+                    .is_some_and(|rec| rec.desc.shape().is_some())
+                    && self
+                        .phys
+                        .bodies
+                        .get(self.entities[id].handle)
+                        .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
+            })
+            .filter_map(|(id, v)| {
+                let spin = self.pre_impulse_spin.get(id).copied()?;
+                Some((*id, (*v, spin)))
+            })
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+        // 对方速度表(勘误 2"对方"条,F02a-2 拆出):**任何醒着的动态实体**——
+        // 单格实体(玩家放出的方块等,没有 `shape`)也算(只认复合体会让单格
+        // 投射物击中醒着的复合体时对方速度按 0 计,12 m/s 单格方块实测不断)。
+        // 不参与上方早退:场上只有醒着的单格实体、没有合格复合体时,本拍不判
+        // 碎裂,也不必为对方速度付全量建表。
+        let other_vels: BTreeMap<EntityId, (Vec3, PreImpactSpin)> = self
             .pre_impulse_vels
             .iter()
             .filter(|(id, _)| {
@@ -45,9 +66,6 @@ impl ShardSim {
                 Some((*id, (*v, spin)))
             })
             .collect();
-        if eligible.is_empty() {
-            return;
-        }
         // collider → 实体(复合体 = 全部格 collider)与复合体 collider → 形状格
         // 序号(局部平移 = 偏移,按偏移匹配,不依赖 colliders() 的插入顺序)。
         // **全部实体都登记**(单格 = 代表 collider;勘误 2"对方"条:对方的
@@ -115,7 +133,7 @@ impl ShardSim {
             // 地形、睡眠体或没有快照时按 0)。
             let other_vel = |side1: bool| -> Option<(Vec3, PreImpactSpin)> {
                 let oid = collider_to_entity.get(if side1 { &key2 } else { &key1 })?;
-                eligible.get(oid).copied()
+                other_vels.get(oid).copied()
             };
             // 读解算器实际使用的流形(REQ-010 §5.7.10 末条、AC-F17;同
             // `evaluate_impacts`):多流形对被 contact clustering 合并解算,
