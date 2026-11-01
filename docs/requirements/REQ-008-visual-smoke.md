@@ -103,6 +103,7 @@ viewer 只能从实体状态包得知服务器拍号:有实体变化时每 10 �
 | 活实体数 | `live_entities = { eq = 0 }`(也可 `le`、`ge`) | 实体表计数满足比较 |
 | 标签实体存活数 | `labeled_alive = { label = "blast", eq = 0 }` | 该标签下仍在实体表里的个数满足比较 |
 | 方块 | `block = { pos = [x, y, z], is = "stone" }` | 方块镜像中该格等于给定方块 |
+| 区域计数 | `count = { from = [x, y, z], to = [x, y, z], is = "stone", ge = 2 }`(也可 `le`、`eq`) | 闭区间长方体内等于给定方块的格数满足比较;区域格数上限与 `fill` 相同(4096);区域内有格所在 chunk 不在方块镜像中时检查不成立(消息指明未装载)。用于表达"碎块落在某一侧"这类落点不确定的结论(§3.4),替代逐格 `block`(REQ-010 F04b 增补,2026-11-01) |
 | 已装载 chunk 数 | `chunks_loaded = { ge = 9 }` | 方块镜像中的 chunk 数满足比较 |
 | 无悬空 | `no_floating = { height = 1.5, still_ticks = 30 }` | 不存在这样的活实体:底面高出所在柱最高实心方块 `height` 米以上,且在最近 `still_ticks` 拍内位置变化不超过 0.05 m(正在下落的不算) |
 
