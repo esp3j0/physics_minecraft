@@ -51,8 +51,8 @@ pub struct CohesionConfig {
     pub load_knockback_max_speed: f32,
     /// 击退后角速度上限 rad/s(6.0,§5.6;取 0 = 钉死为零,裁定 2026-10-30;单元 K02 使用)。
     pub load_knockback_max_ang_speed: f32,
-    /// 撞击冲量流开关(F02a,§5.7.5;F01–F03 期间默认 `false`,F04 起默认
-    /// `true`,D14)。生效条件 = `destruction.enabled` ∧ `cohesion.enabled` ∧ 本键;
+    /// 撞击冲量流开关(F02a,§5.7.5;F04 起默认 `true`,D14)。生效条件 =
+    /// `destruction.enabled` ∧ `cohesion.enabled` ∧ 本键;
     /// 关闭时 REQ-009 §5 与 §5.6 逐位不变。
     pub impact_flow: bool,
     /// 撞击冲量流的 BFS 区域格数上限(1024,§5.7.1;截断处相邻格视为地基)。
@@ -74,7 +74,7 @@ impl Default for CohesionConfig {
             load_knockback_factor: 0.5,
             load_knockback_max_speed: 8.0,
             load_knockback_max_ang_speed: 6.0,
-            impact_flow: false,
+            impact_flow: true,
             impact_flow_max_cells: 1024,
             impact_flow_max_events_per_tick: 8,
         }

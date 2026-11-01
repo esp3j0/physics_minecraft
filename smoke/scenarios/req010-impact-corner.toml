@@ -13,6 +13,10 @@ enabled = true
 enabled = true
 # 门楣残段 3 格整段成一根复合条(默认 2 会按世界网格切成 2 格条 + 1 格碎块)。
 compound_split_size = 4
+# F04b 前暂时关闭:冲量流默认开启后,撞击把整个"7"字从柱脚断走
+# (check 38/39"柱底残留站立"得 air),场景期望按 §5.7.1 末行改写由
+# 总架构师在 F04b 定稿;本场景期望文本不改。
+impact_flow = false
 
 [[step]]
 label = "相机就位"

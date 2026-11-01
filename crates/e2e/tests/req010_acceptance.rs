@@ -2884,7 +2884,10 @@ mod unit06 {
 
     /// 单分片会话(chunk x 2..=6、z 2..=5),破坏与本 REQ 开启;`pad` 时把 x 56..=69、z 60..=80 的地表一层(y = −61)换成石头
     /// (I = 18,只看复合体自身是否碎裂,不让地面被砸穿)。
-    fn session(pad: bool) -> (Session, CommandLog) {
+    /// `impact_flow` = 撞击冲量流开关(F04a):本模块默认新语义(true);
+    /// 测 §7.3 第 7 条均摊砸地形旧语义的用例(acc_c5)显式传 false(§5.7.5
+    /// 迁移,§12.1 第 3 条纪律)。
+    fn session(pad: bool, impact_flow: bool) -> (Session, CommandLog) {
         let mut c = ShardSimConfig::new(shard());
         c.destruction = DestructionConfig {
             enabled: true,
@@ -2892,6 +2895,7 @@ mod unit06 {
         };
         c.cohesion = CohesionConfig {
             enabled: true,
+            impact_flow,
             ..CohesionConfig::default()
         };
         let mut sim = ShardSim::new(c, registry());
@@ -2977,7 +2981,7 @@ mod unit06 {
     /// 会变红的实现:逐格相加而不均摊(求解器把冲量集中在一格,5 m 就断)。
     #[test]
     fn acc_c6_stone_beam_flat_5m_stays_whole() {
-        let (mut s, mut log) = session(true);
+        let (mut s, mut log) = session(true, true);
         drop_beam(&mut s, &mut log, 1, 64.5, 5.0, STONE, Quat::IDENTITY);
         let (done, total) = settle(&mut s);
         assert!(done);
@@ -2995,7 +2999,7 @@ mod unit06 {
     /// 会变红的实现:碎裂没接线;拆分后丢格。
     #[test]
     fn acc_c6_dirt_beam_flat_8m_shatters() {
-        let (mut s, mut log) = session(true);
+        let (mut s, mut log) = session(true, true);
         drop_beam(&mut s, &mut log, 1, 64.5, 8.0, DIRT, Quat::IDENTITY);
         let (done, total) = settle(&mut s);
         assert!(done);
@@ -3019,7 +3023,7 @@ mod unit06 {
     /// 会变红的实现:压向豁免写反(所有粘结都被当成压向)。
     #[test]
     fn acc_c6_corner_first_stone_beam_breaks() {
-        let (mut s, mut log) = session(true);
+        let (mut s, mut log) = session(true, true);
         drop_beam(
             &mut s,
             &mut log,
@@ -3039,9 +3043,12 @@ mod unit06 {
     /// 8 m 那根每格 9.8 ≥ 7,脚下 6 格土在同一拍一起脱落(写 air)。
     ///
     /// 会变红的实现:复合体仍按单格口径逐地形格相加(桩上实测:8 m 那根脚下的 6 格不会同拍一起脱落);阈值或均摊分母算错。
+    ///
+    /// F04a:显式关 `impact_flow`(session 第二参 false)——本用例测 §7.3
+    /// 第 7 条均摊砸地形的旧语义,冲量流生效时该路径被 §5.7 取代(§5.7.5 迁移)。
     #[test]
     fn acc_c5_compound_terrain_impact_averaged() {
-        let (mut s, mut log) = session(false);
+        let (mut s, mut log) = session(false, false);
         drop_beam(&mut s, &mut log, 1, 64.5, 2.0, STONE, Quat::IDENTITY);
         drop_beam(&mut s, &mut log, 2, 72.5, 8.0, STONE, Quat::IDENTITY);
         let low: Vec<BlockPos> = (60..=65).map(|x| p(x, -61, 64)).collect();

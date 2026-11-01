@@ -5,7 +5,7 @@
 //! 未知键显式拒绝。零 macroquad、零恐慌路径(数值转换错误一律返回 `ScriptError`)。
 
 use types::glam::Vec3;
-use types::{BlockId, BlockPos};
+use types::{BlockId, BlockPos, CompoundShape, ShapeCell};
 use voxel::{BlockRegistry, SimpleRegistry};
 
 use super::{Action, Check, Cmp, DetonateAt, FILL_MAX_CELLS, Scenario, ScriptError, SpawnAt, Step};
@@ -142,6 +142,115 @@ fn block_id(value: &toml::Value, registry: &SimpleRegistry, what: &str) -> Resul
         .ok_or_else(|| format!("{what}:未知方块名 \"{name}\""))
 }
 
+/// `spawn.shape` 的解析(F04a,REQ-010 §5.4/§3.2):`{ cells = [[0,0,0],…],
+/// block = "stone" }` → [`CompoundShape`]。校验顺序(错误各自指名):
+/// ① 表含且仅含 `cells`/`block`;② `cells` 为非空整数三元组数组、每项
+/// `[i32;3]`;③ 方块名已知且实心;④ 非空、偏移无重复、≥ 2 格、全格同块
+/// (复用 [`CompoundShape::new`],单格走默认 spawn 不需要 shape);⑤ 形状
+/// 共面连通(共面相邻 BFS 可达;不连通 = 复合体会被承载判定拆散,解析期
+/// 拒绝)。
+fn spawn_shape(
+    value: &toml::Value,
+    registry: &SimpleRegistry,
+    e: &dyn Fn(String) -> ScriptError,
+) -> Result<CompoundShape, ScriptError> {
+    let t = value.as_table().ok_or_else(|| {
+        e("动作 spawn 的 shape 应为内联表(shape = { cells = [..], block = \"..\" })".into())
+    })?;
+    let known = &["cells", "block"];
+    reject_unknown(t, known, "动作 spawn 的 shape").map_err(e)?;
+    let cells_v = t
+        .get("cells")
+        .ok_or_else(|| e("动作 spawn 的 shape 缺必填参数 cells".into()))?;
+    let block_v = t
+        .get("block")
+        .ok_or_else(|| e("动作 spawn 的 shape 缺必填参数 block".into()))?;
+    let arr = cells_v
+        .as_array()
+        .ok_or_else(|| e("spawn.shape.cells 应为数组,如 [[0,0,0],[1,0,0]]".into()))?;
+    if arr.is_empty() {
+        return Err(e("spawn.shape.cells 不能为空".into()));
+    }
+    let block = block_id(block_v, registry, "spawn.shape.block").map_err(e)?;
+    if !registry.is_solid(block) {
+        return Err(e(format!(
+            "spawn.shape.block:\"{name}\" 不是实心方块(复合体每格须实心)",
+            name = block_v.as_str().unwrap_or_default()
+        )));
+    }
+    let mut offsets: Vec<[i32; 3]> = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let triple = item
+            .as_array()
+            .ok_or_else(|| e(format!("spawn.shape.cells[{i}] 应为 [x,y,z] 整数三元组")))?;
+        if triple.len() != 3 {
+            return Err(e(format!(
+                "spawn.shape.cells[{i}] 应为 3 个整数,给了 {} 个",
+                triple.len()
+            )));
+        }
+        let mut off = [0i32; 3];
+        for (axis, v) in triple.iter().enumerate() {
+            let n = v
+                .as_integer()
+                .ok_or_else(|| e(format!("spawn.shape.cells[{i}][{axis}] 应为整数")))?;
+            off[axis] = i32::try_from(n)
+                .map_err(|_| e(format!("spawn.shape.cells[{i}][{axis}] 超出 i32 范围:{n}")))?;
+        }
+        offsets.push(off);
+    }
+    // 偏移重复与 <2 格:直接给 CompoundShape::new 的错误口径(指明是哪一步
+    // 的语义;错误文本带步骤号由外层 e 统一)。
+    let shape = CompoundShape::new(
+        offsets
+            .iter()
+            .map(|&off| ShapeCell { offset: off, block })
+            .collect(),
+    )
+    .map_err(|err| {
+        e(match err {
+            types::ShapeError::TooFewCells => {
+                "spawn.shape.cells 至少要 2 格(单格用默认 spawn,不需要 shape)".into()
+            }
+            types::ShapeError::DuplicateOffset(off) => {
+                format!("spawn.shape.cells 偏移重复:{off:?}")
+            }
+        })
+    })?;
+    // 连通:复合体的格须共面相邻连通(REQ-010 §3.2 粘结;不连通的形状
+    // 生成即被承载判定拆散)。BFS 从 canonical 首格出发。
+    let cells = shape.cells();
+    let set: std::collections::BTreeSet<[i32; 3]> = cells.iter().map(|c| c.offset).collect();
+    let start = cells[0].offset;
+    let mut seen: std::collections::BTreeSet<[i32; 3]> = std::collections::BTreeSet::new();
+    seen.insert(start);
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(start);
+    while let Some(cur) = queue.pop_front() {
+        for d in [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ] {
+            let n = [cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]];
+            if set.contains(&n) && seen.insert(n) {
+                queue.push_back(n);
+            }
+        }
+    }
+    if seen.len() != set.len() {
+        return Err(e(format!(
+            "spawn.shape.cells 不连通(共面相邻 BFS 从 {start:?} 只到 {}/{} 格)",
+            seen.len(),
+            set.len()
+        )));
+    }
+    Ok(shape)
+}
+
 fn f32_of(value: &toml::Value, what: &str) -> Result<f32, String> {
     value
         .as_float()
@@ -186,7 +295,7 @@ fn parse_action(
         "fly" => &["to", "speed"],
         "couple" => &["on"],
         "spawn" => &[
-            "at", "ahead", "lift", "count", "spacing", "velocity", "label",
+            "at", "ahead", "lift", "count", "spacing", "velocity", "label", "shape",
         ],
         "detonate" => &["at", "nearest", "power", "radius"],
         "set_block" => &["pos", "block"],
@@ -293,12 +402,17 @@ fn parse_action(
                 Some(v) => Some(str_of(v, "spawn.label").map_err(e)?),
                 None => None,
             };
+            let shape = match t.get("shape") {
+                Some(v) => Some(spawn_shape(v, registry, &e)?),
+                None => None,
+            };
             Ok(Action::Spawn {
                 at,
                 count,
                 spacing,
                 velocity,
                 label,
+                shape,
             })
         }
         "detonate" => {

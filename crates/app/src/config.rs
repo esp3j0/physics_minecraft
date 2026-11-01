@@ -1389,16 +1389,15 @@ unload_radius = 64
         );
     }
 
-    /// AC-F10(F02a,§5.7.5):撞击冲量流三键——解析、默认值(false / 1024 / 8)、
-    /// `0` 被拒、roundtrip、→ ShardSimConfig 直传。
+    /// AC-F10(F02a,§5.7.5):撞击冲量流三键——解析、默认值(true / 1024 / 8,
+    /// D14:F04 起默认开)、`0` 被拒、roundtrip、→ ShardSimConfig 直传。
     ///
-    /// 变红:默认值误为 true(F04 才默认开);上限键默认或校验漏掉;直传漏键。
+    /// 变红:默认值仍为 false;上限键默认或校验漏掉;直传漏键。
     #[test]
     fn impact_flow_keys_parse_defaults_and_reject_zero() {
-        // 默认值:impact_flow = false(F01–F03 期间;F04 起才默认 true)、
-        // 上限 1024 / 8。
+        // 默认值:impact_flow = true(F04 起,D14)、上限 1024 / 8。
         let c = Config::load(None).expect("默认配置");
-        assert!(!c.cohesion.impact_flow, "默认 false(D14:F04 才开)");
+        assert!(c.cohesion.impact_flow, "默认 true(D14:F04 起默认开)");
         assert_eq!(c.cohesion.impact_flow_max_cells, 1024);
         assert_eq!(c.cohesion.impact_flow_max_events_per_tick, 8);
         // → ShardSimConfig 直传(同源,§12.1)。
@@ -1407,10 +1406,10 @@ unload_radius = 64
             types::DimensionId(0),
             types::ShardPos::new(0, 0),
         ));
-        assert!(!core.cohesion.impact_flow);
+        assert!(core.cohesion.impact_flow);
         assert_eq!(core.cohesion.impact_flow_max_cells, 1024);
         assert_eq!(core.cohesion.impact_flow_max_events_per_tick, 8);
-        // 解析 + roundtrip。
+        // 解析 + roundtrip(显式 false 可解析)。
         let cfg = Config::from_toml_str(
             "[cohesion]\nimpact_flow = true\nimpact_flow_max_cells = 33\n\
              impact_flow_max_events_per_tick = 3\n",
@@ -1419,6 +1418,8 @@ unload_radius = 64
         assert!(cfg.cohesion.impact_flow);
         assert_eq!(cfg.cohesion.impact_flow_max_cells, 33);
         assert_eq!(cfg.cohesion.impact_flow_max_events_per_tick, 3);
+        let off = Config::from_toml_str("[cohesion]\nimpact_flow = false\n").expect("显式关");
+        assert!(!off.cohesion.impact_flow, "显式 false 可解析");
         let rt = Config::from_toml_str(&cfg.to_toml_string()).expect("roundtrip");
         assert_eq!(rt.cohesion.impact_flow, cfg.cohesion.impact_flow);
         assert_eq!(

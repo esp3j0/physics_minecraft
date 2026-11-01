@@ -14,6 +14,7 @@ use super::{
     FrameInput, FrameOutput, Scenario, ScreenshotRequest, SpawnAt, StepOutcome, StepRecord,
     WorldQuery,
 };
+use types::EntityDesc;
 
 /// 结束后的退出码(REQ-008 §4):0 = 全部完成且检查成立;1 = 有检查失败;2 = 场景失败。
 pub(super) fn exit_code(status: &EngineStatus) -> Option<i32> {
@@ -423,6 +424,7 @@ impl EngineInner {
                     spacing,
                     velocity,
                     label: spawn_label,
+                    shape,
                 } => {
                     let start_tick = match self.wait {
                         Some(WaitState::Spawn { start_tick, .. }) => start_tick,
@@ -448,12 +450,23 @@ impl EngineInner {
                         };
                         for i in 0..count {
                             let offset = Vec3::new((i % 5) as f32, 0.0, (i / 5) as f32) * spacing;
+                            // F04a:`at` = 刚体原点 = 形状 offset [0,0,0] 那格的
+                            // 格心;有 shape 时发复合 EntityDesc(`control.spawn`
+                            // 透传,服务端 spawn_owned 生成复合体),无 shape 时
+                            // 默认单格(逐位不变)。clone:count > 1 时同形状多发。
+                            let desc = match &shape {
+                                Some(sh) => {
+                                    EntityDesc::compound(super::COMPOUND_HALF_SIZE, sh.clone())
+                                }
+                                None => EntityDesc::default(),
+                            };
                             out.commands.push(EngineCommand::Spawn {
                                 state: EntityState {
                                     translation: base + offset,
                                     linvel: velocity,
                                     ..EntityState::default()
                                 },
+                                desc,
                             });
                         }
                         self.wait = Some(WaitState::Spawn {

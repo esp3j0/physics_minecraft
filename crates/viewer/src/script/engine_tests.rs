@@ -186,7 +186,7 @@ fn spawn_grid_wraps_every_five() {
         .commands
         .iter()
         .map(|c| match c {
-            crate::script::EngineCommand::Spawn { state } => state.translation,
+            crate::script::EngineCommand::Spawn { state, .. } => state.translation,
             other => panic!("只应有生成命令:{other:?}"),
         })
         .collect();
@@ -395,4 +395,45 @@ fn fill_single_cell_finishes_in_one_frame() {
     assert_eq!(out.finished[0].action, "fill");
     assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
     assert_eq!(e.exit_code(), Some(0));
+}
+
+/// F04a:带 `shape` 的 spawn 产出的命令带复合 EntityDesc,`translation` =
+/// `at`(刚体原点 = offset [0,0,0] 格心;单格默认 spawn 的"格心"语义不变);
+/// count > 1 时同形状多发、间距照旧。
+#[test]
+fn spawn_with_shape_emits_compound_desc() {
+    let mut e = engine(
+        "[[step]]
+spawn = { at = [10.0, -50.0, 20.0], count = 2, spacing = 2.0,          shape = { cells = [[0,0,0],[1,0,0]], block = \"stone\" } }",
+    );
+    let out = frame(&mut e, 0.016, 10, &FlatWorld::with_entities(&[]), &[]);
+    assert_eq!(out.commands.len(), 2, "count 2 → 两条 spawn 命令");
+    for (i, c) in out.commands.iter().enumerate() {
+        let crate::script::EngineCommand::Spawn { state, desc } = c else {
+            panic!("只应有生成命令:{c:?}");
+        };
+        let shape = desc.shape.as_ref().expect("带 shape → desc.shape 为 Some");
+        assert_eq!(shape.cells().len(), 2, "形状 2 格");
+        assert!(shape.cells().iter().all(|c| c.block == types::BlockId(1)));
+        assert_eq!(desc.half_size, crate::script::COMPOUND_HALF_SIZE);
+        let want = Vec3::new(10.0 + 2.0 * i as f32, -50.0, 20.0);
+        assert_eq!(state.translation, want, "第 {i} 个原点格心 = at + 间距偏移");
+        assert_eq!(state.linvel, Vec3::ZERO);
+    }
+}
+
+/// F04a:无 `shape` 的 spawn 命令带默认单格 desc(逐位不变)。
+#[test]
+fn spawn_without_shape_keeps_default_desc() {
+    let mut e = engine(
+        "[[step]]
+spawn = { at = [10.0, -50.0, 20.0] }",
+    );
+    let out = frame(&mut e, 0.016, 10, &FlatWorld::with_entities(&[]), &[]);
+    assert_eq!(out.commands.len(), 1);
+    let crate::script::EngineCommand::Spawn { state, desc } = &out.commands[0] else {
+        panic!("应为 spawn 命令");
+    };
+    assert_eq!(*desc, types::EntityDesc::default(), "默认单格 desc");
+    assert_eq!(state.translation, Vec3::new(10.0, -50.0, 20.0));
 }

@@ -83,7 +83,7 @@ detonate = { nearest = true, power = 12.0, radius = 8.0 }
 | `look_at` | `target` | 调整偏航与俯仰,使相机看向目标点 | 当帧 |
 | `fly` | `to`、`speed`(默认 16 m/s) | 沿直线匀速飞向目标,按帧时长推进;观察者按交互模式的节流规则跟随 | 到达目标点 |
 | `couple` | `on` | 相机 → 观察者耦合开关(脚本模式默认开) | 当帧 |
-| `spawn` | `at` 或(`ahead`、`lift`)、`count`(默认 1)、`spacing`(默认 1.6)、`velocity`(默认 0)、`label` | 生成动态立方体:`at` 为绝对坐标;`ahead`/`lift` 为相机前方距离与抬高;多个时按 5 列网格散开;`velocity` 为初速度(物体飞行);`label` 把服务端回执的实体 ID 记在该名字下 | 收齐 `count` 个 `Spawned` 回执 |
+| `spawn` | `at` 或(`ahead`、`lift`)、`count`(默认 1)、`spacing`(默认 1.6)、`velocity`(默认 0)、`label`、`shape`(可选,F04a) | 生成动态立方体:`at` 为绝对坐标;`ahead`/`lift` 为相机前方距离与抬高;多个时按 5 列网格散开;`velocity` 为初速度(物体飞行);`label` 把服务端回执的实体 ID 记在该名字下。`shape = { cells = [[0,0,0],[1,0,0],…], block = "stone" }` 生成**复合体**(REQ-010 §5.4):`at`(或 `ahead`/`lift` 基点)是刚体原点 = offset `[0,0,0]` 那格的格心,`count > 1` 时同形状多发;解析校验——`cells` 非空、无重复、共面相邻连通、`block` 为已知实心方块名,不合规报解析错误(指明校验步骤);省略 `shape` 时行为不变(默认单格) | 收齐 `count` 个 `Spawned` 回执 |
 | `detonate` | `at` 或 `nearest = true`、`power`、`radius` | 引爆;`nearest` 取相机附近最近的活实体为爆心(同交互模式的吸附规则) | 当帧发出 |
 | `set_block` | `pos`、`block`(方块名或 ID) | 放置或挖掉方块(`air`) | 当帧发出 |
 | `wait_ticks` | `n` | 等服务器推进 `n` 拍(以 viewer 收到的服务器拍号为准) | 服务器拍号 ≥ 起点 + `n` |

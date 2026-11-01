@@ -82,6 +82,7 @@ fn spawn_ahead_requires_lift_and_defaults() {
             spacing: 1.6,
             velocity: Vec3::ZERO,
             label: None,
+            shape: None,
         }
     );
 }
@@ -248,5 +249,77 @@ fn fill_rejects_missing_and_malformed_params() {
     for case in cases {
         let e = err(&one_step(case));
         assert_eq!(e.step, Some(1), "错误要带步骤序号:{case} → {e}");
+    }
+}
+
+/// F04a `spawn.shape` 解析正例:2×1 石条,`at` = 原点格 [0,0,0] 格心(引擎侧),
+/// 形状 canonical(偏移升序)、全格同块。
+#[test]
+fn spawn_shape_parses_and_canonicalizes() {
+    let s = parse_scenario(&one_step(
+        "spawn = { at = [10.0, -50.0, 20.0], shape = { cells = [[1,0,0],[0,0,0]], block = \"stone\" } }",
+    ))
+    .expect("shape 正例应可解析");
+    let Action::Spawn { shape, .. } = &s.steps[0].action else {
+        panic!("应为 spawn 动作");
+    };
+    let shape = shape.as_ref().expect("shape 应为 Some");
+    assert_eq!(
+        shape.cells().iter().map(|c| c.offset).collect::<Vec<_>>(),
+        vec![[0, 0, 0], [1, 0, 0]],
+        "canonical:偏移升序"
+    );
+    assert!(
+        shape.cells().iter().all(|c| c.block == BlockId(1)),
+        "全格 stone"
+    );
+}
+
+/// F04a `spawn.shape` 反例:空 cells、重复偏移、不连通、未知方块、
+/// 非实心方块(air)、单格、cells 非三元组、缺 block、未知键——
+/// 全部带步骤序号,错误指明是哪一步校验。
+#[test]
+fn spawn_shape_rejects_malformed() {
+    let cases = [
+        (
+            "空 cells",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [], block = \"stone\" } }",
+        ),
+        (
+            "重复偏移",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0],[0,0,0],[1,0,0]], block = \"stone\" } }",
+        ),
+        (
+            "不连通",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0],[2,0,0]], block = \"stone\" } }",
+        ),
+        (
+            "未知方块",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0],[1,0,0]], block = \"lava\" } }",
+        ),
+        (
+            "单格",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0]], block = \"stone\" } }",
+        ),
+        (
+            "cells 非三元组",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0],[1,0,0]], block = \"stone\" } }",
+        ),
+        (
+            "缺 block",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0],[1,0,0]] } }",
+        ),
+        (
+            "缺 cells",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { block = \"stone\" } }",
+        ),
+        (
+            "未知键",
+            "spawn = { at = [0.0, -50.0, 0.0], shape = { cells = [[0,0,0],[1,0,0]], block = \"stone\", half = 1 } }",
+        ),
+    ];
+    for (why, case) in cases {
+        let e = err(&one_step(case));
+        assert_eq!(e.step, Some(1), "{why}:错误要带步骤序号");
     }
 }

@@ -4969,11 +4969,15 @@ mod tests {
             c
         }
         // 双片:本体 + 扩张带重叠(片 0 = chunk 0..=8,片 1 = chunk 7..=15)。
+        // F04a:显式关 impact_flow——本测试的前提是实体 44 拍后仍常驻(位移
+        // 对拍);新撞击语义下 60 m/s 撞台阶格会把台阶打掉、实体直线冲出本体
+        // 区被迁移移除,布景前提不成立(REQ-010 §5.7.5 迁移)。
         let mut sched = Scheduler::new(sched_cfg(2));
         for (x, range) in [(0i32, 0..9), (1, 7..16)] {
             let mut s = {
                 let mut cfg = ShardSimConfig::new(shard_id(x, 0));
                 cfg.solidify.enabled = false;
+                cfg.cohesion.impact_flow = false;
                 ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
             };
             for cx in range {
@@ -5028,6 +5032,7 @@ mod tests {
         let mut single = {
             let mut cfg = ShardSimConfig::new(shard_id(0, 0));
             cfg.solidify.enabled = false;
+            cfg.cohesion.impact_flow = false;
             ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()))
         };
         for cx in 0..16 {

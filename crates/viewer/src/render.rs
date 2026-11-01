@@ -386,12 +386,12 @@ fn forward_commands(commands: &[EngineCommand], control: &crate::client::Control
     let mut batch: Vec<SimCommand> = Vec::new();
     for command in commands {
         match command {
-            EngineCommand::Spawn { state } => {
+            EngineCommand::Spawn { state, desc } => {
                 // 批内若有 Spawn:先把已积累的批发出(保序),Spawn 单发。
                 if !batch.is_empty() {
                     control.command_batch(std::mem::take(&mut batch));
                 }
-                control.spawn(*state, EntityDesc::default());
+                control.spawn(*state, desc.clone());
             }
             EngineCommand::Detonate {
                 center,

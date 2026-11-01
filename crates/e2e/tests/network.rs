@@ -924,6 +924,67 @@ async fn acn7_compound_shape_precedes_states() {
     shutdown(h).await;
 }
 
+/// F04a 端到端:`C2S::Spawn` 带 `desc.shape`(viewer 脚本 `spawn.shape` 链路
+/// 的最终帧)→ 服务端经 `spawn_owned` 生成**复合体**——该实体出现在
+/// `EntityShapes`(单格实体不出现)且形状逐格对;默认单格 spawn 不进
+/// `EntityShapes`。质量 = 格数 × 单格质量由 sim 生成路径钉住
+/// (`physics_sim` 复合体 0.729 kg/格,单元 03a 已验)。
+#[tokio::test(start_paused = true)]
+async fn f04a_spawn_with_shape_yields_compound() {
+    let h = harness(base_config(), PumpConfig::default(), (2, 60), true).await;
+    let (mut a, mut rx_a) = client(h.addr).await;
+    join(&mut a, &mut rx_a, 2).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, 3.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    advance_ticks(4).await;
+
+    let shape = types::CompoundShape::new(
+        (0..4)
+            .map(|x| types::ShapeCell {
+                offset: [x, 0, 0],
+                block: BlockId(1),
+            })
+            .collect(),
+    )
+    .expect("4 格");
+    // 单格默认 spawn(对照:不得进 EntityShapes)。
+    let single = spawn_entity(&mut a, &mut rx_a, Vec3::new(4.0, 3.0, 4.0)).await;
+    // 带 shape 的 spawn(viewer 链路同款帧)。
+    let compound = spawn_compound(&mut a, &mut rx_a, Vec3::new(10.5, 3.5, 10.5), &shape).await;
+
+    // 读帧直到含两个实体的 EntityStates,收齐途中的 EntityShapes。
+    let mut got: Option<types::CompoundShape> = None;
+    for _ in 0..400 {
+        match next_frame(&mut rx_a).await {
+            Some(S2C::EntityShapes { shapes }) => {
+                assert!(
+                    shapes.iter().all(|(e, _)| *e != single),
+                    "默认单格 spawn 不得出现在 EntityShapes"
+                );
+                got = shapes
+                    .into_iter()
+                    .find(|(e, _)| *e == compound)
+                    .map(|(_, s)| s);
+            }
+            Some(S2C::EntityStates { states, .. })
+                if states.iter().any(|(e, _)| *e == compound)
+                    && states.iter().any(|(e, _)| *e == single) =>
+            {
+                break;
+            }
+            Some(_) => {}
+            None => {}
+        }
+    }
+    let seen = got.expect("带 shape 的 spawn 应以复合体出现在 EntityShapes");
+    assert_eq!(seen.cells().len(), 4, "格数 = shape.cells");
+    assert_eq!(seen, shape, "偏移与方块逐格一致");
+    shutdown(h).await;
+}
+
 // ---------------------------------------------------------------------------
 // AC-N5 背压
 // ---------------------------------------------------------------------------

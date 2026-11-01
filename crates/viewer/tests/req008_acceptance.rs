@@ -204,6 +204,7 @@ screenshot = { name = "return", expect = "地面上有方块", hud = true }
             spacing: 2.0,
             velocity: Vec3::new(0.0, 3.0, 0.0),
             label: Some("blast".to_owned()),
+            shape: None,
         }
     );
     assert_eq!(
@@ -214,6 +215,7 @@ screenshot = { name = "return", expect = "地面上有方块", hud = true }
             spacing: 1.6,
             velocity: Vec3::ZERO,
             label: None,
+            shape: None,
         },
         "spawn 缺省:count 1、spacing 1.6、velocity 0"
     );
@@ -544,7 +546,7 @@ check = { labeled_alive = { label = "b", eq = 3 } }
         .commands
         .iter()
         .map(|c| match c {
-            EngineCommand::Spawn { state } => (state.translation, state.linvel),
+            EngineCommand::Spawn { state, .. } => (state.translation, state.linvel),
             other => panic!("只应有生成命令:{other:?}"),
         })
         .collect();

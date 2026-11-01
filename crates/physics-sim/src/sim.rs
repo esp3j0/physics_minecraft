@@ -7406,6 +7406,9 @@ mod tests {
             let mut cfg = ShardSimConfig::new(shard_id(0, 0));
             cfg.solidify.enabled = false;
             cfg.cohesion.enabled = true;
+            // F04a:本用例测 §7.3 第 7 条"均摊砸地形"的旧语义(F02a 起
+            // `impact_flow` 生效时被冲量流路径取代),显式关闭(§5.7.5 迁移)。
+            cfg.cohesion.impact_flow = false;
             let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
             s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
             let id = entity(1);
@@ -10976,9 +10979,14 @@ mod tests {
     /// 正下方悬空的 2 格 dirt 段,其请求 impulses 恰含 (β·J, 撞击格中心)。
     ///
     /// 变红:evaluate_impacts 没登记表;登记了但方向/格错;表被隔拍消费。
+    ///
+    /// F04a:显式关 `impact_flow`——本用例测 §5.6"撞击落写冲量表 → 承载
+    /// 转换继承 β·J"的**旧路径**(冲量流生效时撞击破坏走 §5.7,落写口径
+    /// 不同);其余 knockback_* 均为白盒构造(不经真实撞击),不受影响。
     #[test]
     fn knockback_k02_impact_path_feeds_inheritance() {
         let (mut s, hit, seg) = knockback_scene();
+        s.cfg.cohesion.impact_flow = false;
         // 17 m/s 落体砸 hit(撞击速度基准 15 m/s > 1 m/s 接近门槛;D(dirt)
         // 阈值 7 N·s,采样深度 0.1 m 回到 hit 格)。
         s.apply_prefix(&[impact_drop_input(1, entity(1), hit.x, -50.0, hit.z, -15.0)]);
@@ -11333,6 +11341,9 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.destruction.enabled = true;
         cfg.destruction.max_impact_breaks_per_tick = 3;
+        // F04a:本用例测 REQ-009 §5 范围 2"上限 + 不推迟"的旧语义(冲量流
+        // 路径的名额口径不同),显式关闭(§5.7.5 迁移)。
+        cfg.cohesion.impact_flow = false;
         use voxel::WorldGenerator as _;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         for cx in 2..=6i32 {

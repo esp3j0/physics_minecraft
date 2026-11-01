@@ -14,7 +14,7 @@ mod parse;
 pub mod manifest;
 
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, EntityId, EntityState};
+use types::{BlockId, BlockPos, CompoundShape, EntityDesc, EntityId, EntityState};
 
 /// 解析后的场景(REQ-008 §3.1)。
 #[derive(Debug, Clone, PartialEq)]
@@ -57,13 +57,15 @@ pub enum Action {
     Couple {
         on: bool,
     },
-    /// `count` 缺省 1,`spacing` 缺省 1.6,`velocity` 缺省 0。
+    /// `count` 缺省 1,`spacing` 缺省 1.6,`velocity` 缺省 0,`shape` 缺省
+    /// None(单格;F04a:给了 `shape` 发复合体,`at` = 原点格 `[0,0,0]` 的格心)。
     Spawn {
         at: SpawnAt,
         count: u32,
         spacing: f32,
         velocity: Vec3,
         label: Option<String>,
+        shape: Option<CompoundShape>,
     },
     Detonate {
         at: DetonateAt,
@@ -210,9 +212,11 @@ pub struct FrameInput<'a> {
 /// 引擎要求渲染层发给服务器的命令。
 #[derive(Debug, Clone, PartialEq)]
 pub enum EngineCommand {
-    /// 生成动态立方体(`EntityDesc` 用默认值)。
+    /// 生成动态实体(`shape` = None 时 `EntityDesc` 用默认单格;F04a:
+    /// 有 `shape` 时带复合形状,`state.translation` = 原点格 `[0,0,0]` 格心)。
     Spawn {
         state: EntityState,
+        desc: EntityDesc,
     },
     Detonate {
         center: Vec3,
@@ -229,6 +233,12 @@ pub enum EngineCommand {
 pub const FILL_MAX_CELLS: usize = 4096;
 /// `fill` 每帧最多发出的 `SetBlock` 条数(服务器分片收件箱每拍 256 条,REQ-009 §10)。
 pub const FILL_BATCH_PER_FRAME: usize = 64;
+
+/// 复合体每格 cuboid 半边长(F04a `spawn.shape`;与核内
+/// `physics_sim::destruction::DEBRIS_HALF_SIZE` 同值——viewer 不依赖
+/// physics-sim,常量镜像,`snapshot` 侧有同款先例;服务端按 desc 重建
+/// collider,值不一致只会改质量/手感,不会拒绝)。
+pub const COMPOUND_HALF_SIZE: f32 = 0.45;
 
 /// 截图请求:渲染层在当帧画完后截取并保存为 [`ScreenshotRequest::file_name`]。
 #[derive(Debug, Clone, PartialEq)]
