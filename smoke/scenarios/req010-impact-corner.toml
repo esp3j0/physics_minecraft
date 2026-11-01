@@ -1,6 +1,6 @@
 name = "req010-impact-corner"
 req = "REQ-010"
-description = "石门框去掉左柱成 7 字形悬臂;一颗带初速的方块撞上门楣-柱顶拐角接缝:拐角格被撞碎(碎块竖直落下,§5 修订 8 零初速),石柱底部残留站立,剩余三格门楣失去地基,作为一根一字复合刚体整段转换并按 §5.6 继承撞击冲量——带水平击退漂移与轻微翻滚坠落,落在门楣原位侧旁地面凝固"
+description = "石门框去掉左柱成 7 字形悬臂;一颗方块以 40 m/s 斜撞门楣-柱顶拐角:撞击冲量沿粘结网络传到地基,最小割是石柱脚下的石-土粘结(C = 7),整个 7 字(6 格)从柱脚断开、作为一个复合刚体带着平动与翻滚飞出,投射物修正后继续前进;落地后凝固(REQ-010 §5.7.1 末行、§5.7.2;修订 11 改写,原 §5.6 击退语义见 impact_flow = false 回归集)"
 timeout_secs = 240
 
 [server]
@@ -11,136 +11,141 @@ enabled = true
 
 [server.cohesion]
 enabled = true
-# 门楣残段 3 格整段成一根复合条(默认 2 会按世界网格切成 2 格条 + 1 格碎块)。
-compound_split_size = 4
-# F04b 前暂时关闭:冲量流默认开启后,撞击把整个"7"字从柱脚断走
-# (check 38/39"柱底残留站立"得 air),场景期望按 §5.7.1 末行改写由
-# 总架构师在 F04b 定稿;本场景期望文本不改。
-impact_flow = false
+# 切块网格 S = 6(默认):7 字 x=7..10、y=-60..-58 落在同一切块立方内,断下后整体成一个复合体。
 
 [[step]]
 label = "相机就位"
 camera = { pos = [9.0, -52.0, 36.0], yaw = -90.0, pitch = -15.0 }
 
 [[step]]
-look_at = { target = [7.0, -58.0, 17.0] }
+look_at = { target = [8.0, -58.0, 17.0] }
 
 [[step]]
 wait_until = { block = { pos = [9, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
 
 [[step]]
-label = "两根石柱(y=-60..-59)与石门楣(y=-58,x=5..8)"
-fill = { from = [5, -60, 20], to = [5, -59, 20], block = "stone" }
+label = "两根石柱(y=-60..-59)与石门楣(y=-58,x=7..10)"
+fill = { from = [7, -60, 20], to = [7, -59, 20], block = "stone" }
 
 [[step]]
-fill = { from = [8, -60, 20], to = [8, -59, 20], block = "stone" }
+fill = { from = [10, -60, 20], to = [10, -59, 20], block = "stone" }
 
 [[step]]
-fill = { from = [5, -58, 20], to = [8, -58, 20], block = "stone" }
+fill = { from = [7, -58, 20], to = [10, -58, 20], block = "stone" }
 
 [[step]]
-wait_until = { block = { pos = [5, -58, 20], is = "stone" }, timeout_ticks = 600 }
+wait_until = { block = { pos = [7, -58, 20], is = "stone" }, timeout_ticks = 600 }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
 label = "去掉左柱 → 7 字形(悬臂 3 ≤ B(石)=8,挂得住)"
-fill = { from = [5, -60, 20], to = [5, -59, 20], block = "air" }
+fill = { from = [7, -60, 20], to = [7, -59, 20], block = "air" }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
-check = { block = { pos = [5, -58, 20], is = "stone" } }
+check = { block = { pos = [7, -58, 20], is = "stone" } }
 
 [[step]]
-check = { block = { pos = [8, -59, 20], is = "stone" } }
+check = { block = { pos = [10, -59, 20], is = "stone" } }
 
 [[step]]
 screenshot = { name = "seven-shape", expect = "一个 7 字形石结构:右侧一根两格高石柱站在地上,柱顶向左横伸出一根四格长石门楣,门楣左端悬空;空中没有蓝色立方体" }
 
 [[step]]
-label = "相机推近拐角(击退 burst 连拍观察位)"
-camera = { pos = [7.0, -55.0, 28.0], yaw = -90.0, pitch = -20.0 }
+label = "相机推近拐角(连拍观察位)"
+camera = { pos = [9.0, -55.0, 29.0], yaw = -90.0, pitch = -20.0 }
 
 [[step]]
-look_at = { target = [7.0, -58.0, 20.0] }
+look_at = { target = [9.0, -58.0, 20.0] }
 
 [[step]]
-label = "发射方块撞门楣-柱顶拐角接缝(瞄准跨 (8,-58) 与 (8,-59) 两行石头,避开 1 格齐平取样的格界对齐)"
-spawn = { at = [14.0, -57.4, 20.2], count = 1, velocity = [-40.0, -7.0, 0.0], label = "projectile" }
-
-[[step]]
-wait_ticks = { n = 5 }
-
-[[step]]
-screenshot = { name = "burst-01-approach", expect = "一个 7 字形石结构清晰可见:两格高石柱立在右侧,四格长石门楣从柱顶向左横伸;拐角完好;一个蓝色投射物方块在结构右侧空中飞来尚未接触;空中没有其他蓝色立方体" }
-
-[[step]]
-wait_ticks = { n = 2 }
-
-[[step]]
-screenshot = { name = "impact", expect = "撞击已发生:原门楣失去支撑的三格已变成一根蓝色一字横条,大致仍在原门楣高度附近并开始向左水平漂移下坠(§5.6 击退);拐角处缺了格;一个蓝色方块(被撞碎的拐角碎块,修订 8 零初速)竖直落在石柱残段顶上;蓝色投射物已被弹开,出现在结构右侧空中;石柱底部灰色部分仍站立" }
-
-[[step]]
-wait_ticks = { n = 2 }
-
-[[step]]
-screenshot = { name = "burst-03-contact", expect = "蓝色一字横条向左下方漂移坠落中,与门楣原位置已有可见错位(击退水平漂移);柱顶上的蓝色碎块方块仍在;投射物在右侧空中继续飞离;石柱底部仍站立" }
+label = "发射方块撞门楣-柱顶拐角(跨 (10,-58) 与 (10,-59) 两行石头)"
+spawn = { at = [16.0, -57.4, 20.2], count = 1, velocity = [-40.0, -7.0, 0.0], label = "projectile" }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-04-bar-born", expect = "蓝色横条继续左移下降,姿态仍基本保持一字横平(轻微翻滚);柱顶蓝色碎块方块仍在;投射物在右下方空中" }
+screenshot = { name = "burst-01", expect = "7 字形石结构完整:右侧两格高石柱,柱顶向左伸出四格门楣;一个蓝色投射物方块从右侧飞来,即将撞上拐角" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "撞击已发生:整个 7 字(门楣四格和柱子两格)一起变成蓝色,作为一个整体离开原位;蓝色投射物在其右侧" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-03", expect = "蓝色 7 字整体向左飞出并开始倾斜翻转,形状保持完整、没有散开;原位置已空" }
 
 [[step]]
 wait_ticks = { n = 4 }
 
 [[step]]
-screenshot = { name = "burst-05-drift", expect = "蓝色横条已漂移到门楣原位左下方、位置明显偏离原门楣;柱顶蓝色碎块方块仍可见;投射物接近地面" }
+screenshot = { name = "burst-04", expect = "蓝色 7 字继续向左上方或左方飞行并旋转,形状完整;投射物在右侧低处" }
 
 [[step]]
 wait_ticks = { n = 5 }
 
 [[step]]
-screenshot = { name = "burst-06-drift-more", expect = "蓝色横条贴近地面,已明显离开门楣原位(水平漂移还在增大);石柱残段与其顶上的蓝色碎块仍在;投射物在右侧低空或已落地滚动" }
+screenshot = { name = "burst-05", expect = "蓝色 7 字明显倾斜(柱子一端翘起),整体向左下方落;形状完整" }
 
 [[step]]
-wait_ticks = { n = 10 }
+wait_ticks = { n = 8 }
 
 [[step]]
-screenshot = { name = "bar-falling", expect = "蓝色一字横条几乎贴地或刚落地(尚未凝固);石柱底部残段仍立在原位;投射物在右下角地面附近滚动或弹跳;柱顶蓝色碎块可能仍在或已凝固" }
+screenshot = { name = "burst-06", expect = "蓝色 7 字接近地面或落地翻滚,仍是一个完整的形状;投射物在右侧地面附近" }
 
 [[step]]
-wait_ticks = { n = 30 }
+wait_ticks = { n = 12 }
 
 [[step]]
-screenshot = { name = "burst-07-late", expect = "门楣横条已凝固成灰色一字条,躺在门楣原位左侧的地面上;石柱底部灰色残段站立;右下角的投射物仍为蓝色(滚动中)或已凝固;空中蓝色立方体至多剩投射物一个" }
-
-[[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1200 }
+screenshot = { name = "burst-07", expect = "7 字形状躺倒在原位置左侧的地面上(蓝色或正在凝固);投射物在右侧" }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
-label = "剩余门楣格已整段转走(承载判定接管;只有拐角被撞断才可能发生)"
-check = { block = { pos = [5, -58, 20], is = "air" } }
+screenshot = { name = "burst-08", expect = "7 字形状平躺在左侧地面上,可能已凝固成灰色;原位置没有任何残留" }
 
 [[step]]
-check = { block = { pos = [6, -58, 20], is = "air" } }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:原来的 7 字形石结构从原位完全消失;在原位置左侧的地面上平躺着一个灰色的 L 形(由 7 字倒下变成,一长边四格、一短边两格,共 6 格);右侧地面上有一个灰色方块(投射物);空中没有蓝色立方体" }
+
+[[step]]
+label = "全部落定、无悬浮"
+check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
+
+[[step]]
+label = "整个 7 字从柱脚断开飞走:原位置 6 格全空"
+check = { block = { pos = [10, -60, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [10, -59, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [10, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [9, -58, 20], is = "air" } }
+
+[[step]]
+check = { block = { pos = [8, -58, 20], is = "air" } }
 
 [[step]]
 check = { block = { pos = [7, -58, 20], is = "air" } }
 
 [[step]]
-label = "石柱底部残留仍站立(地上插着一小半)"
-check = { block = { pos = [8, -60, 20], is = "stone" } }
-
-[[step]]
-check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, -60, 20], is = "stone" } }
-
-[[step]]
-screenshot = { name = "settled", expect = "终态:一根灰色一字横条(原门楣三格)凝固躺在门楣原位左侧的地面上,横条姿态基本保持水平;石柱底部残段仍立在原地(被撞碎的拐角碎块竖直落回柱顶凝固,柱顶可能多出一格);发射方块凝固在结构右旁的地面上(落地翻滚后姿态可为斜躺);空中没有蓝色立方体" }
+label = "整个 7 字落在原位左侧(左侧区域 6 格石全部到位)"
+check = { count = { from = [-2, -60, 14], to = [6, -57, 26], is = "stone", ge = 6 } }

@@ -141,6 +141,57 @@ fn check_forms() {
     }
 }
 
+/// count 区域计数检查(F04b-2):正例(from/to 无序规整、区域格数 ≤ 上限)
+/// 与反例(缺键、多个比较键、超限、未知方块)。
+#[test]
+fn count_check_parses_and_rejects_malformed() {
+    // 正例:区域 20×2×10 = 400 ≤ 4096;from/to 各分量无序 → 规整为最小/最大。
+    let s = parse_scenario(&one_step(
+        r#"check = { count = { from = [10, -58, 20], to = [-9, -61, 29], is = "stone", ge = 2 } }"#,
+    ))
+    .expect("合法 count 应可解析");
+    match &s.steps[0].action {
+        Action::Check { checks } => {
+            assert_eq!(checks.len(), 1);
+            assert_eq!(
+                checks[0],
+                Check::Count {
+                    from: BlockPos::new(-9, -61, 20),
+                    to: BlockPos::new(10, -58, 29),
+                    is: BlockId(1),
+                    cmp: Cmp::Ge(2),
+                },
+                "from/to 应规整为各轴最小/最大(含两端)"
+            );
+        }
+        other => panic!("应为 check:{other:?}"),
+    }
+
+    // 反例(全部带步骤序号):
+    // ① 缺 from;② 缺 to;③ 缺 is;④ 缺比较项;⑤ 多个比较键;
+    // ⑥ 区域格数超 FILL_MAX_CELLS;⑦ 未知方块。
+    for (i, bad) in [
+        r#"check = { count = { to = [0, 0, 0], is = "stone", ge = 1 } }"#,
+        r#"check = { count = { from = [0, 0, 0], is = "stone", ge = 1 } }"#,
+        r#"check = { count = { from = [0, 0, 0], to = [1, 1, 1], ge = 1 } }"#,
+        r#"check = { count = { from = [0, 0, 0], to = [1, 1, 1], is = "stone" } }"#,
+        r#"check = { count = { from = [0, 0, 0], to = [1, 1, 1], is = "stone", ge = 1, le = 2 } }"#,
+        r#"check = { count = { from = [0, 0, 0], to = [100, 100, 100], is = "stone", ge = 1 } }"#,
+        r#"check = { count = { from = [0, 0, 0], to = [1, 1, 1], is = "lava", ge = 1 } }"#,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let e = err(&one_step(bad));
+        assert_eq!(e.step, Some(1), "反例 ①..⑦ 第 {i} 条应报步骤 1:{bad}");
+    }
+    // ⑥ 单独校验消息含上限数字(101³ = 1 030 301 > 4096)。
+    let e = err(&one_step(
+        r#"check = { count = { from = [0, 0, 0], to = [100, 100, 100], is = "stone", ge = 1 } }"#,
+    ));
+    assert!(e.to_string().contains("4096"), "超限消息应含上限:{e}");
+}
+
 /// 方块名经内置注册表解析:air/stone/dirt → 0/1/2;未知名字报错不落成空气。
 #[test]
 fn block_names_resolve_via_builtin_registry() {

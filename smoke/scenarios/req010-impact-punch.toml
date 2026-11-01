@@ -128,18 +128,12 @@ check = { block = { pos = [10, -58, 19], is = "dirt" } }
 check = { block = { pos = [10, -58, 21], is = "dirt" } }
 
 [[step]]
-label = "碎土飞到墙后落定(x > 10)"
-check = { block = { pos = [15, -60, 19], is = "dirt" } }
+label = "碎土飞到墙后落定(墙后区域 ≥ 2 格土)"
+check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "dirt", ge = 2 } }
 
 [[step]]
-check = { block = { pos = [18, -60, 20], is = "dirt" } }
-
-[[step]]
-label = "石条前段越过墙面所在平面,落在墙后"
-check = { block = { pos = [12, -60, 20], is = "stone" } }
-
-[[step]]
-check = { block = { pos = [12, -59, 20], is = "stone" } }
+label = "石条前段越过墙面所在平面,落在墙后(墙后区域 ≥ 2 格石)"
+check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "stone", ge = 2 } }
 
 [[step]]
 label = "石条后段停在墙前"

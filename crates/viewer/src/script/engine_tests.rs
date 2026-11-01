@@ -19,12 +19,14 @@ pub(crate) fn eid(n: u32) -> EntityId {
     EntityId::from_parts(0, n)
 }
 
-/// 假世界:全范围装载,y ≤ −61 为石头,其余空气;可逐格覆盖。
+/// 假世界:全范围装载,y ≤ −61 为石头,其余空气;可逐格覆盖;可标记未装载格。
 #[derive(Default)]
 struct FlatWorld {
     entities: Vec<(EntityId, Vec3)>,
     chunks: usize,
     overrides: std::collections::BTreeMap<(i32, i32, i32), types::BlockId>,
+    /// 强制未装载的格(block_at 返回 None;count 检查的未装载分支用)。
+    unloaded: std::collections::BTreeSet<(i32, i32, i32)>,
 }
 
 impl FlatWorld {
@@ -42,6 +44,9 @@ impl WorldQuery for FlatWorld {
         self.entities.clone()
     }
     fn block_at(&self, pos: types::BlockPos) -> Option<types::BlockId> {
+        if self.unloaded.contains(&(pos.x, pos.y, pos.z)) {
+            return None;
+        }
         if let Some(b) = self.overrides.get(&(pos.x, pos.y, pos.z)) {
             return Some(*b);
         }
@@ -317,6 +322,76 @@ check = { labeled_alive = { label = \"ghost\", ge = 1 } }",
     ));
 }
 
+/// count 区域计数(F04b-2):成立/不成立/from·to 无序;区域内任一格未装载
+/// → 检查不成立且消息写明未装载(不得当作 0 格数参与比较)。
+///
+/// 会变红的实现:比较方向写反(Ge↔Le);未装载当 0 格数(_ge=0 误成立);
+/// from/to 各分量不规整导致区域为空。
+#[test]
+fn count_check_counts_region_with_unloaded_verdict() {
+    // FlatWorld:y ≤ −61 石头,其余空气。区域 (0..2, −61..−60, 0..1) 内
+    // 石头格 = y=−61 一层 3×2 = 6 格。
+    let text = "[[step]]
+check = { count = { from = [0, -61, 0], to = [2, -60, 1], is = \"stone\", ge = 6 } }";
+
+    // 成立:恰 6 格满足 ge = 6。
+    let mut e = engine(text);
+    let w = FlatWorld::default();
+    let out = frame(&mut e, 0.016, 0, &w, &[]);
+    assert_eq!(
+        out.finished.first().map(|r| r.outcome.clone()),
+        Some(StepOutcome::Ok),
+        "区域内 6 格石,ge = 6 应成立"
+    );
+
+    // 不成立:同一区域 le = 5(6 格 > 5)。
+    let mut e = engine(
+        "[[step]]
+check = { count = { from = [0, -61, 0], to = [2, -60, 1], is = \"stone\", le = 5 } }",
+    );
+    let out = frame(&mut e, 0.016, 0, &w, &[]);
+    match out.finished.first().map(|r| r.outcome.clone()) {
+        Some(StepOutcome::CheckFailed(msgs)) => {
+            assert!(
+                msgs[0].contains("不满足"),
+                "失败消息应指明计数不符:{msgs:?}"
+            );
+        }
+        other => panic!("le = 5 应 CheckFailed,实得 {other:?}"),
+    }
+
+    // from/to 各分量无序(同 fill 口径):写反的对角与正写等价。
+    let mut e = engine(
+        "[[step]]
+check = { count = { from = [2, -60, 1], to = [0, -61, 0], is = \"stone\", ge = 6 } }",
+    );
+    let out = frame(&mut e, 0.016, 0, &w, &[]);
+    assert_eq!(
+        out.finished.first().map(|r| r.outcome.clone()),
+        Some(StepOutcome::Ok),
+        "对角写反应规整为同一区域"
+    );
+
+    // 区域内有格未装载 → 检查不成立,消息写明未装载(即使 ge = 0 也不成立)。
+    let mut w2 = w.clone_shallow();
+    w2.unloaded.insert((1, -61, 0));
+    for cmp_key in ["ge = 2", "ge = 0"] {
+        let mut e = engine(&format!(
+            "[[step]]\ncheck = {{ count = {{ from = [0, -61, 0], to = [2, -60, 1], is = \"stone\", {cmp_key} }} }}"
+        ));
+        let out = frame(&mut e, 0.016, 0, &w2, &[]);
+        match out.finished.first().map(|r| r.outcome.clone()) {
+            Some(StepOutcome::CheckFailed(msgs)) => {
+                assert!(
+                    msgs[0].contains("未装载"),
+                    "应写明未装载({cmp_key}):{msgs:?}"
+                );
+            }
+            other => panic!("未装载格应使检查不成立({cmp_key}),实得 {other:?}"),
+        }
+    }
+}
+
 /// FlatWorld 浅拷贝工具(overrides 可分叉)。
 impl FlatWorld {
     fn clone_shallow(&self) -> Self {
@@ -324,6 +399,7 @@ impl FlatWorld {
             entities: self.entities.clone(),
             chunks: self.chunks,
             overrides: self.overrides.clone(),
+            unloaded: self.unloaded.clone(),
         }
     }
 }

@@ -138,6 +138,15 @@ pub enum Check {
         pos: BlockPos,
         is: BlockId,
     },
+    /// 闭区间长方体(`from`/`to` 各分量不要求有序)内等于 `is` 的格数满足
+    /// `cmp`;格数上限 `FILL_MAX_CELLS`(解析期拒绝);区域内有格所在 chunk
+    /// 未装载 → 检查不成立(F04b-2:落点不确定的结论用区域计数表达)。
+    Count {
+        from: BlockPos,
+        to: BlockPos,
+        is: BlockId,
+        cmp: Cmp,
+    },
     ChunksLoaded(Cmp),
     /// 不存在"底面高出所在柱最高实心方块顶面 `height` 米以上、且最近 `still_ticks`
     /// 拍内位移不超过 0.05 m"的活实体。

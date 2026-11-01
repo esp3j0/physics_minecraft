@@ -657,6 +657,40 @@ impl EngineInner {
                     Some(b) => msgs.push(format!("方块 {pos:?} 是 {b:?},应为 {is:?}")),
                     None => msgs.push(format!("方块 {pos:?} 未装载,不等于任何方块")),
                 },
+                Check::Count { from, to, is, cmp } => {
+                    // 区域内任一格未装载 → 检查不成立(不下结论,不能当 0 格数)。
+                    let mut n = 0u64;
+                    let mut verdict = Ok(());
+                    for x in from.x..=to.x {
+                        for y in from.y..=to.y {
+                            for z in from.z..=to.z {
+                                match input.world.block_at(BlockPos::new(x, y, z)) {
+                                    Some(b) if b == *is => n += 1,
+                                    Some(_) => {}
+                                    None => {
+                                        verdict = Err(format!(
+                                            "区域 {from:?}..{to:?} 含未装载格 ({x},{y},{z}),不成立"
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                            if verdict.is_err() {
+                                break;
+                            }
+                        }
+                        if verdict.is_err() {
+                            break;
+                        }
+                    }
+                    match verdict {
+                        Err(m) => msgs.push(m),
+                        Ok(()) if !cmp_holds(*cmp, n) => msgs.push(format!(
+                            "区域 {from:?}..{to:?} 内 {is:?} 格数 {n} 不满足 {cmp:?}"
+                        )),
+                        Ok(()) => {}
+                    }
+                }
                 Check::ChunksLoaded(cmp) => {
                     let n = input.world.chunks_loaded() as u64;
                     if !cmp_holds(*cmp, n) {

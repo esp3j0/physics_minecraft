@@ -117,18 +117,5 @@ check = { block = { pos = [10, -58, 20], is = "air" } }
 check = { block = { pos = [10, -57, 20], is = "air" } }
 
 [[step]]
-label = "石柱向撞击方向(+x)倒下,横躺在地上凝固"
-check = { block = { pos = [11, -60, 20], is = "stone" } }
-
-[[step]]
-check = { block = { pos = [12, -60, 20], is = "stone" } }
-
-[[step]]
-check = { block = { pos = [13, -60, 20], is = "stone" } }
-
-[[step]]
-check = { block = { pos = [14, -60, 20], is = "stone" } }
-
-[[step]]
-label = "投射物落定在柱子原位前方"
-check = { block = { pos = [9, -60, 21], is = "stone" } }
+label = "石柱向撞击方向(+x)倒下,横躺凝固(原位右侧 ≥ 4 格石)"
+check = { count = { from = [11, -60, 16], to = [18, -57, 24], is = "stone", ge = 4 } }

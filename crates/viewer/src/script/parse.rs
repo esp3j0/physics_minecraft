@@ -305,6 +305,7 @@ fn parse_action(
             "live_entities",
             "labeled_alive",
             "block",
+            "count",
             "chunks_loaded",
             "no_floating",
             "timeout_ticks",
@@ -313,6 +314,7 @@ fn parse_action(
             "live_entities",
             "labeled_alive",
             "block",
+            "count",
             "chunks_loaded",
             "no_floating",
         ],
@@ -570,6 +572,46 @@ fn parse_checks(
                     .ok_or_else(|| "block 缺 is".to_owned())
                     .and_then(|v| block_id(v, registry, "block.is"))?;
                 checks.push(Check::Block { pos, is });
+            }
+            "count" => {
+                let ct = value.as_table().ok_or_else(|| {
+                    "count 应为 { from = [..], to = [..], is = \"..\", .. } 形式的表".to_owned()
+                })?;
+                reject_unknown(ct, &["from", "to", "is", "eq", "le", "ge"], "count")?;
+                let from_v = ct
+                    .get("from")
+                    .ok_or_else(|| "count 缺 from".to_owned())
+                    .and_then(|v| block_pos(v, "count.from"))?;
+                let to_v = ct
+                    .get("to")
+                    .ok_or_else(|| "count 缺 to".to_owned())
+                    .and_then(|v| block_pos(v, "count.to"))?;
+                let is = ct
+                    .get("is")
+                    .ok_or_else(|| "count 缺 is".to_owned())
+                    .and_then(|v| block_id(v, registry, "count.is"))?;
+                let cmp = cmp_of_inline(ct, "count")?;
+                // 两个对角顺序任意(同 fill 口径):规整为各轴最小/最大(含两端)。
+                let from = BlockPos::new(
+                    from_v.x.min(to_v.x),
+                    from_v.y.min(to_v.y),
+                    from_v.z.min(to_v.z),
+                );
+                let to = BlockPos::new(
+                    from_v.x.max(to_v.x),
+                    from_v.y.max(to_v.y),
+                    from_v.z.max(to_v.z),
+                );
+                // 单轴跨度先于乘积判限,避免 i64 乘积溢出(同 fill)。
+                let span = |lo: i32, hi: i32| i64::from(hi) - i64::from(lo) + 1;
+                let (sx, sy, sz) = (span(from.x, to.x), span(from.y, to.y), span(from.z, to.z));
+                let cells = sx * sy * sz;
+                if cells > FILL_MAX_CELLS as i64 {
+                    return Err(format!(
+                        "检查 count 的区域格数 {cells} 超过上限 {FILL_MAX_CELLS}"
+                    ));
+                }
+                checks.push(Check::Count { from, to, is, cmp });
             }
             "chunks_loaded" => checks.push(Check::ChunksLoaded(cmp(value, "chunks_loaded")?)),
             "no_floating" => {
