@@ -1509,6 +1509,7 @@ pub(crate) mod tests {
                 )
                 .expect("两格形状"),
                 impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }),
             None,
             "SpawnCompound 无路由(白名单外)"
@@ -1529,6 +1530,7 @@ pub(crate) mod tests {
                         )
                         .expect("两格形状"),
                         impulses: Vec::new(),
+                        velocity: (Vec3::ZERO, Vec3::ZERO),
                     })
                 ),
                 TranslateOutcome::Reject(_)

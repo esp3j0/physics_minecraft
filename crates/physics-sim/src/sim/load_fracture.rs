@@ -471,6 +471,9 @@ impl ShardSim {
                         origin,
                         shape,
                         impulses,
+                        // §5.6 邻接继承路径无初速度字段(REQ-010 §5.7.3:F02b
+                        // 的 `velocity` 只属于冲量流路径;默认零,既有行为不变)。
+                        velocity: (types::glam::Vec3::ZERO, types::glam::Vec3::ZERO),
                     });
             }
             for &cell in &segment {

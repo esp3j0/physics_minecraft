@@ -3235,9 +3235,17 @@ impl ShardSim {
     ///   记 `impact_flow_skipped_budget`;不拆半个事件。
     /// - **写入**(§5.7.3 第 4 条):S 内各格沿用 REQ-009 撞击写入(air、
     ///   `Emergent`、§4.11 唤醒、重建 collider、进入本拍承载判定的触发集);
-    ///   S 按 §5.5 切块成形(复合体请求 / 单格脱落),**本单元一律零初速**
-    ///   (动量分配与撞击者修正随 F02b)。
-    /// - **遥测**(§5.7.8):8 个计数;`impact_flow_corrections` 本单元恒 0。
+    ///   S 按 §5.5 切块成形(复合体请求 / 单格脱落),初速度按动量分配
+    ///   (§5.7.2,F02b)。
+    /// - **动量分配与撞击者修正**(§5.7.2,F02b):断开且名额够的事件调用
+    ///   [`crate::impact_flow::distribute_momentum`]——`contact_points` 用本
+    ///   单元采样的逐格聚合(每格一条 `(格, 冲量加权位置/该格冲量, 该格冲量)`,
+    ///   归格在采样时已完成);`ImpactBodyProps` 取撞击者 rapier 刚体的质量、
+    ///   世界系有效逆惯量(含旋转)与世界质心。撞击者在事件作用点 p 处受修正
+    ///   冲量 `apply_impulse_at_point` 并唤醒(物理步进之后施加,同拍 D4 碎裂
+    ///   在其后,`fracture_pieces` 读刚体速度自然含修正);计
+    ///   `impact_flow_corrections`。扛住与名额放弃的事件不分配、不修正。
+    /// - **遥测**(§5.7.8):8 个计数;`impact_flow_corrections` = 施加修正数。
     fn apply_impact_flow_events(
         &mut self,
         samples: BTreeMap<EntityId, ImpactFlowSample>,
@@ -3251,7 +3259,17 @@ impl ShardSim {
         }
         // 事件成形(§5.7.1):复合体均摊 J_T/|T|,单格 = 该格冲量和。
         // 空事件(|J| = 0、无格)丢弃;`s` = 各格 s_c 之和(浮点,排序用)。
-        let mut events: Vec<(f32, EntityId, ImpactEvent)> = samples
+        // `contact_points`(F02b,§5.7.2):采样逐格聚合的 `(格, 冲量加权位置/
+        // 该格冲量, 该格冲量)`——归格在采样时按 §5.7.1 完成(地形侧退 0.1 m),
+        // 纯函数不再对坐标取整。
+        // 事件 = (s 排序键, EntityId, 事件, 接触点 (格, 冲量加权位置, 冲量))。
+        type FlowEvent = (
+            f32,
+            EntityId,
+            ImpactEvent,
+            Vec<(types::BlockPos, Vec3, f32)>,
+        );
+        let mut events: Vec<FlowEvent> = samples
             .into_iter()
             .filter_map(|(id, s)| {
                 if s.cells.is_empty() || s.total <= 0.0 {
@@ -3270,6 +3288,15 @@ impl ShardSim {
                 } else {
                     return None;
                 };
+                // 接触点(§5.7.2):每格一条(格, 冲量加权位置/该格冲量,
+                // 该格冲量);该格冲量为 0(不可能,采样只累计 > 0 的点)
+                // 时防御性跳过。
+                let contact_points = s
+                    .cells
+                    .iter()
+                    .filter(|(_, (j, _))| *j > 0.0)
+                    .map(|(&c, (j, w))| (c, w / j, *j))
+                    .collect();
                 Some((
                     s.total,
                     id,
@@ -3278,6 +3305,7 @@ impl ShardSim {
                         impulse: s.vec,
                         point,
                     },
+                    contact_points,
                 ))
             })
             .collect();
@@ -3291,7 +3319,7 @@ impl ShardSim {
         // 判定(&self 借用随返回值结束),再写入(可变借用);后一个事件因此
         // 看得到前一个事件写的 air(AC-F7;借用规则要求判定与写入不同帧,
         // 二者的先后就是这里的依次语义)。
-        for (_, _id, event) in &events {
+        for (_, event_id, event, contact_points) in &events {
             let (outcome, segments) = self.plan_impact_flow_event(event, min, max_x, max_z);
             // 名额(§5.7.4):S 整体装不进**剩余**名额 → 整个事件放弃(不写、
             // 不断)。口径与承载转换一致:每段(单格或复合体)占 1 个实体名额。
@@ -3305,7 +3333,7 @@ impl ShardSim {
             stats.impact_flow_cells_visited += outcome.visited as u64;
             stats.impact_flow_budget_hits += outcome.truncated as u64;
             if outcome.detached.is_empty() {
-                // 扛住:建了网但 C ≥ s,无断开、无修正(修正随 F02b)。
+                // 扛住:建了网但 C ≥ s,无断开、无修正(§5.7.2:修正只随断开)。
                 continue;
             }
             stats.impact_flow_breaks += 1;
@@ -3313,9 +3341,73 @@ impl ShardSim {
                 stats.impact_flow_skipped_budget += 1;
                 continue;
             }
-            // 写入(§5.7.3 第 4 条):S 内各格 air、Emergent、唤醒、触发集、
-            // 冲量表(与逐格路径同源);零初速脱落请求。写 air 即刻落格,下一
-            // 个事件的判定看得到。
+            // 动量分配(§5.7.2,F02b):断开且名额够的事件;`ImpactBodyProps`
+            // 取撞击者 rapier 刚体的质量、世界系有效逆惯量(含旋转,rapier 的
+            // `effective_world_inv_inertia` 就是 R·diag(1/I)·Rᵀ)与世界质心。
+            // 撞击实体必然在场(本拍采到它的接触);不在 = 编程错误 fail-stop。
+            let props = {
+                let rec = self
+                    .entities
+                    .get(event_id)
+                    .expect("事件实体在本拍采样时在场");
+                let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                let inv = body.mass_properties().effective_world_inv_inertia;
+                crate::impact_flow::ImpactBodyProps {
+                    mass: body.mass(),
+                    inv_inertia: [
+                        [inv.m11, inv.m12, inv.m13],
+                        [inv.m12, inv.m22, inv.m23],
+                        [inv.m13, inv.m23, inv.m33],
+                    ],
+                    center_of_mass: conv::rapier_to_vec3(body.mass_properties().world_com),
+                }
+            };
+            let (correction, momenta) =
+                crate::impact_flow::distribute_momentum(event, &outcome, contact_points, &props);
+            // 撞击者修正(§5.7.2):在事件作用点 p 处施加 `correction` 并唤醒——
+            // 它不再停在墙面,以约 w 继续前进;修正只把 rapier 多扣的还回去,
+            // w ≤ u 自然成立,不 clamp(§5.7.2;clamp 两键只属于 §5.6 旧路径)。
+            // 物理步进之后施加:同拍 D4 碎裂(`evaluate_fractures` 在
+            // `evaluate_impacts` 之后)读刚体速度,`fracture_pieces` 继承的
+            // 速度自然含修正。零修正(ρ = 0 的边界)不施加、不计数。
+            if correction != Vec3::ZERO {
+                let rec = self
+                    .entities
+                    .get(event_id)
+                    .expect("事件实体在本拍采样时在场");
+                let handle = rec.handle;
+                let body = self.phys.bodies.get_mut(handle).expect("handle 有效");
+                body.apply_impulse_at_point(
+                    conv::vec3_to_rapier(correction),
+                    conv::vec3_to_rapier(event.point),
+                    true,
+                );
+                self.outbox.cohesion_stats.impact_flow_corrections += 1;
+            }
+            // 各段的初速度(§5.7.3):段 → 所属分量 k。分量按撞击粘结连通、
+            // 段按承载粘结 + 切块网格——段是分量的细分,**⊆ 某个分量**(可以
+            // 只占分量的一部分);跨两个分量 = 未知形态,fail-stop 而非自行
+            // 取舍。单格段 = 单格碎块,`impulse = 0.729·v_seg`(调度器
+            // `detach_spawn` 以 `linvel = impulse / 0.729` 换算,速度恰还原);
+            // ≥ 2 格段 = `velocity: (v_seg, ω_seg)` 直达 N+1 生成点。
+            let seg_velocities: Vec<(Vec3, Vec3)> = segments
+                .iter()
+                .map(|segment| {
+                    let k = momenta
+                        .iter()
+                        .find(|m| segment.iter().all(|c| m.cells.contains(c)));
+                    let k = k.unwrap_or_else(|| {
+                        panic!("段 {segment:?} 不整体落在任何动量分量内:未知形态 fail-stop")
+                    });
+                    let vels =
+                        crate::impact_flow::segment_velocity(k, std::slice::from_ref(segment));
+                    vels[0]
+                })
+                .collect();
+            // 写入(§5.7.3 第 4 条):S 内各格 air、Emergent、唤醒、触发集;
+            // 冲量表(F02b,§5.6 退役):`impact_flow` 生效时邻接继承不再执行
+            // (D12),冲量表不再写入——失去支撑的段零初速。写 air 即刻落格,
+            // 下一个事件的判定看得到。
             let mut dirty: Vec<types::ChunkPos> = Vec::new();
             let mut solid_blocks: std::collections::BTreeMap<types::BlockPos, types::BlockId> =
                 std::collections::BTreeMap::new();
@@ -3329,9 +3421,11 @@ impl ShardSim {
                 self.write_impact_detached_cell(cell, block, &mut dirty);
             }
             self.outbox.cohesion_stats.impact_flow_detached_cells += solid_blocks.len() as u64;
-            // 成形(§5.7.3):S 按承载粘结切块划分——1 格段 = 单格脱落请求,
-            // ≥ 2 格段 = 复合体生成请求;本单元一律零初速(impulses 空)。
-            for segment in &segments {
+            // 成形(§5.7.3):S 按承载粘结切块划分——1 格段 = 单格脱落请求
+            // (初速度 = v_seg,经 `impulse = 0.729·v_seg` 还原),≥ 2 格段 =
+            // 复合体生成请求(`velocity` 直达生成点;§5.6 退役:impulses 恒空,
+            // 速度不走邻接继承路径)。
+            for (segment, (v_seg, w_seg)) in segments.iter().zip(&seg_velocities) {
                 let solid_seg: Vec<types::BlockPos> = segment
                     .iter()
                     .filter(|c| solid_blocks.contains_key(c))
@@ -3347,7 +3441,7 @@ impl ShardSim {
                         .push(crate::destruction::DetachRequest {
                             cell,
                             block: solid_blocks[&cell],
-                            impulse: Vec3::ZERO,
+                            impulse: crate::destruction::DEBRIS_MASS * *v_seg,
                         });
                 } else {
                     let origin = crate::cohesion::compound_origin(&solid_seg);
@@ -3361,6 +3455,7 @@ impl ShardSim {
                             origin,
                             shape,
                             impulses: Vec::new(),
+                            velocity: (*v_seg, *w_seg),
                         });
                 }
             }
@@ -3429,7 +3524,7 @@ impl ShardSim {
     }
 
     /// 冲量流断下格的单格写入(REQ-009 撞击写入同款,§5.7.3 第 4 条):写 air、
-    /// 遥测、冲量表、触发集、Emergent、§4.11 唤醒。caller 负责成形、名额与
+    /// 遥测、触发集、Emergent、§4.11 唤醒。caller 负责成形、名额与
     /// collider 重建。
     fn write_impact_detached_cell(
         &mut self,
@@ -3440,9 +3535,9 @@ impl ShardSim {
         let _ = self.voxels.set_block(cell, types::BlockId::AIR);
         self.outbox.destruction_stats.cells_impacted += 1;
         self.outbox.destruction_stats.detached += 1;
-        // 冲量表(K02 §5.6 第 1 条):与逐格路径同源;`impact_flow` 下 §5.6
-        // 的消费路径(邻接继承)按 F02a 保持可用(零初速成形不影响)。
-        self.impact_impulses.insert(cell, Vec3::ZERO);
+        // 冲量表(F02b,§5.6 退役 / D12):`impact_flow` 生效时邻接继承不再
+        // 执行,冲量表不再写入——失去支撑的段零初速(动量只由 §5.7.2 的守恒
+        // 分配记账,叠加继承会重复计数)。本函数只在冲量流路径被调用。
         self.register_collapse_trigger(cell, block, types::BlockId::AIR);
         self.outbox.block_updates.push(BlockWrite {
             pos: cell,
@@ -3626,17 +3721,26 @@ impl ShardSim {
                 origin,
                 shape,
                 impulses,
+                velocity,
             } => {
                 // 承载转换复合体生成(REQ-010 §5.6 第 3 条,K02;调度器屏障盖章
                 // N+1 的专用命令,外部路径不可达——net 白名单与
                 // validate_external_command 都拒绝):初态与 K01 之前完全一致
-                // (原点格中心、零速、单位旋转、DEBRIS_HALF_SIZE 复合描述);
-                // impulses 非空时生成后逐条 `apply_impulse_at_point`(不合并,
-                // 保真力矩),全部施加完读回 linvel/angvel 按
-                // `load_knockback_max_speed`/`load_knockback_max_ang_speed` 对
-                // 模长 clamp(方向不变)后写回。β 已在构造侧乘入(§5.6 第 2 条);
-                // β = 0 时施加零冲量是数值 no-op(apply_impulse 对零冲量直接
-                // 短路),行为与零速路径逐位一致(AC-K4 已钉)。
+                // (原点格中心、零速、单位旋转、DEBRIS_HALF_SIZE 复合描述)。
+                // 两条速度路径(互斥,不叠加):
+                // - `impulses` 非空(§5.6 旧路径):生成后逐条
+                //   `apply_impulse_at_point`(不合并,保真力矩),全部施加完读回
+                //   linvel/angvel 按 `load_knockback_max_speed`/
+                //   `load_knockback_max_ang_speed` 对模长 clamp(方向不变)后
+                //   写回。β 已在构造侧乘入(§5.6 第 2 条);β = 0 时施加零冲量
+                //   是数值 no-op(apply_impulse 对零冲量直接短路),行为与零速
+                //   路径逐位一致(AC-K4 已钉)。
+                // - `velocity` 非零(§5.7.3,F02b):冲量流路径的初速度,生成后
+                //   **直接设定**,不经 `apply_knockback`、不 clamp——§5.7.2:速度
+                //   已被撞击者的动量自然封顶,clamp 两键只属于 §5.6 旧路径。
+                //   两条同时非空不会发生(§5.7 生效时构造侧 impulses 恒空);
+                //   万一同时非空,velocity 直接覆盖在 impulses 施加之后,以
+                //   velocity 为准。
                 let state = EntityState {
                     translation: Vec3::new(
                         origin.x as f32 + 0.5,
@@ -3644,8 +3748,8 @@ impl ShardSim {
                         origin.z as f32 + 0.5,
                     ),
                     rotation: types::glam::Quat::IDENTITY,
-                    linvel: Vec3::ZERO,
-                    angvel: Vec3::ZERO,
+                    linvel: velocity.0,
+                    angvel: velocity.1,
                 };
                 let desc = EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape);
                 self.spawn_entity(entity, state, desc, None, false);
@@ -10303,6 +10407,7 @@ mod tests {
                 origin: req.origin,
                 shape: req.shape.clone(),
                 impulses: req.impulses.clone(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }),
         }]);
         let state = s.entity_state(e).expect("复合体已生成");
@@ -10397,6 +10502,7 @@ mod tests {
                     )
                     .expect("两格"),
                     impulses,
+                    velocity: (Vec3::ZERO, Vec3::ZERO),
                 }),
             }]);
             s.entity_state(e).expect("已生成")
@@ -10452,6 +10558,7 @@ mod tests {
                 )
                 .expect("两格"),
                 impulses: vec![(Vec3::new(120.0, 120.0, 40.0), Vec3::new(64.5, -60.5, 64.5))],
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }),
         }]);
         let st = s.entity_state(e).expect("已生成");
@@ -10497,6 +10604,7 @@ mod tests {
                 )
                 .expect("两格"),
                 impulses: vec![(Vec3::new(120.0, 120.0, 40.0), Vec3::new(64.5, -60.5, 64.5))],
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }),
         }]);
         let st = s.entity_state(e).expect("已生成");
@@ -10620,6 +10728,7 @@ mod tests {
                 origin: req.origin,
                 shape: req.shape.clone(),
                 impulses: req.impulses.clone(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }),
         }]);
         let st = s.entity_state(e).expect("已生成");
@@ -11887,8 +11996,8 @@ mod tests {
         assert_eq!(stats.impact_flow_prefiltered, 0, "12 m/s 不命中预筛");
         assert_eq!(stats.impact_flow_skipped_budget, 0, "名额充足");
         assert_eq!(
-            stats.impact_flow_corrections, 0,
-            "F02a:撞击者修正恒 0(F02b 接线)"
+            stats.impact_flow_corrections, 1,
+            "F02b:断开事件施加撞击者修正(§5.7.2,12 m/s 单格撞柱断根)"
         );
     }
 
@@ -12026,5 +12135,504 @@ mod tests {
             on.is_empty(),
             "冲量流口径(开启):割 56 > s 扛住,不破——分派生效"
         );
+    }
+
+    // ============================== F02b(§5.7.2/§5.7.3)==============================
+
+    /// AC-F4(生产路径)/ AC-F5(修正)共用布景:零重力悬空土墩(bedrock
+    /// 垫 (10,3,8) + 土 (10,4,8)(10,5,8)),单格石方块 12 m/s 沿 −x 撞上格
+    /// ——共线撞击(接触点在质心行进线上,m_eff = m),割 7 < s ≈ 8.7 断上
+    /// 格,S = 上格单格。断言:①修正计 1 次(§5.7.2);②单格碎块初速非零、
+    /// 沿来袭方向(修订 8 零初速退役,AC-F6)、无横向分量(正撞 d̂ = −x)、
+    /// |v_seg| ≤ u(w ≤ u);③撞击者修正后沿 −x 前进(不再永久停在墙面,
+    /// §5.7.9 勘误 3)。守恒式的纯函数半边由 F01 的 e2e(AC-F4)钉住。
+    ///
+    /// 变红:修正漏施加 / 未计 corrections;单格碎块仍零初速(DetachRequest
+    /// .impulse = 0);碎块速度带横向分量(d̂ 算错);w 超 u(clamp 缺失)。
+    #[test]
+    fn impact_flow_momentum_and_correction_conservation() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        // 悬空土墩:垫 (10,3,8) bedrock、土 (10,4,8)、(10,5,8)。
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        for y in 4..=5 {
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, y, 8), voxel::builtin::DIRT);
+        }
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.45, 5.5, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        let mut corrections = 0u64;
+        let mut detached_impulse: Option<(BlockPos, Vec3, f32)> = None;
+        let mut impactor_vel_after = None;
+        for _ in 0..20 {
+            s.step();
+            let out = s.take_outbox();
+            corrections += out.cohesion_stats.impact_flow_corrections;
+            if !out.detach_requests.is_empty() {
+                let req = &out.detach_requests[0];
+                detached_impulse = Some((req.cell, req.impulse, s.entity_mass(id).unwrap()));
+                impactor_vel_after = s.entity_state(id).map(|st| st.linvel);
+                break;
+            }
+        }
+        assert_eq!(corrections, 1, "断开事件施加 1 次撞击者修正(§5.7.2)");
+        let (cell, impulse, mass) = detached_impulse.expect("上格应断下(割 7 < s)");
+        assert_eq!(cell, BlockPos::new(10, 5, 8), "S = 上格单格");
+        // 单格碎块初速(§5.7.3):调度器 detach_spawn 以 linvel = impulse/m
+        // 换算 → 请求 impulse = m·v_seg。零重力下 d̂ = (−1,0,0),v_seg =
+        // w·d̂ = Δv_k(单格分量,Δω = 0):沿 −x 且非零(零初速退役,AC-F6)。
+        assert!(
+            impulse.x < -1e-3,
+            "单格碎块初速沿 −x(来袭方向)非零(零初速退役):impulse = {impulse:?}"
+        );
+        let v_seg = impulse / mass;
+        assert!(
+            impulse.y.abs() < 1e-4 && impulse.z.abs() < 1e-4,
+            "正撞:d̂ = (−1,0,0),碎块初速无横向分量"
+        );
+        // w ≤ u(§5.7.2):|v_seg| ≤ 12(完全非弹性,共同速度不超原速)。
+        assert!(
+            v_seg.length() <= 12.0 + 1e-3,
+            "w ≤ u(共同速度不超原速):|v_seg| = {}",
+            v_seg.length()
+        );
+        // 撞击者沿 d̂ 的速度增加(勘误 3:不再永久停在墙面)。修正前 rapier
+        // 已把撞击者按固定墙解算(法向速度 ≈ 0),修正后应以约 w 沿 −x 前进。
+        let v_after = impactor_vel_after.expect("撞击者在场");
+        assert!(
+            v_after.x < -0.1,
+            "撞击者修正后沿 −x 前进(不再停墙面,勘误 3):v = {v_after:?}"
+        );
+    }
+
+    /// AC-F6(修订 8 坑内连锁上界):复现 F00 `momentum.py case5_pit` 构造
+    /// ——平地挖 1 格宽、2 格深的坑,坑底静置一块,第二块从上方 3 m 自由
+    /// 落体砸在它上面。F00 demo 记录(300 拍):旧规则无过滤脱落 6 格;
+    /// §5.7 规则(冲量流 + 守恒分配 + 接近速度过滤)= 0;F00b 内缩 + 旧规则
+    /// = 1(第二块真砸在坑底)。生产 §5.7 口径的连锁脱落格数按 demo 上界
+    /// 断言 ≤ 1(出处:demos/impact-flow/momentum.py 第 5 节输出)。
+    ///
+    /// 变红:勘误 4 退役零初速后连锁回归(坑壁对挤被计入供给 → 连锁 > 1)。
+    #[test]
+    fn impact_flow_pit_chain_detached_within_f00_bound() {
+        let mut s = flow_sim();
+        s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+        // 坑:挖 (11,0,8) 与 (11,-1,8)(1 格宽、2 格深;表层土 = y 0)。
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(11, 0, 8), types::BlockId::AIR);
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(11, -1, 8), types::BlockId::AIR);
+        refresh_collider(&mut s);
+        // 第一块:坑底静置位(坑底 = y −1 格的底面 y = −1;静置中心 =
+        // −1 + 0.45 = −0.55),零初速。
+        let (first, second) = (entity(1), entity(2));
+        s.apply_prefix(&[
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: first,
+                    state: EntityState {
+                        translation: Vec3::new(11.5, -0.55, 8.5),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc {
+                        half_size: 0.45,
+                        block: voxel::builtin::STONE,
+                        shape: None,
+                    },
+                }),
+            },
+            // 第二块:坑上方 3 m 自由落体(demo 口径)。
+            StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 2,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: second,
+                    state: EntityState {
+                        translation: Vec3::new(11.5, 2.45, 8.5),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc {
+                        half_size: 0.45,
+                        block: voxel::builtin::STONE,
+                        shape: None,
+                    },
+                }),
+            },
+        ]);
+        let mut detached_cells = 0u64;
+        for _ in 0..300 {
+            s.step();
+            let out = s.take_outbox();
+            detached_cells += out.cohesion_stats.impact_flow_detached_cells;
+        }
+        assert!(
+            detached_cells <= 1,
+            "AC-F6:修订 8 坑内工况连锁脱落 ≤ 1(F00 demo 上界),实际 {detached_cells}"
+        );
+        let _ = first;
+    }
+
+    /// AC-F5(扛住不修正,双开关逐位一致):布景用**两种口径都扛住**的
+    /// 工况——6 m/s 土块落平地:逐格口径 J ≈ 4.4 < 阈值 7 破不了;冲量流
+    /// 口径割 56 > s 同样扛住。双跑只有 `impact_flow` 不同:断言撞击者
+    /// **逐拍轨迹逐位一致**且 corrections 恒 0。扛住时冲量流不分配、
+    /// 不修正,撞击者物理与关闭完全同拍。
+    ///
+    /// 变红:扛住也修正(§5.7.2 边界破);分派在扛住路径上改变了物理。
+    #[test]
+    fn impact_flow_held_impactor_matches_off_bitwise() {
+        let run = |flow: bool| -> (Vec<EntityState>, u64) {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.solidify.enabled = false;
+            cfg.cohesion.enabled = true;
+            cfg.cohesion.impact_flow = flow;
+            let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let id = entity(1);
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: id,
+                    state: EntityState {
+                        translation: Vec3::new(10.5, 2.45, 8.5),
+                        linvel: Vec3::new(0.0, -6.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc {
+                        half_size: 0.45,
+                        block: voxel::builtin::DIRT,
+                        shape: None,
+                    },
+                }),
+            }]);
+            let mut trace = Vec::new();
+            let mut corrections = 0u64;
+            for _ in 0..40 {
+                s.step();
+                let out = s.take_outbox();
+                corrections += out.cohesion_stats.impact_flow_corrections;
+                trace.push(s.entity_state(id).expect("撞击者在场"));
+            }
+            (trace, corrections)
+        };
+        let (off, c_off) = run(false);
+        let (on, c_on) = run(true);
+        assert_eq!(c_off, 0, "关闭:无冲量流,corrections 恒 0");
+        assert_eq!(c_on, 0, "扛住(两种口径都不破):不修正");
+        assert_eq!(
+            off, on,
+            "扛住的撞击者:两开关逐拍轨迹逐位一致(冲量流不改物理)"
+        );
+    }
+
+    /// AC-F8(§5.6 退役):`impact_flow = true` 时 §5.6 的邻接继承不再执行
+    /// (D12)。布景(零重力悬空墩 + 侧挂 2 格):bedrock 垫 (10,3,8)、土
+    /// (10,4,8)(10,5,8)、侧挂 (11,5,8)(12,5,8)。12 m/s 撞上格:S =
+    /// {(10,5,8),(11,5,8),(12,5,8)}(割 7 < s 8.7;柱脚 (10,4,8) 在锚侧、
+    /// 立在 bedrock 上),切块把 S 分成 2 格复合体 + 1 格单格——**两者的初
+    /// 速度都来自守恒分配**(它们是 S 的一部分,带速度是本修订的正确物理)。
+    /// 断言:①冲量表全程为空(退役生产者:F02a 曾写零值占位,F02b 起不写);
+    /// ②全部复合体请求 `impulses` 空(退役消费者:K02 的 β·J 继承在冲量流
+    /// 下永不触发);③承载路径对同一布景不再追加任何失载请求(S 已把悬空
+    /// 结构整体带走;柱脚有支撑)——§5.6 时代的"失载段继承 β·J"再无来源。
+    /// 对照半边(关闭时继承照常)由既有
+    /// `knockback_k02_impact_path_feeds_inheritance` 钉住(不开 impact_flow,
+    /// 走逐格路径写冲量表,继承不退役)。
+    ///
+    /// 变红:冲量流路径仍写冲量表(F02a 行为);成形侧把 impulses 填上;
+    /// 失载侧重复计账(多出一个带 β·J 速度的复合体请求)。
+    #[test]
+    fn impact_flow_retires_knockback_inheritance() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        // 垫 (10,3,8) bedrock;土柱 (10,4,8)(10,5,8);侧挂梁 (11,5,8)(12,5,8)。
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        for y in 4..=5 {
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, y, 8), voxel::builtin::DIRT);
+        }
+        for x in 11..=12 {
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(x, 5, 8), voxel::builtin::DIRT);
+        }
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.45, 5.5, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        // 白盒:冲量流路径恒不写冲量表(§5.6 退役:不再写入)。
+        let mut compound_reqs = Vec::new();
+        for _ in 0..30 {
+            s.step();
+            let out = s.take_outbox();
+            assert!(
+                s.impact_impulses.is_empty(),
+                "冲量流路径不写冲量表(§5.6 退役):{:?}",
+                s.impact_impulses
+            );
+            for r in out.compound_requests {
+                compound_reqs.push(r);
+            }
+        }
+        // 成形侧(冲量流):S 的复合体请求 impulses 恒空(§5.7.3:速度走
+        // velocity 字段,§5.6 的 impulses 路径在冲量流下永不使用)。
+        let req = compound_reqs.first().expect("S 的 2 格段应成复合体");
+        assert_eq!(
+            req.shape.cells().len(),
+            2,
+            "复合体 = S 的 2 格段(切块网格;另 1 格走单格脱落)"
+        );
+        for r in &compound_reqs {
+            assert!(
+                r.impulses.is_empty(),
+                "§5.6 退役:冲量流路径的复合体 impulses 恒空(D12)"
+            );
+            assert!(
+                r.velocity.0 != Vec3::ZERO,
+                "S 的段带守恒分配的速度(不是零初速的失载段):{:?}",
+                r.velocity
+            );
+        }
+        // 失载侧:承载判定对同一布景没有再追加任何失载请求(悬空结构已被
+        // S 整体带走;柱脚立在 bedrock 上有支撑)——§5.6 时代的"失载段继承
+        // β·J"在冲量流下再无来源。等若干拍确认不再出现。
+        let mut extra = 0;
+        for _ in 0..10 {
+            s.step();
+            let out = s.take_outbox();
+            extra += out.compound_requests.len() + out.detach_requests.len();
+        }
+        assert_eq!(extra, 0, "失载侧零追加(继承路径退役):无来源");
+    }
+
+    /// AC-F4/F5(velocity 直达生成点,§5.7.3 第 4 条):`SpawnCompound` 的
+    /// `velocity` 非零时,生成实体初速度**直接等于**(线,角)——不经
+    /// `apply_knockback`、不被 `load_knockback_max_speed/ang_speed` clamp
+    /// (v_max = 0.001 的极端配置下速度照样保留;§5.7.2:速度已被撞击者的
+    /// 动量自然封顶,clamp 两键只属于 §5.6 旧路径)。impulses 与 velocity
+    /// 同给时以 velocity 为准(两路不会同时非空;此处只钉"velocity 直达")。
+    ///
+    /// 变红:消费臂忽略 velocity(零速生成);误走 apply_knockback(被
+    /// clamp 到 0.001)。
+    #[test]
+    fn spawn_compound_velocity_sets_state_without_clamp() {
+        let mut cfg = ShardSimConfig {
+            gravity: Vec3::ZERO,
+            ..ShardSimConfig::new(shard_id(0, 0))
+        };
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        cfg.cohesion.load_knockback_max_speed = 0.001;
+        cfg.cohesion.load_knockback_max_ang_speed = 0.001;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let id = entity(1);
+        let shape = types::CompoundShape::new(
+            (0..2)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("2 格");
+        let (v, w) = (Vec3::new(3.0, -1.0, 0.5), Vec3::new(0.0, 0.0, 2.0));
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnCompound {
+                entity: id,
+                origin: BlockPos::new(10, 5, 8),
+                shape,
+                impulses: Vec::new(),
+                velocity: (v, w),
+            }),
+        }]);
+        let st = s.entity_state(id).expect("复合体已生成");
+        assert!(
+            (st.linvel - v).length() < 1e-5,
+            "velocity 直达:linvel = {:?},want {v:?}",
+            st.linvel
+        );
+        assert!(
+            (st.angvel - w).length() < 1e-5,
+            "velocity 直达:angvel = {:?},want {w:?}",
+            st.angvel
+        );
+    }
+
+    /// AC-F5(穿墙条款,§5.7.10 末条;`demos/inset-slab/passage.py` 工况 1
+    /// 的生产路径复现):1 格厚土墙 w7h5 立在 bedrock 脚上(demo 墙 x=0、
+    /// 墙体 y 0..4、z −3..3,脚下 y −1..−3 bedrock,地表泥土 y=0);
+    /// 6 格石条(4.374 kg)沿运动方向纵置,打墙中行。demo 内缩口径结果
+    /// (passage_out.txt 行 10/12/14):10 m/s 断 1 格停在墙前(前缘
+    /// −0.564 不越面);15 m/s 一次事件断 2 格越过墙面(前缘 1.297);
+    /// 20 m/s 断 2 格穿过(前缘 3.661)。判定 = 终态前缘(最前格 +x 面)
+    /// 越过墙后表面。
+    ///
+    /// 生产坐标系映射(dirt_on_stone_chunk 土面 world y = 1;chunk (0,0)
+    /// 覆盖 world x/z 0..16):demo (x, y, z) → 生产 (x + 8, y + 1, z + 8)
+    /// ——墙 x=8、墙体 y 1..5、z 5..11、脚下 y 0..−2 bedrock;石条首格
+    /// (0, 3, 8)(复合体 translation = 原点格中心 (0.5, 3.5, 8.5),6 格
+    /// 伸到 x 0..5);dt 对齐 demo 的 1/30;gap = 2.55 m 与 demo 原生口径
+    /// 一致;判定面 = 墙后表面 x = 9(demo x=1)。
+    ///
+    /// **停等(2026-10-31,F02b)**:生产路径未复现 demo 的穿墙结论,实测
+    /// 与根因分析见 #21 回评;本测试 `#[ignore]` 留档,待总架构师裁定
+    /// (改布景对准 / 接受差异改写条款 / 拆分交付)后按裁定处理,不改布景
+    /// 或速度求绿。断言保留 demo 口径(ignore 下不跑)。
+    ///
+    /// 变红(解除 ignore 后):修正未接线(撞击者停在墙面,穿墙不成立);
+    /// 薄片口径错(卡洞口)。
+    #[test]
+    #[ignore = "停等:生产未复现 demo 穿墙结论,实测已报 #21 待裁定"]
+    fn impact_flow_wall_passage_matches_demo() {
+        const WALL_X: i32 = 8;
+        const GY: i32 = 1; // 生产土面(demo y=0 地表)
+        const FACE_BACK: f32 = 9.0; // 墙后表面(demo 判定面 x=1)
+        let wall_world = |s: &mut ShardSim| {
+            // 脚下 bedrock(demo y −1..−3 → 生产 0..−2)。
+            for y in (GY - 3)..=(GY - 1) {
+                for z in 5..=11 {
+                    let _ = s
+                        .voxels
+                        .set_block(BlockPos::new(WALL_X, y, z), voxel::builtin::BEDROCK);
+                }
+            }
+            // 墙体(demo y 0..4 → 生产 1..5)。
+            for y in GY..=(GY + 4) {
+                for z in 5..=11 {
+                    let _ = s
+                        .voxels
+                        .set_block(BlockPos::new(WALL_X, y, z), voxel::builtin::DIRT);
+                }
+            }
+            refresh_collider(s);
+        };
+        let bar_shape = types::CompoundShape::new(
+            (0..6)
+                .map(|i| types::ShapeCell {
+                    offset: [i, 0, 0],
+                    block: voxel::builtin::STONE,
+                })
+                .collect(),
+        )
+        .expect("6 格");
+        let run_case = |speed: f32| -> (f32, Vec<(i32, i32, i32)>, u64) {
+            let mut s = flow_sim();
+            // demo 工况 dt = 1/30(python rapier3d common.DT);生产默认
+            // 1/60 会让首触穿透深度与脉冲相位和 demo 不同(0.1 穿透才出
+            // 全脉冲)。对齐 demo 的步长,其余布景逐项同 demo。
+            s.cfg.dt = 1.0 / 30.0;
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            wall_world(&mut s);
+            // 6 格石条复合体:translation = 原点格中心 (0.5, 3.5, 8.5)
+            // (demo 原生口径:起点 (−8,2,0) 行格心 → 生产 (0,3,8))。
+            let id = entity(1);
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: id,
+                    state: EntityState {
+                        translation: Vec3::new(0.5, 3.5, 8.5),
+                        linvel: Vec3::new(speed, 0.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::compound(
+                        crate::destruction::DEBRIS_HALF_SIZE,
+                        bar_shape.clone(),
+                    ),
+                }),
+            }]);
+            let mut breaks = 0u64;
+            let mut air_cells = Vec::new();
+            for _ in 0..300 {
+                s.step();
+                let out = s.take_outbox();
+                breaks += out.cohesion_stats.impact_flow_breaks;
+                for w in &out.block_updates {
+                    if w.block == types::BlockId::AIR {
+                        air_cells.push((w.pos.x, w.pos.y, w.pos.z));
+                    }
+                }
+                // 终态:投射物静止(实体 id 全程不变)且断格已发生。
+                if breaks > 0
+                    && s.entity_state(id)
+                        .is_some_and(|st| st.linvel.length() < 0.05)
+                {
+                    break;
+                }
+            }
+            let front = s
+                .entity_state(id)
+                .map(|st| st.translation.x + 0.45)
+                .unwrap_or(f32::NEG_INFINITY);
+            (front, air_cells, breaks)
+        };
+        for (speed, want_pass) in [(10.0, false), (15.0, true), (20.0, true)] {
+            let (front, air, breaks) = run_case(speed);
+            assert!(breaks >= 1, "{speed} m/s:墙应被打断(断格 {air:?})");
+            assert!(
+                air.iter().all(|(_, y, _)| *y >= GY),
+                "只断墙体的土格(脚下 bedrock 是汇点):{air:?}"
+            );
+            assert_eq!(
+                front > FACE_BACK,
+                want_pass,
+                "{speed} m/s:终态前缘 {front}(demo 内缩口径:10 → 停在墙前,\
+                 15/20 → 越过墙面继续前进)"
+            );
+        }
     }
 }

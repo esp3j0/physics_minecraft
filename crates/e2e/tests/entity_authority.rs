@@ -320,6 +320,7 @@ fn k02_spawn_compound_rejected_on_external_path() {
         origin: types::BlockPos::new(1, 2, 3),
         shape,
         impulses: Vec::new(),
+        velocity: (Vec3::ZERO, Vec3::ZERO),
     };
     assert!(
         validate_external_command(&session, Some(InputSource(7)), shard_id(0, 0), &cmd).is_err(),

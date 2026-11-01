@@ -93,6 +93,10 @@ pub enum SimCommand {
         origin: BlockPos,
         shape: CompoundShape,
         impulses: Vec<(Vec3, Vec3)>,
+        /// 生成初速度(REQ-010 §5.7.3 第 4 条,F02b):(线速度, 角速度),世界系;
+        /// 默认零,生成后直接设定(不经 `apply_knockback`、不 clamp)。快照不升版
+        /// (请求是瞬态)。
+        velocity: (Vec3, Vec3),
     },
 }
 
@@ -256,6 +260,7 @@ mod tests {
                 origin: BlockPos::ZERO,
                 shape: two_cells,
                 impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
             }
             .ordinal(),
             10,

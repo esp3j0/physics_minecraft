@@ -172,8 +172,16 @@ pub struct CompoundRequest {
     pub shape: types::CompoundShape,
     /// 撞击击退冲量(REQ-010 §5.6 第 3 条;(impulse, point),point = 触发格中心,
     /// 世界坐标)。默认空 = 无撞击来源(移柱/爆炸),零初速不变;消费(逐条
-    /// `apply_impulse_at_point` + clamp)在单元 K02 接线。
+    /// `apply_impulse_at_point` + clamp)在单元 K02 接线。**`impact_flow` 生效时
+    /// §5.6 退役(REQ-010 修订 11 / D12):冲量流路径的请求 impulses 恒空,
+    /// 初速度改由 `velocity` 直达**。
     pub impulses: Vec<(types::glam::Vec3, types::glam::Vec3)>,
+    /// 生成初速度(REQ-010 §5.7.3 第 4 条,F02b):(线速度, 角速度),世界系。
+    /// 默认零 = 既有调用点零行为变化;生成后直接设定(不经 `apply_knockback`、
+    /// 不 clamp——§5.7.2:速度已被撞击者的动量自然封顶,clamp 两键只属于
+    /// §5.6 旧路径)。快照不升版(请求是瞬态)。
+    #[serde(default)]
+    pub velocity: (types::glam::Vec3, types::glam::Vec3),
 }
 
 /// 分块请求(REQ-010 §8.3 第 3 条;单元 06、07 复用):一个实体在本拍被删除,其一部分在 N+1 作为新实体出现。

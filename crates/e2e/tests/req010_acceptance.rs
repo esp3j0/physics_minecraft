@@ -5246,4 +5246,125 @@ mod unit_f02a {
             "同一命令日志双跑逐拍一致"
         );
     }
+
+    /// AC-F6(生产链路,§5.7.3):断下的单格碎块带初速度成形——同
+    /// `acc_f7_pillar` 布景(悬空土墩 + 12 m/s 单格方块侧撞),断下的土格
+    /// 经调度器 N+1 成形后**速度非零**(沿来袭方向被击飞;F02a 时为零速
+    /// 成形)。同时断言撞击者修正计 1 次(§5.7.2 接线)。
+    ///
+    /// 会变红的实现:冲量表/速度没一路带到生成点(DetachRequest.impulse
+    /// 在调度器或消费臂被丢弃/再归零);修正未计 corrections。
+    #[test]
+    fn acc_f6_detached_cell_spawns_with_velocity() {
+        let mut s = session();
+        let mut log = CommandLog::default();
+        let pier_base = p(64, -59, 64);
+        let pier_dirt = p(64, -58, 64);
+        set(&mut s, &mut log, &[pier_base], builtin::BEDROCK);
+        set(&mut s, &mut log, &[pier_dirt], DIRT);
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        let mut corrections = 0u64;
+        let mut broke = false;
+        for _ in 0..300 {
+            let summary = s.tick();
+            corrections += summary.cohesion.impact_flow_corrections;
+            if block(&s, pier_dirt) == AIR {
+                broke = true;
+                break;
+            }
+        }
+        assert!(broke, "侧撞悬空土墩应断下土格(割 7)");
+        assert_eq!(corrections, 1, "断开事件施加撞击者修正(§5.7.2,遥测计 1)");
+        // N+1 涌现:断下的土格以 1 个单格实体出现,初速度沿 −x(来袭方向)
+        // 非零(击飞;w ≤ u = 12)。
+        for _ in 0..5 {
+            s.tick();
+        }
+        let mut spawned: Vec<(EntityId, types::glam::Vec3)> = Vec::new();
+        for id in 1u32..=16 {
+            let eid = EntityId::from_parts(types::EMERGENT_ORIGIN, id);
+            if let Some(st) = s.entity_state(shard(), eid) {
+                spawned.push((eid, st.linvel));
+            }
+        }
+        assert_eq!(spawned.len(), 1, "断下的土格成形为 1 个实体");
+        let v = spawned[0].1;
+        assert!(
+            v.x < -0.05,
+            "AC-F6:单格碎块初速沿来袭方向 −x 非零(被击飞),实际 {v:?}"
+        );
+        assert!(
+            v.length() <= 12.0 + 1e-2,
+            "w ≤ u(共同法向速度不超原速):|v| = {}",
+            v.length()
+        );
+        s.shutdown();
+    }
+
+    /// AC-F6/AC-F8(复合体段的 velocity 全链路,§5.7.3 第 4 条):同
+    /// `impact_flow_retires_knockback_inheritance` 的布景(unit 层)搬到
+    /// 生产会话——悬空墩(bedrock 垫 + 土柱)+ 侧挂 2 格,12 m/s 侧撞上格:
+    /// S = 上格 + 侧挂 2 格(割 7 < s),切块成 **2 格复合体段**(velocity
+    /// 非零,守恒分配)+ 1 格单格段。断言:N+1 生成的复合体实体**速度非零**
+    /// (调度器盖章透传 → SpawnCompound → 消费臂直接设定),失载侧零追加
+    /// (§5.6 退役)。
+    ///
+    /// 会变红的实现:调度器盖章丢 velocity(零速复合体);消费臂忽略
+    /// velocity;§5.6 邻接继承仍在跑(失载段重复计账)。
+    #[test]
+    fn acc_f6_compound_segment_velocity_full_chain() {
+        let mut s = session();
+        let mut log = CommandLog::default();
+        let mut cells: Vec<BlockPos> = vec![p(64, -59, 64), p(64, -58, 64)];
+        for x in 65..=66 {
+            cells.push(p(x, -58, 64));
+        }
+        let layout: Vec<(BlockPos, BlockId)> = cells
+            .iter()
+            .map(|&c| {
+                (
+                    c,
+                    if c == p(64, -59, 64) {
+                        builtin::BEDROCK
+                    } else {
+                        DIRT
+                    },
+                )
+            })
+            .collect();
+        for (c, b) in &layout {
+            set(&mut s, &mut log, &[*c], *b);
+        }
+        spawn_projectile(&mut s, &mut log, 1, 67.55, -57.5, 64.5);
+        // 等 S 断开 + N+1 生成 + 实体出现。
+        for _ in 0..40 {
+            s.tick();
+        }
+        // 涌现实体:侧挂 2 格复合体(带 velocity)与 1 格单格段——按质量
+        // 区分(复合体 2 × 0.729 kg,单格 0.729 kg),**复合体实体**的速度
+        // 必须非零(它只走 velocity 字段,不走 DetachRequest.impulse)。
+        let mut compound_vel: Option<types::glam::Vec3> = None;
+        let mut single_vel: Option<types::glam::Vec3> = None;
+        for id in 1u32..=16 {
+            let eid = EntityId::from_parts(types::EMERGENT_ORIGIN, id);
+            let Some(desc) = s.entity_desc(shard(), eid) else {
+                continue;
+            };
+            let st = s.entity_state(shard(), eid).expect("描述在场状态在场");
+            let cells = desc.shape.map(|sh| sh.cells().len()).unwrap_or(0);
+            if cells == 2 {
+                compound_vel = Some(st.linvel);
+            } else if cells == 0 {
+                single_vel = Some(st.linvel);
+            }
+        }
+        let cv = compound_vel.expect("侧挂 2 格应成形为复合体实体(质量 1.458 kg)");
+        assert!(
+            cv.length() > 0.05,
+            "AC-F6:复合体段带守恒分配的初速度(velocity 全链路:调度器盖章 \
+             → SpawnCompound → 消费臂),实际 {cv:?}"
+        );
+        let _ = single_vel;
+        s.shutdown();
+    }
 }
