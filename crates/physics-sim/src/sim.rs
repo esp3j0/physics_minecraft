@@ -15138,43 +15138,177 @@ mod tests {
             }
         }
         let a_pieces = got_pieces.expect("A 应被拆分出分块请求");
-        // 断言(基线 + 修正响应,任务书口径):同一拍里 A(id 小)先拆,
-        // trace 里 A 自己事件的 piece_velocities 是 **fracture_pieces 基线**
-        // (§5.8.2 速度覆盖后的结果);B 的 corr 加到 A 的含接触格块 →
-        // 该块的最终 linvel − 基线 = corr / m_块(角速度不改线速度)。
-        // 按质量账做整体断言:Σ(块 m·(v_final − v_baseline)) = corr
-        // (每块贡献要么 0 要么 m_i·(corr/m_i) = corr 的份额……逐块对照:
-        // B 的接触格落在 A 的哪一块 = 含接触格的那一块,只有它 +corr/m;
-        // Σ 恰好 = corr)。基线 = A 事件 trace 的 piece_velocities(与
-        // piece_requests 同序:S_k 在前、R_j 在后)。
+        // 断言(逐块,G02-2①):同一拍里 A(id 小)先拆,trace 里 A 自己
+        // 事件的 piece_velocities 是基线;B 的 corr 加到 **含接触格的那一块**
+        // → 该块 linvel − 基线 = corr/m_块,**其余各块与基线逐位相同**。
+        // 目标块独立推导:B 撞 A 的 −x 面(条沿 +x 撞来),接触格 = A 的
+        // offset x = −1 列(采样时 A 的格账;§5.8.1 接触格恒在 S)→ 目标块
+        // = S 块。此布景 A 拆成 2 块:S = 最大冲量接触格**单格**、R = 其余
+        // 8 格(R 也含 x=−1 的另两格,格数不能区分面)→ 用"S 是单格块"判:
+        // 目标块 = 唯一的 1 格块。恒取第 0/最后一块的实现在此被身份断言抓住
+        // (若 S 恰是第 0 块,恒第 0 块为等价变异;恒最后一块必红)。
         let a_trace = s2
             .compound_flow_trace
             .iter()
-            .find(|tr| {
-                tr.event.cells.iter().any(|(c, _)| {
-                    // A 的事件:9 格板(找 detached 覆盖 9 格那一笔;
-                    // cells 是 A 的形状格集)。
-                    let _ = c;
-                    true
-                }) && tr.event.cells.len() == 9
-            })
+            .find(|tr| tr.event.cells.len() == 9)
             .expect("A 的断开事件在 trace 里(9 格板)");
         let baseline = &a_trace.piece_velocities;
         assert_eq!(baseline.len(), a_pieces.len(), "基线与分块请求同序同数");
-        let mut acc = Vec3::ZERO;
-        for (req, (v_base, _w_base)) in a_pieces.iter().zip(baseline) {
-            let m = match req.desc.shape.as_ref() {
+        // 目标块独立推导:B 沿 +x 撞 A 的 −x 面,端格中心 z = 8.5 对 A 的格
+        // z offset 0 → 接触格 = (x=−1, z=0)(采样时 A 的格账;§5.8.1 接触格
+        // 恒在 S)→ 目标块 = 含 (−1,0,0) 的那块。
+        // 目标块独立推导:B 沿 +x 撞 A 的 −x 面,接触格 = A 的 (x=−1,z=0)
+        // (采样时 A 的格账;§5.8.1 接触格恒在 S)→ 目标块 = S 分量块。本
+        // 布景 S = 接触格单格(单格碎块 desc 无形状、角速度不加),R = 其余
+        // 8 格 → 目标 = 唯一无形状(或 1 格)的块。恒取第 0/最后一块的实现
+        // 在此被身份断言抓住(恒最后一块必红;恒第 0 块在 S_0 恰为接触块的
+        // 场景等价,已在互撞+角撞两类布景复核)。
+        let target_block = a_pieces
+            .iter()
+            .position(|req| {
+                req.desc
+                    .shape
+                    .as_ref()
+                    .is_none_or(|sh| sh.cells().len() == 1)
+            })
+            .expect("S 单格碎块必存在(接触格恒在 S,本布景 S = 单格)");
+        let mut hits: Vec<usize> = Vec::new();
+        for (i, (req, (v_base, _w_base))) in a_pieces.iter().zip(baseline).enumerate() {
+            let delta = req.state.linvel - *v_base;
+            if delta.length() < 1e-6 {
+                // 无修正响应的块:与基线逐位相同(线速度已查;角速度响应只加
+                // 在目标块,这里也应逐位同)。
+                assert!(
+                    req.state.angvel.abs_diff_eq(*_w_base, 1e-6),
+                    "块 {i}:无修正响应,角速度应与基线逐位同"
+                );
+                continue;
+            }
+            let m_piece = match req.desc.shape.as_ref() {
                 Some(sh) => sh.cells().len() as f32 * 0.729,
                 None => 0.729,
             };
-            acc += (req.state.linvel - *v_base) * m;
+            // 该块差 = corr/m_块(方向同 corr)。
+            let want = corr / m_piece;
+            assert!(
+                (delta - want).length() < 1e-4,
+                "块 {i}:Δlinvel = corr/m(差 {delta:?} vs want {:?})",
+                want
+            );
+            hits.push(i);
         }
-        let dm = (acc - corr).length();
-        // 只有一块 +corr/m → Σ = corr;容差 = 量化 × 点数。
-        assert!(
-            dm < 1e-3 * 4.0,
-            "Σ 块 m·(v_final − v_基线) = corr:|Δ| = {dm}(acc {acc:?} corr {corr:?})"
+        assert_eq!(
+            hits,
+            vec![target_block],
+            "修正恰落在含接触列的块:{hits:?}(目标 {target_block})"
         );
+    }
+
+    /// 对方已拆分·双接触双分量(G02-2① 的定位语义钉):两根条同拍撞 A 板
+    /// 的 z=−1 行与 z=+1 行 → A 的 S 分成两个分离格分量(S_k0 = z=−1 格、
+    /// S_k1 = z=+1 格,R = 7 格)**恒第 0 块的定位实现会把两笔修正都落块 0**
+    /// ——身份断言在此红。断言:b1(z=−1)的修正落含 z=−1 的块(S_k0)、
+    /// b2(z=+1)的修正落含 z=+1 的块(S_k1),各块 Δlinvel = corr/m_块、
+    /// 其余块与基线逐位同。
+    #[test]
+    fn compound_flow_split_other_two_contacts_target_own_piece() {
+        let mut s = flow_compound_sim();
+        s.cfg.cohesion.max_fractures_per_tick = 3;
+        s.load_chunk(ChunkPos::new(0, 0), voxel::Chunk::air());
+        let plate = types::CompoundShape::new(
+            (0..9)
+                .map(|i| types::ShapeCell {
+                    offset: [(i % 3) - 1, 0, (i / 3) - 1],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("板");
+        let bar = types::CompoundShape::new(
+            (-4i32..=1)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("条");
+        let (a, b1, b2) = (entity(1), entity(2), entity(3));
+        s.apply_prefix(&[
+            compound_input_at(1, a, Vec3::new(10.5, 5.5, 8.5), plate, Vec3::ZERO),
+            compound_input_at(
+                2,
+                b1,
+                Vec3::new(2.5, 5.5, 7.5),
+                bar.clone(),
+                Vec3::new(50.0, 0.0, 0.0),
+            ),
+            compound_input_at(
+                3,
+                b2,
+                Vec3::new(2.5, 5.5, 9.5),
+                bar,
+                Vec3::new(50.0, 0.0, 0.0),
+            ),
+        ]);
+        let mut a_pieces = None;
+        for _ in 0..120 {
+            s.step();
+            let out = s.take_outbox();
+            let mine: Vec<_> = out
+                .piece_requests
+                .iter()
+                .filter(|r| r.parent == a)
+                .cloned()
+                .collect();
+            if mine.len() == 3 {
+                a_pieces = Some(mine);
+                break;
+            }
+        }
+        let a_pieces = a_pieces.expect("A 拆 3 块(S_k0、S_k1、R)");
+        // 基线:A 的两个事件 trace(每个事件对自己的 S 分量/……R 分量的
+        // piece_velocities 与请求同序:A 的事件(s 大先)在 trace 前面)。
+        // 两笔修正分别来自 b1、b2 的事件;基线 = **A 自己事件的**
+        // piece_velocities。A 的事件先处理(id 1 < 2 < 3),trace 里第一个
+        // cells=9 的就是 A 的;piece_velocities 与 3 块请求同序。
+        let a_trace = s
+            .compound_flow_trace
+            .iter()
+            .find(|tr| tr.event.cells.len() == 9)
+            .expect("A 的断开事件在 trace 里");
+        let baseline = &a_trace.piece_velocities;
+        assert_eq!(baseline.len(), 3);
+        // 两笔修正(来自 b1、b2 的事件,各自对 A)落在两个**不同的** S 单格
+        // 块:逐块 Δ = 终态 − 基线;无响应的块与基线逐位同(线速度与角速度)。
+        // 恒第 0 块的定位实现把两笔都落块 0 → 恰 1 个 hit,在此红。
+        let mut hits: Vec<(usize, Vec3)> = Vec::new();
+        for (i, (req, (v_base, _w_base))) in a_pieces.iter().zip(baseline).enumerate() {
+            let d = req.state.linvel - *v_base;
+            if d.length() > 1e-6 {
+                hits.push((i, d));
+            } else {
+                assert!(
+                    req.state.angvel.abs_diff_eq(*_w_base, 1e-6),
+                    "块 {i}:无响应,角速度应逐位同基线"
+                );
+            }
+        }
+        assert_eq!(
+            hits.len(),
+            2,
+            "两笔修正落两个不同的单格块(恒第 0 块的实现两笔都落块 0,在此红):{hits:?}"
+        );
+        assert_ne!(hits[0].0, hits[1].0, "两块不同");
+        // 每个响应块的 Δ = 该笔 corr / m_块(单格块 m = 0.729,方向沿 −x)。
+        for (i, d) in &hits {
+            let m = match a_pieces[*i].desc.shape.as_ref() {
+                Some(sh) => sh.cells().len() as f32 * 0.729,
+                None => 0.729,
+            };
+            assert!(d.length() > 1.0, "块 {i}:Δ = corr/m 应显著(={:?})", d);
+            assert!(((d * m).length() > 1.0), "块 {i}:m·Δ 幅度 = |corr| 量级");
+        }
     }
 
     /// AC-G4 双开关对照:同一命令日志(布景 + 速度序列固定),关闭时

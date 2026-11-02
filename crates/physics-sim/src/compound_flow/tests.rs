@@ -1110,3 +1110,78 @@ fn cost_216_cells_release() {
         last.detached.len()
     );
 }
+
+/// 冲量作用于已成形分块请求(§5.8.2"对方已拆分";G02-2②):**旋转块**
+/// (L 形 4 格,绕 y 转 45° 再绕 x 转 30°)的角速度响应 = R_k·I_k⁻¹·R_kᵀ·
+/// (r × P)——解析值逐步构造(形状系逆惯量、世界力矩转形状系、结果转回
+/// 世界系),与 `apply_impulse_to_piece` 输出比对;**去 R_k 的实现**(直接
+/// 用形状系 I⁻¹ 乘世界力矩)在此红。线速度 + P/m、单格块不加角速度同钉。
+#[test]
+fn apply_impulse_to_piece_rotated_inertia_similarity() {
+    use types::glam::Quat;
+    // L 形 4 格:杆 3 格沿 +x,脚 1 格在首格上方(与 impact_flow 的 L 同款)。
+    let cells: Vec<BlockPos> = vec![p(0, 0, 0), p(1, 0, 0), p(2, 0, 0), p(0, 1, 0)];
+    let mut shape_cells: Vec<types::ShapeCell> = cells
+        .iter()
+        .map(|c| types::ShapeCell {
+            offset: [c.x, c.y, c.z],
+            block: types::BlockId(1),
+        })
+        .collect();
+    shape_cells.sort_by_key(|c| c.offset);
+    let shape = types::CompoundShape::new(shape_cells).expect("L 形 4 格");
+    let rot = Quat::from_rotation_y(45f32.to_radians()) * Quat::from_rotation_x(30f32.to_radians());
+    let mut state = types::EntityState {
+        translation: Vec3::new(10.0, 5.0, 3.0),
+        rotation: rot,
+        linvel: Vec3::new(1.0, 0.5, -0.5),
+        angvel: Vec3::new(0.05, -0.02, 0.1),
+    };
+    let point_w = Vec3::new(11.2, 5.6, 2.4);
+    let impulse = Vec3::new(0.0, 0.0, -40.0);
+    let before = state;
+    apply_impulse_to_piece(&mut state, Some(&shape), point_w, impulse);
+    // ---- 线速度:基线 + P/M_块(4 格)。
+    let m = cells.len() as f32 * CELL_MASS;
+    let dv = impulse / m;
+    assert!(
+        (state.linvel - (before.linvel + dv)).length() <= 1e-5,
+        "线速度 += P/m_块"
+    );
+    // ---- 角速度:解析值。
+    // 形状系力臂:com_l(形状系)→ 世界:R·com_l + t;力臂 r = point − com_w。
+    let com_l = component_center_of_mass(&cells);
+    let com_w = rot * com_l + state.translation;
+    let r = point_w - com_w;
+    let torque_w = r.cross(impulse);
+    // 形状系逆惯量 → 世界系相似变换:Δω_w = R·(I_l⁻¹·(Rᵀ·τ_w))。
+    let inv_l = component_inv_inertia(&cells);
+    let dw_want = rot * inertia_mul(&inv_l, rot.inverse() * torque_w);
+    let dw_got = state.angvel - before.angvel;
+    assert!(
+        (dw_got - dw_want).length() <= 1e-5,
+        "Δω = R·I⁻¹·Rᵀ·(r×P):got {dw_got:?} want {dw_want:?}(去 R_k 的实现在此红)"
+    );
+    // ---- 去掉 R_k 的错误口径(实为形状系 I⁻¹ 直接乘世界力矩)与正确值
+    //      的差必须显著(否则该工况测不出旋转)。
+    let dw_wrong = inertia_mul(&inv_l, torque_w);
+    assert!(
+        (dw_wrong - dw_want).length() > 0.5,
+        "工况敏感性:错误口径与正确解析值差 {}(须 > 0.5 才能抓出去 R_k)",
+        (dw_wrong - dw_want).length()
+    );
+    // ---- 单格块:线速度 + P/m、角速度不动。
+    let mut single = types::EntityState {
+        translation: Vec3::new(0.0, 0.0, 0.0),
+        rotation: rot,
+        linvel: Vec3::ONE,
+        angvel: Vec3::new(0.3, 0.2, 0.1),
+    };
+    let single_before = single;
+    apply_impulse_to_piece(&mut single, None, point_w, impulse);
+    assert!(
+        (single.linvel - (single_before.linvel + impulse / CELL_MASS)).length() <= 1e-6,
+        "单格块线速度 += P/m"
+    );
+    assert_eq!(single.angvel, single_before.angvel, "单格块不加角速度");
+}

@@ -31,7 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use types::glam::Vec3;
-use types::{BlockId, BlockPos};
+use types::{BlockId, BlockPos, CompoundShape, EntityState};
 use voxel::BlockRegistry;
 
 use crate::cohesion::{Dinic, impact_bond_between, impact_crush_between};
@@ -678,6 +678,44 @@ pub fn piece_velocity(
     let r = point - com;
     let dw = inertia_mul(&component_inv_inertia(cells), r.cross(impulse));
     (field + impulse / own.mass, angvel + dw)
+}
+
+/// 冲量作用于一个**已成形分块请求的状态**(世界系;§5.8.2"对方已拆分"条,
+/// G02-2②):线速度 `+ P/m_块`(单格块 m = 0.729);多格块角速度
+/// `+ R_k·I_k⁻¹·R_kᵀ·(r × P)`——`I_k` 是块在**形状系**(格 offset 系)里的
+/// 逆惯量,`r × P` 在世界系,须经过块的旋转 `R_k = state.rotation` 相似变换
+/// 到形状系求逆、再变换回来(`component_inv_inertia` 单位 = 形状系;裁定
+/// G02-2②:漏 R_k 时旋转块的结果是错的)。单格块不加角速度(已知近似,
+/// 同 §5.7.2/§5.8.2)。`point_w`/`P` 世界系;`desc_shape` = 块形状(None =
+/// 单格碎块)。`r` = `point_w −(R_k·质心_块 + 平移)`(世界系力臂)。
+pub fn apply_impulse_to_piece(
+    state: &mut EntityState,
+    desc_shape: Option<&CompoundShape>,
+    point_w: Vec3,
+    impulse: Vec3,
+) {
+    let m = match desc_shape {
+        Some(sh) => sh.cells().len() as f32 * CELL_MASS,
+        None => CELL_MASS,
+    };
+    state.linvel += impulse / m;
+    let Some(sh) = desc_shape.filter(|sh| sh.cells().len() > 1) else {
+        return;
+    };
+    let cells: Vec<BlockPos> = sh
+        .cells()
+        .iter()
+        .map(|c| BlockPos::new(c.offset[0], c.offset[1], c.offset[2]))
+        .collect();
+    let com_l = component_center_of_mass(&cells);
+    let r = point_w - (state.rotation * com_l + state.translation);
+    let torque_w = r.cross(impulse);
+    // 形状系逆惯量 I_l⁻¹ → 世界系:I_w⁻¹ = R·I_l⁻¹·Rᵀ;力矩按世界系给,
+    // 变换到形状系求 Δω 再变换回来(等价于 Δω_w = R·(I_l⁻¹·(Rᵀ·τ_w)))。
+    let inv = component_inv_inertia(&cells);
+    let r_k = state.rotation;
+    let torque_l = r_k.inverse() * torque_w;
+    state.angvel += r_k * inertia_mul(&inv, torque_l);
 }
 
 #[cfg(test)]

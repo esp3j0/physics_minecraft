@@ -30,10 +30,12 @@ pub(crate) struct CompoundFlowTrace {
 }
 
 /// `compound_flow` 新路径的按实体事件累计(G02,§5.8.1):`contacts` = 计入
-/// 接触点(局部系);`others` = 动态对方 → 计入点冲量和(o 一侧;同一对方
-/// 跨多个流形累加);`other_points` = 该对方 o 一侧接触点世界位置按冲量加权
-/// 的累计量(修正施加点);`other_cell_contacts` = 接触点落在 o 的哪些格
-/// (collider 序号集,供"对方已拆分"时定位含接触格的分块请求,§5.8.2);
+/// 接触点(局部系);`other_impulses` = 动态对方 → 计入点冲量和(o 一侧;
+/// 同一对方跨多个流形累加);`other_points` = 该对方 o 一侧接触点世界位置
+/// 按冲量加权的累计量(修正施加点);`other_cell_impulses` = o 一侧接触冲量
+/// 按 **o 的原形状格 offset** 累计(采样时 o 在场、collider_to_cell 有效,
+/// 键 = o 的 offset;供"对方已拆分"时定位含接触格的分块请求,§5.8.2——
+/// 裁定 G02-2①:处理期 o 的 collider 已随 remove_body 删除,不能事后反查);
 /// `other_props` = o 的质量属性快照(采样时的 rapier 质量/世界逆惯量/世界
 /// 质心;o 本拍被拆、刚体已删后 m_eff 仍可按采样时口径拆账)。`linvel` /
 /// `angvel` = B 本拍步进后的刚体速度(局部系)。
@@ -41,7 +43,7 @@ struct CompoundFlowSample {
     contacts: Vec<crate::compound_flow::ContactPoint>,
     other_impulses: BTreeMap<types::EntityId, f32>,
     other_points: BTreeMap<types::EntityId, (Vec3, f32)>,
-    other_cell_contacts: BTreeMap<types::EntityId, BTreeSet<(u32, u32)>>,
+    other_cell_impulses: BTreeMap<types::EntityId, BTreeMap<BlockPos, f32>>,
     other_props: BTreeMap<types::EntityId, crate::impact_flow::ImpactBodyProps>,
     linvel: Vec3,
     angvel: Vec3,
@@ -533,7 +535,7 @@ impl ShardSim {
                         contacts: Vec::new(),
                         other_impulses: BTreeMap::new(),
                         other_points: BTreeMap::new(),
-                        other_cell_contacts: BTreeMap::new(),
+                        other_cell_impulses: BTreeMap::new(),
                         other_props: BTreeMap::new(),
                         linvel,
                         angvel,
@@ -575,18 +577,30 @@ impl ShardSim {
                                 ),
                             });
                     }
-                    // 本体侧接触格的 collider 键(对方已拆分时,按"接触点落在
-                    // o 的哪些格"定位分块请求;key 为 o 侧 collider)。
+                    // o 一侧接触冲量按 **o 的原形状格 offset** 累计(G02-2①:
+                    // 采样时 o 在场,collider_to_cell 的键有效;处理期 o 被拆
+                    // 后 collider 已删,不能事后反查)。
                     let other_key = if side1 { key2 } else { key1 };
+                    let other_cell = if oid.is_some() {
+                        collider_to_cell.get(&other_key).copied()
+                    } else {
+                        None
+                    };
                     for pt in &m.points {
                         if pt.data.impulse <= 0.0 {
                             continue;
                         }
-                        if let Some(o) = oid {
-                            s.other_cell_contacts
+                        if let (Some(o), Some(cell_i_o)) = (oid, other_cell) {
+                            let off = {
+                                let rec_o = self.entities.get(&o).expect("oid 过滤已验证在场");
+                                let shape_o = rec_o.desc.shape().expect("对方也可能是复合体或单格");
+                                shape_o.cells()[cell_i_o].offset
+                            };
+                            *s.other_cell_impulses
                                 .entry(o)
                                 .or_default()
-                                .insert(other_key);
+                                .entry(BlockPos::new(off[0], off[1], off[2]))
+                                .or_insert(0.0) += pt.data.impulse;
                         }
                         // 世界作用点与局部换算(坐标对应:c65a8f6)。
                         let p_w = if side1 {
@@ -653,7 +667,7 @@ impl ShardSim {
             crate::compound_flow::CompoundEvent,
             BTreeMap<types::EntityId, (Vec3, f32)>,
             BTreeMap<types::EntityId, f32>,
-            BTreeMap<types::EntityId, BTreeSet<(u32, u32)>>,
+            BTreeMap<types::EntityId, BTreeMap<BlockPos, f32>>,
             BTreeMap<types::EntityId, crate::impact_flow::ImpactBodyProps>,
         );
         let mut candidates: Vec<CompoundCandidate> = samples
@@ -697,7 +711,7 @@ impl ShardSim {
                     ev,
                     s.other_points.clone(),
                     s.other_impulses.clone(),
-                    s.other_cell_contacts.clone(),
+                    s.other_cell_impulses.clone(),
                     s.other_props.clone(),
                 )
             })
@@ -708,10 +722,11 @@ impl ShardSim {
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
         candidates.truncate(self.cfg.cohesion.max_fractures_per_tick);
         candidates.sort_by_key(|(_, id, ..)| *id);
-        // 对方已拆分映射(§5.8.2):被拆实体 → (含接触格的那一块在 piece
-        // 请求里的下标, 块格 offset 集)。处理循环内被拆的实体按原 EntityId
-        // 记账;后续事件对它的修正按此落到分块请求。
-        let mut split_piece_index: BTreeMap<EntityId, BTreeSet<BlockPos>> = BTreeMap::new();
+        // 对方已拆分映射(G02-2①):被拆实体 → "原 offset → 该格所在分块
+        // 请求在 outbox.piece_requests 中的下标"。S_k、R_j 的格都是原形状
+        // offset,拆分时直接可得;后续事件对它的修正按 o 一侧累计冲量最大
+        // 的接触格(同值 BlockPos 升序)经此表定位。
+        let mut split_piece_index: BTreeMap<EntityId, BTreeMap<BlockPos, usize>> = BTreeMap::new();
         #[cfg(test)]
         let mut traces: Vec<CompoundFlowTrace> = Vec::new();
         for (_, id, ev, other_points, other_impulses, other_cells, other_props) in candidates {
@@ -867,6 +882,7 @@ impl ShardSim {
                 outcome.detached.len() as u64;
             self.outbox.cohesion_stats.bonds_broken += outcome.cut_bonds as u64;
             // 写入分块请求并删除原实体(§7.2 成形,(parent, index) N+1 路径)。
+            let piece_base = self.outbox.piece_requests.len();
             for (index, (piece_state, piece_desc)) in pieces.into_iter().enumerate() {
                 self.outbox
                     .piece_requests
@@ -881,22 +897,25 @@ impl ShardSim {
             self.phys.remove_body(handle);
             self.outbox.despawned.push(id);
             self.outbox.cohesion_stats.fracture_components += piece_cells.len() as u64;
-            // 对方已拆分映射:本实体被拆后,其全部块格(局部 offset)供后续
-            // 事件的修正定位含接触格的那一块分块请求。
-            split_piece_index.insert(
-                id,
-                outcome
-                    .detached
-                    .iter()
-                    .chain(split.r_components.iter().flat_map(|r| r.cells.iter()))
-                    .copied()
-                    .collect(),
-            );
+            // 对方已拆分映射(G02-2①):本实体被拆后,"原 offset → 该格所在
+            // 分块请求在 piece_requests 里的下标"(S_k∪R_j 的格都是原形状
+            // offset,第 i 块的格 = piece_cells[i],全局下标 = base+i)。
+            {
+                let mut cell_to_req: BTreeMap<BlockPos, usize> = BTreeMap::new();
+                for (i, cells) in piece_cells.iter().enumerate() {
+                    for &ci in cells {
+                        let off = shape.cells()[ci].offset;
+                        cell_to_req.insert(BlockPos::new(off[0], off[1], off[2]), piece_base + i);
+                    }
+                }
+                split_piece_index.insert(id, cell_to_req);
+            }
             // 对方修正(§5.8.2):`R·correction` 在 o 一侧接触点质心施加并
-            // 唤醒;o 已被拆时加到其含接触格的那一块分块请求(线速度 + P/M;
-            // 多格块角速度 + I⁻¹(r × P) 世界系;单格不加)。"含接触格"按采样
-            // 时记录的 o 侧接触 collider 键 → o 的格 offset 定位(不是 B 侧
-            // 的接触格)。
+            // 唤醒;o 已被拆时加到其**含接触格**的那一块分块请求(线速度
+            // + P/M;多格块角速度 + R_k·I_k⁻¹·R_kᵀ·(r × P);单格不加)。
+            // 定位(G02-2①):o 一侧累计冲量最大的接触格(同值 BlockPos
+            // 升序;采样时按 o 的原形状 offset 记账)→ 拆分时记的
+            // "原 offset → piece 下标"表;不再做任何兜底猜测。
             let mut trace_corrections: Vec<(Vec3, Vec3, types::EntityId, bool)> = Vec::new();
             for ((o, _share), corr) in other_list.iter().zip(&split.other_corrections) {
                 if corr == &Vec3::ZERO {
@@ -907,9 +926,8 @@ impl ShardSim {
                     let (pw, w) = other_points.get(o).expect("other_list ⊆ other_points");
                     pw / *w
                 };
-                self.outbox.cohesion_stats.compound_flow_corrections += 1;
                 if let Some(rec_o) = self.entities.get_mut(o) {
-                    // 去刚体:施加 + 唤醒。
+                    // 去刚体:施加 + 唤醒(真正施加才计数,§5.8.4)。
                     let h = rec_o.handle;
                     let b = self.phys.bodies.get_mut(h).expect("对方 handle 有效");
                     b.apply_impulse_at_point(
@@ -917,92 +935,42 @@ impl ShardSim {
                         conv::vec3_to_rapier(point_w),
                         true,
                     );
+                    self.outbox.cohesion_stats.compound_flow_corrections += 1;
                     trace_corrections.push((corr_w, point_w, *o, true));
-                } else if split_piece_index.contains_key(o) {
-                    // 去分块请求:o 已被拆。接触点落在 o 的哪些格 = 采样时 o
-                    // 侧接触 collider 键的格 offset(o 的 collider
-                    // translation_wrt_parent round → offset;键集与块格集求交)。
-                    let mut contact_offsets: Vec<[i32; 3]> = Vec::new();
-                    if let Some(o_side) = other_cells.get(o) {
-                        for &(cid, generation) in o_side {
-                            if let Some(col) = self.phys.colliders.get(
-                                rapier3d::geometry::ColliderHandle::from_raw_parts(cid, generation),
-                            ) {
-                                let t = col
-                                    .position_wrt_parent()
-                                    .map_or(Vec3::ZERO, |p| p.translation);
-                                contact_offsets.push([
-                                    t.x.round() as i32,
-                                    t.y.round() as i32,
-                                    t.z.round() as i32,
-                                ]);
-                            }
-                        }
-                    }
-                    let mut target: Option<usize> = None;
-                    for (k, req) in self.outbox.piece_requests.iter().enumerate().rev() {
-                        if req.parent != *o {
-                            continue;
-                        }
-                        match req.desc.shape.as_ref() {
-                            Some(sh) => {
-                                let piece_offsets: Vec<[i32; 3]> =
-                                    sh.cells().iter().map(|c| c.offset).collect();
-                                if piece_offsets
-                                    .iter()
-                                    .any(|off| contact_offsets.contains(off))
-                                {
-                                    target = Some(k);
-                                    break;
-                                }
-                            }
-                            // 单格块(无形状):角速度不加,只落到线速度;
-                            // 记为兜底候选。
-                            None => {
-                                if target.is_none() {
-                                    target = Some(k);
-                                }
-                            }
-                        }
-                    }
-                    let k = target.unwrap_or_else(|| {
-                        // 找不到含接触格的块时落到 (parent, index) 最大的分块
-                        // 请求:线速度仍要加(P/M),不丢修正。
-                        self.outbox
-                            .piece_requests
-                            .iter()
-                            .rposition(|req| req.parent == *o)
-                            .expect("被拆实体必有分块请求")
+                } else if let Some(cell_to_req) = split_piece_index.get(o) {
+                    // 去分块请求:o 已被拆。目标 = o 一侧累计冲量最大的接触格
+                    // 所在的块(同值按 BlockPos 升序取首个;BTreeMap 升序保证)。
+                    let cell_impulses = other_cells
+                        .get(o)
+                        .expect("已拆分对方必有采样时格冲量表(o 侧点进过 other_list)");
+                    let target_cell = cell_impulses
+                        .iter()
+                        .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0)))
+                        .map(|(pos, _)| *pos)
+                        .expect("格冲量表非空(other_list ⊆ other_cell_impulses)");
+                    let k = cell_to_req.get(&target_cell).copied().unwrap_or_else(|| {
+                        // 接触格不在 S_k∪R_j 的任何块 = 不可达(拆分覆盖
+                        // 全部格;合成校验外不存在)。debug panic,release
+                        // 丢弃修正、不计数(裁定 G02-2①)。
+                        debug_assert!(false, "接触格 {target_cell:?} 不在被拆实体的任何分块请求里");
+                        usize::MAX
                     });
-                    let m_piece = {
-                        let req = &self.outbox.piece_requests[k];
-                        match req.desc.shape.as_ref() {
-                            Some(sh) => sh.cells().len() as f32 * 0.729,
-                            None => 0.729,
-                        }
-                    };
-                    {
+                    if k != usize::MAX {
                         let req = &mut self.outbox.piece_requests[k];
-                        req.state.linvel += corr_w / m_piece;
-                        if let Some(sh) = req.desc.shape.as_ref().filter(|sh| sh.cells().len() > 1)
-                        {
-                            // 多格块:角速度 + I_块⁻¹(r × P),世界系块的旋转。
-                            let cells_w: Vec<BlockPos> = sh
-                                .cells()
-                                .iter()
-                                .map(|c| BlockPos::new(c.offset[0], c.offset[1], c.offset[2]))
-                                .collect();
-                            let com_l = crate::impact_flow::component_center_of_mass(&cells_w);
-                            let inv = crate::impact_flow::component_inv_inertia(&cells_w);
-                            let r = point_w - (req.state.rotation * com_l + req.state.translation);
-                            let torque = r.cross(corr_w);
-                            req.state.angvel += crate::impact_flow::inertia_mul(&inv, torque);
-                        }
+                        crate::compound_flow::apply_impulse_to_piece(
+                            &mut req.state,
+                            req.desc.shape.as_ref(),
+                            point_w,
+                            corr_w,
+                        );
+                        self.outbox.cohesion_stats.compound_flow_corrections += 1;
+                        trace_corrections.push((corr_w, point_w, *o, false));
+                    } else {
+                        trace_corrections.push((corr_w, point_w, *o, false));
                     }
-                    trace_corrections.push((corr_w, point_w, *o, false));
                 } else {
                     // 对方既不在场也没有分块请求(地形份额不会进 other_list;
-                    // 防御):修正丢弃。
+                    // 防御):修正丢弃、不计数(§5.8.4:只在真正施加时计)。
                     trace_corrections.push((corr_w, point_w, *o, false));
                 }
             }
