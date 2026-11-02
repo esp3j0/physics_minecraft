@@ -162,6 +162,7 @@ pub struct CohesionConfig {
     pub impact_flow: bool,
     pub impact_flow_max_cells: usize,
     pub impact_flow_max_events_per_tick: usize,
+    pub compound_flow: bool,
 }
 
 impl Default for CohesionConfig {
@@ -180,6 +181,7 @@ impl Default for CohesionConfig {
             impact_flow: c.impact_flow,
             impact_flow_max_cells: c.impact_flow_max_cells,
             impact_flow_max_events_per_tick: c.impact_flow_max_events_per_tick,
+            compound_flow: c.compound_flow,
         }
     }
 }
@@ -589,6 +591,7 @@ impl Config {
                 impact_flow: self.cohesion.impact_flow,
                 impact_flow_max_cells: self.cohesion.impact_flow_max_cells,
                 impact_flow_max_events_per_tick: self.cohesion.impact_flow_max_events_per_tick,
+                compound_flow: self.cohesion.compound_flow,
             },
         }
     }
@@ -1444,5 +1447,39 @@ unload_radius = 64
                 }
             }
         }
+    }
+
+    /// AC-G5(G02,§5.8.4/D19):`compound_flow` 键——默认 **false**(G01–G02
+    /// 期间,G03 起默认 true)、显式 true/false 可解析、roundtrip、→
+    /// ShardSimConfig 直传。
+    ///
+    /// 变红:默认仍为 true 或缺字段;直传漏键;roundtrip 丢键。
+    #[test]
+    fn compound_flow_key_parse_default_and_roundtrip() {
+        // 默认值:compound_flow = false(D19:G01–G02 默认关)。
+        let c = Config::load(None).expect("默认配置");
+        assert!(!c.cohesion.compound_flow, "默认 false(D19)");
+        // → ShardSimConfig 直传(同源,§12.1)。
+        let core = c.shard_sim_config(types::ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        ));
+        assert!(!core.cohesion.compound_flow);
+        // 解析(显式 true / false)。
+        let on = Config::from_toml_str("[cohesion]\ncompound_flow = true\n").expect("显式开");
+        assert!(on.cohesion.compound_flow);
+        let off = Config::from_toml_str("[cohesion]\ncompound_flow = false\n").expect("显式关");
+        assert!(!off.cohesion.compound_flow, "显式 false 可解析");
+        // roundtrip(显式 true 保真)。
+        let rt = Config::from_toml_str(&on.to_toml_string()).expect("roundtrip");
+        assert!(rt.cohesion.compound_flow, "roundtrip 保留 true");
+        // 直传(显式 true → core)。
+        let core_on = on.shard_sim_config(types::ShardId::new(
+            types::WorldId(0),
+            types::DimensionId(0),
+            types::ShardPos::new(0, 0),
+        ));
+        assert!(core_on.cohesion.compound_flow, "直传 true");
     }
 }

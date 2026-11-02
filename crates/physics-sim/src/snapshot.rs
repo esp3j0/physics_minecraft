@@ -253,6 +253,10 @@ impl ShardSim {
             // 式清理由测试自行处理,重建后为空)。
             #[cfg(test)]
             impact_flow_trace: Vec::new(),
+            #[cfg(test)]
+            compound_flow_trace: Vec::new(),
+            // §5.7 修正扣除表不入快照(G02;拍内表,同 impact_impulses 口径)。
+            impact_corrections_this_tick: BTreeMap::new(),
         })
     }
 }

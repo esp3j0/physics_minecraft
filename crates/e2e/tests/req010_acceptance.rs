@@ -3377,7 +3377,8 @@ mod unit08 {
                     max_converted_cells_per_tick = 64\nmax_fractures_per_tick = 3\ncompound_snap_lift = 1\n\
                     load_knockback_factor = 0.5\nload_knockback_max_speed = 8.0\n\
                     load_knockback_max_ang_speed = 6.0\nimpact_flow = false\n\
-                    impact_flow_max_cells = 1024\nimpact_flow_max_events_per_tick = 8\n";
+                    impact_flow_max_cells = 1024\nimpact_flow_max_events_per_tick = 8\n\
+                    compound_flow = false\n";
         let c = Config::from_toml_str(text).expect("合法");
         assert_eq!(
             c.shard_sim_config(shard()).cohesion,
@@ -3394,6 +3395,7 @@ mod unit08 {
                 impact_flow: false,
                 impact_flow_max_cells: 1024,
                 impact_flow_max_events_per_tick: 8,
+                compound_flow: false,
             }
         );
         assert_eq!(Config::from_toml_str(&c.to_toml_string()).expect("往返"), c);

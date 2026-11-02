@@ -60,6 +60,12 @@ pub struct CohesionConfig {
     /// 每分片每拍处理的撞击事件数上限(8,§5.7.4;按 `s` 降序、同值
     /// `EntityId` 升序选取,其余本拍不处理、不推迟)。
     pub impact_flow_max_events_per_tick: usize,
+    /// 复合体冲量流开关(G02,§5.8.4;G01–G02 期间默认 `false`,G03 起
+    /// 默认 `true`,D19)。生效条件 = `destruction.enabled` ∧ `cohesion.enabled`
+    /// ∧ 本键;关闭时 §7(局部断键 §7.1、拆分 §7.2)逐位不变(AC-G4);
+    /// 开启时 §7.1 的局部断键与压向豁免不再执行,§5.8 的惯性汇点冲量流
+    /// 接管"断哪里与动量分配"(§7.2 成形、§7.3 名额与 §5.3 砸地形照旧)。
+    pub compound_flow: bool,
 }
 
 impl Default for CohesionConfig {
@@ -77,6 +83,7 @@ impl Default for CohesionConfig {
             impact_flow: true,
             impact_flow_max_cells: 1024,
             impact_flow_max_events_per_tick: 8,
+            compound_flow: false,
         }
     }
 }
@@ -133,6 +140,17 @@ pub struct CohesionStats {
     pub impact_flow_skipped_budget: u64,
     /// 撞击者修正次数(F02a 恒 0——修正随 §5.7.2 在 F02b 接线)。
     pub impact_flow_corrections: u64,
+    /// 复合体冲量流入选并求值的事件数(G02,§5.8.4;含预筛命中)。
+    pub compound_flow_events: u64,
+    /// 复合体冲量流预筛跳过的事件数(G02,§5.8.4)。
+    pub compound_flow_prefiltered: u64,
+    /// 复合体冲量流判"断开"的事件数(G02,§5.8.4)。
+    pub compound_flow_breaks: u64,
+    /// 复合体冲量流断下的格数 Σ|S|(G02,§5.8.4)。
+    pub compound_flow_detached_cells: u64,
+    /// 复合体冲量流修正次数(G02,§5.8.4;施加给对方刚体或加到对方分块
+    /// 请求都计)。
+    pub compound_flow_corrections: u64,
 }
 
 impl CohesionStats {
@@ -161,6 +179,11 @@ impl CohesionStats {
         self.impact_flow_detached_cells += other.impact_flow_detached_cells;
         self.impact_flow_skipped_budget += other.impact_flow_skipped_budget;
         self.impact_flow_corrections += other.impact_flow_corrections;
+        self.compound_flow_events += other.compound_flow_events;
+        self.compound_flow_prefiltered += other.compound_flow_prefiltered;
+        self.compound_flow_breaks += other.compound_flow_breaks;
+        self.compound_flow_detached_cells += other.compound_flow_detached_cells;
+        self.compound_flow_corrections += other.compound_flow_corrections;
     }
 }
 
@@ -1244,7 +1267,7 @@ mod tests {
     /// 变红:漏加任一字段(合计比两分片之和小)。
     #[test]
     fn cohesion_stats_add_sums_every_field() {
-        // 第 i 个字段 = i·k(1..=23):mk(1) + mk(100) = mk(101) 当且仅当
+        // 第 i 个字段 = i·k(1..=28):mk(1) + mk(100) = mk(101) 当且仅当
         // 每个字段都被加过一次。
         let mk = |k: u64| CohesionStats {
             load_evaluations: k,
@@ -1270,6 +1293,11 @@ mod tests {
             impact_flow_detached_cells: 21 * k,
             impact_flow_skipped_budget: 22 * k,
             impact_flow_corrections: 23 * k,
+            compound_flow_events: 24 * k,
+            compound_flow_prefiltered: 25 * k,
+            compound_flow_breaks: 26 * k,
+            compound_flow_detached_cells: 27 * k,
+            compound_flow_corrections: 28 * k,
         };
         let (a, b) = (mk(1), mk(100));
         let mut sum = a;
