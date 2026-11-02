@@ -12,6 +12,7 @@
 pub mod activation;
 pub mod cohesion;
 pub mod collider_build;
+pub mod compound_flow;
 pub mod destruction;
 pub mod explosion;
 pub mod impact_flow;

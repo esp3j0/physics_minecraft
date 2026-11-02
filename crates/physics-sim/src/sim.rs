@@ -8443,8 +8443,9 @@ mod tests {
     }
 
     /// 任务书测试 `sim::i2_footprint_assertion`(I2/§14-7):钩子制造违反
-    /// (醒着 + 缺 ②)→ panic。
+    /// (醒着 + 缺 ②)→ panic。钩子只在 `debug_assertions` 下存在,测试随门。
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "I2 违反")]
     fn i2_footprint_assertion() {
         let mut s = sim(0, 0); // 无地形:足迹 (0,0) 缺 ①②

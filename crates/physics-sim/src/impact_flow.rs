@@ -146,8 +146,8 @@ pub struct ImpactBodyProps {
     pub center_of_mass: Vec3,
 }
 
-/// 3×3 行主序矩阵乘向量。
-fn inertia_mul(m: &[[f32; 3]; 3], v: Vec3) -> Vec3 {
+/// 3×3 行主序矩阵乘向量(`compound_flow` 复用)。
+pub(crate) fn inertia_mul(m: &[[f32; 3]; 3], v: Vec3) -> Vec3 {
     Vec3::new(
         m[0][0] * v.x + m[0][1] * v.y + m[0][2] * v.z,
         m[1][0] * v.x + m[1][1] * v.y + m[1][2] * v.z,
@@ -288,7 +288,19 @@ pub fn component_center_of_mass(cells: &[BlockPos]) -> Vec3 {
 /// 最后整体求逆(3×3 解析逆)。
 ///
 /// 返回 `Option`:分量退化为零体积(不可能,构造保证 ≥ 1 格)时为 `None`。
-fn component_inv_inertia(cells: &[BlockPos]) -> [[f32; 3]; 3] {
+/// `pub(crate)`:复合体冲量流的刚体响应复用同一张量构造与求逆(§5.8.1;
+/// 单元 G01)。
+pub(crate) fn component_inv_inertia(cells: &[BlockPos]) -> [[f32; 3]; 3] {
+    invert_symmetric_3x3(&component_inertia_tensor(cells))
+}
+
+/// 分量的惯量张量(未求逆;§5.7.2 完整 3×3,行主序,含惯性积;轴对齐姿态)。
+/// 逐格 cuboid(半边长 0.45、密度 1)对自身质心的惯量
+/// `I = m/12 · diag(b²+c², a²+c², a²+b²)`(a = b = c = 0.9)——立方格三轴
+/// 相等,`base = m(2h)²/6`(写成 /12 会把 Δω 放大 2 倍,G00 复核),
+/// 平行轴定理平移到分量质心,含惯性积。`component_inv_inertia` 与
+/// `compound_flow` 复用(单一来源)。
+pub(crate) fn component_inertia_tensor(cells: &[BlockPos]) -> [[f32; 3]; 3] {
     let com = component_center_of_mass(cells);
     let half = DEBRIS_HALF_SIZE;
     let cell_mass = DEBRIS_MASS_PER_CELL;
@@ -308,13 +320,13 @@ fn component_inv_inertia(cells: &[BlockPos]) -> [[f32; 3]; 3] {
     i[1][0] = i[0][1];
     i[2][0] = i[0][2];
     i[2][1] = i[1][2];
-    invert_symmetric_3x3(&i)
+    i
 }
 
 /// 3×3 对称矩阵的解析逆(行主序;奇异性不可能——至少 1 格的非零惯量)。
 /// `A = [[a,b,c],[b,d,e],[c,e,f]]`,伴随 = 余子式矩阵的转置(对称同位),
-/// `det = a·C00 + b·C01 + c·C02`。
-fn invert_symmetric_3x3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+/// `det = a·C00 + b·C01 + c·C02`(`compound_flow` 复用)。
+pub(crate) fn invert_symmetric_3x3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let (a, b, c, d, e, f) = (m[0][0], m[0][1], m[0][2], m[1][1], m[1][2], m[2][2]);
     let c00 = d * f - e * e;
     let c01 = c * e - b * f;
@@ -558,7 +570,12 @@ pub fn min_impact(registry: &dyn BlockRegistry) -> f32 {
 }
 
 /// 供给量化:逐格向下取整(§5.7.1;负供给不存在,冲量非负)。
-fn quant_supply(s: f32) -> u64 {
+/// `pub(crate)`:复合体冲量流(`compound_flow`,§5.8.1)复用同一整化口径。
+/// 乘法在 f32 内做(F01 起钉死的行为:18.001 的 f32 真值 18.0009995 经
+/// f32 乘法舍入到 18001.0 → 断;改 f64 得 18000.9994 → floor 18000,
+/// 翻转既有语义)。大 s(≥ 1.7e7 量化单位)下 f32 丢位是两套冲量流共享的
+/// 已知边界。
+pub(crate) fn quant_supply(s: f32) -> u64 {
     if s <= 0.0 {
         0
     } else {
@@ -566,8 +583,8 @@ fn quant_supply(s: f32) -> u64 {
     }
 }
 
-/// 容量量化:向上取整;∞ 用哨兵(§5.7.1)。
-fn quant_cap(c: f32) -> u64 {
+/// 容量量化:向上取整;∞ 用哨兵(§5.7.1;`compound_flow` 复用)。
+pub(crate) fn quant_cap(c: f32) -> u64 {
     if c.is_infinite() {
         INF_CAP
     } else if c <= 0.0 {
