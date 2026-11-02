@@ -37,7 +37,7 @@ use voxel::BlockRegistry;
 use crate::cohesion::{Dinic, impact_bond_between, impact_crush_between};
 use crate::impact_flow::{
     component_center_of_mass, component_inertia_tensor, component_inv_inertia, inertia_mul,
-    min_impact, quant_cap,
+    invert_symmetric_3x3_f64, min_impact, quant_cap,
 };
 
 /// 一格的质量(密度 1 × (2·0.45)³;与 `impact_flow` 的每格质量一致——该常量
@@ -375,6 +375,13 @@ fn cut_bond_count(
 ///   边的割 ≥ s(`Σ d_i ≥ s`),`C < s` 只能来自粘结不足,S 永不为全体;
 /// - **判定在整数域**:`C ≥ s_q` 扛住;否则 S = 残量网络中源点可达的格
 ///   (最小源侧,唯一);
+/// - **数值兜底**:纯平移时 Σd_i 与 s 在实数域恰好相等,超大冲量(平落
+///   ≥ 1e5 N·s)下 `J/M` 的浮点舍入与逐格 floor 的供给损失是否破整数域
+///   不变量是刀刃。因此**求值在 f64 域进行**(J、p、s、质心、刚体响应的
+///   Δω/Δv_i、点积与量化输入全部 f64;惯量张量取 `component_inertia_tensor`
+///   转 f64 后求逆),兜底之上,若可达集仍覆盖全部格,**按扛住处理**
+///   (`detached` 为空)——R 为空的退化分割(把全部格断下来)没有物理意义,
+///   扛住是保守侧;这是数值兜底,不是需求语义(需求语义由 f64 求值保证)。
 /// - 节点 = B 的全部格(≤ `compound_split_size³`,无需区域预算)。
 pub fn evaluate_compound_flow(
     registry: &dyn BlockRegistry,
@@ -385,8 +392,34 @@ pub fn evaluate_compound_flow(
     if j == Vec3::ZERO || event.contacts.is_empty() || event.cells.is_empty() {
         return outcome;
     }
-    let d_hat = event.dir_hat();
-    let s = j.length();
+    // f64 域求值(见文档"数值兜底"):J、p、d̂、s 与刚体响应全程 f64。
+    let mut j64 = [0.0_f64; 3];
+    for pt in &event.contacts {
+        j64[0] += f64::from(pt.normal.x) * f64::from(pt.impulse);
+        j64[1] += f64::from(pt.normal.y) * f64::from(pt.impulse);
+        j64[2] += f64::from(pt.normal.z) * f64::from(pt.impulse);
+    }
+    j64[0] -= f64::from(event.correction.x);
+    j64[1] -= f64::from(event.correction.y);
+    j64[2] -= f64::from(event.correction.z);
+    let s = (j64[0] * j64[0] + j64[1] * j64[1] + j64[2] * j64[2]).sqrt();
+    if s <= 0.0 {
+        return outcome;
+    }
+    let d_hat = [j64[0] / s, j64[1] / s, j64[2] / s];
+    let mut pw = [0.0_f64; 3];
+    let mut w_total = 0.0_f64;
+    for pt in &event.contacts {
+        w_total += f64::from(pt.impulse);
+        pw[0] += f64::from(pt.point.x) * f64::from(pt.impulse);
+        pw[1] += f64::from(pt.point.y) * f64::from(pt.impulse);
+        pw[2] += f64::from(pt.point.z) * f64::from(pt.impulse);
+    }
+    let point = if w_total > 0.0 {
+        [pw[0] / w_total, pw[1] / w_total, pw[2] / w_total]
+    } else {
+        [0.0; 3]
+    };
     let block_of: BTreeMap<BlockPos, BlockId> = event.cells.iter().copied().collect();
     let cells: Vec<BlockPos> = block_of.keys().copied().collect();
     let cellset: BTreeSet<BlockPos> = cells.iter().copied().collect();
@@ -399,16 +432,37 @@ pub fn evaluate_compound_flow(
         );
         contact_cells.insert(pt.cell);
     }
-    let s_each = s / contact_cells.len() as f32;
-    // 预筛(§5.8.1;s < I_min 不建网)。
-    if s < min_impact(registry) {
+    let s_each = s / contact_cells.len() as f64;
+    // 预筛(§5.8.1;s < I_min 不建网;s 是非负有限 f64,直接比)。
+    if s < f64::from(min_impact(registry)) {
         outcome.prefiltered = true;
         return outcome;
     }
-    // 刚体响应(M、c、I 全部由 B 的格算,局部系)。
-    let props = body_props(&cells);
-    let point = event.weighted_point();
-    let (_, dv) = rigid_response(&props, &cells, point, j);
+    // 刚体响应(f64):M、c、I 全部由 B 的格算,局部系。
+    let tensor = component_inertia_tensor(&cells);
+    let tensor64: [[f64; 3]; 3] = tensor.map(|row| row.map(f64::from));
+    let inv64 = invert_symmetric_3x3_f64(&tensor64);
+    let com64 = {
+        let c = component_center_of_mass(&cells);
+        [f64::from(c.x), f64::from(c.y), f64::from(c.z)]
+    };
+    let mass64 = cells.len() as f64 * f64::from(CELL_MASS);
+    let r = [
+        point[0] - com64[0],
+        point[1] - com64[1],
+        point[2] - com64[2],
+    ];
+    let torque = [
+        r[1] * j64[2] - r[2] * j64[1],
+        r[2] * j64[0] - r[0] * j64[2],
+        r[0] * j64[1] - r[1] * j64[0],
+    ];
+    let domega = [
+        inv64[0][0] * torque[0] + inv64[0][1] * torque[1] + inv64[0][2] * torque[2],
+        inv64[1][0] * torque[0] + inv64[1][1] * torque[1] + inv64[1][2] * torque[2],
+        inv64[2][0] * torque[0] + inv64[2][1] * torque[1] + inv64[2][2] * torque[2],
+    ];
+    let v_com = [j64[0] / mass64, j64[1] / mass64, j64[2] / mass64];
     // 网络:节点 = 全部格 + 源 + 汇。
     let idx: BTreeMap<BlockPos, usize> =
         cells.iter().enumerate().map(|(i, c)| (*c, i + 2)).collect();
@@ -418,17 +472,26 @@ pub fn evaluate_compound_flow(
     let mut supply_q = 0_u64;
     for &c in &cells {
         let uc = idx[&c];
-        // 汇边:惯性容量 d_i = m_i·max(0, Δv_i·d̂)(§5.8.1;f64 域算再量化,
-        // 见 quant_cap_f64 的说明)。
-        let dv_i = dv[&c];
-        let d_i = f64::from(CELL_MASS) * f64::from(dv_i.dot(d_hat)).max(0.0);
+        // 汇边:惯性容量 d_i = m_i·max(0, Δv_i·d̂)(§5.8.1;f64 域算再量化)。
+        let x = [
+            f64::from(c.x) + 0.5 - com64[0],
+            f64::from(c.y) + 0.5 - com64[1],
+            f64::from(c.z) + 0.5 - com64[2],
+        ];
+        let dvi = [
+            v_com[0] + domega[1] * x[2] - domega[2] * x[1],
+            v_com[1] + domega[2] * x[0] - domega[0] * x[2],
+            v_com[2] + domega[0] * x[1] - domega[1] * x[0],
+        ];
+        let d_i = f64::from(CELL_MASS)
+            * (dvi[0] * d_hat[0] + dvi[1] * d_hat[1] + dvi[2] * d_hat[2]).max(0.0);
         let cap = quant_cap_f64(d_i);
         if cap > 0 {
             net.edge(uc, SNK, cap);
         }
         // 源边:接触格的均摊供给(向下取整)。
         if contact_cells.contains(&c) {
-            let q = quant_supply_f64(f64::from(s_each));
+            let q = quant_supply_f64(s_each);
             supply_q += q;
             if q > 0 {
                 net.edge(SRC, uc, q);
@@ -441,7 +504,7 @@ pub fn evaluate_compound_flow(
             if !cellset.contains(&b) {
                 continue;
             }
-            let u_dot = Vec3::new(dx as f32, dy as f32, dz as f32).dot(d_hat);
+            let u_dot = Vec3::new(dx as f32, dy as f32, dz as f32).dot(event.dir_hat());
             let block_b = block_of[&b];
             let cap_raw = if u_dot >= COS_PRESS {
                 impact_crush_between(registry, block_a, block_b)
@@ -460,13 +523,18 @@ pub fn evaluate_compound_flow(
     let reach = net.reachable(SRC);
     if outcome.cut_q < outcome.supply_q {
         // C < s:残量网络中源点可达的格 S 断下(最小源侧;必有源边不饱和,
-        // S 非空)。接触格恒在源侧,且 S ≠ 全体(Σd_i ≥ s 的论证,§5.8.1)。
+        // S 非空)。接触格恒在源侧。
         let detached: Vec<BlockPos> = cells.iter().filter(|c| reach[idx[*c]]).copied().collect();
         debug_assert!(!detached.is_empty(), "C < s 时 S 必非空");
-        debug_assert!(
-            detached.len() < cells.len(),
-            "S 永不为全体(§5.8.1:Σd_i ≥ s)"
-        );
+
+        if detached.len() >= cells.len() {
+            // 数值兜底(见文档):可达集覆盖全部格 = R 为空的退化分割,
+            // 按扛住处理(保守侧)。f64 求值下正常事件不触发。
+            outcome.detached.clear();
+            outcome.s_components.clear();
+            outcome.cut_bonds = 0;
+            return outcome;
+        }
         outcome.cut_bonds = cut_bond_count(&detached, &cellset, &block_of, registry);
         outcome.s_components = bond_components(&detached, &block_of, registry);
         outcome.detached = detached;
@@ -582,9 +650,12 @@ pub fn distribute_momentum(
 }
 
 /// 各块初速度(§5.8.2"各块速度"):B 步进后的刚体速度场(`v + ω × (质心_块 −
-/// 质心_B)`,局部系)+ 该块所受冲量 `P` 的刚体响应(`P/M_块`、
-/// `I_块⁻¹(r × P)`,`r = p_块 − 质心_块`);`single_cell = true`(单格块)丢
-/// 角速度(已知近似,同 §5.7.2)。返回 `(v, ω)`。
+/// 质心_B)`,局部系)与 `ω`,再加上该块所受冲量 `P` 的刚体响应(`P/M_块`、
+/// `I_块⁻¹(r × P)`,`r = p_块 − 质心_块`)——即多格块 `(场 + P/M_块,
+/// ω + I_块⁻¹(r × P))`,**`P` 为零时同样保留 `ω`**(速度场与自旋都来自
+/// B 步进后的状态,与冲量无关);`single_cell = true`(单格块)丢角速度
+/// `(场 + P/m, 0)`——只丢 `ω`,**线冲量 `P/m` 保留**(丢了它 S 的 E 份额
+/// 就整个消失,动量不守恒)。返回 `(v, ω)`。
 pub fn piece_velocity(
     cells: &[BlockPos],
     body: &BodyProps,
@@ -596,13 +667,17 @@ pub fn piece_velocity(
 ) -> (Vec3, Vec3) {
     let com = component_center_of_mass(cells);
     let field = linvel + angvel.cross(com - body.center_of_mass);
-    if single_cell || impulse == Vec3::ZERO {
-        return (field, Vec3::ZERO);
+    if single_cell {
+        let m = cells.len() as f32 * CELL_MASS;
+        return (field + impulse / m, Vec3::ZERO);
+    }
+    if impulse == Vec3::ZERO {
+        return (field, angvel);
     }
     let own = body_props(cells);
     let r = point - com;
     let dw = inertia_mul(&component_inv_inertia(cells), r.cross(impulse));
-    (field + impulse / own.mass, dw)
+    (field + impulse / own.mass, angvel + dw)
 }
 
 #[cfg(test)]

@@ -327,6 +327,22 @@ pub(crate) fn component_inertia_tensor(cells: &[BlockPos]) -> [[f32; 3]; 3] {
 /// `A = [[a,b,c],[b,d,e],[c,e,f]]`,伴随 = 余子式矩阵的转置(对称同位),
 /// `det = a·C00 + b·C01 + c·C02`(`compound_flow` 复用)。
 pub(crate) fn invert_symmetric_3x3(m: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let inv = invert_symmetric_3x3_f64(&[
+        [f64::from(m[0][0]), f64::from(m[0][1]), f64::from(m[0][2])],
+        [f64::from(m[0][1]), f64::from(m[1][1]), f64::from(m[1][2])],
+        [f64::from(m[0][2]), f64::from(m[1][2]), f64::from(m[2][2])],
+    ]);
+    [
+        [inv[0][0] as f32, inv[0][1] as f32, inv[0][2] as f32],
+        [inv[1][0] as f32, inv[1][1] as f32, inv[1][2] as f32],
+        [inv[2][0] as f32, inv[2][1] as f32, inv[2][2] as f32],
+    ]
+}
+
+/// 3×3 对称矩阵的解析逆(f64 版;`compound_flow` 的汇容量 f64 求值用;
+/// 与 f32 版同式——伴随 = 余子式矩阵的转置,`det = a·C00 + b·C01 + c·C02`。
+/// 不改变 `impact_flow` 现有行为:f32 路径继续走 `invert_symmetric_3x3`)。
+pub(crate) fn invert_symmetric_3x3_f64(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let (a, b, c, d, e, f) = (m[0][0], m[0][1], m[0][2], m[1][1], m[1][2], m[2][2]);
     let c00 = d * f - e * e;
     let c01 = c * e - b * f;

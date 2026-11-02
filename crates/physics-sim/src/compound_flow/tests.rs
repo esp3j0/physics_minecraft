@@ -203,8 +203,12 @@ fn acg1_end_corner_threshold() {
     assert_threshold(&reg, &dirt_ev, 16.524);
 }
 
-/// 工况 1/5/7 平落(全部格接触、均摊):石、土在 s ≤ 1e5 都不断。
-/// 变异红:供给改逐点分配(平落的 d_i 均匀,逐点集中供给会假断)。
+/// 工况 1/5/7 平落(全部格接触、均摊):石、土在 [4, 1e6] 对数均匀扫 s
+/// (LCG 固定种子)都不断——平落的刚体内部不传力(汇边就地吸收,与供给
+/// 同量级;返修 4:f64 求值 + "S = 全体按扛住"兜底后,任意量级都不得断)。
+/// 变异红:供给改逐点分配(平落每格一点,供给逐点累计本应相同,但 f32 下
+/// 逐点路径的舍入曾触发 R = 空;现由兜底保护,该变异改由
+/// acg1_supply_even_split_two_cells 打中)。
 #[test]
 fn acg1_flat_drop_never_breaks() {
     let reg = SimpleRegistry::builtin();
@@ -214,13 +218,36 @@ fn acg1_flat_drop_never_breaks() {
             for (_c, b) in &mut ev.cells {
                 *b = block;
             }
-            let out = evaluate_compound_flow(&reg, &scaled(&ev, 100_000.0));
-            assert!(
-                out.detached.is_empty(),
-                "{name} 平落 1e5 不断(detached = {:?})",
-                out.detached
-            );
+            // 对数均匀固定种子扫 [4, 1e6](LCG;禁 rand 依赖)。
+            let mut state = 0x9E37_79B9_u64;
+            let mut samples = 0;
+            for i in 0..25 {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                let frac = (state >> 11) as f64 / (1_u64 << 53) as f64;
+                let s = 4.0_f64 * (1.0e6_f64 / 4.0).powf(frac);
+                let _ = i;
+                let out = evaluate_compound_flow(&reg, &scaled(&ev, s as f32));
+                samples += 1;
+                assert!(
+                    out.detached.is_empty(),
+                    "{name} 平落 s = {s:.1} 不断(detached = {:?})",
+                    out.detached
+                );
+            }
+            assert_eq!(samples, 25);
         }
+    }
+    // 端点:s = 4(预筛边界)与 s = 1e6(上限)。
+    for s in [4.0_f32, 4.001, 1e6] {
+        let ev = flat_drop(&beam(), 1.0);
+        let out = evaluate_compound_flow(&reg, &scaled(&ev, s));
+        assert!(
+            out.detached.is_empty(),
+            "平落 s = {s} 不断(detached = {:?})",
+            out.detached
+        );
     }
 }
 
@@ -331,109 +358,405 @@ fn acg1_contact_shuffle_invariant() {
     }
 }
 
+/// 供给均摊语义(§5.8.1"s_c = s/|C|"):双接触格、冲量 3:1 时,均摊
+/// (各 s/2)与"逐格累计点冲量"(3s/4 与 s/4)给出不同判定。
+/// 期望值取自 demo `common.compound_flow`(f64;2026-11-02 实测,6 格石条、
+/// J = +z、p = 两格冲量加权质心):
+/// - s = 66:均摊**扛住**(even s* = 102.795,S = ∅);按逐点(49.5/16.5)
+///   **断**(prop s* = 65.194,S = 端格)——变异④(不均摊)在此红;
+/// - s = 103:均摊**断**(S = 端格+格 1,断 1 根)——钉住均摊在两格情形的
+///   S 形状(prop 在 103 断成端格单独)。
+#[test]
+fn acg1_supply_even_split_two_cells() {
+    let reg = SimpleRegistry::builtin();
+    let cells = beam();
+    let make = |s: f32| {
+        let j0 = s * 3.0 / 4.0;
+        let j1 = s / 4.0;
+        let c0 = Vec3::new(0.5, 0.5, 0.0);
+        let c1 = Vec3::new(1.5, 0.5, 0.0);
+        stone_event(
+            &cells,
+            vec![
+                ContactPoint {
+                    cell: cells[0],
+                    impulse: j0,
+                    point: c0,
+                    normal: Vec3::Z,
+                },
+                ContactPoint {
+                    cell: cells[1],
+                    impulse: j1,
+                    point: c1,
+                    normal: Vec3::Z,
+                },
+            ],
+        )
+    };
+    // s = 66:均摊扛住(逐点分配在此断——变异④红)。
+    let out = evaluate_compound_flow(&reg, &make(66.0));
+    assert!(
+        !out.prefiltered && out.detached.is_empty(),
+        "s = 66 均摊应扛住(demo even s* = 102.795);实际 S = {:?}",
+        out.detached
+    );
+    assert_eq!(out.supply_q, 66_000, "均摊 = 各 33 → floor 和 = 66 000");
+    // s = 103:均摊断,S = 端格 + 格 1(demo even:s* = 102.795、S = {(0,0,0),(1,0,0)}、断 1 根)。
+    let out = evaluate_compound_flow(&reg, &make(103.0));
+    assert_eq!(
+        out.detached,
+        vec![p(0, 0, 0), p(1, 0, 0)],
+        "s = 103 均摊 S = 前两格(demo 实测)"
+    );
+    assert_eq!(out.cut_bonds, 1);
+}
+
 /// 随机扫 s(LCG 固定种子,禁止 rand 依赖):断开样本里 S 永不为全体、
-/// S 与 s_components 一致。
+/// S 与 s_components 一致(返修 4:扩到条 / L 形 / 2×2×2 全部形状 × 侧撞 /
+/// 轴向 / 偏心斜向冲量,s 覆盖 [4, 1e6] 对数均匀)。
 #[test]
 fn acg1_s_never_whole_body() {
     let reg = SimpleRegistry::builtin();
-    let cells = beam();
-    let ev = hit_event(&cells, p(0, 0, 0), Vec3::Z, 1.0);
+    let beam6 = beam();
+    let lshape4 = vec![p(0, 0, 0), p(1, 0, 0), p(1, 1, 0), p(1, 2, 0)];
+    let cube8: Vec<BlockPos> = (0..2)
+        .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| p(x, y, z))))
+        .collect();
+    let shapes: [(&str, &Vec<BlockPos>, usize, Vec3, bool); 5] = [
+        ("beam-side", &beam6, 0, Vec3::Z, false),
+        ("beam-axial", &beam6, 0, Vec3::X, false),
+        ("beam-corner", &beam6, 0, Vec3::Y, true),
+        ("L-side", &lshape4, 1, Vec3::NEG_X, false),
+        ("cube-side", &cube8, 0, Vec3::Z, false),
+    ];
     let mut state = 0x1234_5678_u64;
     let mut checked = 0;
-    for _ in 0..200 {
+    for _ in 0..60 {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
         let frac = (state >> 11) as f32 / (1_u64 << 53) as f32;
-        let s = 10_f32.powf(0.3 + frac * 3.9);
-        let out = evaluate_compound_flow(&reg, &scaled(&ev, s));
-        if out.prefiltered || out.detached.is_empty() {
-            continue;
+        let s = 4.0 * (1.0e6_f32 / 4.0).powf(frac);
+        for (name, cells, hit, normal, corner) in shapes {
+            let mut ev = hit_event(cells, cells[hit], normal, 1.0);
+            if corner {
+                ev.contacts[0].point += Vec3::new(-0.5, -0.5, 0.0);
+            }
+            let out = evaluate_compound_flow(&reg, &scaled(&ev, s));
+            if out.prefiltered || out.detached.is_empty() {
+                continue;
+            }
+            checked += 1;
+            assert_ne!(
+                out.detached.len(),
+                cells.len(),
+                "{name} s = {s}: S = 全体(Σd_i ≥ s 被破坏,兜底未生效)"
+            );
+            assert_eq!(
+                out.detached,
+                out.s_components
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                "{name} s_components 与 detached 不一致"
+            );
         }
-        checked += 1;
-        assert_ne!(
-            out.detached.len(),
-            cells.len(),
-            "s = {s}: S = 全体(Σd_i ≥ s 被破坏)"
-        );
-        assert_eq!(
-            out.detached,
-            out.s_components
-                .iter()
-                .flatten()
-                .copied()
-                .collect::<Vec<_>>(),
-            "s_components 与 detached 不一致"
-        );
     }
-    assert!(checked > 10, "有效样本过少:{checked}");
+    assert!(checked > 30, "有效样本过少:{checked}");
 }
 
 /// ≤ 8 格工况与穷举所有含接触格的割比对:C 与 S 都相同(AC-G1 穷举割条;
-/// 4 格条侧撞第 2 格,大 s 断开工况)。割容量以 evaluate 的同一口径手算:
-/// 割 = 不在 X 的接触格源边 + X→非X 的格间边 + 在 X 的格的汇边(汇边被割
-/// = 源侧格的惯性吸收也被切;最大流视角下"X 的出边"含汇边)。穷举 2⁴ 源侧
-/// 集合取最小。
+/// 返修 2:通用 helper,覆盖 3 格条 / 4 格 L / 2×2×2 / 7 字 × 侧撞 / 轴向
+/// 压向 / 偏心斜向(带 Δω 与负投影格)/ 双接触格,每组合取低于阈值 / 接近
+/// 阈值 / 远高于阈值三档)。
+///
+/// 割容量以 evaluate 的同一口径手算(f64 域)。割(X)由三部分组成:不在 X 的
+/// 接触格源边、在 X 的格的汇边、X→非X 的格间边。穷举 2ⁿ 源侧集合(必含
+/// 接触格)取最小割值;S 的期望 = 全部最小割源侧中格数最少的那个(最小
+/// 源侧,即所有最小割源侧的交)。断言:`cut_q` = min(s_q, 穷举最小割);
+/// 断开时 `detached` = 穷举最小源侧;扛住时 `cut_q ≥ supply_q`。
 #[test]
-fn acg1_bruteforce_min_cut_4cell() {
+fn acg1_bruteforce_min_cut_multi_shape() {
     let reg = SimpleRegistry::builtin();
-    let cells: Vec<BlockPos> = (0..4).map(|x| p(x, 0, 0)).collect();
-    let ev = scaled(&hit_event(&cells, cells[1], Vec3::Z, 1.0), 60.0);
-    let out = evaluate_compound_flow(&reg, &ev);
-    assert!(!out.detached.is_empty(), "60 > 阈值应断");
-    let block_of: BTreeMap<BlockPos, BlockId> =
-        cells.iter().map(|&c| (c, builtin::STONE)).collect();
-    let contacts: BTreeSet<BlockPos> = ev.contacts.iter().map(|pt| pt.cell).collect();
-    let j = ev.impulse_j();
-    let d_hat = ev.dir_hat();
-    let s = j.length();
-    let props = body_props(&cells);
-    let (_, dv) = rigid_response(&props, &cells, ev.weighted_point(), j);
-    let edge_cap = |a: BlockPos, b: BlockPos| -> u64 {
-        let u = Vec3::new((b.x - a.x) as f32, (b.y - a.y) as f32, (b.z - a.z) as f32);
-        let raw = if u.dot(d_hat) >= COS_PRESS {
-            impact_crush_between(&reg, block_of[&a], block_of[&b])
-        } else {
-            impact_bond_between(&reg, block_of[&a], block_of[&b])
-        };
-        quant_cap(raw)
-    };
-    let sink_cap = |c: BlockPos| -> u64 { quant_cap(CELL_MASS * (dv[&c].dot(d_hat)).max(0.0)) };
-    let s_each_q = quant_supply_f64(f64::from(s / contacts.len() as f32));
-    let mut best = u64::MAX;
-    for mask in 0..(1u32 << cells.len()) {
-        let in_x: Vec<bool> = cells
-            .iter()
-            .enumerate()
-            .map(|(i, _)| mask & (1 << i) != 0)
-            .collect();
-        if !cells
-            .iter()
-            .zip(&in_x)
-            .any(|(c, x)| *x && contacts.contains(c))
-        {
-            continue; // 源侧必含接触格
-        }
-        let mut cap = 0_u64;
-        for (i, &c) in cells.iter().enumerate() {
-            if !in_x[i] && contacts.contains(&c) {
-                cap += s_each_q; // 源边被割
+
+    // 形状(≤ 8 格)。
+    let beam3: Vec<BlockPos> = (0..3).map(|x| p(x, 0, 0)).collect();
+    let lshape4 = vec![p(0, 0, 0), p(1, 0, 0), p(1, 1, 0), p(1, 2, 0)];
+    let cube8: Vec<BlockPos> = (0..2)
+        .flat_map(|x| (0..2).flat_map(move |y| (0..2).map(move |z| p(x, y, z))))
+        .collect();
+    let seven6 = vec![
+        p(0, 2, 0),
+        p(1, 2, 0),
+        p(2, 2, 0),
+        p(3, 2, 0),
+        p(3, 1, 0),
+        p(3, 0, 0),
+    ];
+    let shapes: [(&str, &Vec<BlockPos>); 4] = [
+        ("beam3", &beam3),
+        ("L4", &lshape4),
+        ("cube8", &cube8),
+        ("seven6", &seven6),
+    ];
+
+    // 冲量组合(hit 格索引 / 法向 / 名字)。偏心斜向:作用点在格心 +(−0.5,−0.5,0)
+    // → Δω ≠ 0、远端出现负投影格;双接触格:端格与格 1 各半。
+    type HitSpec = (usize, Vec3, &'static str);
+    let specs_per_shape: &[(&'static str, Vec<HitSpec>)] = &[
+        (
+            "beam3",
+            vec![
+                (0, Vec3::Z, "side"),
+                (0, Vec3::X, "axial"),
+                (0, Vec3::Y, "corner"),
+                (0, Vec3::Z, "two_cell"), // 第二个点在格 1,由 helper 展开
+            ],
+        ),
+        (
+            "L4",
+            vec![
+                (1, Vec3::NEG_X, "side"),
+                (0, Vec3::Y, "corner"),
+                (1, Vec3::NEG_X, "two_cell"),
+            ],
+        ),
+        ("cube8", vec![(0, Vec3::Z, "side"), (0, Vec3::Y, "corner")]),
+        (
+            "seven6",
+            vec![
+                (3, Vec3::NEG_X, "side"),
+                (3, Vec3::NEG_Z, "front"),
+                (0, Vec3::Y, "corner"),
+            ],
+        ),
+    ];
+
+    // 每个组合三档 s:低(0.5×参考)、参考、高(1.5×参考;参考取断点附近,
+    // 由各组合的粘结/惯量几何定,以"至少一档断、至少一档扛"为目标选)。
+    let mut broken_cases = 0_u32;
+    let mut held_cases = 0_u32;
+
+    fn make_event(
+        cells: &[BlockPos],
+        hit: usize,
+        normal: Vec3,
+        mode: &'static str,
+        s: f32,
+    ) -> CompoundEvent {
+        let center = Vec3::new(
+            cells[hit].x as f32 + 0.5,
+            cells[hit].y as f32 + 0.5,
+            cells[hit].z as f32 + 0.5,
+        );
+        if mode == "two_cell" {
+            // 双接触格:hit 与 hit+1 各半(J 沿 normal;hit+1 必在体内)。
+            let second = cells[hit + 1];
+            let center2 = Vec3::new(
+                second.x as f32 + 0.5,
+                second.y as f32 + 0.5,
+                second.z as f32 + 0.5,
+            );
+            CompoundEvent {
+                cells: cells.iter().map(|&c| (c, builtin::STONE)).collect(),
+                contacts: vec![
+                    ContactPoint {
+                        cell: cells[hit],
+                        impulse: s / 2.0,
+                        point: center - normal * 0.5,
+                        normal,
+                    },
+                    ContactPoint {
+                        cell: second,
+                        impulse: s / 2.0,
+                        point: center2 - normal * 0.5,
+                        normal,
+                    },
+                ],
+                linvel: Vec3::ZERO,
+                angvel: Vec3::ZERO,
+                correction: Vec3::ZERO,
             }
-            if in_x[i] {
-                cap += sink_cap(c); // 源侧格的汇边(惯性吸收出网)
-                for (k, &b) in cells.iter().enumerate() {
-                    if k != i && neighbor4(c, b) && !in_x[k] {
-                        cap += edge_cap(c, b);
+        } else {
+            let mut ev = hit_event(cells, cells[hit], normal, 1.0);
+            if mode == "corner" {
+                ev.contacts[0].point += Vec3::new(-0.5, -0.5, 0.0);
+            }
+            scaled(&ev, s)
+        }
+    }
+
+    /// 单组合穷举比对(与 evaluate 同口径的手算割;S 期望 = 最少格最小源侧)。
+    fn check_case(reg: &SimpleRegistry, ev: &CompoundEvent, label: &str) -> (bool, bool) {
+        let out = evaluate_compound_flow(reg, ev);
+        let block_of: BTreeMap<BlockPos, BlockId> = ev.cells.iter().map(|&(c, b)| (c, b)).collect();
+        let cells: Vec<BlockPos> = block_of.keys().copied().collect();
+        let contacts: BTreeSet<BlockPos> = ev.contacts.iter().map(|pt| pt.cell).collect();
+        // 手算割容量(f64 域,与 evaluate 同式)。
+        let j = ev.impulse_j();
+        let s = j.length();
+        let d_hat = j.normalize_or_zero();
+        let tensor = component_inertia_tensor(&cells);
+        let tensor64: [[f64; 3]; 3] = tensor.map(|row| row.map(f64::from));
+        let inv64 = invert_symmetric_3x3_f64(&tensor64);
+        let c = component_center_of_mass(&cells);
+        let com = [f64::from(c.x), f64::from(c.y), f64::from(c.z)];
+        let pw = ev.weighted_point();
+        let r = [
+            f64::from(pw.x) - com[0],
+            f64::from(pw.y) - com[1],
+            f64::from(pw.z) - com[2],
+        ];
+        let torque = [
+            r[1] * f64::from(j.z) - r[2] * f64::from(j.y),
+            r[2] * f64::from(j.x) - r[0] * f64::from(j.z),
+            r[0] * f64::from(j.y) - r[1] * f64::from(j.x),
+        ];
+        let domega = [
+            inv64[0][0] * torque[0] + inv64[0][1] * torque[1] + inv64[0][2] * torque[2],
+            inv64[1][0] * torque[0] + inv64[1][1] * torque[1] + inv64[1][2] * torque[2],
+            inv64[2][0] * torque[0] + inv64[2][1] * torque[1] + inv64[2][2] * torque[2],
+        ];
+        let mass = cells.len() as f64 * f64::from(CELL_MASS);
+        let v_com = [
+            f64::from(j.x) / mass,
+            f64::from(j.y) / mass,
+            f64::from(j.z) / mass,
+        ];
+        let d_hat64 = [f64::from(d_hat.x), f64::from(d_hat.y), f64::from(d_hat.z)];
+        let dh32 = [d_hat.x, d_hat.y, d_hat.z];
+        let sink_cap = |c0: BlockPos| -> u64 {
+            let x = [
+                f64::from(c0.x) + 0.5 - com[0],
+                f64::from(c0.y) + 0.5 - com[1],
+                f64::from(c0.z) + 0.5 - com[2],
+            ];
+            let dvi = [
+                v_com[0] + domega[1] * x[2] - domega[2] * x[1],
+                v_com[1] + domega[2] * x[0] - domega[0] * x[2],
+                v_com[2] + domega[0] * x[1] - domega[1] * x[0],
+            ];
+            let along = dvi[0] * d_hat64[0] + dvi[1] * d_hat64[1] + dvi[2] * d_hat64[2];
+            quant_cap_f64(f64::from(CELL_MASS) * along.max(0.0))
+        };
+        let edge_cap = |a: BlockPos, b: BlockPos| -> u64 {
+            let u = Vec3::new((b.x - a.x) as f32, (b.y - a.y) as f32, (b.z - a.z) as f32);
+            let raw = if u.dot(Vec3::from_array(dh32)) >= COS_PRESS {
+                impact_crush_between(reg, block_of[&a], block_of[&b])
+            } else {
+                impact_bond_between(reg, block_of[&a], block_of[&b])
+            };
+            quant_cap(raw)
+        };
+        let s_each_q = quant_supply_f64(f64::from(s) / contacts.len() as f64);
+        // 穷举:最小割值 + 最少格最小源侧。
+        let mut best_cap = u64::MAX;
+        let mut best_x: Vec<BlockPos> = Vec::new();
+        for mask in 0..(1u32 << cells.len()) {
+            let in_x: Vec<bool> = cells
+                .iter()
+                .enumerate()
+                .map(|(i, _)| mask & (1 << i) != 0)
+                .collect();
+            if !cells
+                .iter()
+                .zip(&in_x)
+                .any(|(c0, x)| *x && contacts.contains(c0))
+            {
+                continue;
+            }
+            let mut cap = 0_u64;
+            for (i, &c0) in cells.iter().enumerate() {
+                if !in_x[i] && contacts.contains(&c0) {
+                    cap += s_each_q;
+                }
+                if in_x[i] {
+                    cap += sink_cap(c0);
+                    for (k, &b) in cells.iter().enumerate() {
+                        if k != i && neighbor4(c0, b) && !in_x[k] {
+                            cap += edge_cap(c0, b);
+                        }
+                    }
+                }
+            }
+            if cap < best_cap {
+                best_cap = cap;
+                best_x = cells
+                    .iter()
+                    .zip(&in_x)
+                    .filter(|(_, x)| **x)
+                    .map(|(c0, _)| *c0)
+                    .collect();
+            } else if cap == best_cap && best_x.len() > in_x.iter().filter(|x| **x).count() {
+                best_x = cells
+                    .iter()
+                    .zip(&in_x)
+                    .filter(|(_, x)| **x)
+                    .map(|(c0, _)| *c0)
+                    .collect();
+            }
+        }
+        // 最大流 = min(总供给, 最小割):供给可被网络完全吸收时 C = s_q。
+        let want_cut = out.supply_q.min(best_cap);
+        assert_eq!(
+            out.cut_q, want_cut,
+            "{label}: C ≠ min(s_q, 穷举最小割)(穷举 = {best_cap},s_q = {},C = {})",
+            out.supply_q, out.cut_q
+        );
+        let broken = !out.detached.is_empty();
+        if broken {
+            assert!(out.cut_q < out.supply_q, "{label}: 断开但 C ≥ s_q");
+            assert_eq!(
+                out.detached, best_x,
+                "{label}: S ≠ 穷举最小源侧(期望格数最少的最小割源侧 {:?},实际 {:?})",
+                best_x, out.detached
+            );
+        } else {
+            assert!(
+                out.cut_q >= out.supply_q,
+                "{label}: 扛住但 C < s_q(C = {},s_q = {})",
+                out.cut_q,
+                out.supply_q
+            );
+        }
+        (broken, !broken)
+    }
+
+    // 逐形状 × 逐冲量组合 × 三档 s。
+    for (shape_name, cells) in shapes {
+        for (spec_name, hits) in specs_per_shape {
+            if *spec_name != shape_name {
+                continue;
+            }
+            for &(hit, normal, mode) in hits {
+                // 参考冲量:取该组合"接近断点"的档。用粘结容量与格数的粗估:
+                // 石条断点在 30–90;统一用 3 档 s = 20 / 60 / 200(低于多数阈值、
+                // 中档、远超)——不要求每组合都断,但要求总体两态都有。
+                for s in [20.0_f32, 60.0, 200.0] {
+                    if mode == "two_cell" && hit + 1 >= cells.len() {
+                        continue;
+                    }
+                    let ev = make_event(cells, hit, normal, mode, s);
+                    let label = format!("{shape_name}/{mode}/{hit}/{s}");
+                    let (broken, held) = check_case(&reg, &ev, &label);
+                    if broken {
+                        broken_cases += 1;
+                    }
+                    if held {
+                        held_cases += 1;
                     }
                 }
             }
         }
-        best = best.min(cap);
     }
-    assert_eq!(
-        out.cut_q, best,
-        "C ≠ 穷举最小割(穷举 = {best},C = {})",
-        out.cut_q
+    assert!(
+        broken_cases >= 6,
+        "断开工况过少:{broken_cases}(组合与档位覆盖不足)"
+    );
+    assert!(
+        held_cases >= 6,
+        "扛住工况过少:{held_cases}(组合与档位覆盖不足)"
     );
 }
 
@@ -553,6 +876,62 @@ fn acg2_terrain_other_s_stopped_r_tugged() {
     );
 }
 
+/// ΣT = 0 按 R_j 质量比分摊(§5.8.2;返修 5 补覆盖):合成 outcome——
+/// cells = {0, 2, 4, 5, 6}(0 与 2、2 与 4 之间隔空,格间无粘结边),
+/// S = {0}(接触格),R 经 bond_components 分成 {2}(1 格)与 {4,5,6}
+/// (3 格),都不与 S 相邻 → 断面容量全为 0(合成校验口径,§5.8.2"只在
+/// 合成校验里出现")→ 各分量退还 = −(M_j/M_R)·E(质量比 1:3)。
+/// 变异"改成平分"(各 −E/2)在此红。
+#[test]
+fn acg2_zero_t_splits_by_mass() {
+    let reg = SimpleRegistry::builtin();
+    let cells = vec![p(0, 0, 0), p(2, 0, 0), p(4, 0, 0), p(5, 0, 0), p(6, 0, 0)];
+    let ev = scaled(&hit_event(&cells, p(0, 0, 0), Vec3::Z, 1.0), 40.0);
+    let outcome = CompoundFlowOutcome {
+        supply_q: 40_000,
+        cut_q: 18_000,
+        detached: vec![p(0, 0, 0)],
+        s_components: vec![vec![p(0, 0, 0)]],
+        cut_bonds: 0,
+        prefiltered: false,
+    };
+    let split = distribute_momentum(&reg, &ev, &outcome, &[]);
+    assert_eq!(split.r_components.len(), 2, "R 分成 [2] 与 [4,5,6] 两块");
+    for rc in &split.r_components {
+        assert!(
+            rc.cut_capacity == 0.0,
+            "合成工况断面容量应全为 0(实际 {})",
+            rc.cut_capacity
+        );
+    }
+    let s = ev.total_impulse();
+    let e_mag = (s - outcome.cut_q as f32 / 1000.0) / s * s;
+    // 质量比 1:3 → 退还 −E/4 与 −3E/4(不是平分 −E/2)。
+    let small = split
+        .r_refunds
+        .iter()
+        .find(|(q, _)| (q - Vec3::new(2.5, 0.5, 0.5)).length() <= 1e-4)
+        .expect("R 分量 [格2] 的 q = 自身质心 (2.5,0.5,0.5)");
+    let big = split
+        .r_refunds
+        .iter()
+        .find(|(q, _)| (q - Vec3::new(5.5, 0.5, 0.5)).length() <= 1e-4)
+        .expect("R 分量 [格4,5,6] 的 q = 自身质心 (5.5,0.5,0.5)");
+    assert!(
+        (small.1.length() - e_mag / 4.0).abs() <= 1e-3,
+        "小分量退还 {} ≠ −(M_j/M_R)·E = {}",
+        small.1.length(),
+        e_mag / 4.0
+    );
+    assert!(
+        (big.1.length() - 3.0 * e_mag / 4.0).abs() <= 1e-3,
+        "大分量退还 {} ≠ −(3/4)E = {}",
+        big.1.length(),
+        3.0 * e_mag / 4.0
+    );
+    assert!(split.residual <= 1e-3, "守恒残差");
+}
+
 /// L 形不对称分量:Δω 与完整惯量解析一致(惯性积进账;只取对角的实现
 /// 在此工况必红——诊断断言钉差异)。L = [(0,0,0),(1,0,0),(1,1,0),(1,2,0)],
 /// 冲量 −x 打在顶格 +x 面中心(同 G00 flow.py 工况 6 受力几何)。
@@ -612,8 +991,9 @@ fn acg2_lshape_full_inertia() {
     }
 }
 
-/// piece_velocity:多格块 = B 速度场(过块质心)+ 自身冲量响应;
-/// 单格块丢角速度。
+/// piece_velocity(§5.8.2"各块速度"):多格块 = B 速度场 + `ω_B` + 自身冲量
+/// 响应(P/M、I⁻¹(r×P));单格块 = 速度场 + **P/m**(只丢角速度——丢线冲量
+/// 会让 S 的 E 份额整个消失,动量不守恒);P = 0 的多格块同样保留 ω_B。
 #[test]
 fn piece_velocity_field_and_response() {
     let cells = beam();
@@ -622,19 +1002,41 @@ fn piece_velocity_field_and_response() {
     let angvel = Vec3::new(0.1, 0.2, 0.3);
     let point = Vec3::new(0.5, 0.5, 0.5);
     let impulse = Vec3::new(0.0, 0.0, 30.0);
-    // 多格块(R = 格 1..6):v = 场(块质心)+ P/M;ω = Δω ≠ 0(离轴)。
+    // 多格块(R = 格 1..6):v = 场(块质心)+ P/M;ω = ω_B + Δω ≠ ω_B(离轴响应)。
     let r_cells: Vec<BlockPos> = (1..6).map(|x| p(x, 0, 0)).collect();
     let (v, w) = piece_velocity(&r_cells, &body, linvel, angvel, point, impulse, false);
     let com = component_center_of_mass(&r_cells);
     let field = linvel + angvel.cross(com - body.center_of_mass);
-    assert!((v - (field + impulse / (r_cells.len() as f32 * CELL_MASS))).length() <= 1e-5);
-    assert!(w != Vec3::ZERO, "多格块保角速度");
-    // 单格块:角速度置零,只有速度场。
+    assert!(
+        (v - (field + impulse / (r_cells.len() as f32 * CELL_MASS))).length() <= 1e-5,
+        "多格块线速度 = 场 + P/M_块"
+    );
+    let dw = {
+        let r = point - com;
+        inertia_mul(&component_inv_inertia(&r_cells), r.cross(impulse))
+    };
+    assert!(
+        (w - (angvel + dw)).length() <= 1e-5,
+        "多格块角速度 = ω_B + I⁻¹(r×P)(漏 ω_B 的实现在此红)"
+    );
+    // 单格块:v = 场 + P/m(线冲量保留)、ω = 0(只丢角速度)。
     let one = [p(0, 0, 0)];
     let (v1, w1) = piece_velocity(&one, &body, linvel, angvel, point, impulse, true);
     let com1 = component_center_of_mass(&one);
-    assert!((v1 - (linvel + angvel.cross(com1 - body.center_of_mass))).length() <= 1e-6);
+    let field1 = linvel + angvel.cross(com1 - body.center_of_mass);
+    assert!(
+        (v1 - (field1 + impulse / CELL_MASS)).length() <= 1e-6,
+        "单格块线速度 = 场 + P/m(丢 ΔP/m 的实现在此红)"
+    );
     assert_eq!(w1, Vec3::ZERO);
+    // P = 0 的多格块:纯速度场 + ω_B(自旋保留)。
+    let (v0, w0) = piece_velocity(&r_cells, &body, linvel, angvel, point, Vec3::ZERO, false);
+    assert!((v0 - field).length() <= 1e-6);
+    assert!((w0 - angvel).length() <= 1e-6, "P = 0 仍保 ω_B");
+    // P = 0 的单格块:v = 场、ω = 0。
+    let (v01, w01) = piece_velocity(&one, &body, linvel, angvel, point, Vec3::ZERO, true);
+    assert!((v01 - field1).length() <= 1e-6);
+    assert_eq!(w01, Vec3::ZERO);
 }
 
 /// 修正分配的冲量份额拆账:两个动态对方各占一半份额,修正按份额拆。
