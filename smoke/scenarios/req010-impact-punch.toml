@@ -136,5 +136,5 @@ label = "石条前段越过墙面所在平面,落在墙后(墙后区域 ≥ 2 �
 check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "stone", ge = 2 } }
 
 [[step]]
-label = "石条后段停在墙前"
-check = { block = { pos = [6, -60, 20], is = "stone" } }
+label = "石条后段停在墙前(墙前区域 ≥ 4 格石)"
+check = { count = { from = [0, -60, 14], to = [9, -57, 26], is = "stone", ge = 4 } }
