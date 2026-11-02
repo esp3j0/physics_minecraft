@@ -188,6 +188,17 @@ def quat_to_mat(rot):
          1 - 2 * (xq * xq + yq * yq)]])
 
 
+def cell_world_center(world, comp, cell):
+    """格在**世界系**的中心(G00-3 修正①):t_b + R_b·offset(cell)。
+    复合体原点在中格,offsets = cell − 原点格,cell_center(c)=c+0.5 只是
+    局部语义——投射物瞄准、目标格、摆放一律用本函数。"""
+    cells = list(comp.cells)
+    i = cells.index(cell)
+    off = np.array(comp.offsets[i], float)
+    t_b, R_b = body_pose(world, comp.h)
+    return t_b + R_b @ off
+
+
 def body_pose(world, h):
     """(t_b, R_b):刚体平移(np)与旋转矩阵(np)。"""
     b = world.rigid_bodies[h]
