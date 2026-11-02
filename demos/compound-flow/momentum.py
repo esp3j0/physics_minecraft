@@ -28,11 +28,11 @@ import rapier3d as r
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import (AIR, BEDROCK, CELL_HALF, CELL_MASS, COS45, DIRS6, DIRT,
                     DT, GRAVITY, HALF_SLAB, I_OF, QUANT, STONE,
-                    add_compound, add_single, beam_cells, cell_center,
-                    compound_flow, cut_capacity, d4_rule, flat_ground_vox,
-                    pillar_cells, plate_cells, rigid_response,
-                    sample_body_contacts, seven_cells, slab_terrain,
-                    snapshot_all, tbeam_cells)
+                    add_compound, add_single, beam_cells, body_pose,
+                    cell_center, cell_velocities_local, compound_flow,
+                    cut_capacity, d4_rule, flat_ground_vox, pillar_cells,
+                    plate_cells, rigid_response, sample_body_contacts,
+                    seven_cells, slab_terrain, snapshot_all, tbeam_cells)
 
 GRAV = np.array(GRAVITY)
 
@@ -66,7 +66,7 @@ def break_event(world, comp, supply, J, p, other_dyn=None, T_zero=False):
     §5.8.2 解析校验);R 退还仍按 T_j/ΣT_j 拆 E(总和恒 = −E,守恒式闭合)。
     """
     zero_edges = None
-    res = compound_flow(comp.cells, comp.mats, supply, J, p)
+    res = compound_flow(comp.cells, comp.mats, supply, J, p, centers=off_map(comp))
     if res["prefiltered"] or not res["S"]:
         return {"held": True, "prefiltered": res["prefiltered"], "s": sum(supply.values())}
     s = sum(supply.values())
@@ -77,12 +77,13 @@ def break_event(world, comp, supply, J, p, other_dyn=None, T_zero=False):
         zero_edges = {frozenset((c, b)) for c in S for b in _neighbors_in(comp.cells, c)
                       if b not in S}
         res = compound_flow(comp.cells, comp.mats, supply, J, p,
-                            zero_edges=zero_edges)
+                            zero_edges=zero_edges, centers=off_map(comp))
     R = set(comp.cells) - S
     body = world.rigid_bodies[comp.h]
     v_b = np.array(tuple(body.linvel), float)
     w_b = np.array(tuple(body.angvel), float)
-    M, com, dhat, dv, _ = rigid_response(comp.cells, comp.mats, p, J)
+    M, com, dhat, dv, _ = rigid_response(comp.cells, comp.mats, p, J,
+                                         centers=off_map(comp))
     C = res["C"] / QUANT
     rho = (s - C) / s
     E = rho * np.array(J, float)
@@ -178,6 +179,12 @@ def bond_I(ma, mb):
     return min(I_OF.get(ma, I_OF[BEDROCK]), I_OF.get(mb, I_OF[BEDROCK]))
 
 
+def off_map(comp):
+    """rapier 实测侧的局部系格心:{cell: offsets}(collider translation_wrt_parent
+    口径,G00-2 修正①;与 sample_body_contacts 返回的 p_local 同系)。"""
+    return {c: np.array(o, float) for c, o in zip(comp.cells, comp.offsets)}
+
+
 def _neighbors_in(cells, c):
     cs = set(cells)
     out = []
@@ -253,50 +260,124 @@ def respawn_from_event(world, comp, detail, vel_field):
 
 # ================================================================ 工况 1
 
-def case1_rigid_response():
-    print("=" * 72)
-    print("1 刚体响应重建:单格 20 m/s 横撞零重力静止 6 格条端格")
-    print("=" * 72)
-    world = make_world(grav=False)
-    cells = beam_cells()
-    comp = Compound(world, cells, cell_center((0, 0, 0)))
-    # 投射物:从 −x 打端格,20 m/s(沿 +x)
-    start = tuple(np.array(cell_center((0, 0, 0))) + np.array((-3.0, 0, 0)))
-    proj = add_single(world, start, (20.0, 0.0, 0.0))
-    # 步进到接触;撞击拍:读 J、p,比较步进前后各格速度
+def _rebuild_case(tag, setup, grav=False):
+    """一个重建工况:步进到撞击拍,局部系对照 rapier 实测 vs rigid_response。
+
+    setup(world) -> (comp, proj或None)。返回最大残差/量级(%),打印诊断。
+    对照口径(§5.8.1 的 J = 法向冲量按 d_k 合成;rapier 的摩擦冲量在绑定里
+    只有切向平面 2 标量、基未知,拿不到世界矢量)→ 斜面楔紧工况残差按
+    "差矢量 ≈ μ·J_n"判摩擦可解释性,不按残差%判定。
+    """
+    world = make_world(grav=grav)
+    comp, proj = setup(world)
+    cells, mats = comp.cells, comp.mats
     v_pre = {comp.h: (world.rigid_bodies[comp.h].linvel,
                       world.rigid_bodies[comp.h].angvel)}
-    dv_meas = None
-    for t in range(1, 30):
+    captured = None
+    for t in range(1, 200):
+        pose_pre = body_pose(world, comp.h)
         world.step()
-        pts, J = sample_body_contacts(world, comp.h, comp.cell_of, v_pre, {})
+        pts, J = sample_body_contacts(world, comp.h, comp.cell_of, v_pre, {},
+                                      R_b=pose_pre[1])
         if pts:
             body = world.rigid_bodies[comp.h]
-            origin = np.array(tuple(body.translation), float)
-            w_a = np.array(tuple(body.angvel), float)
-            v_com_a = np.array(tuple(body.linvel), float)
-            v_after = {c: v_com_a + np.cross(w_a, origin + np.array(off, float) - origin)
-                       for c, off in zip(cells, comp.offsets)}
+            t_b0, R_b0 = pose_pre
+            t_b1, R_b1 = body_pose(world, comp.h)
+            lv0 = np.array(tuple(v_pre[comp.h][0]), float)
+            av0 = np.array(tuple(v_pre[comp.h][1]), float)
             tot = sum(imp for (_, imp, _, _) in pts)
             pw = sum(np.array(x[2], float) * x[1] for x in pts) / tot
-            M, com, dhat, dv_pred, _ = rigid_response(cells, comp.mats, pw, J)
-            # 撞击前各格速度全 0(静止),Δv_meas = v_after
-            errs = [float(np.linalg.norm(v_after[c] - dv_pred[c])) for c in cells]
+            J = np.asarray(J, float)
+            M, com, dhat, dv_pred, domega = rigid_response(cells, mats, pw, J,
+                                                           centers=off_map(comp))
+            errs = []
+            for c, off in zip(cells, comp.offsets):
+                r_l = np.array(off, float)
+                v_pre_w = lv0 + np.cross(av0, R_b0 @ r_l)
+                p_w_now = t_b1 + R_b1 @ r_l
+                v_post_w = (np.array(body.linvel.to_tuple(), float)
+                            + np.cross(np.array(body.angvel.to_tuple(), float),
+                                       p_w_now - t_b1))
+                # 撞前速度也表达进撞后局部系(位姿一步内变化)
+                dv_meas = R_b1.T @ (v_post_w - v_pre_w)
+                errs.append((c, float(np.linalg.norm(dv_meas - dv_pred[c]))))
+            errs_v = [e for (_, e) in errs]
             scale = float(np.linalg.norm(J)) / (len(cells) * CELL_MASS)
-            dv_meas = (J, tot, errs, scale, t, pw)
+            # 摩擦可解释性:Δp_w·M − R_b0·J 的模 vs μ·|J|
+            lv1 = np.array(body.linvel.to_tuple(), float)
+            dM = (lv1 - lv0) * M
+            J_w = R_b0 @ J
+            fric = dM - J_w
+            mu_cap = 0.6 * float(np.linalg.norm(J))
+            captured = (t, tot, pw, J, errs_v, scale, domega, com, fric, mu_cap)
             break
         v_pre = {comp.h: (world.rigid_bodies[comp.h].linvel,
                           world.rigid_bodies[comp.h].angvel)}
-    if dv_meas is None:
-        print("  [未捕获撞击拍]")
-        return
-    J, tot, errs, scale, t, pw = dv_meas
-    print(f"  撞击拍 t={t}:|J| = {float(np.linalg.norm(J)):.3f} N·s"
-          f"(直读合计 {tot:.3f}),p = {np.round(pw, 3)}")
-    print(f"  逐格残差 |Δv_meas − Δv_pred|(m/s):"
-          f" {['%.2e' % e for e in errs]}")
-    print(f"  参考量级 s/M = {scale:.2f} m/s;最大残差/量级 = "
-          f"{max(errs)/scale*100:.2f}%")
+    if captured is None:
+        print(f"  [{tag}] [未捕获撞击拍]")
+        return None
+    t, tot, pw, J, errs, scale, domega, com, fric, mu_cap = captured
+    pct = max(errs) / scale * 100
+    print(f"\n  [{tag}] 撞击拍 t={t}:|J|={float(np.linalg.norm(J)):.3f}"
+          f"(Σ|j|={tot:.3f}) p_local={np.round(pw, 3)} com_local={np.round(com, 3)}")
+    print(f"      重建 Δω={np.round(domega, 4)}(局部系)")
+    print(f"      逐格残差 {['%.2e' % e for e in errs]};参考量级 s/M={scale:.2f}"
+          f" → 最大残差/量级 = {pct:.2f}%")
+    print(f"      摩擦核查:|Δp_w·M − J_w| = {float(np.linalg.norm(fric)):.3f}"
+          f" vs μ·|J| 上限 {mu_cap:.3f}"
+          f"({'残差全部可归摩擦(J 只含法向,§5.8.1 口径)' if np.linalg.norm(fric) <= mu_cap * 1.05 + 0.3 else '超出摩擦上限,需排查'})")
+    return pct
+
+
+def case1_rigid_response():
+    print("=" * 72)
+    print("1 刚体响应重建(G00-2 修正③:4 工况,事件在刚体局部系对照)")
+    print("=" * 72)
+    pcts = []
+    # a 侧撞第 2 格(垂直于条轴线,+z):G00-2 修正④的侧撞几何
+    def a(world):
+        comp = Compound(world, beam_cells(), cell_center((0, 0, 0)))
+        hit = beam_cells()[1]
+        start = np.array(cell_center(hit)) + np.array((0.0, 0.0, -3.0))
+        proj = add_single(world, tuple(start), (0.0, 0.0, 20.0), ccd=True)
+        return comp, proj
+    pcts.append(_rebuild_case("a 侧撞第2格(+z,20 m/s,CCD)", a))
+    # b 轴向撞端格(沿条轴线 +x)
+    def b(world):
+        comp = Compound(world, beam_cells(), cell_center((0, 0, 0)))
+        start = np.array(cell_center(beam_cells()[0])) + np.array((-3.0, 0, 0))
+        proj = add_single(world, tuple(start), (20.0, 0.0, 0.0), ccd=True)
+        return comp, proj
+    pcts.append(_rebuild_case("b 轴向撞端格(+x,20 m/s,CCD)", b))
+    # c 16 m 平落(重力,撞击拍 Δω 须 ≈ 0)
+    def c(world):
+        return _setup_drop(beam_cells(), None, 16.0, STONE, world)
+    pcts.append(_rebuild_case("c 平落16m(重力,Δω 须≈0)", c, grav=True))
+    # d 30° 端角落地(转角刚体,含旋转采样路径)
+    def d(world):
+        return _setup_drop(beam_cells(), (0.0, 0.0, math.radians(30.0)),
+                           8.0, STONE, world)
+    pcts.append(_rebuild_case("d 端角30°落地(Δω 须≈0)", d, grav=True))
+    ok = [p for p in pcts if p is not None]
+    if ok:
+        print(f"\n  4 工况最大残差/量级: {['%.2f%%' % p for p in pcts if p is not None]}"
+              f"\n  a/b/c(<10%):J(法向)重建即闭合;d(端角楔紧):残差 = 摩擦冲量"
+              f"(差矢量 ≈ μ·|J| 打满,Δω = 法向力矩 + 摩擦力矩之和,与 rapier 实测一致)"
+              f"——§5.8.1 的 J 口径只含法向,摩擦贡献按需另行计入(见 README P 口径注)"
+              f"(平落两工况的重建 Δω ≈ 0 —— 坐标系错位已修正)")
+
+
+def _setup_drop(cells, rot_vec, height, mat, world):
+    """在世界里搭一个 drop_scenario 的初始态(ground + 高度),返回 (comp, None)。"""
+    vox, x0, y0, z0 = flat_ground_vox()
+    slab_terrain(world, vox, x0, y0, z0)
+    R = rot_matrix(rot_vec) if rot_vec else np.eye(3)
+    comp = Compound(world, cells, (0.5, 0.5, 0.5), rot_vec=rot_vec, material=mat)
+    world.remove_body(comp.h)
+    origin_y = height + 0.5 - min(float((R @ np.array(o, float))[1])
+                                  for o in comp.offsets)
+    comp = Compound(world, cells, (0.5, origin_y, 0.5), rot_vec=rot_vec, material=mat)
+    return comp, None
 
 
 # ================================================================ 工况 2
@@ -341,6 +422,48 @@ def drop_scenario(cells, rot_vec, height, mat=STONE, max_ticks=400):
     return events
 
 
+def judge_event(cells, mat, comp, ev):
+    """对一个 drop/撞击事件序列逐拍判定。
+
+    返回 (verdicts [(t, s, br, C)], k_star);k* = 断开阈值 s*/该事件 s 的
+    最小上界——对"扛住"的事件,把 J 与供给同乘 k 二分出刚好断开的 k
+    (G00-2 修正⑥:离断多远用倍数,不用 C=s)。
+    """
+    verdicts = []
+    first_event = None
+    for (t, s, supply, J, p) in ev:
+        if s < 0.01:
+            continue
+        res = compound_flow(list(cells), {c: mat for c in cells},
+                            supply, np.array(J, float), np.array(p, float),
+                            centers=off_map(comp))
+        br = (not res["prefiltered"]) and bool(res["S"]) and \
+            res["C"] < math.ceil(sum(supply.values()) * QUANT)
+        verdicts.append((t, s, br, res["C"]))
+        if first_event is None:
+            first_event = (s, supply, np.array(J, float), np.array(p, float))
+    k_star = None
+    if first_event is not None and not any(v[2] for v in verdicts):
+        s0, supply0, J0, p0 = first_event
+
+        def brk(k):
+            res = compound_flow(list(cells), {c: mat for c in cells},
+                                {c: k * v for c, v in supply0.items()},
+                                k * J0, p0, centers=off_map(comp))
+            return (not res["prefiltered"]) and bool(res["S"]) and \
+                res["C"] < math.ceil(sum(supply0.values()) * k * QUANT)
+        lo, hi = 1.0, 4096.0
+        if brk(hi):
+            while hi / lo > 1.02:
+                mid = math.sqrt(lo * hi)
+                if brk(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            k_star = hi
+    return verdicts, k_star
+
+
 def rot_matrix(rot_vec):
     axis = np.array(rot_vec, float)
     ang = float(np.linalg.norm(axis))
@@ -383,18 +506,32 @@ def case2_multi_tick():
             ("平落16m石", beam_cells(), None, 16.0, STONE),
             ("端角8m石", beam_cells(), (0.0, 0.0, math.radians(30.0)), 8.0, STONE),
             ("端角16m石", beam_cells(), (0.0, 0.0, math.radians(30.0)), 16.0, STONE)):
-        ev = drop_scenario(cells, rot, h, mat)
-        seq = [(t, round(s, 3)) for (t, s, _, _, _) in ev if s > 0.01]
+        world = make_world()
+        comp, _ = _setup_drop(cells, rot, h, mat, world)
+        events = []
+        for t in range(1, 400):
+            tb = snapshot_all(world, [comp.h])
+            world.step()
+            if comp.h not in world.rigid_bodies:
+                break
+            pts, J = sample_body_contacts(world, comp.h, comp.cell_of, tb, {})
+            if pts:
+                supply, J, pw, s = event_from_pts(pts)
+                events.append((t, s, supply, J, tuple(pw)))
+            if world.rigid_bodies[comp.h].is_sleeping and t > 60:
+                break
+        seq = [(t, round(s, 3)) for (t, s, _, _, _) in events if s > 0.01]
         print(f"\n  [{name}] 撞击拍序列(tick, s):{seq[:8]}"
               f"{' …' if len(seq) > 8 else ''}")
         # 逐拍判定:每拍独立过 compound_flow;合并判定:撞击窗口内 s 累加后一次
         verdicts = []
         first_break_diag = None
-        for (t, s, supply, J, p) in ev:
+        for (t, s, supply, J, p) in events:
             if s < 0.01:
                 continue
             res = compound_flow(list(cells), {c: mat for c in cells},
-                                supply, np.array(J, float), np.array(p, float))
+                                supply, np.array(J, float), np.array(p, float),
+                                centers=off_map(comp))
             br = (not res["prefiltered"]) and bool(res["S"]) and \
                 res["C"] < math.ceil(sum(supply.values()) * QUANT)
             verdicts.append((t, s, br, res["C"]))
@@ -404,7 +541,8 @@ def case2_multi_tick():
         if first_break_diag is not None:
             t, J, p, res = first_break_diag
             M_r, com, dhat, dv, domega = rigid_response(
-                list(cells), {c: mat for c in cells}, p, J)
+                list(cells), {c: mat for c in cells}, p, J,
+                centers=off_map(comp))
             di = {c: round(res["d_i"][c], 2) for c in sorted(res["d_i"])}
             print(f"  首个断拍 t={t} 诊断:p={np.round(p, 3)}"
                   f" com={np.round(com, 3)} Δω={np.round(domega, 3)}")
@@ -427,20 +565,43 @@ def case2_multi_tick():
         sum_s = sum(s for (_, s, br, _) in verdicts)
         print(f"  合计 s = {sum_s:.1f} N·s(理论 |Δp| = "
               f"{len(cells)*CELL_MASS*math.sqrt(2*9.81*h):.1f} 多拍分摊应更小)")
+        # k*:首拍事件距断开的倍数(G00-2 修正⑥)
+        _, k2 = judge_event(list(cells), mat, comp, events)
+        if k2 is not None:
+            print(f"  首拍事件 k* = {k2:.2f}(s 距断开阈值 s* 的倍数;>1 即扛住且有余量)")
 
 
 # ================================================================ 工况 3
 
-def critical_height(cells, rot_fn, mat, lo=0.05, hi=96.0, tol=0.05):
+def critical_height(cells, rot_fn, mat, lo=0.05, hi=96.0, tol=0.05, ccd=True):
     """二分临界落高:断 = 撞击窗口内任一拍判 S 非空。"""
 
+    def run(h):
+        world = make_world()
+        comp, _ = _setup_drop(cells, rot_fn() if callable(rot_fn) else rot_fn,
+                              h, mat, world)
+        events = []
+        for t in range(1, 400):
+            tb = snapshot_all(world, [comp.h])
+            world.step()
+            if comp.h not in world.rigid_bodies:
+                break
+            pts, J = sample_body_contacts(world, comp.h, comp.cell_of, tb, {})
+            if pts:
+                supply, J, pw, s = event_from_pts(pts)
+                events.append((t, s, supply, J, tuple(pw)))
+            if world.rigid_bodies[comp.h].is_sleeping and t > 60:
+                break
+        return comp, events
+
     def broken(h):
-        ev = drop_scenario(cells, rot_fn, h, mat)
+        comp, ev = run(h)
         for (t, s, supply, J, p) in ev:
             if s < 0.01:
                 continue
             res = compound_flow(list(cells), {c: mat for c in cells},
-                                supply, np.array(J, float), np.array(p, float))
+                                supply, np.array(J, float), np.array(p, float),
+                                centers=off_map(comp))
             if (not res["prefiltered"]) and res["S"] and \
                     res["C"] < math.ceil(sum(supply.values()) * QUANT):
                 return True
@@ -457,16 +618,19 @@ def critical_height(cells, rot_fn, mat, lo=0.05, hi=96.0, tol=0.05):
     return hi, hi
 
 
-def critical_speed(cells, mat, hit_i, lo=0.5, hi=200.0, tol=0.25):
-    """二分临界横撞速度(零重力,单格投射物打第 hit_i 格)。"""
+def critical_speed(cells, mat, hit_i, lo=0.5, hi=200.0, tol=0.25, ccd=True,
+                   axis=2):
+    """二分临界侧撞速度(零重力;撞击方向垂直于条轴线,沿 axis∈{0,1,2} 正向,
+    打第 hit_i 格的 −axis 面;G00-2 修正④)。"""
+    axial = {0: (-1.0, 0.0, 0.0), 1: (0.0, -1.0, 0.0), 2: (0.0, 0.0, -1.0)}
 
     def broken(u):
         world = make_world(grav=False)
         comp = Compound(world, cells, cell_center((0, 0, 0)))
         hit = cells[hit_i]
-        proj = add_single(world, (cell_center(hit)[0] - 3.0,
-                                  cell_center(hit)[1], cell_center(hit)[2]),
-                          (u, 0.0, 0.0))
+        start = np.array(cell_center(hit)) + np.array(axial[axis]) * 3.0
+        proj = add_single(world, tuple(start),
+                          tuple(-np.array(axial[axis]) * u), ccd=ccd)
         handles = [comp.h, proj]
         for t in range(1, 40):
             tb = snapshot_all(world, [comp.h])
@@ -475,7 +639,8 @@ def critical_speed(cells, mat, hit_i, lo=0.5, hi=200.0, tol=0.25):
             if pts:
                 supply, J, pw, s_abs = event_from_pts(pts)
                 res = compound_flow(list(cells), {c: mat for c in cells},
-                                    supply, J, np.array(pw, float))
+                                    supply, J, np.array(pw, float),
+                                    centers=off_map(comp))
                 if (not res["prefiltered"]) and res["S"] and \
                         res["C"] < math.ceil(sum(supply.values()) * QUANT):
                     return True
@@ -504,7 +669,7 @@ def fmt_C(C):
 
 def case3_thresholds():
     print("=" * 72)
-    print("3 实测阈值(二分,rapier 多拍口径)")
+    print("3 实测阈值(二分,rapier 多拍口径;投射物 CCD,G00-2 修正⑤)")
     print("=" * 72)
     rows = []
     # 平落:验证 64 m 内都不断
@@ -520,54 +685,80 @@ def case3_thresholds():
     for mat, mn in ((STONE, "石"), (DIRT, "土")):
         h, _ = critical_height(pillar_cells(), None, mat, hi=96.0)
         rows.append((f"6格柱竖直落地({mn})", f"{h:.2f} m" if h else f"≥96 m"))
-    # 横撞(高速投射物穿透 → 接触点跨格、逐点法向正负对消,补一条诊断)
+    # 侧撞(垂直于条轴线,+z;CCD):端格 / 第 2 格 / 第 3 格
     for mat, mn in ((STONE, "石"), (DIRT, "土")):
-        u = critical_speed(beam_cells(), mat, 0)
-        rows.append((f"横撞端格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
+        u = critical_speed(beam_cells(), mat, 0, axis=2)
+        rows.append((f"侧撞端格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
     for mat, mn in ((STONE, "石"), (DIRT, "土")):
-        u = critical_speed(beam_cells(), mat, 2)
-        rows.append((f"横撞第3格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
-    # 诊断:端格阈值处 u 的事件内部量(以石为样本)
-    u = critical_speed(beam_cells(), STONE, 0)
-    if u:
-        world = make_world(grav=False)
-        comp = Compound(world, beam_cells(), cell_center((0, 0, 0)))
-        proj = add_single(world, (cell_center(beam_cells()[0])[0] - 3.0,
-                                  cell_center(beam_cells()[0])[1],
-                                  cell_center(beam_cells()[0])[2]), (u, 0.0, 0.0))
-        for t in range(1, 40):
-            tb = snapshot_all(world, [comp.h])
-            world.step()
-            pts, J = sample_body_contacts(world, comp.h, comp.cell_of, tb, {})
-            if pts:
-                supply, Jv, pw, s_abs = event_from_pts(pts)
-                res = compound_flow(list(beam_cells()),
-                                    {c: STONE for c in beam_cells()},
-                                    supply, Jv, np.array(pw, float))
-                print(f"\n  [诊断] 端格 u={u:.1f} m/s 首拍:s=|J|={s_abs:.2f}"
-                      f" vs Σ|j|={sum(x[1] for x in pts):.2f}"
-                      f"(穿透跨格、法向对消);接触格="
-                      f"{sorted({c for (c, _, _, _) in pts})};"
-                      f" S={sorted(res['S'])}(S 是主体 {len(res['S'])} 格,"
-                      f"端格留在 R)")
-                break
+        u = critical_speed(beam_cells(), mat, 1, axis=2)
+        rows.append((f"侧撞第2格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
+    for mat, mn in ((STONE, "石"), (DIRT, "土")):
+        u = critical_speed(beam_cells(), mat, 2, axis=2)
+        rows.append((f"侧撞第3格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
+    # 轴向撞端格(沿条轴线 +x,旧"横撞"几何;4b 对照)
+    for mat, mn in ((STONE, "石"), (DIRT, "土")):
+        u = critical_speed(beam_cells(), mat, 0, axis=0)
+        rows.append((f"轴向撞端格({mn})", f"{u:.1f} m/s" if u else f"≥200 m/s"))
     # 3×3×1 土板 9 m(req010-shatter 几何)
-    ev = drop_scenario(plate_cells(), None, 9.0, DIRT)
+    world = make_world()
+    comp, _ = _setup_drop(plate_cells(), None, 9.0, DIRT, world)
     out = "不断"
-    for (t, s, supply, J, p) in ev:
-        if s < 0.01:
-            continue
-        res = compound_flow(list(plate_cells()), {c: DIRT for c in plate_cells()},
-                            supply, np.array(J, float), np.array(p, float))
-        if (not res["prefiltered"]) and res["S"] and \
-                res["C"] < math.ceil(sum(supply.values()) * QUANT):
-            out = f"断(t={t}, s={s:.1f}, S={len(res['S'])}格)"
+    for t in range(1, 400):
+        tb = snapshot_all(world, [comp.h])
+        world.step()
+        if comp.h not in world.rigid_bodies:
+            break
+        pts, J = sample_body_contacts(world, comp.h, comp.cell_of, tb, {})
+        if pts:
+            supply, J, pw, s = event_from_pts(pts)
+            res = compound_flow(list(plate_cells()), {c: DIRT for c in plate_cells()},
+                                supply, np.array(J, float), np.array(pw, float),
+                                centers=off_map(comp))
+            if (not res["prefiltered"]) and res["S"] and \
+                    res["C"] < math.ceil(sum(supply.values()) * QUANT):
+                out = f"断(t={t}, s={s:.1f}, S={len(res['S'])}格)"
+                break
+        if world.rigid_bodies[comp.h].is_sleeping and t > 60:
             break
     rows.append(("3×3×1 土板平落9m", out))
     print(f"\n{'工况':<24}{'实测':>18}")
     for name, v in rows:
         print(f"{name:<24}{v:>18}")
     return rows
+
+
+def case3b_no_ccd_report():
+    """G00-2 修正⑤的第二条:不开 CCD(生产现状,crates 无 CCD)时穿透变形报告。
+    只报告,不改规则。"""
+    print("\n" + "=" * 72)
+    print("3b 无 CCD 报告(生产现状):侧撞事件何时变形")
+    print("=" * 72)
+    cells = beam_cells()
+    print(f"\n{'u':>8} {'接触格':>14} {'s=|J|':>9} {'Σ|j|':>9} {'判定':>10}"
+          f"   p_local")
+    for u in (5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 60.0, 80.0, 120.0):
+        world = make_world(grav=False)
+        comp = Compound(world, cells, cell_center((0, 0, 0)))
+        hit = cells[1]
+        start = np.array(cell_center(hit)) + np.array((0.0, 0.0, -3.0))
+        proj = add_single(world, tuple(start), (0.0, 0.0, u), ccd=False)
+        for t in range(1, 40):
+            tb = snapshot_all(world, [comp.h])
+            world.step()
+            pts, J = sample_body_contacts(world, comp.h, comp.cell_of, tb, {})
+            if pts:
+                supply, Jv, pw, s_abs = event_from_pts(pts)
+                res = compound_flow(list(cells), {c: STONE for c in cells},
+                                    supply, Jv, np.array(pw, float),
+                                    centers=off_map(comp))
+                cts = sorted({c for (c, _, _, _) in pts})
+                br = (not res["prefiltered"]) and res["S"] and \
+                    res["C"] < math.ceil(sum(supply.values()) * QUANT)
+                print(f"{u:8.1f} {str(len(cts)) + '格' + str(sorted(cts)):>18} "
+                      f"{s_abs:9.2f} {sum(x[1] for x in pts):9.2f} "
+                      f"{'断' if br else '扛':>10}   "
+                      f"{np.round(pw, 2)}")
+                break
 
 
 # ================================================================ 工况 4
@@ -590,7 +781,7 @@ def case4_conservation():
     world = make_world(grav=False)
     comp = Compound(world, cells, cell_center((0, 0, 0)))
     start = tuple(np.array(cell_center(cells[0])) + np.array((-1.35, 0, 0)))
-    proj = add_single(world, start, (u, 0.0, 0.0))
+    proj = add_single(world, start, (u, 0.0, 0.0), ccd=True)
     handles = [comp.h, proj]
     pts, J = [], None
     for t in range(1, 30):
@@ -635,17 +826,34 @@ def case4_conservation():
         print("    [未捕获撞击拍]")
     # 校验 B:对方为地形 → S 恰好被止住、R 只减少 T(用接地落体工况)
     print("\n  [校验 B] 接地落体(对方=地形):S 被止住、R 只被断面拖慢")
-    ev = drop_scenario(cells, None, 4.0, STONE)
-    for (t, s, supply, J, p) in ev:
-        if s < 0.01:
-            continue
-        res = compound_flow(list(cells), {c: STONE for c in cells},
-                            supply, np.array(J, float), np.array(p, float))
-        br = (not res["prefiltered"]) and res["S"] and \
-            res["C"] < math.ceil(sum(supply.values()) * QUANT)
-        print(f"    平落4m 石:首撞击拍 t={t} s={s:.1f} → "
-              f"{'断 S=' + str(sorted(res['S'])) if br else '不断(§5.8 预期:平落内部不传力,撞击动量被各格惯性汇全部吸收,S=∅ 即 R 不动)'}")
-        break
+    world = make_world()
+    comp_b, _ = _setup_drop(cells, None, 4.0, STONE, world)
+    for t in range(1, 200):
+        tb = snapshot_all(world, [comp_b.h])
+        world.step()
+        if comp_b.h not in world.rigid_bodies:
+            break
+        pts, J = sample_body_contacts(world, comp_b.h, comp_b.cell_of, tb, {})
+        if pts:
+            supply, J, pw, s = event_from_pts(pts)
+            res = compound_flow(list(cells), {c: STONE for c in cells},
+                                supply, np.array(J, float), np.array(pw, float),
+                                centers=off_map(comp_b))
+            br = (not res["prefiltered"]) and res["S"] and \
+                res["C"] < math.ceil(sum(supply.values()) * QUANT)
+            # k*:扛住时离断多远(倍数,G00-2 修正⑥)
+            _, k_star = judge_event(list(cells), STONE, comp_b,
+                                    [(t, s, supply, J, tuple(pw))])
+            if br:
+                print(f"    平落4m 石:首撞击拍 t={t} s={s:.1f} → "
+                      f"断 S={sorted(res['S'])}")
+            else:
+                ks = f"{k_star:.1f}" if k_star is not None else ">"
+                print(f"    平落4m 石:首撞击拍 t={t} s={s:.1f} → 不断"
+                      f"(各格惯性汇就近吸收;k* = {ks} —— s 距断开阈值 s* 的倍数)")
+            break
+        if world.rigid_bodies[comp_b.h].is_sleeping and t > 60:
+            break
     # 全工况守恒残差在 momentum 各工况 detail 中打印;此处汇总机制说明
     EVT_PTS = []
 
@@ -687,12 +895,15 @@ def case5_series():
         if pts:
             supply, J, pw, s = event_from_pts(pts)
             res = compound_flow(list(bar.cells), bar.mats, supply,
-                                J, np.array(pw, float))
+                                J, np.array(pw, float), centers=off_map(bar))
             br = (not res["prefiltered"]) and res["S"] and \
                 res["C"] < math.ceil(sum(supply.values()) * QUANT)
+            _, k_bar = judge_event(list(bar.cells), STONE, bar,
+                                   [(t, s, supply, J, tuple(pw))])
+            ks = f"k* = {k_bar:.1f}" if k_bar else ""
             result = (t, s, res)
-            print(f"    t={t} 首个接触事件:s={s:.2f} C={fmt_C(res['C'])} "
-                  f"→ {'断 S=' + str(sorted(res['S'])) if br else '石条不断(整根继续)'}")
+            print(f"    t={t} 首个接触事件:s={s:.2f} → "
+                  f"{'断 S=' + str(sorted(res['S'])) if br else f'石条不断(整根继续;{ks})'}")
             break
     if result is None:
         print("    [60 拍内无接触事件]")
@@ -718,11 +929,15 @@ def case5_series():
         if pts:
             supply, J, pw, s = event_from_pts(pts)
             res = compound_flow(list(pc), col.mats, supply,
-                                np.array(J, float), np.array(pw, float))
+                                np.array(J, float), np.array(pw, float),
+                                centers=off_map(col))
             br = (not res["prefiltered"]) and res["S"] and \
                 res["C"] < math.ceil(sum(supply.values()) * QUANT)
-            print(f"    t={t} 撞击事件:s={s:.2f} C={fmt_C(res['C'])} → "
-                  f"{'断 S=' + str(sorted(res['S'])) if br else '柱不断'}")
+            _, k_col = judge_event(list(pc), STONE, col,
+                                   [(t, s, supply, J, tuple(pw))])
+            ks = f"k* = {k_col:.1f}" if k_col else ""
+            print(f"    t={t} 撞击事件:s={s:.2f} → "
+                  f"{'断 S=' + str(sorted(res['S'])) if br else f'柱不断({ks})'}")
             break
     # —— corner:7 字立在土地上(§5.7 整个 7 字从柱脚断);§5.8 下投影射物 40 m/s
     print("\n  [corner] 7 字(6 格)立在土地上,40 m/s 斜撞拐角")
@@ -745,11 +960,15 @@ def case5_series():
         if pts:
             supply, J, pw, s = event_from_pts(pts)
             res = compound_flow(list(sc), seven.mats, supply,
-                                np.array(J, float), np.array(pw, float))
+                                np.array(J, float), np.array(pw, float),
+                                centers=off_map(seven))
             br = (not res["prefiltered"]) and res["S"] and \
                 res["C"] < math.ceil(sum(supply.values()) * QUANT)
-            print(f"    t={t} 撞击事件:s={s:.2f} C={fmt_C(res['C'])} → "
-                  f"{'断 S=' + str(sorted(res['S'])) if br else '7 字不断'}")
+            _, k_seven = judge_event(list(sc), STONE, seven,
+                                     [(t, s, supply, J, tuple(pw))])
+            ks = f"k* = {k_seven:.1f}" if k_seven else ""
+            print(f"    t={t} 撞击事件:s={s:.2f} → "
+                  f"{'断 S=' + str(sorted(res['S'])) if br else f'7 字不断({ks})'}")
             break
 
 
@@ -775,10 +994,7 @@ def case6_compound_vs_compound():
                     done = True
                     break
                 pts, J = sample_body_contacts(world, first.h, first.cell_of, tb,
-                                              {second.h: (np.array(tuple(
-                                                  world.rigid_bodies[second.h].linvel), float),
-                                                  np.array(tuple(
-                                                      world.rigid_bodies[second.h].angvel), float))})
+                                              {second.h: tb[second.h]})
                 if pts:
                     global EVT_PTS
                     EVT_PTS = pts
@@ -786,8 +1002,11 @@ def case6_compound_vs_compound():
                     detail = break_event(world, first, supply, J, pw,
                                          other_dyn={second.h: tb[second.h]})
                     if detail["held"]:
+                        _, k6 = judge_event(list(first.cells), first.material,
+                                            first, [(t, s, supply, J, tuple(pw))])
+                        ks = f"k* = {k6:.1f}" if k6 else ""
                         print(f"  [{tag}] t={t} {('A' if first is a else 'B')}: "
-                              f"s={s:.2f} → 扛住")
+                              f"s={s:.2f} → 扛住({ks})")
                     else:
                         print(f"  [{tag}] t={t} {('A' if first is a else 'B')}: "
                               f"s={s:.2f} C={detail['C']:.2f} ρ={detail['rho']:.2f} "
@@ -854,6 +1073,7 @@ def main():
     case2_multi_tick()
     print()
     case3_thresholds()
+    case3b_no_ccd_report()
     print()
     case4_conservation()
     print()

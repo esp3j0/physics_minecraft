@@ -176,34 +176,76 @@ class FlowGraph:
 
 # ---------------------------------------------------------------- §5.8.1 模型
 
-def rigid_response(cells, mats, p, J, pose=None):
+def quat_to_mat(rot):
+    """rapier Rotation3(有 .quaternion = (x,y,z,w))→ 3×3 旋转矩阵。"""
+    xq, yq, zq, wq = rot.quaternion
+    return np.array([
+        [1 - 2 * (yq * yq + zq * zq), 2 * (xq * yq - wq * zq),
+         2 * (xq * zq + wq * yq)],
+        [2 * (xq * yq + wq * zq), 1 - 2 * (xq * xq + zq * zq),
+         2 * (yq * zq - wq * xq)],
+        [2 * (xq * zq - wq * yq), 2 * (yq * zq + wq * xq),
+         1 - 2 * (xq * xq + yq * yq)]])
+
+
+def body_pose(world, h):
+    """(t_b, R_b):刚体平移(np)与旋转矩阵(np)。"""
+    b = world.rigid_bodies[h]
+    t_b = np.array(b.translation.to_tuple(), float)
+    R_b = quat_to_mat(b.rotation)
+    return t_b, R_b
+
+
+def collider_matches_cells(world, h, cells, offsets):
+    """断言:刚体 h 的每个 collider 的 translation_wrt_parent 与格→offset 一致
+    (G00-2 修正①:不依赖 colliders.handles() 的创建顺序)。返回 cell_of。"""
+    by_off = {}
+    for c, off in zip(cells, offsets):
+        by_off[tuple(float(v) for v in off)] = c
+    hs = [ch for ch in world.colliders.handles()
+          if world.colliders.get(ch).parent == h]
+    if len(hs) != len(cells):
+        raise AssertionError(f"collider 数 {len(hs)} ≠ 格数 {len(cells)}")
+    cell_of = {}
+    for ch in hs:
+        tw = tuple(float(v) for v in
+                   world.colliders.get(ch).translation_wrt_parent.to_tuple())
+        if tw not in by_off:
+            raise AssertionError(f"collider offset {tw} 不在任何格的 offsets 中")
+        cell_of[ch] = by_off[tw]
+    return cell_of
+
+
+def rigid_response(cells, mats, p, J, pose=None, centers=None):
     """整体刚体响应(§5.8.1):Δω = I_w⁻¹((p−c)×J)、Δv_i = J/M + Δω×(x_i−c)。
 
-    cells: [(x,y,z),...];mats: {cell: 材质};p: 作用点(世界);
-    J: 冲量矢量;pose: None = 轴对齐、原点在格 0(纯函数工况);否则 (origin, R)。
-    M、c、I_w:逐格 cuboid 半边长 0.45 密度 1,平行轴定理,**含惯性积**(§5.7.2)。
-    返回 (M, c, dhat, dv_by_cell {cell: np.ndarray(3)}, domega)。
+    **事件统一在刚体局部系构造**(G00-2 修正①):p 与 J 必须与格心同系。
+    centers: {cell: np.ndarray(3)} **局部系格心**——rapier 实测侧传 offsets
+    (collider 的 translation_wrt_parent,裁定①);None = cell_center(c)=c+0.5
+    (flow.py 纯函数工况,p 也在该口径,自洽)。
+    pose: (origin, R) 仅用于把局部系格心映射到世界做展示,不影响求值
+    (刚体响应在 R 下不变,局部系求值 = 世界系求值)。
+    cells: [(x,y,z),...];mats: {cell: 材质}。
+    M、c、I:逐格 cuboid 半边长 0.45 密度 1,平行轴定理,**含惯性积**(§5.7.2);
+    单格自身惯量 = m(2h)²/6(立方体绕任一轴,rapier 对照核过)。
+    返回 (M, com, dhat, dv_by_cell {cell: np.ndarray(3)}, domega)。
     """
     n = len(cells)
     M = n * CELL_MASS
-    centers = []
-    for c in cells:
-        ctr = cell_center(c)
-        if pose is not None:
-            origin, R = pose
-            ctr = R @ (ctr - origin) + origin
-        centers.append(ctr)
-    centers = np.array(centers)
+    if centers is None:
+        centers = {c: cell_center(c) for c in cells}
+    centers = np.array([np.asarray(centers[c], float) for c in cells])
     com = centers.mean(axis=0)
     J = np.asarray(J, float)
     p = np.asarray(p, float)
-    # 完整惯量张量(世界系;轴对齐格 + 同一旋转时惯性积在对角外)
+    # 完整惯量张量(格心同系;含惯性积)
     I = np.zeros((3, 3))
     h = CELL_HALF
     for ctr in centers:
         d = ctr - com
-        # 单格对自身质心的惯量(立方体)
-        s = CELL_MASS * (2 * h) ** 2 / 12.0
+        # 单格对自身质心的惯量(立方体,绕任一轴 = m(a²+b²)/12 = m(2h)²/6;
+        # 写成 /12 会让 Δω 偏大 2 倍 —— rapier apply_impulse_at_point 对照核过)
+        s = CELL_MASS * (2 * h) ** 2 / 6.0
         I += np.diag([s, s, s])
         I += CELL_MASS * (np.dot(d, d) * np.eye(3) - np.outer(d, d))
     r = p - com
@@ -218,18 +260,20 @@ def rigid_response(cells, mats, p, J, pose=None):
     return M, com, dhat, dv, domega
 
 
-def compound_flow(cells, mats, supply, J, p, algos=("ek", "dinic"), zero_edges=None):
+def compound_flow(cells, mats, supply, J, p, algos=("ek", "dinic"), zero_edges=None,
+                  centers=None):
     """§5.8.1 完整求值(纯函数;一个事件)。
 
     cells: 复合体全部格;mats: {cell: 材质};supply: {接触格: s_c};
-    J: 冲量矢量;p: 作用点;zero_edges: {frozenset({a,b}): 强制容量 0} 的边集合
-    (§5.8.2 校验用:T=0 合成工况)。返回 dict:
-    s, C(int, 量化), S(set), cut_bonds, dhat, dv, d_i, algos_agree, prefiltered,
-    n_nodes, n_edges, t_flows。
+    J: 冲量矢量;p: 作用点;p/J 与 centers(格心,同 rigid_response)同系
+    (rapier 实测侧传 offsets 口径;纯函数工况缺省 c+0.5)。
+    zero_edges: {frozenset({a,b}): 强制容量 0} 的边集合(§5.8.2 校验用)。
+    返回 dict: s, C(int, 量化), S(set), cut_bonds, dhat, dv, d_i,
+    algos_agree, prefiltered, n_nodes, n_edges, t_flows。
     """
     J = np.asarray(J, float)
     s_total = sum(supply.values())
-    M, com, dhat, dv, _ = rigid_response(cells, mats, p, J)
+    M, com, dhat, dv, _ = rigid_response(cells, mats, p, J, centers=centers)
     out = {"s": s_total, "dhat": dhat, "dv": dv, "M": M, "com": com,
            "t_flows": {}, "algos_agree": True, "prefiltered": False}
     if s_total < I_MIN:
@@ -482,40 +526,51 @@ def add_compound(world, cells, origin_pos, linvel=(0.0, 0.0, 0.0),
              .translation(off).density(1.0).friction(0.6).restitution(0.0)
              for off in offsets]
     h = world.add_body(b, colliders=colls)
-    handles = [ch for ch in world.colliders.handles()
-               if world.colliders.get(ch).parent == h]
-    cell_of = {ch: cell for ch, cell in zip(handles, cells)}
+    # G00-2 修正①:collider↔格 按 translation_wrt_parent 匹配(不依赖创建序),
+    # 并断言每个 collider 的 local 平移与期望 offset 逐位一致
+    cell_of = collider_matches_cells(world, h, cells, offsets)
     return h, offsets, cell_of
 
 
-def add_single(world, pos, vel, half=CELL_HALF):
-    """单格实体。"""
+def add_single(world, pos, vel, half=CELL_HALF, ccd=False):
+    """单格实体。ccd=True 开连续碰撞检测(G00-2 修正⑤:高速投射物防隧穿)。"""
     b = (r.RigidBodyBuilder(r.RigidBodyType.DYNAMIC).translation(tuple(pos))
          .linvel(tuple(vel)))
+    if ccd:
+        b = b.ccd_enabled(True)
     return world.add_body(b, colliders=[r.Collider.cuboid(half, half, half)
                                         .density(1.0).friction(0.6)
                                         .restitution(0.0)])
 
 
-def sample_body_contacts(world, handle, cell_of, tb, others, min_speed=IMPACT_MIN_APPROACH_SPEED):
+def sample_body_contacts(world, handle, cell_of, tb, others,
+                         min_speed=IMPACT_MIN_APPROACH_SPEED, R_b=None):
     """§5.8.1 事件采样:handle 的接触中按勘误 2 计入的流形(按流形取大)。
 
-    tb: {handle: (linvel, angvel)} 本步前快照;others: {handle: np.ndarray(3) 质心
-    速度} 或地形(None,速度 0)。
-    返回 (points, J)。points 元素 (cell, impulse, world_pos, n_toward_body);
-    n_toward_body 指向本体内(§5.8.1 的 d_k)。
+    tb: {handle: (linvel, angvel)} 本步前快照;others: {handle: (linvel, angvel)}
+    或地形(不在其中且 is_fixed → 速度 0)。
+    **返回局部系事件**(G00-2 修正①②):points 元素
+    (cell, impulse, p_local, d_local)——p_local 已除以 collider 旋转
+    (p_l = R_cᵀ(p_w − t_c)),d_local = R_bᵀ d_w 指向本体内;J(局部系)。
+    R_b:刚体旋转矩阵(body_pose 给出);None = 轴对齐。
+    接近速度筛在世界系做:v_pt = R_b·(局部速度场),法向 n_w = R_b·(R_cᵀ)⁻¹…,
+    即把局部法向 R_c·n_l 转世界再筛;对方速度用快照。
     """
     pts = []
+    t_b = np.array(world.rigid_bodies[handle].translation.to_tuple(), float)
+    if R_b is None:
+        R_b = np.eye(3)
+    RbT = R_b.T
     for pair in world.narrow_phase.contact_pairs():
         c1, c2 = pair.collider1, pair.collider2
         p1 = world.colliders.get(c1).parent
         p2 = world.colliders.get(c2).parent
         if c1 in cell_of:
-            # 我是侧 1:local_n1 指向对方(侧 2),local_n2 指向我 → d_k = +local_n2
-            # 我是侧 1:local_n2 指向我;接触点坐标取**我这一侧**的 local_p1
-            my_c, other_h, n_f, p_f, sgn = c1, p2, "local_n2", "local_p1", +1.0
+            # 我是侧 1:local_n1 指向对方(侧 2),local_n2 指向我 → d_w = local_n2;
+            # 接触点取我这一侧的 local_p1
+            my_c, other_h, n_f, p_f = c1, p2, "local_n2", "local_p1"
         elif c2 in cell_of:
-            my_c, other_h, n_f, p_f, sgn = c2, p1, "local_n1", "local_p2", +1.0
+            my_c, other_h, n_f, p_f = c2, p1, "local_n1", "local_p2"
         else:
             continue
         # 对方速度(勘误 2):地形/固定 = 0;动态对方必须用本步前快照——
@@ -539,37 +594,63 @@ def sample_body_contacts(world, handle, cell_of, tb, others, min_speed=IMPACT_MI
                 ov = np.zeros(3)
                 oav = np.zeros(3)
                 have_snap = False
-        my = world.rigid_bodies[handle]
-        bp = np.array(tuple(my.translation), float)
         lv, av = np.array(tuple(tb[handle][0]), float), np.array(tuple(tb[handle][1]), float)
-        # collider 世界位置(含位姿)
+        # 我的 collider 世界位姿(t_c, R_c)与局部系(f = R_cᵀ(·−t_c) 逆映射)
         ct = world.colliders.get(my_c)
-        cp = np.array(tuple(ct.translation), float)
+        t_c = np.array(ct.translation.to_tuple(), float)
+        R_c = quat_to_mat(ct.rotation)
+        RcT = R_c.T
+        # 对方 collider 旋转(法向 local_n 在对方 collider 局部系;对方若为
+        # 固定地形,其 collider 无旋转 → R_o = I)
+        oc = world.colliders.get(c2 if c1 in cell_of else c1)
+        R_o = quat_to_mat(oc.rotation)
         for mf in pair.manifolds:
-            n = np.array(tuple(getattr(mf, n_f)), float)   # 指向我(本体)
-            # 勘误 2:质心口径与逐点口径取大;接近速度 = 朝对方分量 = dot(v, −n)
+            n_l = np.array(tuple(getattr(mf, n_f)), float)  # 对方局部系,指向我
+            n_w = R_o @ n_l                                  # → 世界系
+            # 勘误 2:质心口径与逐点口径取大;接近速度 = 朝对方分量 = dot(v, −n_w)
             if not have_snap:
                 worst = float("inf")     # 无对方快照:不筛,计入
             else:
-                cen = float(np.dot(lv - ov, -n))
+                cen = float(np.dot(lv - ov, -n_w))
                 worst = cen
                 for pt in mf.points:
-                    lp = np.array(tuple(getattr(pt, p_f)), float)
-                    pw = cp + lp
-                    r_me = pw - bp
+                    p_l = np.array(tuple(getattr(pt, p_f)), float)  # 我的 collider 局部
+                    p_w = t_c + R_c @ p_l
+                    r_me = p_w - t_b
                     v_pt = (lv + np.cross(av, r_me)) - ov
-                    worst = max(worst, float(np.dot(v_pt, -n)))
+                    worst = max(worst, float(np.dot(v_pt, -n_w)))
             if worst < min_speed:
                 continue
             for pt in mf.points:
                 if pt.impulse <= 0:
                     continue
-                pw = cp + np.array(tuple(getattr(pt, p_f)), float)
-                pts.append((cell_of[my_c], pt.impulse, tuple(pw), tuple(sgn * n)))
+                p_l = np.array(tuple(getattr(pt, p_f)), float)
+                # 事件统一局部系:作用点 = 刚体局部系坐标(G00-2 修正①)
+                p_body_l = RcT @ (t_c + R_c @ p_l - t_b)
+                d_body_l = RbT @ n_w
+                pts.append((cell_of[my_c], pt.impulse, tuple(p_body_l),
+                            tuple(d_body_l)))
     J = np.zeros(3)
-    for (_, imp, _, n) in pts:
-        J += imp * np.array(n, float)
+    for (_, imp, _, d) in pts:
+        J += imp * np.array(d, float)
     return pts, J
+
+
+def cell_velocities_local(world, h, offsets):
+    """步进后各格在**刚体局部系**的速度(Δv 实测):
+    v_l = R_bᵀ v_w,i,v_w,i = v_com + ω × (r_w,i − t_b),r_w,i = t_b + R_b·off。
+    返回 {格序号: np.ndarray(3)}(按 offsets 的顺序)。"""
+    b = world.rigid_bodies[h]
+    t_b = np.array(b.translation.to_tuple(), float)
+    R_b = quat_to_mat(b.rotation)
+    v_com = np.array(b.linvel.to_tuple(), float)
+    w_b = np.array(b.angvel.to_tuple(), float)
+    out = []
+    for off in offsets:
+        r_w = R_b @ np.array(off, float)
+        v_w = v_com + np.cross(w_b, r_w)
+        out.append(R_b.T @ v_w)
+    return out
 
 
 def snapshot_all(world, handles):

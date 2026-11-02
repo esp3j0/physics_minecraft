@@ -171,19 +171,35 @@ world.step()       # 推进一步;固定步长,默认 dt 见下
 - **rapier 睡眠会把"斜靠悬空"的复合体判静止**:impact-corner 断下的 7 字
   以 34° 斜插、最低角点与地面薄片接触(支撑冲量 0.3–0.4/拍)即 sleeping;
   验证"是否真的被支撑"要看接触对冲量,不要只看 is_sleeping。
-- **§5.8 demo(compound-flow)实测的 manifold 侧别语义**:pair.manifolds 的
-  `local_n1/local_n2` 各指向**对方**侧(我是侧 1 → local_n2 指向我),
-  `local_p1/local_p2` 各相对**自己** collider 的局部系(我是侧 1 → 接触点取
-  local_p1,世界坐标 = 自己 collider 平移 + local_p)。判别方法:把两个候选
-  世界点都算出来,看哪个落在预期的几何位置(如地面薄片 y≈0.075 而非格心)。
+- **§5.8 demo(compound-flow)实测的 manifold 侧别语义**(G00-2 修订):
+  pair.manifolds 的 `local_n1/local_n2` 各指向**对方**侧(我是侧 1 → local_n2
+  指向我),`local_p1/local_p2` 各相对**自己** collider 的局部系。**local_p 是
+  collider 局部系坐标,collider 有转角时世界坐标 = collider 的 translation +
+  R(collider.rotation)·local_p**(rotation 属性可迭代出 quaternion 元组
+  .quaternion = (x,y,z,w),矩阵换算见 demos/compound-flow/common.py 的
+  quat_to_mat);只用平移会在斜面上差出 0.16 m(G00-2 复核实例)。法向同理:
+  local_n 在对方 collider 局部系,世界法向 = R(对方 collider rotation)·local_n。
+  判别方法:把两个候选世界点都算出来,看哪个落在预期的几何位置。
+- **事件要做在刚体局部系**(G00-2):`p_local = R_bᵀ(p_w − t_b)`、
+  `J_local = R_bᵀ J_w`,格心用 collider 的 `translation_wrt_parent`(不要用
+  c+0.5 拼世界坐标——复合体刚体原点在中格,两套坐标差半个形体)。collider↔格
+  匹配用 `translation_wrt_parent` 断言,不依赖 colliders.handles() 创建顺序。
+  单格 cuboid 自身惯量 = m(2h)²/6(立方体绕任一轴);写成 /12 会把重建 Δω
+  放大 2 倍(apply_impulse_at_point 对照核过)。
+- **摩擦冲量只有切向平面 2 标量**:manifold point 有 `tangent_impulse`
+  (2 元组),但 manifold 不暴露切向基,世界矢量无法恢复;斜面楔紧工况摩擦
+  打满 μ·j_n(实测 |Δp·M − J_法向| = 19.07 vs μ·|J| = 19.06)。要含摩擦的
+  动量账需要引擎侧导出带基的切向冲量。
 - **动态对方必须用本步前快照的速度**:撞击后读 world 当前 linvel 已是衰减值,
   接近速度会被低估成负、被 1 m/s 门槛滤掉;无快照的动态对方宁可不过门槛
   (worst=inf 直接计入)。FIXED 对方用运行时属性 `is_fixed` 判(构建期
   RigidBodyBuilder 无 body_type 查询),速度按 0。
-- **高速投射物会隧穿**:180 m/s 每拍 3 m > 单格 0.9;要首拍即接触,把投射物
-  贴面生成(距离 = u·dt − 0.05)。穿透还会把事件构型改掉:接触点跨两个格、
-  逐点法向正负对消(实测 s=|J|=108 而 Σ|j|=540),做事件口径实验要打印
-  s=|J| 与 Σ|j| 对照。
+- **高速投射物会隧穿**:180 m/s 每拍 3 m > 单格 0.9。两类防法:①投射物开
+  CCD(`RigidBodyBuilder.ccd_enabled(True)`,绑定已有,G00-2 修正⑤实测全部
+  速度事件不变形);②贴面生成(距离 = u·dt − 0.05)。无 CCD 时 u ≳ 60 m/s
+  (每拍 ≈1 格)事件开始变形:接触点跨格、逐点法向正负对消(极端时
+  s=|J|=0.12 而 Σ|j|=0.12 的对消事件),做事件口径实验要打印 s=|J| 与
+  Σ|j| 对照。
 - **rapier 单拍交付冲量 = μ·u(完全非弹性解)**:自由投射物 → 静止复合体,
   μ = mM/(m+M)(两格均 μ=0.625 实测到 0.00% 偏差);任何"速度 → 冲量"的
   换算和验收阈值都按这个口径,不要用全额 m·u。
