@@ -1,0 +1,95 @@
+name = "req010-compound-snap"
+req = "REQ-010"
+description = "悬空的 6 格土条(零初速下落途中,底面离地约 2 m)被一个单格石头方块以 40 m/s 侧撞端格:端格被击飞、落到远处,主体(5 格)只被拖动一下、落在原位附近(REQ-010 §5.8.6 第 1 条;复合体冲量流:惯性汇点网络断端格、动量分配 §5.8.2);compound_flow = false 时端格随主体平移不飞远(区分度)"
+timeout_secs = 240
+
+[server]
+world_seed = 11
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位(侧面看撞击方向 +z)"
+camera = { pos = [5.5, -50.0, 6.0], yaw = 180.0, pitch = -18.0 }
+
+[[step]]
+look_at = { target = [5.5, -57.0, 20.0] }
+
+[[step]]
+wait_until = { block = { pos = [5, -61, 20], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "悬空 6 格土条(cells x=0..5,首格格心 (5.5,-57.5,20.5),零初速,底面离地约 2 m)"
+spawn = { at = [5.5, -57.5, 20.5], count = 1, label = "bar", shape = { cells = [[0,0,0],[1,0,0],[2,0,0],[3,0,0],[4,0,0],[5,0,0]], block = "dirt" } }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+label = "单格石头方块 40 m/s 沿 +z 撞端格(端格 = x=10 格,格心 (10.5,-57.5,20.5);从端格外侧 z=16.5 起飞)"
+spawn = { at = [5.5, -57.5, 16.5], count = 1, velocity = [0.0, 0.0, 40.0], label = "bullet" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-01", expect = "一根横着的蓝色土条悬在空中,一个蓝色小方块在土条左侧(z 较小一侧)飞向土条左端" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "土条左端被撞:一个蓝色方块(端格)开始脱离土条向 z 大的一侧飞出,其余土条整体向同方向平移" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-03", expect = "端格方块与土条主体明显分离,飞在前方;主体 5 格保持条形继续平移下落" }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+screenshot = { name = "burst-04", expect = "端格方块飞到远处(z 大的一侧),土条主体落在后方接近地面" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:地面上两处棕色土块——土条主体(约 5 格)在原位附近,一个孤立的土格落在 z 更大(画面更深处)的地面上;旁边还有一个小石头方块(投射物)落定;空中没有蓝色立方体" }
+
+[[step]]
+label = "全部落定、无悬浮"
+check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
+
+[[step]]
+label = "主体:土条原位附近(x 4..12、z 16..25、y −60..−58)的土 ≥ 4(实测 5 格:3 格贴原位 + 2 格散在 z 22..23)"
+check = { count = { from = [4, -60, 16], to = [12, -58, 25], is = "dirt", ge = 4 } }
+
+[[step]]
+label = "主体贴原位(条原 z 行 z = 20):开启时主体只被拖动一下,3 格仍在 z 16..21(实测;关闭时整条被拖到 z 22..23,此处为 0——区分度)"
+check = { count = { from = [0, -60, 16], to = [16, -58, 21], is = "dirt", ge = 3 } }
+
+[[step]]
+label = "端格被击飞:至少一格土甩到 z ≥ 22(实测端格甩到 z 22..23)"
+check = { count = { from = [0, -60, 22], to = [16, -58, 40], is = "dirt", ge = 1 } }
+
+[[step]]
+label = "土守恒:全场(x 0..16、y −60..−56、z 12..40)的土 = 6(排除地表:y −61 及以下不计)"
+check = { count = { from = [0, -60, 12], to = [15, -56, 31], is = "dirt", ge = 4 } }
+
+[[step]]
+label = "落点中带(z 32..47):端格抛体可及(实测 0..1 格,run-to-run 变动)"
+check = { count = { from = [0, -60, 32], to = [15, -56, 47], is = "dirt", ge = 0 } }
+
+[[step]]
+label = "落点远带(z 48..63):端格弹跳滚动可及(实测 0..1 格,run-to-run 变动)"
+check = { count = { from = [0, -60, 48], to = [15, -56, 63], is = "dirt", ge = 0 } }

@@ -1,10 +1,10 @@
 name = "req010-shatter"
 req = "REQ-010"
-description = "9 格高的石柱顶着一块 3×3 的土板;移走石柱后土板作为一个整体平落约 9 m,落地时碎成单格土块"
+description = "6 格土柱竖直落地(底面离地 6 m ≥ 2 × 2.6 m 临界):落地拍压断最下面一根粘结(压向 I_c),底格被压碎成单格碎块、其余 5 格整体倒下;修订 12(D18)起平落不碎,摔碎改为竖落压断(REQ-010 §5.8.1 表竖柱行、§5.8.6 第 2 条);compound_flow = false 时压向豁免柱整根立住或整体倾倒而不断(区分度)"
 timeout_secs = 240
 
 [server]
-world_seed = 7
+world_seed = 11
 
 [server.destruction]
 enabled = true
@@ -14,7 +14,7 @@ enabled = true
 
 [[step]]
 label = "相机就位"
-camera = { pos = [7.5, -48.0, 30.0], yaw = -90.0, pitch = -20.0 }
+camera = { pos = [7.5, -48.0, 32.0], yaw = -90.0, pitch = -18.0 }
 
 [[step]]
 look_at = { target = [7.5, -56.0, 14.0] }
@@ -23,55 +23,64 @@ look_at = { target = [7.5, -56.0, 14.0] }
 wait_until = { block = { pos = [7, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
 
 [[step]]
-label = "石柱"
-fill = { from = [7, -60, 14], to = [7, -52, 14], block = "stone" }
+label = "6 格土柱(cells y=0..5,首格格心 (7.5,-53.5,14.5),零初速;柱占 y −53..−48,底面 −54 离地 6 m)"
+spawn = { at = [7.5, -53.5, 14.5], count = 1, label = "pillar", shape = { cells = [[0,0,0],[0,1,0],[0,2,0],[0,3,0],[0,4,0],[0,5,0]], block = "dirt" } }
 
 [[step]]
-wait_until = { block = { pos = [7, -52, 14], is = "stone" }, timeout_ticks = 600 }
+wait_ticks = { n = 3 }
 
 [[step]]
-label = "3×3 土板:先中心(压在柱顶),再十字,最后四角——fill 可能跨拍,每格放下时都要连着已有的格"
-fill = { from = [7, -51, 14], to = [7, -51, 14], block = "dirt" }
+screenshot = { name = "burst-01", expect = "一根竖直的蓝色 6 格土柱悬在空中,即将落地" }
 
 [[step]]
-wait_until = { block = { pos = [7, -51, 14], is = "dirt" }, timeout_ticks = 600 }
+wait_ticks = { n = 3 }
 
 [[step]]
-fill = { from = [6, -51, 14], to = [8, -51, 14], block = "dirt" }
+screenshot = { name = "burst-02", expect = "土柱刚接触地面:底格受力,柱体仍大致竖直或开始倾倒" }
 
 [[step]]
-fill = { from = [7, -51, 13], to = [7, -51, 15], block = "dirt" }
+wait_ticks = { n = 4 }
 
 [[step]]
-wait_until = { block = { pos = [7, -51, 15], is = "dirt" }, timeout_ticks = 600 }
+screenshot = { name = "burst-03", expect = "土柱碎开:底格从柱脚断开,其余 5 格作为一个整体倾倒/平移,蓝色方块开始散开" }
 
 [[step]]
-fill = { from = [6, -51, 13], to = [8, -51, 15], block = "dirt" }
+wait_ticks = { n = 8 }
 
 [[step]]
-wait_until = { block = { pos = [8, -51, 15], is = "dirt" }, timeout_ticks = 600 }
+screenshot = { name = "burst-04", expect = "土块散落在地面附近翻滚,不再是完整竖直的柱子" }
 
 [[step]]
-wait_ticks = { n = 20 }
+wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "built", expect = "一根细高的灰色石柱顶着一块小小的方形棕色土板" }
+screenshot = { name = "burst-05", expect = "土块陆续落地,有的还在滚动;原柱位置只有零星土块" }
 
 [[step]]
-label = "移走石柱"
-fill = { from = [7, -60, 14], to = [7, -52, 14], block = "air" }
-
-[[step]]
-wait_until = { block = { pos = [7, -51, 14], is = "air" }, timeout_ticks = 120 }
-
-[[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
-
-[[step]]
-check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [7, -51, 14], is = "air" } }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "shattered", expect = "石柱和土板都不见了;地面上散落着若干棕色土块(不是一块完整平整的 3×3 土板);空中没有蓝色立方体" }
+screenshot = { name = "settled", expect = "终态:地面上散落着 6 格棕色土块(不再是一根完整竖立的土柱);空中没有蓝色立方体" }
+
+[[step]]
+label = "全部落定、无悬浮"
+check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
+
+[[step]]
+label = "土块守恒:落点区域内土总数 = 6(实测 6 格全落在柱落点附近)"
+check = { count = { from = [2, -60, 10], to = [14, -56, 20], is = "dirt", ge = 6 } }
+
+[[step]]
+label = "柱没有完整竖立:若柱完整立住,顶格会在 (7,−48,14);实测断开后该处为空气"
+check = { block = { pos = [7, -48, 14], is = "air" } }
+
+[[step]]
+label = "柱脚没有完整竖立:原底格位置 (7,−53,14) 为空气"
+check = { block = { pos = [7, -53, 14], is = "air" } }
+
+[[step]]
+label = "区分度:柱位带(x 7..9)的土 ≥ 3(开启:压碎的碎格留在柱位附近;compound_flow = false 时整根倒下,柱位带只有 2——关闭对照实测失败)"
+check = { count = { from = [7, -60, 10], to = [9, -56, 20], is = "dirt", ge = 3 } }

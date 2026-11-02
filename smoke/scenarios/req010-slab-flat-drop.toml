@@ -1,0 +1,66 @@
+name = "req010-slab-flat-drop"
+req = "REQ-010"
+description = "3×3 土板平落约 9 m(整块落地):平落的刚体内部不传力,任何落高都不断(D18;REQ-010 §5.8.1 表平落行、§5.8.6 第 3 条)——落地后整块凝固回 3×3;compound_flow = false 时按旧 D4 均摊口径碎成单格土块。区分度说明:实测碎块全部落回原位 3×3(y −60 层 9 格),体素终态与整块落地逐位相同——冒烟检查无法区分两开关,区分度由同布景 e2e 单元测试 compound_flow_flat_plate_9m_holds_when_on_breaks_when_off 断言(开启 breaks = 0、关闭碎)承担)"
+timeout_secs = 240
+
+[server]
+world_seed = 11
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位"
+camera = { pos = [7.5, -48.0, 30.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [7.5, -58.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [7, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "3×3 土板(cells x,z = 0..2,首格 = 角格格心 (6.5,-50.5,13.5),零初速;板底面离地约 9 m)"
+spawn = { at = [6.5, -50.5, 13.5], count = 1, label = "slab", shape = { cells = [[0,0,0],[1,0,0],[2,0,0],[0,0,1],[1,0,1],[2,0,1],[0,0,2],[1,0,2],[2,0,2]], block = "dirt" } }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "built", expect = "一块 3×3 的蓝色土板悬在空中,即将平落" }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+screenshot = { name = "burst-01", expect = "土板接近地面,仍是完整的一块 3×3 板,没有碎开" }
+
+[[step]]
+wait_ticks = { n = 5 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "土板落地或刚接触地面,仍保持 3×3 完整形状(平落不碎)" }
+
+[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1200 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:地面上是一块完整的 3×3 棕色土板(凝固的方块颜色),边缘整齐;没有散落的单格土块;空中没有蓝色立方体" }
+
+[[step]]
+label = "全部落定、无悬浮"
+check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
+
+[[step]]
+label = "落点处 3×3 范围 9 格土齐全(实测整块落回原位附近,高度按实测)"
+check = { count = { from = [5, -60, 12], to = [10, -57, 17], is = "dirt", ge = 9 } }
+
+[[step]]
+label = "没有散落的土块:同高度层落点区域外无土(实测无散落;地表自身的土在更低的 y 层)"
+check = { count = { from = [0, -57, 6], to = [15, -57, 22], is = "dirt", eq = 0 } }

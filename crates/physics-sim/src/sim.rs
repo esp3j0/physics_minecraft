@@ -7351,6 +7351,10 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.solidify.enabled = false;
         cfg.cohesion.enabled = true;
+        // G03 迁移(§12.1 第 3 条):测 §7.1 旧碎裂路径本身(5 根横向粘结全
+        // 断、6 分量 = D4 局部断键语义),显式关 compound_flow(AC-G4 关闭
+        // 回归;开启版阈值见 compound_flow_* 测试)。
+        cfg.cohesion.compound_flow = false;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
         let id = entity(1);
@@ -7548,6 +7552,10 @@ mod tests {
         cfg.solidify.enabled = false;
         cfg.cohesion.enabled = true;
         cfg.cohesion.max_fractures_per_tick = 1;
+        // G03 迁移(§12.1 第 3 条):测 §7.3 第 6 条名额的 J_c 口径(旧路径
+        // 排序键),显式关 compound_flow;新路径的 s 口径名额由
+        // compound_flow_quota_picks_highest_s_then_entity_order 覆盖。
+        cfg.cohesion.compound_flow = false;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
         let (a, b) = (entity(1), entity(2));
@@ -7640,6 +7648,10 @@ mod tests {
         let mut cfg = ShardSimConfig::new(shard_id(0, 0));
         cfg.solidify.enabled = false;
         cfg.cohesion.enabled = true;
+        // G03 迁移(§12.1 第 3 条):AC-F9 第 2 句的 D4 断键版(静置体被击
+        // 中断键),显式关 compound_flow——对方速度资格两条路径共享,新路径
+        // 由互撞/侧撞测试覆盖(AC-G4 关闭回归)。
+        cfg.cohesion.compound_flow = false;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
         let (target, proj) = (entity(1), entity(2));
@@ -7715,6 +7727,9 @@ mod tests {
         cfg.cohesion.enabled = true;
         // dt = 1/240:端点一步旋转弧 7.5/240 ≈ 0.03 m,贴地缝出生不隧穿。
         cfg.dt = 1.0 / 240.0;
+        // G03 迁移(§12.1 第 3 条):F03b 旋转体接触点速度判定的 D4 断键版,
+        // 显式关 compound_flow(资格表两条路径共享;AC-G4 关闭回归)。
+        cfg.cohesion.compound_flow = false;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
         let id = entity(1);
@@ -11913,6 +11928,9 @@ mod tests {
         cfg.solidify.enabled = false;
         cfg.cohesion.enabled = true;
         cfg.cohesion.impact_flow = true;
+        // G03 迁移(§12.1 第 3 条):AC-F7 单格对方资格的 D4 断键版,显式关
+        // compound_flow(资格表两条路径共享;AC-G4 关闭回归)。
+        cfg.cohesion.compound_flow = false;
         let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
         s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
         let (target, proj) = (entity(1), entity(2));
@@ -14393,6 +14411,62 @@ mod tests {
         }
     }
 
+    /// 落体 spawn 高度(G03 裁定纪律):地面顶面 = **world y = 1**
+    /// (`dirt_on_stone_chunk`/`solid_chunk` 的方块层在 chunk 局部 y = 64 =
+    /// world y = 0,格 [0,1],顶面 y = 1)。刚体原点的静置高度 = 顶面
+    /// (y = 1)+ 半边长 0.45 + (原点相对最低格的高度);`h` = 最低点离地,
+    /// spawn 原点 y = 静置原点 y + h。**G03 教训(写进注释):落体布景必须
+    /// 经此函数算高度,不能手写 `67.x + h`——手写把地面顶面当成 65,
+    /// 落高多了 64 m,错当成物理现象(见 G00 同类错);配套断言
+    /// `assert_touch_speed` 由每个落体测试调用,布景再错直接红。**
+    fn drop_origin_y(shape: &types::CompoundShape, h: f32) -> f32 {
+        let min_y = shape
+            .cells()
+            .iter()
+            .map(|c| c.offset[1])
+            .min()
+            .expect("形状非空") as f32;
+        // 最低格中心 = origin + min_y;最低点 = 中心 − 0.45;静置时 = 1。
+        1.0 + 0.45 - min_y + h
+    }
+
+    /// 落地前一拍的竖直速度断言(G03 裁定第 1 条):窗口内第一次 |vy| 达到
+    /// 0.9 × touch_speed(h) 时停,断言它 ≤ 1.1 × touch_speed。**不能取窗口
+    /// 内 vy 的最小值**:端角等翻倒工况触地后质心继续下落(倒平姿势),重力
+    /// 把 vy 推过自由落体值(0.9 m 档实测 min_vy = 4.81 > 4.20,18% 假红);
+    /// "到 0.9 倍即停"保证采到的必然是触地前的自由落体段。窗口不足(整段
+    /// 都没到 0.9 倍,即 spawn 高度偏高 / 地面基准错)时报错。
+    fn assert_touch_speed(s: &mut ShardSim, id: EntityId, h: f32, until: usize, ctx: &str) {
+        let want = touch_speed(h);
+        // 自由落体到触地需 √(2h/g)/dt 拍(dt = 1/60);窗口必须盖过它,否则
+        // 没到触地就退出(G03 实测 28 拍窗口 vy 只到 4.58)。取 1.5 倍行程
+        // 拍数与调用者给的 until 的较大者。
+        let fall_ticks = ((want / 9.81) / (1.0 / 60.0)).ceil() as usize;
+        let until = until.max(fall_ticks * 3 / 2 + 2);
+        for _ in 0..until {
+            s.step();
+            match s.entity_state(id) {
+                Some(st) => {
+                    let v = st.linvel.y.abs();
+                    if v >= 0.9 * want {
+                        assert!(
+                            v <= 1.1 * want,
+                            "{ctx}:落地前竖直速度 {v} 超出 touch_speed({h}) = {want} \
+                             的 ±10% ——落高/地面基准错了(地面顶面 world y = 1)"
+                        );
+                        return;
+                    }
+                }
+                None => panic!("{ctx}:实体在触地前就消失(断裂过早或 spawn 失败)"),
+            }
+        }
+        panic!(
+            "{ctx}:{} 拍内竖直速度没到 0.9 × touch_speed({h}) = {} ——\
+             spawn 高度偏高或地面基准错了(地面顶面 world y = 1)",
+            until, want
+        );
+    }
+
     /// AC-G3 侧撞(G03 冒烟同款工况):悬空 6 格土条,单格土方块 40 m/s
     /// (≈ 1.45 × 27.6,土阈值)沿 +z 撞**端格**——投射物从端格外侧起飞、
     /// 按**真实格世界中心**瞄准(端格 = 原点刚体 + 形状 offset,取整格心
@@ -14617,22 +14691,16 @@ mod tests {
     /// N·s、S = 底格、**事件 J 沿局部 +y**(压向)。断言:断开发生、首个断开
     /// 事件接触格 = 底格(局部 offset y 最小)、J 局部系 +y 分量显著、
     /// S = 底格单格、§5.8.4 breaks = 1 / detached_cells = 1。
+    ///
+    /// G03 教训:地面顶面 = world y = 1(dirt_on_stone_chunk 的方块层在
+    /// chunk 局部 y = 64 = world y = 0)——此前手写 `67 + h` 落高多 64 m,
+    /// 落地冲量被当成"倒下拍"现象(裁定 6f67791 后注释)。落高经
+    /// `drop_origin_y` 换算 + `assert_touch_speed` 钉落地前速度。
     #[test]
     fn compound_flow_pillar_landing_breaks_bottom_cell_press_direction() {
         let mut s = flow_compound_gravity_sim();
         s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
-        // 6 格土柱:形状 offset y = −2..=3(canonical 升序底格 = −2),原点
-        // 在格 (10,4,8),柱占 y 2..=7;落高:底面(y=2 底)离地面(y=1 顶,
-        // world 顶面 y=2?dirt_on_stone_chunk 实心层顶 = y 64 的 BlockId(1),
-        // DIRT 层 = y 64)——直接抄 beam_spawn_input 口径:实心层顶 world
-        // y = 65 的面(64 是 DIRT),spawn 底面 y = 1 + 0.45 + gap。
-        // 落高 = spawn 底面 − 静置底面(y=65);静置时柱底格中心 y = 65.5。
         let h = 2.0 * 2.6;
-        // 静置底格中心 = 65.5 → spawn 原点(中格 y offset −2..=3 → 原点 =
-        // y offset 0 对应格 (10, 4+2)=(10,6,8)?)——柱 6 格:offset
-        // y = −2..=3,原点格 = 世界 (10, y0, 8),柱底格 = y0 − 2,其中心 =
-        // y0 − 1.5;静置时 = 65.5 → y0 = 67。spawn 时 y0 = 67 + h。
-        let y0 = 67.0 + h;
         let shape = types::CompoundShape::new(
             (-2i32..=3)
                 .map(|y| types::ShapeCell {
@@ -14646,10 +14714,12 @@ mod tests {
         s.apply_prefix(&[compound_input_at(
             1,
             id,
-            Vec3::new(10.5, y0 + 0.5, 8.5),
+            Vec3::new(10.5, drop_origin_y(&shape, h), 8.5),
             shape,
             Vec3::ZERO,
         )]);
+        // 落地拍在 ~30 拍内到达(落高 5.2 m);取 28 拍内 vy 最小值核对落高。
+        assert_touch_speed(&mut s, id, h, 28, "土柱竖落");
         let mut broke = false;
         let mut j_local = Vec3::ZERO;
         let mut cells_y = Vec::new();
@@ -14732,7 +14802,7 @@ mod tests {
             s.apply_prefix(&[compound_input_at(
                 1,
                 id,
-                Vec3::new(10.5, 66.5 + h, 8.5),
+                Vec3::new(10.5, drop_origin_y(&shape, h), 8.5),
                 shape,
                 Vec3::ZERO,
             )]);
@@ -14778,10 +14848,16 @@ mod tests {
         .expect("6 格条");
         let id = entity(1);
         let h = 2.0 * 2.1;
-        // 静置最低点(端格外下角):y = y0 + R·(−4,0,0).y − 0.45·cos30°
-        // ≈ y0 − 2 − 0.39 = y0 − 2.39;贴地(world y = 65)→ y0 ≈ 67.39。
-        // spawn 抬高 h。
-        let y0 = 67.39 + h;
+        // 30° 端角的静置高度:最低格(offset −4)旋转后中心 = y0 + R·(−4,0,0).y
+        // = y0 − 4·sin30° = y0 − 2,cuboid 旋转后最低点 = 中心 − 0.45·(sin30°
+        // + cos30°) ≈ −0.61;贴地面(world y = 1)→ 静置原点 y = 1 + 2 + 0.61
+        // = 3.61。spawn = 3.61 + h(此前手写 67.39 多了 64 m,G03 教训)。
+        // drop_origin_y 不处理旋转(按 offset y 直立形状换算),这里手写并
+        // 写明推导。
+        let y0 = 1.0
+            + 4.0 * 30f32.to_radians().sin()
+            + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+            + h;
         s.apply_prefix(&[StampedInput {
             apply_at: Tick::ZERO,
             source: messaging::InputSource::SCHEDULER,
@@ -14796,6 +14872,8 @@ mod tests {
                 desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
             }),
         }]);
+        // 落地拍核对(2.1×2 = 4.2 m → vy ≈ 9.1;取 30 拍内最小 vy)。
+        assert_touch_speed(&mut s, id, h, 30, "30° 端角");
         let mut s_cells = Vec::new();
         let mut contact_x = Vec::new();
         let mut broke = false;
@@ -14855,7 +14933,12 @@ mod tests {
         .expect("6 格条");
         let id = entity(1);
         let h = 2.0 * 2.1;
-        let y0 = 67.39 + h;
+        // 静置高度同 corner 测试:R_y(45°) 不改 y 分量,最低点推导一致 →
+        // 静置原点 y = 3.61;spawn = 静置 + h(此前手写 67.39 多了 64 m)。
+        let y0 = 1.0
+            + 4.0 * 30f32.to_radians().sin()
+            + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+            + h;
         s.apply_prefix(&[StampedInput {
             apply_at: Tick::ZERO,
             source: messaging::InputSource::SCHEDULER,
@@ -14871,6 +14954,8 @@ mod tests {
                 desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
             }),
         }]);
+        // 落地拍核对(4.2 m → vy ≈ 9.1;取 30 拍内最小 vy)。
+        assert_touch_speed(&mut s, id, h, 30, "45°+30° 双旋土条");
         let mut saw_event = false;
         for _ in 0..400 {
             s.step();
@@ -14897,6 +14982,401 @@ mod tests {
         }
         // 布景有效性:落地途中确实采样过事件(否则守卫没跑)。
         assert!(saw_event, "落地途中应有冲量流事件(守卫有效性)");
+    }
+
+    // ==================== AC-C6 开启版(§5.8.6 末条;G03) ====================
+    // 档位按 §5.8.1 表 rapier 列(土),每项上下各取一档、约 20% 余量。
+    // 落地工况全部经 assert_touch_speed 钉住落高(布景错直接红)。
+
+    /// AC-C6 开启版①:6 格土柱竖落,2.0 m 不断、3.2 m 落地拍压断底格
+    /// (土阈值 2.6 m 的 ± ~20%)。断开发生在**落地拍**(裁定复测:
+    /// 2.6 m s = 34.20 > C = 33.71),不是倒下拍——落高错了 64 m 时落地拍
+    /// 供给被分拍摊薄,首断推迟到 ~220 拍的倒下拍(G03 停报教训)。
+    #[test]
+    fn compound_flow_acc_c6_pillar_thresholds() {
+        let run = |h: f32| -> (bool, u64, usize) {
+            let mut s = flow_compound_gravity_sim();
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let shape = types::CompoundShape::new(
+                (-2i32..=3)
+                    .map(|y| types::ShapeCell {
+                        offset: [0, y, 0],
+                        block: voxel::builtin::DIRT,
+                    })
+                    .collect(),
+            )
+            .expect("6 格柱");
+            let id = entity(1);
+            s.apply_prefix(&[compound_input_at(
+                1,
+                id,
+                Vec3::new(10.5, drop_origin_y(&shape, h), 8.5),
+                shape,
+                Vec3::ZERO,
+            )]);
+            assert_touch_speed(&mut s, id, h, 60, "AC-C6 柱");
+            let mut broke = false;
+            let mut breaks = 0u64;
+            let mut first_tick = 0usize;
+            for tick in 0..400 {
+                let alive = s.entity_state(id).is_some();
+                let out = s.take_outbox();
+                breaks += out.cohesion_stats.compound_flow_breaks;
+                if breaks > 0 && !broke {
+                    broke = true;
+                    first_tick = tick;
+                }
+                if !alive {
+                    break;
+                }
+                s.step();
+            }
+            (broke, breaks, first_tick)
+        };
+        // 2.0 m:落地拍 s = 30.45 < C,不断(弹跳拍 20.7 / 18.0 也不够)。
+        let (broke_lo, breaks_lo, _t_lo) = run(2.0);
+        assert!(!broke_lo, "2.0 m 竖落应不断(breaks = {breaks_lo})");
+        assert_eq!(breaks_lo, 0);
+        // 3.2 m:落地拍 s = 38.08 > C = 34.36,落地拍断底格。
+        let (broke_hi, _breaks_hi, t_hi) = run(3.2);
+        assert!(broke_hi, "3.2 m 竖落应压断底格");
+        assert!(
+            t_hi <= 20,
+            "断开应在落地拍(≤ 20 拍,实际第 {t_hi} 拍)——推迟到倒下拍说明落高错了"
+        );
+    }
+
+    /// AC-C6 开启版②:6 格土条 / 石条 30° 端角先着地,档位 = 生产实测临界
+    /// h* 的 0.75 倍不断 / 1.25 倍断端格(G03-2 裁定:采纳 A,按生产实测
+    /// 重标;G00 表"30° 端角 石 13.4 / 土 2.1 m"作废——demo 二分的采样
+    /// 没把法向转进刚体系)。BISECT_CORNER 二分实测(0.05 m 容差,判据 =
+    /// 落地窗口内任一拍断开):**土 h* = 1.17 m、石 h* = 8.27 m**;临界
+    /// 供给恰落纯函数 s*(土 12.99 ≈ 12.60、石 33.49 ≈ 32.40,差 = 量化 +
+    /// 弹跳相位)。档位:土 0.9 / 1.5 m、石 6.0 / 10.5 m。逐拍探针见回评。
+    #[test]
+    fn compound_flow_acc_c6_corner_thresholds() {
+        let run = |h: f32, block: types::BlockId| -> (bool, u64, usize) {
+            let mut s = flow_compound_gravity_sim();
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let shape = types::CompoundShape::new(
+                (-4i32..=1)
+                    .map(|x| types::ShapeCell {
+                        offset: [x, 0, 0],
+                        block,
+                    })
+                    .collect(),
+            )
+            .expect("6 格条");
+            let id = entity(1);
+            // 30° 旋转静置原点:最低格 offset −4,旋转后格心 = y0 − 4·sin30°
+            // (= y0 − 2),cuboid 旋转后最低点 = 格心 − 0.45·(sin30° + cos30°);
+            // 贴地(world y = 1)→ y0 = 1 + 2 + 0.615 = 3.61(spawn 再加 h)。
+            // drop_origin_y 不处理旋转,这里手写;此前把 4·sin30° 误写成
+            // 4·0.5·sin30°(少 1 m,touch_speed 断言抓出)。
+            let y0 = 1.0
+                + 4.0 * 30f32.to_radians().sin()
+                + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+                + h;
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: id,
+                    state: EntityState {
+                        translation: Vec3::new(10.5, y0, 8.5),
+                        rotation: types::glam::Quat::from_rotation_z(30f32.to_radians()),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
+                }),
+            }]);
+            assert_touch_speed(&mut s, id, h, 60, "AC-C6 端角");
+            let mut broke = false;
+            let mut breaks = 0u64;
+            let mut first_tick = 0usize;
+            for tick in 0..400 {
+                let alive = s.entity_state(id).is_some();
+                let out = s.take_outbox();
+                breaks += out.cohesion_stats.compound_flow_breaks;
+                if breaks > 0 && !broke {
+                    broke = true;
+                    first_tick = tick;
+                }
+                if !alive {
+                    break;
+                }
+                s.step();
+            }
+            (broke, breaks, first_tick)
+        };
+        // 生产二分(G03-2 裁定"要做的"第 1 条,由 BISECT_CORNER 触发):土、
+        // 石 30° 端角临界落高,容差 0.05 m,判据 = 落地窗口(60 拍)内任一拍
+        // 断开;每个材料打印临界两侧各 0.05 m 档的逐拍探针(首事件拍/vy/s/C/S)。
+        if std::env::var("BISECT_CORNER").is_ok() {
+            for (block, name) in [(voxel::builtin::DIRT, "土"), (voxel::builtin::STONE, "石")] {
+                let broken = |h: f32| -> bool {
+                    let mut s = flow_compound_gravity_sim();
+                    s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+                    let shape = types::CompoundShape::new(
+                        (-4i32..=1)
+                            .map(|x| types::ShapeCell {
+                                offset: [x, 0, 0],
+                                block,
+                            })
+                            .collect(),
+                    )
+                    .expect("6 格条");
+                    let id = entity(1);
+                    let y0 = 1.0
+                        + 4.0 * 30f32.to_radians().sin()
+                        + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+                        + h;
+                    s.apply_prefix(&[StampedInput {
+                        apply_at: Tick::ZERO,
+                        source: messaging::InputSource::SCHEDULER,
+                        sequence: 1,
+                        payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                            entity: id,
+                            state: EntityState {
+                                translation: Vec3::new(10.5, y0, 8.5),
+                                rotation: types::glam::Quat::from_rotation_z(30f32.to_radians()),
+                                ..EntityState::default()
+                            },
+                            desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
+                        }),
+                    }]);
+                    let mut broke = false;
+                    // 窗口按落高缩放(自由落体行程 ×3 + 10),大落高不能被
+                    // 固定 60 拍截断(8 m 落地就要 ~77 拍)。
+                    let window = (((2.0 * h / 9.81).sqrt() * 60.0).ceil() as usize) * 3 + 10;
+                    for tick in 0..window {
+                        s.step();
+                        let out = s.take_outbox();
+                        let n = s.compound_flow_trace.len();
+                        if out.cohesion_stats.compound_flow_breaks > 0 {
+                            broke = true;
+                            println!(
+                                "[bisect corner {name} BROKE h={h:.3} tick {tick} breaks+={}]",
+                                out.cohesion_stats.compound_flow_breaks
+                            );
+                            if n > 0 {
+                                let tr = s.compound_flow_trace.last().expect("有事件");
+                                println!(
+                                    "    last event: s={} C={} S={:?}",
+                                    tr.outcome.supply_q as f32 / 1000.0,
+                                    tr.outcome.cut_q as f32 / 1000.0,
+                                    tr.outcome.detached
+                                );
+                            }
+                            break;
+                        }
+                        if s.entity_state(id).is_none() {
+                            broke = true;
+                            println!("[bisect corner {name} GONE h={h:.3} tick {tick}]");
+                            break;
+                        }
+                    }
+                    broke
+                };
+                let (mut lo, mut hi) = (0.05f32, 16.0f32);
+                assert!(broken(hi), "{name}:hi = {hi} m 未验证会断(上限抬高)");
+                while hi - lo > 0.05 {
+                    let mid = 0.5 * (lo + hi);
+                    if broken(mid) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                println!("[bisect corner {name}] h* = {hi:.3} m(扛 {lo:.3} / 断 {hi:.3})");
+                // 临界两侧各一档的逐拍探针(首事件拍/vy/s/C/S)。
+                for (tag, h) in [("<", lo), (">=", hi)] {
+                    let mut s = flow_compound_gravity_sim();
+                    s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+                    let shape = types::CompoundShape::new(
+                        (-4i32..=1)
+                            .map(|x| types::ShapeCell {
+                                offset: [x, 0, 0],
+                                block,
+                            })
+                            .collect(),
+                    )
+                    .expect("6 格条");
+                    let id = entity(1);
+                    let y0 = 1.0
+                        + 4.0 * 30f32.to_radians().sin()
+                        + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+                        + h;
+                    s.apply_prefix(&[StampedInput {
+                        apply_at: Tick::ZERO,
+                        source: messaging::InputSource::SCHEDULER,
+                        sequence: 1,
+                        payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                            entity: id,
+                            state: EntityState {
+                                translation: Vec3::new(10.5, y0, 8.5),
+                                rotation: types::glam::Quat::from_rotation_z(30f32.to_radians()),
+                                ..EntityState::default()
+                            },
+                            desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
+                        }),
+                    }]);
+                    let mut printed = 0usize;
+                    for tick in 0..80 {
+                        let st = s.entity_state(id);
+                        let vy = st.map(|v| v.linvel.y).unwrap_or(f32::NAN);
+                        let n = s.compound_flow_trace.len();
+                        s.step();
+                        let out = s.take_outbox();
+                        if s.compound_flow_trace.len() > n && printed < 4 {
+                            for tr in &s.compound_flow_trace[n..] {
+                                println!(
+                                    "[corner {name} {tag}{h:.2}] tick {tick} vy={vy:.2} \
+                                     s={} C={} S={:?} breaks+={}",
+                                    tr.outcome.supply_q as f32 / 1000.0,
+                                    tr.outcome.cut_q as f32 / 1000.0,
+                                    tr.outcome.detached,
+                                    out.cohesion_stats.compound_flow_breaks
+                                );
+                                printed += 1;
+                            }
+                        }
+                        if s.entity_state(id).is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // 土档位(0.75 h* / 1.25 h*,h* = 1.17 m 二分实测):0.9 m 不断、
+        // 1.5 m 落地窗口断端格(裁定 A:按生产实测重标)。
+        let (broke_lo, breaks_lo, _t_lo) = run(0.9, voxel::builtin::DIRT);
+        assert!(!broke_lo, "0.9 m(0.75 h*)端角应不断(breaks = {breaks_lo})");
+        assert_eq!(breaks_lo, 0);
+        let (broke_hi, _breaks_hi, t_hi) = run(1.5, voxel::builtin::DIRT);
+        assert!(broke_hi, "1.5 m(1.25 h*)端角应断下端格");
+        assert!(
+            t_hi <= 60,
+            "断开应在落地窗口(≤ 60 拍,实际第 {t_hi} 拍)——推迟到倒下拍说明落高错了"
+        );
+        // 石档位(石 h* = 8.27 m 二分实测):6 m(0.75 h*)不断、10 m(1.25 h*)
+        // 断端格。石远强于土,土断的高度石扛住(反向不成立)。
+        let (broke_stone_lo, stone_lo_breaks, _t) = run(6.0, voxel::builtin::STONE);
+        assert!(
+            !broke_stone_lo,
+            "6 m(0.75 石 h*)石条端角应不断(breaks = {stone_lo_breaks})"
+        );
+        let (broke_stone_hi, _b, t_stone_hi) = run(10.5, voxel::builtin::STONE);
+        assert!(broke_stone_hi, "10.5 m(1.25 石 h*)石条端角应断下端格");
+        assert!(
+            t_stone_hi <= 250,
+            "石 10.5 m 断开应在落地窗口(≤ 250 拍,实际第 {t_stone_hi} 拍)"
+        );
+    }
+
+    /// AC-C6 开启版③:单格土方块侧撞悬空 6 格土条端格,22 m/s 不断、
+    /// 34 m/s 断端格(土阈值 27.6 m/s 的 ± ~20%)。
+    #[test]
+    fn compound_flow_acc_c6_side_impact_thresholds() {
+        let run = |speed: f32| -> (bool, Vec<(i32, i32, i32)>) {
+            let mut s = flow_compound_sim();
+            s.load_chunk(ChunkPos::new(0, 0), voxel::Chunk::air());
+            let shape = types::CompoundShape::new(
+                (-4i32..=1)
+                    .map(|x| types::ShapeCell {
+                        offset: [x, 0, 0],
+                        block: voxel::builtin::DIRT,
+                    })
+                    .collect(),
+            )
+            .expect("6 格条");
+            let (bar, bullet) = (entity(1), entity(2));
+            s.apply_prefix(&[
+                compound_input_at(1, bar, Vec3::new(9.5, 5.5, 8.5), shape, Vec3::ZERO),
+                dirt_bullet_input(
+                    2,
+                    bullet,
+                    Vec3::new(10.5, 5.5, 4.0),
+                    Vec3::new(0.0, 0.0, speed),
+                ),
+            ]);
+            let mut broke = false;
+            let mut s_cells = Vec::new();
+            for _ in 0..200 {
+                s.step();
+                let out = s.take_outbox();
+                if !out.piece_requests.is_empty() {
+                    broke = true;
+                    if let Some(tr) = s
+                        .compound_flow_trace
+                        .iter()
+                        .find(|tr| !tr.outcome.detached.is_empty())
+                    {
+                        s_cells = tr
+                            .outcome
+                            .detached
+                            .iter()
+                            .map(|c| (c.x, c.y, c.z))
+                            .collect();
+                    }
+                    break;
+                }
+            }
+            (broke, s_cells)
+        };
+        let (broke_lo, _cells_lo) = run(22.0);
+        assert!(!broke_lo, "22 m/s 侧撞端格应不断");
+        let (broke_hi, cells_hi) = run(34.0);
+        assert!(broke_hi, "34 m/s 侧撞端格应断下端格");
+        assert_eq!(
+            cells_hi,
+            vec![(1i32, 0, 0)],
+            "S = 端格(offset x = 1):{cells_hi:?}"
+        );
+    }
+
+    /// AC-C6 开启版④:3×3 土板平落 9 m 与 16 m 都不断(平落刚体假设,
+    /// D18:任何落高都不断)。
+    #[test]
+    fn compound_flow_acc_c6_plate_thresholds() {
+        let run = |h: f32| -> u64 {
+            let mut s = flow_compound_gravity_sim();
+            s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+            let shape = types::CompoundShape::new(
+                (0..9)
+                    .map(|i| types::ShapeCell {
+                        offset: [(i % 3) - 1, 0, (i / 3) - 1],
+                        block: voxel::builtin::DIRT,
+                    })
+                    .collect(),
+            )
+            .expect("9 格板");
+            let id = entity(1);
+            s.apply_prefix(&[compound_input_at(
+                1,
+                id,
+                Vec3::new(10.5, drop_origin_y(&shape, h), 8.5),
+                shape,
+                Vec3::ZERO,
+            )]);
+            assert_touch_speed(&mut s, id, h, 90, "AC-C6 板");
+            let mut breaks = 0u64;
+            for _ in 0..400 {
+                let alive = s.entity_state(id).is_some();
+                let out = s.take_outbox();
+                breaks += out.cohesion_stats.compound_flow_breaks;
+                if !alive {
+                    break;
+                }
+                s.step();
+            }
+            breaks
+        };
+        let breaks_9 = run(9.0);
+        assert_eq!(breaks_9, 0, "9 m 平落应不断");
+        let breaks_16 = run(16.0);
+        assert_eq!(breaks_16, 0, "16 m 平落应不断");
     }
 
     /// §5.7 修正扣除(punch 几何,G02;§5.8.1 c65a8f6 符号条):悬空石条

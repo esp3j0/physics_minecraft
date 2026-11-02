@@ -2887,7 +2887,10 @@ mod unit06 {
     /// `impact_flow` = 撞击冲量流开关(F04a):本模块默认新语义(true);
     /// 测 §7.3 第 7 条均摊砸地形旧语义的用例(acc_c5)显式传 false(§5.7.5
     /// 迁移,§12.1 第 3 条纪律)。
-    fn session(pad: bool, impact_flow: bool) -> (Session, CommandLog) {
+    /// `compound_flow` = 复合体冲量流开关(G03):测 §7.1 旧碎裂路径(AC-C6
+    /// 原阈值集)的用例显式传 false(G03 默认翻转,§12.1 第 3 条纪律);
+    /// 新增的 AC-C6 开启版(acc_c6_compound_flow_*)传 true。
+    fn session(pad: bool, impact_flow: bool, compound_flow: bool) -> (Session, CommandLog) {
         let mut c = ShardSimConfig::new(shard());
         c.destruction = DestructionConfig {
             enabled: true,
@@ -2896,6 +2899,7 @@ mod unit06 {
         c.cohesion = CohesionConfig {
             enabled: true,
             impact_flow,
+            compound_flow,
             ..CohesionConfig::default()
         };
         let mut sim = ShardSim::new(c, registry());
@@ -2931,7 +2935,10 @@ mod unit06 {
         )
     }
 
-    /// 生成一根 6 格梁:原点格中心 x = 62.5、给定 z,最低点离地 `h` 米(平放时原点 y = −59.475 + h)。
+    /// 生成一根 6 格梁:原点格中心 x = 62.5、给定 z,最低点离落点地面 `h` 米
+    /// (平放静置中心 = 地面顶 −60 + 0.45 = −59.55,spawn = −59.475 + h 的
+    /// 旧常量多垫 0.075 m,影响 ≤1.5% 落高,按 G03 教训改为 −59.55 + h;
+    /// 旋转布景的最低点换算由调用方在 `h` 里折算)。
     fn drop_beam(
         s: &mut Session,
         log: &mut CommandLog,
@@ -2946,7 +2953,7 @@ mod unit06 {
                 shard(),
                 EntityId::from_parts(0, k),
                 EntityState {
-                    translation: Vec3::new(62.5, -59.475 + h, z),
+                    translation: Vec3::new(62.5, -59.55 + h, z),
                     rotation,
                     ..EntityState::default()
                 },
@@ -2978,10 +2985,15 @@ mod unit06 {
 
     /// AC-C6 石梁平落 5 m 不碎(设计意图):落在石垫上,整块凝固回一排 6 格石头,期间不断任何粘结。
     ///
+    /// `h` = 平放梁最低点离**落点地面**(石垫顶 = world y = −60)的落高;
+    /// 静置中心 = −60 + 0.45,spawn = −59.475 + h(drop_beam 内换算)。
+    ///
     /// 会变红的实现:逐格相加而不均摊(求解器把冲量集中在一格,5 m 就断)。
     #[test]
     fn acc_c6_stone_beam_flat_5m_stays_whole() {
-        let (mut s, mut log) = session(true, true);
+        // G03 迁移:§7.1 旧路径(AC-C6 原阈值集,压向豁免下石梁 5 m 不碎)
+        // 显式关 compound_flow(开启版断言见 acc_c6_compound_flow_*)。
+        let (mut s, mut log) = session(true, true, false);
         drop_beam(&mut s, &mut log, 1, 64.5, 5.0, STONE, Quat::IDENTITY);
         let (done, total) = settle(&mut s);
         assert!(done);
@@ -2999,7 +3011,10 @@ mod unit06 {
     /// 会变红的实现:碎裂没接线;拆分后丢格。
     #[test]
     fn acc_c6_dirt_beam_flat_8m_shatters() {
-        let (mut s, mut log) = session(true, true);
+        // G03 迁移:§7.1 旧路径(AC-C6 原阈值集:土梁 8 m 碎 6 段)显式关
+        // compound_flow——D18/§5.8 开启后平落不碎,开启版阈值见
+        // acc_c6_compound_flow_*。
+        let (mut s, mut log) = session(true, true, false);
         drop_beam(&mut s, &mut log, 1, 64.5, 8.0, DIRT, Quat::IDENTITY);
         let (done, total) = settle(&mut s);
         assert!(done);
@@ -3023,13 +3038,17 @@ mod unit06 {
     /// 会变红的实现:压向豁免写反(所有粘结都被当成压向)。
     #[test]
     fn acc_c6_corner_first_stone_beam_breaks() {
-        let (mut s, mut log) = session(true, true);
+        // G03 迁移:§7.1 旧路径(角先着地 8 m 断开)显式关 compound_flow
+        // (§5.8 下该工况由惯性汇点网络判,开启版阈值见 acc_c6_compound_flow_*)。
+        let (mut s, mut log) = session(true, true, false);
+        // 30° 旋转最低点 = 原点 − 2·sin30° − 0.45·cos30° ≈ 原点 − 1.39,
+        // 要"最低点离地 8 m"需 8 + 1.39(旧 +1.0 是平放口径,少 0.39)。
         drop_beam(
             &mut s,
             &mut log,
             1,
             72.5,
-            8.0 + 1.0,
+            8.0 + 2.0 * 0.5 + 0.45 * 30f32.to_radians().cos(),
             STONE,
             Quat::from_rotation_z(30f32.to_radians()),
         );
@@ -3048,7 +3067,7 @@ mod unit06 {
     /// 第 7 条均摊砸地形的旧语义,冲量流生效时该路径被 §5.7 取代(§5.7.5 迁移)。
     #[test]
     fn acc_c5_compound_terrain_impact_averaged() {
-        let (mut s, mut log) = session(false, false);
+        let (mut s, mut log) = session(false, false, false);
         drop_beam(&mut s, &mut log, 1, 64.5, 2.0, STONE, Quat::IDENTITY);
         drop_beam(&mut s, &mut log, 2, 72.5, 8.0, STONE, Quat::IDENTITY);
         let low: Vec<BlockPos> = (60..=65).map(|x| p(x, -61, 64)).collect();

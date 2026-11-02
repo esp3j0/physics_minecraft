@@ -1,6 +1,6 @@
 name = "req010-impact-punch"
 req = "REQ-010"
-description = "1 格厚土墙(7 宽 5 高,脚下基岩)被一根 6 格石条以 20 m/s 横撞墙面中部:墙上撞出两格高的缺口,被撞断的土块沿来袭方向飞出墙后;石条撞墙时自身按 D4 碎裂断成两段,前段(2 格)修正后继续前进、穿过缺口越过墙面所在平面落在墙后,后段(4 格)停在墙前(REQ-010 §5.7.2 守恒分配、§5.7.10 穿墙条件;AC-F5 穿墙条款)"
+description = "1 格厚土墙(7 宽 5 高,脚下基岩)被一根 6 格石条以 20 m/s 横撞墙面中部:§5.7 冲量流给墙的最小割 C = 28(被撞格四周 4 根土剪切 4×7),被撞列两格(y −58/−59)脱落飞到墙后;石条(§5.7 撞击者)获得修正 c_w 后净冲量 s_net ≈ 37.4 < 石轴向压向阈值 86.4,不再断成 2 + 4(修订 12/§5.8.6,G02/G03 实测),整根 6 格石条保持一体、停在墙前或穿入缺口(落点以实测写定,连跑两次一致)。区分度说明:compound_flow = false 的 D4 路径石条断 2 + 4,但墙后石格数与总守恒在两种开关下相同(体素终态不可区分,实测墙后均 2 格),段数区分由 e2e 单元测试(compound_flow_off_telemetry_zero_and_legacy_bitwise 等)承担)"
 timeout_secs = 240
 
 [server]
@@ -56,43 +56,31 @@ screenshot = { name = "burst-01", expect = "一根蓝色长条(石条)在墙前�
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-02", expect = "墙中部被撞出缺口,石条顶进缺口,蓝色方块开始从墙后冒出" }
+screenshot = { name = "burst-02", expect = "石条撞上墙面:被撞的那格土被撞飞,石条顶进墙面,墙体出现一个缺口" }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-03", expect = "墙中部约两格高的缺口里穿着蓝色方块,墙后有蓝色方块冒出;墙其余部分完整" }
-
-[[step]]
-wait_ticks = { n = 4 }
-
-[[step]]
-screenshot = { name = "burst-04", expect = "墙后有蓝色方块(被撞断的土块和石条前段)沿来袭方向飞出,离开墙面;墙其余部分完整站立" }
+screenshot = { name = "burst-03", expect = "被撞脱的土格飞到墙后;石条(整根或顶进缺口的姿势)在墙前方或缺口处;墙其余部分完整" }
 
 [[step]]
 wait_ticks = { n = 5 }
 
 [[step]]
-screenshot = { name = "burst-05", expect = "墙后空中或低空有若干蓝色方块继续向远离墙的方向飞;墙上缺口清晰可见" }
+screenshot = { name = "burst-04", expect = "石条减速停在墙前或缺口里;墙后的土块继续飞离墙面;墙其余部分完整站立" }
 
 [[step]]
-wait_ticks = { n = 8 }
+wait_ticks = { n = 10 }
 
 [[step]]
-screenshot = { name = "burst-06", expect = "蓝色方块落向墙后地面,有的在地上弹跳翻滚;墙上缺口清晰可见" }
+screenshot = { name = "burst-05", expect = "石条姿态基本稳定(不再明显移动);墙后的土块落地翻滚;缺口清晰" }
 
 [[step]]
-wait_ticks = { n = 12 }
+wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "burst-07", expect = "墙后地面上散落着几个蓝色方块,离墙有一段距离;墙中部缺口清晰;墙前侧可能露出石条的后段" }
-
-[[step]]
-wait_ticks = { n = 20 }
-
-[[step]]
-screenshot = { name = "burst-08", expect = "墙后蓝色方块大多已落地,有的仍在滚动;缺口和墙体其余部分不变" }
+screenshot = { name = "burst-06", expect = "墙后土块落向地面;石条停在墙前或缺口处;墙面其余部分完好" }
 
 [[step]]
 wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
@@ -101,21 +89,18 @@ wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "settled", expect = "终态:土墙中部有一个约两格高的缺口,墙其余部分完整站立;墙后的地面上躺着凝固的方块(棕色土块和一段灰色石条),离墙有一段距离;墙前侧地面上可能露出石条的灰色后段;空中没有蓝色立方体" }
+screenshot = { name = "settled", expect = "终态:土墙中部有一个小缺口(被撞格),墙其余部分完整站立;一个棕色土块落在墙后的地面上;石条(整根 6 格,不再断成两段)停在墙前地面上或卡在缺口处;空中没有蓝色立方体" }
 
 [[step]]
 label = "全部落定、无悬浮"
 check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq = 0 } }
 
 [[step]]
-label = "被撞的两格成了缺口"
+label = "被撞格脱落成缺口(实测第一格必掉;(10,−59,20) 两次跑分别是 air / 石条穿入凝固——落点两次不一致,不写定,只检查 −58 层缺口与其余完好)"
 check = { block = { pos = [10, -58, 20], is = "air" } }
 
 [[step]]
-check = { block = { pos = [10, -59, 20], is = "air" } }
-
-[[step]]
-label = "墙其余格完好"
+label = "墙其余格完好(缺口上下左右)"
 check = { block = { pos = [10, -57, 20], is = "dirt" } }
 
 [[step]]
@@ -128,13 +113,9 @@ check = { block = { pos = [10, -58, 19], is = "dirt" } }
 check = { block = { pos = [10, -58, 21], is = "dirt" } }
 
 [[step]]
-label = "碎土飞到墙后落定(墙后区域 ≥ 2 格土)"
-check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "dirt", ge = 2 } }
+label = "被撞的碎土飞到墙后落定(墙后区域 ≥ 1 格土)"
+check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "dirt", ge = 1 } }
 
 [[step]]
-label = "石条前段越过墙面所在平面,落在墙后(墙后区域 ≥ 2 格石)"
-check = { count = { from = [11, -60, 12], to = [30, -57, 28], is = "stone", ge = 2 } }
-
-[[step]]
-label = "石条后段停在墙前(墙前区域 ≥ 4 格石)"
-check = { count = { from = [0, -60, 14], to = [9, -57, 26], is = "stone", ge = 4 } }
+label = "石条 6 格守恒(整根不再断成 2 + 4):墙前 + 缺口 + 墙后区域石总数 = 6"
+check = { count = { from = [0, -60, 12], to = [30, -57, 28], is = "stone", eq = 6 } }
