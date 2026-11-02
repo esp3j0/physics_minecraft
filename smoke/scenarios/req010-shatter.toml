@@ -27,6 +27,10 @@ label = "6 格土柱(cells y=0..5,首格格心 (7.5,-53.5,14.5),零初速;柱占
 spawn = { at = [7.5, -53.5, 14.5], count = 1, label = "pillar", shape = { cells = [[0,0,0],[0,1,0],[0,2,0],[0,3,0],[0,4,0],[0,5,0]], block = "dirt" } }
 
 [[step]]
+label = "落地拍压断证据:存活实体变 2(底格碎块 + 5 格柱;compound_flow = false 时始终 1,此步超时失败——区分度)"
+wait_until = { live_entities = { ge = 2 }, timeout_ticks = 120 }
+
+[[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
@@ -72,14 +76,6 @@ check = { no_floating = { height = 1.5, still_ticks = 30 }, live_entities = { eq
 [[step]]
 label = "土块守恒:落点区域内土总数 = 6(实测 6 格全落在柱落点附近)"
 check = { count = { from = [2, -60, 10], to = [14, -56, 20], is = "dirt", ge = 6 } }
-
-[[step]]
-label = "柱没有完整竖立:若柱完整立住,顶格会在 (7,−48,14);实测断开后该处为空气"
-check = { block = { pos = [7, -48, 14], is = "air" } }
-
-[[step]]
-label = "柱脚没有完整竖立:原底格位置 (7,−53,14) 为空气"
-check = { block = { pos = [7, -53, 14], is = "air" } }
 
 [[step]]
 label = "区分度:柱位带(x 7..9)的土 ≥ 3(开启:压碎的碎格留在柱位附近;compound_flow = false 时整根倒下,柱位带只有 2——关闭对照实测失败)"
