@@ -10,7 +10,9 @@ pub mod cli;
 pub mod client;
 pub mod mesh;
 pub mod render;
-/// REQ-008:图形冒烟场景脚本(纯逻辑,零 macroquad)。
+/// REQ-008:场景脚本(纯逻辑,零 macroquad)。
 pub mod script;
+/// REQ-011 W01:交互模式调试工具(纯逻辑层;拾取/预制/动作)。
+pub mod tools;
 /// REQ-008:世界状态(纯逻辑;渲染与脚本引擎共用)。
 pub mod world;

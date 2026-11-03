@@ -9,17 +9,19 @@ use std::path::Path;
 use std::time::Instant;
 
 use macroquad::camera::{Camera3D, Projection, set_camera, set_default_camera};
-use macroquad::color::{BLUE, DARKGRAY, SKYBLUE, WHITE, YELLOW};
+use macroquad::color::{BLUE, DARKGRAY, GRAY, ORANGE, RED, SKYBLUE, WHITE, YELLOW};
 use macroquad::input::{
-    KeyCode, is_key_down, is_key_pressed, mouse_delta_position, set_cursor_grab, show_mouse,
+    KeyCode, MouseButton, is_key_down, is_key_pressed, is_mouse_button_pressed,
+    mouse_delta_position, set_cursor_grab, show_mouse,
 };
 use macroquad::math::vec3;
-use macroquad::models::{Mesh, draw_cube, draw_mesh};
+use macroquad::models::{Mesh, draw_cube, draw_cube_wires, draw_mesh};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
 use macroquad::window::{clear_background, next_frame, screen_height};
 use messaging::SimCommand;
-use types::{ChunkPos, EntityDesc, EntityId, EntityState};
+use types::glam::Vec3 as TVec3;
+use types::{BlockPos, ChunkPos, EntityDesc, EntityId, EntityState};
 // 注:macroquad 0.4 内嵌 glam 0.27,types 用 glam 0.33——两版 Vec3 不互认,
 // 一切跨界处按字段换算(下文 vec3(t.x, t.y, t.z) / types::glam::Vec3::new)。
 
@@ -30,6 +32,10 @@ use crate::script::WorldQuery;
 use crate::script::manifest::Manifest;
 use crate::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
+};
+use crate::tools::{
+    Hit, Placeable, ToolAction, ToolState, cycle_placeable, dig, help_lines, hud_tool_line,
+    orientation_from_yaw, pick, place, preview_outline, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -62,6 +68,46 @@ const BLAST_SNAP: f32 = 25.0;
 /// 脚本模式观察者上报的立即触发阈值:相机较上次上报移动超过 1 m 即上报
 /// (不等 100 ms 节流——传送当帧即可带动观察者;REQ-008 单元 02 任务书)。
 const OBSERVER_JUMP_METERS: f32 = 1.0;
+
+/// 拾取最远距离(REQ-011 §3.3)。
+const PICK_MAX_DIST: f32 = 48.0;
+
+/// 工具动作发出(纯函数层 [`ToolAction`] → 控制句柄):Single 走
+/// `command`,Batch 打一条批(REQ-010 终审返修 1 原子编辑语义),Rejected
+/// 写入工具提示(3 秒)。
+fn apply_tool_action(
+    action: ToolAction,
+    tools: &mut ToolState,
+    control: &crate::client::ControlHandle,
+) {
+    match action {
+        ToolAction::Single(command) => control.command(command),
+        ToolAction::Batch(commands) => control.command_batch(commands),
+        ToolAction::Rejected(reason) => tools.reject(reason),
+    }
+}
+
+/// 画一格线框(目标格高亮 / 预制轮廓逐格;格 (x,y,z) 覆盖 [x,x+1)³)。
+fn draw_cell_wire(pos: BlockPos, color: macroquad::color::Color) {
+    draw_cube_wires(
+        vec3(pos.x as f32 + 0.5, pos.y as f32 + 0.5, pos.z as f32 + 0.5),
+        vec3(1.0, 1.0, 1.0),
+        color,
+    );
+}
+
+/// 拾取(每帧;相机位姿 → 3D 线框用命中)。零 macroquad 依赖的纯函数在
+/// tools::pick,这里只做 glam 版本换算。
+fn pick_at_camera(camera: &FlyCamera, world: &WorldState) -> Option<Hit> {
+    let o = camera.position;
+    let d = camera.forward();
+    pick(
+        world,
+        TVec3::new(o.x, o.y, o.z),
+        TVec3::new(d.x, d.y, d.z),
+        PICK_MAX_DIST,
+    )
+}
 
 /// 交互模式的飞行相机初始位姿(地表上方约 12 m;REQ-008 §4 顺带修正:旧值
 /// (8, 12, 24) 按 y=4 地表写死)。脚本模式以修正后的同一位姿为起始相机。
@@ -630,10 +676,15 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
     };
     let mut disconnected: Option<String> = None;
     let mut disconnect_elapsed = 0.0_f32;
+    // REQ-011 W01:调试工具状态(交互模式独有;脚本模式不碰)。
+    let mut tools = ToolState::default();
+    // 每帧拾取目标(线框高亮、HUD、左/右键共用;M 释放鼠标时仍显示)。
+    let mut target: Option<Hit>;
 
     loop {
         let dt = get_frame_time();
         camera.update(dt);
+        tools.tick(dt); // 拒绝提示计时(逐帧 dt;工具行为不进模拟)
 
         // 事件排空(主循环 try_recv 排空,README 决策 3)。
         while let Ok(event) = events.try_recv() {
@@ -646,6 +697,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         }
         world.sync();
 
+        // 拾取(REQ-011 §3.3):客户端已收到的 chunk 数据,最远 48 m。
+        target = pick_at_camera(&camera, &world.state);
+
         // 空格切换耦合(边沿触发,不连发)。
         if is_key_pressed(KeyCode::Space) {
             coupled = !coupled;
@@ -655,6 +709,38 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             mouse_grabbed = !mouse_grabbed;
             set_cursor_grab(mouse_grabbed);
             show_mouse(!mouse_grabbed);
+        }
+        // —— REQ-011 W01 工具按键(仅交互模式;鼠标释放(M)时左右键不
+        //   触发,避免点 HUD 误拆;断连后不发命令)——
+        let tools_sendable = mouse_grabbed && disconnected.is_none();
+        if is_key_pressed(KeyCode::Key1) {
+            crate::tools::select_material(&mut tools, 0);
+        }
+        if is_key_pressed(KeyCode::Key2) {
+            crate::tools::select_material(&mut tools, 1);
+        }
+        if is_key_pressed(KeyCode::Key3) {
+            crate::tools::select_material(&mut tools, 2);
+        }
+        if is_key_pressed(KeyCode::Key4) {
+            crate::tools::select_material(&mut tools, 3);
+        }
+        if is_key_pressed(KeyCode::T) {
+            cycle_placeable(&mut tools);
+        }
+        if is_key_pressed(KeyCode::H) {
+            toggle_help(&mut tools);
+        }
+        if tools_sendable {
+            if is_mouse_button_pressed(MouseButton::Left) {
+                let action = dig(target.as_ref());
+                apply_tool_action(action, &mut tools, &control);
+            }
+            if is_mouse_button_pressed(MouseButton::Right) {
+                let yaw = camera.yaw.to_degrees();
+                let action = place(&tools, target.as_ref(), yaw, &world.state);
+                apply_tool_action(action, &mut tools, &control);
+            }
         }
         // B:准星前方生成动态立方体(落下→静止→凝固成地形色;ACV4 ③④)。
         // 连按散布:同点重叠的刚体被求解器永久抖动、永不满足凝固判据
@@ -727,6 +813,26 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         for (id, pose) in world.entities.iter() {
             world.draw_entity(*id, pose);
         }
+        // —— REQ-011 W01:拾取线框 + 预制轮廓(3D 相机下画;线框颜色区分
+        //   基岩:普通格白、基岩橙)——
+        if let Some(hit) = &target {
+            let color = if hit.block == voxel::builtin::BEDROCK {
+                ORANGE
+            } else {
+                WHITE
+            };
+            draw_cell_wire(hit.block_pos, color);
+        }
+        // 轮廓预览(放置物 = 预制结构且有拾取目标):锚点 = 命中面外侧格,
+        // 朝向 = 相机水平朝向取整;与实际放置同一展开函数,越界警示色(红)。
+        if let (Placeable::Prefab(prefab), Some(hit)) = (&tools.placeable, &target) {
+            let orientation = orientation_from_yaw(camera.yaw.to_degrees());
+            let (cells, out_of_world) = preview_outline(*prefab, hit.place_pos(), orientation);
+            let color = if out_of_world { RED } else { GRAY };
+            for (pos, _) in &cells {
+                draw_cell_wire(*pos, color);
+            }
+        }
         set_default_camera();
 
         // —— HUD(2D 默认相机;四行)——
@@ -738,6 +844,19 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         );
         for (i, line) in lines.iter().enumerate() {
             draw_text(line, 12.0, 20.0 + i as f32 * 20.0, 18.0, WHITE);
+        }
+        // REQ-011 W01:工具行(HUD 第 5 行;临时,W04 并入调试面板)。
+        let tool_line = hud_tool_line(&tools, target.as_ref(), &world.state);
+        draw_text(&tool_line, 12.0, 122.0, 16.0, WHITE);
+        // 拒绝提示(3 秒过期;工具状态逐帧计时)。
+        if let Some((message, _)) = &tools.notice {
+            draw_text(message, 12.0, 142.0, 16.0, ORANGE);
+        }
+        // 按键帮助表(H 切换)。
+        if tools.help_shown {
+            for (i, line) in help_lines().iter().enumerate() {
+                draw_text(line, 12.0, 162.0 + i as f32 * 18.0, 15.0, YELLOW);
+            }
         }
         draw_text(
             if coupled {
