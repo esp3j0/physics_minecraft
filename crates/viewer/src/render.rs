@@ -34,9 +34,9 @@ use crate::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
 };
 use crate::tools::{
-    ChargeState, Hit, PanelColor, PanelState, Placeable, ToolAction, ToolState,
-    adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request, orientation_from_yaw,
-    panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
+    ChargeState, Hit, PanelColor, PanelState, Placeable, StageDriver, StagePhase, ToolAction,
+    ToolState, adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request,
+    orientation_from_yaw, panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -387,10 +387,33 @@ pub async fn run(args: ViewerArgs) {
         .and_then(|v| v.parse::<u8>().ok());
     match args.mode {
         ViewerMode::Interactive => {
-            run_viewer(addr, env_view.unwrap_or(4)).await;
+            run_viewer(addr, env_view.unwrap_or(4), None).await;
         }
         ViewerMode::Script { script, out } => {
             run_script(addr, env_view, &script, &out).await;
+        }
+        // REQ-011 §3.6(W05):布景交互 = 交互模式 + 场景文件。
+        ViewerMode::Stage { script } => {
+            run_viewer(addr, env_view.unwrap_or(4), Some(script.as_path())).await;
+        }
+    }
+}
+
+/// 布景模式的场景前置(非窗口部分):读文件、解析;失败 → 标准错误打印
+/// 原因,退出码 2(同脚本模式口径)。不创建输出目录(布景无截图输出)。
+fn prepare_stage(script: &Path) -> crate::script::Scenario {
+    let text = match std::fs::read_to_string(script) {
+        Ok(text) => text,
+        Err(e) => {
+            eprintln!("读取场景文件 {} 失败:{e}", script.display());
+            std::process::exit(2);
+        }
+    };
+    match crate::script::parse_scenario(&text) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("场景解析失败:{e}");
+            std::process::exit(2);
         }
     }
 }
@@ -663,7 +686,9 @@ fn current_step(engine: &Option<Engine>) -> usize {
 }
 
 /// 交互模式主循环(REQ-004A,行为不变;仅初始相机/BLAST_Y 常量修正)。
-pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
+/// W05(REQ-011 §3.6):`stage = Some(场景文件)` 时进入布景交互——连接装载后
+/// 自动执行场景布景段,`R` 重建、`K` 播放动作段;`None` 时行为与改前逐位一致。
+pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path>) {
     let (events, control) = ViewerClient::spawn(addr, view_distance)
         .unwrap_or_else(|e| panic!("连接服务器 {addr} 失败(fail-stop):{e}"));
 
@@ -700,6 +725,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
     let mut panel = PanelState::default();
     // 订阅只发一次(连上即发;服务器侧幂等,重发无副作用——本地一次性)。
     let mut subscribed = false;
+    // REQ-011 W05:布景执行器(None = 普通交互模式;连接装载后自动搭布景,
+    // R 重建、K 播放动作段)。
+    let mut stage_driver: Option<StageDriver> =
+        stage.map(|path| StageDriver::new(prepare_stage(path), camera.to_pose()));
 
     loop {
         let dt = get_frame_time();
@@ -726,6 +755,39 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         if !subscribed {
             control.subscribe_debug();
             subscribed = true;
+        }
+
+        // —— REQ-011 W05:布景推进(连接装载后自动搭;tick 已知才动——
+        //   布景的等待步骤按服务器拍号算,拍号未知时等无意义;断连不发)——
+        if let (false, Some(driver)) = (disconnected.is_some(), stage_driver.as_mut())
+            && world.state.tick_known()
+        {
+            // [server] 提示与超时提示 → 工具提示通道(3 秒过期,复用)。
+            if let Some(notice) = driver.take_server_notice() {
+                tools.reject(notice);
+            }
+            if let Some(notice) = driver.take_timeout_notice() {
+                tools.reject(notice);
+            }
+            let out = driver.frame(dt, world.state.tick(), &world.state);
+            for entry in out {
+                match entry {
+                    crate::tools::StageOut::Command(command) => {
+                        forward_commands(std::slice::from_ref(&command), &control);
+                    }
+                    crate::tools::StageOut::Remove(entity) => {
+                        control.command(messaging::SimCommand::RemoveEntity { entity });
+                    }
+                }
+            }
+            // 布景相机跟随(driver 每帧回布景位姿;Building/Playing 时覆写
+            // 用户飞行,Ready/Played 后不夺回控制权)。
+            if matches!(
+                driver.phase(),
+                StagePhase::Building | StagePhase::Playing { .. }
+            ) {
+                camera.set_from_pose(&driver.camera());
+            }
         }
 
         // 拾取(REQ-011 §3.3):客户端已收到的 chunk 数据,最远 48 m。
@@ -768,6 +830,26 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         }
         if is_key_pressed(KeyCode::C) {
             panel.reset_baseline();
+        }
+        // —— REQ-011 W05:R 重建 / K 播放动作段(布景模式;断连不发)——
+        if let (false, Some(driver)) = (disconnected.is_some(), stage_driver.as_mut()) {
+            if is_key_pressed(KeyCode::R) {
+                let mut out = Vec::new();
+                driver.rebuild(&world.state, &mut out);
+                for entry in out {
+                    if let crate::tools::StageOut::Remove(entity) = entry {
+                        control.command(messaging::SimCommand::RemoveEntity { entity });
+                    }
+                }
+            }
+            if is_key_pressed(KeyCode::K) {
+                driver.play();
+            }
+        } else if (is_key_pressed(KeyCode::R) || is_key_pressed(KeyCode::K))
+            && stage_driver.is_none()
+        {
+            // 普通交互模式按 R/K:提示未给 --stage(§3.6/放行说明)。
+            tools.reject("no --stage scenario");
         }
         if tools_sendable {
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -952,12 +1034,16 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         );
         // REQ-011 W04:调试面板(F3 切换,交互默认显示)画在四行 HUD + 耦合
         // 行下方;面板显示时第 1 段(工具)取代 W01 的临时工具行,不重复画;
-        // 面板隐藏时工具行与提示行照旧(W01 行为)。
-        if panel_shown {
-            for (i, (line, color)) in panel_lines(&tools, target.as_ref(), &world.state, &panel)
-                .iter()
-                .enumerate()
-            {
+        // 面板隐藏时工具行与提示行照旧(W01 行为)。W05:布景状态行画在面板
+        // 下方(面板隐藏时在提示行下),提示已复用工具提示通道随面板/提示行
+        // 显示。
+        let stage_status = stage_driver
+            .as_ref()
+            .map(|driver| (driver.status_line(), driver.phase()));
+        let panel_len = if panel_shown {
+            let lines = panel_lines(&tools, target.as_ref(), &world.state, &panel);
+            let len = lines.len();
+            for (i, (line, color)) in lines.iter().enumerate() {
                 draw_text(
                     line,
                     12.0,
@@ -966,6 +1052,7 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
                     panel_color(*color),
                 );
             }
+            Some(len)
         } else {
             // 面板隐藏:W01 临时工具行 + 提示行照旧(ASCII)。
             let tool_line = crate::tools::hud_tool_line(&tools, target.as_ref(), &world.state);
@@ -973,6 +1060,16 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             if let Some((message, _)) = &tools.notice {
                 draw_text(message, 12.0, 142.0, 16.0, ORANGE);
             }
+            None
+        };
+        // W05 布景状态行:面板显示时排在其下(y = 124 + 面板行数 × 18 + 6);
+        // 隐藏时 y = 162(提示行 142 之下)。
+        if let Some((line, _)) = &stage_status {
+            let y = match panel_len {
+                Some(len) => 124.0 + len as f32 * 18.0 + 6.0,
+                None => 162.0,
+            };
+            draw_text(line, 12.0, y, 16.0, YELLOW);
         }
         // 蓄力条(W02;屏幕中央,蓄力阶段才显示;ASCII。中央 y 略偏上,
         // 避开断连提示带)。

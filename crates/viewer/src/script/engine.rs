@@ -49,8 +49,9 @@ struct FillProgress {
 }
 
 /// `from..=to`(解析已保证各轴 from ≤ to)按 `BlockPos` 升序展开;`BlockPos` 的
-/// `Ord` 是 (x, y, z) 字典序,三重循环顺序即升序,每格恰好一次。
-fn fill_cells(from: BlockPos, to: BlockPos) -> Vec<BlockPos> {
+/// `Ord` 是 (x, y, z) 字典序,三重循环顺序即升序,每格恰好一次。`pub(super)`:
+/// tools::stage(W05 布景执行器)直接调用同一实现,保证分批顺序逐位一致。
+pub(crate) fn fill_cells(from: BlockPos, to: BlockPos) -> Vec<BlockPos> {
     let mut cells = Vec::new();
     for x in from.x..=to.x {
         for y in from.y..=to.y {

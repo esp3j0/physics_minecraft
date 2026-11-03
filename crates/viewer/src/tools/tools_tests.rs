@@ -98,22 +98,22 @@ fn help_lines_cover_all_keys() {
     ] {
         assert!(joined.contains(key), "帮助表缺按键 {key}");
     }
-    // W04 后 F/E/wheel/F3/C 已接,不得再带 todo;仍未接的 2 键(R/K)
-    // 带 1 处 (todo)(两键同行)。
+    // W05 后 R/K 已接,全部键已接:不得再带任何 (todo) 标记。
     let todo_count = joined.matches("(todo").count();
-    assert_eq!(todo_count, 1, "W04 后仍带 (todo 的标记数");
-    for (key, line) in [("F ", 2), ("E ", 2), ("wheel", 2), ("F3", 3), ("C ", 3)] {
+    assert_eq!(todo_count, 0, "W05 后 (todo 的标记数应为 0");
+    for (key, line) in [
+        ("F ", 2),
+        ("E ", 2),
+        ("wheel", 2),
+        ("F3", 3),
+        ("C ", 3),
+        ("R ", 4),
+        ("K ", 4),
+    ] {
         let l = help_lines()[line];
         assert!(
             l.contains(key) && !l.contains("(todo"),
             "已接键 {key} 不带 todo:{l}"
-        );
-    }
-    for (key, line) in [("R ", 4), ("K ", 4)] {
-        let l = help_lines()[line];
-        assert!(
-            l.contains(key) && l.contains("(todo"),
-            "未接键 {key} 须带 todo:{l}"
         );
     }
 }

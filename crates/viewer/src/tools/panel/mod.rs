@@ -9,7 +9,8 @@
 //! - 计数段:13 项相对基线的增量(`saturating_sub` 防服务器重启负数),
 //!   每行 4 项;未收到任何 DebugStats 时只显示 `waiting for server`;
 //! - 最近事件段:最新 5 条、新的在上,`C/s < 1` 即断(`BREAK`,红),
-//!   `C = 0` 显示 `0.00` 判断开,`s = 0` 显示 `inf`(防御,也判断);
+//!   `C = 0` 显示 `0.00` 判断开,`s = 0` 显示 `inf`(字面口径:inf 不小于 1,
+//!   判 hold);
 //! - 提示行:沿用 [`ToolState::notice`] 的 3 秒过期(由调用方传入当前值)。
 
 use sim_api::proto::{DebugCounters, FlowEventWire};
@@ -227,7 +228,8 @@ fn tools_line(
 }
 
 /// 断开判定(§3.5.3 第 4 条):`C/s < 1` 即断;`C = 0` 时 `C/s` 显示 `0.00`,
-/// 算断开(0 无穷大危险度);`s = 0` 时显示 `inf`(防御;0/0 也判断)。
+/// 算断开(0 无穷大危险度);`s = 0` 时显示 `inf` 并判 hold(字面口径:
+/// inf 不小于 1;W04 验收确认,s > 0 时 C ≥ s 也同样判 hold)。
 #[must_use]
 pub fn is_break(ev: &FlowEventWire) -> bool {
     ev.cut < ev.supply

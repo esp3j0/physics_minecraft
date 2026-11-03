@@ -1,8 +1,11 @@
 //! cli —— viewer 命令行参数(REQ-008 §4):交互模式或脚本模式。
 //!
-//! 写法:`viewer [--addr <地址>] [--script <场景文件> --out <输出目录>]`。
+//! 写法:`viewer [--addr <地址>] [--script <场景文件> --out <输出目录>]
+//! [--stage <场景文件>]`。
 //! - 不带参数 → 交互模式(行为同 REQ-004A);
 //! - `--script` 与 `--out` 必须同时给出;
+//! - `--stage` 布景交互(REQ-011 §3.6,W05):交互模式下自动执行场景的布景段,
+//!   与 `--script` 互斥,也不接受 `--out`(脚本模式输出目录对布景无意义);
 //! - `--addr` 缺省时由调用方回落到环境变量 `VIEWER_ADDR` 或 `127.0.0.1:25565`;
 //! - 未知参数、缺少参数值、重复参数 → 错误。
 
@@ -12,7 +15,14 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewerMode {
     Interactive,
-    Script { script: PathBuf, out: PathBuf },
+    Script {
+        script: PathBuf,
+        out: PathBuf,
+    },
+    /// 布景交互(REQ-011 §3.6;W05):交互模式 + 场景文件。
+    Stage {
+        script: PathBuf,
+    },
 }
 
 /// 解析后的命令行参数。
@@ -27,6 +37,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<ViewerArgs,
     let mut addr: Option<String> = None;
     let mut script: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut stage: Option<PathBuf> = None;
 
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -54,15 +65,34 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<ViewerArgs,
                 let value = iter.next().ok_or_else(|| "--out 缺少参数值".to_owned())?;
                 out = Some(PathBuf::from(value));
             }
+            "--stage" => {
+                if stage.is_some() {
+                    return Err("--stage 重复给出".to_owned());
+                }
+                let value = iter.next().ok_or_else(|| "--stage 缺少参数值".to_owned())?;
+                stage = Some(PathBuf::from(value));
+            }
             other => return Err(format!("未知参数:{other}")),
         }
     }
 
-    let mode = match (script, out) {
-        (None, None) => ViewerMode::Interactive,
-        (Some(script), Some(out)) => ViewerMode::Script { script, out },
-        (Some(_), None) => return Err("--script 必须与 --out 成对给出".to_owned()),
-        (None, Some(_)) => return Err("--out 必须与 --script 成对给出".to_owned()),
+    let mode = match (script.is_some(), out.is_some(), stage.is_some()) {
+        (false, false, false) => ViewerMode::Interactive,
+        (true, true, false) => ViewerMode::Script {
+            script: script.unwrap(),
+            out: out.unwrap(),
+        },
+        (false, false, true) => ViewerMode::Stage {
+            script: stage.unwrap(),
+        },
+        (true, false, false) => return Err("--script 必须与 --out 成对给出".to_owned()),
+        (false, true, false) => return Err("--out 必须与 --script 成对给出".to_owned()),
+        (_, _, true) if script.is_some() => {
+            return Err("--stage 与 --script 互斥:布景在交互模式下运行,不走脚本引擎".to_owned());
+        }
+        (_, _, true) => {
+            return Err("--stage 不接受 --out:布景交互没有截图输出目录".to_owned());
+        }
     };
     Ok(ViewerArgs { mode, addr })
 }
@@ -149,5 +179,40 @@ mod tests {
                 addr: Some("localhost:1".to_owned())
             })
         );
+    }
+
+    /// `--stage` 单独给出 → Stage 模式(REQ-011 §3.6,W05);与 `--script`
+    /// 互斥、不接受 `--out`(AC-W13 CLI 解析测试);缺值 / 重复各自报错。
+    #[test]
+    fn cli_stage_mode_and_exclusions() {
+        assert_eq!(
+            args(&["--stage", "scene.toml"]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Stage {
+                    script: "scene.toml".into()
+                },
+                addr: None
+            })
+        );
+        assert_eq!(
+            args(&["--stage", "scene.toml", "--addr", "1.2.3.4:9"]),
+            Ok(ViewerArgs {
+                mode: ViewerMode::Stage {
+                    script: "scene.toml".into()
+                },
+                addr: Some("1.2.3.4:9".to_owned())
+            })
+        );
+        for (bad, what) in [
+            (
+                &["--stage", "a", "--script", "s", "--out", "o"][..],
+                "stage+script",
+            ),
+            (&["--stage", "a", "--out", "o"], "stage+out"),
+            (&["--stage"], "stage 缺值"),
+            (&["--stage", "a", "--stage", "b"], "重复 stage"),
+        ] {
+            assert!(args(bad).is_err(), "{what}:应报错");
+        }
     }
 }

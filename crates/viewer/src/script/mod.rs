@@ -8,10 +8,12 @@
 //! 实现函数体;可以新增私有项或拆分子模块,但 `viewer::script::*` 的公开面不得改名、删字段
 //! 或改类型。
 
-mod engine;
-mod parse;
-
 pub mod manifest;
+
+// crate 内可见(REQ-011 W05:tools::stage 直接调用引擎的 fill_cells,
+// 保证布景与脚本模式的分批顺序逐位一致;对外仍不公开)。
+pub(crate) mod engine;
+mod parse;
 
 use types::glam::Vec3;
 use types::{BlockId, BlockPos, CompoundShape, EntityDesc, EntityId, EntityState};

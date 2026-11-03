@@ -5,13 +5,14 @@
 //! 单元范围(REQ-011 §6 W01):材料 1–4、左键拆除、右键放置(单方块 /
 //! 预制结构一批)、T 循环放置物、H 帮助;拾取([`pick`])、线框高亮、
 //! 轮廓预览。发射参数与蓄力(W02)、调试面板文本([`panel`],W04)、
-//! 布景(W05)按单元推进。
+//! 场景布景([`stage`],W05)按单元推进。
 
 mod actions;
 mod launch;
 mod panel;
 mod pick;
 mod prefab;
+mod stage;
 
 pub mod tests_support;
 
@@ -25,6 +26,9 @@ pub use panel::{
 };
 pub use pick::{Hit, pick};
 pub use prefab::{ExpandError, Orientation, Prefab, expand, orientation_from_yaw};
+pub use stage::{
+    StageDriver, StageOut, StagePhase, StageSplit, has_server_table, is_action_step, split,
+};
 
 use types::{BlockId, BlockPos};
 use voxel::builtin;
@@ -143,7 +147,7 @@ pub fn toggle_help(state: &mut ToolState) {
 }
 
 /// 帮助表(REQ-011 §3.1 全按键;H 显示;ASCII 英文——macroquad 位图字体
-/// 不含 CJK。未接的键标 `(todo)` + 所属单元;W04 起 F3/C 已接)。
+/// 不含 CJK。W05 起 R/K 已接,全部键已接,无 `(todo)` 标记)。
 #[must_use]
 pub fn help_lines() -> Vec<&'static str> {
     vec![
@@ -151,7 +155,7 @@ pub fn help_lines() -> Vec<&'static str> {
         "1-4 material(dirt/stone/sand/bedrock)  LMB dig  RMB place(single/prefab)",
         "T cycle placeable  H help  F launch/charge  E shape  wheel speed",
         "F3 debug panel  C reset counters  B spawn cube  X blast",
-        "R rebuild / K play(todo W05)",
+        "R rebuild stage  K play action",
     ]
 }
 
