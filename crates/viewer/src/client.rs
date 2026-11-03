@@ -51,6 +51,13 @@ pub enum ViewEvent {
     Shapes {
         shapes: Vec<(EntityId, types::CompoundShape)>,
     },
+    /// 调试遥测包(REQ-011 §3.5.2;W04):仅交互模式订阅后收到;脚本模式
+    /// 不订阅、收到也忽略。
+    DebugStats {
+        tick: Tick,
+        counters: sim_api::proto::DebugCounters,
+        recent: Vec<(Tick, sim_api::proto::FlowEventWire)>,
+    },
     /// 断连(对端 Bye/EOF/IO 失败;reason = 尽力还原的说明)。
     Disconnected { reason: String },
 }
@@ -77,6 +84,9 @@ pub(crate) enum Control {
         state: EntityState,
         desc: types::EntityDesc,
     },
+    /// 调试遥测订阅(REQ-011 §3.5.2;W04:连接循环发 `C2S::SubscribeDebug`,
+    /// 服务端开始按 10 拍下发 [`S2C::DebugStats`];重复发送幂等)。
+    SubscribeDebug,
     /// 主动离场(`C2S::Goodbye`)。
     Goodbye,
 }
@@ -114,6 +124,12 @@ impl ControlHandle {
         let _ = self.tx.try_send(Control::Spawn { state, desc });
     }
 
+    /// 发调试遥测订阅(REQ-011 §3.5.2;W04:交互模式连上后发一次;服务端
+    /// 每 10 拍回 [`S2C::DebugStats`] → [`ViewEvent::DebugStats`])。
+    pub fn subscribe_debug(&self) {
+        let _ = self.tx.try_send(Control::SubscribeDebug);
+    }
+
     /// 主动离场(尽力而为;连接亡故时静默)。
     pub fn goodbye(&self) {
         let _ = self.tx.try_send(Control::Goodbye);
@@ -138,9 +154,35 @@ const HELLO_CLIENT_ID: u64 = 0;
 /// 读循环的 socket 缓冲块大小(4 KiB,app::net 迷你客户端同量级)。
 const READ_CHUNK: usize = 4096;
 
+/// 断连原因英文化(W04,W01 遗留):交互模式 HUD 只认 ASCII(macroquad
+/// 位图字体不含 CJK)。
+/// - 已知客户端原因映射成英文(`连接关闭`/`帧解码失败`/`连接失败:…`);
+/// - `io::Error` 文本可能是系统语言,非 ASCII 字符一律替换 `?`;
+/// - 服务器 `Bye` 原因本来就是英文,透传。脚本模式的 `draw_hud` 与
+///   manifest 里的原因文本不动(不经此函数)。
+#[must_use]
+pub fn localize_disconnect_reason(reason: &str) -> String {
+    let known = match reason.strip_prefix("连接失败:") {
+        Some(rest) => Some(format!("connect failed: {}", ascii_escape(rest))),
+        None => match reason {
+            "连接关闭" => Some("connection closed".to_owned()),
+            "帧解码失败" => Some("frame decode failed".to_owned()),
+            _ => None,
+        },
+    };
+    known.unwrap_or_else(|| ascii_escape(reason))
+}
+
+/// 非 ASCII 字符替换 `?`(io::Error 文本的系统语言防御;ASCII 原样保留)。
+fn ascii_escape(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_ascii() { c } else { '?' })
+        .collect()
+}
+
 /// 断连原因 → 事件说明文本(尽力还原;EOF/IO 失败同路)。
 fn disconnect_reason(err: &io::Error) -> String {
-    format!("连接失败:{err}")
+    format!("连接失败:{}", err)
 }
 
 /// S2C 帧 → [`ViewEvent`] 映射(纯函数;连接循环与 codec 一致性测试共用,
@@ -166,9 +208,17 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
         S2C::EntityShapes { shapes } => Some(ViewEvent::Shapes { shapes }),
         S2C::Pong => None,
         S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
-        // 调试遥测(REQ-011 W03):viewer 本单元不订阅(W04 接收面),收到
-        // 也无从谈起——吞掉,行为与 Pong 同型(帧序列不变语义在服务端)。
-        S2C::DebugStats { .. } => None,
+        // 调试遥测(REQ-011 §3.5.2;W04):交互模式订阅后接收,映射成事件;
+        // 脚本模式不订阅,不会收到。
+        S2C::DebugStats {
+            tick,
+            counters,
+            recent,
+        } => Some(ViewEvent::DebugStats {
+            tick,
+            counters,
+            recent,
+        }),
     }
 }
 
@@ -339,6 +389,12 @@ async fn run_connection(
                         break 'read;
                     }
                 }
+                Some(Control::SubscribeDebug) => {
+                    let frame = encode_c2s_frame(&C2S::SubscribeDebug);
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
                 Some(Control::Goodbye) => {
                     let frame = encode_c2s_frame(&C2S::Goodbye);
                     let _ = write_all(&mut stream, &frame).await; // 尽力;随后读 EOF
@@ -476,6 +532,26 @@ mod tests {
                     .expect("2 格梁"),
                 )],
             },
+            // W04:调试遥测包(协议镜像 → 事件一比一)。
+            S2C::DebugStats {
+                tick: Tick(120),
+                counters: sim_api::proto::DebugCounters {
+                    impact_flow_events: 3,
+                    impact_flow_breaks: 1,
+                    ..sim_api::proto::DebugCounters::default()
+                },
+                recent: vec![(
+                    Tick(118),
+                    sim_api::proto::FlowEventWire {
+                        impact: true,
+                        supply: 9.217,
+                        cut: 7.0,
+                        broke: true,
+                        detached_cells: 1,
+                        position: Vec3::new(10.5, 5.5, 8.5),
+                    },
+                )],
+            },
         ];
 
         for case in cases {
@@ -536,6 +612,20 @@ mod tests {
                 (S2C::EntityShapes { shapes }, Some(ViewEvent::Shapes { shapes: s })) => {
                     assert_eq!(s, shapes, "EntityShapes 字段一致(内容原样)");
                 }
+                (
+                    S2C::DebugStats {
+                        tick,
+                        counters,
+                        recent,
+                    },
+                    Some(ViewEvent::DebugStats {
+                        tick: t,
+                        counters: c,
+                        recent: r,
+                    }),
+                ) => {
+                    assert_eq!((t, c, r), (tick, counters, recent), "DebugStats 字段一致");
+                }
                 (S2C::Pong, None) => {}
                 (original, event) => panic!("变体 {original:?} 映射不符: {event:?}"),
             }
@@ -591,10 +681,12 @@ mod tests {
             });
             use std::io::Write;
             sock.write_all(&welcome).expect("写 Welcome");
-            // 收 MoveObserver 帧(控制端 roundtrip)。
+            // 收 MoveObserver 帧(控制端 roundtrip)与 SubscribeDebug(W04:
+            // 到达顺序不定——两帧都到才收口;SubscribeDebug 恰一帧)。
             let mut move_seen = None;
+            let mut debug_subs = 0usize;
             let mut buf = Vec::new();
-            while move_seen.is_none() {
+            while move_seen.is_none() || debug_subs < 1 {
                 let mut chunk = [0u8; 1024];
                 let n = sock.read(&mut chunk).expect("读 MoveObserver");
                 assert!(n > 0, "等 MoveObserver 期间客户端断开");
@@ -607,10 +699,23 @@ mod tests {
                     let frame: Vec<u8> = buf.drain(..4 + len).collect();
                     match sim_api::proto::decode_c2s_frame(&frame).expect("帧可解码") {
                         C2S::MoveObserver { position } => move_seen = Some(position),
+                        C2S::SubscribeDebug => debug_subs += 1,
                         _ => continue,
                     }
                 }
             }
+            assert_eq!(
+                debug_subs, 1,
+                "控制端 subscribe_debug → 服务器恰一帧(幂等订阅一次)"
+            );
+            // 服务器回一包 DebugStats(客户端映射成 ViewEvent::DebugStats 的
+            // 收端验证;W03 协议在 e2e 已覆盖,这里只证映射链路)。
+            let stats = sim_api::proto::encode_frame(&S2C::DebugStats {
+                tick: Tick(9),
+                counters: sim_api::proto::DebugCounters::default(),
+                recent: Vec::new(),
+            });
+            sock.write_all(&stats).expect("写 DebugStats");
             // 发 Bye(断连呈现)并关闭。
             let bye = sim_api::proto::encode_frame(&S2C::Bye {
                 reason: "server-shutdown".to_owned(),
@@ -633,12 +738,29 @@ mod tests {
             other => panic!("首事件应为 Welcome,实为 {other:?}"),
         }
         control.move_observer(Vec3::new(24.0, -58.0, 8.0));
+        control.subscribe_debug();
         let moved = server.join().expect("迷你服务器线程不 panic");
         assert_eq!(
             moved,
             Vec3::new(24.0, -58.0, 8.0),
             "控制端 move_observer → 服务器侧同值 MoveObserver 帧"
         );
+        // 服务器回的 DebugStats → ViewEvent::DebugStats(W04 映射链路)。
+        match events
+            .recv_timeout(net_timeout())
+            .expect("DebugStats 事件必达")
+        {
+            ViewEvent::DebugStats {
+                tick,
+                counters,
+                recent,
+            } => {
+                assert_eq!(tick, Tick(9), "DebugStats 拍号一致");
+                assert_eq!(counters, sim_api::proto::DebugCounters::default());
+                assert!(recent.is_empty());
+            }
+            other => panic!("应为 DebugStats,实为 {other:?}"),
+        }
         // 服务器 Bye → Disconnected(reason 透传)。
         match events.recv_timeout(net_timeout()).expect("断连事件必达") {
             ViewEvent::Disconnected { reason } => {

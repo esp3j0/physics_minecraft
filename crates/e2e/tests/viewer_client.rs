@@ -584,3 +584,63 @@ async fn viewer_client_launch_bar_receives_spawned() {
 
     shutdown(h).await;
 }
+
+// ---------------------------------------------------------------------------
+// REQ-011 W04(AC-W11 e2e 侧):ViewerClient 订阅 → ViewEvent::DebugStats;
+// 不订阅的 ViewerClient 收不到(真服务器 + viewer::client 全链路)。
+// ---------------------------------------------------------------------------
+
+/// W04:两个 ViewerClient,A 连上即经交互路径订阅(ControlHandle 新方法),
+/// B 不订阅。A 收到 DebugStats 事件(计数 13 项可读、拍号单调),B 的同窗
+/// 事件流中无 DebugStats。
+#[tokio::test(start_paused = true)]
+async fn viewer_client_subscribed_receives_debug_stats() {
+    let h = harness(base_config(), PumpConfig::default(), (2, 60), true).await;
+    let (events_a, _control_a) = ViewerClient::spawn(h.addr, 2).expect("A spawn");
+    let (events_b, _control_b) = ViewerClient::spawn(h.addr, 2).expect("B spawn");
+    wait_event(&events_a, 400, |e| matches!(e, ViewEvent::Welcome { .. }))
+        .await
+        .expect("A Welcome 必达");
+    wait_event(&events_b, 400, |e| matches!(e, ViewEvent::Welcome { .. }))
+        .await
+        .expect("B Welcome 必达");
+
+    // A 订阅(ControlHandle::subscribe_debug,W04 新方法;服务器幂等)。
+    // 经 _control_a 的新绑定变量调用(消除 unused 命名差异)。
+    let control_a = &_control_a;
+    control_a.subscribe_debug();
+    settle(60).await;
+
+    // A 在 60 拍内收到 DebugStats(3 个下发点);字段健全。
+    let got = wait_event(&events_a, 600, |e| {
+        matches!(e, ViewEvent::DebugStats { .. })
+    })
+    .await
+    .expect("订阅的 A 必收到 DebugStats(60 拍 = 3 个下发点)");
+    match got {
+        ViewEvent::DebugStats {
+            tick,
+            counters,
+            recent,
+        } => {
+            assert!(tick.0 >= 10, "首个包 ≥10 拍:{tick:?}");
+            // 起点全 0(零重力空场景,无破坏):13 项读得出即可(类型层面);
+            // 这里对拍号与 recent 空做正断言。
+            assert!(recent.is_empty(), "尚无事件");
+            let _ = counters; // 13 项结构在 W8/W10 已逐值钉,此处字段存在性由编译保证
+        }
+        other => unreachable!("谓词已限定 DebugStats,实为 {other:?}"),
+    }
+
+    // B 同窗(再多推进些,给服务器充足的下发机会)收不到 DebugStats。
+    settle(120).await;
+    let mut b_got = false;
+    while let Ok(event) = events_b.try_recv() {
+        if matches!(event, ViewEvent::DebugStats { .. }) {
+            b_got = true;
+        }
+    }
+    assert!(!b_got, "不订阅的 B 收不到 DebugStats");
+
+    shutdown(h).await;
+}

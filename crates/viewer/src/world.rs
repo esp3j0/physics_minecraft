@@ -137,6 +137,9 @@ impl WorldState {
                 }
             }
             ViewEvent::Disconnected { .. } => {}
+            // 调试遥测(W04):世界镜像不消费(面板经主循环侧 PanelState 收),
+            // 到这里即忽略。
+            ViewEvent::DebugStats { .. } => {}
         }
     }
 
@@ -207,6 +210,10 @@ impl WorldQuery for WorldState {
 
     fn chunks_loaded(&self) -> usize {
         self.chunks.len()
+    }
+
+    fn entity_shape(&self, id: EntityId) -> Option<&CompoundShape> {
+        self.entity_shape(id)
     }
 }
 

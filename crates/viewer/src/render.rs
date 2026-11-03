@@ -34,9 +34,9 @@ use crate::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
 };
 use crate::tools::{
-    ChargeState, Hit, Placeable, ToolAction, ToolState, adjust_preset_speed, cycle_placeable, dig,
-    help_lines, hud_tool_line, launch_request, orientation_from_yaw, pick, place, preview_outline,
-    speed_bar, toggle_help,
+    ChargeState, Hit, PanelColor, PanelState, Placeable, ToolAction, ToolState,
+    adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request, orientation_from_yaw,
+    panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -72,6 +72,17 @@ const OBSERVER_JUMP_METERS: f32 = 1.0;
 
 /// 拾取最远距离(REQ-011 §3.3)。
 const PICK_MAX_DIST: f32 = 48.0;
+
+/// 面板行颜色 → macroquad 颜色(§3.5.3 第 4 条:断开行红、标题黄、提示橙、
+/// 其余白;纯函数层 [`PanelColor`] 的唯一映射点)。
+fn panel_color(color: PanelColor) -> macroquad::color::Color {
+    match color {
+        PanelColor::Normal => WHITE,
+        PanelColor::Break => RED,
+        PanelColor::Header => YELLOW,
+        PanelColor::Notice => ORANGE,
+    }
+}
 
 /// 工具动作发出(纯函数层 [`ToolAction`] → 控制句柄):Single 走
 /// `command`,Batch 打一条批(REQ-010 终审返修 1 原子编辑语义),Rejected
@@ -684,6 +695,11 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
     // REQ-011 W02:F 蓄力状态机(按下/松开边沿跟踪 + 逐帧 dt)。
     let mut charge = ChargeState::default();
     let mut f_down_prev = false;
+    // REQ-011 W04:调试面板(F3 切换、交互默认显示;计数基线/最近事件)。
+    let mut panel_shown = true;
+    let mut panel = PanelState::default();
+    // 订阅只发一次(连上即发;服务器侧幂等,重发无副作用——本地一次性)。
+    let mut subscribed = false;
 
     loop {
         let dt = get_frame_time();
@@ -696,10 +712,21 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
                 ViewEvent::Disconnected { reason } => {
                     disconnected = Some(reason);
                 }
+                ViewEvent::DebugStats {
+                    tick,
+                    counters,
+                    recent,
+                } => panel.receive(tick, counters, recent),
                 other => world.apply(other),
             }
         }
         world.sync();
+
+        // W04:交互模式订阅调试遥测(连上即发一次;脚本模式不订阅)。
+        if !subscribed {
+            control.subscribe_debug();
+            subscribed = true;
+        }
 
         // 拾取(REQ-011 §3.3):客户端已收到的 chunk 数据,最远 48 m。
         target = pick_at_camera(&camera, &world.state);
@@ -734,6 +761,13 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         }
         if is_key_pressed(KeyCode::H) {
             toggle_help(&mut tools);
+        }
+        // W04:F3 切换面板;C 把当前计数设为基线(增量归零重新累计)。
+        if is_key_pressed(KeyCode::F3) {
+            panel_shown = !panel_shown;
+        }
+        if is_key_pressed(KeyCode::C) {
+            panel.reset_baseline();
         }
         if tools_sendable {
             if is_mouse_button_pressed(MouseButton::Left) {
@@ -916,10 +950,30 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             16.0,
             YELLOW,
         );
-        // REQ-011 W01:工具行(HUD 第 6 行;临时,W04 并入调试面板;
-        // ASCII 英文——macroquad 位图字体不含 CJK,返修 W01-2)。
-        let tool_line = hud_tool_line(&tools, target.as_ref(), &world.state);
-        draw_text(&tool_line, 12.0, 122.0, 16.0, WHITE);
+        // REQ-011 W04:调试面板(F3 切换,交互默认显示)画在四行 HUD + 耦合
+        // 行下方;面板显示时第 1 段(工具)取代 W01 的临时工具行,不重复画;
+        // 面板隐藏时工具行与提示行照旧(W01 行为)。
+        if panel_shown {
+            for (i, (line, color)) in panel_lines(&tools, target.as_ref(), &world.state, &panel)
+                .iter()
+                .enumerate()
+            {
+                draw_text(
+                    line,
+                    12.0,
+                    124.0 + i as f32 * 18.0,
+                    16.0,
+                    panel_color(*color),
+                );
+            }
+        } else {
+            // 面板隐藏:W01 临时工具行 + 提示行照旧(ASCII)。
+            let tool_line = crate::tools::hud_tool_line(&tools, target.as_ref(), &world.state);
+            draw_text(&tool_line, 12.0, 122.0, 16.0, WHITE);
+            if let Some((message, _)) = &tools.notice {
+                draw_text(message, 12.0, 142.0, 16.0, ORANGE);
+            }
+        }
         // 蓄力条(W02;屏幕中央,蓄力阶段才显示;ASCII。中央 y 略偏上,
         // 避开断连提示带)。
         if let Some(speed) = charge.display_speed() {
@@ -928,14 +982,11 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             let x = screen_width() * 0.5 - 60.0;
             draw_text(&bar, x, y, 18.0, YELLOW);
         }
-        // 拒绝提示(3 秒过期;工具状态逐帧计时)。
-        if let Some((message, _)) = &tools.notice {
-            draw_text(message, 12.0, 142.0, 16.0, ORANGE);
-        }
-        // 按键帮助表(H 切换)。
+        // 按键帮助表(H 切换;W04 布局:画在右半屏,与左侧面板不叠字)。
         if tools.help_shown {
+            let help_x = screen_width() * 0.5 + 8.0;
             for (i, line) in help_lines().iter().enumerate() {
-                draw_text(line, 12.0, 162.0 + i as f32 * 18.0, 15.0, YELLOW);
+                draw_text(line, help_x, 20.0 + i as f32 * 18.0, 15.0, YELLOW);
             }
         }
         draw_text(
@@ -946,9 +997,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             DARKGRAY,
         );
         // 断连提示放屏幕中部(W01-2:原先 y=128 与工具行 y=122 重叠;中部
-        // 独立带,不与任何 HUD 行重叠,断连 3 s 宽限期里足够醒目)。
+        // 独立带,不与任何 HUD 行重叠,断连 3 s 宽限期里足够醒目。W04:
+        // 原因英文化——已知客户端原因映射 + 非 ASCII 换 `?`)。
         if let Some(reason) = &disconnected {
-            let text = format!("disconnected: {reason} (window will close)");
+            let text = crate::tools::disconnect_text(reason);
             let y = screen_height() * 0.5;
             draw_text(&text, 12.0, y, 18.0, YELLOW);
         }

@@ -205,6 +205,12 @@ pub trait WorldQuery {
     fn block_at(&self, pos: BlockPos) -> Option<BlockId>;
     /// 方块镜像中的 chunk 数。
     fn chunks_loaded(&self) -> usize;
+    /// 实体的复合形状(REQ-010 §10 修订 4;单格实体 = None)。W04 调试面板
+    /// 的复合体计数用(有形状的实体才算复合体);默认 None(假世界可不实现
+    /// 复合体语义,`WorldState` 覆盖)。
+    fn entity_shape(&self, _id: EntityId) -> Option<&CompoundShape> {
+        None
+    }
 }
 
 /// 一帧的输入。
