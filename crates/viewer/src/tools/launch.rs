@@ -568,6 +568,50 @@ mod tests {
         assert_eq!(state.translation, Vec3::new(12.0, -56.0, 20.0));
     }
 
+    /// 附带(W03 放行说明,W02 验收遗留的测试缺口):6 格条·纵,原点格
+    /// 是空气,只在 w = 3 那格的格心所在格放土 → 拒绝,文案含该格坐标。
+    /// 抓住"实心判定只查原点格"的变异(逐格 `c_k = translation + o_k`)。
+    #[test]
+    fn launch_rejects_non_origin_cell_solid() {
+        // 平视 +x:d̂ = (1,0,0),全 6 格 o·d̂ ≥ 0 → d = 2,translation = 原点
+        // 格心 + 2。条·纵 yaw = 0:w 轴 = +x,6 格偏移 (0,0,w),世界偏移
+        // (w, 0, 0);相机 (10,−56,20) → translation (12,−56,20),各格格心
+        // (12+w,−56,20),floor = 格 (12+w,−56,20)。
+        let mut world = FakeVoxelWorld::empty();
+        world.set_block(15, -56, 20, DIRT);
+        let got = launch_request(
+            LaunchShape::BarLongitudinal,
+            crate::tools::Material::Dirt,
+            20.0,
+            Vec3::new(10.0, -56.0, 20.0),
+            flat_dir(),
+            0.0,
+            &world,
+        );
+        assert!(
+            got.is_err(),
+            "w=3 格格心所在格 (15,−56,20) 实心 → 拒绝(原点格是空气)"
+        );
+        assert!(
+            got.unwrap_err().contains("(15,-56,20)"),
+            "拒绝文案含非原点冲突格坐标"
+        );
+
+        // 对照:同格不放土 → 放行(证明拒绝来自该格而非原点格)。
+        let world = FakeVoxelWorld::empty();
+        let (state, _) = launch_request(
+            LaunchShape::BarLongitudinal,
+            crate::tools::Material::Dirt,
+            20.0,
+            Vec3::new(10.0, -56.0, 20.0),
+            flat_dir(),
+            0.0,
+            &world,
+        )
+        .expect("全空气 → 放行");
+        assert_eq!(state.translation, Vec3::new(12.0, -56.0, 20.0));
+    }
+
     /// W02-2 补充(AC-W3):水平斜视抬高 d——yaw = −30°、pitch = 0,发
     /// 6 格条·横。w 取整为 +x、u = +z,d̂ = (0.866, 0, −0.5);u = 5 那格
     /// o = (0,0,5),o·d̂ = −2.5 → d = 4.5(只靠水平分量触发,抓"只看 y

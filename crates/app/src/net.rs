@@ -123,6 +123,9 @@ pub enum NetUp {
         player: InputSource,
         cmd: DriverCommand,
     },
+    /// 调试遥测订阅(REQ-011 §3.5.2;W03):幂等上报(重复发送不重复生效);
+    /// 驱动侧记录订阅集合,断连(NetUp::Left)即移除。
+    SubscribeDebug { player: InputSource },
 }
 
 /// 订阅视距上限(REQ-003 §4.3:钳制 ≤32 chunk)。
@@ -143,6 +146,9 @@ pub enum TranslateOutcome {
     Subscribe(u8),
     Hello,
     Goodbye,
+    /// 调试遥测订阅(REQ-011 §3.5.2;W03):幂等;该连接开始接收
+    /// [`S2C::DebugStats`]。
+    SubscribeDebug,
     /// 非白名单命令等(协议违规 → 断连)。
     Reject(&'static str),
 }
@@ -169,6 +175,7 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
         C2S::Spawn { state, desc } => TranslateOutcome::Send(DriverCommand::Spawn { state, desc }),
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
+        C2S::SubscribeDebug => TranslateOutcome::SubscribeDebug,
     }
 }
 
@@ -847,7 +854,11 @@ async fn handle_frame(
     // 状态机门(先于翻译:门是会话层的,翻译是纯形状映射)。
     if *state == SessionState::Connected {
         match c2s {
-            C2S::Hello { .. } | C2S::Subscribe { .. } | C2S::Ping | C2S::Goodbye => {}
+            C2S::Hello { .. }
+            | C2S::Subscribe { .. }
+            | C2S::Ping
+            | C2S::Goodbye
+            | C2S::SubscribeDebug => {}
             _ => {
                 return Flow::Disconnect(DisconnectReason::ProtocolViolation(
                     "未 Subscribe 前的帧",
@@ -961,6 +972,13 @@ async fn handle_frame(
             }
         }
         TranslateOutcome::Goodbye => Flow::Disconnect(DisconnectReason::Goodbye),
+        TranslateOutcome::SubscribeDebug => {
+            // 调试遥测订阅(REQ-011 §3.5.2):上行给驱动登记;幂等(重复
+            // SubscribeDebug 重复上报,驱动侧集合插入天然幂等);不入 Critical
+            // / World 队列,帧序列不变。
+            let _ = up_tx.send(NetUp::SubscribeDebug { player }).await;
+            Flow::Continue
+        }
         TranslateOutcome::Reject(why) => Flow::Disconnect(DisconnectReason::ProtocolViolation(why)),
     }
 }

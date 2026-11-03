@@ -4,7 +4,7 @@
 //! tick > 命令——命令洪水永远饿不死模拟;`MissedTickBehavior::Skip` 让超载降拍
 //! 而不补帧。checkpoint = 快照拍 + 此后命令日志原子一体(README 决策 4),只存增量。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -601,6 +601,9 @@ impl PendingStreams {
 
 // ---- 观察输出编排(REQ-003 §4.4;任务书 req003-net/03) ----
 
+/// `DebugStats` 下发节奏(REQ-011 §3.5.2;W03):每 10 拍一次(20 Hz 下 2 Hz)。
+const DEBUG_STATS_INTERVAL_TICKS: u64 = 10;
+
 /// 驱动侧观察输出编排器(REQ-003 §4.4;每驱动一个,observe 关闭时不建):
 /// 每订阅玩家的观察流状态 + 增量/全量两周期计数 + 跨拍积压(Welcome 拍号、
 /// 方块变更源)。玩家生命周期(Join/Leave/换视距)由网络上行事件驱动。
@@ -616,6 +619,18 @@ pub struct ObserveOrchestrator {
     pending_welcome: BTreeMap<messaging::InputSource, types::Tick>,
     /// 跨拍积压的方块变更源(格 → 写入值;后写覆盖先写)。
     pending_blocks: BTreeMap<types::BlockPos, types::BlockId>,
+    /// 调试遥测订阅集合(REQ-011 §3.5.2;W03):已发 `C2S::SubscribeDebug` 且
+    /// 未断连的连接。幂等(重复插入);断连由 `NetUp::Left` 移除。
+    debug_subscribers: BTreeSet<messaging::InputSource>,
+    /// 调试遥测 13 项累计值(REQ-011 §3.5.2;W03):自服务器启动逐拍累加,
+    /// 不入检查点、重启从 0(协议结构 [`sim_api::proto::DebugCounters`])。
+    debug_counters: sim_api::proto::DebugCounters,
+    /// 最近 8 条非空冲量流事件(REQ-011 §3.5.2;W03):(拍号, 协议镜像),
+    /// 旧 → 新;超 8 弹最旧。
+    debug_recent: std::collections::VecDeque<(types::Tick, sim_api::proto::FlowEventWire)>,
+    /// 距上次 `DebugStats` 下发的拍数(REQ-011 §3.5.2;W03):满 10 拍下发并
+    /// 清零(驱动内存节拍,与观察两周期计数同型)。
+    ticks_since_debug: u64,
     /// 外部 spawn 的服务端 ID 序号(REQ-006 任务 02;origin=0 保留)。
     next_spawn_seq: u32,
     /// 节奏副本(输出点用)。
@@ -640,6 +655,10 @@ impl ObserveOrchestrator {
             ticks_since_full: 0,
             pending_welcome: BTreeMap::new(),
             pending_blocks: BTreeMap::new(),
+            debug_subscribers: BTreeSet::new(),
+            debug_counters: sim_api::proto::DebugCounters::default(),
+            debug_recent: std::collections::VecDeque::new(),
+            ticks_since_debug: 0,
             next_spawn_seq: spawn_next_seq,
             _cadence: cadence,
         }
@@ -763,11 +782,18 @@ impl ObserveOrchestrator {
                 // 单调 sequence,log.append → 可回放;幂等——不在表无害)。
                 self.players.remove(&player);
                 self.pending_welcome.remove(&player);
+                // 调试遥测订阅即失效(REQ-011 §3.5.2;不在集合 = 无害幂等)。
+                self.debug_subscribers.remove(&player);
                 match session.remove_observer_from(player) {
                     Ok(entry) => log.append(entry),
                     // 观察者收件箱 unbounded → 无失败路径;非预期错误 fail-stop。
                     Err(other) => panic!("观察者移除失败(非预期):{other:?}"),
                 }
+            }
+            NetUp::SubscribeDebug { player } => {
+                // 调试遥测订阅(REQ-011 §3.5.2;W03):登记进集合(幂等);
+                // 断连由 Left 分支移除。不发任何回执帧。
+                self.debug_subscribers.insert(player);
             }
             NetUp::DriverCommand { player, cmd } => match cmd {
                 DriverCommand::MoveObserver { position } => {
@@ -1003,6 +1029,71 @@ impl ObserveOrchestrator {
                 }
                 hub.push_world(player, S2C::BlockUpdates { updates });
             }
+        }
+    }
+
+    /// 调试遥测累计(REQ-011 §3.5.2;W03):读本拍 [`TickSummary`] 的
+    /// `cohesion` / `destruction` 两份 stats,把 13 项计数加进累计值;非空
+    /// `flow_event` 转协议镜像进最近 8 条环形缓冲(旧 → 新,超 8 弹最旧)。
+    /// 纯驱动内存状态:不入检查点,重启从 0。
+    ///
+    /// 口径注意:这里**不**改判定分支,也不回写 stats——`TickSummary` 里的
+    /// stats 是调度器已经合计好的每拍值;`TickSummary::flow_event` 已经是
+    /// 全分片"最危险"胜者,直接采用。
+    fn record_debug_telemetry(&mut self, summary: &shard::TickSummary, tick: types::Tick) {
+        let c = &summary.cohesion;
+        let d = &summary.destruction;
+        let acc = &mut self.debug_counters;
+        acc.impact_flow_events += c.impact_flow_events;
+        acc.impact_flow_breaks += c.impact_flow_breaks;
+        acc.impact_flow_detached_cells += c.impact_flow_detached_cells;
+        acc.compound_flow_events += c.compound_flow_events;
+        acc.compound_flow_breaks += c.compound_flow_breaks;
+        acc.compound_flow_detached_cells += c.compound_flow_detached_cells;
+        acc.compound_flow_corrections += c.compound_flow_corrections;
+        acc.bonds_broken += c.bonds_broken;
+        acc.compounds_spawned += c.compounds_spawned;
+        acc.compounds_solidified += c.compounds_solidified;
+        acc.cells_blasted += d.cells_blasted;
+        acc.cells_impacted += d.cells_impacted;
+        acc.cells_collapsed += d.cells_collapsed;
+        if let Some(ev) = summary.flow_event {
+            self.debug_recent.push_back((
+                tick,
+                sim_api::proto::FlowEventWire {
+                    impact: ev.kind == physics_sim::FlowKind::Impact,
+                    supply: ev.supply,
+                    cut: ev.cut,
+                    broke: ev.broke,
+                    detached_cells: ev.detached_cells,
+                    position: ev.position,
+                },
+            ));
+            if self.debug_recent.len() > 8 {
+                self.debug_recent.pop_front();
+            }
+        }
+    }
+
+    /// 调试遥测下发(REQ-011 §3.5.2;W03):订阅集合非空且距上次下发满 10 拍
+    /// → 对每个订阅者入 Critical 队列(满 → CriticalFull → 连接侧断连收口,
+    /// 驱动侧注册消失后自然弃,无阻塞)。无订阅者时不组装任何帧。
+    fn maybe_emit_debug_stats(&mut self, hub: &OutboundHub, tick: types::Tick) {
+        if self.debug_subscribers.is_empty() {
+            return;
+        }
+        self.ticks_since_debug = self.ticks_since_debug.wrapping_add(1);
+        if self.ticks_since_debug < DEBUG_STATS_INTERVAL_TICKS {
+            return;
+        }
+        self.ticks_since_debug = 0;
+        let msg = S2C::DebugStats {
+            tick,
+            counters: self.debug_counters,
+            recent: self.debug_recent.iter().copied().collect(),
+        };
+        for player in self.debug_subscribers.clone() {
+            hub.push_critical(player, msg.clone());
         }
     }
 }
@@ -1314,10 +1405,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。
                 // TODO(REQ-003):tick() 移入 spawn_blocking,消掉驱动的阻塞段。
-                let _summary = session.tick();
+                let summary = session.tick();
                 telemetry.record(t0.elapsed());
                 ticks_run += 1;
-
                 // tick 末端编排(REQ-002 §4.4/§4.5,顺序固定 ①②③④):
                 // ensure 观察者分片 → 激活请求取数回填/卸载 → despawn 候选 +
                 // 持久化屏障 → chunk 流请求取数回执。无观察者且无挂起流请求时
@@ -1369,6 +1459,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     }
                     orchestrator.record_block_changes(&mut session);
                     orchestrator.emit_outputs(&session, hub, session.tick_now(), *cadence);
+                    // 调试遥测(REQ-011 §3.5.2;W03):先累计(读本拍 TickSummary),
+                    // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
+                    orchestrator.record_debug_telemetry(&summary, session.tick_now());
+                    orchestrator.maybe_emit_debug_stats(hub, session.tick_now());
                 }
 
                 // checkpoint 节奏:整间隔倍数拍到期(fire-and-forget,决策 5)。
@@ -1660,6 +1754,7 @@ mod tests {
     use physics_sim::{ShardSim, ShardSimConfig, SolidifyConfig};
     use storage::mem::{MemCheckpointStore, MemChunkStore};
     use storage::traits::{CheckpointId, CheckpointStore, StoreError};
+    use types::Tick;
     use types::glam::Vec3;
     use types::{DimensionId, EntityDesc, EntityId, EntityState, ShardPos, WorldId};
     use voxel::SimpleRegistry;
@@ -5091,5 +5186,214 @@ mod tests {
 
         tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
         driver.await.expect("驱动不 panic");
+    }
+
+    // ---- W03(REQ-011 §3.5.2):调试遥测累计与下发 ----
+
+    /// 带事件/计数的 TickSummary(其余字段默认)。
+    fn debug_summary(
+        cohesion: physics_sim::cohesion::CohesionStats,
+        destruction: physics_sim::destruction::DestructionStats,
+        flow_event: Option<physics_sim::FlowEventInfo>,
+    ) -> shard::TickSummary {
+        shard::TickSummary {
+            tick: Tick::ZERO,
+            stepped_shards: 1,
+            migrations_admitted: 0,
+            telemetry: shard::ActivationTelemetry::default(),
+            destruction,
+            cohesion,
+            flow_event,
+        }
+    }
+
+    /// 单元(订阅生命周期 + 累计 + 环形缓冲 + 10 拍门):
+    /// ① `SubscribeDebug` 经 `consume_net_up` 登记(幂等);`NetUp::Left` 移除;
+    /// ② 13 项计数逐拍累加自 TickSummary 两份 stats;非空 flow_event 入
+    ///    recent(旧→新,超 8 弹最旧);
+    /// ③ 无订阅者时不组装(计数器不走钟——发不出去的节拍不计);
+    /// ④ 订阅后每 10 拍发一次(节拍满才发)。
+    ///
+    /// 变红:订阅重复插入/断连不失效;漏计某一项;环形缓冲无上限;
+    /// 无订阅者仍组装;节拍错位。
+    #[test]
+    fn debug_telemetry_accumulate_and_gate() {
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        let hub = OutboundHub::new();
+        let p = messaging::InputSource(3);
+
+        // ① 订阅登记 + 幂等。
+        o.consume_net_up(
+            NetUp::SubscribeDebug { player: p },
+            &mut sim_api::session::Session::new(Config::default().session_config()),
+            &mut sim_api::log::CommandLog::new(),
+            &mut 0,
+            &hub,
+        );
+        o.consume_net_up(
+            NetUp::SubscribeDebug { player: p },
+            &mut sim_api::session::Session::new(Config::default().session_config()),
+            &mut sim_api::log::CommandLog::new(),
+            &mut 0,
+            &hub,
+        );
+        assert_eq!(o.debug_subscribers.len(), 1, "重复订阅幂等(集合语义)");
+
+        // ③ 无订阅者(清空后)不组装且不走钟。
+        o.debug_subscribers.clear();
+        let ev = physics_sim::FlowEventInfo {
+            kind: physics_sim::FlowKind::Impact,
+            supply: 9.217,
+            cut: 7.0,
+            broke: true,
+            detached_cells: 1,
+            position: Vec3::new(10.5, 5.5, 8.5),
+        };
+        o.record_debug_telemetry(
+            &debug_summary(
+                physics_sim::cohesion::CohesionStats {
+                    impact_flow_events: 1,
+                    impact_flow_breaks: 1,
+                    impact_flow_detached_cells: 1,
+                    ..Default::default()
+                },
+                physics_sim::destruction::DestructionStats {
+                    cells_blasted: 5,
+                    ..Default::default()
+                },
+                Some(ev),
+            ),
+            Tick(1),
+        );
+        o.maybe_emit_debug_stats(&hub, Tick(1));
+        assert_eq!(o.ticks_since_debug, 0, "无订阅者:节拍不走");
+        // 重新订阅(继续累计验证)。
+        o.consume_net_up(
+            NetUp::SubscribeDebug { player: p },
+            &mut sim_api::session::Session::new(Config::default().session_config()),
+            &mut sim_api::log::CommandLog::new(),
+            &mut 0,
+            &hub,
+        );
+
+        // ② 累计:拍 2 再喂一份(stats 同款 + Compound 事件)。
+        let ev2 = physics_sim::FlowEventInfo {
+            kind: physics_sim::FlowKind::Compound,
+            supply: 23.87,
+            cut: 17.898,
+            broke: true,
+            detached_cells: 1,
+            position: Vec3::new(138.5, 3.4, 8.5),
+        };
+        o.record_debug_telemetry(
+            &debug_summary(
+                physics_sim::cohesion::CohesionStats {
+                    impact_flow_events: 1,
+                    impact_flow_breaks: 1,
+                    impact_flow_detached_cells: 1,
+                    compound_flow_events: 2,
+                    compound_flow_breaks: 1,
+                    compound_flow_detached_cells: 1,
+                    compound_flow_corrections: 1,
+                    bonds_broken: 3,
+                    compounds_spawned: 1,
+                    compounds_solidified: 1,
+                    ..Default::default()
+                },
+                physics_sim::destruction::DestructionStats {
+                    cells_blasted: 5,
+                    cells_impacted: 2,
+                    cells_collapsed: 4,
+                    ..Default::default()
+                },
+                Some(ev2),
+            ),
+            Tick(2),
+        );
+        let acc = o.debug_counters;
+        let got = [
+            acc.impact_flow_events,
+            acc.impact_flow_breaks,
+            acc.impact_flow_detached_cells,
+            acc.compound_flow_events,
+            acc.compound_flow_breaks,
+            acc.compound_flow_detached_cells,
+            acc.compound_flow_corrections,
+            acc.bonds_broken,
+            acc.compounds_spawned,
+            acc.compounds_solidified,
+            acc.cells_blasted,
+            acc.cells_impacted,
+            acc.cells_collapsed,
+        ];
+        let want = [2u64, 2, 2, 2, 1, 1, 1, 3, 1, 1, 10, 2, 4];
+        assert_eq!(got, want, "13 项逐拍累加");
+        assert_eq!(
+            o.debug_recent
+                .iter()
+                .map(|(_, w)| w.impact)
+                .collect::<Vec<_>>(),
+            vec![true, false],
+            "recent 旧→新(Impact 先进)"
+        );
+        assert_eq!(o.debug_recent[0].0, Tick(1), "recent 带拍号");
+
+        // ④ 10 拍门:订阅在场时,前 9 拍不发、第 10 拍发并清零。
+        for i in 1..=9u64 {
+            o.maybe_emit_debug_stats(&hub, Tick(2 + i));
+            assert_eq!(o.ticks_since_debug, i, "第 {i} 拍未满 10,不发(节拍 = {i})");
+        }
+        o.maybe_emit_debug_stats(&hub, Tick(11));
+        assert_eq!(o.ticks_since_debug, 0, "第 10 拍下发并清零");
+
+        // ① 断连失效:Left 移除订阅;之后又不走钟。
+        o.consume_net_up(
+            NetUp::Left {
+                player: p,
+                reason: crate::net::DisconnectReason::Goodbye,
+            },
+            &mut sim_api::session::Session::new(Config::default().session_config()),
+            &mut sim_api::log::CommandLog::new(),
+            &mut 0,
+            &hub,
+        );
+        assert!(o.debug_subscribers.is_empty(), "断连后订阅失效");
+        o.maybe_emit_debug_stats(&hub, Tick(12));
+        assert_eq!(o.ticks_since_debug, 0, "无订阅者不走钟");
+    }
+
+    /// ② 的环形缓冲上限:灌 12 条非空事件 → recent 恒 8(旧→新;最旧的 4
+    /// 条被弹掉,首条 = 第 5 次事件)。
+    ///
+    /// 变红:环形缓冲无上限(recent 无限增长,DebugStats 帧膨胀)。
+    #[test]
+    fn debug_recent_ring_capped_at_8() {
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        for i in 0..12u64 {
+            o.record_debug_telemetry(
+                &debug_summary(
+                    Default::default(),
+                    Default::default(),
+                    Some(physics_sim::FlowEventInfo {
+                        kind: physics_sim::FlowKind::Impact,
+                        supply: i as f32,
+                        cut: 0.0,
+                        broke: false,
+                        detached_cells: 0,
+                        position: Vec3::ZERO,
+                    }),
+                ),
+                Tick(i),
+            );
+        }
+        assert_eq!(o.debug_recent.len(), 8, "环形缓冲上限 8");
+        assert_eq!(
+            o.debug_recent
+                .iter()
+                .map(|(_, w)| w.supply)
+                .collect::<Vec<_>>(),
+            (4..12).map(|v| v as f32).collect::<Vec<_>>(),
+            "最旧 4 条被弹,首条 = 第 5 次(supply = 4)"
+        );
     }
 }

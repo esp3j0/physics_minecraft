@@ -166,6 +166,9 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
         S2C::EntityShapes { shapes } => Some(ViewEvent::Shapes { shapes }),
         S2C::Pong => None,
         S2C::Bye { reason } => Some(ViewEvent::Disconnected { reason }),
+        // 调试遥测(REQ-011 W03):viewer 本单元不订阅(W04 接收面),收到
+        // 也无从谈起——吞掉,行为与 Pong 同型(帧序列不变语义在服务端)。
+        S2C::DebugStats { .. } => None,
     }
 }
 

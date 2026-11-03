@@ -40,6 +40,10 @@ pub enum C2S {
         state: EntityState,
         desc: EntityDesc,
     },
+    /// 订阅调试遥测(REQ-011 §3.5.2;W03,枚举末尾追加):该连接开始接收
+    /// [`S2C::DebugStats`];重复发送幂等;断连即失效。未订阅连接的帧序列
+    /// 与不订阅时逐位相同。
+    SubscribeDebug,
 }
 
 /// 服务器 → 客户端(追加式)。
@@ -84,6 +88,69 @@ pub enum S2C {
     EntityShapes {
         shapes: Vec<(EntityId, types::CompoundShape)>,
     },
+    /// 调试遥测(REQ-011 §3.5.2;W03,枚举末尾追加):仅发给已订阅
+    /// ([`C2S::SubscribeDebug`])的连接,每 10 拍一次;未订阅连接收不到,
+    /// 帧序列与改动前逐位相同。
+    DebugStats {
+        /// 本包对应的最新拍号。
+        tick: Tick,
+        /// 服务器启动以来的累计计数(13 项,§3.5.2)。
+        counters: DebugCounters,
+        /// 最近 8 条非空冲量流事件(带拍号,旧 → 新)。
+        recent: Vec<(Tick, FlowEventWire)>,
+    },
+}
+
+/// 调试遥测累计计数(REQ-011 §3.5.2;W03):sim-api 内定义的协议结构,
+/// 不直接暴露 physics-sim 类型;各项对应 `CohesionStats` / `DestructionStats`
+/// 中的同名字段(驱动逐拍累加,重启从 0 开始,不入检查点)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DebugCounters {
+    /// §5.7 撞击冲量流:建网求值的事件数。
+    pub impact_flow_events: u64,
+    /// §5.7:断开事件数(`C < s`)。
+    pub impact_flow_breaks: u64,
+    /// §5.7:断下格数 |S| 合计。
+    pub impact_flow_detached_cells: u64,
+    /// §5.8 复合体冲量流:成形并进入处理循环的事件数(含预筛命中,
+    /// §5.8.4 口径)。
+    pub compound_flow_events: u64,
+    /// §5.8:断开事件数。
+    pub compound_flow_breaks: u64,
+    /// §5.8:断下格数 |S| 合计。
+    pub compound_flow_detached_cells: u64,
+    /// §5.8:真正施加的对方修正次数(§5.8.4)。
+    pub compound_flow_corrections: u64,
+    /// 被切断的粘结数合计(承载 + 冲量流两路)。
+    pub bonds_broken: u64,
+    /// 复合体生成次数(承载塌落 / 摔断 / 撞散 / 落体成形)。
+    pub compounds_spawned: u64,
+    /// 复合体凝固次数。
+    pub compounds_solidified: u64,
+    /// 爆炸粉碎格数。
+    pub cells_blasted: u64,
+    /// 撞击破坏格数(逐格路径 + 冲量流路径合计)。
+    pub cells_impacted: u64,
+    /// 承载塌落转换格数。
+    pub cells_collapsed: u64,
+}
+
+/// [`physics_sim::FlowEventInfo`](冲量流事件摘要)的协议镜像(REQ-011
+/// §3.5.2;sim-api 不依赖 physics-sim,字段一比一)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FlowEventWire {
+    /// 事件种类(true = Impact,false = Compound)。
+    pub impact: bool,
+    /// 供给合计 `s`(N·s)。
+    pub supply: f32,
+    /// 最小割 `C`(N·s)。
+    pub cut: f32,
+    /// 断开与否(`C < s`)。
+    pub broke: bool,
+    /// 断下格数 |S|。
+    pub detached_cells: u64,
+    /// 世界坐标(Impact = 被撞格格心;Compound = 刚体平移)。
+    pub position: Vec3,
 }
 
 /// 单帧字节上限(REQ-003 §4.1;超限断连)。
@@ -335,6 +402,73 @@ mod tests {
                 tick: Tick(1),
             }),
             vec![3, 0, 0, 0, 0, 1, 1]
+        );
+    }
+
+    /// AC-W8(REQ-011 W03):两个新变体编解码往返;判别值钉在声明序
+    /// (追加在末尾)——`SubscribeDebug` = 7(Hello0/Subscribe1/MoveObserver2/
+    /// Command3/Ping4/Goodbye5/Spawn6),`DebugStats` = 9(Welcome0/ChunkData1/
+    /// ChunkUnload2/EntityStates3/BlockUpdates4/Pong5/Bye6/Spawned7/
+    /// EntityShapes8/DebugStats9);既有变体 golden 不变由
+    /// [`Self::ace7_old_variant_golden_bytes`] 与上面两处判别值钉住。
+    #[test]
+    fn w8_debug_variants_roundtrip_and_discriminants() {
+        // C2S::SubscribeDebug(无字段)往返 + 判别值。
+        let frame = encode_c2s_frame(&C2S::SubscribeDebug);
+        assert_eq!(
+            frame,
+            vec![1, 0, 0, 0, 7],
+            "SubscribeDebug 判别值 = 7(声明序追加)"
+        );
+        assert_eq!(
+            decode_c2s_frame(&frame),
+            Some(C2S::SubscribeDebug),
+            "SubscribeDebug 帧往返"
+        );
+        // S2C::DebugStats 往返 + 判别值(空 recent 最短帧;13 项计数 = 104 B)。
+        let stats = S2C::DebugStats {
+            tick: Tick(120),
+            counters: DebugCounters {
+                impact_flow_events: 3,
+                impact_flow_breaks: 1,
+                impact_flow_detached_cells: 4,
+                compound_flow_events: 9,
+                compound_flow_breaks: 2,
+                compound_flow_detached_cells: 6,
+                compound_flow_corrections: 1,
+                bonds_broken: 12,
+                compounds_spawned: 5,
+                compounds_solidified: 2,
+                cells_blasted: 60,
+                cells_impacted: 7,
+                cells_collapsed: 8,
+            },
+            recent: vec![(
+                Tick(118),
+                FlowEventWire {
+                    impact: true,
+                    supply: 9.217,
+                    cut: 7.0,
+                    broke: true,
+                    detached_cells: 1,
+                    position: Vec3::new(10.5, 5.5, 8.5),
+                },
+            )],
+        };
+        let frame = encode_frame(&stats);
+        // 判别值 = 载荷首字节(varint)。
+        assert_eq!(frame[4], 9, "DebugStats 判别值 = 9(声明序追加)");
+        assert_eq!(decode_frame(&frame), Some(stats), "DebugStats 帧往返");
+        // NaN 不可能出现(supply/cut 来自量化值除法);无穷 recent 空表往返。
+        let empty = S2C::DebugStats {
+            tick: Tick(0),
+            counters: DebugCounters::default(),
+            recent: Vec::new(),
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&empty)),
+            Some(empty),
+            "空 recent 往返"
         );
     }
 }

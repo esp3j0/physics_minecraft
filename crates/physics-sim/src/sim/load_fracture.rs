@@ -734,6 +734,7 @@ impl ShardSim {
             self.outbox.cohesion_stats.compound_flow_events += 1;
             let outcome = crate::compound_flow::evaluate_compound_flow(self.registry.as_ref(), &ev);
             if outcome.prefiltered {
+                // 预筛跳过:不建网、无 `C`,不记 FlowEventInfo(§3.5.1)。
                 self.outbox.cohesion_stats.compound_flow_prefiltered += 1;
                 #[cfg(test)]
                 traces.push(CompoundFlowTrace {
@@ -745,6 +746,26 @@ impl ShardSim {
                 });
                 continue;
             }
+            // 事件摘要(REQ-011 §3.5.1;W03):`s`/`C` 由判定的同一份量化值
+            // 换算;`broke` 与判定同比较;position = 该刚体本拍步进后的平移
+            // (复合体原点;此时本体必在场——同实体至多一候选,先前候选只
+            // 拆它们自己的本体)。
+            let info = {
+                let rec = self.entities.get(&id).expect("本体在场");
+                let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                crate::sim::FlowEventInfo {
+                    kind: crate::sim::FlowKind::Compound,
+                    // 量化单位与 compound_flow 内部常量同值 1000(impact_flow
+                    // 的 pub(crate) 镜像;§3.5.1"同一份数据")。
+                    supply: outcome.supply_q as f32 / crate::impact_flow::QUANT as f32,
+                    cut: outcome.cut_q as f32 / crate::impact_flow::QUANT as f32,
+                    broke: !outcome.detached.is_empty(),
+                    detached_cells: outcome.detached.len() as u64,
+                    position: conv::rapier_to_vec3(body.translation()),
+                }
+            };
+            self.outbox.flow_event =
+                crate::sim::FlowEventInfo::pick(self.outbox.flow_event.take(), Some(info));
             if outcome.detached.is_empty() {
                 // 扛住:无断开、无修正(§5.8.2:修正只随断开)。
                 #[cfg(test)]

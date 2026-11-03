@@ -153,10 +153,104 @@ pub struct BlockWrite {
     pub load_conversion: bool,
 }
 
+/// 冲量流事件摘要(REQ-011 §3.5.1;只读遥测,纯计数不入快照):
+/// 一条建网求值的冲量流事件(§5.7 撞地形 / §5.8 复合体摔断撞散)。
+/// 只记**建了网、求了值**的事件——预筛跳过的不记(无 `C`);`compound_flow
+/// = false` 的旧路径不记;`compound_flow_events` 计数含预筛命中,与本字段
+/// 口径不同(计数不改)。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlowEventInfo {
+    /// 事件种类:撞地形(§5.7)或复合体(§5.8)。
+    pub kind: FlowKind,
+    /// 供给合计 `s`(N·s;由判定用的量化值 `supply_q` 换算,同一份数据)。
+    pub supply: f32,
+    /// 最小割 `C`(N·s;由 `cut_q` 换算,同一份数据)。
+    pub cut: f32,
+    /// 断开与否:`cut_q < supply_q`(与判定分支同一比较;未断为 `false`)。
+    pub broke: bool,
+    /// 断下格数 |S|(未断为 0)。
+    pub detached_cells: u64,
+    /// 世界坐标:`Impact` = 被撞格格心;`Compound` = 该刚体本拍步进后的平移。
+    pub position: Vec3,
+}
+
+/// 事件种类(§3.5.1;并列决出时 Impact 在前)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FlowKind {
+    /// §5.7 撞击冲量流(撞地形)。
+    Impact,
+    /// §5.8 复合体冲量流。
+    Compound,
+}
+
+/// 量化单位(与 `impact_flow::QUANT` / `compound_flow::QUANT` 同值;两处
+/// 常量均为 pub(crate),此处本地镜像,语义一致)。
+const FLOW_QUANT: f32 = 1000.0;
+
+impl FlowEventInfo {
+    /// 危险度比较(§3.5.1:取 `s / C` 最大者;`C = 0` 视为无穷大):
+    /// `C = 0` 的比 `C ≠ 0` 的危险;同为 `C = 0` 比 `s`;否则交叉相乘
+    /// `s₁·C₂ vs s₂·C₁`(量化整数域,值 ≤ ~1e14,无溢出)。
+    pub(crate) fn danger_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let s1 = (self.supply * FLOW_QUANT) as u64;
+        let c1 = (self.cut * FLOW_QUANT).max(0.0) as u64;
+        let s2 = (other.supply * FLOW_QUANT) as u64;
+        let c2 = (other.cut * FLOW_QUANT).max(0.0) as u64;
+        match (c1, c2) {
+            (0, 0) => s1.cmp(&s2),
+            (0, _) => std::cmp::Ordering::Greater,
+            (_, 0) => std::cmp::Ordering::Less,
+            _ => (s1 * c2).cmp(&(s2 * c1)),
+        }
+    }
+
+    /// 并列决出(§3.5.1,danger 相等时):kind 升序(Impact 先)、position
+    /// 各分量的 `f32::to_bits` 升序,取确定的一者。
+    pub(crate) fn tie_break_select(a: &Self, b: &Self) -> Self {
+        let key = |e: &Self| -> (u8, u32, u32, u32) {
+            (
+                match e.kind {
+                    FlowKind::Impact => 0,
+                    FlowKind::Compound => 1,
+                },
+                e.position.x.to_bits(),
+                e.position.y.to_bits(),
+                e.position.z.to_bits(),
+            )
+        };
+        if key(a) <= key(b) { *a } else { *b }
+    }
+
+    /// 两取一(§3.5.1 的合计规则:`Outbox` 片内与调度器全分片合计共用):
+    /// danger 大者胜;并列走 [`Self::tie_break_select`]。
+    pub fn pick(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                if a.danger_cmp(&b) == std::cmp::Ordering::Less {
+                    Some(b)
+                } else if a.danger_cmp(&b) == std::cmp::Ordering::Equal {
+                    Some(Self::tie_break_select(&a, &b))
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
+    }
+}
+
 /// 本 tick 产出(调度器消费):迁移意图、collider 重建过的 chunk、凝固记录。
 /// 可序列化 + 可克隆(快照携带未消费的产出,任务书 01 细则 1)。
 #[derive(Debug, Default, PartialEq, Clone, Serialize, Deserialize)]
 pub struct Outbox {
+    /// 本拍冲量流事件摘要(REQ-011 §3.5.1;W03):"最危险"的一条(`s / C`
+    /// 最大,C=0 视为 ∞;并列按 kind、position 位模式升序决出)。
+    /// **不入快照**(`#[serde(skip)]`:Outbox 随检查点序列化,跳过该字段
+    /// 使检查点格式逐字节不变,`CHECKPOINT_FORMAT_VERSION` 保持 7);每拍
+    /// 重算、outbox 取走即清。
+    #[serde(skip)]
+    pub flow_event: Option<FlowEventInfo>,
     /// 迁移意图(调度器盖章成信封,REQ-001 §4.2 (b))。
     pub migrations: Vec<Intent>,
     /// 本 tick collider 重建过的 chunk(可见性/换装统计用)。
@@ -3514,12 +3608,38 @@ impl ShardSim {
             let remaining = self.remaining_detach_quota();
             let stats = &mut self.outbox.cohesion_stats;
             if outcome.prefiltered {
+                // 预筛跳过:不建网、无 `C`,不记 FlowEventInfo(§3.5.1)。
                 stats.impact_flow_prefiltered += 1;
                 continue;
             }
             stats.impact_flow_events += 1;
             stats.impact_flow_cells_visited += outcome.visited as u64;
             stats.impact_flow_budget_hits += outcome.truncated as u64;
+            // 事件摘要(REQ-011 §3.5.1;W03):`s`/`C` 由判定的同一份量化值
+            // 换算;`broke` 与判定同比较;position = 被撞格格心(取供给最大
+            // 的格,并列字典序最小,确定)。候选拿"本拍最危险"一条(后面
+            // 每事件 pick 一次)。
+            let info = crate::sim::FlowEventInfo {
+                kind: crate::sim::FlowKind::Impact,
+                supply: outcome.supply_q as f32 / crate::impact_flow::QUANT as f32,
+                cut: outcome.cut_q as f32 / crate::impact_flow::QUANT as f32,
+                broke: !outcome.detached.is_empty(),
+                detached_cells: outcome.detached.len() as u64,
+                position: {
+                    let best = event
+                        .supplies
+                        .iter()
+                        .max_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+                        .map(|(c, _)| *c);
+                    match best {
+                        Some(c) => Vec3::new(c.x as f32 + 0.5, c.y as f32 + 0.5, c.z as f32 + 0.5),
+                        // 防御:无格事件不可能过建网;回退作用点。
+                        None => event.point,
+                    }
+                },
+            };
+            self.outbox.flow_event =
+                crate::sim::FlowEventInfo::pick(self.outbox.flow_event.take(), Some(info));
             if outcome.detached.is_empty() {
                 // 扛住:建了网但 C ≥ s,无断开、无修正(§5.7.2:修正只随断开)。
                 continue;
@@ -12406,6 +12526,379 @@ mod tests {
         assert!(
             on.is_empty(),
             "冲量流口径(开启):割 56 > s 扛住,不破——分派生效"
+        );
+    }
+
+    // ============================== W03(REQ-011 §3.5.1)==============================
+
+    /// AC-W6 事件摘要(§3.5.1):单格撞结构 §5.7 路径产生的 `flow_event`
+    /// ——`supply` / `cut` 与判定同源(与 §5.7 现有量逐值对上:12 m/s 单格
+    /// 石方块撞土墩上格,割 = 土石剪切 7;F02b 同布景供给 s ≈ 8.7)、
+    /// `broke` 与实际断开一致、`position` = 被撞格(供给最大格)格心。
+    ///
+    /// 变红:supply/cut 另算一遍(与判定量化值不同源);position 取错格;
+    /// broke 与判定分支比较脱节。
+    #[test]
+    fn flow_event_impact_single_cell_vs_dirt_mound() {
+        let mut s = flow_sim_zero_g();
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        // 悬空土墩:垫 (10,3,8) bedrock、土 (10,4,8)、(10,5,8)(F02b 同布景:
+        // 12 m/s 撞上格,割 7 < s ≈ 8.7 → 断上格 (10,5,8))。
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        for y in 4..=5 {
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, y, 8), voxel::builtin::DIRT);
+        }
+        refresh_collider(&mut s);
+        let id = entity(1);
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(13.45, 5.5, 8.5),
+                    linvel: Vec3::new(-12.0, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }]);
+        let mut event = None;
+        for _ in 0..20 {
+            s.step();
+            let out = s.take_outbox();
+            if out.cohesion_stats.impact_flow_breaks > 0 {
+                event = out.flow_event;
+                break;
+            }
+        }
+        let ev = event.expect("断开拍应有 flow_event(Impact)");
+        assert_eq!(ev.kind, crate::sim::FlowKind::Impact);
+        // 判定同源:量化值换算回 N·s 后必须落在 §5.7 既有量上——割 = 土-石
+        // 剪切 min(18,7) = 7(F02b 同布景实测);供给 ≈ 8.7(J ≈ 0.729 kg ×
+        // 12 m/s ≈ 8.748,量化 floor)。逐值钉住换算而非另算。
+        assert_eq!(ev.cut, 7.0, "割 = min(18,7) = 7(量化 7000 换算)");
+        // 供给 = 解算冲量(牛顿封顶后),生产实测 9.217(F02b 注释的 ≈8.7 是
+        // m·v 估算;解算值略高,带内钉住)。
+        assert!(
+            (9.0..=9.5).contains(&ev.supply),
+            "供给 ≈ 9.2 N·s(解算冲量),实得 {}",
+            ev.supply
+        );
+        assert!(ev.broke, "割 7 < 供给 → broke = true(与判定同比较)");
+        assert_eq!(ev.detached_cells, 1, "S = 上格单格");
+        assert_eq!(
+            ev.position,
+            Vec3::new(10.5, 5.5, 8.5),
+            "position = 被撞格(供给最大格)格心"
+        );
+    }
+
+    /// AC-W6 预筛不记 + 关闭路径不记:①低速贴面起跑(s < I_min = 4 不建网)
+    /// → `flow_event` 为 `None`;②`compound_flow = false` 旧路径同布景
+    /// (悬空 6 格土条 40 m/s 端格侧撞,关闭时逐格口径会碎)→ `flow_event`
+    /// 为 `None`。
+    ///
+    /// 变红:预筛命中也记(无 C 还编一个);旧路径混入摘要。
+    #[test]
+    fn flow_event_none_for_prefilter_and_legacy_path() {
+        // ① 预筛:0.729 kg × 2 m/s ≈ 1.46 < I_min = 4(sand min(I,I_c)),
+        // 贴面起跑(13.45 → 撞击格 10)直线弹道。
+        {
+            let mut s = flow_sim_zero_g();
+            s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+            for y in 4..=5 {
+                let _ = s
+                    .voxels
+                    .set_block(BlockPos::new(10, y, 8), voxel::builtin::DIRT);
+            }
+            refresh_collider(&mut s);
+            let id = entity(1);
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: id,
+                    state: EntityState {
+                        translation: Vec3::new(13.45, 5.5, 8.5),
+                        linvel: Vec3::new(-2.0, 0.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc {
+                        half_size: 0.45,
+                        block: voxel::builtin::STONE,
+                        shape: None,
+                    },
+                }),
+            }]);
+            let mut events = 0u64;
+            // 2 m/s × 60 拍/s:飞完 2 m 需 ~60 拍,窗口取 150 盖过。
+            for _ in 0..150 {
+                s.step();
+                let out = s.take_outbox();
+                events += out.cohesion_stats.impact_flow_prefiltered;
+                assert!(
+                    out.flow_event.is_none(),
+                    "预筛命中不记 flow_event(§3.5.1),实得 {:?}",
+                    out.flow_event
+                );
+            }
+            assert!(events >= 1, "布景须真的命中过预筛(否则测了个空)");
+        }
+        // ② compound_flow = false 旧路径:悬空 6 格土条被 40 m/s 单格土方块
+        // 撞端格(compound_flow_side_impact 同布景),关闭 → 不记。
+        {
+            let mut cfg = ShardSimConfig {
+                gravity: Vec3::ZERO,
+                ..ShardSimConfig::new(shard_id(0, 0))
+            };
+            cfg.solidify.enabled = false;
+            cfg.cohesion.enabled = true;
+            cfg.cohesion.impact_flow = true;
+            cfg.cohesion.compound_flow = false;
+            let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+            s.load_chunk(ChunkPos::new(0, 0), voxel::Chunk::air());
+            let shape = types::CompoundShape::new(
+                (-4i32..=1)
+                    .map(|x| types::ShapeCell {
+                        offset: [x, 0, 0],
+                        block: voxel::builtin::DIRT,
+                    })
+                    .collect(),
+            )
+            .expect("6 格");
+            s.apply_prefix(&[
+                compound_input_at(1, entity(1), Vec3::new(9.5, 5.5, 8.5), shape, Vec3::ZERO),
+                dirt_bullet_input(
+                    2,
+                    entity(2),
+                    Vec3::new(10.5, 5.5, 4.0),
+                    Vec3::new(0.0, 0.0, 40.0),
+                ),
+            ]);
+            let mut broke = false;
+            for _ in 0..60 {
+                s.step();
+                let out = s.take_outbox();
+                if out.cohesion_stats.compound_flow_events == 0 {
+                    assert!(
+                        out.flow_event.is_none(),
+                        "旧路径(compound_flow = false)不记 flow_event"
+                    );
+                }
+                broke |= out.cohesion_stats.bonds_broken > 0;
+            }
+            assert!(broke, "关闭时该场景按旧口径碎(布景有效性)");
+        }
+    }
+
+    /// AC-W6 一拍两事件取 `s / C` 大者(§3.5.1):同拍两条撞击事件布景——
+    /// 石方块 A 12 m/s 撞上格(起点 13.45,10 拍到)、石方块 B 6 m/s 撞下格
+    /// (起点 12.45,同为 10 拍到;速度 × 距离同积,同拍接触),上限 2(都
+    /// 处理)。两条割同为 7(单键),供给 A > B → `flow_event` = A 那条;
+    /// 供给值与单独复跑逐值一致。
+    ///
+    /// 变红:取第一条/最后一条(非 s/C 最大);C=0 未按无穷大处理。
+    #[test]
+    fn flow_event_two_impacts_same_tick_picks_more_dangerous() {
+        // 单独复跑(只留一个投射物)量取各自事件的 (supply, position)。
+        let solo = |x: f32, speed: f32, y: f32| -> (f32, Vec3) {
+            let mut s = flow_sim_zero_g();
+            s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+            for yy in 4..=5 {
+                let _ = s
+                    .voxels
+                    .set_block(BlockPos::new(10, yy, 8), voxel::builtin::DIRT);
+            }
+            refresh_collider(&mut s);
+            s.apply_prefix(&[StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                    entity: entity(1),
+                    state: EntityState {
+                        translation: Vec3::new(x, y, 8.5),
+                        linvel: Vec3::new(-speed, 0.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc {
+                        half_size: 0.45,
+                        block: voxel::builtin::STONE,
+                        shape: None,
+                    },
+                }),
+            }]);
+            let mut got = None;
+            for _ in 0..40 {
+                s.step();
+                let out = s.take_outbox();
+                if let Some(ev) = out.flow_event {
+                    got = Some((ev.supply, ev.position));
+                    break;
+                }
+            }
+            got.expect("单投射物布景应有事件")
+        };
+        let (s_upper, p_upper) = solo(13.45, 12.0, 5.5);
+        let (s_lower, p_lower) = solo(12.45, 6.0, 4.5);
+        assert!(
+            s_upper > s_lower,
+            "布景对照:上格弹 12 m/s 供给须大于下格弹 6 m/s({s_upper} vs {s_lower})"
+        );
+        // 双事件拍:上限 2(同拍都处理),flow_event 应 = 供给大的 A 那条。
+        let mut cfg = ShardSimConfig {
+            gravity: Vec3::ZERO,
+            ..ShardSimConfig::new(shard_id(0, 0))
+        };
+        cfg.solidify.enabled = false;
+        cfg.cohesion.enabled = true;
+        cfg.cohesion.impact_flow = true;
+        cfg.cohesion.impact_flow_max_events_per_tick = 2;
+        let mut s = ShardSim::new(cfg, Box::new(voxel::SimpleRegistry::builtin()));
+        s.load_chunk(ChunkPos::new(0, 0), solid_chunk());
+        let _ = s
+            .voxels
+            .set_block(BlockPos::new(10, 3, 8), voxel::builtin::BEDROCK);
+        for yy in 4..=5 {
+            let _ = s
+                .voxels
+                .set_block(BlockPos::new(10, yy, 8), voxel::builtin::DIRT);
+        }
+        refresh_collider(&mut s);
+        let mk = |seq: u64, id: EntityId, x: f32, speed: f32, y: f32| StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(x, y, 8.5),
+                    linvel: Vec3::new(-speed, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        };
+        s.apply_prefix(&[
+            mk(1, entity(1), 13.45, 12.0, 5.5),
+            mk(2, entity(2), 12.45, 6.0, 4.5),
+        ]);
+        let mut picked = None;
+        for _ in 0..40 {
+            s.step();
+            let out = s.take_outbox();
+            if out.cohesion_stats.impact_flow_events >= 2 {
+                picked = out.flow_event;
+                break;
+            }
+        }
+        let ev = picked.expect("双事件拍应有 flow_event(两事件同拍建网求值)");
+        assert_eq!(
+            ev.position, p_upper,
+            "取供给大的 A 那条(position = 被撞上格格心;{p_upper} vs {p_lower})"
+        );
+        assert_eq!(ev.supply, s_upper, "供给值与单独复跑逐值一致");
+    }
+
+    /// AC-W6 复合体路径:6 格土条 30° 端角落地(§5.8,AC-G3 落地③同布景)
+    /// 产生 `flow_event`(Compound)——broke = true、detached_cells = 1、
+    /// position = 该刚体本拍步进后的平移(原点格心 (10.5, ·, 8.5):x/z 分量
+    /// 钉住,y 在静置原点下方)。
+    ///
+    /// 变红:Compound 事件不记 / position 取成格坐标(应为刚体平移)。
+    #[test]
+    fn flow_event_compound_corner_landing() {
+        let mut s = flow_compound_gravity_sim();
+        s.load_chunk(ChunkPos::new(0, 0), dirt_on_stone_chunk());
+        let shape = types::CompoundShape::new(
+            (-4i32..=1)
+                .map(|x| types::ShapeCell {
+                    offset: [x, 0, 0],
+                    block: voxel::builtin::DIRT,
+                })
+                .collect(),
+        )
+        .expect("6 格条");
+        let id = entity(1);
+        let h = 2.0 * 2.1;
+        let y0 = 1.0
+            + 4.0 * 30f32.to_radians().sin()
+            + 0.45 * (30f32.to_radians().sin() + 30f32.to_radians().cos())
+            + h;
+        s.apply_prefix(&[StampedInput {
+            apply_at: Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity: id,
+                state: EntityState {
+                    translation: Vec3::new(10.5, y0, 8.5),
+                    rotation: types::glam::Quat::from_rotation_z(30f32.to_radians()),
+                    ..EntityState::default()
+                },
+                desc: EntityDesc::compound(crate::destruction::DEBRIS_HALF_SIZE, shape),
+            }),
+        }]);
+        assert_touch_speed(&mut s, id, h, 30, "30° 端角");
+        let mut event = None;
+        for _ in 0..400 {
+            s.step();
+            let out = s.take_outbox();
+            if out.cohesion_stats.compound_flow_breaks > 0 {
+                event = out.flow_event;
+                break;
+            }
+        }
+        let ev = event.expect("断开拍应有 flow_event(Compound)");
+        assert_eq!(ev.kind, crate::sim::FlowKind::Compound);
+        assert!(ev.broke, "端格断下 → broke = true");
+        assert_eq!(ev.detached_cells, 1, "S = 端格单格");
+        // 供给/割与判定量一致:端格断下的 s 在 G03 实测档位(≈ 15–19 N·s)
+        // 且必 > 割;割随 30° 端角布景取窄口,断言 broke/s 关系与 detachment
+        // 同源,再钉 supply 非零且量化换算回整数无残差。
+        assert!(
+            ev.supply > ev.cut,
+            "断开 ⇒ s > C({} vs {})",
+            ev.supply,
+            ev.cut
+        );
+        assert!(ev.supply > 0.0 && ev.cut > 0.0, "s/C 都非零(建网求值)");
+        assert!(
+            (ev.supply * 1000.0).fract() < 1e-3 && (ev.cut * 1000.0).fract() < 1e-3,
+            "s/C 由量化值除 1000 换算(整数域无残差)"
+        );
+        // position = 刚体本拍步进后的平移:条原点在格 (10,·,8),x/z 钉格心;
+        // y 应在静置原点(≈ 3.61)下方(已触地),且为有限值。
+        assert!(
+            (ev.position.x - 10.5).abs() < 1.0 && (ev.position.z - 8.5).abs() < 1.0,
+            "position = 刚体平移(条原点 x/z 邻域),实得 {}",
+            ev.position
+        );
+        assert!(
+            ev.position.y < y0 && ev.position.y.is_finite(),
+            "position.y 在触地下方:{},spawn y = {y0}",
+            ev.position.y
         );
     }
 

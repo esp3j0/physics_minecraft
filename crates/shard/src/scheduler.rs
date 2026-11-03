@@ -96,7 +96,10 @@ impl Default for SchedulerConfig {
 }
 
 /// 一拍的执行摘要。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Eq` 降为 `PartialEq`(REQ-011 W03):`flow_event` 含 `f32` 的世界坐标,
+/// 无位级相等语义;全库无 `TickSummary` 整体 `==` 断言(仅字段断言),降级
+/// 不破坏任何既有用例。`Copy` 保持(§3.5.1)。
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TickSummary {
     /// 本拍执行的拍号(tick() 第 k 次调用返回 k-1,README 决策 7)。
     pub tick: Tick,
@@ -112,6 +115,10 @@ pub struct TickSummary {
     /// 粘结与整块塌落遥测(REQ-010 §11):全部分片的 `Outbox::cohesion_stats` 合计。
     /// **总架构师接口桩(REQ-010 单元 02)**:字段已加,合计由实施方接线(桩阶段恒为默认)。
     pub cohesion: physics_sim::cohesion::CohesionStats,
+    /// 冲量流事件摘要(REQ-011 §3.5.1;W03):全部分片的 `Outbox::flow_event`
+    /// 按"最危险"规则(`s / C` 最大,C=0 视为 ∞;并列按 kind、position 位
+    /// 模式升序)取一条。每拍重算、纯只读遥测、不入快照。
+    pub flow_event: Option<physics_sim::FlowEventInfo>,
 }
 
 /// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
@@ -1610,6 +1617,10 @@ impl Scheduler {
         let mut destruction = physics_sim::destruction::DestructionStats::default();
         // 粘结与整块塌落遥测合计(REQ-010 §11,单元 02):同款逐分片相加。
         let mut cohesion = physics_sim::cohesion::CohesionStats::default();
+        // 冲量流事件摘要合计(REQ-011 §3.5.1;W03):全部分片按"最危险"
+        // 规则取一条(results 升序迭代 + [`FlowEventInfo::pick`] 的确定
+        // 决出,顺序无关且确定)。outbox 每拍取走即清,本值每拍重算。
+        let mut flow_event: Option<physics_sim::FlowEventInfo> = None;
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
@@ -1620,6 +1631,9 @@ impl Scheduler {
             destruction.add(&outbox.destruction_stats);
             // 粘结与整块塌落遥测(REQ-010 §11):同款并入合计。
             cohesion.add(&outbox.cohesion_stats);
+            // 冲量流事件摘要(REQ-011 §3.5.1;W03):并入"最危险"一条。
+            flow_event =
+                physics_sim::FlowEventInfo::pick(flow_event.take(), outbox.flow_event.take());
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -2161,6 +2175,7 @@ impl Scheduler {
             migrations_admitted,
             destruction,
             cohesion,
+            flow_event,
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -2464,6 +2479,7 @@ mod tests {
                 telemetry: ActivationTelemetry::default(),
                 destruction: physics_sim::destruction::DestructionStats::default(),
                 cohesion: physics_sim::cohesion::CohesionStats::default(),
+                flow_event: None,
             }
         );
         sched.shutdown();
@@ -6840,5 +6856,212 @@ mod tests {
             )
             .expect("收件箱未满");
         sched.tick();
+    }
+
+    // ---- REQ-011 W03(§3.5.1):TickSummary::flow_event 合计 ----
+
+    /// 冲量流开启的同相对分片(悬浮土墩 + 石方块撞击布景;solidify 关)。
+    fn flow_event_sim(x: i32, z: i32) -> ShardSim {
+        let mut cfg = ShardSimConfig::new(shard_id(x, z));
+        cfg.gravity = Vec3::ZERO;
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.cohesion.enabled = true;
+        cfg.cohesion.impact_flow = true;
+        let mut s = ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        let mut ch = voxel::Chunk::air();
+        for cx in 0..voxel::CHUNK_X {
+            for cz in 0..voxel::CHUNK_Z {
+                ch.set(cx, 64, cz, voxel::builtin::STONE);
+            }
+        }
+        let (bx, bz) = (x * 8, z * 8);
+        // 布景格 (x0+10..13, ·, z0+8) 都落在本分片 chunk (bx, bz)
+        // (chunk 16 格:(10,8) → floor_div = (0,0))。
+        let cp = types::ChunkPos::new(bx, bz);
+        s.load_chunk(cp, ch);
+        s
+    }
+
+    /// 撞土墩输入(悬空土墩在本体区内相对格 (10,3..=5,8);12 或 6 m/s)。
+    fn impact_bullet(
+        shard: types::ShardId,
+        apply_at: Tick,
+        seq: u64,
+        entity: types::EntityId,
+        x: f32,
+        speed: f32,
+        y: f32,
+    ) -> StampedInput {
+        let x0 = shard.pos.x * 128;
+        let z0 = shard.pos.z * 128;
+        StampedInput {
+            apply_at,
+            source: InputSource(1),
+            sequence: seq,
+            payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                entity,
+                state: types::EntityState {
+                    translation: Vec3::new(x0 as f32 + x, y, z0 as f32 + 8.5),
+                    linvel: Vec3::new(-speed, 0.0, 0.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc {
+                    half_size: 0.45,
+                    block: voxel::builtin::STONE,
+                    shape: None,
+                },
+            }),
+        }
+    }
+
+    /// 悬空土墩(垫 (10,3,8) bedrock + 土 (10,4,8)/(10,5,8),分片相对坐标)。
+    fn place_dirt_mound(sched: &mut Scheduler, shard: types::ShardId, seq_base: u64) {
+        let x0 = shard.pos.x * 128;
+        let z0 = shard.pos.z * 128;
+        let cells = [
+            (
+                types::BlockPos::new(x0 + 10, 3, z0 + 8),
+                voxel::builtin::BEDROCK,
+            ),
+            (
+                types::BlockPos::new(x0 + 10, 4, z0 + 8),
+                voxel::builtin::DIRT,
+            ),
+            (
+                types::BlockPos::new(x0 + 10, 5, z0 + 8),
+                voxel::builtin::DIRT,
+            ),
+        ];
+        for (k, (pos, block)) in cells.into_iter().enumerate() {
+            sched
+                .submit(
+                    shard,
+                    cmd_input(
+                        InputSource(1),
+                        seq_base + k as u64,
+                        Tick::ZERO,
+                        SimCommand::SetBlock { pos, block },
+                    ),
+                )
+                .expect("收件箱未满");
+        }
+    }
+
+    /// AC-W7 合计(REQ-011 §3.5.1):两分片同拍各产生一条事件(A 12 m/s 撞
+    /// 上格、B 6 m/s 撞下格,supply 不同)→ `TickSummary::flow_event` 取
+    /// s/C 大的 A 那条(position = A 的被撞上格格心)。布景对每分片同相对
+    /// 几何,只有速度差 → 两分片事件 danger 不等,决出与分片顺序无关。
+    ///
+    /// 变红:合计没接线(summary 恒 None);取错分片(B 的 position)。
+    #[test]
+    fn tick_summary_picks_more_dangerous_flow_event_across_shards() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        let (a, b) = (shard_id(0, 0), shard_id(1, 0));
+        sched.register(flow_event_sim(0, 0));
+        sched.register(flow_event_sim(1, 0));
+        for &shard in [a, b].iter() {
+            place_dirt_mound(&mut sched, shard, 0);
+        }
+        sched.tick(); // 搭墩
+        // 各分片一个投射物:A 分片 0 撞上格(12 m/s,起点距 2 m ≈ 10 拍到),
+        // B 分片 1 撞下格(6 m/s,起点距 1 m ≈ 10 拍到)——**同一拍**接触,
+        // 同拍各一条事件;A 供给(≈9.2)> B(≈4.6,速度低)→ 合计取 A。
+        // 提交在拍 1 之后,apply_at = 当前拍。
+        sched
+            .submit(
+                a,
+                impact_bullet(
+                    a,
+                    Tick(1),
+                    100,
+                    types::EntityId::from_parts(1, 1),
+                    13.45,
+                    12.0,
+                    5.5,
+                ),
+            )
+            .expect("入箱");
+        sched
+            .submit(
+                b,
+                impact_bullet(
+                    b,
+                    Tick(1),
+                    100,
+                    types::EntityId::from_parts(1, 2),
+                    12.45,
+                    6.0,
+                    4.5,
+                ),
+            )
+            .expect("入箱");
+        // 拍 1:spawn;拍 2 起飞;~10 拍后同拍接触。
+        sched.tick();
+        let mut picked = None;
+        for _ in 0..30 {
+            let t = sched.tick();
+            if t.cohesion.impact_flow_events >= 2 {
+                picked = t.flow_event;
+                break;
+            }
+        }
+        let ev = picked.expect("两分片同拍各一条事件,合计应非 None");
+        assert_eq!(ev.kind, physics_sim::FlowKind::Impact);
+        assert_eq!(
+            ev.position,
+            Vec3::new(10.5, 5.5, 8.5),
+            "取危险度大的 A(12 m/s 撞上格)那条"
+        );
+        sched.shutdown();
+    }
+
+    /// AC-W7 并列决出(纯函数单测):`FlowEventInfo::pick` 的 danger 相等时
+    /// 按 kind(Impact 先)、position 分量 to_bits 升序,与调用顺序无关。
+    ///
+    /// 变红:并列取先来/后写者(顺序不定);Impact/Compound 序颠倒。
+    #[test]
+    fn flow_event_pick_tie_break_is_deterministic() {
+        let ev = |kind: physics_sim::FlowKind,
+                  supply: f32,
+                  cut: f32,
+                  x: f32,
+                  y: f32,
+                  z: f32|
+         -> physics_sim::FlowEventInfo {
+            physics_sim::FlowEventInfo {
+                kind,
+                supply,
+                cut,
+                broke: cut < supply,
+                detached_cells: 0,
+                position: Vec3::new(x, y, z),
+            }
+        };
+        // 并列(s/C 相等):position 5.5 的 bits > 4.5 → 升序取 4.5;两个方向
+        // 调用结果一致(决出与顺序无关)。
+        let high = ev(physics_sim::FlowKind::Impact, 9.0, 7.0, 10.5, 5.5, 8.5);
+        let low = ev(physics_sim::FlowKind::Impact, 9.0, 7.0, 10.5, 4.5, 8.5);
+        let ab = physics_sim::FlowEventInfo::pick(Some(high), Some(low)).expect("非空");
+        let ba = physics_sim::FlowEventInfo::pick(Some(low), Some(high)).expect("非空");
+        assert_eq!(ab.position.y, 4.5, "并列按 position 位模式升序取 4.5");
+        assert_eq!(ab, ba, "决出与调用顺序无关");
+        // kind 并列破:I 的 key < C(Impact 先)。
+        let impact = ev(physics_sim::FlowKind::Impact, 9.0, 7.0, 10.5, 5.5, 8.5);
+        let compound = ev(physics_sim::FlowKind::Compound, 9.0, 7.0, 10.5, 5.5, 8.5);
+        let ic = physics_sim::FlowEventInfo::pick(Some(impact), Some(compound)).expect("非空");
+        assert_eq!(ic.kind, physics_sim::FlowKind::Impact, "并列 Impact 在前");
+        // C = 0 视为无穷大:必胜过任何 C ≠ 0 的事件(哪怕 s 很小)。
+        let zero_cut = ev(physics_sim::FlowKind::Compound, 0.5, 0.0, 0.5, 0.5, 0.5);
+        let big = ev(physics_sim::FlowKind::Impact, 1000.0, 999.0, 1.5, 1.5, 1.5);
+        let picked = physics_sim::FlowEventInfo::pick(Some(big), Some(zero_cut)).expect("非空");
+        assert_eq!(picked.cut, 0.0, "C = 0(∞)危险度更大");
+        // 危险度不等:s/C 交叉相乘——(s=8, C=4) = 2.0 > (s=100, C=60) ≈ 1.67。
+        let mid = ev(physics_sim::FlowKind::Impact, 8.0, 4.0, 0.5, 0.5, 0.5);
+        let weak = ev(physics_sim::FlowKind::Impact, 100.0, 60.0, 1.5, 1.5, 1.5);
+        let picked = physics_sim::FlowEventInfo::pick(Some(weak), Some(mid)).expect("非空");
+        assert_eq!(picked.supply, 8.0, "s/C = 2.0 > 1.67,取 mid");
     }
 }
