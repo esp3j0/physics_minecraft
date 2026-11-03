@@ -6,11 +6,12 @@
 //! 约定沿 viewer 相机(`forward = (cos yaw·cos pitch, sin pitch, sin yaw·
 //! cos pitch)`),经 [`super::prefab::orientation_from_yaw`] 取整到 ±x / ±z。
 //!
-//! **出生距离**(§3.2,W02 放行澄清的写法):
-//! `d = 2 − min(0, min_k(o_k · d̂))`,其中 `o_k` 为各格偏移的世界向量、
-//! `d̂` 为视线单位方向。单格 o = 0 → d = 2;复合体中若有格的偏移与 d̂ 反向
-//! (点积 < 0,例如低头发射竖条时 v=0..3 的格),d 被抬高,保证离相机最近的
-//! 那一格的格心也恰在视线方向 2 m 外。
+//! **出生位置**(§3.2,W02-2 返修澄清):`translation = cam_pos + d̂·d`
+//! 是**连续值,不取整**——`d = 2 − min(0, min_k(o_k · d̂))`,其中 `o_k`
+//! 为各格偏移的世界向量、`d̂` 为视线单位方向。单格 o = 0 → d = 2;复合体
+//! 中若有格的偏移与 d̂ 反向(点积 < 0),d 被抬高,保证离相机最近那格的
+//! 格心沿视线也在 2 m 外,且轨迹严格穿过准星。实心判定按各格格心
+//! `c_k = translation + o_k` 的 `floor(c_k)` 查块,非空气拒绝(None 放行)。
 //!
 //! **组装**(§3.2):单格 `EntityDesc { block: 材料, ..default }`(半边长
 //! 0.5,与 B 键同型);复合体 `EntityDesc::compound(COMPOUND_HALF_SIZE,
@@ -123,13 +124,15 @@ impl LaunchShape {
 }
 
 /// 发射请求(§3.2;AC-W3 / AC-W4):
-/// - 原点格格心 = `cam_pos + d̂·d`,`d = 2 − min(0, min_k(o_k · d̂))`
-///   (`o_k` = 各格世界偏移);
+/// - `translation = cam_pos + d̂·d`(**连续值不取整**,W02-2 返修:
+///   `d = 2 − min(0, min_k(o_k · d̂))`,`o_k` = 各格世界偏移;取整会让轨迹
+///   平行错开视线、破坏"最近格 ≥ 2 m"保证并造出齐平对齐干扰);
 /// - `linvel = d̂ × speed`、`rotation` 单位四元数、`angvel` 0;
 /// - 单格 `EntityDesc { block: 材料, ..default }`(半边长 0.5 = B 键同型);
 ///   复合体 `EntityDesc::compound(COMPOUND_HALF_SIZE, shape)`(每格同一材料);
-/// - 拒绝:材料基岩;任一格**格心**落在实心方块里(`block_at` = Some(非空气);
-///   `None` 未装载不算实心,交给服务器现有规则)。
+/// - 拒绝:材料基岩;任一格的格心 `c_k = translation + o_k` 所在块
+///   **`floor(c_k)`** 为实心(`block_at` = Some(非空气);`None` 未装载
+///   不算实心,交给服务器现有规则);文案给冲突格坐标。
 ///
 /// `yaw_deg` 只用于形状偏移取整;`cam_dir` 内部单位化,零向量防御性回退
 /// +x(窗口初始化帧的病态输入不 panic)。
@@ -161,19 +164,13 @@ pub fn launch_request(
         min_dot = min_dot.min(o.dot(dir));
     }
     let d = SPAWN_CLEARANCE - min_dot.min(0.0);
-    let origin_cell = Vec3::new(
-        (cam_pos + dir * d).floor().x,
-        (cam_pos + dir * d).floor().y,
-        (cam_pos + dir * d).floor().z,
-    );
+    let translation = cam_pos + dir * d;
 
-    // 格心判定(格 (x,y,z) 的格心 = (x,y,z) + 0.5):任一格格心在实心里 → 拒绝。
+    // 实心判定:每格格心 c_k = translation + o_k,查 floor(c_k) 所在块
+    // (连续出生点不落格,按格心所在格查询;非空气 → 拒绝,文案给该格)。
     for [ox, oy, oz] in &offsets {
-        let cell = [
-            origin_cell.x as i32 + ox,
-            origin_cell.y as i32 + oy,
-            origin_cell.z as i32 + oz,
-        ];
+        let c = translation + Vec3::new(*ox as f32, *oy as f32, *oz as f32);
+        let cell = [c.x.floor() as i32, c.y.floor() as i32, c.z.floor() as i32];
         let pos = types::BlockPos::new(cell[0], cell[1], cell[2]);
         if let Some(b) = world.block_at(pos)
             && !b.is_air()
@@ -185,10 +182,10 @@ pub fn launch_request(
         }
     }
 
-    // 组装:原点格 [0,0,0] 的格心 = 刚体 translation(脚本 spawn 同语义:
-    // at = 原点格格心;此处我们算的就是原点格格心)。
+    // 组装:translation 连续(不取整;脚本 spawn 的 at 语义对齐到"原点格
+    // [0,0,0] 的格心"是格对齐输入,发射的输入是连续视线,二者同型在 desc)。
     let state = EntityState {
-        translation: origin_cell + Vec3::new(0.5, 0.5, 0.5),
+        translation,
         linvel: dir * speed,
         ..EntityState::default()
     };
@@ -401,7 +398,12 @@ mod tests {
             &world,
         )
         .expect("单格发射");
-        assert_eq!(state.translation, Vec3::new(12.5, -55.5, 20.5), "格心");
+        // translation = cam + d̂·d 连续值(W02-2):10+2=12、−56、20,不取整。
+        assert_eq!(
+            state.translation,
+            Vec3::new(12.0, -56.0, 20.0),
+            "连续出生点"
+        );
         assert_eq!(state.linvel, Vec3::new(20.0, 0.0, 0.0), "linvel = d̂·speed");
         assert_eq!(state.rotation, types::glam::Quat::IDENTITY);
         assert_eq!(state.angvel, Vec3::ZERO);
@@ -409,8 +411,8 @@ mod tests {
         assert_eq!(desc.half_size, 0.5, "单格半边长与 B 键同型");
         assert!(desc.shape().is_none(), "单格无形状");
 
-        // 6 格条·纵(w=+x,偏移 0..5 沿 +x):所有 o·d̂ ≥ 0 → d = 2,原点格
-        // 同单格;形状 6 格 stone…每格 dirt。
+        // 6 格条·纵(w=+x,偏移 0..5 沿 +x):所有 o·d̂ ≥ 0 → d = 2,原点同
+        // 单格;形状 6 格每格 dirt。
         let (state, desc) = launch_request(
             LaunchShape::BarLongitudinal,
             crate::tools::Material::Dirt,
@@ -421,7 +423,7 @@ mod tests {
             &world,
         )
         .expect("条纵发射");
-        assert_eq!(state.translation, Vec3::new(12.5, -55.5, 20.5));
+        assert_eq!(state.translation, Vec3::new(12.0, -56.0, 20.0));
         let shape = desc.shape().expect("复合体带形状");
         assert_eq!(shape.cells().len(), 6);
         assert_eq!(desc.half_size, COMPOUND_HALF_SIZE);
@@ -463,18 +465,19 @@ mod tests {
         )
         .expect("低头发射");
         // 最小点积格:o=(0,2,0)(v=2),o·d̂ = 2×(−0.866) = −1.732;
-        // d = 2 + 1.732 = 3.732。cam + d̂·d = (11.866, −53.232, 20)
-        // → 格 (11, −54, 20)(floor),格心 (11.5, −53.5, 20.5)。
-        // 平视参照(同相机,dir=+x):d = 2 → 格 (12, −50, 20)——低头把
-        // 出生点沿视线推远并下沉,竖向格不怼在相机脸上。
-        assert_eq!(
-            state.translation,
-            Vec3::new(11.5, -53.5, 20.5),
-            "低头 d 抬高后的原点格心(d = 3.732)"
+        // d = 2 + 1.732 = 3.732。translation = cam + d̂·d(连续,W02-2)
+        //   = (10 + 0.5×3.732, −50 − 0.866×3.732, 20) ≈ (11.866, −53.232, 20)。
+        assert!(
+            (state.translation.x - 11.866).abs() < 1e-3
+                && (state.translation.y - (-53.232)).abs() < 1e-3
+                && (state.translation.z - 20.0).abs() < 1e-3,
+            "低头 d 抬高后的连续出生点,实得 {}",
+            state.translation
         );
     }
 
-    /// 拒绝:基岩材料;出生格心在实心里(在发射路径上放一格土)。
+    /// 拒绝:基岩材料;出生格心在实心里(W02-2:非整数出生点,按各格格心
+    /// floor 查块)。
     #[test]
     fn launch_rejections() {
         // 基岩。
@@ -491,7 +494,52 @@ mod tests {
         assert!(got.is_err(), "基岩拒绝");
         assert!(got.unwrap_err().contains("bedrock"), "拒绝文案含 bedrock");
 
-        // 出生格心在实心里:相机前 2 m 处的格 (12,−56,20) 放 dirt。
+        // 非整数出生点冲突(W02-2):相机 (10.3,−55.6,20.2) 平视 +x →
+        // translation = (12.3,−55.6,20.2),格心所在格 floor = (12,−56,20);
+        // 在该格放土 → 拒绝,文案含 (12,-56,20)。
+        let mut world = FakeVoxelWorld::empty();
+        world.set_block(12, -56, 20, DIRT);
+        let got = launch_request(
+            LaunchShape::Single,
+            crate::tools::Material::Dirt,
+            20.0,
+            Vec3::new(10.3, -55.6, 20.2),
+            flat_dir(),
+            0.0,
+            &world,
+        );
+        assert!(
+            got.is_err(),
+            "出生格 floor(12.3,−55.6,20.2)=(12,−56,20) 实心 → 拒绝"
+        );
+        assert!(
+            got.unwrap_err().contains("(12,-56,20)"),
+            "拒绝文案含冲突格坐标"
+        );
+
+        // 同一出生点,土挪到 (13,−56,20)(下一格,非出生格)→ 放行。
+        let mut world = FakeVoxelWorld::empty();
+        world.set_block(13, -56, 20, DIRT);
+        let (state, _) = launch_request(
+            LaunchShape::Single,
+            crate::tools::Material::Dirt,
+            20.0,
+            Vec3::new(10.3, -55.6, 20.2),
+            flat_dir(),
+            0.0,
+            &world,
+        )
+        .expect("冲突格不在出生格 → 放行");
+        assert!(
+            (state.translation.x - 12.3).abs() < 1e-5
+                && (state.translation.y - (-55.6)).abs() < 1e-5
+                && (state.translation.z - 20.2).abs() < 1e-5,
+            "连续出生点 (12.3,−55.6,20.2),实得 {}",
+            state.translation
+        );
+
+        // 整数出生点(W02-2 前的旧用例口径,期望改连续值):格 (12,−56,20)
+        // 放土、出生点恰 (12,−56,20) → 同样拒绝。
         let mut world = FakeVoxelWorld::empty();
         world.set_block(12, -56, 20, DIRT);
         let got = launch_request(
@@ -503,13 +551,9 @@ mod tests {
             0.0,
             &world,
         );
-        assert!(got.is_err());
-        assert!(
-            got.unwrap_err().contains("(12,-56,20)"),
-            "拒绝文案含冲突格坐标"
-        );
+        assert!(got.is_err(), "整数出生点恰在实心格 → 拒绝");
 
-        // 未装载(None)不算实心:同一位置改成未装载 chunk,放行。
+        // 未装载(None)不算实心:同一位置在未装载 chunk,放行。
         let unloaded = FakeVoxelWorld::empty();
         let (state, _) = launch_request(
             LaunchShape::Single,
@@ -521,7 +565,41 @@ mod tests {
             &unloaded,
         )
         .expect("None 不算实心");
-        assert_eq!(state.translation, Vec3::new(12.5, -55.5, 20.5));
+        assert_eq!(state.translation, Vec3::new(12.0, -56.0, 20.0));
+    }
+
+    /// W02-2 补充(AC-W3):水平斜视抬高 d——yaw = −30°、pitch = 0,发
+    /// 6 格条·横。w 取整为 +x、u = +z,d̂ = (0.866, 0, −0.5);u = 5 那格
+    /// o = (0,0,5),o·d̂ = −2.5 → d = 4.5(只靠水平分量触发,抓"只看 y
+    /// 分量"的实现错误)。
+    #[test]
+    fn launch_yaw_diagonal_raises_d() {
+        let world = FakeVoxelWorld::empty();
+        let cam = Vec3::new(10.0, -56.0, 20.0);
+        let dir = Vec3::new(
+            (-30.0_f32).to_radians().cos(),
+            0.0,
+            (-30.0_f32).to_radians().sin(),
+        );
+        let (state, _) = launch_request(
+            LaunchShape::BarCross,
+            crate::tools::Material::Dirt,
+            20.0,
+            cam,
+            dir,
+            -30.0,
+            &world,
+        )
+        .expect("斜视发射");
+        // d = 4.5:translation = cam + d̂·4.5
+        //   = (10 + 0.866×4.5, −56, 20 − 0.5×4.5) ≈ (13.897, −56, 17.75)。
+        assert!(
+            (state.translation.x - (10.0 + 0.866_025_4 * 4.5)).abs() < 1e-3
+                && (state.translation.y - (-56.0)).abs() < 1e-5
+                && (state.translation.z - (20.0 - 0.5 * 4.5)).abs() < 1e-5,
+            "yaw=−30° 条·横 d=4.5 的连续出生点,实得 {}",
+            state.translation
+        );
     }
 
     // ---- 蓄力状态机(AC-W3)----
@@ -567,6 +645,39 @@ mod tests {
         c.cancel();
         assert_eq!(c.release(20.0), 20.0, "取消后点按预设");
         assert!(!c.holding());
+    }
+
+    /// W02-2 补充(AC-W3):蓄力阈值边界——`update(0.25)` 恰满 0.25 s
+    /// 即进入蓄力(§3.2"按住满 0.25 s 进入蓄力")→ 速度 5;`update(0.249)`
+    /// 仍点按 → 预设 20。抓 `<` 误写成 `<=` 的实现。
+    #[test]
+    fn charge_threshold_boundary() {
+        // 恰 0.25 s:进入蓄力,速度 = clamp(5 + 25×0) = 5。
+        let mut c = ChargeState::default();
+        c.press();
+        c.update(0.25);
+        let speed = c.release(20.0);
+        assert!(
+            (speed - 5.0).abs() < 1e-4,
+            "恰满 0.25 s = 蓄力起点 5,实得 {speed}"
+        );
+
+        // 0.249 s:仍点按 = 预设 20。
+        let mut c = ChargeState::default();
+        c.press();
+        c.update(0.249);
+        assert_eq!(c.release(20.0), 20.0, "0.249 s 仍点按 = 预设");
+
+        // display_speed 同口径:恰 0.25 s 起显示(条只在蓄力阶段出现)。
+        let mut c = ChargeState::default();
+        c.press();
+        c.update(0.249);
+        assert_eq!(c.display_speed(), None, "0.249 s 无速度条");
+        c.update(0.001);
+        assert!(
+            (c.display_speed().expect("恰 0.25 s 有速度条") - 5.0).abs() < 1e-4,
+            "恰 0.25 s 速度条显示 5"
+        );
     }
 
     /// 帧切分无关:同一总时长(1.25 s),60 等分 vs 7 等分 vs 不等长序列,

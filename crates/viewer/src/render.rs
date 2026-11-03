@@ -759,39 +759,49 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             }
         }
         // F:按下边沿 press;按住逐帧 update;松开边沿 release → 发射
-        // (断连后不发,蓄力也不动;拒绝时蓄力结束、提示 3 秒)。
-        let f_down = is_key_down(KeyCode::F) && disconnected.is_none();
-        if f_down && !f_down_prev {
-            charge.press();
-        }
-        if f_down {
-            charge.update(dt);
-        }
-        if f_down_prev && !f_down {
-            let speed = charge.release(tools.preset_speed);
-            let o = camera.position;
-            let d = camera.forward();
-            let got = launch_request(
-                tools.launch_shape,
-                tools.material,
-                speed,
-                TVec3::new(o.x, o.y, o.z),
-                TVec3::new(d.x, d.y, d.z),
-                camera.yaw.to_degrees(),
-                &world.state,
-            );
-            match got {
-                Ok((state, desc)) => {
-                    tools.last_shot = Some((tools.launch_shape, tools.material.name(), speed));
-                    control.spawn(state, desc);
-                }
-                Err(reason) => {
-                    charge.cancel(); // 拒绝:蓄力结束,不发命令(§3.2)
-                    tools.reject(reason);
+        // (拒绝时蓄力结束、提示 3 秒)。断连(W02-2 返修 3):f_down 因
+        // `disconnected.is_none()` 变 false 会误走松开分支——先判断连,
+        // charge.cancel() 收掉按住状态,不走发射。
+        let f_raw_down = is_key_down(KeyCode::F);
+        if disconnected.is_some() && f_raw_down {
+            if f_down_prev {
+                charge.cancel();
+            }
+            f_down_prev = false;
+        } else {
+            let f_down = f_raw_down;
+            if f_down && !f_down_prev {
+                charge.press();
+            }
+            if f_down {
+                charge.update(dt);
+            }
+            if f_down_prev && !f_down {
+                let speed = charge.release(tools.preset_speed);
+                let o = camera.position;
+                let d = camera.forward();
+                let got = launch_request(
+                    tools.launch_shape,
+                    tools.material,
+                    speed,
+                    TVec3::new(o.x, o.y, o.z),
+                    TVec3::new(d.x, d.y, d.z),
+                    camera.yaw.to_degrees(),
+                    &world.state,
+                );
+                match got {
+                    Ok((state, desc)) => {
+                        tools.last_shot = Some((tools.launch_shape, tools.material.name(), speed));
+                        control.spawn(state, desc);
+                    }
+                    Err(reason) => {
+                        charge.cancel(); // 拒绝:蓄力结束,不发命令(§3.2)
+                        tools.reject(reason);
+                    }
                 }
             }
+            f_down_prev = f_down;
         }
-        f_down_prev = f_down;
         // B:准星前方生成动态立方体(落下→静止→凝固成地形色;ACV4 ③④)。
         // 连按散布:同点重叠的刚体被求解器永久抖动、永不满足凝固判据
         // (实跑反馈的蓝方块存留根因之一)——按序号在 5×5 网格散开出生点。
