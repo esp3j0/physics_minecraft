@@ -126,6 +126,8 @@ pub struct StageDriver {
     wait_start: Option<u64>,
     /// 本帧的超时提示(`wait_until` 超时;主循环读走)。
     timeout_notice: Option<String>,
+    /// 按键拒绝提示(W05-2:Building 时按 `K`;主循环读走)。
+    reject_notice: Option<String>,
     /// 场景含 `[server]` 表的提示(创建即置位;主循环读走)。
     server_notice: Option<String>,
 }
@@ -149,6 +151,7 @@ impl StageDriver {
             fill: None,
             wait_start: None,
             timeout_notice: None,
+            reject_notice: None,
             server_notice,
         }
     }
@@ -161,6 +164,25 @@ impl StageDriver {
     /// 本帧的超时提示(`wait_until` 超时;取走一次性)。
     pub fn take_timeout_notice(&mut self) -> Option<String> {
         self.timeout_notice.take()
+    }
+
+    /// 按键拒绝提示(取走一次性;W05-2:布景搭建中按 `K` →
+    /// `stage still building, wait`,走调用方的 3 秒提示通道)。
+    pub fn take_reject_notice(&mut self) -> Option<String> {
+        self.reject_notice.take()
+    }
+
+    /// 相机覆写(W05-2):只在 `Building`(搭布景,含 `R` 之后的重放)时返回
+    /// `Some(布景位姿)`——render 据此每帧覆写飞行相机;`Playing` 时不覆写
+    /// (§3.6:K 播放跳过相机类步骤,相机留给用户——punch 的动作段带等待,
+    /// 播放持续数秒,锁死相机用户就看不到撞击);`Ready` / `Played` 同样
+    /// `None`(不夺回控制权)。
+    #[must_use]
+    pub fn camera_override(&self) -> Option<CameraPose> {
+        match self.phase {
+            StagePhase::Building => Some(self.camera),
+            StagePhase::Ready | StagePhase::Played | StagePhase::Playing { .. } => None,
+        }
     }
 
     /// 当前相机位姿。
@@ -206,12 +228,19 @@ impl StageDriver {
         self.wait_start = None;
     }
 
-    /// `K`:播放动作段。播放中再按无效(不发命令、不改状态);播完进
-    /// `Played`(主循环渲染 `action playback done`)。空动作段(materials 类)
-    /// 同样合法:一步即完,直接提示播完。
+    /// `K`:播放动作段。播放中再按无效(不发命令、不改状态);**布景搭建中
+    /// 按 `K` 同样无效**并置提示 `stage still building, wait`(W05-2:布景
+    /// 只搭一半就播放会撞上未完成的结构);播完进 `Played`(主循环渲染
+    /// `action playback done`)。`Played` 后再按重放动作段(保持现状)。
+    /// 空动作段(materials 类)同样合法:一步即完,直接提示播完。
     pub fn play(&mut self) {
-        if matches!(self.phase, StagePhase::Playing { .. }) {
-            return; // 播放中再按 K 无效
+        match self.phase {
+            StagePhase::Playing { .. } => return, // 播放中再按 K 无效
+            StagePhase::Building => {
+                self.reject_notice = Some("stage still building, wait".to_owned());
+                return;
+            }
+            StagePhase::Ready | StagePhase::Played => {}
         }
         self.segment = Segment::Action;
         self.cursor = 0;

@@ -260,6 +260,118 @@ fn camera_follows_staging_and_k_skips_action_cameras() {
     assert!(driver.status_line().contains("action playback done"));
 }
 
+/// 相机覆写纯函数(W05-2):只在 `Building`(搭布景,含 R 重放)时返回
+/// `Some(布景位姿)`;`Playing` 返回 `None`(§3.6:K 播放相机留给用户——
+/// punch 动作段带等待,锁死相机用户看不到撞击);`Ready` / `Played` 同样
+/// `None`;`rebuild()` 后回 `Building` 重新返回 `Some`。
+#[test]
+fn camera_override_only_while_building() {
+    let text = scenario_text(&[
+        "camera = { pos = [1.0, 2.0, 3.0], yaw = 0.0, pitch = 0.0 }",
+        "wait_ticks = { n = 5 }",
+        "spawn = { at = [0.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+        "wait_ticks = { n = 5 }",
+    ]);
+    // wait_ticks 不是动作步骤 → 布景 = [0, 1],动作 = [2, 3]。
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let world = StubWorld::empty();
+
+    // Building(刚创建,布景相机步骤尚未跑):Some(初始位姿)。
+    assert_eq!(
+        driver.camera_override(),
+        Some(pose()),
+        "Building 时覆写相机"
+    );
+
+    // 布景段等待中(camera 步骤已跑 → 位姿已更新,仍 Some)。
+    let _ = driver.frame(0.016, 0, &world);
+    assert_eq!(
+        driver.camera_override().map(|c| c.pos),
+        Some(Vec3::new(1.0, 2.0, 3.0)),
+        "Building 等待中仍覆写,且位姿是布景相机"
+    );
+    let _ = driver.frame(0.016, 5, &world);
+    assert_eq!(driver.phase(), StagePhase::Ready);
+    assert_eq!(driver.camera_override(), None, "Ready 不覆写");
+
+    // Playing:None(动作段的等待步骤播放中,用户可自由转视角)。
+    driver.play();
+    assert!(
+        matches!(driver.phase(), StagePhase::Playing { .. }),
+        "动作段有等待,进入 Playing"
+    );
+    assert_eq!(driver.camera_override(), None, "Playing 不覆写");
+
+    // Played:None(动作段 = spawn + wait_ticks 5:tick 10 到点播完)。
+    let _ = driver.frame(0.016, 5, &world); // spawn 当帧发出,wait_ticks 起点 = 5
+    let _ = driver.frame(0.016, 10, &world); // 10 ≥ 5 + 5 → 播完
+    assert_eq!(driver.phase(), StagePhase::Played);
+    assert_eq!(driver.camera_override(), None, "Played 不覆写");
+
+    // R → 重新 Building:重新 Some(布景位姿)。
+    driver.rebuild(&world, &mut Vec::new());
+    assert_eq!(driver.phase(), StagePhase::Building);
+    assert_eq!(
+        driver.camera_override().map(|c| c.pos),
+        Some(Vec3::new(1.0, 2.0, 3.0)),
+        "R 后重放布景,相机覆写恢复(回布景位姿)"
+    );
+}
+
+/// Building 时按 `K`(W05-2):无效——phase 与 cursor 不变、不产生命令,
+/// 并给出提示 `stage still building, wait`(ASCII);布景搭完进 Ready 后
+/// `play()` 正常进入 Playing。
+#[test]
+fn play_during_building_is_rejected_with_notice() {
+    let text = scenario_text(&[
+        "wait_ticks = { n = 5 }",
+        "spawn = { at = [0.0, -59.0, 0.0], count = 1, velocity = [1.0, 0.0, 0.0] }",
+    ]);
+    // 布景 = [0](wait_ticks 等待中),动作 = [1]。
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let world = StubWorld::empty();
+    let _ = driver.frame(0.016, 0, &world);
+    assert_eq!(
+        driver.phase(),
+        StagePhase::Building,
+        "wait_ticks 5 拍等待中"
+    );
+
+    // Building 中按 K:拒绝 + 提示,状态不变。
+    driver.play();
+    assert_eq!(
+        driver.phase(),
+        StagePhase::Building,
+        "Building 按 K 不切播放"
+    );
+    let out = driver.frame(0.016, 0, &world);
+    assert!(out.is_empty(), "Building 按 K 不产生命令");
+    let notice = driver.take_reject_notice().expect("Building 按 K 要给提示");
+    assert_eq!(notice, "stage still building, wait");
+    assert!(notice.is_ascii());
+    assert!(driver.take_reject_notice().is_none(), "提示取走一次性");
+
+    // cursor 不变:布景段等待仍在同一步(camera() 仍为初始位姿,佐证没有
+    // 前进过任何 camera 步骤)。
+    assert_eq!(
+        driver.camera(),
+        pose(),
+        "cursor 未前进(无 camera 步骤被跑过)"
+    );
+
+    // 布景搭完 → Ready:play() 正常生效。
+    let _ = driver.frame(0.016, 5, &world);
+    assert_eq!(driver.phase(), StagePhase::Ready);
+    driver.play();
+    assert!(
+        matches!(driver.phase(), StagePhase::Playing { .. }),
+        "Ready 按 K 正常播放"
+    );
+    let out = driver.frame(0.016, 5, &world);
+    assert_eq!(out.len(), 1, "Ready 后 K 发出动作段 spawn");
+    assert_eq!(driver.phase(), StagePhase::Played);
+}
+
 /// `R`:打桩世界 3 个活实体,按 R 后先发 3 条 RemoveEntity(按 EntityId 升序),
 /// 再重放布景(相机回到布景位姿由布景段 camera 步骤恢复;AC-W13)。
 #[test]

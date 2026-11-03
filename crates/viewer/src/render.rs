@@ -34,9 +34,9 @@ use crate::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
 };
 use crate::tools::{
-    ChargeState, Hit, PanelColor, PanelState, Placeable, StageDriver, StagePhase, ToolAction,
-    ToolState, adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request,
-    orientation_from_yaw, panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
+    ChargeState, Hit, PanelColor, PanelState, Placeable, StageDriver, ToolAction, ToolState,
+    adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request, orientation_from_yaw,
+    panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -769,6 +769,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             if let Some(notice) = driver.take_timeout_notice() {
                 tools.reject(notice);
             }
+            if let Some(notice) = driver.take_reject_notice() {
+                tools.reject(notice);
+            }
             let out = driver.frame(dt, world.state.tick(), &world.state);
             for entry in out {
                 match entry {
@@ -780,13 +783,12 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     }
                 }
             }
-            // 布景相机跟随(driver 每帧回布景位姿;Building/Playing 时覆写
-            // 用户飞行,Ready/Played 后不夺回控制权)。
-            if matches!(
-                driver.phase(),
-                StagePhase::Building | StagePhase::Playing { .. }
-            ) {
-                camera.set_from_pose(&driver.camera());
+            // 布景相机跟随(W05-2):只在 Building(搭布景,含 R 重放)时
+            // 覆写用户飞行;Playing 时相机留给用户(§3.6,K 播放跳过相机类
+            // 步骤——punch 动作段带等待,锁死相机用户看不到撞击);Ready /
+            // Played 不夺回控制权。判定收在 driver 的纯函数里,render 只管调用。
+            if let Some(pose) = driver.camera_override() {
+                camera.set_from_pose(&pose);
             }
         }
 
