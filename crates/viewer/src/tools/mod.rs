@@ -63,14 +63,14 @@ impl Material {
         }
     }
 
-    /// 中文名(HUD / 提示)。
+    /// 英文名(HUD / 提示;macroquad 位图字体不含 CJK,交互显示一律 ASCII)。
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
-            Self::Dirt => "土",
-            Self::Stone => "石",
-            Self::Sand => "沙",
-            Self::Bedrock => "基岩",
+            Self::Dirt => "dirt",
+            Self::Stone => "stone",
+            Self::Sand => "sand",
+            Self::Bedrock => "bedrock",
         }
     }
 }
@@ -139,20 +139,21 @@ pub fn toggle_help(state: &mut ToolState) {
     state.help_shown = !state.help_shown;
 }
 
-/// 帮助表(REQ-011 §3.1 全按键;H 显示。本单元未接的键注明所属单元)。
+/// 帮助表(REQ-011 §3.1 全按键;H 显示;ASCII 英文——macroquad 位图字体
+/// 不含 CJK。本单元未接的键标 `(todo)` + 所属单元)。
 #[must_use]
 pub fn help_lines() -> Vec<&'static str> {
     vec![
-        "WASD+鼠标 飞行  Shift/Ctrl 升降  Space 相机耦合  M 释放/锁定鼠标",
-        "1-4 材料(土/石/沙/基岩)  左键 拆除  右键 放置(单方块/预制结构)",
-        "T 切换放置物  H 帮助  F 发射/蓄力(W02)  E 发射形状(W02)",
-        "滚轮 发射速度(W02)  F3 调试面板(W04)  C 计数清零(W04)",
-        "R 重建布景 / K 播放动作(W05)  B 生成立方体  X 爆炸",
+        "WASD+mouse fly  Shift/Ctrl up/down  Space couple  M grab/release mouse",
+        "1-4 material(dirt/stone/sand/bedrock)  LMB dig  RMB place(single/prefab)",
+        "T cycle placeable  H help  F launch/charge(todo W02)  E shape(todo W02)",
+        "wheel speed(todo W02)  F3 debug panel(todo W04)  C reset counters(todo W04)",
+        "R rebuild / K play(todo W05)  B spawn cube  X blast",
     ]
 }
 
 /// HUD 工具行(§3.5.3 第 1 条的临时版,W04 并入调试面板):材料、放置物、
-/// 目标格坐标与方块名(无目标 "—")。
+/// 目标格坐标与方块名(无目标 "-";ASCII 英文,理由同帮助表)。
 #[must_use]
 pub fn hud_tool_line(
     state: &ToolState,
@@ -160,7 +161,7 @@ pub fn hud_tool_line(
     world: &dyn crate::script::WorldQuery,
 ) -> String {
     let placeable = match state.placeable {
-        Placeable::SingleBlock => "单方块".to_owned(),
+        Placeable::SingleBlock => "single block".to_owned(),
         Placeable::Prefab(p) => p.name().to_owned(),
     };
     let target = match target {
@@ -174,10 +175,10 @@ pub fn hud_tool_line(
                 hit.block_pos.x, hit.block_pos.y, hit.block_pos.z, name
             )
         }
-        None => "—".to_owned(),
+        None => "-".to_owned(),
     };
     format!(
-        "工具:材料 {} | 放置物 {} | 目标 {}",
+        "tool: material {} | placeable {} | target {}",
         state.material.name(),
         placeable,
         target
@@ -230,11 +231,11 @@ pub fn preview_outline(
     }
 }
 
-/// 拒绝提示文案(§3.5.3 第 5 条的原因;集中在此)。
+/// 拒绝提示文案(§3.5.3 第 5 条的原因;集中在此;ASCII 英文,理由同帮助表)。
 pub mod notices {
-    pub const NO_TARGET: &str = "无目标";
-    pub const OUT_OF_WORLD: &str = "结构越界,未放置";
-    pub const BEDROCK_LAUNCH: &str = "基岩不可发射(W02)";
+    pub const NO_TARGET: &str = "no target";
+    pub const OUT_OF_WORLD: &str = "prefab out of world, not placed";
+    pub const BEDROCK_LAUNCH: &str = "bedrock cannot be launched (todo W02)";
 }
 
 #[cfg(test)]

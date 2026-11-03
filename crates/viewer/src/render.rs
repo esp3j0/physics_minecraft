@@ -845,7 +845,19 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         for (i, line) in lines.iter().enumerate() {
             draw_text(line, 12.0, 20.0 + i as f32 * 20.0, 18.0, WHITE);
         }
-        // REQ-011 W01:工具行(HUD 第 5 行;临时,W04 并入调试面板)。
+        draw_text(
+            if coupled {
+                "coupled: ON (Space to toggle)"
+            } else {
+                "coupled: OFF (Space to toggle)"
+            },
+            12.0,
+            104.0,
+            16.0,
+            YELLOW,
+        );
+        // REQ-011 W01:工具行(HUD 第 6 行;临时,W04 并入调试面板;
+        // ASCII 英文——macroquad 位图字体不含 CJK,返修 W01-2)。
         let tool_line = hud_tool_line(&tools, target.as_ref(), &world.state);
         draw_text(&tool_line, 12.0, 122.0, 16.0, WHITE);
         // 拒绝提示(3 秒过期;工具状态逐帧计时)。
@@ -859,26 +871,18 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
             }
         }
         draw_text(
-            if coupled {
-                "coupled: ON(Space 切换)"
-            } else {
-                "coupled: OFF(Space 切换)"
-            },
-            12.0,
-            104.0,
-            16.0,
-            YELLOW,
-        );
-        draw_text(
-            "WASD+鼠标飞行 Shift/Ctrl 升降 | B 生成立方体 X 爆炸 | M 释放/锁定鼠标",
+            "WASD+mouse fly Shift/Ctrl up/down | B spawn cube X blast | M grab/release mouse",
             12.0,
             screen_height() - 12.0,
             16.0,
             DARKGRAY,
         );
+        // 断连提示放屏幕中部(W01-2:原先 y=128 与工具行 y=122 重叠;中部
+        // 独立带,不与任何 HUD 行重叠,断连 3 s 宽限期里足够醒目)。
         if let Some(reason) = &disconnected {
-            let text = format!("已断连:{reason}(窗口将关闭)");
-            draw_text(&text, 12.0, 128.0, 18.0, YELLOW);
+            let text = format!("disconnected: {reason} (window will close)");
+            let y = screen_height() * 0.5;
+            draw_text(&text, 12.0, y, 18.0, YELLOW);
         }
 
         // 断连宽限后退出(让用户看到提示;Goodbye 后服务器 Bye/EOF 亦入此)。

@@ -67,14 +67,14 @@ impl Prefab {
         }
     }
 
-    /// 中文名(帮助 / HUD / 提示用)。
+    /// 英文名(HUD / 帮助 / 拒绝提示;macroquad 位图字体不含 CJK)。
     pub fn name(self) -> &'static str {
         match self {
-            Self::DirtWall => "土墙",
-            Self::StonePillar => "石柱",
-            Self::StoneBridge => "石桥",
-            Self::DirtLintel => "土门楣门框",
-            Self::StoneCantilever => "石 7 字",
+            Self::DirtWall => "dirt wall",
+            Self::StonePillar => "stone pillar",
+            Self::StoneBridge => "stone bridge",
+            Self::DirtLintel => "dirt lintel",
+            Self::StoneCantilever => "stone 7-shape",
         }
     }
 }

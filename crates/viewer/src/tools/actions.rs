@@ -75,7 +75,7 @@ pub fn place(
         Placeable::SingleBlock => {
             if pos.y < types::WORLD_Y_MIN || pos.y > types::WORLD_Y_MAX {
                 return ToolAction::Rejected(format!(
-                    "放置格 ({},{},{}) 在世界 y 范围外,未放置",
+                    "place pos ({},{},{}) out of world y range, not placed",
                     pos.x, pos.y, pos.z
                 ));
             }
@@ -83,7 +83,7 @@ pub fn place(
                 && !existing.is_air()
             {
                 return ToolAction::Rejected(format!(
-                    "放置格 ({},{},{}) 已有方块,未放置",
+                    "place pos ({},{},{}) occupied, not placed",
                     pos.x, pos.y, pos.z
                 ));
             }
@@ -113,14 +113,15 @@ pub fn place(
     }
 }
 
-/// 越界拒绝文案(§3.5.3 第 5 条"结构越界")。
+/// 越界拒绝文案(§3.5.3 第 5 条"结构越界";ASCII 英文——macroquad 位图
+/// 字体不含 CJK,返修 W01-2)。
 fn out_of_world_message(prefab: Prefab, anchor: BlockPos, err: ExpandError) -> String {
     let detail = match err {
-        ExpandError::BelowWorld { y_min } => format!("最低格 y={y_min} 低于世界底"),
-        ExpandError::AboveWorld { y_max } => format!("最高格 y={y_max} 高于世界顶"),
+        ExpandError::BelowWorld { y_min } => format!("lowest cell y={y_min} below world bottom"),
+        ExpandError::AboveWorld { y_max } => format!("highest cell y={y_max} above world top"),
     };
     format!(
-        "{}越界(锚点 ({}, {}, {})):{}",
+        "{} out of world (anchor ({}, {}, {})): {}",
         prefab.name(),
         anchor.x,
         anchor.y,
@@ -218,7 +219,7 @@ mod tests {
         );
         assert_eq!(
             dig(None),
-            ToolAction::Rejected("无目标".to_owned()),
+            ToolAction::Rejected("no target".to_owned()),
             "无目标拒绝"
         );
     }
@@ -269,8 +270,9 @@ mod tests {
         ));
     }
 
-    /// AC-W5:右键预制结构 = **一条批**(格数条 SetBlock);yaw 取整进格
-    /// 坐标;越界整构拒绝。
+    /// AC-W5:右键预制结构 = **一条批**,批内容**逐条等于 expand 输出**
+    /// (W01-2 返修 2:杀 `.take(n)` 截断变异);yaw 取整进格坐标;越界整构
+    /// 拒绝。覆盖石柱(yaw = 0°)与土墙(yaw = 90° 非零朝向)。
     #[test]
     fn place_prefab_is_single_batch() {
         let world = FakeWorld::superflat(&[]);
@@ -285,26 +287,74 @@ mod tests {
         let ToolAction::Batch(commands) = action else {
             panic!("预制结构必须是一条批,实为 {action:?}");
         };
-        assert_eq!(commands.len(), 4, "石柱 4 格");
-        let want: Vec<SimCommand> = (0..=3)
-            .map(|v| SimCommand::SetBlock {
-                pos: BlockPos::new(3, TOP + 1 + v, 0),
-                block: STONE,
-            })
+        // 批内容逐条 = expand 输出(位置与方块都比;截断/乱序/漏格在此变红)。
+        let want_cells = expand(
+            crate::tools::Prefab::StonePillar,
+            BlockPos::new(0, TOP + 1, 0),
+            orientation_from_yaw(0.0),
+            types::WORLD_Y_MIN,
+            types::WORLD_Y_MAX,
+        )
+        .expect("石柱展开");
+        assert_eq!(commands.len(), want_cells.len(), "批条数 = 展开格数");
+        let want: Vec<SimCommand> = want_cells
+            .into_iter()
+            .map(|(pos, block)| SimCommand::SetBlock { pos, block })
             .collect();
-        assert_eq!(commands, want, "柱在 x=3(w=3·+x),z=0(u=0),v=0..3");
+        assert_eq!(commands, want, "石柱批逐条 = expand 输出(x=3、z=0、v=0..3)");
 
-        // 越界:目标格贴世界顶、面 Top → 土墙锚点(命中面外侧格)的顶格
-        // (v=4)越出世界顶,整构拒绝。
+        // 土墙 + 非 yaw = 0 朝向(yaw = 90°:w=+z、u=−x):42 格基岩脚 + 土墙身。
         let wall_state = ToolState {
             placeable: Placeable::Prefab(crate::tools::Prefab::DirtWall),
             ..ToolState::default()
         };
+        let action = place(&wall_state, Some(&hit), 90.0, &world);
+        let ToolAction::Batch(commands) = action else {
+            panic!("土墙必须是一条批,实为 {action:?}");
+        };
+        let want_cells = expand(
+            crate::tools::Prefab::DirtWall,
+            BlockPos::new(0, TOP + 1, 0),
+            orientation_from_yaw(90.0),
+            types::WORLD_Y_MIN,
+            types::WORLD_Y_MAX,
+        )
+        .expect("土墙展开");
+        assert_eq!(want_cells.len(), 42, "土墙 42 格");
+        assert_eq!(
+            commands.len(),
+            want_cells.len(),
+            "批条数 = 展开格数(42;.take(40) 截断在此变红)"
+        );
+        let want: Vec<SimCommand> = want_cells
+            .into_iter()
+            .map(|(pos, block)| SimCommand::SetBlock { pos, block })
+            .collect();
+        assert_eq!(commands, want, "土墙批(yaw=90°)逐条 = expand 输出");
+        // 抽查朝向语义:w=+z → z 恒 = 锚 z + 3;u=−x → x = 锚 x − u(u=+3
+        // → x=−3 最小,升序在最前;基岩脚 y 最低)。升序首格 = (−3, TOP, 3)。
+        assert_eq!(
+            commands[0],
+            SimCommand::SetBlock {
+                pos: BlockPos::new(-3, TOP, 3),
+                block: voxel::builtin::BEDROCK,
+            },
+            "升序首格 = 墙脚(x=−3 由 u=+3 反转,y=TOP 为脚,z=3)"
+        );
+        assert!(
+            commands
+                .iter()
+                .all(|c| matches!(c, SimCommand::SetBlock { pos, .. } if pos.z == 3)),
+            "yaw=90° 的 w=+z:全部格 z = 锚 z + 3 = 3"
+        );
+
+        // 越界:目标格贴世界顶、面 Top → 土墙锚点(命中面外侧格)的顶格
+        // (v=4)越出世界顶,整构拒绝。
         let hit_top = hit_at(0, types::WORLD_Y_MAX - 3, 0, DIRT, FaceDir::Top);
         let rejected = place(&wall_state, Some(&hit_top), 0.0, &world);
         assert!(matches!(rejected, ToolAction::Rejected(_)), "整构拒绝");
         if let ToolAction::Rejected(msg) = rejected {
-            assert!(msg.contains("土墙"), "拒绝文案含结构名:{msg}");
+            assert!(msg.contains("dirt wall"), "拒绝文案含结构英文名:{msg}");
         }
     }
 

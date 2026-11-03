@@ -88,18 +88,37 @@ fn toggle_help_flips() {
     assert!(!state.help_shown);
 }
 
-/// 帮助表列全 §3.1 按键(W01 未接的键注明单元)。
+/// 帮助表列全 §3.1 按键(ASCII 英文;W01 未接的键标 (todo) + 单元)。
 #[test]
 fn help_lines_cover_all_keys() {
     let joined = help_lines().join("\n");
     for key in [
-        "1-4", "左键", "右键", "T", "F", "E", "滚轮", "F3", "C", "R", "K", "H", "B", "X",
+        "1-4", "LMB", "RMB", "T ", "F ", "E ", "wheel", "F3", "C ", "R ", "K ", "H ", "B ", "X ",
     ] {
         assert!(joined.contains(key), "帮助表缺按键 {key}");
     }
+    // 未接的 7 个键(F/E/wheel/F3/C/R/K)全部带 (todo 标记(F/E 同行、
+    // R/K 同行各共用一处标记,故 6 处覆盖 7 键)。
+    let todo_count = joined.matches("(todo").count();
+    assert!(todo_count >= 6, "未接键须标 (todo),实有 {todo_count} 处");
+    for (key, line) in [
+        ("F", 2),
+        ("E", 2),
+        ("wheel", 3),
+        ("F3", 3),
+        ("C ", 3),
+        ("R ", 4),
+        ("K ", 4),
+    ] {
+        let l = help_lines()[line];
+        assert!(
+            l.contains(key) && l.contains("(todo"),
+            "键 {key} 所在行须带 (todo):{l}"
+        );
+    }
 }
 
-/// HUD 工具行:材料 / 放置物 / 目标(坐标 + 方块名),无目标 "—"。
+/// HUD 工具行:材料 / 放置物 / 目标(坐标 + 方块名),无目标 "-"(ASCII)。
 #[test]
 fn hud_tool_line_shows_material_placeable_target() {
     let world = OneChunkWorld::empty();
@@ -107,9 +126,9 @@ fn hud_tool_line_shows_material_placeable_target() {
 
     // 无目标。
     let line = hud_tool_line(&state, None, &world);
-    assert!(line.contains("材料 土"), "{line}");
-    assert!(line.contains("放置物 单方块"), "{line}");
-    assert!(line.contains("—"), "{line}");
+    assert!(line.contains("material dirt"), "{line}");
+    assert!(line.contains("placeable single block"), "{line}");
+    assert!(line.contains("target -"), "{line}");
 
     // 有目标:命中格 (5,−61,7) dirt(世界返回 AIR 只在非命中格——让
     // block_at 对命中格返回 dirt)。
@@ -127,8 +146,8 @@ fn hud_tool_line_shows_material_placeable_target() {
     state.material = Material::Stone;
     state.placeable = Placeable::Prefab(Prefab::StoneBridge);
     let line = hud_tool_line(&state, None, &world);
-    assert!(line.contains("材料 石"), "{line}");
-    assert!(line.contains("放置物 石桥"), "{line}");
+    assert!(line.contains("material stone"), "{line}");
+    assert!(line.contains("placeable stone bridge"), "{line}");
 }
 
 /// 轮廓预览与实际展开同一函数:格集合逐格相同(AC-W5"断言二者格集合相同")。
