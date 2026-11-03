@@ -88,7 +88,8 @@ fn toggle_help_flips() {
     assert!(!state.help_shown);
 }
 
-/// 帮助表列全 §3.1 按键(ASCII 英文;W01 未接的键标 (todo) + 单元)。
+/// 帮助表列全 §3.1 按键(ASCII 英文;W02 起已接键无 todo,未接键标
+/// (todo) + 单元)。
 #[test]
 fn help_lines_cover_all_keys() {
     let joined = help_lines().join("\n");
@@ -97,23 +98,22 @@ fn help_lines_cover_all_keys() {
     ] {
         assert!(joined.contains(key), "帮助表缺按键 {key}");
     }
-    // 未接的 7 个键(F/E/wheel/F3/C/R/K)全部带 (todo 标记(F/E 同行、
-    // R/K 同行各共用一处标记,故 6 处覆盖 7 键)。
+    // W02 后 F/E/wheel 已接,不得再带 todo;仍未接的 4 键(F3/C/R/K)
+    // 带 (todo(3 处标记覆盖 4 键,R/K 同行)。
     let todo_count = joined.matches("(todo").count();
-    assert!(todo_count >= 6, "未接键须标 (todo),实有 {todo_count} 处");
-    for (key, line) in [
-        ("F", 2),
-        ("E", 2),
-        ("wheel", 3),
-        ("F3", 3),
-        ("C ", 3),
-        ("R ", 4),
-        ("K ", 4),
-    ] {
+    assert_eq!(todo_count, 3, "W02 后仍带 (todo 的标记数");
+    for (key, line) in [("F ", 2), ("E ", 2), ("wheel", 2)] {
+        let l = help_lines()[line];
+        assert!(
+            l.contains(key) && !l.contains("(todo"),
+            "已接键 {key} 不带 todo:{l}"
+        );
+    }
+    for (key, line) in [("F3", 3), ("C ", 3), ("R ", 4), ("K ", 4)] {
         let l = help_lines()[line];
         assert!(
             l.contains(key) && l.contains("(todo"),
-            "键 {key} 所在行须带 (todo):{l}"
+            "未接键 {key} 须带 todo:{l}"
         );
     }
 }

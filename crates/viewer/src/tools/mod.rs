@@ -8,11 +8,17 @@
 //! [`ToolState`] 留字段。
 
 mod actions;
+mod launch;
 mod pick;
 mod prefab;
 
+pub mod tests_support;
+
 pub use actions::{PLACEABLE_CYCLE, ToolAction};
 pub use actions::{dig, place, select_material};
+pub use launch::{
+    ChargeState, LaunchShape, adjust_preset_speed, charge_speed, launch_request, speed_bar,
+};
 pub use pick::{Hit, pick};
 pub use prefab::{ExpandError, Orientation, Prefab, expand, orientation_from_yaw};
 
@@ -22,18 +28,20 @@ use voxel::builtin;
 /// 工具状态(REQ-011 §3.1;交互模式独有)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolState {
-    /// 当前材料(1–4 切;单方块放置用)。
+    /// 当前材料(1–4 切;单方块放置与发射用)。
     pub material: Material,
     /// 当前放置物(单方块或预制结构;T 循环)。
     pub placeable: Placeable,
-    /// 当前发射形状(W02 消费;本单元只存默认值)。
+    /// 当前发射形状(E 循环;W02)。
     pub launch_shape: LaunchShape,
-    /// 预设发射速度 m/s(滚轮 ±5,夹 5–55;W02 消费)。
+    /// 预设发射速度 m/s(滚轮 ±5,夹 5–55;W02)。
     pub preset_speed: f32,
     /// 按键帮助显示(H 切换)。
     pub help_shown: bool,
     /// 拒绝提示(消息 + 剩余秒数;逐帧 dt 累减,3 秒过期)。
     pub notice: Option<(String, f32)>,
+    /// 上一发(形状、材料名、实际速度;W02;HUD"上一发"显示)。
+    pub last_shot: Option<(LaunchShape, &'static str, f32)>,
 }
 
 /// 当前材料(REQ-011 §3.1:土 / 石 / 沙 / 基岩)。
@@ -83,16 +91,6 @@ pub enum Placeable {
     Prefab(Prefab),
 }
 
-/// 发射形状(W02 消费;REQ-011 §3.2 表,E 循环。本单元只存字段)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LaunchShape {
-    Single,
-    BeamLongitudinal,
-    BeamCross,
-    Plate2x2,
-    Block3x3x3,
-}
-
 /// 拒绝提示显示时长(秒;REQ-011 §3.5.3 第 5 条)。
 pub const NOTICE_SECS: f32 = 3.0;
 
@@ -102,9 +100,10 @@ impl Default for ToolState {
             material: Material::Dirt,
             placeable: Placeable::SingleBlock,
             launch_shape: LaunchShape::Single,
-            preset_speed: 20.0,
+            preset_speed: launch::SPEED_PRESET_DEFAULT,
             help_shown: false,
             notice: None,
+            last_shot: None,
         }
     }
 }
@@ -140,14 +139,14 @@ pub fn toggle_help(state: &mut ToolState) {
 }
 
 /// 帮助表(REQ-011 §3.1 全按键;H 显示;ASCII 英文——macroquad 位图字体
-/// 不含 CJK。本单元未接的键标 `(todo)` + 所属单元)。
+/// 不含 CJK。未接的键标 `(todo)` + 所属单元)。
 #[must_use]
 pub fn help_lines() -> Vec<&'static str> {
     vec![
         "WASD+mouse fly  Shift/Ctrl up/down  Space couple  M grab/release mouse",
         "1-4 material(dirt/stone/sand/bedrock)  LMB dig  RMB place(single/prefab)",
-        "T cycle placeable  H help  F launch/charge(todo W02)  E shape(todo W02)",
-        "wheel speed(todo W02)  F3 debug panel(todo W04)  C reset counters(todo W04)",
+        "T cycle placeable  H help  F launch/charge  E shape  wheel speed",
+        "F3 debug panel(todo W04)  C reset counters(todo W04)",
         "R rebuild / K play(todo W05)  B spawn cube  X blast",
     ]
 }
@@ -178,10 +177,17 @@ pub fn hud_tool_line(
         None => "-".to_owned(),
     };
     format!(
-        "tool: material {} | placeable {} | target {}",
+        "tool: material {} | placeable {} | shape {} | preset {} m/s | target {}{}",
         state.material.name(),
         placeable,
-        target
+        state.launch_shape.name(),
+        state.preset_speed as i32,
+        target,
+        match &state.last_shot {
+            Some((shape, mat, speed)) =>
+                format!(" | last {} {} {} m/s", shape.name(), mat, *speed as i32),
+            None => String::new(),
+        }
     )
 }
 
@@ -231,11 +237,12 @@ pub fn preview_outline(
     }
 }
 
-/// 拒绝提示文案(§3.5.3 第 5 条的原因;集中在此;ASCII 英文,理由同帮助表)。
+/// 拒绝提示文案(§3.5.3 第 5 条的原因;集中在此;ASCII 英文——macroquad
+/// 位图字体不含 CJK)。
 pub mod notices {
     pub const NO_TARGET: &str = "no target";
     pub const OUT_OF_WORLD: &str = "prefab out of world, not placed";
-    pub const BEDROCK_LAUNCH: &str = "bedrock cannot be launched (todo W02)";
+    pub const BEDROCK_LAUNCH: &str = "bedrock cannot be launched";
 }
 
 #[cfg(test)]

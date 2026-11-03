@@ -12,13 +12,13 @@ use macroquad::camera::{Camera3D, Projection, set_camera, set_default_camera};
 use macroquad::color::{BLUE, DARKGRAY, GRAY, ORANGE, RED, SKYBLUE, WHITE, YELLOW};
 use macroquad::input::{
     KeyCode, MouseButton, is_key_down, is_key_pressed, is_mouse_button_pressed,
-    mouse_delta_position, set_cursor_grab, show_mouse,
+    mouse_delta_position, mouse_wheel, set_cursor_grab, show_mouse,
 };
 use macroquad::math::vec3;
 use macroquad::models::{Mesh, draw_cube, draw_cube_wires, draw_mesh};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
-use macroquad::window::{clear_background, next_frame, screen_height};
+use macroquad::window::{clear_background, next_frame, screen_height, screen_width};
 use messaging::SimCommand;
 use types::glam::Vec3 as TVec3;
 use types::{BlockPos, ChunkPos, EntityDesc, EntityId, EntityState};
@@ -34,8 +34,9 @@ use crate::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, ScreenshotRequest,
 };
 use crate::tools::{
-    Hit, Placeable, ToolAction, ToolState, cycle_placeable, dig, help_lines, hud_tool_line,
-    orientation_from_yaw, pick, place, preview_outline, toggle_help,
+    ChargeState, Hit, Placeable, ToolAction, ToolState, adjust_preset_speed, cycle_placeable, dig,
+    help_lines, hud_tool_line, launch_request, orientation_from_yaw, pick, place, preview_outline,
+    speed_bar, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -680,6 +681,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
     let mut tools = ToolState::default();
     // 每帧拾取目标(线框高亮、HUD、左/右键共用;M 释放鼠标时仍显示)。
     let mut target: Option<Hit>;
+    // REQ-011 W02:F 蓄力状态机(按下/松开边沿跟踪 + 逐帧 dt)。
+    let mut charge = ChargeState::default();
+    let mut f_down_prev = false;
 
     loop {
         let dt = get_frame_time();
@@ -742,6 +746,52 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
                 apply_tool_action(action, &mut tools, &control);
             }
         }
+        // —— REQ-011 W02:发射(F 点按/蓄力、E 形状、滚轮预设速度)——
+        // E:循环切换形状(不受鼠标锁定影响;断连无妨,纯本地)。
+        if is_key_pressed(KeyCode::E) {
+            tools.launch_shape = tools.launch_shape.next();
+        }
+        // 滚轮:预设速度 ±5,一帧最多一档;鼠标释放(M)时不生效(§3.1)。
+        if mouse_grabbed {
+            let (_, wheel_y) = mouse_wheel();
+            if wheel_y != 0.0 {
+                tools.preset_speed = adjust_preset_speed(tools.preset_speed, wheel_y);
+            }
+        }
+        // F:按下边沿 press;按住逐帧 update;松开边沿 release → 发射
+        // (断连后不发,蓄力也不动;拒绝时蓄力结束、提示 3 秒)。
+        let f_down = is_key_down(KeyCode::F) && disconnected.is_none();
+        if f_down && !f_down_prev {
+            charge.press();
+        }
+        if f_down {
+            charge.update(dt);
+        }
+        if f_down_prev && !f_down {
+            let speed = charge.release(tools.preset_speed);
+            let o = camera.position;
+            let d = camera.forward();
+            let got = launch_request(
+                tools.launch_shape,
+                tools.material,
+                speed,
+                TVec3::new(o.x, o.y, o.z),
+                TVec3::new(d.x, d.y, d.z),
+                camera.yaw.to_degrees(),
+                &world.state,
+            );
+            match got {
+                Ok((state, desc)) => {
+                    tools.last_shot = Some((tools.launch_shape, tools.material.name(), speed));
+                    control.spawn(state, desc);
+                }
+                Err(reason) => {
+                    charge.cancel(); // 拒绝:蓄力结束,不发命令(§3.2)
+                    tools.reject(reason);
+                }
+            }
+        }
+        f_down_prev = f_down;
         // B:准星前方生成动态立方体(落下→静止→凝固成地形色;ACV4 ③④)。
         // 连按散布:同点重叠的刚体被求解器永久抖动、永不满足凝固判据
         // (实跑反馈的蓝方块存留根因之一)——按序号在 5×5 网格散开出生点。
@@ -860,6 +910,14 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8) {
         // ASCII 英文——macroquad 位图字体不含 CJK,返修 W01-2)。
         let tool_line = hud_tool_line(&tools, target.as_ref(), &world.state);
         draw_text(&tool_line, 12.0, 122.0, 16.0, WHITE);
+        // 蓄力条(W02;屏幕中央,蓄力阶段才显示;ASCII。中央 y 略偏上,
+        // 避开断连提示带)。
+        if let Some(speed) = charge.display_speed() {
+            let bar = speed_bar(speed);
+            let y = screen_height() * 0.5 - 40.0;
+            let x = screen_width() * 0.5 - 60.0;
+            draw_text(&bar, x, y, 18.0, YELLOW);
+        }
         // 拒绝提示(3 秒过期;工具状态逐帧计时)。
         if let Some((message, _)) = &tools.notice {
             draw_text(message, 12.0, 142.0, 16.0, ORANGE);

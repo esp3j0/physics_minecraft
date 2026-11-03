@@ -506,3 +506,81 @@ async fn viewer_client_clean_disconnect() {
 
     shutdown(h).await;
 }
+
+// ---------------------------------------------------------------------------
+// REQ-011 W02(e2e 自查,放行说明):发射一个 6 格土条打地面 → 服务器回
+// Spawned。launch_request(纯函数)组装 → control.spawn 发 C2S::Spawn →
+// ViewEvent::Spawned 回执;重力开(非 zero_g)让条砸到地面。
+// ---------------------------------------------------------------------------
+
+/// W02 自查:发射请求组装(6 格土条、20 m/s 朝 +x 平视)→ spawn →
+/// Spawned 回执;随后 Entities 事件带该复合体的服务器位置(条在飞行中)。
+#[tokio::test(start_paused = true)]
+async fn viewer_client_launch_bar_receives_spawned() {
+    let h = harness(base_config(), PumpConfig::default(), (2, 60), false).await;
+    let (events, control) = ViewerClient::spawn(h.addr, 2).expect("spawn 连真服务器");
+    wait_event(&events, 400, |e| matches!(e, ViewEvent::Welcome { .. }))
+        .await
+        .expect("Welcome 必达");
+    // 观察者就位(服务器据此 ensure 分片与装载 chunk;外部 spawn 只允许
+    // 已加载区域)+ 等装载落地。
+    control.move_observer(Vec3::new(8.0, -52.0, 8.0));
+    settle(60).await;
+
+    // 发射组装(viewer::tools 纯函数):相机 (8,−52,8) 平视 +x,20 m/s,
+    // 6 格土条(bar-long)。d = 2(所有 o·d̂ ≥ 0),原点格 (10,−52,8)。
+    // 发射点与 6 格延伸全在已装载 chunk (0,0)(x≤15、z≤15)。
+    let world = viewer::tools::tests_support::FakeVoxelWorld::new(&[ChunkPos::new(0, 0)], &[]);
+    let (state, desc) = viewer::tools::launch_request(
+        viewer::tools::LaunchShape::BarLongitudinal,
+        viewer::tools::Material::Dirt,
+        20.0,
+        Vec3::new(8.0, -52.0, 8.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        0.0,
+        &world,
+    )
+    .expect("空旷处发射必成");
+    assert_eq!(desc.shape().expect("6 格条带形状").cells().len(), 6);
+    control.spawn(state, desc);
+
+    // Spawned 回执(服务器分配 ID;external seq 从 1 起)。
+    let spawned = wait_event(&events, 400, |e| matches!(e, ViewEvent::Spawned { .. }))
+        .await
+        .expect("发射 → Spawned 回执必达");
+    match spawned {
+        ViewEvent::Spawned { entity } => {
+            assert_eq!(
+                entity,
+                EntityId::from_parts(0, 0),
+                "外部生成 ID(0 区,seq 0 起);"
+            );
+        }
+        other => unreachable!("谓词已限定 Spawned,实为 {other:?}"),
+    }
+
+    // 实体状态流:复合体出现(位置在发射点附近,重力下开始飞行/下落)。
+    let mut seen_pos = None;
+    for _ in 0..400 {
+        match next_event(&events, 200).await {
+            Some(ViewEvent::Entities { states, .. }) => {
+                if let Some((_, s)) = states
+                    .iter()
+                    .find(|(id, _)| *id == EntityId::from_parts(0, 0))
+                {
+                    seen_pos = Some(s.translation);
+                    break;
+                }
+            }
+            Some(_) => continue,
+            None => {}
+        }
+    }
+    let pos = seen_pos.expect("实体状态流必含发射的条");
+    assert!(
+        (pos.x - 10.5).abs() < 8.0 && (pos.y + 52.0).abs() < 8.0,
+        "条在发射点附近飞行,实得 {pos:?}"
+    );
+
+    shutdown(h).await;
+}
