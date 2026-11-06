@@ -39,7 +39,7 @@ use storage::worker::StoreWorker;
 use types::glam::{Quat, Vec3};
 use types::{
     BlockId, BlockPos, CompoundShape, DimensionId, EntityDesc, EntityId, EntityState, ShardId,
-    ShardPos, Tick, WorldId,
+    ShardPos, WorldId,
 };
 use voxel::{SimpleRegistry, builtin};
 
@@ -51,7 +51,8 @@ const MAX_TICKS: u64 = 1800;
 const STOP_P95_MS: f64 = 33.0;
 /// 每档重复次数(full;quick = 1)。
 const REPEATS: usize = 3;
-/// 落定判据的连续静拍数(醒体 0 且待转换 0)。
+/// 落定确认拍数:实体数归零须连续保持(碎裂原体的涌现分块是 N+1 生成,
+/// despawn 拍的计数恰为 0——单拍归零会在断块拍误判落定,漏掉整批分块)。
 const SETTLE_CALM_TICKS: u32 = 2;
 /// 空闲基线观测拍数。
 const IDLE_TICKS: u64 = 300;
@@ -287,23 +288,31 @@ pub(crate) struct Run {
     forced_landings: u64,
     /// 破坏方块累计(blasted + impacted + collapsed)。
     blocks_destroyed: u64,
-    /// 凝固写入方块累计(take_solidified 条数;实体落定的直接证据)。
-    solidified: u64,
+    /// 非空气凝固写入累计(R3:实体落定的直接证据;空气写入不计)。
+    solidified_solid: u64,
+    /// 空气写入累计(凝固/强制落地/破坏等 Emergent 写 air;R3 拆分)。
+    solidified_air: u64,
     /// 承载塌落生成的复合体累计。
     compounds_spawned: u64,
-    /// 落定所需拍数(醒体 0 且待转换 0 连续 [`SETTLE_CALM_TICKS`] 拍;
-    /// 窗口耗尽 = None)。
+    /// 落定所需拍数(全世界实体数 == 0,R4;窗口耗尽 = None)。
     settle_ticks: Option<u64>,
-    /// 实体数峰值拍的一次全量 EntityStates bincode 字节数
-    /// (S2C::EntityStates 全量口径,removed 空、full = true)。
+    /// 窗口耗尽仍残留的实体数(R4;落定 = 0)。
+    leftover_entities: usize,
+    /// 实体数峰值拍的一次全量 EntityStates bincode 字节数(全分片合并后
+    /// 编码,R5:与生产全量包同口径,removed 空、full = true)。
     peak_snapshot_bytes: usize,
     /// 该拍快照编码耗时(ms)。
     peak_snapshot_ms: f64,
-    /// 最近一拍遥测(静置判定用;不序列化)。
+    /// R2:最长连续超预算拍数(持久化字段;计算见 `max_over_budget_streak_fn`)。
+    max_over_budget_streak: u64,
+    /// R2:累计超预算量 Σ max(0, t − budget)(ms)(持久化字段)。
+    total_over_budget_ms: f64,
+    /// R2:最差连续 60 拍均值(ms)(持久化字段)。
+    worst_60_mean_ms: f64,
+    /// 最近一拍全世界实体数(R4 落定判据;measure_tick 内一次遍历顺带
+    /// 计出——count 另走一遍 entity_states 会在 debug 下成倍拖慢冒烟)。
     #[serde(skip)]
-    pub(crate) peak_last_awake: usize,
-    #[serde(skip)]
-    pub(crate) peak_last_load_pending: u64,
+    pub(crate) last_entity_count: usize,
 }
 
 impl Run {
@@ -322,6 +331,43 @@ impl Run {
             .cloned()
             .max_by(|a, b| a.partial_cmp(b).expect("tick_ms 非 NaN"))
             .unwrap_or(0.0)
+    }
+    /// R2:最长连续超预算拍数。
+    fn max_over_budget_streak_fn(&self) -> u64 {
+        let mut best = 0u64;
+        let mut cur = 0u64;
+        for t in &self.tick_ms {
+            if *t > BUDGET_MS {
+                cur += 1;
+                best = best.max(cur);
+            } else {
+                cur = 0;
+            }
+        }
+        best
+    }
+    /// R2:累计超预算量 Σ max(0, t − budget)(ms)。
+    fn total_over_budget_ms_fn(&self) -> f64 {
+        self.tick_ms.iter().map(|t| (t - BUDGET_MS).max(0.0)).sum()
+    }
+    /// R2:最差连续 60 拍均值(不足 60 拍时取全长窗口)。
+    fn worst_60_mean_ms_fn(&self) -> f64 {
+        const W: usize = 60;
+        if self.tick_ms.is_empty() {
+            return 0.0;
+        }
+        let n = self.tick_ms.len();
+        if n <= W {
+            return self.tick_ms.iter().sum::<f64>() / n as f64;
+        }
+        // 滑动窗口:先算首窗和,再逐拍增减(O(n))。
+        let mut sum: f64 = self.tick_ms[..W].iter().sum();
+        let mut worst = sum;
+        for i in W..n {
+            sum += self.tick_ms[i] - self.tick_ms[i - W];
+            worst = worst.max(sum);
+        }
+        worst / W as f64
     }
 }
 
@@ -403,6 +449,9 @@ struct Setup {
     expect_compounds: bool,
     /// 要求凝固写入累计 > 0(一切有下落实体的场景)。
     expect_solidified: bool,
+    /// R4 守恒断言:落定且非空气凝固 == 该值(loose=N、bridge=cells)。
+    expect_conservation: bool,
+    expect_conservation_cells: u64,
 }
 
 impl Default for Setup {
@@ -417,6 +466,8 @@ impl Default for Setup {
             expect_impacted: false,
             expect_compounds: false,
             expect_solidified: false,
+            expect_conservation: false,
+            expect_conservation_cells: 0,
         }
     }
 }
@@ -573,9 +624,12 @@ fn build_loose(_rig_witness: (), s: &mut Setup, n: usize) -> Build {
     // 生产醒体预算 512(§9.4):N > 512 时,超额瞬态体在 spawn 当拍即被
     // 预算强制落地(就地转方块,§4.8/§4.16 预算归因)——真实规模 = 512
     // 醒体下落 + 其余就地凝固。期望按此下限;强制落地数与醒体峰值在
-    // 报告列如实呈现。
+    // 报告列如实呈现。R4 守恒:全部 N 个最终都进世界(落体凝固 + 强制
+    // 落地写块都是非空气 Emergent 写入)→ 非空气凝固 == N。
     s.expect_min_entities = n.min(512);
     s.expect_solidified = true;
+    s.expect_conservation = true;
+    s.expect_conservation_cells = n as u64;
     Build {
         spawns: cells
             .iter()
@@ -656,6 +710,11 @@ fn build_bridge(_witness: (), s: &mut Setup, cells: usize) -> Build {
     s.expect_min_entities = 1;
     s.expect_compounds = true;
     s.expect_solidified = true;
+    // R4 守恒:落定后全部板格凝固回世界(非空气凝固 == cells;柱格被拆,
+    // 不回填)。塌落体可能经强制落地写回(已知现象:复合体待地形挂起 →
+    // 1200 拍截止强制落地),两种路径都计非空气 Emergent 写入。
+    s.expect_conservation = true;
+    s.expect_conservation_cells = cells as u64;
     let mut blocks: Vec<(BlockPos, BlockId)> = pillars
         .iter()
         .chain(deck_top.iter())
@@ -669,21 +728,43 @@ fn build_bridge(_witness: (), s: &mut Setup, cells: usize) -> Build {
     }
 }
 
-/// blast:爆心置于分片中央地下 2.5 m;power = 3·radius(近爆心 P > k·R
-/// 恒成立,demo 12/8 同比例)。
+/// blast:圆柱土堆真实爆炸(R1)。圆柱半径 r+1、高 2r+2,从地表(SURFACE)
+/// 向上堆到 y = SURFACE + 2r+1;每一列从地表直起、接地链经脚下 dirt 层直达
+/// bedrock。爆心 = 圆柱中心(地表上 r+1 格);power = 5r+8(dirt R=2,射线
+/// 衰减后近爆心仍 P > k·R = 4,半径内处处可炸)。方块从下往上分批写入
+/// (submit_batched 的批间 tick 让承载判定全程看到"柱列接地"的稳定结构)。
 fn build_blast(_witness: (), s: &mut Setup, radius: u32) -> Build {
-    // 爆心在地表下 0.5 格(REQ-009 冒烟同款:表面系 −59.5)。
-    s.center = Vec3::new(64.5, (SURFACE + 1) as f32 - 0.5, 64.5);
+    let r = radius as i32;
+    let (cx, cz) = (64, 64);
+    let height = 2 * r + 2;
+    let mut blocks = Vec::new();
+    for dy in 0..height {
+        for dx in -r - 1..=r + 1 {
+            for dz in -r - 1..=r + 1 {
+                if dx * dx + dz * dz <= (r + 1) * (r + 1) {
+                    blocks.push((BlockPos::new(cx + dx, SURFACE + dy, cz + dz), builtin::DIRT));
+                }
+            }
+        }
+    }
+    s.center = Vec3::new(
+        cx as f32 + 0.5,
+        (SURFACE + height / 2) as f32 + 0.5,
+        cz as f32 + 0.5,
+    );
     s.trigger = Trigger::Blast {
-        power: 3.0 * radius as f32,
+        power: 5.0 * radius as f32 + 8.0,
         radius: radius as f32,
     };
-    // 爆炸必破坏(近爆心 P > k·R);保守下限 8 格。
-    s.expect_min_destroyed = 8;
-    s.expect_solidified = true;
+    // R1 断言口径(评论字面):destroyed ≥ min(2048, 0.15 × (4/3)πr³)。
+    // 纯粉碎爆炸不承诺碎屑实体:expect_solidified 不设(旧口径的"凝固"
+    // 计数就是爆炸写 air,R3 拆列后不再把它当凝固证据)。落定 = 实体清零
+    // (全粉碎时触发后 1 拍即达,如实报告)。
+    let volume = (4.0 / 3.0) * std::f64::consts::PI * (r as f64).powi(3);
+    s.expect_min_destroyed = ((0.15 * volume) as u64).min(2048);
     Build {
         spawns: Vec::new(),
-        blocks: Vec::new(),
+        blocks,
         settle_quiet_ticks: 0,
     }
 }
@@ -759,18 +840,34 @@ fn build_rain(_witness: (), s: &mut Setup, m: usize) -> Build {
     }
 }
 
-/// cross-shard:blast radius=8 放在四片交汇角 (0,0)(分片界上的事件)。
+/// cross-shard:blast radius=8 放在四片交汇角 (0,0)(分片界上的事件);
+/// R1 同款圆柱土堆(半径 r+1、高 2r+2,从地表向上),爆心 = 圆柱中心,
+/// power = 5r+8。圆柱骑在分片界上,四片都要注册(布景写入的 owner 校验)。
 fn build_cross_blast(_witness: (), s: &mut Setup) -> Build {
-    s.center = Vec3::new(0.5, (SURFACE + 1) as f32 - 0.5, 0.5);
+    let r = 8;
+    let height = 2 * r + 2;
+    let mut blocks = Vec::new();
+    for dy in 0..height {
+        for dx in -r - 1..=r + 1 {
+            for dz in -r - 1..=r + 1 {
+                if dx * dx + dz * dz <= (r + 1) * (r + 1) {
+                    blocks.push((BlockPos::new(dx, SURFACE + dy, dz), builtin::DIRT));
+                }
+            }
+        }
+    }
+    s.center = Vec3::new(0.5, (SURFACE + height / 2) as f32 + 0.5, 0.5);
     s.trigger = Trigger::Blast {
-        power: 24.0,
-        radius: 8.0,
+        power: 5.0 * r as f32 + 8.0,
+        radius: r as f32,
     };
-    s.expect_min_destroyed = 8;
-    s.expect_solidified = true;
+    // R1 断言口径(评论字面):destroyed ≥ min(2048, 0.15 × (4/3)πr³)。
+    // 同 build_blast:纯粉碎不设 expect_solidified。
+    let volume = (4.0 / 3.0) * std::f64::consts::PI * (r as f64).powi(3);
+    s.expect_min_destroyed = ((0.15 * volume) as u64).min(2048);
     Build {
         spawns: Vec::new(),
-        blocks: Vec::new(),
+        blocks,
         settle_quiet_ticks: 0,
     }
 }
@@ -806,7 +903,8 @@ fn build_cross_loose(_witness: (), s: &mut Setup) -> Build {
 struct WindowTotals {
     forced_landings: u64,
     blocks_destroyed: u64,
-    solidified: u64,
+    solidified_solid: u64,
+    solidified_air: u64,
     compounds_spawned: u64,
     cells_impacted: u64,
     flow_events: u64,
@@ -888,14 +986,14 @@ fn run_once(def: &ScenarioDef) -> Run {
 
     // ---- 观测窗口(续;Blast/RemoveSupports 从触发起,Trigger::None 已在
     //      提交段起计)。
+    // R4:落定判据 = 全世界实体数为 0(含冻结/待地形/在途——凝固或移除
+    // 才会消失),且连续 SETTLE_CALM_TICKS 拍保持(碎裂原体的分块是调度器
+    // N+1 生成:despawn 拍实体数恰为 0,下一拍才见分块);窗口耗尽报
+    // "未落定"并给出残留实体数。先测后判。
     let mut calm: u32 = 0;
     for _ in 0..MAX_TICKS {
-        // 计时口径 = session.tick() 全程(含屏障;与 app::telemetry 同口径)。
         measure_tick(&mut rig, &mut run, &mut totals);
-
-        // 静置判定:醒体 0 且承载无待转换,连续 SETTLE_CALM_TICKS 拍。
-        let quiet = run.peak_last_awake == 0 && run.peak_last_load_pending == 0;
-        if quiet {
+        if run.last_entity_count == 0 {
             calm += 1;
             if calm >= SETTLE_CALM_TICKS {
                 run.settle_ticks = Some(run.ticks_observed);
@@ -904,13 +1002,18 @@ fn run_once(def: &ScenarioDef) -> Run {
         } else {
             calm = 0;
         }
-
         rig.orchestrate();
     }
+    run.leftover_entities = run.last_entity_count;
     run.forced_landings = totals.forced_landings;
     run.blocks_destroyed = totals.blocks_destroyed;
-    run.solidified = totals.solidified;
+    run.solidified_solid = totals.solidified_solid;
+    run.solidified_air = totals.solidified_air;
     run.compounds_spawned = totals.compounds_spawned;
+    // R2 指标进 report.json(渲染时方法口径同源;这里落盘持久化值)。
+    run.max_over_budget_streak = run.max_over_budget_streak_fn();
+    run.total_over_budget_ms = run.total_over_budget_ms_fn();
+    run.worst_60_mean_ms = run.worst_60_mean_ms_fn();
 
     // ---- 遥测断言:场景必须真的发生了,否则直接报错退出。
     let tag = format!("{} [{}]", def.scenario, def.scale);
@@ -935,13 +1038,13 @@ fn run_once(def: &ScenarioDef) -> Run {
             totals.cells_impacted > 0,
             "{tag}: 无撞击破坏(cells_impacted == 0),场景未发生(fail-stop):\
              peak_entities={} peak_awake={} flow_breaks={} flow_prefiltered={} flow_events={} \
-             impact_events={} settle={:?} ticks={}",
+             cells_impacted={} settle={:?} ticks={}",
             run.peak_entities,
             run.peak_awake,
-            0,
-            0,
-            0,
-            0,
+            totals.flow_breaks,
+            totals.flow_prefiltered,
+            totals.flow_events,
+            totals.cells_impacted,
             run.settle_ticks,
             run.ticks_observed,
         );
@@ -954,8 +1057,31 @@ fn run_once(def: &ScenarioDef) -> Run {
     }
     if setup.expect_solidified {
         assert!(
-            run.solidified > 0,
-            "{tag}: 无凝固写入,实体未落定(fail-stop)"
+            run.solidified_solid > 0,
+            "{tag}: 无非空气凝固写入,实体未落定(fail-stop):\
+             air={} destroyed={} compounds={} forced={} peak_entities={} settle={:?} \
+             leftover={} ticks={}",
+            run.solidified_air,
+            run.blocks_destroyed,
+            run.compounds_spawned,
+            run.forced_landings,
+            run.peak_entities,
+            run.settle_ticks,
+            run.leftover_entities,
+            run.ticks_observed,
+        );
+    }
+    // R4 守恒断言:loose / bridge 落定时非空气凝固 == 规模(N / cells)。
+    if setup.expect_conservation {
+        assert!(
+            run.settle_ticks.is_some(),
+            "{tag}: 守恒断言要求落定,窗口耗尽(残留 {} 实体)",
+            run.leftover_entities
+        );
+        assert_eq!(
+            run.solidified_solid, setup.expect_conservation_cells,
+            "{tag}: 非空气凝固 {} != 期望 {},守恒破坏(fail-stop)",
+            run.solidified_solid, setup.expect_conservation_cells
         );
     }
 
@@ -1013,7 +1139,6 @@ fn submit_batched(
 }
 
 /// 计时一拍(tick 全程)+ 遥测累计与峰值采样(观测窗口的最小单位)。
-/// 静置判定在调用方(不同窗口起点的语义差异)。
 fn measure_tick(rig: &mut Rig, run: &mut Run, totals: &mut WindowTotals) {
     // Instant 属压测授权面(计时只属于测量,不进模拟;driver 同款 allow)。
     #[allow(clippy::disallowed_methods)]
@@ -1024,7 +1149,15 @@ fn measure_tick(rig: &mut Rig, run: &mut Run, totals: &mut WindowTotals) {
         run.tick_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
     }
     run.ticks_observed += 1;
-    totals.solidified += rig.session.take_solidified().len() as u64;
+    // R3:凝固写入按空气/非空气拆分(take_solidified 是"涌现写块"兼容字段,
+    // 含破坏写 air;非空气才是实体落定的证据)。
+    for (_, _, block) in rig.session.take_solidified() {
+        if block.is_air() {
+            totals.solidified_air += 1;
+        } else {
+            totals.solidified_solid += 1;
+        }
+    }
     let _ = rig.session.take_block_updates();
     let t = &summary.telemetry;
     totals.forced_landings += t.forced_landings_deadline + t.forced_landings_budget;
@@ -1039,44 +1172,46 @@ fn measure_tick(rig: &mut Rig, run: &mut Run, totals: &mut WindowTotals) {
     run.peak_awake = run.peak_awake.max(t.entities_awake);
     run.peak_frozen = run.peak_frozen.max(t.entities_frozen);
     run.peak_awaiting = run.peak_awaiting.max(t.entities_awaiting_terrain);
-    run.peak_last_awake = t.entities_awake;
-    run.peak_last_load_pending = summary.cohesion.load_pending;
-    // 全分片实体表;峰值拍做一次全量 EntityStates bincode 编码
-    // (S2C::EntityStates 全量口径,removed 空、full = true)。
+    // 全分片实体表:每拍只遍历计实体数(R4 落定判据 + 峰值);新峰值拍
+    // 才做一次合并(与生产 driver `visible` 全量口径同构:跨分片合并的
+    // BTreeMap,压测不做视距过滤 = 全表)并编码 S2C::EntityStates。
+    // 每拍无谓地克隆合并会在 debug 下成倍拖慢冒烟(31 s → 155 s 实测),
+    // 故合并只发生在峰值更替拍。
     let mut entities = 0usize;
-    let mut peak_states: Option<(Tick, Vec<(EntityId, types::EntityState)>)> = None;
     for s in rig.session.shard_ids() {
         if let Some(states) = rig.session.entity_states(s) {
             entities += states.len();
-            if peak_states
-                .as_ref()
-                .is_none_or(|(_t0, s0)| states.len() > s0.len())
-            {
-                peak_states = Some((summary.tick, states));
-            }
         }
     }
+    run.last_entity_count = entities;
     if entities > run.peak_entities {
         run.peak_entities = entities;
-        if let Some((tick, states)) = peak_states {
-            #[allow(clippy::disallowed_methods)]
-            let t0 = std::time::Instant::now();
-            let bytes = bincode::serde::encode_to_vec(
-                &S2C::EntityStates {
-                    tick,
-                    states,
-                    removed: Vec::new(),
-                    full: true,
-                },
-                bincode::config::standard(),
-            )
-            .expect("EntityStates 编码");
-            #[allow(clippy::disallowed_methods)]
-            {
-                run.peak_snapshot_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let mut merged: std::collections::BTreeMap<EntityId, types::EntityState> =
+            std::collections::BTreeMap::new();
+        for s in rig.session.shard_ids() {
+            if let Some(states) = rig.session.entity_states(s) {
+                for (id, state) in states {
+                    merged.insert(id, state);
+                }
             }
-            run.peak_snapshot_bytes = bytes.len();
         }
+        #[allow(clippy::disallowed_methods)]
+        let t0 = std::time::Instant::now();
+        let bytes = bincode::serde::encode_to_vec(
+            &S2C::EntityStates {
+                tick: summary.tick,
+                states: merged.into_iter().collect(),
+                removed: Vec::new(),
+                full: true,
+            },
+            bincode::config::standard(),
+        )
+        .expect("EntityStates 编码");
+        #[allow(clippy::disallowed_methods)]
+        {
+            run.peak_snapshot_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        }
+        run.peak_snapshot_bytes = bytes.len();
     }
 }
 
@@ -1208,13 +1343,16 @@ fn render_md(report: &Report) -> String {
     ));
     md.push_str(&format!("- 说明:{}\n\n", report.note));
     md.push_str(
-        "| 场景 | 规模 | 观测拍数 | P50 (ms) | P95 (ms) | P99 (ms) | max (ms) | 超预算拍数 | 峰值实体 | 峰值醒体 | 峰值冻结/待地形 | 强制落地 | 落定拍 | 破坏方块 | 凝固 | 复合体 | 快照字节 | 快照耗时 (ms) |\n",
+        "| 场景 | 规模 | 观测拍数 | P50 (ms) | P95 (ms) | P99 (ms) | max (ms) | 超预算拍数 | 最长连续超预算 | 累计超预算 (ms) | 最差 60 拍均值 (ms) | 峰值实体 | 峰值醒体 | 峰值冻结/待地形 | 强制落地 | 落定拍 | 残留实体 | 破坏方块 | 凝固(非空气) | 空气写入 | 复合体 | 快照字节 | 快照耗时 (ms) |\n",
     );
-    md.push_str("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n");
+    md.push_str(
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+",
+    );
     for tier in &report.tiers {
         let r = tier.median_run();
         md.push_str(&format!(
-            "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {:.3} |\n",
+            "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {:.1} | {:.2} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {:.3} |\n",
             tier.scenario,
             tier.scale,
             r.ticks_observed,
@@ -1223,6 +1361,9 @@ fn render_md(report: &Report) -> String {
             r.percentile(0.99),
             r.max_ms(),
             r.over_budget(),
+            r.max_over_budget_streak,
+            r.total_over_budget_ms,
+            r.worst_60_mean_ms,
             r.peak_entities,
             r.peak_awake,
             r.peak_frozen,
@@ -1232,8 +1373,10 @@ fn render_md(report: &Report) -> String {
                 Some(t) => t.to_string(),
                 None => "未落定".to_string(),
             },
+            r.leftover_entities,
             r.blocks_destroyed,
-            r.solidified,
+            r.solidified_solid,
+            r.solidified_air,
             r.compounds_spawned,
             r.peak_snapshot_bytes,
             r.peak_snapshot_ms,
