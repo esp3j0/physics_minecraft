@@ -156,6 +156,8 @@ dependencies = [
  "messaging",
  "physics-sim",
  "rapier3d",
+ "serde",
+ "serde_json",
  "shard",
  "sim-api",
  "storage",
