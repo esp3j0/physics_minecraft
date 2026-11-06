@@ -82,6 +82,10 @@ fill = { from = [6, -60, 14], to = [6, -56, 14], block = "air" }
 [[step]]
 fill = { from = [6, -60, 20], to = [6, -56, 20], block = "air" }
 
+# 先等门楣塌落实体出现(杜绝实体帧未到时空过)。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 wait_until = { block = { pos = [9, -55, 14], is = "air" }, timeout_ticks = 120 }
 
@@ -89,17 +93,17 @@ wait_until = { block = { pos = [9, -55, 14], is = "air" }, timeout_ticks = 120 }
 wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "falling", expect = "远处门框的土门楣左边一长条变成一整根连在一起的蓝色横条,在原门楣高度附近下落(是一根,不是一串分开的方块);近处的灰色石门楣仍横挂在右侧石柱上,左端悬空" }
+screenshot = { name = "falling", expect = "远处门框的土门楣左边一长条变成了蓝色活实体横条,在原门楣高度附近下落(渲染上是一排相邻的蓝色方块拼成的一根横条,方块间可有细缝但整体平直下落、宽度仍约 7 格,不是散开的碎块堆);近处的灰色石门楣仍横挂在右侧石柱上,左端悬空" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 label = "再等一次归零:门楣落地碎开时旧实体移除与碎块出生可能分两次到达,中间有一拍实体数为 0(10-28 起偶发,拍 150 归零、拍 170 又有 11–12 个)"
 wait_ticks = { n = 30 }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [9, -55, 20], is = "stone" } }

@@ -168,11 +168,14 @@ fn cmd_smoke(selectors: &[String], out: Option<&Path>, no_ai: bool) -> i32 {
         }
     }
 
-    // 输出根目录:--out 或 <target>/smoke/<YYYYmmdd-HHMMSS>。
-    let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| {
+    // 输出根目录:--out 或 <target>/smoke/<YYYYmmdd-HHMMSS>。统一转绝对路径
+    // (S01 返修必修 1):相对 --out 时截图路径也是相对的,审图器原样传给
+    // zcode 的 --attach,附件不被摄入(审图模型看不到像素)——入口处归一。
+    let out_root = std::path::absolute(out.map(Path::to_path_buf).unwrap_or_else(|| {
         let stamp = timestamp_now();
         target_dir.join("smoke").join(stamp)
-    });
+    }))
+    .expect("out_root 转绝对路径失败");
     if let Err(e) = std::fs::create_dir_all(&out_root) {
         eprintln!("创建输出目录 {} 失败:{e}", out_root.display());
         return 2;
@@ -492,7 +495,27 @@ fn review_all(
     let template = load_template(repo_root)?;
     let mut reviewer = ZcodeReviewer::new()?.with_progress(true);
     let (_, calibration) = calibration_once(repo_root, &template, &mut reviewer)?;
+    let shots = review_shots(
+        &mut reviewer,
+        &template,
+        out_root,
+        entries,
+        calibration.ok,
+        &mut 0,
+    );
+    Ok((Some(calibration), shots))
+}
 
+/// 逐张审图(不含校准):按 manifest 的截图步骤调 [`review_image`]。`done`
+/// 是跨调用的进度计数(调用方传 0 起头)。测试用它注入桩审图器。
+fn review_shots(
+    reviewer: &mut dyn Reviewer,
+    template: &str,
+    out_root: &Path,
+    entries: &[ScenarioEntry],
+    calibration_ok: bool,
+    done: &mut usize,
+) -> Vec<ShotEntry> {
     let total: usize = entries
         .iter()
         .filter_map(|entry| entry.manifest.as_ref())
@@ -505,7 +528,6 @@ fn review_all(
         })
         .sum();
     let mut shots = Vec::new();
-    let mut done = 0usize;
     for entry in entries {
         let Some(manifest) = &entry.manifest else {
             continue;
@@ -514,14 +536,15 @@ fn review_all(
             let Some(shot) = &step.screenshot else {
                 continue;
             };
-            done += 1;
+            *done += 1;
             println!(
-                "==== AI 审图 {done}/{total}:{}/{} ====",
-                entry.run.name, shot.file
+                "==== AI 审图 {}/{}:{}/{} ====",
+                done, total, entry.run.name, shot.file
             );
-            let image = out_root.join(&entry.run.name).join(&shot.file);
-            let review = review_image(&mut reviewer, &template, &image, &shot.expect);
-            let flagged = shot_flagged(Some(&review), calibration.ok);
+            let image = std::path::absolute(out_root.join(&entry.run.name).join(&shot.file))
+                .expect("截图路径绝对化失败");
+            let review = review_image(reviewer, template, &image, &shot.expect);
+            let flagged = shot_flagged(Some(&review), calibration_ok);
             let line = match &review {
                 ReviewResult::Judged(v) => format!(
                     "pass = {},confidence = {v:.2}{}",
@@ -541,7 +564,7 @@ fn review_all(
             });
         }
     }
-    Ok((Some(calibration), shots))
+    shots
 }
 
 /// `cargo xtask smoke --selftest`(单元 04 范围 4;AC-S8):运行 `selftest-negative`,
@@ -577,11 +600,12 @@ fn cmd_selftest(no_ai: bool, out: Option<&Path>) -> i32 {
         return 2;
     };
 
-    let out_root = out.map(Path::to_path_buf).unwrap_or_else(|| {
+    let out_root = std::path::absolute(out.map(Path::to_path_buf).unwrap_or_else(|| {
         target_dir
             .join("smoke")
             .join(format!("selftest-{}", timestamp_now()))
-    });
+    }))
+    .expect("out_root 转绝对路径失败");
     if let Err(e) = std::fs::create_dir_all(&out_root) {
         eprintln!("创建输出目录 {} 失败:{e}", out_root.display());
         return 2;
@@ -1061,5 +1085,95 @@ mod tests {
     fn modules_wired() {
         let _ = Path::new(".");
         assert_eq!(smoke::overall_exit_code(&[]), 1);
+    }
+
+    /// 记录收到的附件路径的桩审图器(必修 1 测试用)。
+    struct PathRecordingReviewer {
+        seen: std::sync::Mutex<Vec<std::path::PathBuf>>,
+    }
+
+    impl PathRecordingReviewer {
+        fn new() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::review::Reviewer for PathRecordingReviewer {
+        fn review(&mut self, image: &Path, _prompt: &str) -> Result<String, String> {
+            self.seen.lock().expect("锁").push(image.to_path_buf());
+            Ok(r#"{"observed": "o", "pass": true, "issues": [], "confidence": 0.9}"#.to_owned())
+        }
+    }
+
+    /// 必修 1(S01 返修):相对 `--out` 目录下,传给审图器的截图路径必须是
+    /// 绝对路径——相对路径传给 zcode 的 --attach 不被摄入,审图模型看不到
+    /// 像素(校准集恰好用绝对路径,所以基线没暴露)。
+    ///
+    /// 会变红的实现:review_shots 原样把相对 out_root 拼进附件路径。
+    #[test]
+    fn review_shots_absolutizes_image_paths() {
+        let shot = ManifestShot {
+            file: "02-a.png".to_owned(),
+            name: "a".to_owned(),
+            expect: "期望文本".to_owned(),
+            hud: false,
+            live_entities: 0,
+            chunks_loaded: 0,
+        };
+        let step = |action: &str, shot: Option<ManifestShot>| ManifestStep {
+            step: 1,
+            label: None,
+            action: action.to_owned(),
+            start_tick: 0,
+            end_tick: 1,
+            camera: ManifestCamera {
+                pos: [0.0; 3],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            outcome: "ok".to_owned(),
+            messages: vec![],
+            screenshot: shot,
+        };
+        let entries = vec![ScenarioEntry {
+            run: ScenarioRun {
+                name: "alpha".to_owned(),
+                viewer_exit: Some(0),
+                timed_out: false,
+                server_panicked: false,
+            },
+            manifest: Some(Manifest {
+                scenario: "alpha".to_owned(),
+                req: None,
+                description: "d".to_owned(),
+                steps: vec![step("screenshot", Some(shot))],
+                result: None,
+            }),
+        }];
+        // 故意用相对 out_root(验收两轮也用相对 --out,以此证明修复有效)。
+        let mut reviewer = PathRecordingReviewer::new();
+        let mut done = 0usize;
+        let shots = review_shots(
+            &mut reviewer,
+            "{expect}",
+            Path::new("target/smoke/relative-probe"),
+            &entries,
+            true,
+            &mut done,
+        );
+        assert_eq!(shots.len(), 1);
+        let seen = reviewer.seen.into_inner().expect("锁");
+        assert_eq!(seen.len(), 1);
+        let image = &seen[0];
+        assert!(
+            image.is_absolute(),
+            "传给审图器的附件路径必须是绝对路径,实为 {image:?}"
+        );
+        assert!(
+            image.ends_with("alpha/02-a.png") || image.ends_with("alpha\\02-a.png"),
+            "路径仍应指向场景目录下的截图:{image:?}"
+        );
     }
 }

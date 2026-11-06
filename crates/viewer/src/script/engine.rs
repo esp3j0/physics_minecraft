@@ -66,19 +66,31 @@ pub(crate) fn fill_cells(from: BlockPos, to: BlockPos) -> Vec<BlockPos> {
 /// 等待步骤的跨帧状态(与当前步骤一一对应;即时步骤不进入等待状态)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WaitState {
-    Fly { start_tick: u64 },
-    WaitTicks { start_tick: u64 },
-    WaitUntil { start_tick: u64 },
-    Spawn { start_tick: u64, emitted: bool },
+    Fly {
+        start_tick: u64,
+    },
+    WaitTicks {
+        start_tick: u64,
+    },
+    /// `ok_since` = 当前连续成立段的起始拍号(Some = 正在连续成立中);
+    /// 条件不成立即清空,重新成立时记当前拍。满足判据见 WaitUntil 分支:
+    /// `tick - ok_since + 1 >= hold_ticks`(按拍号算,不按观测次数)。
+    WaitUntil {
+        start_tick: u64,
+        ok_since: Option<u64>,
+    },
+    Spawn {
+        start_tick: u64,
+        emitted: bool,
+    },
 }
 
 impl WaitState {
     fn start_tick(self) -> u64 {
         match self {
-            WaitState::Fly { start_tick }
-            | WaitState::WaitTicks { start_tick }
-            | WaitState::WaitUntil { start_tick }
-            | WaitState::Spawn { start_tick, .. } => start_tick,
+            WaitState::Fly { start_tick } | WaitState::WaitTicks { start_tick } => start_tick,
+            WaitState::WaitUntil { start_tick, .. } => start_tick,
+            WaitState::Spawn { start_tick, .. } => start_tick,
         }
     }
 }
@@ -383,11 +395,40 @@ impl EngineInner {
                 Action::WaitUntil {
                     checks,
                     timeout_ticks,
+                    hold_ticks,
                 } => {
-                    let start_tick =
-                        self.enter_wait(|t| WaitState::WaitUntil { start_tick: t }, tick);
+                    let start_tick = self.enter_wait(
+                        |t| WaitState::WaitUntil {
+                            start_tick: t,
+                            ok_since: None,
+                        },
+                        tick,
+                    );
                     let msgs = self.run_checks(&checks, input);
-                    if msgs.is_empty() {
+                    let msgs_is_empty = msgs.is_empty();
+                    // 连续成立段起点(ok_since):成立且无段 → 记当前拍;
+                    // 不成立 → 清空(重新计数)。同一拍内的重复帧不重复更新。
+                    let ok_since = match &mut self.wait {
+                        Some(WaitState::WaitUntil { ok_since, .. }) => {
+                            if msgs_is_empty {
+                                if ok_since.is_none() {
+                                    *ok_since = Some(tick);
+                                }
+                            } else {
+                                *ok_since = None;
+                            }
+                            *ok_since
+                        }
+                        _ => None,
+                    };
+                    // 按拍号判连续成立时长(不按观测次数):viewer 每 ~10 拍才
+                    // 拿到一次新拍,hold_ticks = N 实际等待的是 N 个服务器拍。
+                    let held_ticks = ok_since.map(|s| tick.saturating_sub(s) + 1);
+                    // msgs_is_empty 时 ok_since 必为 Some(hold_ticks = 0 也记段,
+                    // held = 1 ≥ 0 立即满足 = 旧语义首拍即过);None 只在条件
+                    // 不成立时出现,此处必不满足。
+                    let hold_met = held_ticks.is_some_and(|n| n >= hold_ticks);
+                    if msgs_is_empty && hold_met {
                         self.finish_step(
                             &mut out,
                             step_no,
@@ -399,7 +440,14 @@ impl EngineInner {
                             tick,
                         );
                     } else if tick >= start_tick.saturating_add(timeout_ticks) {
-                        let reason = format!("wait_until 超时:{timeout_ticks} 拍内条件未全部成立");
+                        let reason = if hold_ticks > 0 {
+                            let held = held_ticks.unwrap_or(0);
+                            format!(
+                                "wait_until 超时:{timeout_ticks} 拍内条件未连续成立 {hold_ticks} 拍(当前连续 {held} 拍)"
+                            )
+                        } else {
+                            format!("wait_until 超时:{timeout_ticks} 拍内条件未全部成立")
+                        };
                         self.finish_step(
                             &mut out,
                             step_no,

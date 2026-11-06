@@ -33,6 +33,10 @@ wait_ticks = { n = 70 }
 label = "落地凝固前引爆"
 detonate = { nearest = true, power = 12.0, radius = 8.0 }
 
+# 先等炸松的实体出现(杜绝实体帧未到时空过),再截图。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 wait_ticks = { n = 20 }
 
@@ -54,7 +58,7 @@ fly = { to = [8.0, -50.0, 30.0], speed = 16.0 }
 look_at = { target = [9.0, -57.0, 14.0] }
 
 [[step]]
-wait_until = { labeled_alive = { label = "blast", eq = 0 }, live_entities = { eq = 0 }, block = { pos = [8, -64, 14], is = "bedrock" }, timeout_ticks = 900 }
+wait_until = { labeled_alive = { label = "blast", eq = 0 }, live_entities = { eq = 0 }, block = { pos = [8, -64, 14], is = "bedrock" }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 check = { live_entities = { eq = 0 }, no_floating = { height = 1.5, still_ticks = 30 } }

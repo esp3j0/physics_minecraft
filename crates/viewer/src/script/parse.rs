@@ -309,6 +309,7 @@ fn parse_action(
             "chunks_loaded",
             "no_floating",
             "timeout_ticks",
+            "hold_ticks",
         ],
         "check" => &[
             "live_entities",
@@ -501,10 +502,19 @@ fn parse_action(
             let timeout = t
                 .get("timeout_ticks")
                 .ok_or_else(|| e("动作 wait_until 缺必填参数 timeout_ticks".into()))?;
+            // hold_ticks 可选(缺省 0 = 旧语义)。格式:`wait_until = { ..,
+            // timeout_ticks = T, hold_ticks = N }`——全部条件连续成立 N 拍才算
+            // 满足(中途断开重新计数;timeout 仍从步骤首拍起算),N = 0 与旧
+            // 语义逐位相同。完整语义见 Action::WaitUntil 的文档注释。
+            let hold = match t.get("hold_ticks") {
+                Some(v) => u64_of(v, "wait_until.hold_ticks").map_err(e)?,
+                None => 0,
+            };
             let checks = parse_checks(t, "wait_until", registry).map_err(e)?;
             Ok(Action::WaitUntil {
                 checks,
                 timeout_ticks: u64_of(timeout, "wait_until.timeout_ticks").map_err(e)?,
+                hold_ticks: hold,
             })
         }
         "check" => {
@@ -632,8 +642,8 @@ fn parse_checks(
                     still_ticks,
                 });
             }
-            // timeout_ticks 只属于 wait_until 本身,不是检查项。
-            "timeout_ticks" if what == "wait_until" => {}
+            // timeout_ticks / hold_ticks 只属于 wait_until 本身,不是检查项。
+            "timeout_ticks" | "hold_ticks" if what == "wait_until" => {}
             other => return Err(format!("{what} 含未知检查项 \"{other}\"")),
         }
     }

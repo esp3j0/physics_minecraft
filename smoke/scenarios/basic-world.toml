@@ -30,7 +30,7 @@ wait_until = { block = { pos = [100, -61, 94], is = "dirt" }, timeout_ticks = 12
 wait_ticks = { n = 60 }
 
 [[step]]
-screenshot = { name = "southeast", expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块" }
+screenshot = { name = "southeast", expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面内部连续完整,没有缺块、空洞或整块缺失的区块;画面上缘的地平线向左右两角略微下斜收束,是有限大小地面在透视下的自然边界,不算缺块" }
 
 [[step]]
 label = "西侧负坐标"

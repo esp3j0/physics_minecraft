@@ -46,44 +46,48 @@ screenshot = { name = "wall", expect = "地面上立着一面竖直的棕色土�
 label = "发射 6 格石条(沿 +x 纵置,首格格心 (2.5,-57.5,20.5),前缘 x≈7.95,距墙面 2 m)打墙中行 (10,-58,20)"
 spawn = { at = [2.5, -57.5, 20.5], count = 1, velocity = [20.0, 0.0, 0.0], label = "bar", shape = { cells = [[0,0,0],[1,0,0],[2,0,0],[3,0,0],[4,0,0],[5,0,0]], block = "stone" } }
 
+# 先等实体出现(杜绝空过),连拍按状态证据写 expect。
 [[step]]
-wait_ticks = { n = 3 }
-
-[[step]]
-screenshot = { name = "burst-01", expect = "一根蓝色长条(石条)在墙前方飞向墙面,尚未接触或刚接触;墙面完整" }
-
-[[step]]
-wait_ticks = { n = 3 }
-
-[[step]]
-screenshot = { name = "burst-02", expect = "石条撞上墙面:被撞的那格土被撞飞,石条顶进墙面,墙体出现一个缺口" }
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-03", expect = "被撞脱的土格飞到墙后;石条(整根或顶进缺口的姿势)在墙前方或缺口处;墙其余部分完整" }
+screenshot = { name = "burst-01", expect = "画面中部偏右立着一面棕色土墙(竖直的大片棕色方块);撞击已发生:石条已顶进墙面——墙面中部可见蓝色实体露出,石条的尾段从墙背面(画面左侧)伸出;墙的其余部分仍完好站立" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "石条撞上墙面:墙体出现缺口和/或蓝色方块(被撞脱的土、石条)出现在墙附近;墙的其余部分仍立在原位" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-03", expect = "画面中有蓝色方块(石条与/或被撞脱的土格)在墙的缺口附近;墙的其余部分仍完整站立(除被撞格外的墙面完好)" }
 
 [[step]]
 wait_ticks = { n = 5 }
 
 [[step]]
-screenshot = { name = "burst-04", expect = "石条减速停在墙前或缺口里;墙后的土块继续飞离墙面;墙其余部分完整站立" }
+screenshot = { name = "burst-04", expect = "蓝色方块群的运动已明显减速(群体聚在墙前或缺口附近,不再快速横穿画面);墙其余部分完整站立,缺口清晰可见" }
 
 [[step]]
 wait_ticks = { n = 10 }
 
 [[step]]
-screenshot = { name = "burst-05", expect = "石条姿态基本稳定(不再明显移动);墙后的土块落地翻滚;缺口清晰" }
+screenshot = { name = "burst-05", expect = "石条姿态基本稳定(不再明显移动);墙后的土块或已落地、或散落在墙后不远处;缺口清晰" }
 
 [[step]]
 wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "burst-06", expect = "墙后土块落向地面;石条停在墙前或缺口处;墙面其余部分完好" }
+screenshot = { name = "burst-06", expect = "墙后土块已落地或接近落地;石条停在墙前或缺口处;墙面其余部分完好" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500, hold_ticks = 30 }
 
 [[step]]
 wait_ticks = { n = 20 }

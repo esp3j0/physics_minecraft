@@ -28,14 +28,16 @@ fn load_scenario(name: &str) -> Scenario {
 /// 布景含临时脚手架(动作从拆脚手架的 fill air 起);beam-whole 动作从移走
 /// 左柱起;impact-corner 布景是完整门框(动作从去掉左柱起);shatter 布景
 /// 只有相机和等待(动作从 spawn 起);materials 全部是布景。
+/// S01 冒烟降噪在若干场景加了等待门/hold 步骤(不改变切分规则本身),
+/// 步骤总数与动作段长度随之更新(2026-11-06)。
 #[test]
 fn split_points_match_spec_on_real_scenarios() {
     let expected: [(&str, usize, usize); 6] = [
-        ("req010-impact-punch", 9, 24),
-        ("req010-door-lintel", 14, 19),
-        ("req010-beam-whole", 10, 14),
-        ("req010-impact-corner", 8, 35),
-        ("req010-shatter", 3, 18),
+        ("req010-impact-punch", 9, 25),
+        ("req010-door-lintel", 14, 20),
+        ("req010-beam-whole", 10, 15),
+        ("req010-impact-corner", 8, 40),
+        ("req010-shatter", 3, 20),
         ("req009-materials", 12, 0),
     ];
     for (name, staging, action) in expected {
@@ -573,6 +575,120 @@ fn status_lines_are_ascii() {
     assert!(notice.is_ascii());
 }
 
+/// 布景执行器的 `wait_until` hold_ticks(必修 3):与脚本引擎同语义——按
+/// 服务器拍号计连续成立拍数(不按观测次数);不成立清空重新计数;超时提示
+/// 后继续;步骤切换(`advance`)与 `R` 重建清零。
+///
+/// 会变红的实现:忽略 hold_ticks(首拍成立即过);按观测次数计数。
+#[test]
+fn stage_wait_until_hold_ticks_matches_script_semantics() {
+    // 场景:wait_ticks 1(布景)→ [动作段] spawn → wait_until hold 30 → spawn。
+    let text = scenario_text(&[
+        "wait_ticks = { n = 1 }",
+        "spawn = { at = [0.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+        "wait_until = { chunks_loaded = { ge = 1 }, timeout_ticks = 1000, hold_ticks = 30 }",
+        "spawn = { at = [1.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+    ]);
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let world = StubWorld::empty();
+    let _ = driver.frame(0.016, 100, &world); // wait_ticks 1:100 起步,未到
+    let _ = driver.frame(0.016, 101, &world); // wait_ticks 完成 → Ready
+    assert_eq!(driver.phase(), StagePhase::Ready);
+    // 按 K 播放动作段:第一个 spawn 当帧发出,进入 wait_until(ok_since = 101)。
+    driver.play();
+    let out = driver.frame(0.016, 101, &world);
+    assert_eq!(out.len(), 1, "第一个 spawn 当帧发出");
+    assert!(
+        matches!(driver.phase(), StagePhase::Playing { .. }),
+        "wait_until hold 未满,播放中"
+    );
+    // 拍 111(held = 11)、拍 121(held = 21)都不满足;拍 130(held = 30 ≥ 30)
+    // 满足 → 动作段尾 spawn 发出 → Played。
+    for tick in [111u64, 121u64] {
+        let out = driver.frame(0.016, tick, &world);
+        assert!(out.is_empty(), "拍 {tick} hold 未满,无命令");
+        assert!(
+            matches!(driver.phase(), StagePhase::Playing { .. }),
+            "拍 {tick} 仍在等待"
+        );
+    }
+    let out = driver.frame(0.016, 130, &world);
+    assert_eq!(out.len(), 1, "hold 满足后动作段第二个 spawn 当帧发出");
+    assert_eq!(driver.phase(), StagePhase::Played);
+}
+
+/// stage hold_ticks 中途断开重新计数 + 超时提示后继续。
+#[test]
+fn stage_wait_until_hold_ticks_restart_and_timeout_continues() {
+    // wait_until 恒不成立(chunks_loaded ge 999),hold 30 timeout 50:
+    // 拍 1 起步(动作段),超时点 51;拍 51 提示后继续到动作段尾。
+    let text = scenario_text(&[
+        "wait_ticks = { n = 1 }",
+        "spawn = { at = [1.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+        "wait_until = { chunks_loaded = { ge = 999 }, timeout_ticks = 50, hold_ticks = 30 }",
+        "spawn = { at = [2.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+    ]);
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let world = StubWorld::empty();
+    let _ = driver.frame(0.016, 0, &world);
+    let _ = driver.frame(0.016, 1, &world); // wait_ticks 完成 → Ready
+    driver.play();
+    let out = driver.frame(0.016, 1, &world);
+    assert_eq!(out.len(), 1, "第一个 spawn 当帧发出");
+    let out = driver.frame(0.016, 50, &world);
+    assert!(out.is_empty(), "拍 50 未到超时点(≥51 才超)");
+    let out = driver.frame(0.016, 51, &world);
+    assert_eq!(out.len(), 1, "超时后提示并继续:第二个 spawn 发出");
+    let notice = driver.take_timeout_notice().expect("超时要给提示");
+    assert!(notice.starts_with("stage wait timeout: "), "{notice}");
+    assert_eq!(driver.phase(), StagePhase::Played);
+
+    // 按拍重新计数:ok_since = 201,拍 230 held = 30 ≥ 30 满足(拍 229 差一拍)。
+    let text = scenario_text(&[
+        "wait_ticks = { n = 1 }",
+        "spawn = { at = [0.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+        "wait_until = { chunks_loaded = { ge = 1 }, timeout_ticks = 1000, hold_ticks = 30 }",
+        "spawn = { at = [3.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+    ]);
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let empty = StubWorld::empty();
+    let _ = driver.frame(0.016, 200, &empty);
+    let _ = driver.frame(0.016, 201, &empty); // wait_ticks 完成 → Ready
+    driver.play();
+    let out = driver.frame(0.016, 201, &empty);
+    assert_eq!(out.len(), 1, "第一个 spawn 当帧发出");
+    // ok_since = 201:拍 229 held = 29 卡边界;拍 230 held = 30 满足。
+    let out = driver.frame(0.016, 229, &empty);
+    assert!(out.is_empty(), "拍 229 held = 29 < 30,仍等待");
+    let out = driver.frame(0.016, 230, &empty);
+    assert_eq!(out.len(), 1, "拍 230 held = 30 ≥ 30,结束");
+    assert_eq!(driver.phase(), StagePhase::Played);
+}
+
+/// `R` 重建清空 hold 状态(必修 3):重放后 wait_until 从零起算。
+#[test]
+fn stage_rebuild_clears_hold_state() {
+    let text = scenario_text(&[
+        "camera = { pos = [1.0, 2.0, 3.0], yaw = 0.0, pitch = 0.0 }",
+        "wait_until = { chunks_loaded = { ge = 1 }, timeout_ticks = 1000, hold_ticks = 5 }",
+        "spawn = { at = [0.0, -59.0, 0.0], count = 1, velocity = [0.0, 0.0, 0.0] }",
+    ]);
+    let mut driver = StageDriver::new(parse(&text), pose());
+    let world = StubWorld::empty();
+    // 布景:camera 步骤完成 → 等待 hold 5(成立段 ok_since = 0)。
+    let _ = driver.frame(0.016, 0, &world);
+    assert_eq!(driver.phase(), StagePhase::Building, "hold 未满仍 Building");
+    // R:清空状态重放 → hold 从零起算,拍 4(held 5 ≥ 5)完成。
+    let mut out = Vec::new();
+    driver.rebuild(&world, &mut out);
+    assert_eq!(driver.phase(), StagePhase::Building);
+    let _ = driver.frame(0.016, 0, &world); // camera 重放;wait_until ok_since = 0
+    let _ = driver.frame(0.016, 3, &world); // held 4 < 5
+    assert_eq!(driver.phase(), StagePhase::Building);
+    let _ = driver.frame(0.016, 4, &world); // held 5 → Ready
+    assert_eq!(driver.phase(), StagePhase::Ready);
+}
+
 /// fill 分批与脚本引擎逐位一致:布景执行器逐帧发出的 SetBlock 序列 = 脚本
 /// 引擎 fill_cells 展开按 FILL_BATCH_PER_FRAME 切片拼接(含尾批)。
 #[test]
@@ -628,11 +744,11 @@ fn play_spawn_with_shape_carries_compound_desc() {
         "spawn = { at = [2.5, -57.5, 20.5], count = 1, velocity = [20.0, 0.0, 0.0], shape = { cells = [[0,0,0],[1,0,0]], block = \"stone\" } }",
     ]);
     let mut driver = StageDriver::new(parse(&text), pose());
-    let world = StubWorld::empty();
-    let _ = driver.frame(0.016, 0, &world);
-    let _ = driver.frame(0.016, 1, &world);
+    let empty = StubWorld::empty();
+    let _ = driver.frame(0.016, 200, &empty);
+    let _ = driver.frame(0.016, 201, &empty); // wait_ticks 完成 → Ready
     driver.play();
-    let out = driver.frame(0.016, 1, &world);
+    let out = driver.frame(0.016, 201, &empty);
     assert_eq!(out.len(), 1);
     match &out[0] {
         StageOut::Command(EngineCommand::Spawn { state, desc }) => {

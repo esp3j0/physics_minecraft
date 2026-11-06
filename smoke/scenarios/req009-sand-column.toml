@@ -38,6 +38,10 @@ screenshot = { name = "column", expect = "棕色地面上一块灰色石头,石�
 label = "移走石块"
 set_block = { pos = [6, -60, 14], block = "air" }
 
+# 先等塌落实体出现(杜绝实体帧未到时空过)。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 label = "等沙柱塌落"
 wait_until = { block = { pos = [6, -55, 14], is = "air" }, timeout_ticks = 120 }
@@ -46,7 +50,7 @@ wait_until = { block = { pos = [6, -55, 14], is = "air" }, timeout_ticks = 120 }
 wait_ticks = { n = 5 }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 600 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 600, hold_ticks = 30 }
 
 [[step]]
 check = { block = { pos = [6, -55, 14], is = "air" }, no_floating = { height = 1.5, still_ticks = 30 } }

@@ -236,11 +236,57 @@ fn empty_check_rejected_but_wait_until_allows_empty() {
         Action::WaitUntil {
             checks,
             timeout_ticks,
+            hold_ticks,
         } => {
             assert!(checks.is_empty());
             assert_eq!(*timeout_ticks, 5);
+            assert_eq!(*hold_ticks, 0, "hold_ticks 缺省 0(旧语义)");
         }
         other => panic!("应为 wait_until:{other:?}"),
+    }
+}
+
+/// wait_until 的 hold_ticks(S01 冒烟降噪):可选、非负整数;缺省 0 = 旧语义;
+/// 写了按写值解析;负数/非整数报错并带步骤序号;check 动作不接受 hold_ticks。
+#[test]
+fn wait_until_hold_ticks_parses_and_rejects_malformed() {
+    // 正例:hold_ticks = 30。
+    let s = parse_scenario(&one_step(
+        "wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }",
+    ))
+    .expect("hold_ticks 正例应可解析");
+    match &s.steps[0].action {
+        Action::WaitUntil {
+            checks,
+            timeout_ticks,
+            hold_ticks,
+        } => {
+            assert_eq!(checks, &vec![Check::LiveEntities(Cmp::Eq(0))]);
+            assert_eq!(*timeout_ticks, 900);
+            assert_eq!(*hold_ticks, 30);
+        }
+        other => panic!("应为 wait_until:{other:?}"),
+    }
+
+    // hold_ticks = 0 显式写出与缺省等价。
+    let s = parse_scenario(&one_step(
+        "wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 0 }",
+    ))
+    .expect("hold_ticks = 0 应可解析");
+    match &s.steps[0].action {
+        Action::WaitUntil { hold_ticks, .. } => assert_eq!(*hold_ticks, 0),
+        other => panic!("应为 wait_until:{other:?}"),
+    }
+
+    // 反例:负数、浮点小数、字符串;check 带 hold_ticks 报未知键。
+    for bad in [
+        "wait_until = { timeout_ticks = 5, hold_ticks = -1 }",
+        "wait_until = { timeout_ticks = 5, hold_ticks = 1.5 }",
+        "wait_until = { timeout_ticks = 5, hold_ticks = \"x\" }",
+        "check = { live_entities = { eq = 0 }, hold_ticks = 5 }",
+    ] {
+        let e = err(&one_step(bad));
+        assert_eq!(e.step, Some(1), "反例应报步骤 1:{bad} → {e}");
     }
 }
 

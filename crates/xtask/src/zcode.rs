@@ -73,6 +73,10 @@ impl ZcodeReviewer {
 
 impl Reviewer for ZcodeReviewer {
     fn review(&mut self, image: &Path, prompt: &str) -> Result<String, String> {
+        // 附件路径统一绝对化(S01 返修必修 1):相对路径传给 zcode 的 --attach
+        // 不被摄入,审图模型看不到像素、只按 expect 文字作答(基线之所以没
+        // 踩到,是校准集恰好用绝对路径)。入口(smoke)已归一,这里兜底。
+        let image = std::path::absolute(image).map_err(|e| format!("附件路径绝对化失败:{e}"))?;
         if self.progress {
             println!("    调用 zcode 审 {} …", image.display());
         }
@@ -83,7 +87,7 @@ impl Reviewer for ZcodeReviewer {
             .arg("-p")
             .arg(prompt)
             .arg("--attach")
-            .arg(image)
+            .arg(&image)
             .arg("--mode")
             .arg("plan")
             .arg("--json")

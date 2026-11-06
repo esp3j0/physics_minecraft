@@ -29,14 +29,18 @@ wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge
 label = "贴地引爆"
 detonate = { at = [8.0, -59.5, 14.0], power = 12.0, radius = 8.0 }
 
+# 先等炸松的实体出现(杜绝实体帧未到时空过),再给翻起下落留时间,最后截图。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "blast", expect = "棕色地面上出现一个浅坑,坑内和坑边有若干蓝色立方体(刚被炸松的土块)" }
+screenshot = { name = "blast", expect = "棕色地面上出现一个浅坑,坑内或坑边能看到蓝色立方体(刚被炸松、尚未凝固的土块);坑本身已经成形" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, -64, 14], is = "bedrock" } }
@@ -45,4 +49,4 @@ check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [8, 
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "settled", expect = "棕色地面上有一个浅坑,坑里散落着凝固的棕色方块;空中没有蓝色立方体,也没有悬浮的方块" }
+screenshot = { name = "settled", expect = "棕色地面上有一个浅坑,坑里和坑边散落着凝固的棕色方块(颜色与地面相近但坑的轮廓清晰);空中没有蓝色立方体,也没有悬浮的方块" }

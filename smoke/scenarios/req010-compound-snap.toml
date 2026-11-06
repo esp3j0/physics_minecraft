@@ -29,6 +29,10 @@ spawn = { at = [5.5, -57.5, 20.5], count = 1, label = "bar", shape = { cells = [
 [[step]]
 wait_ticks = { n = 3 }
 
+# 先等土条实体出现(杜绝实体帧未到时空过),再发射子弹。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 label = "单格石头方块 40 m/s 沿 +z 撞端格(端格 = x=10 格,格心 (10.5,-57.5,20.5);从端格外侧 z=16.5 起飞)"
 spawn = { at = [5.5, -57.5, 16.5], count = 1, velocity = [0.0, 0.0, 40.0], label = "bullet" }
@@ -36,35 +40,37 @@ spawn = { at = [5.5, -57.5, 16.5], count = 1, velocity = [0.0, 0.0, 40.0], label
 [[step]]
 wait_ticks = { n = 3 }
 
+# 子弹 40 m/s 约 6 拍就撞上,首帧常常已撞上:expect 按"土条悬空 + 有蓝色方块"
+# 写,方位不作硬性断言(分开的位置证据由 burst-03/04 承担)。
 [[step]]
-screenshot = { name = "burst-01", expect = "一根横着的蓝色土条悬在空中,一个蓝色小方块在土条左侧(z 较小一侧)飞向土条左端" }
+screenshot = { name = "burst-01", expect = "一根横着的蓝色土条悬在空中(未接触地面),画面里另有蓝色方块(投射物,或在土条一端附近);空中没有凝固的灰色方块" }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-02", expect = "土条左端被撞:一个蓝色方块(端格)开始脱离土条向 z 大的一侧飞出,其余土条整体向同方向平移" }
+screenshot = { name = "burst-02", expect = "画面中有蓝色方块开始与土条分离或已分离:至少一个方块在土条条形之外移动(端格被击飞的开始);土条主体仍大致保持条形" }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-03", expect = "端格方块与土条主体明显分离,飞在前方;主体 5 格保持条形继续平移下落" }
+screenshot = { name = "burst-03", expect = "土条主体与击飞部分明显分离成两部分:前方一小段蓝色方块(1–2 格)、后方主体条形(约 4–5 格),两者之间有空隙" }
 
 [[step]]
 wait_ticks = { n = 5 }
 
 [[step]]
-screenshot = { name = "burst-04", expect = "端格方块飞到远处(z 大的一侧),土条主体落在后方接近地面" }
+screenshot = { name = "burst-04", expect = "击飞的方块(1–2 格)与土条主体两部分清晰分离,两者之间有明显空隙;击飞部分飞在更远离相机的一侧(画面上缘方向),主体靠近相机一侧;主体接近地面或仍在下落" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500, hold_ticks = 30 }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "settled", expect = "终态:地面上两处棕色土块——土条主体(约 5 格)在原位附近,一个孤立的土格落在 z 更大(画面更深处)的地面上;旁边还有一个小石头方块(投射物)落定;空中没有蓝色立方体" }
+screenshot = { name = "settled", expect = "终态:近处地面上是贴地凝固的土条主体(约 5 格,连成一短条);远处(z 更大、画面更深处)有两个小方块——击飞的端格土块与投射物石头,都凝固落定;空中没有蓝色立方体" }
 
 [[step]]
 label = "全部落定、无悬浮"

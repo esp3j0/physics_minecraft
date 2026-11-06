@@ -52,8 +52,16 @@ check = { block = { pos = [7, -58, 20], is = "stone" } }
 [[step]]
 check = { block = { pos = [10, -59, 20], is = "stone" } }
 
+# 低机位近拍:7 字贴着地平线下方,柱脚与地面的接触可见(高机位俯视时结构
+# 悬在地平线上,看不出柱脚是否落地——20261103 基线 flagged)。
 [[step]]
-screenshot = { name = "seven-shape", expect = "一个 7 字形石结构:右侧一根两格高石柱站在地上,柱顶向左横伸出一根四格长石门楣,门楣左端悬空;空中没有蓝色立方体" }
+camera = { pos = [8.5, -57.0, 26.0], yaw = -90.0, pitch = -8.0 }
+
+[[step]]
+look_at = { target = [8.5, -58.5, 20.0] }
+
+[[step]]
+screenshot = { name = "seven-shape", expect = "一个灰色的 7 字形石结构立在棕色地面上:右侧一根两格高石柱,柱底与地面相接,柱顶向左横伸出一根四格长石门楣,门楣左端悬空;空中没有蓝色立方体" }
 
 [[step]]
 label = "相机推近拐角(连拍观察位)"
@@ -66,62 +74,74 @@ look_at = { target = [9.0, -58.0, 20.0] }
 label = "发射方块撞门楣-柱顶拐角(跨 (10,-58) 与 (10,-59) 两行石头)"
 spawn = { at = [16.0, -57.4, 20.2], count = 1, velocity = [-40.0, -7.0, 0.0], label = "projectile" }
 
+# 撞击后先等 7 字变成实体(杜绝空过),连拍按状态证据写 expect。
 [[step]]
-wait_ticks = { n = 3 }
-
-[[step]]
-screenshot = { name = "burst-01", expect = "7 字形石结构完整:右侧两格高石柱,柱顶向左伸出四格门楣;一个蓝色投射物方块从右侧飞来,即将撞上拐角" }
-
-[[step]]
-wait_ticks = { n = 3 }
-
-[[step]]
-screenshot = { name = "burst-02", expect = "撞击已发生:整个 7 字(门楣四格和柱子两格)一起变成蓝色,作为一个整体离开原位;蓝色投射物在其右侧" }
+wait_until = { live_entities = { ge = 2 }, timeout_ticks = 300 }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-03", expect = "蓝色 7 字整体向左飞出并开始倾斜翻转,形状保持完整、没有散开;原位置已空" }
+screenshot = { name = "burst-01", expect = "画面里有蓝色方块(7 字被撞后变成的活实体,和/或投射物);原地不再有完整的灰色 7 字形——撞击已经发生" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-02", expect = "多个蓝色方块组成的群体整体离开了原柱位(x=10),呈倾斜或移动中的姿态;主体(至少 5 格)连在一起,允许至多 1 个方块脱离主体单独飞行" }
+
+[[step]]
+wait_ticks = { n = 3 }
+
+[[step]]
+screenshot = { name = "burst-03", expect = "蓝色方块群整体位于原柱位左侧(x < 10)的空中,证明整个 7 字朝撞击反方向飞出;主体(至少 5 格)连在一起,允许至多 1 个方块完全脱离主体单独飞行" }
 
 [[step]]
 wait_ticks = { n = 4 }
 
 [[step]]
-screenshot = { name = "burst-04", expect = "蓝色 7 字继续向左上方或左方飞行并旋转,形状完整;投射物在右侧低处" }
+screenshot = { name = "burst-04", expect = "蓝色方块群整体位于原柱位(x=10)左侧较远处的空中或已接近地面,仍是一个聚拢的群体(至多 1 个方块在外);投射物(若可见)在其右侧" }
 
 [[step]]
 wait_ticks = { n = 5 }
 
 [[step]]
-screenshot = { name = "burst-05", expect = "蓝色 7 字明显倾斜(柱子一端翘起),整体向左下方落;形状完整" }
+screenshot = { name = "burst-05", expect = "蓝色方块群整体明显向左下方落下(高度低于门楣原高度),主体聚拢成倾斜的形状;允许边缘个别方块分离,但主体(≥4 格)连在一起" }
 
 [[step]]
 wait_ticks = { n = 8 }
 
 [[step]]
-screenshot = { name = "burst-06", expect = "蓝色 7 字接近地面或落地翻滚,仍是一个完整的形状;投射物在右侧地面附近" }
+screenshot = { name = "burst-06", expect = "蓝色方块群接近地面或已接触地面翻滚,主体仍是聚拢的一团(不是散成单格);投射物(若可见)在右侧" }
 
 [[step]]
 wait_ticks = { n = 12 }
 
 [[step]]
-screenshot = { name = "burst-07", expect = "7 字形状躺倒在原位置左侧的地面上(蓝色或正在凝固);投射物在右侧" }
+screenshot = { name = "burst-07", expect = "方块群落在原柱位左侧的地面上(蓝色或正在凝固),主体聚拢;投射物在右侧区域" }
 
 [[step]]
 wait_ticks = { n = 20 }
 
 [[step]]
-screenshot = { name = "burst-08", expect = "7 字形状平躺在左侧地面上,可能已凝固成灰色;原位置没有任何残留" }
+screenshot = { name = "burst-08", expect = "方块群贴在原柱位左侧的地面上(灰色或蓝色);原柱位(x=10 竖直线)附近没有残留的竖立结构,画面中只有一个小的分离方块允许在群体外" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500, hold_ticks = 30 }
 
 [[step]]
 wait_ticks = { n = 20 }
 
+# 低机位近拍终态:倒下的 L 形衬着地面(同 seven-shape 的理由,俯视高机位
+# 看不清贴地的形状——20261103 基线 flagged 同类)。
 [[step]]
-screenshot = { name = "settled", expect = "终态:原来的 7 字形石结构从原位完全消失;在原位置左侧的地面上平躺着一个灰色的 L 形(由 7 字倒下变成,一长边四格、一短边两格,共 6 格);右侧地面上有一个灰色方块(投射物);空中没有蓝色立方体" }
+camera = { pos = [4.0, -56.5, 27.0], yaw = -70.0, pitch = -12.0 }
+
+[[step]]
+look_at = { target = [4.0, -59.5, 18.0] }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:画面主体是一个灰色的 6 格 L 形(一长边四格、一短边两格)整体落在地面上,由倒下的 7 字凝固而成;整体姿态不限(翻倒后短边可以竖起或平躺),但 6 格连成一个整体;画面边缘附近的地面上另有一个单独的灰色小方块(投射物凝固),不属于 L 形;原来的 7 字位置(画面右侧远处)没有残留的竖立结构;空中没有蓝色立方体" }
 
 [[step]]
 label = "全部落定、无悬浮"

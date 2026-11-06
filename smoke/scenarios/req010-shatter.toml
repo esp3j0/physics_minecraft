@@ -14,7 +14,7 @@ enabled = true
 
 [[step]]
 label = "相机就位"
-camera = { pos = [7.5, -48.0, 32.0], yaw = -90.0, pitch = -18.0 }
+camera = { pos = [7.5, -50.0, 30.0], yaw = -90.0, pitch = -15.0 }
 
 [[step]]
 look_at = { target = [7.5, -56.0, 14.0] }
@@ -34,40 +34,48 @@ wait_until = { live_entities = { ge = 2 }, timeout_ticks = 120 }
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-01", expect = "一根竖直的蓝色 6 格土柱悬在空中,即将落地" }
+screenshot = { name = "burst-01", expect = "画面中有蓝色方块组成的柱状群体悬在空中或下落中(6 格土柱已变成活实体);没有凝固成灰色" }
 
 [[step]]
 wait_ticks = { n = 3 }
 
 [[step]]
-screenshot = { name = "burst-02", expect = "土柱刚接触地面:底格受力,柱体仍大致竖直或开始倾倒" }
+screenshot = { name = "burst-02", expect = "蓝色方块群已靠近地面(明显低于悬空土柱的初始高度),柱体仍大致成竖直或开始倾斜;地面上方没有灰色凝固方块" }
 
 [[step]]
 wait_ticks = { n = 4 }
 
 [[step]]
-screenshot = { name = "burst-03", expect = "土柱碎开:底格从柱脚断开,其余 5 格作为一个整体倾倒/平移,蓝色方块开始散开" }
+screenshot = { name = "burst-03", expect = "蓝色方块群已接触地面并开始倾倒或散开:群体不再保持入射前的竖直姿态,能看到柱脚附近方块与主体错位" }
 
 [[step]]
 wait_ticks = { n = 8 }
 
 [[step]]
-screenshot = { name = "burst-04", expect = "土块散落在地面附近翻滚,不再是完整竖直的柱子" }
+screenshot = { name = "burst-04", expect = "蓝色方块群仍在柱位附近(没有飞离):柱体已有断开、倾斜或错位的迹象,不再保持入射前的竖直姿态;群体尚未横躺成一片" }
 
 [[step]]
 wait_ticks = { n = 15 }
 
 [[step]]
-screenshot = { name = "burst-05", expect = "土块陆续落地,有的还在滚动;原柱位置只有零星土块" }
+screenshot = { name = "burst-05", expect = "蓝色方块群接近地面或已贴地,柱体明显倾斜(不再竖直),柱脚附近有分离的方块;群体仍在柱位附近,没有散落到远处" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1500, hold_ticks = 30 }
 
 [[step]]
 wait_ticks = { n = 20 }
 
+# 低机位近拍(距离约 6 m):土块群在画面里可辨轮廓但不糊成一片(r2 的
+# 4 m 机位太近,土块群占满画面下半被当成一整片)。
 [[step]]
-screenshot = { name = "settled", expect = "终态:地面上散落着 6 格棕色土块(不再是一根完整竖立的土柱);空中没有蓝色立方体" }
+camera = { pos = [7.5, -57.5, 18.5], yaw = -90.0, pitch = -17.0 }
+
+[[step]]
+look_at = { target = [7.5, -59.5, 12.0] }
+
+[[step]]
+screenshot = { name = "settled", expect = "终态:近处地面上散落着棕色土块,画面中下部的深色区域就是凝固的土块群,与周围平坦地表形成深浅差;不再是原来的完整竖直土柱;空中没有蓝色立方体" }
 
 [[step]]
 label = "全部落定、无悬浮"

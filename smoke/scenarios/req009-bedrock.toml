@@ -29,6 +29,10 @@ wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge
 label = "大威力贴地引爆"
 detonate = { at = [8.0, -59.5, 14.0], power = 48.0, radius = 12.0 }
 
+# 先等炸松的实体出现(杜绝实体帧未到时空过,后续等待与检查才可靠)。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 wait_until = { block = { pos = [8, -63, 14], is = "air" }, timeout_ticks = 120 }
 
@@ -36,7 +40,7 @@ wait_until = { block = { pos = [8, -63, 14], is = "air" }, timeout_ticks = 120 }
 wait_ticks = { n = 5 }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 check = { block = { pos = [8, -64, 14], is = "bedrock" }, no_floating = { height = 1.5, still_ticks = 30 } }

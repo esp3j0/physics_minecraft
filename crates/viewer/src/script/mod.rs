@@ -94,6 +94,13 @@ pub enum Action {
     WaitUntil {
         checks: Vec<Check>,
         timeout_ticks: u64,
+        /// 可选(缺省 0):全部条件须**连续**成立 N 拍才算满足;中途任一拍不成立
+        /// 即清零重新计数;`timeout_ticks` 仍从步骤开始的第一拍起算(计数未满 N
+        /// 拍同样会超时失败)。toml 写法 `wait_until = { .., hold_ticks = N }`;
+        /// 不写或写 0 与旧语义逐位相同(任一拍成立即过)。用途(S01 冒烟降噪):
+        /// `live_entities = { eq = 0 }` + `hold_ticks = 30` 防实体帧未到的空过,
+        /// 并保证凝固回填已完成。
+        hold_ticks: u64,
     },
     Check {
         checks: Vec<Check>,

@@ -513,3 +513,197 @@ spawn = { at = [10.0, -50.0, 20.0] }",
     assert_eq!(*desc, types::EntityDesc::default(), "默认单格 desc");
     assert_eq!(state.translation, Vec3::new(10.0, -50.0, 20.0));
 }
+
+/// hold_ticks(S01 冒烟降噪)·连续满足:条件连续成立满 N 拍才通过。
+/// 拍 100 条件成立(计 1),拍 101..=104 连续成立,到第 5 拍(计 5 ≥ 5)该步才结束——
+/// 早于第 5 个观测拍结束的实现(任一拍成立即过)在这里变红。
+#[test]
+fn hold_ticks_passes_only_after_continuous_hold() {
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 100, hold_ticks = 5 }",
+    );
+    let w = FlatWorld::with_entities(&[]);
+    let mut finished_at = None;
+    for tick in 100..=105 {
+        let out = frame(&mut e, 0.016, tick, &w, &[]);
+        if !out.finished.is_empty() {
+            finished_at = Some(tick);
+            break;
+        }
+    }
+    assert_eq!(
+        finished_at,
+        Some(104),
+        "拍 100..104 共 5 拍连续成立,第 5 个观测拍(104)才结束"
+    );
+    assert_eq!(e.exit_code(), Some(0));
+}
+
+/// hold_ticks · 中途断开重新计数:成立若干拍后被打破,须从打破后的下一拍重新数起。
+/// 会变红的实现:计数不清零(总成立拍数累计)、按帧而非按拍计数(同拍两帧计 2)。
+#[test]
+fn hold_ticks_restarts_after_broken_streak() {
+    // 拍 100 成立(计 1)、拍 101 成立(计 2)、拍 102 不成立(清零)、
+    // 拍 103..106 连续成立(计 4 ≥ 4)→ 拍 106 结束。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 200, hold_ticks = 4 }",
+    );
+    let empty = FlatWorld::with_entities(&[]);
+    let occupied = FlatWorld::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
+    let expect_end_at = [
+        (100, true, None),      // 计 1
+        (101, true, None),      // 计 2
+        (102, false, None),     // 断开 → 清零
+        (103, true, None),      // 计 1
+        (104, true, None),      // 计 2
+        (105, true, None),      // 计 3
+        (106, true, Some(106)), // 计 4 ≥ 4 → 结束
+    ];
+    for (tick, holds, end_at) in expect_end_at {
+        let w = if holds {
+            empty.clone_shallow()
+        } else {
+            occupied.clone_shallow()
+        };
+        let out = frame(&mut e, 0.016, tick, &w, &[]);
+        match end_at {
+            Some(_) => assert_eq!(
+                out.finished.len(),
+                1,
+                "拍 {tick} 连续成立满 4 拍,该步应结束"
+            ),
+            None => assert!(out.finished.is_empty(), "拍 {tick} 不应结束(hold 未满)"),
+        }
+    }
+    assert_eq!(e.exit_code(), Some(0));
+}
+
+/// hold_ticks · 同一拍内的多帧不重复计数(计数按拍,不按帧)。
+/// 会变红的实现:每帧 held + 1(同拍两帧就凑满 N)。
+#[test]
+fn hold_ticks_counts_ticks_not_frames() {
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 100, hold_ticks = 3 }",
+    );
+    let w = FlatWorld::with_entities(&[]);
+    // 同一拍 100 推三帧:只应计 1 拍。
+    for _ in 0..3 {
+        let out = frame(&mut e, 0.016, 100, &w, &[]);
+        assert!(out.finished.is_empty(), "同拍多帧不得凑满计数");
+    }
+    // 拍 101、102 各一帧:计 2、3 → 拍 102 结束。
+    let out = frame(&mut e, 0.016, 101, &w, &[]);
+    assert!(out.finished.is_empty(), "计 2 < 3,不结束");
+    let out = frame(&mut e, 0.016, 102, &w, &[]);
+    assert_eq!(out.finished.len(), 1, "计 3 ≥ 3,拍 102 结束");
+    assert_eq!(e.exit_code(), Some(0));
+}
+
+/// hold_ticks · 超时:timeout_ticks 仍从步骤开始拍起算;条件一直不成立,或成立
+/// 但 hold 计数未满(如断开重计耗光了窗口),到 start + timeout 拍即失败,
+/// 失败消息写明要求连续成立的拍数。
+#[test]
+fn hold_ticks_times_out_from_step_start() {
+    // 一直不成立:拍 100 起步、timeout 10 → 拍 110 失败(与无 hold 时边界一致)。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 10, hold_ticks = 3 }",
+    );
+    let occupied = FlatWorld::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
+    frame(&mut e, 0.016, 100, &occupied, &[]);
+    frame(&mut e, 0.016, 105, &occupied, &[]);
+    let out = frame(&mut e, 0.016, 110, &occupied, &[]);
+    assert!(matches!(e.status(), EngineStatus::Failed { step: 1, .. }));
+    match out.finished.last().map(|r| r.outcome.clone()) {
+        Some(StepOutcome::Error(reason)) => {
+            assert!(
+                reason.contains("hold_ticks") || reason.contains("3"),
+                "超时消息应写明 hold 要求:{reason}"
+            );
+        }
+        other => panic!("应超时失败,实得 {other:?}"),
+    }
+
+    // 成立但计数未满:timeout 10、hold 8,拍 100 起步,拍 102 才成立(计 1)…
+    // 到拍 110 时连续计数最多 9,但仍未到 8 → 边界拍失败(hold 挡不住 timeout)。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 10, hold_ticks = 12 }",
+    );
+    let empty = FlatWorld::with_entities(&[]);
+    let occupied = FlatWorld::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
+    // 拍 100..101 有实体(不成立),拍 102 起成立,连续计数 102..110 最多 9 < 12。
+    frame(&mut e, 0.016, 100, &occupied, &[]);
+    frame(&mut e, 0.016, 101, &occupied, &[]);
+    for tick in 102..110 {
+        let out = frame(&mut e, 0.016, tick, &empty.clone_shallow(), &[]);
+        assert!(out.finished.is_empty(), "拍 {tick} hold 未满不应结束");
+    }
+    let out = frame(&mut e, 0.016, 110, &empty, &[]);
+    assert_eq!(out.finished.len(), 1, "拍 110 = 100 + 10,超时失败");
+    assert!(matches!(e.status(), EngineStatus::Failed { step: 1, .. }));
+
+    // hold_ticks = 0(或缺省)保持旧语义:任一拍成立即过。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 10, hold_ticks = 0 }",
+    );
+    let out = frame(&mut e, 0.016, 100, &FlatWorld::with_entities(&[]), &[]);
+    assert_eq!(out.finished.len(), 1, "hold = 0 时首拍成立即过(旧语义)");
+    assert_eq!(e.exit_code(), Some(0));
+}
+
+/// hold_ticks 按拍号计,不按观测次数(S01 返修必修 2):viewer 每 ~10 拍才
+/// 拿到一次新拍号,hold_ticks = 30 应在 ok_since + 30 拍(即第 3 个观测拍)
+/// 满足——按观测 +1 计数的实现要等 30 个观测拍(约 300 拍),在这里变红。
+/// 同时覆盖中途断开后按拍重新计数。
+#[test]
+fn hold_ticks_counts_server_ticks_with_skipped_observations() {
+    // 连续满足:步骤拍 100 起步,拍 100 成立(ok_since = 100),
+    // 拍 110 held = 11、拍 120 held = 21、拍 130 held = 31 ≥ 30 → 拍 130 结束;
+    // 拍 120 仍不满足。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1000, hold_ticks = 30 }",
+    );
+    let w = FlatWorld::with_entities(&[]);
+    for tick in [100, 110, 120] {
+        let out = frame(&mut e, 0.016, tick, &w, &[]);
+        assert!(
+            out.finished.is_empty(),
+            "拍 {tick} 连续成立不足 30 拍,不应结束"
+        );
+    }
+    let out = frame(&mut e, 0.016, 130, &w, &[]);
+    assert_eq!(
+        out.finished.len(),
+        1,
+        "拍 130 = ok_since 100 + 30,held = 31 ≥ 30,应结束"
+    );
+    assert_eq!(e.exit_code(), Some(0));
+
+    // 中途断开重新计数(拍号大步长):拍 200 成立、拍 210 成立、拍 220 断开
+    // (清空)、拍 230 重新成立(ok_since = 230)→ 拍 260 held = 31 ≥ 30 结束,
+    // 拍 250(held = 21)不结束。
+    let mut e = engine(
+        "[[step]]
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1000, hold_ticks = 30 }",
+    );
+    let occupied = FlatWorld::with_entities(&[(eid(1), Vec3::new(0.5, -59.5, 0.5))]);
+    frame(&mut e, 0.016, 200, &FlatWorld::with_entities(&[]), &[]);
+    frame(&mut e, 0.016, 210, &FlatWorld::with_entities(&[]), &[]);
+    frame(&mut e, 0.016, 220, &occupied, &[]);
+    for tick in [230, 240, 250] {
+        let out = frame(&mut e, 0.016, tick, &FlatWorld::with_entities(&[]), &[]);
+        assert!(
+            out.finished.is_empty(),
+            "拍 {tick} 距重新成立(ok_since 230)不足 30 拍,不应结束"
+        );
+    }
+    let out = frame(&mut e, 0.016, 260, &FlatWorld::with_entities(&[]), &[]);
+    assert_eq!(out.finished.len(), 1, "拍 260 = ok_since 230 + 30,应结束");
+    assert_eq!(e.exit_code(), Some(0));
+}

@@ -59,6 +59,10 @@ check = { block = { pos = [8, -58, 14], is = "stone" } }
 label = "移走右柱"
 fill = { from = [11, -60, 14], to = [11, -59, 14], block = "air" }
 
+# 先等塌落实体出现(杜绝实体帧未到时空过)。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
 [[step]]
 wait_until = { block = { pos = [8, -58, 14], is = "air" }, timeout_ticks = 120 }
 
@@ -66,10 +70,10 @@ wait_until = { block = { pos = [8, -58, 14], is = "air" }, timeout_ticks = 120 }
 wait_ticks = { n = 6 }
 
 [[step]]
-screenshot = { name = "falling", expect = "一整根蓝色横梁(6 个方块连成一根)在空中平平地下落;两根石柱都不见了" }
+screenshot = { name = "falling", expect = "画面中部有一整根蓝色横梁(6 个方块横向连成一根,没有散开成单格),在原梁高度的下方、地面附近或已经贴地——整根梁已从两根矮柱上脱落下落;画面中没有任何直立的蓝色或灰色柱状结构站在梁原来的位置上" }
 
 [[step]]
-wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900 }
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 900, hold_ticks = 30 }
 
 [[step]]
 check = { no_floating = { height = 1.5, still_ticks = 30 }, block = { pos = [6, -60, 14], is = "stone" } }

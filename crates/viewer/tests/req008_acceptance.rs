@@ -247,7 +247,8 @@ screenshot = { name = "return", expect = "地面上有方块", hud = true }
         s.steps[10].action,
         Action::WaitUntil {
             checks: vec![Check::LiveEntities(Cmp::Eq(0))],
-            timeout_ticks: 900
+            timeout_ticks: 900,
+            hold_ticks: 0
         }
     );
     match &s.steps[11].action {

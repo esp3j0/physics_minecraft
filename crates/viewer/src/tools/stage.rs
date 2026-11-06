@@ -124,6 +124,9 @@ pub struct StageDriver {
     fill: Option<FillProgress>,
     /// 等待步骤的起点拍号(进入该步那一帧的拍号)。
     wait_start: Option<u64>,
+    /// `wait_until` 连续成立段的起始拍号(与脚本引擎同语义;步骤切换 /
+    /// `R` 重建 / `K` 播放时清零)。
+    wait_hold_since: Option<u64>,
     /// 本帧的超时提示(`wait_until` 超时;主循环读走)。
     timeout_notice: Option<String>,
     /// 按键拒绝提示(W05-2:Building 时按 `K`;主循环读走)。
@@ -150,6 +153,7 @@ impl StageDriver {
             segment: Segment::Staging,
             fill: None,
             wait_start: None,
+            wait_hold_since: None,
             timeout_notice: None,
             reject_notice: None,
             server_notice,
@@ -226,6 +230,7 @@ impl StageDriver {
         self.phase = StagePhase::Building;
         self.fill = None;
         self.wait_start = None;
+        self.wait_hold_since = None;
     }
 
     /// `K`:播放动作段。播放中再按无效(不发命令、不改状态);**布景搭建中
@@ -246,6 +251,7 @@ impl StageDriver {
         self.cursor = 0;
         self.fill = None;
         self.wait_start = None;
+        self.wait_hold_since = None;
         if self.split.action.is_empty() {
             self.phase = StagePhase::Played;
         } else {
@@ -325,17 +331,31 @@ impl StageDriver {
                 Action::WaitUntil {
                     checks,
                     timeout_ticks,
+                    hold_ticks,
                 } => {
                     let start = *self.wait_start.get_or_insert(tick);
+                    // hold_ticks 与脚本引擎同语义(必修 3):条件连续成立
+                    // `hold_ticks` 个服务器拍才算满足(按拍号差计,不按观测
+                    // 次数);不成立清空,重新成立记当前拍。超时提示后继续
+                    // 下一步的行为不变(REQ-011 §3.6)。
                     if checks_hold(&checks, world) {
-                        self.advance();
-                    } else if tick >= start.saturating_add(timeout_ticks) {
-                        // §3.6:超时不退出,提示后继续下一步。
-                        self.timeout_notice =
-                            Some(format!("stage wait timeout: {}", describe_checks(&checks)));
-                        self.advance();
+                        let since = *self.wait_hold_since.get_or_insert(tick);
+                        let held = tick.saturating_sub(since) + 1;
+                        if held >= hold_ticks {
+                            self.advance();
+                        } else {
+                            break;
+                        }
                     } else {
-                        break;
+                        self.wait_hold_since = None;
+                        if tick >= start.saturating_add(timeout_ticks) {
+                            // §3.6:超时不退出,提示后继续下一步。
+                            self.timeout_notice =
+                                Some(format!("stage wait timeout: {}", describe_checks(&checks)));
+                            self.advance();
+                        } else {
+                            break;
+                        }
                     }
                 }
                 Action::Spawn {
@@ -416,6 +436,7 @@ impl StageDriver {
     fn advance(&mut self) {
         self.cursor += 1;
         self.wait_start = None;
+        self.wait_hold_since = None;
     }
 
     /// `look_at` 角度换算(与脚本引擎同式):目标与相机重合时保持原朝向。
