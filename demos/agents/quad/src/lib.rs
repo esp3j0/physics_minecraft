@@ -336,6 +336,28 @@ pub fn set_target(
     }
 }
 
+/// 按主体追加求解迭代(A00-2 R2 放行的 `extra` 变量):对主体全部连杆和
+/// 机身调用 `RigidBody::set_additional_solver_iterations(n)`。rapier 语义:
+/// 该值属于刚体,求解时取其所在连通分量(接触 + 关节)内所有刚体的
+/// **最大值**,整个分量跑 `num_solver_iterations + extra` 个 solver substep;
+/// `dt` 与世界其他分量不变(不碰 D4)。`extra = 0` 时不调用任何 API,
+/// 数值路径与不开 `extra` 完全一致。
+pub fn set_extra_solver_iterations(world: &mut PhysicsWorld, robot: &Robot, extra: usize) {
+    if extra == 0 {
+        return;
+    }
+    for h in robot
+        .links
+        .iter()
+        .copied()
+        .chain(std::iter::once(robot.body))
+    {
+        if let Some(rb) = world.bodies.get_mut(h) {
+            rb.set_additional_solver_iterations(extra);
+        }
+    }
+}
+
 /// 读一个关节的当前角(rad)。revolute 单自由度,coords 的角分量里取
 /// 对应轴;单自由度关节另一角分量恒 0。
 pub fn read_angle(world: &MultibodyJointSet, robot: &Robot, dof: usize) -> f32 {

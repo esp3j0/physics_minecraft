@@ -31,8 +31,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Instant;
 
 use quad::{
-    default_gait, ik, production_params, read_angle, set_target, spawn_robot_yawed, DampMode,
-    GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
+    default_gait, ik, production_params, read_angle, set_extra_solver_iterations, set_target,
+    spawn_robot_yawed, DampMode, GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
 };
 use rapier3d::dynamics::RigidBodyBuilder;
 use rapier3d::geometry::{ColliderBuilder, PairContacts};
@@ -101,12 +101,15 @@ enum Scene {
     M5Awake,
     /// 走向 1 个静止方块,走 1200 拍。
     M6,
-    /// 重物:整块 cuboid(h,h,h) 从 5 m 砸,h ∈ {1,2,4}。
+    /// 重物:整块 cuboid(h,h,h) 从 5 m 砸,h ∈ {1,2,4}(质量 8、64、512),
+    /// 9 落点 ox、oz ∈ {−0.3, 0, 0.3}(R2-1:oz 生效)。
     M7 {
         h: f32,
         ox: f32,
         oz: f32,
     },
+    /// 隔离性验证:3×3×3 堆从 1 m 落下,无主体(R2-6)。
+    Isolation,
 }
 
 impl Scene {
@@ -124,6 +127,7 @@ impl Scene {
             Scene::M5Awake => "M5Awake".into(),
             Scene::M6 => "M6".into(),
             Scene::M7 { h, ox, oz } => format!("M7_h{}_ox{}_oz{}", h, ox, oz),
+            Scene::Isolation => "Isolation".into(),
         }
     }
 
@@ -139,6 +143,8 @@ impl Scene {
             Scene::M4 => STAND_TICKS + 600 + 600,
             Scene::M5 | Scene::M5Awake => STAND_TICKS + 3600 + 1200,
             Scene::M6 => STAND_TICKS + 1200,
+            // 隔离性验证:堆落定 + 稳定段(无主体,世界照跑)。
+            Scene::Isolation => 900,
         }
     }
 }
@@ -152,6 +158,11 @@ struct Cfg {
     scale: Scale,
     /// guard 阈值(None = 不防护)。
     v_guard: Option<f32>,
+    /// 方块出生高度微扰(A00-2 R2:d ∈ {0, 0.017, 0.034, 0.051, 0.068};
+    /// 0 = 与旧行逐位同)。
+    d: f32,
+    /// 按主体追加求解迭代(仅压缩档;0 = 不调用,数值路径不变)。
+    extra: usize,
 }
 
 struct Outcome {
@@ -197,6 +208,10 @@ struct Outcome {
     pushed_dist: f32,
     /// M5Awake:滑移速度(静置段机身水平速度均值)。
     m5awake_slide: f32,
+    /// 隔离性验证(R2-6):堆方块逐拍位姿哈希 + 终态位置和(差异大小用;
+    /// 仅 Isolation 行非 0)。
+    isolation_hash: u64,
+    iso_pos_sum: f32,
     state_hash: u64,
 }
 
@@ -209,7 +224,71 @@ fn hash_f32(h: u64, v: f32) -> u64 {
     h
 }
 
+/// panic 证据(R2-3):world.step panic 时,上一拍记录的全部连杆状态。
+#[derive(Clone, Default)]
+struct PrePanicSnapshot {
+    tick: usize,
+    max_lin: f32,
+    max_ang: f32,
+    joints_finite: bool,
+    poses_finite: bool,
+    joint_pos_min: f32,
+    joint_pos_max: f32,
+    joint_vel_abs_max: f32,
+    valid: bool,
+}
+
+/// 逐拍记录:panic 时的"前一拍"状态(R2-3)。
+fn snapshot_pre_panic(world: &PhysicsWorld, robot: &quad::Robot, tick: usize) -> PrePanicSnapshot {
+    let mut snap = PrePanicSnapshot {
+        tick,
+        ..Default::default()
+    };
+    let mut all_finite = true;
+    for lh in robot
+        .links
+        .iter()
+        .copied()
+        .chain(std::iter::once(robot.body))
+    {
+        if let Some(rb) = world.bodies.get(lh) {
+            let lv = rb.linvel();
+            let av = rb.angvel();
+            snap.max_lin = snap.max_lin.max(lv.length());
+            snap.max_ang = snap.max_ang.max(av.length());
+            let p = rb.translation();
+            let r = rb.rotation();
+            if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() {
+                all_finite = false;
+            }
+            if !(r.x.is_finite() && r.y.is_finite() && r.z.is_finite() && r.w.is_finite()) {
+                all_finite = false;
+            }
+        }
+    }
+    let (mb_index, _) = robot.joints[0];
+    if let Some(mb) = world.multibody_joints.get_multibody(mb_index) {
+        for link in mb.links() {
+            for c in link.joint.coords() {
+                if !c.is_finite() {
+                    all_finite = false;
+                }
+            }
+            snap.joint_pos_min = snap.joint_pos_min.min(link.joint.coords()[quad::ANG_X]);
+            snap.joint_pos_max = snap.joint_pos_max.max(link.joint.coords()[quad::ANG_X]);
+        }
+        let gv = mb.generalized_velocity();
+        snap.joint_vel_abs_max = gv.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+    }
+    snap.poses_finite = all_finite;
+    snap.joints_finite = all_finite;
+    snap.valid = true;
+    snap
+}
+
 /// 与生产一致的单格方块(density 1、friction 0.6、restitution 0.1)。
+/// `size` = 边长(cuboid 半边 = size/2);R2-1:M7 曾把 h 当"半边"传,
+/// 实际生成的质量是 1/8/64 而非 8/64/512——现在统一按边长口径。
 fn spawn_block(
     world: &mut PhysicsWorld,
     pos: Vector,
@@ -232,7 +311,29 @@ fn spawn_block(
         .0
 }
 
+// panic 证据(R2-3)的跨 catch_unwind 传递:世界在 panic 时被丢弃,
+// snapshot 无法走返回值——用 thread_local 存"最近一拍"的连杆状态,
+// run_inner 每 tick 在 world.step() 前刷新,run_once 的 catch_unwind
+// 分支读取(单线程 demo,口径成立)。
+thread_local! {
+    static LAST_SNAPSHOT: std::cell::RefCell<Option<PrePanicSnapshot>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn record_snapshot(world: &PhysicsWorld, robot: &quad::Robot, tick: usize) {
+    LAST_SNAPSHOT.with(|c| {
+        *c.borrow_mut() = Some(snapshot_pre_panic(world, robot, tick));
+    });
+}
+
+fn take_snapshot() -> PrePanicSnapshot {
+    LAST_SNAPSHOT
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default()
+}
+
 fn run_once(cfg: &Cfg) -> Result<Outcome, String> {
+    LAST_SNAPSHOT.with(|c| *c.borrow_mut() = None);
     match catch_unwind(AssertUnwindSafe(|| run_inner(cfg))) {
         Ok(o) => Ok(o),
         Err(e) => {
@@ -241,9 +342,32 @@ fn run_once(cfg: &Cfg) -> Result<Outcome, String> {
                 .cloned()
                 .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "non-string panic".into());
+            let _ = msg;
             Err(msg)
         }
     }
+}
+
+/// panic 行的格式化证据列(R2-3):前一拍连杆最大线速度/角速度、关节角
+/// 范围、关节速度峰值、位姿/关节是否有限。
+fn panic_line(name: &str, msg: &str, snap: &PrePanicSnapshot) -> String {
+    let evidence = if snap.valid {
+        format!(
+            "pre_tick={} lin={:.3e} ang={:.3e} jpos=[{:.4},{:.4}] jvel={:.3e} finite={}",
+            snap.tick,
+            snap.max_lin,
+            snap.max_ang,
+            snap.joint_pos_min,
+            snap.joint_pos_max,
+            snap.joint_vel_abs_max,
+            snap.poses_finite
+        )
+    } else {
+        "no_snapshot".to_string()
+    };
+    format!(
+        "{name},false,true,0,\"{msg} [{evidence}]\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-,-,0,0,-,0,PANIC"
+    )
 }
 
 fn run_inner(cfg: &Cfg) -> Outcome {
@@ -257,6 +381,27 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             .restitution(GROUND_RESTITUTION),
     );
 
+    // 隔离性验证(R2-6):20 m 外 3×3×3 自由方块堆从 1 m 落下。三情形:
+    // norobot = 世界里只有堆;comp_e0 / comp_e12 = 压缩档主体站在原点
+    // (照常写站立目标、每拍照常更新)——堆哈希若因主体存在或 extra 而
+    // 变,即隔离性破坏,如实报差异。
+    let isolation_pile: Option<Vec<rapier3d::dynamics::RigidBodyHandle>> =
+        if cfg.scene == Scene::Isolation {
+            let mut pile: Vec<rapier3d::dynamics::RigidBodyHandle> = Vec::new();
+            let base_y = GROUND_TOP + BLOCK_HALF + 1.0;
+            for ix in 0..3i32 {
+                for iy in 0..3i32 {
+                    for iz in 0..3i32 {
+                        let pos = Vector::new(20.0 + ix as f32, base_y + iy as f32, iz as f32);
+                        pile.push(spawn_block(&mut world, pos, Vector::ZERO, 1.0));
+                    }
+                }
+            }
+            Some(pile)
+        } else {
+            None
+        };
+
     let s = cfg.scale.s;
     let gait = default_gait();
     let pile_top = if matches!(cfg.scene, Scene::M5 | Scene::M5Awake) {
@@ -266,6 +411,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     };
     let y0 = GROUND_TOP + pile_top + 2.0 * quad::L + quad::FOOT_R + 0.002;
     let mut leg_spawn_pos = Vector::ZERO;
+    // norobot 情形(R2-6):不建主体,堆哈希 = 纯世界基线。
+    let no_robot = cfg.scene == Scene::Isolation && cfg.name.contains("norobot");
     let robot = spawn_robot_yawed(
         &mut world,
         Vector::new(0.0, y0, 0.0),
@@ -274,6 +421,19 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         quad::GROUND_FRICTION,
         DampMode::Scaled,
     );
+    if no_robot {
+        // 立即移除:multibody 全部刚体不被建出副作用(句柄分配顺序改变
+        // 对孤立堆的物理无影响,哈希比较会暴露任何差异)。
+        let mut all_handles: Vec<_> = robot.links.clone();
+        all_handles.push(robot.body);
+        for h in all_handles {
+            world.remove_body(h);
+        }
+    }
+    // extra 变量(A00-2 R2):0 = 不调用,旧组哈希不变。
+    if !no_robot {
+        set_extra_solver_iterations(&mut world, &robot, cfg.extra);
+    }
     if matches!(cfg.scene, Scene::M1Leg5 | Scene::M1Leg10) {
         leg_spawn_pos = world.bodies.get(robot.body).expect("alive").translation();
     }
@@ -285,6 +445,7 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         Scene::M5 | Scene::M5Awake => STAND_TICKS + 3600,
         Scene::M6 => STAND_TICKS,
         Scene::M4 => STAND_TICKS + 600,
+        // Isolation:主体(若有)全程站立,不走。
         _ => STAND_TICKS,
     };
     // M5Awake:静置段(在行走前)就强制醒;堆 9×9(R1-5)。
@@ -340,6 +501,10 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let mut sat_total = 0u64;
     let mut anomaly = None;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // 隔离性验证哈希(R2-6;Isolation 行专用)。
+    let mut iso_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut iso_max_v = 0.0f32;
+    let mut iso_pos_sum = 0.0f64;
     let mut block_disp_max = 0.0f32;
     let m5_settle_start = STAND_TICKS;
     let m5_settle_end = STAND_TICKS + 3600;
@@ -351,10 +516,18 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let static_window = 120usize;
     let mut static_pen_bb = 0.0f32;
     let mut static_pen_bg = 0.0f32;
-    let mut dyn_pen_within_step: Option<bool> = None;
+    // 动态穿透(R2-7):撞击窗口(spawn 后 300 拍)内 body-block 的最大
+    // 穿透深度;比较口径 = 该拍 (|方块速度| + 机身速度)·dt 的最大值。
+    let mut dyn_pen_max = 0.0f32;
+    let mut dyn_step_travel_max = 0.0f32;
+    let mut dyn_pen_seen = false;
+
     // M1 系列:撞击后窗口(方块生成后 300 拍)机身最高点、方块反弹。
     let mut block_rebound_speed = 0.0f32;
     let mut block_rebound_caught = false;
+    // 撞后上抛(R2-7):首次撞击后(生成 10 拍后)方块的**绝对**最高点
+    // —— 上抛 = 绝对最高点 − 撞后落定高度(末 120 拍均值)。
+    let mut block_max_y_post = f32::NEG_INFINITY;
     // M1Leg:首碰连杆与被推距离。
     let mut first_hit_link: Option<&'static str> = None;
     let mut pushed_dist = 0.0f32; // M1Leg:结尾按机身位移赋值
@@ -375,7 +548,7 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         if tick == spawn_tick && blocks.is_empty() && !m5_pile.is_empty() {
             // M5 系列无延迟方块;这里只对延迟场景生效(见下方 match)。
         }
-        if tick == spawn_tick {
+        if tick == spawn_tick && !no_robot {
             let body = world.bodies.get(robot.body).expect("alive");
             let bp = body.translation();
             let body_top = bp.y + quad::BODY_HALF[1];
@@ -389,12 +562,10 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     // M1 网格落点(R1-2): ox、oz 来自名字(M1Body5_ox-0.15_oz0.3)。
                     let (ox, oz) = m1_offsets(&cfg.name);
                     // 末速口径:上限按实际落距(机身顶面)。
-                    let drop = body_top + BLOCK_HALF + h - (body_top + BLOCK_HALF);
                     v_limit = (2.0 * (2.0f32 * 9.81f32 * h).sqrt()).max(20.0f32);
-                    let _ = drop;
                     blocks.push(spawn_block(
                         &mut world,
-                        Vector::new(bp.x + ox, body_top + BLOCK_HALF + h, bp.z + oz),
+                        Vector::new(bp.x + ox, body_top + BLOCK_HALF + h + cfg.d, bp.z + oz),
                         Vector::ZERO,
                         1.0,
                     ));
@@ -411,7 +582,7 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     // 1 m 方块盖住机身)。撞的是 FL 腿小腿段。
                     blocks.push(spawn_block(
                         &mut world,
-                        Vector::new(bp.x, body_top + BLOCK_HALF + h, bp.z - 0.56),
+                        Vector::new(bp.x, body_top + BLOCK_HALF + h + cfg.d, bp.z - 0.56),
                         Vector::ZERO,
                         1.0,
                     ));
@@ -453,18 +624,19 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     }
                 }
                 Scene::M7 { h, ox, oz } => {
-                    // R1-6:整块 cuboid(h,h,h) 从 5 m(底面距机身顶面 5 m)。
-                    let _ = oz;
+                    // R1-6 + R2-1:整块 cuboid(h,h,h)(spawn_block 按边长,
+                    // 质量 = h³ = 8/64/512),从 5 m(底面距机身顶面 5 m),
+                    // 9 落点 ox、oz 都生效;出生高度微扰 d(R2)。
                     blocks.push(spawn_block(
                         &mut world,
-                        Vector::new(bp.x + ox, body_top + h * 0.5 + 5.0, bp.z),
+                        Vector::new(bp.x + ox, body_top + h * 0.5 + 5.0 + cfg.d, bp.z + oz),
                         Vector::ZERO,
                         h,
                     ));
-                    blocks_spawn_pos.push(Vector::new(bp.x + ox, 0.0, bp.z));
+                    blocks_spawn_pos.push(Vector::new(bp.x + ox, 0.0, bp.z + oz));
                     v_limit = (2.0 * (2.0f32 * 9.81f32 * 5.0f32).sqrt()).max(20.0f32);
                 }
-                Scene::M5 | Scene::M5Awake | Scene::M6 => {}
+                Scene::M5 | Scene::M5Awake | Scene::M6 | Scene::Isolation => {}
             }
             if !blocks.is_empty() {
                 block_spawn_y = world.bodies.get(blocks[0]).expect("alive").translation().y;
@@ -480,8 +652,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
 
         // 关节目标:站立序列;M5 系列在静置 3600 拍后行走,M6 站稳即走。
         // M5Awake:目标恒站姿(不走)。guard 移除主体后不再写目标
-        // (multibody 已不在,R1-7:panic 必须归零)。
-        if robot_alive && tick % 2 == 0 {
+        // (multibody 已不在,R1-7:panic 必须归零)。norobot 情形无主体。
+        if robot_alive && !no_robot && tick % 2 == 0 {
             for leg in 0..4 {
                 let foot = if tick < rise_ticks {
                     let a = tick as f32 / rise_ticks as f32;
@@ -529,9 +701,35 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             }
         }
 
+        // panic 证据(R2-3):step 前记录全部连杆线速度/角速度/位姿与
+        // 关节角/关节速度的快照——panic 时该快照就是"前一拍"状态。
+        if robot_alive {
+            record_snapshot(&world, &robot, tick);
+        }
+
         world.step();
 
-        // guard 检查(R1-7):非有限或速度超 V_GUARD → 整体移除,世界继续。
+        // 隔离性验证(R2-6):堆方块逐拍位姿进 isolation 哈希(三情形
+        // 各自累计,逐位比较——主体在旁/extra 大时若哈希不同即隔离破坏)。
+        if let Some(pile) = &isolation_pile {
+            for h in pile {
+                if let Some(rb) = world.bodies.get(*h) {
+                    let p = rb.translation();
+                    for v in [p.x, p.y, p.z] {
+                        iso_hash = hash_f32(iso_hash, v);
+                    }
+                    let rot = rb.rotation();
+                    for c in [rot.w, rot.x, rot.y, rot.z] {
+                        iso_hash = hash_f32(iso_hash, c);
+                    }
+                    iso_max_v = iso_max_v.max(rb.linvel().length());
+                    iso_pos_sum += f64::from(p.x + p.y + p.z);
+                }
+            }
+        }
+
+        // guard 检查(R1-7;R2-4 扩展):连杆线速度、角速度、位姿平移/旋转、
+        // 关节角、关节速度的非有限性,加线速度阈值 → 整体移除,世界继续。
         // 先检查再采样:移除后本拍跳过主体统计。
         if let (true, Some(v_guard)) = (robot_alive, cfg.v_guard) {
             let mut kill = false;
@@ -543,10 +741,44 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             {
                 if let Some(rb) = world.bodies.get(lh) {
                     let v = rb.linvel();
-                    if !v.x.is_finite() || !v.y.is_finite() || !v.z.is_finite() {
+                    let av = rb.angvel();
+                    let p = rb.translation();
+                    let r = rb.rotation();
+                    if !v.x.is_finite()
+                        || !v.y.is_finite()
+                        || !v.z.is_finite()
+                        || !av.x.is_finite()
+                        || !av.y.is_finite()
+                        || !av.z.is_finite()
+                        || !p.x.is_finite()
+                        || !p.y.is_finite()
+                        || !p.z.is_finite()
+                        || !r.x.is_finite()
+                        || !r.y.is_finite()
+                        || !r.z.is_finite()
+                        || !r.w.is_finite()
+                    {
                         nan = true;
                         kill = true;
                     } else if v.length() > v_guard {
+                        kill = true;
+                    }
+                }
+            }
+            // 关节角 / 关节速度(R2-4 扩展)。
+            if !kill {
+                let (mb_index, _) = robot.joints[0];
+                if let Some(mb) = world.multibody_joints.get_multibody(mb_index) {
+                    for link in mb.links() {
+                        for c in link.joint.coords() {
+                            if !c.is_finite() {
+                                nan = true;
+                                kill = true;
+                            }
+                        }
+                    }
+                    if !kill && mb.generalized_velocity().iter().any(|v| !v.is_finite()) {
+                        nan = true;
                         kill = true;
                     }
                 }
@@ -562,6 +794,10 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                 robot_alive = false;
                 guard_removed += 1;
             }
+        }
+        if no_robot {
+            // norobot 情形(R2-6):只算堆哈希,世界照跑完全部拍。
+            continue;
         }
         if !robot_alive {
             // 世界继续跑(方块正常落定);主体统计冻结。
@@ -617,6 +853,13 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             let v = rb.linvel().length();
             max_block_speed = max_block_speed.max(v);
             max_upthrow = max_upthrow.max(rb.translation().y - block_spawn_y);
+            // 撞后上抛(R2-7):首次撞击后的方块绝对最高点。窗口起点按
+            // 自由落体全程(5 m 需 ~31 拍、10 m 需 ~44 拍,取 60 拍)——
+            // 旧窗口 spawn+10 拍在 10 m 档把下落段算进"最高点"(读数 =
+            // 出生高度,不是上抛)。
+            if tick >= spawn_tick + 60 {
+                block_max_y_post = block_max_y_post.max(rb.translation().y);
+            }
             let sp = blocks_spawn_pos[i];
             let d = rb.translation() - sp;
             cur_block_disp = cur_block_disp.max((d.x * d.x + d.z * d.z).sqrt());
@@ -656,35 +899,44 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     .and_then(|co| co.parent())
                     .and_then(|ph| world.bodies.get(ph));
                 let is_ground = other_rb.map(|rb| rb.is_fixed()).unwrap_or(true);
-                // M1Leg 首碰连杆:方块生成后第一次 body-block 接触,另一侧
-                // 是哪个连杆 collider。
+                // M1Leg 首碰连杆(R2-7):只认**有真实接触点**的接触对
+                // (旧版取第一个接触对,空流形也计数)。
                 if !is_ground
                     && tick >= spawn_tick
                     && first_hit_link.is_none()
                     && matches!(cfg.scene, Scene::M1Leg5 | Scene::M1Leg10)
                 {
-                    let hit = if is_robot(c1) { c1 } else { c2 };
-                    first_hit_link = Some(if hit == robot.colliders[0] {
-                        "body"
-                    } else {
-                        // colliders 顺序:body,每腿 [lat, thigh, shank, foot]
-                        let idx = robot.colliders.iter().position(|c| *c == hit).unwrap_or(0);
-                        match idx % 4 {
-                            1 => "hip",
-                            2 => "thigh",
-                            3 => "shank",
-                            _ => "foot",
+                    for manifold in &rigid.manifolds {
+                        if manifold.points.is_empty() {
+                            continue;
                         }
-                    });
+                        let hit = if is_robot(c1) { c1 } else { c2 };
+                        first_hit_link = Some(if hit == robot.colliders[0] {
+                            "body"
+                        } else {
+                            // colliders 顺序:body,每腿 [lat, thigh, shank, foot]
+                            let idx = robot.colliders.iter().position(|c| *c == hit).unwrap_or(0);
+                            match idx % 4 {
+                                1 => "hip",
+                                2 => "thigh",
+                                3 => "shank",
+                                _ => "foot",
+                            }
+                        });
+                        break;
+                    }
                 }
                 let in_static = tick >= total_ticks.saturating_sub(static_window);
                 for manifold in &rigid.manifolds {
+                    if manifold.points.is_empty() {
+                        continue;
+                    }
                     let deepest = manifold
                         .points
                         .iter()
                         .map(|pt| pt.dist)
                         .reduce(f32::max)
-                        .unwrap_or(0.0);
+                        .expect("points nonempty");
                     if is_ground {
                         max_pen_bg = max_pen_bg.min(deepest);
                         if in_static {
@@ -695,11 +947,17 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                         if in_static {
                             static_pen_bb = static_pen_bb.min(deepest);
                         }
-                        // 动态穿透 ≤ v·dt?以撞击拍刚体速度估一拍行程。
-                        if deepest < 0.0 && dyn_pen_within_step.is_none() {
-                            // 用当前主体连杆最大速度 × dt 比较。
-                            dyn_pen_within_step =
-                                Some(-deepest <= tick_link_max * world.integration_parameters.dt);
+                        // 动态穿透(R2-7):撞击窗口内取**最大**穿透,与该拍
+                        // (方块速度 + 机身速度)·dt 的最大值比(旧版只看第一次)。
+                        if deepest < 0.0 && tick >= spawn_tick && tick < spawn_tick + 300 {
+                            let block_v = other_rb.map(|rb| rb.linvel().length()).unwrap_or(0.0);
+                            let travel = (block_v + body.linvel().length())
+                                * world.integration_parameters.dt;
+                            dyn_pen_seen = true;
+                            if -deepest > dyn_pen_max {
+                                dyn_pen_max = -deepest;
+                                dyn_step_travel_max = travel;
+                            }
                         }
                     }
                 }
@@ -748,6 +1006,44 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         }
     }
 
+    // 隔离性验证(R2-6):norobot / comp_e0 / comp_e12 三情形只报堆哈希。
+    if no_robot {
+        return Outcome {
+            name: cfg.name.clone(),
+            nan,
+            panicked: false,
+            panic_msg: String::new(),
+            guard_removed,
+            max_link_speed,
+            link_over_ticks,
+            link_v_limit: v_limit,
+            max_body_speed,
+            max_block_speed: iso_max_v,
+            max_block_upthrow: 0.0,
+            post_impact_body_max_y: 0.0,
+            max_pen_body_block: 0.0,
+            max_pen_body_ground: 0.0,
+            static_pen_bb: 0.0,
+            static_pen_bg: 0.0,
+            dyn_pen_within_step: None,
+            torque_sat_ratio: 0.0,
+            end_body_y: f32::NAN,
+            end_up_y: f32::NAN,
+            block_disp_max: 0.0,
+            block_upthrow_after_settle: 0.0,
+            block_rebound_speed: 0.0,
+            anomaly_tick: None,
+            m5_height_change: 0.0,
+            m5_sleep_ratio: 0.0,
+            m5awake_slide: 0.0,
+            first_hit_link: "-".into(),
+            pushed_dist: 0.0,
+            isolation_hash: iso_hash,
+            iso_pos_sum: iso_pos_sum as f32,
+            state_hash: iso_hash,
+        };
+    }
+
     let end_body = if robot_alive {
         world.bodies.get(robot.body).expect("alive")
     } else {
@@ -770,7 +1066,11 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             max_pen_body_ground: max_pen_bg,
             static_pen_bb,
             static_pen_bg,
-            dyn_pen_within_step,
+            dyn_pen_within_step: if dyn_pen_seen {
+                Some(dyn_pen_max <= dyn_step_travel_max)
+            } else {
+                None
+            },
             torque_sat_ratio: if sat_total > 0 {
                 sat_n as f32 / sat_total as f32
             } else {
@@ -787,6 +1087,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             m5awake_slide: (m5_settle_slide_sum / m5_settle_slide_n.max(1) as f64) as f32,
             first_hit_link: first_hit_link.unwrap_or("-").to_string(),
             pushed_dist,
+            isolation_hash: 0,
+            iso_pos_sum: 0.0,
             state_hash: hash,
         };
     };
@@ -795,6 +1097,12 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let end_p = end_body.translation();
     pushed_dist =
         ((end_p.x - leg_spawn_pos.x).powi(2) + (end_p.z - leg_spawn_pos.z).powi(2)).sqrt();
+    // 动态穿透 ≤ v·dt(R2-7):窗口内最大穿透 vs 同窗口 (方块+机身)·dt 最大值。
+    let dyn_pen_within_step = if dyn_pen_seen {
+        Some(dyn_pen_max <= dyn_step_travel_max)
+    } else {
+        None
+    };
 
     Outcome {
         name: cfg.name.clone(),
@@ -806,7 +1114,7 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         link_over_ticks,
         link_v_limit: v_limit,
         max_body_speed,
-        max_block_speed,
+        max_block_speed: max_block_speed.max(iso_max_v),
         max_block_upthrow: max_upthrow,
         post_impact_body_max_y,
         max_pen_body_block: max_pen_bb,
@@ -822,7 +1130,13 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         end_body_y: end_body.translation().y,
         end_up_y: end_up.y,
         block_disp_max,
-        block_upthrow_after_settle: max_upthrow - (settle_y_mean - block_spawn_y),
+        // 撞后上抛(R2-7):首次撞击后的最高点 − 撞后落定高度(末 120 拍均值)。
+        // 旧版把 max_upthrow(相对出生高度)混进来,5 m 落体组读数 = 落距。
+        block_upthrow_after_settle: if block_max_y_post > f32::NEG_INFINITY / 2.0 {
+            block_max_y_post - settle_y_mean
+        } else {
+            0.0
+        },
         block_rebound_speed,
         anomaly_tick: anomaly,
         m5_height_change: m5_h_start.map_or(0.0, |h0| m5_h_end - h0),
@@ -830,6 +1144,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         m5awake_slide: (m5_settle_slide_sum / m5_settle_slide_n.max(1) as f64) as f32,
         first_hit_link: first_hit_link.unwrap_or("-").to_string(),
         pushed_dist,
+        isolation_hash: iso_hash,
+        iso_pos_sum: iso_pos_sum as f32,
         state_hash: hash,
     }
 }
@@ -850,8 +1166,10 @@ fn m1_offsets(name: &str) -> (f32, f32) {
 }
 
 fn outcome_csv(o: &Outcome) -> String {
+    // 列序与表头一致(R2-7:旧版表头 27 列、数据 30 列;新版 30 列对齐,
+    // 新增 isolation_hash 在 state_hash 前)。
     format!(
-        "{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{},{:.4},{:016x}",
+        "{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{},{:.4},{:016x},{:.6},{:016x}",
         o.name,
         o.nan,
         o.panicked,
@@ -868,14 +1186,14 @@ fn outcome_csv(o: &Outcome) -> String {
         o.max_pen_body_ground,
         o.static_pen_bb,
         o.static_pen_bg,
+        o.dyn_pen_within_step
+            .map_or_else(|| "-".to_string(), |b| b.to_string()),
         o.torque_sat_ratio,
         o.end_body_y,
         o.end_up_y,
         o.block_disp_max,
         o.block_upthrow_after_settle,
         o.block_rebound_speed,
-        o.dyn_pen_within_step
-            .map_or_else(|| "-".to_string(), |b| b.to_string()),
         o.anomaly_tick
             .map_or_else(|| "-".to_string(), |t| t.to_string()),
         o.m5_height_change,
@@ -883,6 +1201,8 @@ fn outcome_csv(o: &Outcome) -> String {
         o.m5awake_slide,
         o.first_hit_link,
         o.pushed_dist,
+        o.isolation_hash,
+        o.iso_pos_sum,
         o.state_hash,
     )
 }
@@ -923,9 +1243,10 @@ fn main() {
         "name,nan,panicked,guard_removed,panic_msg,max_link_speed,link_over_ticks,\
          link_v_limit,max_body_speed,max_block_speed,max_block_upthrow,\
          post_impact_body_max_y,max_pen_body_block,max_pen_body_ground,\
-         static_pen_bb,static_pen_bg,torque_sat_ratio,end_body_y,end_up_y,\
-         block_disp_max,block_upthrow_after_settle,block_rebound_speed,\
-         dyn_pen_le_step,anomaly_tick,m5_sleep_ratio,m5awake_slide,state_hash\n",
+         static_pen_bb,static_pen_bg,dyn_pen_le_step,torque_sat_ratio,end_body_y,\
+         end_up_y,block_disp_max,block_upthrow_after_settle,block_rebound_speed,\
+         anomaly_tick,m5_height_change,m5_sleep_ratio,m5awake_slide,first_hit_link,\
+         pushed_dist,isolation_hash,iso_pos_sum,state_hash\n",
     );
     for cfg in &all {
         let selected = if det_mode {
@@ -943,12 +1264,9 @@ fn main() {
         let line = match res {
             Ok(o) => outcome_csv(&o),
             Err(msg) => {
-                // panic 隔离:单次 panic 记一行,矩阵继续(R1-4)。
-                format!(
-                    "{},false,true,0,{},0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-,-,0,0,PANIC",
-                    cfg.name,
-                    msg.replace(',', " ")
-                )
+                // panic 隔离:单次 panic 记一行(带前一拍证据,R2-3),矩阵继续。
+                let snap = take_snapshot();
+                panic_line(&cfg.name, &msg.replace(',', " "), &snap)
             }
         };
         println!("{} | {:.1}s", line, t0.elapsed().as_secs_f32());
@@ -976,7 +1294,19 @@ fn main() {
     let _ = guard_matrix;
 }
 
-/// M1Body 网格矩阵(R1-2/3):7 档比例 × 25 落点 × 2 高度。
+/// 出生高度微扰档(A00-2 R2;d = 0 = 旧行逐位同)。
+const D_GRID: [f32; 5] = [0.0, 0.017, 0.034, 0.051, 0.068];
+/// M7 九落点(R2-1:oz 生效)。
+const M7_GRID: [f32; 3] = [-0.3, 0.0, 0.3];
+/// extra 档(A00-2 R2;仅压缩档)。
+const EXTRA_GRID: [usize; 4] = [0, 4, 8, 12];
+
+fn fmt_d(d: f32) -> String {
+    format!("d{:.3}", d)
+}
+
+/// M1Body 网格矩阵(R1-2/3 + R2 微扰):7 档比例 × 25 落点 × 2 高度;
+/// comp / 1-50 档加 5 档微扰(其余比例保留现状,不加微扰)。
 fn build_matrix(guard: Option<&str>) -> Vec<Cfg> {
     let mut all = Vec::new();
     let v_guard = guard.map(|g| g.parse::<f32>().unwrap());
@@ -990,52 +1320,77 @@ fn build_matrix(guard: Option<&str>) -> Vec<Cfg> {
         1.0,
     ];
     if let Some(vg) = v_guard {
-        // guard 模式:M7 全部 + real / 1-500 的 M1 网格;名字带 _vg{n} 后缀。
+        // guard 模式(R2-4):M7 全部 540 组 + real / 1-500 的 M1 网格 × 3 档
+        // 微扰;名字带 _vg{n} 后缀。
         for s in [1.0 / 1500.0, 1.0 / 500.0] {
             for h5 in [5.0f32, 10.0] {
                 for ox in M1_GRID {
                     for oz in M1_GRID {
-                        let scene = if h5 == 5.0 {
-                            Scene::M1Body5
-                        } else {
-                            Scene::M1Body10
-                        };
-                        all.push(Cfg {
-                            name: format!(
+                        for d in [0.0f32, 0.034, 0.068] {
+                            let scene = if h5 == 5.0 {
+                                Scene::M1Body5
+                            } else {
+                                Scene::M1Body10
+                            };
+                            let mut name = format!(
                                 "{}_ox{ox}_oz{oz}_{}_vg{}",
                                 scene.name(),
                                 Scale { s }.tag(),
                                 vg as i32
-                            ),
-                            scene,
-                            scale: Scale { s },
-                            v_guard: Some(vg),
-                        });
+                            );
+                            if d != 0.0 {
+                                name.push_str(&fmt_d(d));
+                            }
+                            all.push(Cfg {
+                                name,
+                                scene,
+                                scale: Scale { s },
+                                v_guard: Some(vg),
+                                d,
+                                extra: 0,
+                            });
+                        }
                     }
                 }
             }
         }
         for h in [1.0f32, 2.0, 4.0] {
-            for ox in [-0.3f32, 0.0, 0.3] {
-                let scene = Scene::M7 { h, ox, oz: 0.0 };
-                for s in [1.0 / 100.0, 1.0 / 20.0, 1.0 / 5.0, 1.0] {
-                    all.push(Cfg {
-                        name: format!("{}_{}_vg{}", scene.name(), Scale { s }.tag(), vg as i32),
-                        scene,
-                        scale: Scale { s },
-                        v_guard: Some(vg),
-                    });
+            for ox in M7_GRID {
+                for oz in M7_GRID {
+                    for d in D_GRID {
+                        let scene = Scene::M7 { h, ox, oz };
+                        for s in [1.0 / 100.0, 1.0 / 20.0, 1.0 / 5.0, 1.0] {
+                            let mut name =
+                                format!("{}_{}_vg{}", scene.name(), Scale { s }.tag(), vg as i32);
+                            if d != 0.0 {
+                                name.push_str(&fmt_d(d));
+                            }
+                            all.push(Cfg {
+                                name,
+                                scene,
+                                scale: Scale { s },
+                                v_guard: Some(vg),
+                                d,
+                                extra: 0,
+                            });
+                        }
+                    }
                 }
             }
         }
         return all;
     }
     // 常规矩阵:
-    // - M1Body 网格 × 7 档(R1-3)
+    // - M1Body 网格 × 7 档(R1-3);comp/1-50 加微扰 5 档(R2-2,d0 = 复现行)
     // - M1Leg / M2 / M3 / M4 / M5 / M6 × §4 三档
     // - M5Awake × 三档(R1-5)
-    // - M7 × 4 档(R1-6)
+    // - M7:9 落点 × 5 微扰 × 4 档 = 540 组(R2-1,真实质量)
     for s in scales {
+        let ds: &[f32] = if matches!(Scale { s }.tag().as_str(), "comp" | "s1-50") {
+            &D_GRID
+        } else {
+            &[0.0]
+        };
         for h5 in [5.0f32, 10.0] {
             for ox in M1_GRID {
                 for oz in M1_GRID {
@@ -1044,12 +1399,21 @@ fn build_matrix(guard: Option<&str>) -> Vec<Cfg> {
                     } else {
                         Scene::M1Body10
                     };
-                    all.push(Cfg {
-                        name: format!("{}_ox{ox}_oz{oz}_{}", scene.name(), Scale { s }.tag()),
-                        scene,
-                        scale: Scale { s },
-                        v_guard: None,
-                    });
+                    for d in ds {
+                        let mut name =
+                            format!("{}_ox{ox}_oz{oz}_{}", scene.name(), Scale { s }.tag());
+                        if *d != 0.0 {
+                            name.push_str(&fmt_d(*d));
+                        }
+                        all.push(Cfg {
+                            name,
+                            scene,
+                            scale: Scale { s },
+                            v_guard: None,
+                            d: *d,
+                            extra: 0,
+                        });
+                    }
                 }
             }
         }
@@ -1077,26 +1441,177 @@ fn build_matrix(guard: Option<&str>) -> Vec<Cfg> {
                 scene,
                 scale,
                 v_guard: None,
+                d: 0.0,
+                extra: 0,
             });
         }
     }
     for h in [1.0f32, 2.0, 4.0] {
-        for ox in [-0.3f32, 0.0, 0.3] {
-            let scene = Scene::M7 { h, ox, oz: 0.0 };
-            for s in [1.0 / 100.0f32, 1.0 / 20.0, 1.0 / 5.0, 1.0] {
-                all.push(Cfg {
-                    name: format!("{}_{}", scene.name(), Scale { s }.tag()),
-                    scene,
-                    scale: Scale { s },
-                    v_guard: None,
-                });
+        for ox in M7_GRID {
+            for oz in M7_GRID {
+                let scene = Scene::M7 { h, ox, oz };
+                for s in [1.0 / 100.0f32, 1.0 / 20.0, 1.0 / 5.0, 1.0] {
+                    all.push(Cfg {
+                        name: format!("{}_{}", scene.name(), Scale { s }.tag()),
+                        scene,
+                        scale: Scale { s },
+                        v_guard: None,
+                        d: 0.0,
+                        extra: 0,
+                    });
+                }
             }
         }
+    }
+    // M7 微扰 5 档(R2-1:9 落点 × 5 d × 4 档 = 540;d0 = 上面的复现行)。
+    for h in [1.0f32, 2.0, 4.0] {
+        for ox in M7_GRID {
+            for oz in M7_GRID {
+                for d in D_GRID {
+                    if d == 0.0 {
+                        continue;
+                    }
+                    let scene = Scene::M7 { h, ox, oz };
+                    for s in [1.0 / 100.0f32, 1.0 / 20.0, 1.0 / 5.0, 1.0] {
+                        all.push(Cfg {
+                            name: format!("{}_{}_{}", scene.name(), Scale { s }.tag(), fmt_d(d)),
+                            scene,
+                            scale: Scale { s },
+                            v_guard: None,
+                            d,
+                            extra: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // extra 变量(A00-2 R2-5):仅压缩档,M1 微扰网格 + M7 135 组
+    // (h3 × 9 落点 × 5 d);extra 0 不重复(= 上面的常规行)。
+    for extra in EXTRA_GRID {
+        if extra == 0 {
+            continue;
+        }
+        for h5 in [5.0f32, 10.0] {
+            for ox in M1_GRID {
+                for oz in M1_GRID {
+                    for d in D_GRID {
+                        let scene = if h5 == 5.0 {
+                            Scene::M1Body5
+                        } else {
+                            Scene::M1Body10
+                        };
+                        all.push(Cfg {
+                            name: format!(
+                                "e{extra}_{}_ox{ox}_oz{oz}_comp_{}",
+                                scene.name(),
+                                fmt_d(d)
+                            ),
+                            scene,
+                            scale: Scale { s: 1.0 / 100.0 },
+                            v_guard: None,
+                            d,
+                            extra,
+                        });
+                    }
+                }
+            }
+        }
+        for h in [1.0f32, 2.0, 4.0] {
+            for ox in M7_GRID {
+                for oz in M7_GRID {
+                    for d in D_GRID {
+                        let scene = Scene::M7 { h, ox, oz };
+                        all.push(Cfg {
+                            name: format!("e{extra}_{}_comp_{}", scene.name(), fmt_d(d)),
+                            scene,
+                            scale: Scale { s: 1.0 / 100.0 },
+                            v_guard: None,
+                            d,
+                            extra,
+                        });
+                    }
+                }
+            }
+        }
+        // extra 的 M5Awake 滑移对照(R2-5)。
+        all.push(Cfg {
+            name: format!("e{extra}_M5Awake_comp"),
+            scene: Scene::M5Awake,
+            scale: Scale { s: 1.0 / 100.0 },
+            v_guard: None,
+            d: 0.0,
+            extra,
+        });
+    }
+    // guard + extra 组合(R2-5:"各报无防护和 V=200 两种"):M7 135 组 + M1
+    // 微扰网格,extra ∈ {4,8,12} × vg200。
+    for extra in EXTRA_GRID {
+        if extra == 0 {
+            continue;
+        }
+        for h in [1.0f32, 2.0, 4.0] {
+            for ox in M7_GRID {
+                for oz in M7_GRID {
+                    for d in D_GRID {
+                        let scene = Scene::M7 { h, ox, oz };
+                        all.push(Cfg {
+                            name: format!("e{extra}_{}_comp_{}_vg200", scene.name(), fmt_d(d)),
+                            scene,
+                            scale: Scale { s: 1.0 / 100.0 },
+                            v_guard: Some(200.0),
+                            d,
+                            extra,
+                        });
+                    }
+                }
+            }
+        }
+        for h5 in [5.0f32, 10.0] {
+            for ox in M1_GRID {
+                for oz in M1_GRID {
+                    for d in D_GRID {
+                        let scene = if h5 == 5.0 {
+                            Scene::M1Body5
+                        } else {
+                            Scene::M1Body10
+                        };
+                        all.push(Cfg {
+                            name: format!(
+                                "e{extra}_{}_ox{ox}_oz{oz}_comp_{}_vg200",
+                                scene.name(),
+                                fmt_d(d)
+                            ),
+                            scene,
+                            scale: Scale { s: 1.0 / 100.0 },
+                            v_guard: Some(200.0),
+                            d,
+                            extra,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // 隔离性验证(R2-6):无主体 / 主体 comp e0 / 主体 comp e12,各一行,
+    // 对比 isolation_hash(comp_* 行跑出机器人世界;Isolation 场景本身
+    // 不建主体,差别在机器人世界是否在世界里跑过——extra 对地形侧的影响
+    // 由堆哈希逐位比较暴露)。
+    for (tag, extra) in [("norobot", 0usize), ("comp_e0", 0), ("comp_e12", 12)] {
+        all.push(Cfg {
+            name: format!("Isolation_{tag}"),
+            scene: Scene::Isolation,
+            scale: Scale { s: 1.0 / 100.0 },
+            v_guard: None,
+            d: 0.0,
+            extra,
+        });
     }
     all
 }
 
-/// guard 矩阵(R1-7):V_GUARD 1000/200 × (M7 全部 + real/1-500 M1 网格)。
+/// guard 矩阵(R1-7;R2-4):V_GUARD 1000/200 × (M7 全部 + real/1-500 M1
+/// 网格 × 3 微扰)。
 fn build_guard_matrix() -> Vec<Cfg> {
     let mut all = Vec::new();
     for vg in V_GUARDS {

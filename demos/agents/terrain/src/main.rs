@@ -27,8 +27,8 @@ use std::time::Instant;
 
 use physics_sim::collider_build::{greedy_colliders, BoxCollider, NeighborChunks};
 use quad::{
-    default_gait, ik, production_params, read_angle, set_target, spawn_robot_yawed, DampMode,
-    GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
+    default_gait, ik, production_params, read_angle, set_extra_solver_iterations, set_target,
+    spawn_robot_yawed, DampMode, GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
 };
 use rapier3d::dynamics::RigidBodyBuilder;
 use rapier3d::geometry::{ColliderBuilder, ColliderHandle, PairContacts, SharedShape};
@@ -349,7 +349,7 @@ fn ditch_xs(w: Workload) -> Vec<f32> {
     out
 }
 
-/// 颠簸事件段在进行中的聚合状态:
+/// 颠簸事件段在进行中的聚合状态(R2-3:每只独立):
 /// (robot_idx, 拍数, max |vy|, min up·y, x, z, 各脚是否接触, min |n.y|)。
 type BumpAcc = (usize, usize, f32, f32, f32, f32, [bool; 4], f32);
 
@@ -364,10 +364,15 @@ struct Cfg {
     total_ticks: usize,
     /// 8 只同世界(耗时测量 + 事件核对)。
     eight: bool,
+    /// 按主体追加求解迭代(A00-2 R2;0 = 不调用,数值路径不变)。
+    extra: usize,
 }
 
-/// 颠簸事件段(R1-5):连续满足条件的拍(间隔 ≤ 5 拍)合并。
+/// 颠簸事件段(R1-5;R2-4:每只独立状态、单拍事件也记录,不再有"≥2 拍
+/// 才收"的丢弃;合并规则 = 同一只的连续 active 拍合为一段)。
 struct BumpEvent {
+    /// 归属个体(8 只组区分;单只组恒 0)。
+    robot: usize,
     tick: usize,
     ticks: usize,
     max_vy: f32,
@@ -378,7 +383,7 @@ struct BumpEvent {
     feet: Vec<usize>,
     min_abs_ny: f32,
     /// 最近地形特征的描述("seam x=16 / d 0.02"、"ditch x=13.5 / d 11.9"、
-    /// "step x=32 / d 0.3"、"none")。
+    /// "step x=32 / d 0.3"、"none";tail 段同样给出该归因)。
     nearest: String,
 }
 
@@ -397,8 +402,11 @@ struct Outcome {
     max_body_vy: f32,
     max_link_speed: f32,
     max_pen_ground: f32,
-    /// 窄口径(R1-2):脚对地形、最深点 dist<1mm 的流形。
+    /// 窄口径(R1-2):脚对地形、流形非空且最深点 dist<1mm。
+    /// R2:空流形(points 为空)单独计数,不进任何接触统计。
+    /// 口径 = 第 0 只(倾斜/跨缝的窄口径只对第 0 只;全体口径列见下)。
     foot_manifolds: u64,
+    empty_manifolds: u64,
     foot_tilt: u64,
     foot_tilt_near_seam: u64,
     foot_min_abs_ny: f32,
@@ -422,6 +430,81 @@ fn hash_f32(h: u64, v: f32) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+/// 关闭一个颠簸事件段并归因(R2-4):最近的接缝线 / 沟中心 / 台阶沿;
+/// tail 段(跑到总拍数仍 active)同样给出该归因。事件条件与合并不再
+/// 丢单拍(旧版 cnt>=2 才收,与 README"间隔≤5 拍合并"的说法都不符——
+/// 真实规则是同一只的连续 active 拍合为一段)。
+#[allow(clippy::too_many_arguments)]
+fn close_bump(
+    ri: usize,
+    cnt: usize,
+    mv: f32,
+    mu: f32,
+    bx: f32,
+    bz: f32,
+    ftouch: [bool; 4],
+    mny: f32,
+    tick: usize,
+    seam_lines: &[SeamLine],
+    ditch_xs: &[f32],
+    step_edges: &[f32],
+    bp: Vector,
+) -> BumpEvent {
+    // 归因:最近的接缝线 / 沟中心 / 台阶沿。
+    let mut nearest = String::from("none");
+    let mut best_d = f32::INFINITY;
+    for line in seam_lines {
+        let d = if line.axis == 0 {
+            (bx - line.c).abs()
+        } else {
+            (bz - line.c).abs()
+        };
+        if d < best_d {
+            best_d = d;
+            nearest = format!(
+                "seam{}={}/d{:.2}",
+                if line.axis == 0 { "x" } else { "z" },
+                line.c,
+                d
+            );
+        }
+    }
+    for dx0 in ditch_xs {
+        // 沟在 |z|>T2_DITCH_MARGIN;机身到沟的水平距离。
+        let d = ((bx - dx0) * (bx - dx0)
+            + ((bp.z.abs() - T2_DITCH_MARGIN as f32).max(0.0)).powi(2))
+        .sqrt();
+        if d < best_d {
+            best_d = d;
+            nearest = format!("ditch_x={:.1}/d{:.2}", dx0, d);
+        }
+    }
+    for se in step_edges {
+        let d = (bx - se).abs();
+        if d < best_d {
+            best_d = d;
+            nearest = format!("step_x={}/d{:.2}", se, d);
+        }
+    }
+    BumpEvent {
+        robot: ri,
+        tick,
+        ticks: cnt,
+        max_vy: mv,
+        min_upy: mu,
+        x: bx,
+        z: bz,
+        feet: ftouch
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| **t)
+            .map(|(i, _)| i)
+            .collect(),
+        min_abs_ny: mny,
+        nearest,
+    }
 }
 
 fn run(cfg: &Cfg) -> Outcome {
@@ -466,6 +549,10 @@ fn run(cfg: &Cfg) -> Outcome {
         );
         robots.push(r);
     }
+    // extra 变量(A00-2 R2):0 = 不调用,旧组哈希不变。
+    for r in &robots {
+        set_extra_solver_iterations(&mut world, r, cfg.extra);
+    }
     let robot = &robots[0];
     // R1-1:from_rotation_y(θ) 把 +x 转向 −z → 前进方向 (cos θ, 0, −sin θ);
     // 横偏/路程统一走 lateral_of / lateral_of_at。
@@ -499,17 +586,18 @@ fn run(cfg: &Cfg) -> Outcome {
     let mut max_vy = 0.0f32;
     let mut max_link_speed = 0.0f32;
     let mut max_pen = 0.0f32;
-    // 窄口径接触统计(R1-2)。
+    // 窄口径接触统计(R1-2;R2:空流形单独计数)。
     let mut foot_manifolds = 0u64;
+    let mut empty_manifolds = 0u64;
     let mut foot_tilt = 0u64;
     let mut foot_tilt_near = 0u64;
     let mut foot_min_abs_ny = 1.0f32;
     // 跨缝计数(R1-4):每脚 × 每线上一拍的带符号距离符号。
     let mut seam_prev: Vec<[f32; 4]> = Vec::new();
     let mut seam_crossings = 0u64;
-    // 颠簸事件(R1-5)。
+    // 颠簸事件(R1-5;R2-3:每只独立状态;R2-4:单拍事件也记录)。
     let mut bumps: Vec<BumpEvent> = Vec::new();
-    let mut cur_bump: Option<BumpAcc> = None;
+    let mut cur_bumps: Vec<Option<BumpAcc>> = vec![None; n_bots];
     // T4:下台阶与摔倒过程。
     let mut t4_edge_tick = None;
     let mut t4_fall_link_v = 0.0f32;
@@ -521,9 +609,12 @@ fn run(cfg: &Cfg) -> Outcome {
     let mut end_reason = "completed";
     let mut end_tick = cfg.total_ticks;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let colliders = &robot.colliders;
+    // R2-3:全体个体的 collider 集(穿透统计覆盖 8 只;第 0 只的窄口径
+    // 统计单独走 is_foot)。
+    let all_colliders: Vec<Vec<ColliderHandle>> =
+        robots.iter().map(|r| r.colliders.clone()).collect();
     let feet = &robot.feet;
-    let is_robot_collider = |h: ColliderHandle| colliders.contains(&h);
+    let is_robot_collider = |h: ColliderHandle| all_colliders.iter().any(|cs| cs.contains(&h));
     let is_foot = |h: ColliderHandle| feet.contains(&h);
     let mut step_ms: Vec<f32> = Vec::new();
     let mut bump_unexplained: Vec<String> = Vec::new();
@@ -584,9 +675,10 @@ fn run(cfg: &Cfg) -> Outcome {
             hash = hash_f32(hash, read_angle(&world.multibody_joints, robot, dof));
         }
 
-        // 横偏 = 相对"出生点 + 初始航向"轴线的 2D 叉积(R1-1 修正符号后
-        // fwd0 与 yaw 一致)。
-        let lateral = lateral_of(p.x, p.z, lay.origin_x, cfg.heading);
+        // 横偏(R2-2):判定轴用**带轴** `lay.heading`(工况基准航向),
+        // 不用 `cfg.heading`(带偏置的个体航向)——旧版把个体偏置也算进
+        // 带轴,±1°/±2° 组会提前/延后离带,T3_h0 走到带外 4.57 m 才结束。
+        let lateral = lateral_of(p.x, p.z, lay.origin_x, lay.heading);
 
         // 脚世界坐标(球心):每拍都要(跨缝、接触统计、事件归因)。
         let mut foot_pos = [Vector::ZERO; 4];
@@ -620,30 +712,35 @@ fn run(cfg: &Cfg) -> Outcome {
         }
 
         if tick >= walk0 {
+            // 全体统计(R2-3):up·y / max vy / 连杆速度对**每只个体**取
+            // (旧版只统计 robots[0];单只组数值不变)。哈希、跨缝、窄口径
+            // 接触统计仍以第 0 只为样本个体(状态哈希口径不变)。
+            for r in robots.iter() {
+                let b = world.bodies.get(r.body).expect("alive");
+                let bup = (b.rotation() * Vector::new(0.0, 1.0, 0.0)).y;
+                if bup < 0.7 && fell_tick.is_none() && std::ptr::eq(r, robot) {
+                    fell_tick = Some(tick - walk0);
+                }
+                up_min = up_min.min(bup);
+                let blv = b.linvel();
+                max_vy = max_vy.max(blv.y.abs());
+                for lh in r.links.iter().copied().chain(std::iter::once(r.body)) {
+                    let rb = world.bodies.get(lh).expect("alive");
+                    max_link_speed = max_link_speed.max(rb.linvel().length());
+                }
+            }
             if up.y < 0.7 && fell_tick.is_none() {
                 fell_tick = Some(tick - walk0);
             }
-            up_min = up_min.min(up.y);
             let py = f64::from(p.y);
             h_sum += py;
             h_sq += py * py;
             h_n += 1;
             let lv = body.linvel();
-            max_vy = max_vy.max(lv.y.abs());
             let fwd = body.rotation() * Vector::new(1.0, 0.0, 0.0);
             let fh = Vector::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
             vfwd_sum += f64::from(lv.dot(fh));
             vel_n += 1;
-            // 最大连杆速度:全部连杆 + 机身(R1 通用要求)。
-            for lh in robot
-                .links
-                .iter()
-                .copied()
-                .chain(std::iter::once(robot.body))
-            {
-                let rb = world.bodies.get(lh).expect("alive");
-                max_link_speed = max_link_speed.max(rb.linvel().length());
-            }
             // 接触统计:连杆侧对地穿透(自接触已关;地形 = fixed)。
             // 窄口径(R1-2):脚对地形、流形最深点 dist<1mm。
             for pair in world.narrow_phase.contact_graph().interactions() {
@@ -661,12 +758,19 @@ fn run(cfg: &Cfg) -> Outcome {
                     let vs_terrain = terrain_handles.contains(&pair.collider1)
                         || terrain_handles.contains(&pair.collider2);
                     for manifold in &rigid.manifolds {
+                        // R2-1:空流形单独计数,不进穿透/窄口径统计
+                        // (旧版 unwrap_or(0.0) 让空流形得到 deepest=0、
+                        // 法线为零向量,污染 min |n.y|"=0" 的读数)。
+                        if manifold.points.is_empty() {
+                            empty_manifolds += 1;
+                            continue;
+                        }
                         let deepest = manifold
                             .points
                             .iter()
                             .map(|pt| pt.dist)
                             .reduce(f32::max)
-                            .unwrap_or(0.0);
+                            .expect("points nonempty");
                         if vs_terrain {
                             max_pen = max_pen.min(deepest);
                         }
@@ -741,8 +845,9 @@ fn run(cfg: &Cfg) -> Outcome {
                     }
                 }
             }
-            // 颠簸事件(R1-5):|vy| > 0.35 或 up·y < 0.97。多只时每只都
-            // 检测(事件归到该组;位置/脚取对应个体)。这里逐只:
+            // 颠簸事件(R1-5;R2-3/R2-4):|vy| > 0.35 或 up·y < 0.97。
+            // **每只独立状态**(旧版共用一个 cur_bump,一只的事件会被另一
+            // 只关闭);**单拍事件也记录**(旧版 cnt>=2 才收,丢单拍)。
             for (ri, r) in robots.iter().enumerate() {
                 let b = world.bodies.get(r.body).expect("alive");
                 let bp = b.translation();
@@ -758,12 +863,15 @@ fn run(cfg: &Cfg) -> Outcome {
                             for (fi, fc) in r.feet.iter().enumerate() {
                                 if *fc == pair.collider1 || *fc == pair.collider2 {
                                     for manifold in &rigid.manifolds {
+                                        if manifold.points.is_empty() {
+                                            continue;
+                                        }
                                         let deepest = manifold
                                             .points
                                             .iter()
                                             .map(|pt| pt.dist)
                                             .reduce(f32::max)
-                                            .unwrap_or(0.0);
+                                            .expect("points nonempty");
                                         if deepest < 0.001 {
                                             feet_touch[fi] = true;
                                             min_ny = min_ny.min(manifold.data.normal.y.abs());
@@ -774,7 +882,7 @@ fn run(cfg: &Cfg) -> Outcome {
                         }
                     }
                 }
-                let open = cur_bump.as_mut();
+                let open = cur_bumps[ri].as_mut();
                 if active {
                     match open {
                         Some((_, _cnt, mv, mu, _x, _z, ftouch, mny)) => {
@@ -787,70 +895,27 @@ fn run(cfg: &Cfg) -> Outcome {
                             *mny = mny.min(min_ny);
                         }
                         None => {
-                            cur_bump =
+                            cur_bumps[ri] =
                                 Some((ri, 1, bvy.abs(), bup, bp.x, bp.z, feet_touch, min_ny));
                         }
                     }
-                } else if let Some((bri, cnt, mv, mu, bx, bz, ftouch, mny)) = cur_bump.take() {
-                    if cnt >= 2 {
-                        // 归因:最近的接缝线 / 沟中心 / 台阶沿。
-                        let mut nearest = String::from("none");
-                        let mut best_d = f32::INFINITY;
-                        for line in &seam_lines {
-                            let d = if line.axis == 0 {
-                                (bx - line.c).abs()
-                            } else {
-                                (bz - line.c).abs()
-                            };
-                            if d < best_d {
-                                best_d = d;
-                                nearest = format!(
-                                    "seam{}={}/d{:.2}",
-                                    if line.axis == 0 { "x" } else { "z" },
-                                    line.c,
-                                    d
-                                );
-                            }
-                        }
-                        for dx0 in &ditch_xs {
-                            let dxy = ((bx - dx0).abs()).hypot(12.0f32.min(bp.z.abs()).max(0.0));
-                            // 沟在 |z|>12;机身到沟的水平距离。
-                            let d = ((bx - dx0) * (bx - dx0)
-                                + ((bp.z.abs() - T2_DITCH_MARGIN as f32).max(0.0)).powi(2))
-                            .sqrt();
-                            let _ = dxy;
-                            if d < best_d {
-                                best_d = d;
-                                nearest = format!("ditch_x={}/d{:.2}", dx0, d);
-                            }
-                        }
-                        for se in &step_edges {
-                            let d = (bx - se).abs();
-                            if d < best_d {
-                                best_d = d;
-                                nearest = format!("step_x={}/d{:.2}", se, d);
-                            }
-                        }
-                        bumps.push(BumpEvent {
-                            tick,
-                            ticks: cnt,
-                            max_vy: mv,
-                            min_upy: mu,
-                            x: bx,
-                            z: bz,
-                            feet: ftouch
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, t)| **t)
-                                .map(|(i, _)| i)
-                                .collect(),
-                            min_abs_ny: mny,
-                            nearest,
-                        });
-                        let _ = bri;
-                    }
+                } else if let Some((bri, cnt, mv, mu, bx, bz, ftouch, mny)) = cur_bumps[ri].take() {
+                    bumps.push(close_bump(
+                        bri,
+                        cnt,
+                        mv,
+                        mu,
+                        bx,
+                        bz,
+                        ftouch,
+                        mny,
+                        tick,
+                        &seam_lines,
+                        &ditch_xs,
+                        &step_edges,
+                        bp,
+                    ));
                 }
-                let _ = ri;
             }
             if lateral.abs() > lay.leave {
                 end_reason = "left_lane";
@@ -865,25 +930,26 @@ fn run(cfg: &Cfg) -> Outcome {
         }
     }
 
-    // 事件段闭合(跑到总拍数仍 active)。
-    if let Some((_ri, cnt, mv, mu, bx, bz, ftouch, mny)) = cur_bump.take() {
-        if cnt >= 2 {
-            bumps.push(BumpEvent {
-                tick: end_tick,
-                ticks: cnt,
-                max_vy: mv,
-                min_upy: mu,
-                x: bx,
-                z: bz,
-                feet: ftouch
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, t)| **t)
-                    .map(|(i, _)| i)
-                    .collect(),
-                min_abs_ny: mny,
-                nearest: "tail".to_string(),
-            });
+    // 事件段闭合(R2-3/R2-4:每只独立;跑到总拍数仍 active 的段收为
+    // tail 行,归因同普通段——旧版只收第 0 只且 nearest 硬编码 tail)。
+    for (ri, acc) in cur_bumps.iter_mut().enumerate() {
+        if let Some((_bri, cnt, mv, mu, bx, bz, ftouch, mny)) = acc.take() {
+            let end_body_all = world.bodies.get(robots[ri].body).expect("alive");
+            bumps.push(close_bump(
+                ri,
+                cnt,
+                mv,
+                mu,
+                bx,
+                bz,
+                ftouch,
+                mny,
+                end_tick,
+                &seam_lines,
+                &ditch_xs,
+                &step_edges,
+                end_body_all.translation(),
+            ));
         }
     }
 
@@ -919,6 +985,7 @@ fn run(cfg: &Cfg) -> Outcome {
         max_link_speed,
         max_pen_ground: max_pen,
         foot_manifolds,
+        empty_manifolds,
         foot_tilt,
         foot_tilt_near_seam: foot_tilt_near,
         foot_min_abs_ny,
@@ -954,7 +1021,7 @@ fn percentile_of(sorted: &[f32], p: f64) -> f32 {
 
 fn outcome_csv(o: &Outcome) -> String {
     format!(
-        "{},{},{},{:.2},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.5},{},{},{},{},{},{:.4},{:.4},{},{:016x},{:.3},{:.3},{:.3}",
+        "{},{},{},{:.2},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.5},{},{},{},{},{},{:.4},{:.4},{},{},{:016x},{:.3},{:.3},{:.3}",
         o.name,
         o.end_tick,
         o.end_reason,
@@ -968,6 +1035,7 @@ fn outcome_csv(o: &Outcome) -> String {
         o.max_pen_ground,
         o.foot_min_abs_ny,
         o.foot_manifolds,
+        o.empty_manifolds,
         o.foot_tilt,
         o.foot_tilt_near_seam,
         o.fell_tick
@@ -987,10 +1055,13 @@ fn outcome_csv(o: &Outcome) -> String {
 fn bumps_txt(name: &str, o: &Outcome) -> String {
     let mut s = format!("# bumps: {} ({} events)\n", o.name, o.bumps.len());
     let _ = name;
-    s.push_str("# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest\n");
+    // 列说明(R2-4):robot = 事件归属个体;合并规则 = 同一只的连续
+    // active 拍合为一段(没有"间隔≤5 拍合并";单拍事件也记录)。
+    s.push_str("# robot,tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest\n");
     for b in &o.bumps {
         s.push_str(&format!(
-            "{},{},{:.3},{:.4},{:.2},{:.2},{},{:.4},{}\n",
+            "{},{},{},{:.3},{:.4},{:.2},{:.2},{},{:.4},{}\n",
+            b.robot,
             b.tick,
             b.ticks,
             b.max_vy,
@@ -1063,6 +1134,7 @@ fn main() {
                 update_every: 2,
                 total_ticks: 3600 + 3 * 60,
                 eight: false,
+                extra: 0,
             });
         }
     }
@@ -1074,14 +1146,50 @@ fn main() {
         update_every: 2,
         total_ticks: 1800 + 3 * 60,
         eight: true,
+        extra: 0,
     });
+    // extra 变量(A00-2 R2-5):extra ∈ {0,4,8,12},跑 T0、T2、T3 各 5 航向
+    // 与 8 只组(T2)。extra 0 组是新名字独立行(数值 = 基线组的复现对照;
+    // 基线行本身不动,T1/T2 的哈希约束按放行保持)。
+    for extra in [0usize, 4, 8, 12] {
+        for (tag, w) in [
+            ("T0", Workload::T0),
+            ("T2", Workload::T2),
+            ("T3", Workload::T3),
+        ] {
+            for (i, dy) in yaw_offsets.iter().enumerate() {
+                let heading = layout(w).heading + dy.to_radians();
+                let name = Box::leak(format!("e{extra}_{tag}_h{i}_dy{dy:+.0}").into_boxed_str());
+                cfgs.push(Cfg {
+                    name,
+                    w,
+                    heading,
+                    update_every: 2,
+                    total_ticks: 3600 + 3 * 60,
+                    eight: false,
+                    extra,
+                });
+            }
+        }
+        let name = Box::leak(format!("e{extra}_eight_T2").into_boxed_str());
+        cfgs.push(Cfg {
+            name,
+            w: Workload::T2,
+            heading: 0.0,
+            update_every: 2,
+            total_ticks: 1800 + 3 * 60,
+            eight: true,
+            extra,
+        });
+    }
 
     let mut out = String::new();
     out.push_str(
         "name,end_tick,end_reason,distance,seam_crossings,up_y_min,height_std,\
          fwd_speed_mean,max_body_vy,max_link_speed,max_pen_ground,foot_min_abs_ny,\
-         foot_manifolds,foot_tilt,foot_tilt_near_seam,fell_tick,t4_edge_tick,\
-         t4_fall_link_v,t4_fall_pen,nan,state_hash,step_ms_p50,step_ms_p95,step_ms_max\n",
+         foot_manifolds,empty_manifolds,foot_tilt,foot_tilt_near_seam,fell_tick,\
+         t4_edge_tick,t4_fall_link_v,t4_fall_pen,nan,state_hash,step_ms_p50,\
+         step_ms_p95,step_ms_max\n",
     );
     let mut bump_out = String::new();
     for cfg in &cfgs {
@@ -1090,6 +1198,11 @@ fn main() {
             cfg.name.starts_with("T2_h2") || cfg.eight
         } else if cfg.eight {
             only_has_eight
+                || (!only.is_empty() && only_has_eight)
+                || (!only.is_empty()
+                    && only
+                        .iter()
+                        .any(|a| cfg.name.starts_with(a.as_str()) && a.as_str() != "eight"))
         } else {
             only.is_empty() && !cfg.eight
                 || (!only.is_empty()

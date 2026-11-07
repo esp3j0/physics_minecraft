@@ -27,7 +27,11 @@ Go2 尺度四足模型、足端逆解、开环步态、运行时电机目标(`se
 - `DampMode`(Scaled/Unscaled/Zero)+ `production_params`:
   rapier 默认参数只覆写 dt;默认阻尼 0.1 是绝对常量,质量缩放时同步 ×s;
 - `default_gait` / `DEFAULT_KP/KD`:A00-2 放行定的默认步态组
-  (kp100 kd3 f3 s0.15 l0.06 脚摩擦 0.6,30 Hz 目标更新)。
+  (kp100 kd3 f3 s0.15 l0.06 脚摩擦 0.6,30 Hz 目标更新);
+- `set_extra_solver_iterations`(A00-2 R2):对主体全部连杆+机身调
+  `RigidBody::set_additional_solver_iterations(n)`;求解按连通分量取最大值,
+  整个分量多跑 n 个 solver substep,`dt` 不变(不碰 D4);`n = 0` 不调用
+  任何 API(数值路径不变)。
 
 ## 三个 rapier 坑(生产实现要避开;详见 gait README §13)
 

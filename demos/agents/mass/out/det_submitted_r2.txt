@@ -1,0 +1,82 @@
+== det 双跑(A00-2 R2:36 对全部 IDENTICAL;判据两组 + e4/e8/e12 各档)==
+determinism: bf3388a6208ea85c vs bf3388a6208ea85c -> IDENTICAL
+--
+determinism: f23f7a3500034e1c vs f23f7a3500034e1c -> IDENTICAL
+--
+determinism: e67354566a47a573 vs e67354566a47a573 -> IDENTICAL
+--
+determinism: be278e5de4a94060 vs be278e5de4a94060 -> IDENTICAL
+--
+determinism: 14c4883d5837bd4e vs 14c4883d5837bd4e -> IDENTICAL
+--
+determinism: 81c08e64364138de vs 81c08e64364138de -> IDENTICAL
+--
+determinism: 019fb9f211e5d6f6 vs 019fb9f211e5d6f6 -> IDENTICAL
+--
+determinism: 3bd6f766482ac1af vs 3bd6f766482ac1af -> IDENTICAL
+--
+determinism: ce438668400b878e vs ce438668400b878e -> IDENTICAL
+--
+determinism: 7fbec5731cb8ecbd vs 7fbec5731cb8ecbd -> IDENTICAL
+--
+determinism: e0cce91803d524e3 vs e0cce91803d524e3 -> IDENTICAL
+--
+determinism: 7eb6888d29a0750b vs 7eb6888d29a0750b -> IDENTICAL
+--
+determinism: 3336667c5d09ac2f vs 3336667c5d09ac2f -> IDENTICAL
+--
+determinism: e3423662b4b80d28 vs e3423662b4b80d28 -> IDENTICAL
+--
+determinism: acd96c32490db57b vs acd96c32490db57b -> IDENTICAL
+--
+determinism: 98ac441d1995bcf8 vs 98ac441d1995bcf8 -> IDENTICAL
+--
+determinism: 91307949154344bc vs 91307949154344bc -> IDENTICAL
+--
+determinism: 6d735d29cc57dbfd vs 6d735d29cc57dbfd -> IDENTICAL
+--
+determinism: 2d2efa2a038819c7 vs 2d2efa2a038819c7 -> IDENTICAL
+--
+determinism: 89854a320767244a vs 89854a320767244a -> IDENTICAL
+--
+determinism: bbae62580da13f60 vs bbae62580da13f60 -> IDENTICAL
+--
+determinism: 019fb9f211e5d6f6 vs 019fb9f211e5d6f6 -> IDENTICAL
+--
+determinism: 3bd6f766482ac1af vs 3bd6f766482ac1af -> IDENTICAL
+--
+determinism: ce438668400b878e vs ce438668400b878e -> IDENTICAL
+--
+determinism: 7fbec5731cb8ecbd vs 7fbec5731cb8ecbd -> IDENTICAL
+--
+determinism: e0cce91803d524e3 vs e0cce91803d524e3 -> IDENTICAL
+--
+determinism: 7eb6888d29a0750b vs 7eb6888d29a0750b -> IDENTICAL
+--
+determinism: 3336667c5d09ac2f vs 3336667c5d09ac2f -> IDENTICAL
+--
+determinism: e3423662b4b80d28 vs e3423662b4b80d28 -> IDENTICAL
+--
+determinism: acd96c32490db57b vs acd96c32490db57b -> IDENTICAL
+--
+determinism: 98ac441d1995bcf8 vs 98ac441d1995bcf8 -> IDENTICAL
+--
+determinism: 91307949154344bc vs 91307949154344bc -> IDENTICAL
+--
+determinism: 6d735d29cc57dbfd vs 6d735d29cc57dbfd -> IDENTICAL
+--
+determinism: 2d2efa2a038819c7 vs 2d2efa2a038819c7 -> IDENTICAL
+--
+determinism: 89854a320767244a vs 89854a320767244a -> IDENTICAL
+--
+determinism: bbae62580da13f60 vs bbae62580da13f60 -> IDENTICAL
+
+== 隔离性验证(R2-6:20 m 外 3×3×3 堆从 1 m 落下;isolation_hash + 终态位置和)==
+Isolation_norobot,false,false,0,,0,0,20.0000,0.0000,6.0451,0.0000,0.0000,0.0000,0.0000,0.0000,0,-,0.0000,NaN,NaN,0.0000,0.0000,0,-,0.0000,0.0000,0.0000,-,0.0000,ccc32d56bde06761,563252.000000,ccc32d56bde06761
+Isolation_comp_e0,false,false,0,,0.29493162,0,20.0000,0.2797,6.0451,0.0000,0.2770,0.0000,-0.0028,0.0000,-0.0023158044,-,0.0000,0.2770,0.99915904,0.0000,0.0000,0,-,0.0000,0.0000,0.0000,-,0.1452,ccc32d56bde06761,563252.000000,4144158caaaa4e13
+Isolation_comp_e12,false,false,0,,0.2869839,0,20.0000,0.2784,4.4145,0.0000,0.2879,0.0000,-0.0025,0.0000,-0.0023342222,-,0.0000,0.2879,0.99992615,0.0000,0.0000,0,-,0.0000,0.0000,0.0000,-,0.0217,584f92a6a891271f,570671.437500,59fae204c6c8623f
+
+norobot 与 comp_e0 的 isolation_hash 逐位相同(ccc32d56bde06761 / Σ=563252.000000):
+主体静止且距堆 20 m,无可测影响。
+comp_e12 isolation_hash 不同(584f92a6a891271f / Σ=570671.437500,Σ 差 7419):
+extra 12 对 20 m 外孤立堆仍有毫米级数值影响——extra ≠ 隔离,如实报。

@@ -27,7 +27,10 @@
 
 use std::time::Instant;
 
-use quad::{ik, joint_velocity, production_params, read_angle, set_target, spawn_robot};
+use quad::{
+    ik, joint_velocity, production_params, read_angle, set_extra_solver_iterations, set_target,
+    spawn_robot,
+};
 use quad::{
     DampMode, Gait, Robot, FOOT_R, FULL_STRETCH_DY, GROUND_FRICTION, GROUND_RESTITUTION, N_JOINTS,
     TAU_LIMIT,
@@ -60,6 +63,9 @@ struct RunCfg {
     /// 站立漂移模式(R1-2):目标恒站姿、每拍 wake_up、跑 3600 拍取站稳
     /// 后段,报 v_x / v_z / 身高 / up·y / 脚对地滑移。
     stand: bool,
+    /// 按主体追加求解迭代(A00-2 R2):全部连杆 + 机身
+    /// `set_additional_solver_iterations(n)`;0 = 不调用(数值路径不变)。
+    extra: usize,
 }
 
 /// 一组结果(CSV 行 / README 表列)。
@@ -158,6 +164,10 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
             cfg.foot_mu,
             cfg.damp,
         ));
+    }
+    // extra 变量(A00-2 R2):按主体追加求解迭代;0 = 不调用,旧组哈希不变。
+    for robot in &robots {
+        set_extra_solver_iterations(&mut world, robot, cfg.extra);
     }
 
     let tau = cfg.mass_scale * TAU_LIMIT;
@@ -559,6 +569,7 @@ fn base_cfg(name: &'static str) -> RunCfg {
         walk_ticks: 3600,
         eight: false,
         stand: false,
+        extra: 0,
     }
 }
 
@@ -784,6 +795,36 @@ fn build_matrix() -> Vec<RunCfg> {
         c.stand = true;
         c.dt = 1.0 / 240.0;
         c.walk_ticks = 14400; // 同 60 s(速度按秒归一化,口径一致)
+        all.push(c);
+    }
+    // A00-2 R2:extra 表——按主体追加求解迭代(set_additional_solver_
+    // iterations)。站立(目标不变、每拍唤醒):extra ∈ {0,2,4,8,12,20};
+    // 默认步态:同 6 档。s = 1/100 为主口径,extra 0 和 12 再加 s=1 对照。
+    // extra 0 行 = 不调用 API,与已有 x001/real 组同参数但独立命名重跑
+    // (哈希应与对应旧行一致,作为 extra 路径没改数值的对照)。
+    for extra in [0usize, 2, 4, 8, 12, 20] {
+        let name = Box::leak(format!("stand_x001_e{extra}_kp100_kd3").into_boxed_str());
+        let mut c = mk(name, 100.0, 3.0, 1, 0.01);
+        c.stand = true;
+        c.extra = extra;
+        all.push(c);
+        let name = Box::leak(format!("walk_x001_e{extra}_kp100_kd3").into_boxed_str());
+        let mut c = mk(name, 100.0, 3.0, 2, 0.01);
+        g1(&mut c);
+        c.extra = extra;
+        all.push(c);
+    }
+    // extra 的 s=1 对照(放行:extra 0 和 12 再加 s = 1)。
+    for extra in [0usize, 12] {
+        let name = Box::leak(format!("stand_real_e{extra}_kp100_kd3").into_boxed_str());
+        let mut c = mk(name, 100.0, 3.0, 1, 1.0);
+        c.stand = true;
+        c.extra = extra;
+        all.push(c);
+        let name = Box::leak(format!("walk_real_e{extra}_kp100_kd3").into_boxed_str());
+        let mut c = mk(name, 100.0, 3.0, 2, 1.0);
+        g1(&mut c);
+        c.extra = extra;
         all.push(c);
     }
     all
