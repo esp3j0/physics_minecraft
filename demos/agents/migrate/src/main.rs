@@ -35,6 +35,20 @@
 //!
 //! `cross` / `cross_hist` 的轨迹分歧(diverge_tick,与相同快照类型的
 //! `same` 行比)只报数,不是判据。
+//!
+//! R2 修正(A00-3 R1 验收 MR1–MR6):
+//! - MR2 `active_order_end` 读主体最后所在的世界;新增 `active_order_post`
+//!   (迁移后第 120 拍、主体所在世界的顺序);
+//! - MR3 新增 `dst_awake_at_migrate`(迁移拍目标世界醒着的非主体动态刚体
+//!   数;同世界写 -);`pilesleep` 迁移门槛 = 堆全部睡着且连续 60 拍保持
+//!   全睡,才在下一个对应相位的拍迁移,不为 0 panic;新增
+//!   `dst_rewake_tick`(迁移后堆重新醒来的拍);
+//! - MR4 去重复行(拆分家族只跑 full);
+//! - MR5 窗口只收迁移后(对照行用自己的基点,不再把迁移前拍混进同一统计;
+//!   order 行无迁移窗口写 -);
+//! - MR6 新增 `yaw_change_deg`(全程累计航向变化,展开 ±180°)、
+//!   `path_len_m`(机身水平路径长度)、`slept`(主体是否睡过);新增
+//!   `seq_control_T0`(seq 前后两段同时长的干净世界对照)。
 
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -68,6 +82,8 @@ const WALK_TICKS: usize = STAND_TICKS + 1320;
 const PINGPONG_TICKS: usize = 3600;
 /// 质量比例 k(压缩档,§4;A00-3 统一口径)。
 const K: f32 = 1.0 / 100.0;
+/// pilesleep 迁移门槛:堆全部睡着且连续保持这么多拍(MR3)。
+const PILE_ALL_ASLEEP_STREAK: usize = 60;
 
 /// 重建方式。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -487,14 +503,27 @@ struct Outcome {
     /// R1-7:迁移前/后的活跃集顺序与前后段 vfwd、航向速率(SeqShuffle 组)。
     seq_pre_order: String,
     seq_post_order: String,
-    /// R1 通用:迁移/起跑前与运行结束的活跃集顺序(全部行)。
+    /// R1 通用:迁移/起跑前与运行结束的活跃集顺序(全部行;MR2:end 读
+    /// 主体最后所在的世界)。
     active_order_start: String,
     active_order_end: String,
+    /// MR2:迁移后第 120 拍、主体所在世界的活跃集顺序(非迁移行 = -)。
+    active_order_post: String,
+    /// MR3:迁移拍目标世界里醒着的非主体动态刚体数(同世界行 = -)。
+    dst_awake_at_migrate: Option<usize>,
+    /// MR3:迁移后目标世界堆重新醒来的拍(相对迁移拍;未复醒 = -)。
+    dst_rewake_tick: Option<usize>,
     seq_pre_vfwd: f32,
     seq_post_vfwd: f32,
     /// 航向速率(度/s;pre/post 段)。
     seq_pre_yaw_rate: f32,
     seq_post_yaw_rate: f32,
+    /// MR6:全程累计航向变化(度,展开过 ±180°)。
+    yaw_change_deg: f32,
+    /// MR6:机身水平路径长度(m)。
+    path_len_m: f32,
+    /// MR6:主体是否睡过(全程)。
+    slept: bool,
     state_hash: u64,
 }
 
@@ -506,8 +535,9 @@ fn outcome_csv(o: &Outcome) -> String {
             "inf".to_string()
         }
     };
+    let num_or = |v: Option<usize>| v.map_or_else(|| "-".to_string(), |t| t.to_string());
     format!(
-        "{},{:.3e},{:.3e},{:.3e},{:.3e},{},{},{},{},{},{},{},{},{},false,{},{:.1},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:016x}",
+        "{},{:.3e},{:.3e},{:.3e},{:.3e},{},{},{},{},{},{},{},{},{},false,{},{:.1},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:016x}",
         o.name,
         o.err_coord,
         o.err_pos,
@@ -534,10 +564,16 @@ fn outcome_csv(o: &Outcome) -> String {
         o.seq_post_order,
         o.active_order_start,
         o.active_order_end,
+        o.active_order_post,
+        num_or(o.dst_awake_at_migrate),
+        num_or(o.dst_rewake_tick),
         fnum(o.seq_pre_vfwd),
         fnum(o.seq_post_vfwd),
         fnum(o.seq_pre_yaw_rate),
         fnum(o.seq_post_yaw_rate),
+        fnum(o.yaw_change_deg),
+        fnum(o.path_len_m),
+        o.slept,
         o.state_hash,
     )
 }
@@ -606,6 +642,8 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
         _ => WALK_TICKS,
     };
 
+    // MR3(pilesleep):迁移拍推迟到"堆全部睡着且连续 60 拍保持全睡"之后的
+    // 第一个对应相位拍。名义迁移拍 = migrate_ticks[0](Deferred 由状态机覆写)。
     let mut migrate_ticks: Vec<usize> = Vec::new();
     match cfg.scene {
         Scene::WalkPhase { phase } => migrate_ticks.push(walk0 + phase * period / 12),
@@ -656,11 +694,22 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
     // PileAwake 组:目标世界的方块堆迁移拍前每拍唤醒(醒着的堆参与求解,
     // PileSleep 对照堆睡着;唤醒窗口见主循环 pile_wake_now)。
     let pile_awake = cfg.rebuild == Rebuild::PileAwake;
+    // MR3(pilesleep):全部睡着且连续 PILE_ALL_ASLEEP_STREAK 拍 → 允许迁移;
+    // 名义拍在门槛满足后的第一个"相位对齐"拍执行。
+    let pile_sleep_gate = cfg.rebuild == Rebuild::PileSleep;
+    let mut pile_asleep_streak = 0usize;
+    // MR3:目标世界堆复醒检测(迁移后第几拍;pileawake 组也报)。
+    let mut dst_rewake_tick: Option<usize> = None;
     let mut err = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut migrated = false;
     let mut post_base = 0usize;
+    // MR2:迁移后第 POST_TICKS 拍采样的 active_order_post。
+    let mut order_post = String::new();
+    let mut order_post_done = false;
+    // MR3:迁移拍目标世界醒着的非主体动态刚体数。
+    let mut dst_awake_at_migrate: Option<usize> = None;
     // R1 通用要求:每行报 active_order_start(迁移/起跑前)与
-    // active_order_end(运行结束时)。
+    // active_order_end(运行结束时;MR2 = 主体最后所在的世界)。
     let mut order_start = String::new();
     let mut order_end = String::new();
     let mut migrate_us = 0.0f32;
@@ -691,6 +740,12 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
     let mut seq_post_yaw1: Option<f32> = None;
     let seq_pre_span = (walk0, walk0 + 300);
     let seq_post_span = (walk0 + 300, total_ticks);
+    // MR6:全程航向变化(展开)与水平路径长度、睡眠。
+    let mut yaw_prev: Option<f32> = None;
+    let mut yaw_total = 0.0f32;
+    let mut path_len = 0.0f32;
+    let mut body_prev: Option<Vector> = None;
+    let mut slept = false;
 
     for tick in 0..total_ticks {
         // 落地布景(land):站稳(60 拍)→ 抬到 0.5 m 落下;在刚接触那拍迁移。
@@ -746,10 +801,24 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
                 let _ = gap;
             }
         }
+        // MR3(pilesleep):迁移拍 = 堆全睡连续 60 拍后的第一个对应相位拍。
+        // 名义相位拍集合 = walk0 + k·period/12(与该组 phase 对齐的拍 =
+        // (tick - 名义拍) % (period/12) == 0)。
         let do_now = match cfg.scene {
             Scene::PingPong { .. } => next_ping == Some(tick),
-            _ => !cfg.control_like && migrate_ticks.first() == Some(&tick) && !migrated,
+            _ => {
+                !cfg.control_like
+                    && migrate_ticks.first() == Some(&tick)
+                    && !migrated
+                    && pile_gate_ok(pile_sleep_gate, pile_asleep_streak)
+            }
         };
+        // pilesleep 门槛未满足时把迁移拍顺延一个相位格(period/12),保持
+        // 相位对齐(状态机在下面 pile_streak 更新处推进)。
+        if pile_sleep_gate && !migrated && migrate_ticks.first() == Some(&tick) && !do_now {
+            let phase_step = period / 12;
+            migrate_ticks[0] = tick + phase_step;
+        }
         if do_now && tick > 0 {
             // 快照(读活跃侧)→ 移除 → 重建(目标侧)。迁移拍照常写目标、
             // 照常步进(M2:不再 continue)。
@@ -758,6 +827,19 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
                 let r = src.robot.as_ref().expect("alive");
                 snapshot_robot(&src.world, r, &cur_targets, cfg.snap == SnapKind::Full)
             };
+            // MR3:迁移拍目标世界里醒着的非主体动态刚体数(同世界 = None)。
+            // pilewasawake 用于复醒列语义(pileawake 组迁移前堆醒着是布景预期)。
+            if two_worlds {
+                let dst = if in_a { &b } else { &a };
+                let n = count_awake_dynamic_excluding(dst, &[]);
+                dst_awake_at_migrate = Some(n);
+                if cfg.rebuild == Rebuild::PileSleep && n != 0 {
+                    panic!(
+                        "pilesleep gate violated at migrate: {} awake bodies in dst (name={})",
+                        n, cfg.name
+                    );
+                }
+            }
             #[allow(clippy::disallowed_methods)]
             let t0 = Instant::now();
             if two_worlds {
@@ -852,6 +934,41 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
             nan = true;
             break;
         }
+        // MR6:航向累计(展开 ±180°)与水平路径。
+        let rot0 = body.rotation();
+        let yaw = yaw_of(rot0);
+        if let Some(prev) = yaw_prev {
+            let d = (yaw - prev).rem_euclid(std::f32::consts::TAU);
+            let d = if d > std::f32::consts::PI {
+                d - std::f32::consts::TAU
+            } else {
+                d
+            };
+            yaw_total += d;
+        }
+        yaw_prev = Some(yaw);
+        if let Some(prev) = body_prev {
+            let d = p - prev;
+            path_len += (d.x * d.x + d.z * d.z).sqrt();
+        }
+        body_prev = Some(p);
+        // MR6:slept = 主体任一连杆睡过(含机身)。
+        if !slept {
+            slept = active
+                .world
+                .bodies
+                .get(r.body)
+                .map(|b| b.is_sleeping())
+                .unwrap_or(false)
+                || r.links.iter().any(|lh| {
+                    active
+                        .world
+                        .bodies
+                        .get(*lh)
+                        .map(|b| b.is_sleeping())
+                        .unwrap_or(false)
+                });
+        }
         let mut th: u64 = 0xcbf2_9ce4_8422_2325;
         for v in [p.x, p.y, p.z] {
             hash = hash_f32(hash, v);
@@ -885,15 +1002,23 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
             tick_link_max = tick_link_max.max(rb.linvel().length());
         }
         let pen = ground_pen(&active.world, r, &active.terrain);
-        // M3/M4:窗口 = 迁移/对照基点后 POST_TICKS 拍,只统计窗口内。
+        // M3/M4 + MR5:窗口 = 迁移/对照基点后 POST_TICKS 拍,只统计窗口内。
+        // 对照行用自己的基点(不与迁移行混统计);迁移前行不进窗口。
         let in_window = if migrated {
             tick >= post_base && tick < post_base + POST_TICKS
         } else {
-            tick >= control_base_of(cfg, period, walk0, land_tick)
-                && tick < control_base_of(cfg, period, walk0, land_tick) + POST_TICKS
+            !cfg.control_like && cfg.scene == Scene::Eight
+                || control_like_window(cfg, tick, period, walk0, land_tick)
         };
         if in_window {
             win.push(upy, vy, tick_link_max, pen, p);
+        }
+        // MR2:迁移后第 POST_TICKS 拍(窗口末拍)、step 后采样目标世界顺序。
+        if migrated && !order_post_done && two_worlds && tick == post_base + POST_TICKS {
+            if let Some(rr) = active.robot.as_ref() {
+                order_post = active_order(&active.world, rr);
+                order_post_done = true;
+            }
         }
         // 接触恢复(迁移组):迁移后首次真实脚-地接触。
         if contact_recover.is_none()
@@ -945,11 +1070,46 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
                 }
             }
         }
+        // MR3(pilesleep 状态机):步进后统计堆睡眠连拍;名义迁移拍到达但
+        // 门槛未满足时,do_now 已把 migrate_ticks[0] 顺延一个相位格。
+        if pile_sleep_gate && !migrated && pile_all_asleep(idle_world(in_a, &a, &b)) {
+            pile_asleep_streak += 1;
+        } else if pile_sleep_gate && !migrated {
+            pile_asleep_streak = 0;
+        }
+        // MR3:堆复醒检测(迁移后第几拍;pileawake/pilesleep/cross_hist 都
+        // 有堆。堆在**主体迁移后的目标世界** = 活跃侧;判定 = 出现醒着的
+        // 动态刚体(排除主体自身),记第一拍。放在循环末,避开 active
+        // 可变借用区)。
+        if migrated
+            && dst_rewake_tick.is_none()
+            && matches!(
+                cfg.rebuild,
+                Rebuild::PileSleep | Rebuild::PileAwake | Rebuild::CrossHist
+            )
+        {
+            let robot_handles: Vec<RigidBodyHandle> = active_robot_handles(in_a, &a, &b);
+            if pile_has_awake(active_world(in_a, &a, &b), &robot_handles) {
+                dst_rewake_tick = Some(tick - post_base);
+            }
+        }
     }
 
-    // R1 通用:运行结束时的活跃集顺序(active_order_end)。
-    if let Some(r) = a.robot.as_ref() {
-        order_end = active_order(&a.world, r);
+    // R1 通用 + MR2:运行结束时的活跃集顺序(active_order_end 读主体
+    // 最后所在的世界;跨世界迁移后主体在 b)。
+    let final_robot = a.robot.as_ref().or(b.robot.as_ref());
+    if let Some(r) = final_robot {
+        let world = if a.robot.is_some() {
+            &a.world
+        } else {
+            &b.world
+        };
+        order_end = active_order(world, r);
+    }
+    // MR2:order_post 没采到(总拍数 < post_base+120、非迁移行、同世界行)
+    // 一律写 -。
+    if !order_post_done {
+        order_post = "-".to_string();
     }
 
     let vfwd = (vfwd_sum / vfwd_n.max(1) as f64) as f32;
@@ -983,10 +1143,16 @@ fn run(cfg: &Cfg, ref_hashes: &[u64]) -> (Outcome, Vec<u64>) {
         seq_post_order,
         active_order_start: order_start,
         active_order_end: order_end,
+        active_order_post: order_post,
+        dst_awake_at_migrate,
+        dst_rewake_tick,
         seq_pre_vfwd: (seq_pre_vfwd / seq_pre_n.max(1) as f64) as f32,
         seq_post_vfwd: (seq_post_vfwd / seq_post_n.max(1) as f64) as f32,
         seq_pre_yaw_rate: seq_pre_rate,
         seq_post_yaw_rate: seq_post_rate,
+        yaw_change_deg: yaw_total * 180.0 / std::f32::consts::PI,
+        path_len_m: path_len,
+        slept,
         state_hash: hash,
     };
     (outcome, tick_hashes)
@@ -1074,8 +1240,88 @@ fn control_base_of(cfg: &Cfg, period: usize, walk0: usize, land_tick: Option<usi
             let _ = gap;
             walk0 + 60
         }
+        // MR5:order / seq 行没有对齐的迁移窗口,列写 -(不进窗口统计)。
+        Scene::Order | Scene::SeqShuffle => usize::MAX,
         _ => 0,
     }
+}
+
+/// 对照行是否处于自己的统计窗口(MR5:对照行用自己的基点,不与迁移行混;
+/// order/seq 行基点 = usize::MAX 恒不在窗口)。
+fn control_like_window(
+    cfg: &Cfg,
+    tick: usize,
+    period: usize,
+    walk0: usize,
+    land_tick: Option<usize>,
+) -> bool {
+    let base = control_base_of(cfg, period, walk0, land_tick);
+    tick >= base && tick < base + POST_TICKS
+}
+
+/// MR3(pilesleep):迁移门槛 = 堆全睡连续 60 拍。非 pilesleep 行恒 true。
+fn pile_gate_ok(gate: bool, streak: usize) -> bool {
+    !gate || streak >= PILE_ALL_ASLEEP_STREAK
+}
+
+/// 目标世界(非活跃侧)是否全睡(动态刚体全部 sleeping;MR3 门槛用)。
+fn pile_all_asleep(world: &PhysicsWorld) -> bool {
+    world
+        .bodies
+        .iter()
+        .all(|(_, rb)| rb.is_fixed() || rb.is_sleeping())
+}
+
+/// 目标世界是否有醒着的动态刚体(MR3 复醒检测用;exclude = 主体句柄,
+/// 主体醒着行走不算堆复醒)。
+fn pile_has_awake(world: &PhysicsWorld, exclude: &[RigidBodyHandle]) -> bool {
+    world
+        .bodies
+        .iter()
+        .any(|(h, rb)| !rb.is_fixed() && !exclude.contains(&h) && !rb.is_sleeping())
+}
+
+/// 目标世界(非活跃侧)引用。
+fn idle_world<'w>(in_a: bool, a: &'w Side, b: &'w Side) -> &'w PhysicsWorld {
+    if in_a {
+        &b.world
+    } else {
+        &a.world
+    }
+}
+
+/// 主体所在世界(活跃侧)引用。迁移后堆所在的目标世界 = 活跃侧。
+fn active_world<'w>(in_a: bool, a: &'w Side, b: &'w Side) -> &'w PhysicsWorld {
+    if in_a {
+        &a.world
+    } else {
+        &b.world
+    }
+}
+
+/// 主体所在世界的主体句柄组(机身 + 连杆;空 = 无主体)。
+fn active_robot_handles(in_a: bool, a: &Side, b: &Side) -> Vec<RigidBodyHandle> {
+    let side = if in_a { a } else { b };
+    match side.robot.as_ref() {
+        Some(r) => std::iter::once(r.body)
+            .chain(r.links.iter().copied())
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+/// 世界里醒着的非主体动态刚体数(MR3;exclude = 主体连杆/机身句柄)。
+fn count_awake_dynamic_excluding(side: &Side, exclude: &[RigidBodyHandle]) -> usize {
+    let mut n = 0usize;
+    for (h, rb) in side.world.bodies.iter() {
+        if rb.is_fixed() || exclude.contains(&h) {
+            continue;
+        }
+        if !rb.is_sleeping() {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 8 只同拍迁移(same/full,T0):8 只沿 x 排开(间隔 2.5 m),站立后
@@ -1086,6 +1332,8 @@ fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
     let walk0 = STAND_TICKS;
     let total_ticks = WALK_TICKS;
     let migrate_tick = walk0 + 60; // 行走 1 s 后
+                                   // 对照行(M10/eight_control_T0)不迁移:migrate_us 无值,行名用 cfg.name。
+    let is_control = cfg.control_like;
 
     let mut side = make_side(cfg.t1);
     let n = 8;
@@ -1121,8 +1369,9 @@ fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
                 write_targets(&mut side.world, r, &cur_targets);
             }
         }
-        // 同拍迁移:全部 8 只快照 → 移除 → 重建。
-        if tick == migrate_tick {
+        // 同拍迁移:全部 8 只快照 → 移除 → 重建。对照行(eight_control_T0)
+        // 不迁移(R2/M10:对照行必须没做被测操作,migrate_us 列 = 0)。
+        if tick == migrate_tick && !is_control {
             #[allow(clippy::disallowed_methods)]
             let t0 = Instant::now();
             let snaps: Vec<_> = robots
@@ -1190,10 +1439,12 @@ fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
     }
 
     // 逐只行(M10)+ 汇总行(全体窗口指标;逐只明细在 per 行)。
+    // 行名带 cfg.name(区分迁移组与不迁移对照)。
     let mut lines = Vec::new();
     for (ri, pr) in per.iter().enumerate() {
         lines.push(format!(
-            "eight_same_full_T0_r{ri},{:.3e},{:.3e},{:.3e},{:.3e},{},{},{},{},{},{},{:.4},{},false,,{:.1},-,-,,,,,,{:016x}",
+            "{}_r{ri},{:.3e},{:.3e},{:.3e},{:.3e},{},{},{},{},{},{},{:.4},{},false,,{:.1},-,-,,,,,-,-,-,-,-,-,-,-,false,{:016x}",
+            cfg.name,
             pr.err.0,
             pr.err.1,
             pr.err.2,
@@ -1222,7 +1473,7 @@ fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
         .sum::<f64>()
         / n as f64;
     let summary = Outcome {
-        name: "eight_same_full_T0".into(),
+        name: cfg.name.clone(),
         err_coord: 0.0,
         err_pos: 0.0,
         err_rot: 0.0,
@@ -1245,10 +1496,16 @@ fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
         seq_post_order: String::new(),
         active_order_start: String::new(),
         active_order_end: String::new(),
+        active_order_post: "-".into(),
+        dst_awake_at_migrate: None,
+        dst_rewake_tick: None,
         seq_pre_vfwd: 0.0,
         seq_post_vfwd: 0.0,
         seq_pre_yaw_rate: 0.0,
         seq_post_yaw_rate: 0.0,
+        yaw_change_deg: 0.0,
+        path_len_m: 0.0,
+        slept: false,
         state_hash: hash,
     };
     (summary, lines)
@@ -1326,6 +1583,8 @@ fn build_matrix() -> Vec<Cfg> {
         });
     }
     // 行走中迁移:12 相位 × 重建家族 × 两快照 × 两地形。
+    // MR4:full/novec 只属 same/cross/cross_hist;拆分家族(histonly/
+    // pilesleep/pileawake)按 R1 放行原文只跑 full,不重复推进。
     let rebuilds = [
         Rebuild::Same,
         Rebuild::Cross,
@@ -1336,13 +1595,13 @@ fn build_matrix() -> Vec<Cfg> {
     ];
     for phase in 0..12usize {
         for rb in rebuilds {
-            // R1-5 拆分组只跑 full(R1 文字:"各跑 12 相位、full、T0 和 T1")。
-            let snaps = if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
-                [SnapKind::Full, SnapKind::Novec]
-            } else {
-                [SnapKind::Full, SnapKind::Full]
-            };
-            for sk in snaps {
+            let snap_list: &[SnapKind] =
+                if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
+                    &[SnapKind::Full, SnapKind::Novec]
+                } else {
+                    &[SnapKind::Full]
+                };
+            for sk in snap_list {
                 for t1 in [false, true] {
                     all.push(Cfg {
                         name: format!(
@@ -1354,7 +1613,7 @@ fn build_matrix() -> Vec<Cfg> {
                         ),
                         scene: Scene::WalkPhase { phase },
                         rebuild: rb,
-                        snap: sk,
+                        snap: *sk,
                         t1,
                         eight: false,
                         order: None,
@@ -1370,12 +1629,13 @@ fn build_matrix() -> Vec<Cfg> {
         (Scene::StandAsleep, "stand_asleep"),
     ] {
         for rb in rebuilds {
-            let snaps = if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
-                [SnapKind::Full, SnapKind::Novec]
-            } else {
-                [SnapKind::Full, SnapKind::Full]
-            };
-            for sk in snaps {
+            let snap_list: &[SnapKind] =
+                if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
+                    &[SnapKind::Full, SnapKind::Novec]
+                } else {
+                    &[SnapKind::Full]
+                };
+            for sk in snap_list {
                 for t1 in [false, true] {
                     all.push(Cfg {
                         name: format!(
@@ -1386,7 +1646,7 @@ fn build_matrix() -> Vec<Cfg> {
                         ),
                         scene,
                         rebuild: rb,
-                        snap: sk,
+                        snap: *sk,
                         t1,
                         eight: false,
                         order: None,
@@ -1398,12 +1658,13 @@ fn build_matrix() -> Vec<Cfg> {
     }
     // 落地瞬间 × 重建家族 × 两快照 × 两地形。
     for rb in rebuilds {
-        let snaps = if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
-            [SnapKind::Full, SnapKind::Novec]
-        } else {
-            [SnapKind::Full, SnapKind::Full]
-        };
-        for sk in snaps {
+        let snap_list: &[SnapKind] =
+            if matches!(rb, Rebuild::Same | Rebuild::Cross | Rebuild::CrossHist) {
+                &[SnapKind::Full, SnapKind::Novec]
+            } else {
+                &[SnapKind::Full]
+            };
+        for sk in snap_list {
             for t1 in [false, true] {
                 all.push(Cfg {
                     name: format!(
@@ -1414,7 +1675,7 @@ fn build_matrix() -> Vec<Cfg> {
                     ),
                     scene: Scene::LandTick,
                     rebuild: rb,
-                    snap: sk,
+                    snap: *sk,
                     t1,
                     eight: false,
                     order: None,
@@ -1568,6 +1829,18 @@ fn build_matrix() -> Vec<Cfg> {
         }),
         control_like: false,
     });
+    // R2(MR6):seq 的干净世界对照(T0,不插方块,不迁移),报同样两段的
+    // vfwd 与航向速率。
+    all.push(Cfg {
+        name: "seq_control_T0".into(),
+        scene: Scene::SeqShuffle,
+        rebuild: Rebuild::Same,
+        snap: SnapKind::Full,
+        t1: false,
+        eight: false,
+        order: None,
+        control_like: true,
+    });
     all
 }
 
@@ -1588,8 +1861,9 @@ fn main() {
         "name,err_coord_rad,err_pos_m,err_rot_rad,err_vel,post_upy_min,post_max_vy,\
          post_link_max,post_pen_max,post_body_step_max,contact_recover_tick,vfwd,fell_tick,\
          nan,panicked,panic_msg,migrate_us,diverge_tick,land_tick,seq_pre_order,seq_post_order,\
-         active_order_start,active_order_end,seq_pre_vfwd,seq_post_vfwd,\
-         seq_pre_yaw_rate,seq_post_yaw_rate,state_hash\n",
+         active_order_start,active_order_end,active_order_post,dst_awake_at_migrate,\
+         dst_rewake_tick,seq_pre_vfwd,seq_post_vfwd,seq_pre_yaw_rate,seq_post_yaw_rate,\
+         yaw_change_deg,path_len_m,slept,state_hash\n",
     );
     let mut extra_out = String::new();
     let mut det_out = String::new();

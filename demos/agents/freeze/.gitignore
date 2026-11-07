@@ -2,3 +2,4 @@
 /out/*
 !out/matrix_submitted.txt
 !out/det_submitted.txt
+!out/eight_per_robot_submitted.txt
