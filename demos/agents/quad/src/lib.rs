@@ -336,12 +336,15 @@ pub fn set_target(
     }
 }
 
-/// 按主体追加求解迭代(A00-2 R2 放行的 `extra` 变量):对主体全部连杆和
-/// 机身调用 `RigidBody::set_additional_solver_iterations(n)`。rapier 语义:
-/// 该值属于刚体,求解时取其所在连通分量(接触 + 关节)内所有刚体的
-/// **最大值**,整个分量跑 `num_solver_iterations + extra` 个 solver substep;
-/// `dt` 与世界其他分量不变(不碰 D4)。`extra = 0` 时不调用任何 API,
-/// 数值路径与不开 `extra` 完全一致。
+/// 按主体追加求解迭代(A00-2 R2 放行的 `extra` 变量;**R3 已判不采用**,
+/// 见 mass README 隔离性一节):对主体全部连杆和机身调用
+/// `RigidBody::set_additional_solver_iterations(n)`。R2 的隔离性实验
+/// 证实:世界里只要有一个 multibody,rapier 0.36.1 的 solver 就把全部
+/// 醒着的刚体合成一组,按 `base + max_extra` 个 solver substep 求解
+/// (`dynamics/solver/staged_island_solver/init.rs:62` 的 `multi_group`
+/// 条件)——extra 实际等同改全局迭代数,会改变同一分片内无关刚体的
+/// 数值路径,不是按主体隔离的。函数保留只用于实验,生产不采用。
+/// `extra = 0` 时不调用任何 API,数值路径与不开 `extra` 完全一致。
 pub fn set_extra_solver_iterations(world: &mut PhysicsWorld, robot: &Robot, extra: usize) {
     if extra == 0 {
         return;

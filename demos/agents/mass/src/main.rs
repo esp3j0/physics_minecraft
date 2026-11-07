@@ -287,8 +287,9 @@ fn snapshot_pre_panic(world: &PhysicsWorld, robot: &quad::Robot, tick: usize) ->
 }
 
 /// 与生产一致的单格方块(density 1、friction 0.6、restitution 0.1)。
-/// `size` = 边长(cuboid 半边 = size/2);R2-1:M7 曾把 h 当"半边"传,
-/// 实际生成的质量是 1/8/64 而非 8/64/512——现在统一按边长口径。
+/// `size` = **边长**(cuboid 半边 = size/2)。R1/R2 的 M7 bug 正是没对齐
+/// 这个口径:调 `spawn_block(.., h)` 得到边长 h、质量 h³ = 1/8/64,而非
+/// 8/64/512——R3 起调用侧传 `2.0 * h` 并以质量断言自检(见 Scene::M7)。
 fn spawn_block(
     world: &mut PhysicsWorld,
     pos: Vector,
@@ -624,15 +625,25 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     }
                 }
                 Scene::M7 { h, ox, oz } => {
-                    // R1-6 + R2-1:整块 cuboid(h,h,h)(spawn_block 按边长,
-                    // 质量 = h³ = 8/64/512),从 5 m(底面距机身顶面 5 m),
-                    // 9 落点 ox、oz 都生效;出生高度微扰 d(R2)。
-                    blocks.push(spawn_block(
+                    // R1-6 + R3-1:整块 cuboid(h,h,h),质量 = 8h³ = 8/64/512。
+                    // R1/R2 的 bug:spawn_block 按边长口径建 cuboid(size·0.5),
+                    // 传 h 实际生成 cuboid(h/2)³、质量 h³ = 1/8/64——边长必须
+                    // 传 2h。底面距机身顶面 5 m(出生中心 = body_top + h + 5),
+                    // 高度微扰 d;9 落点 ox、oz 都生效。
+                    let handle = spawn_block(
                         &mut world,
-                        Vector::new(bp.x + ox, body_top + h * 0.5 + 5.0 + cfg.d, bp.z + oz),
+                        Vector::new(bp.x + ox, body_top + h + 5.0 + cfg.d, bp.z + oz),
                         Vector::ZERO,
-                        h,
-                    ));
+                        2.0 * h,
+                    );
+                    let rb_mass = world.bodies.get(handle).expect("alive").mass();
+                    assert!(
+                        (rb_mass - 8.0 * h * h * h).abs() < 1e-3,
+                        "M7 spawn mass {} != 8·h³ = {}",
+                        rb_mass,
+                        8.0 * h * h * h
+                    );
+                    blocks.push(handle);
                     blocks_spawn_pos.push(Vector::new(bp.x + ox, 0.0, bp.z + oz));
                     v_limit = (2.0 * (2.0f32 * 9.81f32 * 5.0f32).sqrt()).max(20.0f32);
                 }

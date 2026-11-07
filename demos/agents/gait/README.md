@@ -7,7 +7,8 @@
 1. **`extra` 表(R2 放行 gait-1)**:按主体追加求解迭代
    (`set_additional_solver_iterations`),extra ∈ {0,2,4,8,12,20},
    s=1/100 为主口径,extra 0/12 加 s=1 对照;站立与默认步态各 6 组
-   (下文专节);
+   (下文专节;**R3 已判不采用**,表格保留作实验记录,原因见
+   mass README 隔离性一节);
 2. **extra 12 确定性双跑(R2 放行 gait-2)**:IDENTICAL
    (`out/det_eight.txt`);
 3. **README 小修(R2 放行 gait-3)**:"57 分钟"改 60 秒;站立高度数字
@@ -187,14 +188,16 @@ extra 12 双跑 + 8 只耗时组)。
 不重叠**,维持 kp100 kd3 做步态默认、站立漂移另案处理(控制层补偿或
 接受 0.08 m/s 量级)是数据支持的组合。
 
-### `extra` 表(A00-2 R2:按主体追加求解迭代)
+### `extra` 表(A00-2 R2;**R3 已判不采用**,原因见 mass README 隔离性一节)
 
-rapier 0.36.1 的 `RigidBody::set_additional_solver_iterations(n)` 只对
-该刚体所在的连通分量(接触 + 关节)生效,整个分量跑
-`num_solver_iterations + n` 个 solver substep;`dt` 不变(不碰 D4)。
-对主体全部连杆 + 机身设置。s = 1/100,extra 0 = 不调用 API(与既有组
-逐位相同的对照:stand/walk e0 行的哈希与 `stand_kp100_kd3_x001` /
-`kp100_kd3_u2_..._x001` 完全一致)。
+rapier 0.36.1 的 `RigidBody::set_additional_solver_iterations(n)`:R2 曾
+以为只对该刚体所在连通分量生效、不碰 D4——**这个理解错了**。R2 的隔离性
+实验证实:世界里只要有一个 multibody,全部醒着的刚体就合成一组求解
+(`staged_island_solver/init.rs:62` 的 `multi_group`),extra 等同改全局
+迭代数。**结论已判不采用**(站立滑移按验收裁定:写进需求作已知现象,
+空闲靠睡眠、策略靠闭环;不用 extra)。下表数据保留作实验记录;s = 1/100,
+extra 0 = 不调用 API(与既有组逐位相同的对照:stand/walk e0 行的哈希与
+`stand_kp100_kd3_x001` / `kp100_kd3_u2_..._x001` 完全一致)。
 
 站立(目标不变、每拍唤醒、3600 拍):
 
