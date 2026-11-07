@@ -1,4 +1,4 @@
-//! REQ-012 A00-1 demo `gait`(2026-11-06,R1 重做)。
+//! REQ-012 A00-1 demo `gait`(2026-11-06,R1 重做;A00-2 抽公共代码到 quad)。
 //!
 //! 问题:Go2 尺度四足(约 15 kg、12 自由度),用 rapier multibody + PD 电机,
 //! 在全世界 60 Hz、不做子步、生产求解参数的条件下,靠运行时更新关节目标
@@ -12,29 +12,10 @@
 //! - 地面 = fixed cuboid,friction 0.6、restitution 0(`rebuild_chunk_collider`
 //!   sim.rs:4205-4206)。脚的摩擦也是 0.6,不加垫(R1-4)。
 //!
-//! 运行时目标的写法:rapier 0.36.1 的 multibody 电机每拍由 solver 从
-//! `link.joint.data.motors[axis]` 重建约束(`unit_joint_motor_constraint`),
-//! 所以改 `target_pos` 即可生效,不重建 multibody。PD 用 `MotorModel::
-//! ForceBased`(force = kp·(q*−q) + kd·(q̇*−q̇)),这样 kp/kd/力矩上限是
-//! 真实单位,×0.01 档可以同比缩放。三个 rapier 坑见 README(R1-8):
-//! revolute 电机恒在 AngX 槽、目标变化要 `wake_up`、关节默认阻尼 0.1。
-//!
-//! 几何:Go2 真实尺寸与质量(R1-1)。大腿 = 小腿 = 0.213 m,足端球半径
-//! 0.022,髋 (±0.1934, 0, ±0.0465),大腿横向偏置 0.0955;质量:机身
-//! 6.921、髋 0.678、大腿 1.152、小腿 0.154、足 0.04,合计约 15 kg。
-//! 碰撞体用 `.mass()` 让惯量跟形状走,不用 `additional_mass`。
-//! 所有关节 `contacts_enabled(false)`(R1-2):旧模型相邻连杆胶囊恒定
-//! 重叠,自接触恒开既污染穿透判据也可能与膝电机对抗;真实几何下关掉
-//! 后站立与行走都正常,穿透只统计主体与地面。
-//!
-//! 步态(R1-3):足端轨迹 + 2 连杆逆解。支撑相足端匀速后扫,摆动相
-//! smoothstep 前摆 + 正弦抬脚;起步先从直腿 1 s 平滑降到足端 0.28 m
-//! 站高,站稳(2 s)后再 1 s 渐入步幅与抬脚。全程无接触反馈,仍是开环。
-//!
-//! 阻尼(R1-5):rapier 给 multibody 根节点角自由度与每个关节默认设绝对
-//! 常量阻尼 0.1(`Multibody::damping()`,不随质量缩放)。×s 档默认把
-//! 阻尼逐项 ×s(根节点平动的 0 保留);矩阵里有"不缩放阻尼"的 ×0.01
-//! 对照组与"阻尼清零"组,用于把 D9 的差异归因钉在阻尼上。
+//! 运行时目标的写法、三个 rapier 坑、几何与步态的完整说明见 `quad` crate
+//! 文档与 README(R1-8)。本文件的数值路径与 9a7405a 提交版逐行一致
+//! (A00-2 放行:抽取不改行为,全矩阵状态哈希必须逐行相同;相位滞后列
+//! 按验收意见 1 改为 ±半周期取峰的有符号值)。
 //!
 //! 用法(见 README):
 //! `cargo run --release -- --list` 列参数组;
@@ -46,341 +27,13 @@
 
 use std::time::Instant;
 
-use rapier3d::dynamics::{
-    IntegrationParameters, JointAxis, MotorModel, Multibody, MultibodyIndex, MultibodyJointSet,
-    MultibodyLink, RevoluteJointBuilder, RigidBodyBuilder, RigidBodyHandle,
+use quad::{ik, joint_velocity, production_params, read_angle, set_target, spawn_robot};
+use quad::{
+    DampMode, Gait, Robot, FOOT_R, FULL_STRETCH_DY, GROUND_FRICTION, GROUND_RESTITUTION, N_JOINTS,
+    TAU_LIMIT,
 };
-use rapier3d::geometry::ColliderBuilder;
 use rapier3d::math::Vector;
 use rapier3d::pipeline::PhysicsWorld;
-
-// ── 模型常量(Go2 真实尺寸与质量,R1-1) ─────────────────────────────────
-
-/// 大腿长 = 小腿长(Go2 URDF)。
-const L: f32 = 0.213;
-/// 足端球半径。
-const FOOT_R: f32 = 0.022;
-/// 髋锚点纵向偏移(机身 local x)。
-const HIP_X: f32 = 0.1934;
-/// 髋锚点横向偏移(机身 local z)。
-const HIP_Z: f32 = 0.0465;
-/// 大腿横向偏置(lat 关节 → hip pitch 关节,z 向)。
-const THIGH_OFF: f32 = 0.0955;
-/// 机身半尺寸(x 长 / y 厚 / z 宽)。
-const BODY_HALF: [f32; 3] = [0.19, 0.057, 0.047];
-/// 各连杆质量(kg):机身 / 髋 / 大腿 / 小腿 / 足端球。
-const BODY_MASS: f32 = 6.921;
-const HIP_MASS: f32 = 0.678;
-const THIGH_MASS: f32 = 1.152;
-const SHANK_MASS: f32 = 0.154;
-const FOOT_MASS: f32 = 0.04;
-/// 髋球半径(髋质量挂 ball,与探针一致)。
-const HIP_BALL_R: f32 = 0.035;
-/// 大腿 / 小腿胶囊半径。
-const THIGH_RADIUS: f32 = 0.02;
-const SHANK_RADIUS: f32 = 0.012;
-/// 力矩上限(N·m,§9.1)。
-const TAU_LIMIT: f32 = 23.7;
-/// 地面摩擦 / 恢复(同 rebuild_chunk_collider;脚也用 0.6,R1-4)。
-const GROUND_FRICTION: f32 = 0.6;
-const GROUND_RESTITUTION: f32 = 0.0;
-/// 关节总数 = 4 腿 × 3。
-const N_JOINTS: usize = 12;
-/// 站立段足端目标离髋高度(世界 m;R1-3:先降到 0.28 再渐入)。
-const FOOT_HEIGHT: f32 = 0.28;
-/// motors 数组下标:3D 布局 [LinX, LinY, LinZ, AngX, AngY, AngZ]。
-const ANG_X: usize = 3;
-/// 直腿(full stretch)足端离髋距离:2L − 1 mm,避免逆解在奇异点上。
-const FULL_STRETCH_DY: f32 = -(2.0 * L - 0.001);
-
-// ── 世界与机器人 ────────────────────────────────────────────────────────
-
-/// 生产参数的 IntegrationParameters(rapier 默认 + dt 覆写)。
-fn production_params(dt: f32) -> IntegrationParameters {
-    IntegrationParameters {
-        dt,
-        ..IntegrationParameters::default()
-    }
-}
-
-/// 一只机器人:句柄 + 每关节的 (multibody, link) 写入地址 + 4 条小腿刚体。
-struct Robot {
-    body: RigidBodyHandle,
-    /// 长度 12,顺序 = 腿序 [FL, FR, RL, RR] × [hip_lat, hip_pitch, knee]。
-    joints: Vec<(MultibodyIndex, usize)>,
-    /// 每腿小腿(shank)刚体句柄:足端世界坐标 = shank 位姿算(R1-6)。
-    shanks: Vec<RigidBodyHandle>,
-}
-
-/// 腿的锚点:机身 local 下的髋位置与横向符号。
-fn leg_signs() -> [(f32, f32); 4] {
-    [(1.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (-1.0, 1.0)]
-}
-
-/// 建一只机器人:机身 + 4 腿 × 3 关节,连杆按"关节角全 0"的竖直链位姿。
-/// 与总架构师探针同构(scratchpad r12a/probe-gait):碰撞体 `.mass()`、
-/// 所有 joint `contacts_enabled(false)`、脚 = shank 末端的独立 ball。
-fn spawn_robot(
-    world: &mut PhysicsWorld,
-    origin: Vector,
-    mass_scale: f32,
-    foot_mu: f32,
-    damp: DampMode,
-) -> Robot {
-    let s = mass_scale;
-    let body = world.insert_body(RigidBodyBuilder::dynamic().translation(origin));
-    let _ = world.colliders.insert_with_parent(
-        ColliderBuilder::cuboid(BODY_HALF[0], BODY_HALF[1], BODY_HALF[2])
-            .mass(BODY_MASS * s)
-            .friction(GROUND_FRICTION)
-            .restitution(GROUND_RESTITUTION),
-        body,
-        &mut world.bodies,
-    );
-
-    let mut joints = Vec::new();
-    let mut shanks = Vec::new();
-    for (fx, fz) in leg_signs() {
-        let anchor = Vector::new(fx * HIP_X, 0.0, fz * HIP_Z);
-        let hip_w = origin + anchor;
-        // 髋连杆(ball):hip lateral 关节的从动体。
-        let lat_c = hip_w + Vector::new(0.0, 0.0, fz * THIGH_OFF / 2.0);
-        let lat = world.insert_body(RigidBodyBuilder::dynamic().translation(lat_c));
-        let _ = world.colliders.insert_with_parent(
-            ColliderBuilder::ball(HIP_BALL_R)
-                .mass(HIP_MASS * s)
-                .friction(GROUND_FRICTION)
-                .restitution(GROUND_RESTITUTION),
-            lat,
-            &mut world.bodies,
-        );
-        let lat_joint = RevoluteJointBuilder::new(Vector::new(1.0, 0.0, 0.0))
-            .local_anchor1(anchor)
-            .local_anchor2(Vector::new(0.0, 0.0, -fz * THIGH_OFF / 2.0))
-            .contacts_enabled(false)
-            .limits([-0.8, 0.8])
-            .build();
-        world
-            .insert_multibody_joint(body, lat, lat_joint)
-            .expect("lat joint");
-
-        // 大腿:从髋外端竖直向下 L(capsule_y 半长)。
-        let th_top = hip_w + Vector::new(0.0, 0.0, fz * THIGH_OFF);
-        let th_c = th_top - Vector::new(0.0, L / 2.0, 0.0);
-        let th = world.insert_body(RigidBodyBuilder::dynamic().translation(th_c));
-        let _ = world.colliders.insert_with_parent(
-            ColliderBuilder::capsule_y(L / 2.0, THIGH_RADIUS)
-                .mass(THIGH_MASS * s)
-                .friction(GROUND_FRICTION)
-                .restitution(GROUND_RESTITUTION),
-            th,
-            &mut world.bodies,
-        );
-        let hip_joint = RevoluteJointBuilder::new(Vector::new(0.0, 0.0, 1.0))
-            .local_anchor1(Vector::new(0.0, 0.0, fz * THIGH_OFF / 2.0))
-            .local_anchor2(Vector::new(0.0, L / 2.0, 0.0))
-            .contacts_enabled(false)
-            .limits([-1.6, 1.6])
-            .build();
-        world
-            .insert_multibody_joint(lat, th, hip_joint)
-            .expect("hip joint");
-
-        // 小腿:从膝竖直向下 L;足端 = 末端独立 ball(摩擦 R1-4 默认同地面)。
-        let sh_c = th_c - Vector::new(0.0, L, 0.0);
-        let sh = world.insert_body(RigidBodyBuilder::dynamic().translation(sh_c));
-        let _ = world.colliders.insert_with_parent(
-            ColliderBuilder::capsule_y(L / 2.0, SHANK_RADIUS)
-                .mass(SHANK_MASS * s)
-                .friction(GROUND_FRICTION)
-                .restitution(GROUND_RESTITUTION),
-            sh,
-            &mut world.bodies,
-        );
-        let _ = world.colliders.insert_with_parent(
-            ColliderBuilder::ball(FOOT_R)
-                .translation(Vector::new(0.0, -L / 2.0, 0.0))
-                .mass(FOOT_MASS * s)
-                .friction(foot_mu)
-                .restitution(GROUND_RESTITUTION),
-            sh,
-            &mut world.bodies,
-        );
-        let knee_joint = RevoluteJointBuilder::new(Vector::new(0.0, 0.0, 1.0))
-            .local_anchor1(Vector::new(0.0, -L / 2.0, 0.0))
-            .local_anchor2(Vector::new(0.0, L / 2.0, 0.0))
-            .contacts_enabled(false)
-            .limits([0.0, 2.6])
-            .build();
-        world
-            .insert_multibody_joint(th, sh, knee_joint)
-            .expect("knee joint");
-
-        // 关节地址 = 第二个刚体的 link;三关节并进同一 multibody。
-        for body_h in [lat, th, sh] {
-            let lid = world
-                .multibody_joints
-                .rigid_body_link(body_h)
-                .expect("link id");
-            joints.push((lid.multibody, lid.id));
-        }
-        shanks.push(sh);
-    }
-    // 阻尼处理(R1-5):rapier 默认给根节点角自由度与每个关节设绝对常量
-    // 0.1,不随质量缩放。三种口径:
-    // - Scaled(默认):逐项 ×s,根节点平动的 0 天然保留;
-    // - Unscaled:rapier 默认不动(×0.01 对照组,复现"D9 差异来自阻尼");
-    // - Zero:全部清零。
-    match damp {
-        DampMode::Scaled => {
-            let mi = joints[0].0;
-            let mb = world.multibody_joints.get_multibody_mut(mi).unwrap();
-            for d in mb.damping_mut().iter_mut() {
-                *d *= s;
-            }
-        }
-        DampMode::Zero => {
-            let mi = joints[0].0;
-            let mb = world.multibody_joints.get_multibody_mut(mi).unwrap();
-            mb.damping_mut().fill(0.0);
-        }
-        DampMode::Unscaled => {}
-    }
-    Robot {
-        body,
-        joints,
-        shanks,
-    }
-}
-
-/// 阻尼口径(每组参数;R1-5)。
-#[derive(Clone, Copy, PartialEq)]
-enum DampMode {
-    /// 逐项 ×s(默认,×s 档 R1-5 的主口径)。
-    Scaled,
-    /// rapier 默认 0.1 不动(×0.01 不缩放阻尼对照组)。
-    Unscaled,
-    /// 全部清零。
-    Zero,
-}
-
-/// 每关节的 motors 下标:一律 AngX。revolute 关节不管世界转轴是 x 还是
-/// z,`RevoluteJoint::new(axis)` 都是把"主轴 = local X"用 complete_ang_frame
-/// 转到给定世界轴,LOCKED_REVOLUTE_AXES 恒锁 AngY/AngZ、只放 AngX
-/// (探针证据:motor_axes=100000、locked=110111 → AngZ 上的电机落在锁定位
-/// 上,num_velocity_constraints=0,约束根本不建)。世界轴向由 joint frame 决定。
-fn motor_index(_dof: usize) -> usize {
-    ANG_X
-}
-
-/// 运行时写一个关节的目标(ForceBased PD + 力矩上限),不重建 multibody。
-/// 新目标(与上次不同)时唤醒整个 multibody——生产的控制周期(D10)每 2 拍
-/// 发一次目标,等价语义是"目标变化即唤醒",否则站立平衡后 island 睡着,
-/// 电机约束不再被求解,起步目标永远不生效。
-fn set_target(
-    world: &mut PhysicsWorld,
-    robot: &Robot,
-    dof: usize,
-    target: f32,
-    kp: f32,
-    kd: f32,
-    tau_limit: f32,
-) {
-    let (mb_index, link_id) = robot.joints[dof];
-    let mb: &mut Multibody = world
-        .multibody_joints
-        .get_multibody_mut(mb_index)
-        .expect("multibody alive");
-    let link: &mut MultibodyLink = mb.link_mut(link_id).expect("link alive");
-    // motor_axes 位掩码必须含该轴,否则 solver 根本不建电机约束
-    // (num_velocity_constraints 数 motor_bits);set_motor 负责置位。
-    // revolute 的电机/限位恒在 AngX 槽(见 motor_index 注释)。
-    let axis = JointAxis::AngX;
-    let changed = (link.joint.data.motors[ANG_X].target_pos - target).abs() > 1e-6;
-    link.joint
-        .data
-        .set_motor(axis, target, 0.0, kp, kd)
-        .set_motor_model(axis, MotorModel::ForceBased);
-    link.joint.data.motors[ANG_X].max_force = tau_limit;
-    if changed {
-        let handles: Vec<RigidBodyHandle> = mb
-            .links()
-            .map(|l| l.rigid_body_handle())
-            .chain(std::iter::once(robot.body))
-            .collect();
-        for h in handles {
-            if let Some(rb) = world.bodies.get_mut(h) {
-                rb.wake_up(true);
-            }
-        }
-    }
-}
-
-/// 读一个关节的当前角(rad)。revolute 单自由度,coords 的角分量里取
-/// 对应轴;单自由度关节另一角分量恒 0。
-fn read_angle(world: &MultibodyJointSet, robot: &Robot, dof: usize) -> f32 {
-    let (mb_index, link_id) = robot.joints[dof];
-    let mb = world.get_multibody(mb_index).expect("multibody alive");
-    let link = mb.link(link_id).expect("link alive");
-    link.joint.coords()[motor_index(dof)]
-}
-
-// ── 步态:足端轨迹 + 2 连杆逆解(R1-3) ─────────────────────────────────
-
-/// 足端(相对髋,x 前 / y 下为负)→ (hip_pitch, knee)。膝朝后(Go2 口径)。
-fn ik(dx: f32, dy: f32) -> (f32, f32) {
-    let d2 = dx * dx + dy * dy;
-    let c = ((d2 - 2.0 * L * L) / (2.0 * L * L)).clamp(-1.0, 1.0);
-    let k = c.acos();
-    let phi = dx.atan2(-dy);
-    (phi - k / 2.0, k)
-}
-
-/// 开环步态参数(足端轨迹口径)。
-#[derive(Clone, Copy)]
-struct Gait {
-    /// 步态频率(Hz)。
-    freq: f32,
-    /// 步长(单步前后位移,m)。
-    stride: f32,
-    /// 抬脚高度(m)。
-    lift: f32,
-    /// 支撑相占比(0..1),其余为摆动相。
-    duty: f32,
-    /// 足端目标离髋高度(站高,m)。
-    h: f32,
-    /// 足端目标前后中心(相对髋,m)。
-    x0: f32,
-}
-
-impl Gait {
-    /// 腿 leg 在行走时刻 t 的足端目标(相对髋)。腿序 [FL, FR, RL, RR],
-    /// 对角小跑:FL/RR 相位 0,FR/RL 相位 0.5。
-    fn foot_target(&self, leg: usize, t: f32) -> (f32, f32) {
-        let ph0 = if leg == 0 || leg == 3 { 0.0 } else { 0.5 };
-        let ramp = (t / 1.0).min(1.0); // 步幅/抬脚 1 s 渐入
-        let p = (self.freq * t + ph0).rem_euclid(1.0);
-        let stride = self.stride * ramp;
-        let lift = self.lift * ramp;
-        if p < self.duty {
-            // 支撑相:匀速后扫。
-            let u = p / self.duty;
-            (self.x0 + stride / 2.0 - stride * u, -self.h)
-        } else {
-            // 摆动相:smoothstep 前摆 + 正弦抬脚。
-            let u = (p - self.duty) / (1.0 - self.duty);
-            let sm = u * u * (3.0 - 2.0 * u);
-            (
-                self.x0 - stride / 2.0 + stride * sm,
-                -self.h + lift * (std::f32::consts::PI * u).sin(),
-            )
-        }
-    }
-    /// 站姿 / 摆动相位无关的初始目标:直腿降下来后取 (x0, −h)。
-    fn stand_foot(&self) -> (f32, f32) {
-        (self.x0, -self.h)
-    }
-}
 
 // ── 参数组 ──────────────────────────────────────────────────────────────
 
@@ -430,7 +83,7 @@ struct RunResult {
     foot_clearance: f32,
     nan: bool,
     max_link_speed: f32,
-    /// 力矩饱和占比:kp·Δq + kd·Δq̇ 达到力矩上限的采样比例(R1-6)。
+    /// 力矩饱和占比:kp·Δq + kd·Δq̇ 达到力矩上限的拍数比例(R1-6)。
     torque_sat_ratio: f32,
     step_ms_p50: f32,
     step_ms_p95: f32,
@@ -471,8 +124,8 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
     world.integration_parameters = production_params(cfg.dt);
     world.integration_parameters.num_solver_iterations = cfg.num_solver_iterations;
     let _ = world.insert(
-        RigidBodyBuilder::fixed().translation(Vector::new(0.0, -0.5, 0.0)),
-        ColliderBuilder::cuboid(200.0, 0.5, 200.0)
+        rapier3d::dynamics::RigidBodyBuilder::fixed().translation(Vector::new(0.0, -0.5, 0.0)),
+        rapier3d::geometry::ColliderBuilder::cuboid(200.0, 0.5, 200.0)
             .friction(GROUND_FRICTION)
             .restitution(GROUND_RESTITUTION),
     );
@@ -484,7 +137,7 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
     let walk0 = rise_ticks + settle_ticks;
     let total_ticks = walk0 + cfg.walk_ticks;
     // 直腿初始悬空高度:足端刚触地(2L + 足球半径 + 2 mm)。
-    let y0 = 2.0 * L + FOOT_R + 0.002;
+    let y0 = 2.0 * quad::L + FOOT_R + 0.002;
     let mut robots: Vec<Robot> = Vec::new();
     for i in 0..n_bots {
         let off = Vector::new((i % 4) as f32 * 2.0, 0.0, (i / 4) as f32 * 2.0);
@@ -626,11 +279,7 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
                 let e = f64::from(targets[dof] - q);
                 err[dof % 3] += e * e;
                 // 上一控制拍目标的 PD 输出(ForceBased 即力矩)。
-                let qd = {
-                    let (mb_index, link_id) = robots[0].joints[dof];
-                    let mb = world.multibody_joints.get_multibody(mb_index).expect("a");
-                    mb.joint_velocity(mb.link(link_id).expect("a"))[0]
-                };
+                let qd = joint_velocity(&world.multibody_joints, &robots[0], dof);
                 let tau_cmd = (kp * (e as f32) + kd * (0.0 - qd)).abs();
                 sat_total += 1;
                 if tau_cmd >= tau {
@@ -645,7 +294,7 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
             // 真实足端世界坐标(含小腿倾斜)+ 最大连杆速度(R1-6)。
             for sh in &robots[0].shanks {
                 let rb = world.bodies.get(*sh).expect("alive");
-                let f = rb.translation() + rb.rotation() * Vector::new(0.0, -L / 2.0, 0.0);
+                let f = rb.translation() + rb.rotation() * Vector::new(0.0, -quad::L / 2.0, 0.0);
                 foot_clear = foot_clear.max(f.y - FOOT_R);
                 max_link_speed = max_link_speed.max(rb.linvel().length());
             }
@@ -689,7 +338,10 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
         (err[1] / (n_ticks * 4.0)).sqrt() as f32,
         (err[2] / (n_ticks * 4.0)).sqrt() as f32,
     ];
-    let lag_ticks = cross_corr_lag(&tgt_hist, &act_hist);
+    // 步态周期(拍):f Hz → 60/f 拍;验收意见 1:在 ±半周期内取峰,
+    // 有符号(正 = 实际落后目标),不再在 0..n/2 上取全局最大。
+    let period_ticks = ((1.0 / cfg.gait.freq) / cfg.dt).round().max(2.0) as i32;
+    let lag_ticks = cross_corr_lag(&tgt_hist, &act_hist, period_ticks);
     let fwd_speed_mean = (vfwd_sum / (vel_n.max(1) as f64)) as f32;
     let vx_world_mean = (vx_sum / (vel_n.max(1) as f64)) as f32;
     let net_speed = start_pos.map_or(0.0, |s| {
@@ -729,21 +381,33 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
     (res, trace_csv)
 }
 
-/// 互相关求相位滞后(拍):把目标摆和实际角在滞后 0..len/2 内扫,取相关
-/// 最大处。数据不足返回 0。
-fn cross_corr_lag(tgt: &[f32], act: &[f32]) -> f32 {
+/// 互相关求相位滞后(拍,有符号:正 = 实际落后目标)。验收意见 1:只在
+/// ±半周期内取峰——0..n/2 的全局最大会把"相差一个周期"当成 0 滞后
+/// (周期折返)。数据不足返回 0。
+fn cross_corr_lag(tgt: &[f32], act: &[f32], period_ticks: i32) -> f32 {
     let n = tgt.len().min(act.len());
     if n < 60 {
         return 0.0;
     }
-    let mut best_lag = 0usize;
-    let mut best = f32::NEG_INFINITY;
-    let max_lag = n / 2;
-    for lag in 0..max_lag {
-        let mut dot = 0.0f32;
-        for i in lag..n {
-            dot += tgt[i] * act[i - lag];
+    let half = (period_ticks / 2).max(1) as usize;
+    let mut best_lag = 0i32;
+    let mut best = f64::NEG_INFINITY;
+    // 滞后 lag>0:实际 = 目标向右平移 lag(实际落后);lag<0:实际超前。
+    for lag in -(half as i32)..=(half as i32) {
+        let mut dot = 0.0f64;
+        let mut cnt = 0u64;
+        for (i, tv) in tgt.iter().enumerate().take(n) {
+            let j = i as i64 - lag as i64;
+            if j < 0 || j >= n as i64 {
+                continue;
+            }
+            dot += f64::from(*tv) * f64::from(act[j as usize]);
+            cnt += 1;
         }
+        if cnt == 0 {
+            continue;
+        }
+        let dot = dot / cnt as f64; // 归一化:窗口大小不同不可比
         if dot > best {
             best = dot;
             best_lag = lag;
@@ -816,7 +480,7 @@ fn base_cfg(name: &'static str) -> RunCfg {
             stride: 0.10,
             lift: 0.05,
             duty: 0.5,
-            h: FOOT_HEIGHT,
+            h: quad::FOOT_HEIGHT,
             x0: 0.0,
         },
         damp: DampMode::Scaled,

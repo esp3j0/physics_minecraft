@@ -2,4 +2,3 @@
 /out/*
 !out/matrix_full.txt
 !out/det_eight.txt
-probe.rs

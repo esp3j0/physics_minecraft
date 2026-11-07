@@ -1,0 +1,19 @@
+[package]
+name = "terrain-demo"
+version = "0.1.0"
+edition = "2021"
+
+default-run = "terrain"
+
+[[bin]]
+name = "terrain"
+path = "src/main.rs"
+
+[dependencies]
+physics-sim = { path = "../../../crates/physics-sim" }
+quad = { path = "../quad" }
+rapier3d = { version = "=0.36.1", features = ["serde-serialize"] }
+types = { path = "../../../crates/types" }
+voxel = { path = "../../../crates/voxel" }
+
+[workspace]

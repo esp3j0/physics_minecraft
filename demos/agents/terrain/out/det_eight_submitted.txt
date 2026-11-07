@@ -1,0 +1,2 @@
+eight_T2,1549,left_lane,0.8284,0.0046,0.5153,0.7034,2.3616,-0.0043,8573.2725,13280,-,false,42e6503558599651,1.112,1.162,2.289 | 1.8s
+det T2_h0_dy-2 double-run: determinism: 1a8ffd693b601875 vs 1a8ffd693b601875 -> IDENTICAL
