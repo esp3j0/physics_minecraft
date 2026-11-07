@@ -3,6 +3,8 @@ name = "gait-demo"
 version = "0.1.0"
 edition = "2021"
 
+default-run = "gait"
+
 [[bin]]
 name = "gait"
 path = "src/main.rs"
