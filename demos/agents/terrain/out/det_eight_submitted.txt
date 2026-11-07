@@ -1,2 +1,67 @@
-eight_T2,1549,left_lane,0.8284,0.0046,0.5153,0.7034,2.3616,-0.0043,8573.2725,13280,-,false,42e6503558599651,1.112,1.162,2.289 | 1.8s
-det T2_h0_dy-2 double-run: determinism: 1a8ffd693b601875 vs 1a8ffd693b601875 -> IDENTICAL
+== 颠簸事件表(R1-5:25 组单只,事件条件 |vy|>0.35 或 up·y<0.97;间隔≤5 拍合并)==
+# bumps: T0_h0_dy-2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T0_h1_dy-1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T0_h2_dy+0 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T0_h3_dy+1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T0_h4_dy+2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T1_h0_dy-2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T1_h1_dy-1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T1_h2_dy+0 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T1_h3_dy+1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T1_h4_dy+2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T2_h0_dy-2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T2_h1_dy-1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T2_h2_dy+0 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T2_h3_dy+1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T2_h4_dy+2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T3_h0_dy-2 (1 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+3326,13,0.589,0.7200,32.91,-16.44,0|1|2|3,0.00,tail
+# bumps: T3_h1_dy-1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T3_h2_dy+0 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T3_h3_dy+1 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T3_h4_dy+2 (0 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+# bumps: T4_h0_dy-2 (1 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+3780,2186,4.058,-1.0000,31.98,-3.36,0|1|2|3,0.00,tail
+# bumps: T4_h1_dy-1 (2 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+1604,3,0.441,0.9910,31.84,-3.97,0|2|3,-,seamx=32/d0.16
+3780,2170,3.947,-1.0000,31.90,-3.96,0|1|2|3,0.00,tail
+# bumps: T4_h2_dy+0 (1 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+3780,2163,3.722,-1.0000,31.90,-4.26,0|1|2|3,0.00,tail
+# bumps: T4_h3_dy+1 (1 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+3780,2177,3.881,-1.0000,31.91,-3.80,0|1|2|3,0.00,tail
+# bumps: T4_h4_dy+2 (1 events)
+# tick,ticks,max_vy,min_upy,x,z,feet,min_abs_ny,nearest
+3780,2146,3.849,-1.0001,31.91,-4.68,0|1|2|3,0.00,tail
+
+== det T2_h2 双跑 + 8 只同世界(A00-2 R1 重跑)==
+determinism: 4f336756debc4cf5 vs 4f336756debc4cf5 -> IDENTICAL
+eight_T2,1980,completed,15.20,34,0.9890,0.0027,0.5192,0.2750,2.0278,-0.0046,0.00000,4924,28,13,-,-,0.0000,0.0000,false,22a6269deda32358,1.121,1.179,2.504 | 2.3s
+
+== 接缝密度(新布局 R1-3;0.5 m 网格去重,x 向+z 向)==
+seam lines T1: 18 total (x-facing 15, z-facing 3) / 0.084 per m
+seam lines T2: 139 total (x-facing 134, z-facing 5) / 0.650 per m
+seam lines T3: 71 total (x-facing 38, z-facing 33) / 1.578 per m

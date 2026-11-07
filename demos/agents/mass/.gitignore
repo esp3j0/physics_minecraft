@@ -1,4 +1,4 @@
 /target/
 /out/*
-!out/matrix_submitted.txt
-!out/det_submitted.txt
+!out/matrix_full_r1.txt
+!out/det_submitted_r1.txt

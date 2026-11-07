@@ -81,6 +81,9 @@ pub struct Robot {
     /// 全部连杆的 collider 句柄(与 `links` 同序):接触对归属判定用
     /// (terrain/mass 的"对地穿透"只统计连杆侧)。
     pub colliders: Vec<rapier3d::geometry::ColliderHandle>,
+    /// 每腿足端球 collider(4 个;terrain 窄口径"脚对地形"统计、
+    /// mass M1Leg 首碰连杆判定用)。只记录,不参与数值路径。
+    pub feet: Vec<rapier3d::geometry::ColliderHandle>,
 }
 
 /// 腿的锚点:机身 local 下的髋位置与横向符号。
@@ -136,6 +139,7 @@ pub fn spawn_robot_yawed(
 
     let mut joints = Vec::new();
     let mut shanks = Vec::new();
+    let mut feet = Vec::new();
     for (fx, fz) in leg_signs() {
         let anchor = Vector::new(fx * HIP_X, 0.0, fz * HIP_Z);
         // 髋/大腿/小腿出生位置按"关节角全 0"的竖直链计算(机身 local),
@@ -227,6 +231,7 @@ pub fn spawn_robot_yawed(
 
         colliders.extend([lat_collider, th_collider, sh_collider, foot_collider]);
         links.extend([lat, th, sh]);
+        feet.push(foot_collider);
 
         // 关节地址 = 第二个刚体的 link;三关节并进同一 multibody。
         for body_h in [lat, th, sh] {
@@ -264,6 +269,7 @@ pub fn spawn_robot_yawed(
         shanks,
         links,
         colliders,
+        feet,
     }
 }
 

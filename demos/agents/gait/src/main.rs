@@ -57,6 +57,9 @@ struct RunCfg {
     walk_ticks: usize,
     /// 8 只机器人(耗时测量)。
     eight: bool,
+    /// 站立漂移模式(R1-2):目标恒站姿、每拍 wake_up、跑 3600 拍取站稳
+    /// 后段,报 v_x / v_z / 身高 / up·y / 脚对地滑移。
+    stand: bool,
 }
 
 /// 一组结果(CSV 行 / README 表列)。
@@ -85,6 +88,13 @@ struct RunResult {
     max_link_speed: f32,
     /// 力矩饱和占比:kp·Δq + kd·Δq̇ 达到力矩上限的拍数比例(R1-6)。
     torque_sat_ratio: f32,
+    /// 站立漂移模式(R1-2):站稳后段的世界系 v_x / v_z 均值;行走模式 0。
+    drift_vx: f32,
+    drift_vz: f32,
+    /// 站立漂移模式:后段脚对地滑移速度均值(|脚水平速度| 均值)。
+    drift_foot_slide: f32,
+    /// 站立漂移模式:后段睡眠拍占比(每拍 wake_up 时恒 0;对照组证伪用)。
+    drift_wake_ticks: u64,
     step_ms_p50: f32,
     step_ms_p95: f32,
     step_ms_max: f32,
@@ -183,13 +193,23 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
     }
     // 上一拍写入的目标(力矩饱和 = kp·Δq + kd·Δq̇ 达上限的估算用)。
     let mut targets = [0.0f32; N_JOINTS];
+    // 站立漂移模式(R1-2):站稳后段(行走起点之后全部)的采样与脚滑移。
+    let stand_mode = cfg.stand;
+    let stand_stat0 = walk0; // 3 s 序列结束即视为站稳(直腿降+稳),从这开始统计
+    let mut drift_vx_sum = 0.0f64;
+    let mut drift_vz_sum = 0.0f64;
+    let mut drift_foot_slide_sum = 0.0f64;
+    let mut drift_n = 0u64;
+    let mut drift_wake_ticks = 0u64;
 
     for tick in 0..total_ticks {
         let t0 = Instant::now();
 
         // 1) 更新关节目标(每 update_every 拍;R1-3:先 1 s 直腿降到
         //    足端 0.28 站高,再站稳,起步后步态足端轨迹)。
-        if tick % cfg.update_every == 0 {
+        //    站立漂移模式:目标恒站姿,每拍更新并每拍强 WakeUp(策略控制
+        //    场景主体一直醒着;R1-2 放行口径)。
+        if stand_mode || tick % cfg.update_every == 0 {
             for robot in &robots {
                 for leg in 0..4 {
                     let foot = if tick < rise_ticks {
@@ -198,7 +218,7 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
                         let sm = a * a * (3.0 - 2.0 * a);
                         let (x, _) = cfg.gait.stand_foot();
                         (x, FULL_STRETCH_DY + (-cfg.gait.h - FULL_STRETCH_DY) * sm)
-                    } else if tick < walk0 {
+                    } else if stand_mode || tick < walk0 {
                         cfg.gait.stand_foot()
                     } else {
                         let walk_t = (tick - walk0) as f32 * cfg.dt;
@@ -220,6 +240,25 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
                             tau,
                         );
                     }
+                }
+            }
+        }
+        if stand_mode && tick >= walk0 {
+            // 每拍强制唤醒(目标不变时电机约束在睡眠 island 里不被求解,
+            // 生产策略控制 = 主体一直醒)。wake 计数只算第 0 只的拍数。
+            for (ri, robot) in robots.iter().enumerate() {
+                for h in robot
+                    .links
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(robot.body))
+                {
+                    if let Some(rb) = world.bodies.get_mut(h) {
+                        rb.wake_up(true);
+                    }
+                }
+                if ri == 0 {
+                    drift_wake_ticks += 1;
                 }
             }
         }
@@ -273,6 +312,22 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
             last_pos = body.translation();
             last_fwd = fwd;
 
+            // 站立漂移模式(R1-2):后段世界系 v_x/v_z + 脚对地滑移采样。
+            if stand_mode && tick >= stand_stat0 {
+                drift_vx_sum += f64::from(lv.x);
+                drift_vz_sum += f64::from(lv.z);
+                let mut slide = 0.0f32;
+                for sh in &robots[0].shanks {
+                    let rb = world.bodies.get(*sh).expect("alive");
+                    let v = rb.linvel();
+                    // 滑移速度 = 脚速度的水平分量(与地面接触的脚 ~0;
+                    // 摆动腿混入会抬高读数,站立模式无摆动,口径成立)。
+                    slide = slide.max((v.x * v.x + v.z * v.z).sqrt());
+                }
+                drift_foot_slide_sum += f64::from(slide);
+                drift_n += 1;
+            }
+
             // 关节跟踪 RMS(按 lat/hip/knee 分开)+ 力矩饱和占比(R1-6)。
             for dof in 0..N_JOINTS {
                 let q = read_angle(&world.multibody_joints, &robots[0], dof);
@@ -291,11 +346,18 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
                 act_hist.push(read_angle(&world.multibody_joints, &robots[0], 1));
             }
 
-            // 真实足端世界坐标(含小腿倾斜)+ 最大连杆速度(R1-6)。
+            // 真实足端世界坐标(含小腿倾斜)+ 最大连杆速度(R1-6;A00-2
+            // R1 通用要求:全部连杆计入速度统计,不只是小腿)。
             for sh in &robots[0].shanks {
                 let rb = world.bodies.get(*sh).expect("alive");
                 let f = rb.translation() + rb.rotation() * Vector::new(0.0, -quad::L / 2.0, 0.0);
                 foot_clear = foot_clear.max(f.y - FOOT_R);
+            }
+            for lh in &robots[0].links {
+                let rb = world.bodies.get(*lh).expect("alive");
+                max_link_speed = max_link_speed.max(rb.linvel().length());
+            }
+            if let Some(rb) = world.bodies.get(robots[0].body) {
                 max_link_speed = max_link_speed.max(rb.linvel().length());
             }
 
@@ -372,6 +434,10 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
         nan,
         max_link_speed,
         torque_sat_ratio: sat_n as f32 / sat_total.max(1) as f32,
+        drift_vx: (drift_vx_sum / drift_n.max(1) as f64) as f32,
+        drift_vz: (drift_vz_sum / drift_n.max(1) as f64) as f32,
+        drift_foot_slide: (drift_foot_slide_sum / drift_n.max(1) as f64) as f32,
+        drift_wake_ticks,
         step_ms_p50: percentile(&mut step_ms, 0.5),
         step_ms_p95: percentile(&mut step_ms, 0.95),
         step_ms_max: step_ms.iter().copied().fold(0.0, f32::max),
@@ -381,9 +447,11 @@ fn run(cfg: &RunCfg, keep_trace: bool) -> (RunResult, String) {
     (res, trace_csv)
 }
 
-/// 互相关求相位滞后(拍,有符号:正 = 实际落后目标)。验收意见 1:只在
-/// ±半周期内取峰——0..n/2 的全局最大会把"相差一个周期"当成 0 滞后
-/// (周期折返)。数据不足返回 0。
+/// 互相关求相位滞后(拍,有符号:正 = 实际落后目标)。A00-2 验收修正两处:
+/// ① 只在 ±半周期内取峰——0..n/2 的全局最大会把"相差一个周期"当成 0
+/// 滞后(周期折返);② 符号约定:实际落后 d 拍 = act[i] ≈ tgt[i−d] =
+/// tgt 向右平移 d 后对齐 act,所以拿 `act[i+lag]` 对 `tgt[i]` 取峰,
+/// lag>0 即落后(旧版取 `act[i−lag]`,符号正好反了)。数据不足返回 0。
 fn cross_corr_lag(tgt: &[f32], act: &[f32], period_ticks: i32) -> f32 {
     let n = tgt.len().min(act.len());
     if n < 60 {
@@ -392,12 +460,11 @@ fn cross_corr_lag(tgt: &[f32], act: &[f32], period_ticks: i32) -> f32 {
     let half = (period_ticks / 2).max(1) as usize;
     let mut best_lag = 0i32;
     let mut best = f64::NEG_INFINITY;
-    // 滞后 lag>0:实际 = 目标向右平移 lag(实际落后);lag<0:实际超前。
     for lag in -(half as i32)..=(half as i32) {
         let mut dot = 0.0f64;
         let mut cnt = 0u64;
         for (i, tv) in tgt.iter().enumerate().take(n) {
-            let j = i as i64 - lag as i64;
+            let j = i as i64 + lag as i64;
             if j < 0 || j >= n as i64 {
                 continue;
             }
@@ -428,6 +495,7 @@ fn result_header() -> String {
     "name,up_y_min,height_mean,height_std,rms_hip_lat,rms_hip_pitch,rms_knee,\
      lag_ticks,fwd_speed_mean,vx_world_mean,net_speed,lateral_drift,heading_drift_deg,\
      min_penetration,foot_clearance,nan,max_link_speed,torque_sat_ratio,\
+     drift_vx,drift_vz,drift_foot_slide,drift_wake_ticks,\
      step_ms_p50,step_ms_p95,step_ms_max,fell_tick,trace_hash"
         .to_string()
 }
@@ -436,7 +504,7 @@ fn result_header() -> String {
 fn result_csv(r: &RunResult) -> String {
     let hash = format!("{:016x}", r.trace_hash);
     format!(
-        "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.4},{:.4},{:.4},{:.4},{:.2},{:.4},{:.4},{},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
+        "{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1},{:.4},{:.4},{:.4},{:.4},{:.2},{:.4},{:.4},{},{:.3},{:.3},{:.4},{:.4},{:.4},{},{:.3},{:.3},{:.3},{},{}",
         csv_escape(&r.name),
         r.up_y_min,
         r.height_mean,
@@ -455,6 +523,10 @@ fn result_csv(r: &RunResult) -> String {
         r.nan,
         r.max_link_speed,
         r.torque_sat_ratio,
+        r.drift_vx,
+        r.drift_vz,
+        r.drift_foot_slide,
+        r.drift_wake_ticks,
         r.step_ms_p50,
         r.step_ms_p95,
         r.step_ms_max,
@@ -486,6 +558,7 @@ fn base_cfg(name: &'static str) -> RunCfg {
         damp: DampMode::Scaled,
         walk_ticks: 3600,
         eight: false,
+        stand: false,
     }
 }
 
@@ -666,6 +739,51 @@ fn build_matrix() -> Vec<RunCfg> {
         let mut c = mk(name, 100.0, 3.0, 2, 1.0);
         g1(&mut c);
         c.eight = true;
+        all.push(c);
+    }
+    // A00-2 R1-3:高 kd 组 (100,10) / (100,20) 默认步态——能否同时满足
+    // 行走判据与"站立不滑"(漂移表见 stand 组)。real 与 ×0.01 各两组。
+    for (kp, kd) in [(100.0f32, 10.0f32), (100.0, 20.0)] {
+        for (ms, tag) in [(1.0f32, "real"), (0.01, "x001")] {
+            let name =
+                Box::leak(format!("kp{kp}_kd{kd}_u2_f3.0_s0.15_l0.06_{tag}").into_boxed_str());
+            let mut c = mk(name, kp, kd, 2, ms);
+            g1(&mut c);
+            all.push(c);
+        }
+    }
+    // A00-2 R1-2:站立漂移表。平地、目标恒站姿、每拍更新 + 每拍 wake_up,
+    // 跑 3600 拍、统计站稳后段;增益 6 组 × s=1/100 主口径,s=1 对照;
+    // 参照 16 迭代 / 240 Hz(只作对照,速度按秒归一化口径相同)。
+    for (kp, kd) in [
+        (100.0f32, 3.0f32),
+        (100.0, 10.0),
+        (100.0, 20.0),
+        (60.0, 2.0),
+        (60.0, 20.0),
+        (400.0, 12.0),
+    ] {
+        let name = Box::leak(format!("stand_kp{kp}_kd{kd}_x001").into_boxed_str());
+        let mut c = mk(name, kp, kd, 1, 0.01);
+        c.stand = true;
+        all.push(c);
+        let name = Box::leak(format!("stand_kp{kp}_kd{kd}_real").into_boxed_str());
+        let mut c = mk(name, kp, kd, 1, 1.0);
+        c.stand = true;
+        all.push(c);
+    }
+    // 漂移参照:16 迭代与 240 Hz(压住漂移的候选归因:求解收敛不足)。
+    {
+        let name = "stand_iter16_kp100_kd3_x001";
+        let mut c = mk(name, 100.0, 3.0, 1, 0.01);
+        c.stand = true;
+        c.num_solver_iterations = 16;
+        all.push(c);
+        let name = "stand_240hz_kp100_kd3_x001";
+        let mut c = mk(name, 100.0, 3.0, 1, 0.01);
+        c.stand = true;
+        c.dt = 1.0 / 240.0;
+        c.walk_ticks = 14400; // 同 60 s(速度按秒归一化,口径一致)
         all.push(c);
     }
     all
