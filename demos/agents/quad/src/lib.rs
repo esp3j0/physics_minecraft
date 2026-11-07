@@ -619,6 +619,16 @@ pub fn restore_robot(
         mb.forward_kinematics(&world.bodies, true);
         mb.update_rigid_bodies(&mut world.bodies, false);
     }
+    // 目标写回(R1 修 M1):信封带"最后的目标"必须生效——重建的关节
+    // motors 是新值,不写回时主体失力 1–2 拍(到下一次 30 Hz 目标写入)。
+    // 经 quad::set_target 同一路径写(ForceBased PD + 力矩上限 + 唤醒),
+    // kp/kd/tau 由调用方增益传入(与生产 30 Hz 写入同参)。
+    let kp = mass_scale * DEFAULT_KP;
+    let kd = mass_scale * DEFAULT_KD;
+    let tau = mass_scale * TAU_LIMIT;
+    for (dof, tgt) in snap.targets.iter().enumerate() {
+        set_target(world, &robot, dof, *tgt, kp, kd, tau);
+    }
     // 状态注入 = "目标变化"级事件,按生产语义强唤醒整只(根 + 全部连杆)。
     for h in robot
         .links
@@ -681,4 +691,33 @@ pub fn measure_restore_error(
         max_rot_err,
         max_vel_err.max(root_lin_err).max(root_ang_err),
     )
+}
+
+/// 主体连杆在 `world.islands.active_bodies()`(活跃集)里的顺序(R1 通用
+/// 要求,连杆顺序表用):按活跃集遍历序写出 links 下标,不在活跃集的连杆
+/// 不出现;根机身活跃时记 `B`。格式 `0-1-2-…-12-B`(无逗号,CSV 安全)。
+///
+/// 背景(#25 A00-3 验收"连杆顺序"节):刚体睡着时 island 管理器用
+/// `swap_remove` 把它移出活跃集、把末尾刚体搬到空位,主体之前插入过会睡
+/// 着的刚体会把主体连杆搬到活跃集前面,求解顺序随之改变,1 次 PGS 下足以
+/// 改变行走偏置。机制归因见 #25 总架构师验收,本函数只负责测量。
+pub fn active_order(world: &PhysicsWorld, robot: &Robot) -> String {
+    let mut out = String::new();
+    for h in world.islands.active_bodies() {
+        if h == robot.body {
+            out.push_str("B-");
+            continue;
+        }
+        if let Some(pos) = robot.links.iter().position(|l| *l == h) {
+            out.push_str(&pos.to_string());
+            out.push('-');
+        }
+    }
+    if out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
 }

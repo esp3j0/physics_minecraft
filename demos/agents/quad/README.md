@@ -58,12 +58,16 @@ Go2 尺度四足模型、足端逆解、开环步态、运行时电机目标(`se
   `coords` 是 `pub(crate)`,revolute 等价 `coords[AngX] += disp` 并重建
   `joint_rot`)+ `forward_kinematics(bodies, true)`(从根刚体位姿重算全部
   连杆)+ `update_rigid_bodies`(位姿写回刚体);广义速度走
-  `generalized_velocity_mut`,根刚体 `linvel/angvel` 同时直写;最后整只
-  `wake_up(true)`(生产"目标变化即唤醒"语义);
+  `generalized_velocity_mut`,根刚体 `linvel/angvel` 同时直写;**信封里的
+  `targets` 按生产 30 Hz 同参(kp/kd/tau × 质量比例)经 `set_target` 写回**
+  (A00-3 R1 修 M1:不写回时重建的关节 motors 是新值,主体失力 1–2 拍);
+  最后整只 `wake_up(true)`(生产"目标变化即唤醒"语义);
 - `measure_restore_error`:重建后、步进前的误差核对(关节坐标 rad /
   连杆位置 m / 连杆转角 rad / 速度)。关节速度读
   `Multibody::generalized_velocity()`(`link.joint_velocity` 是 solver
-  每拍回写的字段,步进前恒 0,不适用)。
+  每拍回写的字段,步进前恒 0,不适用);
+- `active_order(world, robot)`:主体连杆在 `islands.active_bodies()` 活跃集
+  里的顺序(R1 连杆顺序表用;机制与归因见 #25 总架构师验收)。
 
 实测:完整快照重建误差**逐位为 0**(migrate 全矩阵 97 个 full 行、
 freeze snap 全部 21 行)。

@@ -1,24 +1,27 @@
-//! REQ-012 A00-3 demo `freeze`(2026-11-07)。
+//! REQ-012 A00-3 demo `freeze`(2026-11-07,R1 返修)。
 //!
 //! 问题(A00-3 放行原文):多连杆能不能冻住,唤醒后会不会弹飞?REQ-012 §3
 //! 写明"rapier 对 multibody 的运动学切换行为未验证"。
 //!
-//! 先读 REQ-007 冻结语义与 `crates/physics-sim` 现有实现,再读 rapier 对
-//! multibody 根/非根连杆 `body_type` 的处理:
-//! - 生产语义(sim.rs freeze_entity):清速度 → `set_body_type(KinematicPositionBased)`
-//!   (rapier 0.36 的 KinematicPositionBased 下 set_linvel/set_angvel 是 no-op,
-//!   必须先清再切);唤醒 = `set_body_type(Dynamic)`。
-//! - rapier 0.36.1 `Multibody::update_root_type`(multibody_joint/multibody.rs
-//!   ~:1290):每拍 `forward_kinematics` 时若根刚体 `is_dynamic()` 与
-//!   `root_is_dynamic` 不符,重建根关节(free ↔ fixed)。**只处理根连杆**;
-//!   非根连杆切 kinematic/fixed 的行为本 demo 实证(预期:关节自由度仍在
-//!   multibody 里,非根切型不影响求解——是否成立由数据回答)。
+//! R1 修正(A00-3 验收 F1–F10):
+//! - F1 snap 障碍物 = **一个** fixed 刚体,携带全部连杆的**真实碰撞体**
+//!   (形状/局部偏移/摩擦/恢复系数原样搬,compound),不再手写形状表;
+//!   `obstacle_shape_ok` 列逐个核对碰撞体数量、形状与世界位姿;
+//! - F2/F3 唤醒必须真的发生:`woke_tick` 列,没唤醒的行 panic;
+//!   falling 半空冻结(冻结时最低脚离地 > 0),唤醒才落地;长冻结 3600 拍
+//!   后真唤醒、再跑 600 拍;
+//! - F4 行走对照 12 相位各一条(真行走,vfwd 同拍数同起点);
+//! - F5 目标每拍都写(奇偶拍都写,奇数拍唤醒不失力);
+//! - F6 `z` 口径根速度+关节速度都清零;snap 的 12 相位 rst、z 都跑;
+//! - F7 8 只组 snap 与 kinroot 各一组,冻结/唤醒耗时分开;
+//! - F8/F9/F10 布景与说明一致(pressed 放方块 30 拍后冻结;hit 冻结 100 拍
+//!   后生成方块;suprm 报唤醒时离地高度;删"1 kg 压不塌")。
 //!
-//! 方案三种(都跑,放行):
-//! - `kin`:全部连杆切 `KinematicPositionBased`,唤醒切回 `Dynamic`;
-//! - `fixed`:全部连杆切 `Fixed`,唤醒切回;
-//! - `snap`:移除整个 multibody(刚体 + 关节),碰撞体留在 fixed 刚体上当
-//!   障碍物,唤醒按 migrate 的快照重建。
+//! 方案(放行,都跑):`kin` / `fixed`(全连杆切型,rapier multibody.rs:1457
+//! 断言非根连杆必须 Dynamic → panic 证据行)、`kinroot` / `fixedroot`(只切根;
+//! **R1 已否决:不算冻结**——非根连杆保持 Dynamic 继续被求解,保留站立 +
+//! 12 相位 rst 作记录)、`snap`(移除 multibody + 碰撞体留一个 fixed 障碍物,
+//! 唤醒按 migrate 快照重建)。
 //!
 //! 统一口径(A00-3 放行):60 Hz、生产求解参数(只覆写 dt)、默认步态
 //! (kp 100、kd 3、3 Hz)、k = 1/100、阻尼按 k 缩放、30 Hz 更新目标、
@@ -27,11 +30,11 @@
 use std::time::Instant;
 
 use quad::{
-    default_gait, ik, production_params, read_angle, restore_robot, set_target, spawn_robot,
-    DampMode, GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
+    active_order, default_gait, ik, production_params, read_angle, restore_robot, set_target,
+    spawn_robot, DampMode, GROUND_RESTITUTION, N_JOINTS, TAU_LIMIT,
 };
 use rapier3d::dynamics::{RigidBodyBuilder, RigidBodyHandle, RigidBodyType};
-use rapier3d::geometry::{ColliderBuilder, ColliderHandle};
+use rapier3d::geometry::{ColliderBuilder, ColliderHandle, SharedShape};
 use rapier3d::math::{Pose, Vector};
 use rapier3d::pipeline::PhysicsWorld;
 
@@ -41,27 +44,29 @@ const GROUND_TOP: f32 = 0.0;
 const STAND_TICKS: usize = 180;
 /// 唤醒后跟踪窗口(判据 3)。
 const POST_TICKS: usize = 120;
-/// 单次冻结组的总拍数:站立 + 行走(冻结在行走中段)+ 唤醒后段。
+/// 单次冻结组的总拍数:站立 180 + 行走 1200(冻结在行走中段,唤醒后再走)。
 const WALK_TICKS: usize = STAND_TICKS + 1200;
-/// 长冻结组的静置拍数(放行:600 和 3600 两档)。
-const FREEZE_LONG: usize = 3600;
+/// 冻结时长档(放行:600 和 3600 两档)。
 const FREEZE_SHORT: usize = 600;
+const FREEZE_LONG: usize = 3600;
+/// 唤醒后至少再跑的拍数(F2/F3)。
+const POST_WAKE_MIN: usize = 600;
 /// 质量比例 k(压缩档)。
 const K: f32 = 1.0 / 100.0;
 
 /// 冻结方案。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scheme {
-    /// 全部连杆切 KinematicPositionBased(放行原文口径;预期 panic,
-    /// rapier multibody.rs:1457 断言非根连杆必须 Dynamic)。
+    /// 全部连杆切 KinematicPositionBased(放行原文口径;panic 证据)。
     Kin,
-    /// 全部连杆切 Fixed(同上,预期 panic)。
+    /// 全部连杆切 Fixed(同上)。
     Fixed,
-    /// 移除 multibody,碰撞体留 fixed 障碍物;唤醒按快照重建。
+    /// 移除 multibody,全部连杆真实碰撞体搬到一个 fixed 刚体上;唤醒按
+    /// 快照重建。
     Snap,
-    /// 只切根连杆 KinematicPositionBased(实际可行的运动学冻结)。
+    /// 只切根连杆 KinematicPositionBased(R1 已否决:不算冻结;保留记录)。
     KinRoot,
-    /// 只切根连杆 Fixed。
+    /// 只切根连杆 Fixed(同上)。
     FixedRoot,
 }
 
@@ -75,41 +80,43 @@ impl Scheme {
             Scheme::FixedRoot => "fixedroot",
         }
     }
-    /// 全连杆切型(rapier 断言会 panic 的方案)。
-    fn all_links(self) -> bool {
-        matches!(self, Scheme::Kin | Scheme::Fixed)
+    fn is_snap(self) -> bool {
+        self == Scheme::Snap
+    }
+    /// 只切根(否决记录口径)。
+    fn is_root_only(self) -> bool {
+        matches!(self, Scheme::KinRoot | Scheme::FixedRoot)
     }
 }
 
 /// 场景。
 #[derive(Clone, Copy, PartialEq)]
 enum Scene {
-    /// 醒着站立中冻结(每拍 wake_up 的站立口径;冻结期间不再唤醒)。
+    /// 醒着站立中冻结(每拍 wake_up;冻结期间不再唤醒)。
     Stand,
     /// 行走中冻结:步态周期(f3 = 20 拍)内 12 个相位。
     WalkPhase { phase: usize },
-    /// 站在 3×3 方块堆上冻结(堆在冻结期间不动;唤醒后主体在堆顶)。
+    /// 站在 3×3 方块堆上冻结。
     OnPile,
-    /// 被单格方块压着冻结(方块轻放在背上,同 mass M3One 口径)。
+    /// 被单格方块压着:放方块 30 拍后冻结(F8;探针证实 30 拍内机身已下沉)。
     Pressed,
-    /// 离地 0.5 m 下落途中冻结(瞬移悬空后第 10 拍冻结,落地前)。
+    /// 半空冻结:瞬移 0.5 m 悬空下落,离地时冻结(冻结时最低脚离地 > 0,
+    /// F2),唤醒后才落地。
     Falling,
-    /// 冻结期间有方块砸中(冻结后 100 拍,1 kg 方块从 3 m 高落在背上)。
+    /// 冻结 100 拍后 1 kg 方块从 3 m 高砸中(F8)。
     HitWhileFrozen,
-    /// 冻结期间脚下方块被移走(站 3×3 堆顶,冻结后 100 拍移除全堆)。
+    /// 冻结 100 拍后脚下方块堆被移走。
     SupportRemoved,
-    /// 对照:同参数、不冻结的同一条轨迹。
-    Control,
-    /// 8 只一起冻结、一起唤醒(耗时)。
+    /// 8 只一起冻结、一起唤醒(耗时 + 逐只窗口)。
     Eight,
 }
 
-/// 唤醒速度口径:恢复冻结前的速度 / 唤醒时速度清零(两种都跑,放行)。
+/// 唤醒速度口径(F6:z 把根速度和关节速度都清零)。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WakeVel {
     /// 恢复冻结前的速度(快照里带)。
     Restore,
-    /// 速度清零(生产 freeze_entity 语义:冻结时本来就清零)。
+    /// 根速度 + 关节速度都清零(生产 freeze_entity 语义)。
     Zero,
 }
 
@@ -127,8 +134,10 @@ struct Cfg {
     scene: Scene,
     scheme: Scheme,
     wake_vel: WakeVel,
-    /// 冻结时长档(拍);0 = 场景默认。
+    /// 冻结时长(拍);0 = FREEZE_SHORT。
     freeze_ticks: usize,
+    /// 对照行(不冻结;行走对照走对应相位、同拍数)。
+    control_like: bool,
     eight: bool,
 }
 
@@ -146,9 +155,9 @@ fn hash_f32(h: u64, v: f32) -> u64 {
 struct Side {
     world: PhysicsWorld,
     robot: Option<quad::Robot>,
-    /// 地面 collider(穿透统计/冻结期位移判定用;当前统计走 bodies,保留字段)。
+    /// 地面 collider(穿透统计用;穿透统计走连杆对地形口径时保留字段)。
     #[allow(dead_code)]
-    terrain: Vec<ColliderHandle>,
+    ground: ColliderHandle,
     blocks: Vec<RigidBodyHandle>,
 }
 
@@ -177,7 +186,7 @@ fn make_side(with_robot: bool) -> Side {
     Side {
         world,
         robot,
-        terrain: vec![collider],
+        ground: collider,
         blocks: Vec::new(),
     }
 }
@@ -249,366 +258,419 @@ fn wake_all(world: &mut PhysicsWorld, robot: &quad::Robot) {
     }
 }
 
-// ── 冻结 / 唤醒三方案 ───────────────────────────────────────────────────
+fn body_y(world: &PhysicsWorld, robot: &quad::Robot) -> f32 {
+    world.bodies.get(robot.body).expect("alive").translation().y
+}
 
-/// 冻结前的记录:全部连杆位姿 + 速度 + 关节坐标/速度(唤醒与判据 2 用)。
+/// 全部连杆的最低点(粗口径:连杆位姿 y − 足球半径;falling 的"冻结时
+/// 离地 > 0"自检用)。
+fn lowest_foot_y(world: &PhysicsWorld, robot: &quad::Robot) -> f32 {
+    let mut min_y = f32::INFINITY;
+    for sh in &robot.shanks {
+        let rb = world.bodies.get(*sh).expect("alive");
+        // 足端 = shank 位姿 * (0, −L, 0)。
+        let p = *rb.position() * Vector::new(0.0, -quad::L, 0.0);
+        min_y = min_y.min(p.y - quad::FOOT_R);
+    }
+    min_y
+}
+
+// ── 冻结 / 唤醒 ──────────────────────────────────────────────────────────
+
+/// 冻结前的记录:根快照口径(migrate 同款)+ 连杆位姿/速度。
 struct FrozenState {
-    /// 13 个连杆位姿(links 序 + 根最后,同 quad::Robot.links 序)。
+    /// 13 个连杆位姿(links 序,**links[0] = 根机身**,同 quad::Robot.links;
+    /// quad::AgentSnapshot 的 link_poses 与 Robot.links 同序)。
     link_poses: Vec<Pose>,
-    link_linvels: Vec<Vector>,
-    link_angvels: Vec<Vector>,
+    root_linvel: Vector,
+    root_angvel: Vector,
     joint_coords: [f32; N_JOINTS],
     joint_vels: [f32; N_JOINTS],
     targets: [f32; N_JOINTS],
+    /// snap 障碍物刚体的冻结拍基准(fixed,理论恒 0 位移)。
+    obstacle_base: Vector,
 }
 
 fn capture(world: &PhysicsWorld, robot: &quad::Robot, targets: &[f32; N_JOINTS]) -> FrozenState {
     let mut poses = Vec::new();
-    let mut lins = Vec::new();
-    let mut angs = Vec::new();
-    for lh in robot
-        .links
-        .iter()
-        .copied()
-        .chain(std::iter::once(robot.body))
-    {
-        let rb = world.bodies.get(lh).expect("alive");
+    for lh in &robot.links {
+        let rb = world.bodies.get(*lh).expect("alive");
         poses.push(*rb.position());
-        lins.push(rb.linvel());
-        angs.push(rb.angvel());
     }
     let mut coords = [0.0f32; N_JOINTS];
     let mut vels = [0.0f32; N_JOINTS];
     for dof in 0..N_JOINTS {
         coords[dof] = read_angle(&world.multibody_joints, robot, dof);
-        vels[dof] = mb_joint_vel(world, robot, dof);
+        let (mb_index, link_id) = robot.joints[dof];
+        if let Some(mb) = world.multibody_joints.get_multibody(mb_index) {
+            let aid = mb.link(link_id).expect("link alive").assembly_id();
+            vels[dof] = mb.generalized_velocity()[aid];
+        }
     }
+    let root = world.bodies.get(robot.body).expect("alive");
     FrozenState {
         link_poses: poses,
-        link_linvels: lins,
-        link_angvels: angs,
+        root_linvel: root.linvel(),
+        root_angvel: root.angvel(),
         joint_coords: coords,
         joint_vels: vels,
         targets: *targets,
+        obstacle_base: Vector::ZERO,
     }
 }
 
-/// 关节速度(solver 回写的 generalized velocity;快照口径同 quad)。
-fn mb_joint_vel(world: &PhysicsWorld, robot: &quad::Robot, dof: usize) -> f32 {
-    let (mb_index, link_id) = robot.joints[dof];
-    let Some(mb) = world.multibody_joints.get_multibody(mb_index) else {
-        return 0.0;
-    };
-    let aid = mb.link(link_id).expect("link alive").assembly_id();
-    mb.generalized_velocity()[aid]
+impl FrozenState {
+    /// 构造 migrate 同款的 AgentSnapshot(snap 唤醒与误差核对用)。
+    /// link_poses 与 Robot.links 同序,links[0] = 根机身(见 capture)。
+    fn snapshot(&self, wake_vel: WakeVel) -> quad::AgentSnapshot {
+        quad::AgentSnapshot {
+            root_pose: self.link_poses[0],
+            root_linvel: match wake_vel {
+                WakeVel::Restore => self.root_linvel,
+                WakeVel::Zero => Vector::ZERO,
+            },
+            root_angvel: match wake_vel {
+                WakeVel::Restore => self.root_angvel,
+                WakeVel::Zero => Vector::ZERO,
+            },
+            joint_coords: self.joint_coords,
+            joint_vels: match wake_vel {
+                WakeVel::Restore => self.joint_vels,
+                WakeVel::Zero => [0.0; N_JOINTS],
+            },
+            link_poses: self.link_poses.clone(),
+            targets: self.targets,
+        }
+    }
 }
 
-/// snap 方案的障碍物句柄:移除 multibody 时把连杆碰撞体保留在 fixed 刚体上。
+/// snap 方案的障碍物:**一个** fixed 刚体,携带全部连杆的真实碰撞体(F1)。
+/// 碰撞体从原 collider 集合逐个读形状(SharedShape 克隆)、局部偏移
+/// (`position_wrt_parent`)、摩擦、恢复系数,compound 到障碍物上。
 struct SnapObstacles {
-    /// 每连杆一个 fixed 刚体(位置 = 冻结时连杆位姿,collider 形状同原)。
-    obstacles: Vec<RigidBodyHandle>,
+    body: RigidBodyHandle,
+    /// 障碍物上的 collider(数量与顺序 = robot.colliders)。
+    colliders: Vec<ColliderHandle>,
 }
 
-/// 冻结(schema 分派)。返回 snap 方案的障碍物记录(其余返回空)。
-///
-/// `Kin`/`Fixed` = 全部连杆切型(放行原文的口径)。rapier 0.36.1 的
-/// `Multibody::forward_kinematics`(multibody_joint/multibody.rs:1457)有
-/// 硬断言"非根连杆必须 Dynamic"——全连杆切型在下一次 step 即 panic,
-/// 这是本 demo 的实证结果(§3"运动学切换行为未验证"的答案),不是 demo bug。
-/// `KinRoot`/`FixedRoot` = 只切根连杆(实际可行的运动学冻结;非根保持
-/// Dynamic,关节由 multibody 求解冻结前的目标)。
-fn do_freeze(side: &mut Side, scheme: Scheme, state: &FrozenState) -> SnapObstacles {
-    let robot = side.robot.as_ref().expect("alive");
-    match scheme {
-        Scheme::Kin | Scheme::Fixed | Scheme::KinRoot | Scheme::FixedRoot => {
-            let ty = match scheme {
-                Scheme::Kin | Scheme::KinRoot => RigidBodyType::KinematicPositionBased,
-                _ => RigidBodyType::Fixed,
+fn do_freeze_snap(side: &mut Side, _state: &FrozenState) -> SnapObstacles {
+    let old = side.robot.take().expect("alive");
+    // links 序 = [body, lat, th, sh]×4(见 spawn_robot:links[0] = body);
+    // colliders 序 = [body_collider, lat, th, sh, foot]×4。两个 Vec 同长
+    // (13),下标 i 的 collider 属于下标 i 的刚体(spawn_robot 的 push 序)。
+    debug_assert_eq!(old.links.len(), old.colliders.len());
+    let mut parts: Vec<(Pose, SharedShape)> = Vec::new();
+    let mut frics = Vec::new();
+    let mut rests = Vec::new();
+    for lh in old.links.iter() {
+        let rb = side.world.bodies.get(*lh).expect("alive");
+        let body_pose = *rb.position();
+        for ch in &old.colliders {
+            let Some(col) = side.world.colliders.get(*ch) else {
+                continue;
             };
-            // 生产语义:先清速度再切(rapier 0.36 kinematic 下 set_vel no-op)。
-            let handles: Vec<RigidBodyHandle> =
-                if matches!(scheme, Scheme::KinRoot | Scheme::FixedRoot) {
-                    vec![robot.body]
-                } else {
-                    robot
-                        .links
-                        .iter()
-                        .copied()
-                        .chain(std::iter::once(robot.body))
-                        .collect()
-                };
-            for h in handles {
-                if let Some(rb) = side.world.bodies.get_mut(h) {
-                    rb.set_linvel(Vector::ZERO, false);
-                    rb.set_angvel(Vector::ZERO, false);
-                    rb.set_body_type(ty, false);
-                }
+            // collider 属于这个刚体?(parent 匹配)
+            if col.parent() != Some(*lh) {
+                continue;
             }
-            SnapObstacles {
-                obstacles: Vec::new(),
-            }
+            let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+            // 世界位姿 = body_pose * local(snap 障碍物刚体放 IDENTITY 位姿,
+            // 所以 part 的 local = 世界位姿)。
+            let world_pose = body_pose * local;
+            parts.push((world_pose, col.shared_shape().clone()));
+            frics.push(col.friction());
+            rests.push(col.restitution());
         }
-        Scheme::Snap => {
-            // 移除整个 multibody;每连杆碰撞体形状在 fixed 刚体上重建为
-            // 障碍物(位置 = 冻结时连杆位姿)。
-            let old = side.robot.take().expect("alive");
-            let all: Vec<RigidBodyHandle> = old
-                .links
-                .iter()
-                .copied()
-                .chain(std::iter::once(old.body))
-                .collect();
-            // 障碍物:先建 fixed 刚体(位置同冻结连杆),再移除原刚体。
-            // 形状近似:机身 cuboid;髋 ball;大腿/小腿 capsule_y;足 ball。
-            // 用 quad 的常量重建(与 spawn_robot 同形状)。
-            let mut obstacles = Vec::new();
-            for (i, pose) in state.link_poses.iter().enumerate() {
-                let shape = if i == old.links.len() {
-                    // 根(机身)。
-                    ColliderBuilder::cuboid(
-                        quad::BODY_HALF[0],
-                        quad::BODY_HALF[1],
-                        quad::BODY_HALF[2],
-                    )
-                } else {
-                    match i % 4 {
-                        0 => ColliderBuilder::ball(quad::HIP_BALL_R),
-                        1 => ColliderBuilder::capsule_y(quad::L / 2.0, quad::THIGH_RADIUS),
-                        2 => ColliderBuilder::capsule_y(quad::L / 2.0, quad::SHANK_RADIUS),
-                        _ => ColliderBuilder::ball(quad::FOOT_R).translation(Vector::new(
-                            0.0,
-                            -quad::L / 2.0,
-                            0.0,
-                        )),
-                    }
-                };
-                let (h, _) = world_insert_fixed(&mut side.world, *pose, shape);
-                obstacles.push(h);
-            }
-            for h in all {
-                side.world.remove_body(h);
-            }
-            SnapObstacles { obstacles }
-        }
+    }
+    // 移除原刚体(连带拆 multibody 与 collider)。
+    let mut all: Vec<RigidBodyHandle> = old.links.clone();
+    all.push(old.body);
+    for h in all {
+        side.world.remove_body(h);
+    }
+    // 一个 fixed 刚体 + compound collider(F1:留在**一个**固定刚体上)。
+    // 每个部分的摩擦/恢复系数不同(脚 = foot_mu),compound 的整体材质取
+    // 机身档;逐 collider 材质通过 set 函数在插入后逐个覆写不可行
+    // (CompoundCollider 是单 collider)——compound 材质 = 第一个部分的
+    // 摩擦/恢复(机身与连杆主体都是 GROUND_FRICTION/GROUND_RESTITUTION,
+    // 只有足球是 foot_mu,本 demo foot_mu = GROUND_FRICTION = 0.6,一致)。
+    let (_bh, ch) = side.world.insert(
+        RigidBodyBuilder::fixed(),
+        ColliderBuilder::compound(parts)
+            .friction(frics.first().copied().unwrap_or(quad::GROUND_FRICTION))
+            .restitution(rests.first().copied().unwrap_or(GROUND_RESTITUTION)),
+    );
+    SnapObstacles {
+        body: _bh,
+        colliders: vec![ch],
     }
 }
 
-fn world_insert_fixed(
-    world: &mut PhysicsWorld,
-    pose: Pose,
-    collider: ColliderBuilder,
-) -> (RigidBodyHandle, ColliderHandle) {
-    world.insert(
-        RigidBodyBuilder::fixed().pose(Pose {
-            translation: pose.translation,
-            rotation: pose.rotation,
-            ..Pose::IDENTITY
-        }),
-        collider
-            .friction(quad::GROUND_FRICTION)
-            .restitution(GROUND_RESTITUTION),
-    )
+/// F1:obstacle_shape_ok —— 用代码逐个核对障碍物碰撞体数量、形状和世界
+/// 位姿 vs 原连杆碰撞体(在冻结前采样的对照表)。
+struct ShapeCheck {
+    /// (原 collider 世界位姿, 形状类型 + 特征值)快照。
+    expected: Vec<(Pose, String)>,
 }
 
-/// 唤醒(kin/fixed:切回 Dynamic + 按口径写速度;snap:按快照重建)。
-/// 返回(新机器人(或原句柄组), 唤醒后步进前误差)。
-fn do_unfreeze(
+fn sample_shape_table(world: &PhysicsWorld, robot: &quad::Robot) -> ShapeCheck {
+    // 按 parent 归属逐 collider 采样(同 do_freeze_snap 的遍历口径)。
+    let mut expected = Vec::new();
+    for lh in robot.links.iter().copied() {
+        let rb = world.bodies.get(lh).expect("alive");
+        let body_pose = *rb.position();
+        for ch in &robot.colliders {
+            let Some(col) = world.colliders.get(*ch) else {
+                continue;
+            };
+            if col.parent() != Some(lh) {
+                continue;
+            }
+            let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+            let world_pose = body_pose * local;
+            let shape = col.shared_shape();
+            let desc = if let Some(b) = shape.as_ball() {
+                format!("ball r={:.6}", b.radius)
+            } else if let Some(c) = shape.as_cuboid() {
+                format!(
+                    "cuboid h={:.6}",
+                    c.half_extents.x * 1e6 + c.half_extents.y + c.half_extents.z
+                )
+            } else if let Some(cap) = shape.as_capsule() {
+                format!("capsule hh={:.6} r={:.6}", cap.half_height(), cap.radius)
+            } else {
+                "other".to_string()
+            };
+            expected.push((world_pose, desc));
+        }
+    }
+    ShapeCheck { expected }
+}
+
+/// 核对 snap 障碍物:碰撞体数量一致 + 逐形状特征一致 + 世界位姿逐位一致。
+/// 返回 "true" / 失败原因(列里只写 true/FALSE(原因),保证 CSV 无逗号)。
+fn check_obstacle_shape(side: &Side, obstacles: &SnapObstacles, expect: &ShapeCheck) -> String {
+    let mut actual: Vec<(Pose, String)> = Vec::new();
+    for ch in &obstacles.colliders {
+        let Some(col) = side.world.colliders.get(*ch) else {
+            return "no-collider".into();
+        };
+        let Some(compound) = col.shared_shape().as_compound() else {
+            return "not-compound".into();
+        };
+        for (pose, shape) in compound.shapes() {
+            let desc = if let Some(b) = shape.as_ball() {
+                format!("ball r={:.6}", b.radius)
+            } else if let Some(c) = shape.as_cuboid() {
+                format!(
+                    "cuboid h={:.6}",
+                    c.half_extents.x * 1e6 + c.half_extents.y + c.half_extents.z
+                )
+            } else if let Some(cap) = shape.as_capsule() {
+                format!("capsule hh={:.6} r={:.6}", cap.half_height(), cap.radius)
+            } else {
+                "other".to_string()
+            };
+            actual.push((*pose, desc));
+        }
+    }
+    if actual.len() != expect.expected.len() {
+        return format!("count {} vs {}", actual.len(), expect.expected.len());
+    }
+    // 顺序核对(compound 保留插入序)。
+    for (i, ((pa, da), (pe, de))) in actual.iter().zip(expect.expected.iter()).enumerate() {
+        if da != de {
+            return format!("shape{i} {da} vs {de}");
+        }
+        if (pa.translation.x - pe.translation.x).abs() > 1e-6
+            || (pa.translation.y - pe.translation.y).abs() > 1e-6
+            || (pa.translation.z - pe.translation.z).abs() > 1e-6
+        {
+            return format!("pose{i} {:.6e}", (pa.translation - pe.translation).length());
+        }
+        let dq = pa.rotation * pe.rotation.inverse();
+        let rot_err = 2.0 * Vector::new(dq.x, dq.y, dq.z).length();
+        if rot_err > 1e-5 {
+            return format!("rot{i} {rot_err:.3e}");
+        }
+    }
+    "true".to_string()
+}
+
+/// 只切根的冻结(否决记录口径)。
+fn do_freeze_root(side: &mut Side, scheme: Scheme) {
+    let robot = side.robot.as_ref().expect("alive");
+    let ty = match scheme {
+        Scheme::KinRoot => RigidBodyType::KinematicPositionBased,
+        Scheme::FixedRoot => RigidBodyType::Fixed,
+        _ => unreachable!(),
+    };
+    if let Some(rb) = side.world.bodies.get_mut(robot.body) {
+        rb.set_linvel(Vector::ZERO, false);
+        rb.set_angvel(Vector::ZERO, false);
+        rb.set_body_type(ty, false);
+    }
+}
+
+/// 只切根的唤醒(否决记录口径;按 WakeVel 恢复/清零根速度)。
+fn do_unfreeze_root(
     side: &mut Side,
-    scheme: Scheme,
     wake_vel: WakeVel,
     state: &FrozenState,
-    obstacles: &SnapObstacles,
-) -> (Option<quad::Robot>, (f32, f32, f32, f32)) {
-    match scheme {
-        Scheme::Kin | Scheme::Fixed | Scheme::KinRoot | Scheme::FixedRoot => {
-            let robot = side.robot.as_ref().expect("alive");
-            let handles: Vec<RigidBodyHandle> = if scheme.all_links() {
-                robot
-                    .links
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(robot.body))
-                    .collect()
-            } else {
-                vec![robot.body]
-            };
-            for h in &handles {
-                if let Some(rb) = side.world.bodies.get_mut(*h) {
-                    rb.set_body_type(RigidBodyType::Dynamic, false);
-                }
+) -> (f32, f32, f32, f32) {
+    let robot = side.robot.as_ref().expect("alive");
+    if let Some(rb) = side.world.bodies.get_mut(robot.body) {
+        rb.set_body_type(RigidBodyType::Dynamic, false);
+        match wake_vel {
+            WakeVel::Restore => {
+                rb.set_linvel(state.root_linvel, false);
+                rb.set_angvel(state.root_angvel, false);
             }
-            // 速度口径:恢复(冻结前)/清零(生产语义本来就 0)。
-            for (i, h) in handles.iter().enumerate() {
-                if let Some(rb) = side.world.bodies.get_mut(*h) {
-                    match wake_vel {
-                        WakeVel::Restore => {
-                            rb.set_linvel(state.link_linvels[i], false);
-                            rb.set_angvel(state.link_angvels[i], false);
-                        }
-                        WakeVel::Zero => {}
-                    }
-                }
-            }
-            // multibody 根切型已发生:下一拍 forward_kinematics 的
-            // update_root_type 会按新根类型重建根关节——这里先手动触发
-            // (与生产唤醒后立刻 step 的路径一致)。全连杆切型的唤醒走不到
-            // 这里(capture 时已 panic,矩阵记录 panicked 行)。
-            let robot = side.robot.as_ref().expect("alive");
-            let (mb_index, _) = robot.joints[0];
-            if let Some(mb) = side.world.multibody_joints.get_multibody_mut(mb_index) {
-                mb.forward_kinematics(&side.world.bodies, true);
-                mb.update_rigid_bodies(&mut side.world.bodies, false);
-            }
-            wake_all(&mut side.world, robot);
-            let err = measure_frozen_error(side, robot, state);
-            (None, err)
-        }
-        Scheme::Snap => {
-            // 移除障碍物;按 migrate 快照口径重建(restore_robot)。
-            for h in &obstacles.obstacles {
-                side.world.remove_body(*h);
-            }
-            // 构造 AgentSnapshot 兼容结构:根位姿 = links 最后一个。
-            let n_links = state.link_poses.len() - 1;
-            let snap = quad::AgentSnapshot {
-                root_pose: state.link_poses[n_links],
-                root_linvel: state.link_linvels[n_links],
-                root_angvel: state.link_angvels[n_links],
-                joint_coords: state.joint_coords,
-                joint_vels: if wake_vel == WakeVel::Restore {
-                    state.joint_vels
-                } else {
-                    [0.0; N_JOINTS]
-                },
-                link_poses: state.link_poses[..n_links].to_vec(),
-                targets: state.targets,
-            };
-            let new_robot = restore_robot(
-                &mut side.world,
-                &snap,
-                K,
-                quad::GROUND_FRICTION,
-                DampMode::Scaled,
-            );
-            let err = quad::measure_restore_error(&side.world, &new_robot, &snap);
-            (Some(new_robot), err)
+            WakeVel::Zero => {}
         }
     }
-}
-
-/// 唤醒后步进前误差(判据 2):kin/fixed 与 snap 同口径——连杆位姿/关节
-/// 坐标 vs 冻结前(quad::measure_restore_error 的快照式)。
-fn measure_frozen_error(
-    side: &Side,
-    robot: &quad::Robot,
-    state: &FrozenState,
-) -> (f32, f32, f32, f32) {
-    let n_links = state.link_poses.len() - 1;
+    // 根切型已发生:手动触发 FK(update_root_type 重建根关节)。
+    let (mb_index, _) = robot.joints[0];
+    if let Some(mb) = side.world.multibody_joints.get_multibody_mut(mb_index) {
+        mb.forward_kinematics(&side.world.bodies, true);
+        mb.update_rigid_bodies(&mut side.world.bodies, false);
+    }
+    let robot = side.robot.as_ref().expect("alive");
+    wake_all(&mut side.world, robot);
     let snap = quad::AgentSnapshot {
-        root_pose: state.link_poses[n_links],
-        root_linvel: state.link_linvels[n_links],
-        root_angvel: state.link_angvels[n_links],
+        root_pose: state.link_poses[0],
+        root_linvel: state.root_linvel,
+        root_angvel: state.root_angvel,
         joint_coords: state.joint_coords,
         joint_vels: state.joint_vels,
-        link_poses: state.link_poses[..n_links].to_vec(),
+        link_poses: state.link_poses.clone(),
         targets: state.targets,
     };
     quad::measure_restore_error(&side.world, robot, &snap)
 }
 
-/// 冻结期间连杆位移最大值(判据 1):对 kin/fixed 每拍读刚体平移 vs 冻结
-/// 前;snap 对障碍物刚体(snap 期间原刚体已不存在,障碍物不动 = fixed)。
+/// 冻结期间连杆位移最大值(判据 1):kinroot/fixedroot 读连杆刚体;
+/// snap 读障碍物刚体(fixed,理论恒 0)。
 fn frozen_drift(
     side: &Side,
     scheme: Scheme,
     state: &FrozenState,
     obstacles: &SnapObstacles,
 ) -> f32 {
-    match scheme {
-        Scheme::Kin | Scheme::Fixed | Scheme::KinRoot | Scheme::FixedRoot => {
-            let robot = side.robot.as_ref().expect("alive");
-            let mut max_d = 0.0f32;
-            for (i, lh) in robot
-                .links
-                .iter()
-                .copied()
-                .chain(std::iter::once(robot.body))
-                .enumerate()
-            {
-                let rb = side.world.bodies.get(lh).expect("alive");
-                let d = rb.translation() - state.link_poses[i].translation;
-                max_d = max_d.max(d.length());
-            }
-            max_d
-        }
-        Scheme::Snap => {
-            let mut max_d = 0.0f32;
-            for (i, h) in obstacles.obstacles.iter().enumerate() {
-                let rb = side.world.bodies.get(*h).expect("alive");
-                let d = rb.translation() - state.link_poses[i].translation;
-                max_d = max_d.max(d.length());
-            }
-            max_d
-        }
+    if scheme.is_snap() {
+        // 障碍物是 fixed 刚体(IDENTITY + compound 全部真实碰撞体),物理上
+        // 不会动;这里测刚体位姿相对冻结拍基准 obstacle_base 的位移。
+        let rb = side.world.bodies.get(obstacles.body).expect("alive");
+        return (rb.translation() - state.obstacle_base).length();
     }
+    let robot = side.robot.as_ref().expect("alive");
+    let mut max_d = 0.0f32;
+    // links = [body, lat, th, sh]x4,与 state.link_poses 同序同长;kinroot
+    // 只有根被切,非根连杆在动,位移对全部连杆统计。
+    for (i, lh) in robot.links.iter().copied().enumerate() {
+        let rb = side.world.bodies.get(lh).expect("alive");
+        let frozen_pose = state.link_poses[i];
+        let d = rb.translation() - frozen_pose.translation;
+        max_d = max_d.max(d.length());
+    }
+    max_d
+}
+
+/// 窗口统计(F:真实窗口,只收唤醒后 POST_TICKS 拍)。
+struct WinStats {
+    upy_min: f32,
+    max_vy: f32,
+    link_max: f32,
+    body_rise_max: f32,
+    base_y: Option<f32>,
 }
 
 struct Outcome {
     name: String,
-    /// 冻结期间连杆位移最大值(判据 1;snap = 障碍物位移)。
+    /// 冻结期间全部连杆/障碍物位移最大值(判据 1)。
     frozen_drift: f32,
+    /// 障碍物形状核对(F1;snap 行)。
+    obstacle_shape_ok: String,
     /// 唤醒后步进前误差(判据 2)。
     err_coord: f32,
     err_pos: f32,
     err_rot: f32,
     err_vel: f32,
-    /// 唤醒后 POST_TICKS:up·y 最小、最大 |vy|、连杆峰值、机身最大升高。
+    /// 实际唤醒拍(F2/F3;相对冻结拍)。
+    woke_tick: usize,
+    /// 唤醒后 POST_TICKS 真实窗口。
     post_upy_min: f32,
     post_max_vy: f32,
     post_link_max: f32,
     body_max_rise: f32,
-    /// 全程 vfwd(行走拍;对照同口径)。
+    /// 全程 vfwd(行走拍,只算唤醒后的行走段;对照同口径)。
     vfwd: f32,
+    /// 从唤醒起全程摔倒检查。
     fell_tick: Option<usize>,
+    /// 布景终态报数:方块位置/睡着/是否在背上、机身高度、唤醒时离地高度。
+    scene_note: String,
     nan: bool,
-    /// panic 隔离(全连杆切型方案 Kin/Fixed 预期 panic;catch_unwind 记行)。
     panicked: bool,
     panic_msg: String,
-    /// 冻结/唤醒总耗时(µs;8 只组为 8 只平均)。
+    /// 冻结耗时(µs)。
     freeze_us: f32,
+    /// 唤醒耗时(µs;F7/R1-6 分开)。
+    wake_us: f32,
+    /// 活跃集顺序(F 通用要求;唤醒后)。
+    active_order_end: String,
     state_hash: u64,
+}
+
+fn fnum(v: f32) -> String {
+    if v.is_finite() {
+        format!("{v:.4}")
+    } else {
+        "inf".to_string()
+    }
 }
 
 fn outcome_csv(o: &Outcome) -> String {
     if o.panicked {
-        // panic 行:整行占位 + 消息(列序一致;消息内逗号替换)。
+        // panic 行:整行占位 + 消息(逗号/引号/换行替换;列数与正常行一致,
+        // 22 列:name + 13 个 "-"(drift..fell_tick)+ "-"(scene_note)+
+        // false(nan)+ true(panicked)+ "msg" + 0(freeze_us)+ 0(wake_us)+
+        // -(order)+ hash。
+        let msg = o.panic_msg.replace(',', " ").replace('"', "'").replace(
+            "
+", " ",
+        );
         return format!(
-            "{},-,-,-,-,-,-,-,-,-,-,-,false,true,\"{}\",0,{:016x}",
-            o.name,
-            o.panic_msg.replace(',', " "),
-            o.state_hash,
+            "{},-,-,-,-,-,-,-,-,-,-,-,-,-,-,false,true,\"{}\",0,0,-,0000000000000000",
+            o.name, msg
         );
     }
-    format!(
-        "{},{:.3e},{:.3e},{:.3e},{:.3e},{:.4},{:.4},{:.4},{:.4},{:.4},{},{},{},false,{},{:.1},{:016x}",
-        o.name,
-        o.frozen_drift,
-        o.err_coord,
-        o.err_pos,
-        o.err_rot,
-        o.err_vel,
-        o.post_upy_min,
-        o.post_max_vy,
-        o.post_link_max,
-        o.body_max_rise,
-        o.vfwd,
+    let cells = [
+        o.name.clone(),
+        fnum(o.frozen_drift),
+        o.obstacle_shape_ok.clone(),
+        o.woke_tick.to_string(),
+        format!("{:.3e}", o.err_coord),
+        format!("{:.3e}", o.err_pos),
+        format!("{:.3e}", o.err_rot),
+        format!("{:.3e}", o.err_vel),
+        fnum(o.post_upy_min),
+        fnum(o.post_max_vy),
+        fnum(o.post_link_max),
+        fnum(o.body_max_rise),
+        fnum(o.vfwd),
         o.fell_tick
             .map_or_else(|| "-".to_string(), |t| t.to_string()),
-        o.nan,
-        o.panic_msg,
-        o.freeze_us,
-        o.state_hash,
-    )
+        o.scene_note.replace(',', " "),
+        o.nan.to_string(),
+        "false".to_string(),
+        String::new(),
+        fnum(o.freeze_us),
+        fnum(o.wake_us),
+        "-".to_string(),
+        o.active_order_end.clone(),
+        format!("{:016x}", o.state_hash),
+    ];
+    cells.join(",")
 }
 
 fn run_once(cfg: &Cfg) -> Result<Outcome, String> {
@@ -623,20 +685,25 @@ fn run_once(cfg: &Cfg) -> Result<Outcome, String> {
             Ok(Outcome {
                 name: cfg.name.clone(),
                 frozen_drift: 0.0,
+                obstacle_shape_ok: "-".into(),
                 err_coord: 0.0,
                 err_pos: 0.0,
                 err_rot: 0.0,
                 err_vel: 0.0,
+                woke_tick: 0,
                 post_upy_min: 0.0,
                 post_max_vy: 0.0,
                 post_link_max: 0.0,
                 body_max_rise: 0.0,
                 vfwd: 0.0,
                 fell_tick: None,
+                scene_note: String::new(),
                 nan: false,
                 panicked: true,
                 panic_msg: msg,
                 freeze_us: 0.0,
+                wake_us: 0.0,
+                active_order_end: String::new(),
                 state_hash: 0,
             })
         }
@@ -648,220 +715,336 @@ fn run(cfg: &Cfg) -> Outcome {
     let period = (60.0 / gait.freq).round() as usize;
     let walk0 = STAND_TICKS;
     let walking = matches!(cfg.scene, Scene::WalkPhase { .. });
-    // 冻结拍:WalkPhase 相位 → 行走开始后 phase·period/12;Stand → walk0;
-    // 其余场景见循环内布景。冻结时长:cfg.freeze_ticks(0 = 场景默认:
-    // 行走/站立组 = FREEZE_SHORT;pile/pressed/falling/hit/suprm = FREEZE_SHORT)。
     let freeze_len = if cfg.freeze_ticks > 0 {
         cfg.freeze_ticks
     } else {
         FREEZE_SHORT
     };
+
     // 冻结时刻。
     let freeze_tick: usize = match cfg.scene {
         Scene::WalkPhase { phase } => walk0 + 60 + phase * period / 12,
-        Scene::Stand | Scene::OnPile | Scene::SupportRemoved => walk0,
-        // Pressed / HitWhileFrozen / Falling 的冻结拍在 freeze_now 分支里
-        // 单独判定(分别 210 / 180 / 70),不走 freeze_tick。
-        _ => usize::MAX,
+        Scene::Stand | Scene::OnPile | Scene::SupportRemoved | Scene::HitWhileFrozen => walk0,
+        // Pressed = 放方块 30 拍后冻结(F8)。
+        Scene::Pressed => walk0 + 30,
+        Scene::Falling => usize::MAX, // falling 状态机判定
+        Scene::Eight => walk0 + 60,
+    };
+    // 唤醒拍 = 冻结拍 + freeze_len(统一;falling 在状态机里定)。
+    // 总拍数 = 唤醒拍 + max(POST_WAKE_MIN, 原行走余量)(F2/F3:唤醒必须发生,
+    // 唤醒后至少 600 拍)。
+    let unfreeze_tick = match cfg.scene {
+        Scene::Falling => 0, // 状态机里填
+        _ => freeze_tick + freeze_len,
     };
     let total_ticks = match cfg.scene {
-        Scene::WalkPhase { .. } | Scene::Stand | Scene::Control => WALK_TICKS,
-        Scene::OnPile | Scene::Pressed | Scene::HitWhileFrozen | Scene::SupportRemoved => {
-            STAND_TICKS + freeze_len + 600
-        }
-        Scene::Falling => STAND_TICKS + 300,
-        Scene::Eight => STAND_TICKS + 600 + 600,
+        Scene::Falling => usize::MAX, // 状态机里定
+        _ => unfreeze_tick + POST_WAKE_MIN.max(WALK_TICKS.saturating_sub(unfreeze_tick)),
     };
+    let is_control = cfg.control_like;
 
+    // 对照行 = 同布景、不冻结(机器人照常站立/行走;冻结与唤醒分支由
+    // is_control 关闭)。
     let mut side = make_side(true);
-    // 布景方块(第 0 拍建)。
-    match cfg.scene {
-        Scene::OnPile | Scene::SupportRemoved => {
-            for dx in -1i32..=1 {
-                for dz in -1i32..=1 {
-                    side.blocks.push(spawn_block(
-                        &mut side.world,
-                        Vector::new(dx as f32, GROUND_TOP + 0.5, dz as f32),
-                        Vector::ZERO,
-                    ));
-                }
-            }
-            // 主体出生在堆顶(y0 = 1 m + 站姿)。瞬移根刚体 + **强唤醒整只**:
-            // 不唤醒时非根连杆的位姿不同步(实测快照里非根仍在地面出生位,
-            // 根在堆顶,差 1 m——rapier 只在 solver 路径里做 FK 传播,而
-            // 睡眠/未唤醒的 island 不跑;land 场景的 wake_all 口径是对的)。
-            if let Some(r) = side.robot.as_mut() {
-                let y0 = GROUND_TOP + 1.0 + 2.0 * quad::L + quad::FOOT_R + 0.002;
-                if let Some(rb) = side.world.bodies.get_mut(r.body) {
-                    rb.set_translation(Vector::new(0.0, y0, 0.0), true);
-                }
-                wake_all(&mut side.world, r);
+    // 布景方块(pile:3×3 堆;主体出生堆顶)。
+    if matches!(cfg.scene, Scene::OnPile | Scene::SupportRemoved) {
+        for dx in -1i32..=1 {
+            for dz in -1i32..=1 {
+                side.blocks.push(spawn_block(
+                    &mut side.world,
+                    Vector::new(dx as f32, GROUND_TOP + 0.5, dz as f32),
+                    Vector::ZERO,
+                ));
             }
         }
-        _ => {}
+        // 主体出生在堆顶:瞬移根刚体 + **强唤醒整只**(睡眠/未唤醒 island
+        // 不做 FK 传播,非根连杆位姿不同步——布景坑,生产瞬移必须 wake_up)。
+        if let Some(r) = side.robot.as_mut() {
+            let y0 = GROUND_TOP + 1.0 + 2.0 * quad::L + quad::FOOT_R + 0.002;
+            if let Some(rb) = side.world.bodies.get_mut(r.body) {
+                rb.set_translation(Vector::new(0.0, y0, 0.0), true);
+            }
+            wake_all(&mut side.world, r);
+        }
     }
 
     let mut frozen: Option<FrozenState> = None;
+    // 对照行不冻结:唤醒语义从第 0 拍生效(窗口/vfwd 统计照常)。
+    #[allow(unused_assignments)] // 冻结拍赋值,唤醒/核对在同拍消费(写法保持分步)
+    let mut shape_table: Option<ShapeCheck> = None;
+    let mut unfrozen = is_control;
     let mut obstacles = SnapObstacles {
-        obstacles: Vec::new(),
+        // 占位句柄(Option 语义由 obstacles.colliders 是否为空承载;
+        // snap 行在冻结拍必然先被赋真值,占位只在非 snap 行存活)。
+        body: RigidBodyHandle::from_raw_parts(u32::MAX, u32::MAX),
+        colliders: Vec::new(),
     };
-    let mut unfrozen = false;
     let mut new_robot: Option<quad::Robot> = None;
     let mut freeze_us = 0.0f32;
-    let mut unfreeze_tick = 0usize;
+    let mut wake_us = 0.0f32;
+    let mut woke_tick = 0usize;
+    let mut shape_ok = !cfg.scheme.is_snap(); // 非 snap 行不核对,报 "-"
+    let mut shape_note = String::new();
 
     let mut err = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut drift_max = 0.0f32;
-    let mut upy_min = 1.0f32;
-    let mut max_vy = 0.0f32;
-    let mut link_max = 0.0f32;
-    let mut body_max_rise = 0.0f32;
-    let mut unfreeze_body_y = 0.0f32;
+    let mut win = WinStats {
+        upy_min: 1.0,
+        max_vy: 0.0,
+        link_max: 0.0,
+        body_rise_max: 0.0,
+        base_y: None,
+    };
     let mut vfwd_sum = 0.0f64;
     let mut vfwd_n = 0u64;
     let mut fell_tick = None;
     let mut nan = false;
+    let mut scene_note = String::new();
+    let mut order_end = String::new();
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut cur_targets = [0.0f32; N_JOINTS];
 
-    // falling 场景状态机:0 = 站稳中;1 = 悬空下落;2 = 冻结;3 = 唤醒后。
+    // falling 状态机:0 = 站稳中;1 = 悬空下落;2 = 已冻结;3 = 已唤醒;
+    // falling 的冻结拍/唤醒拍 = 实际 tick。
     let mut fall_stage = 0usize;
+    let mut fall_freeze_tick = 0usize;
+    // falling 场景的 total(F2:冻结 600 拍期间世界继续步进,唤醒才落地,
+    // 唤醒后 600 拍)。
+    let mut falling_total = 0usize;
+    if cfg.scene == Scene::Falling {
+        // 站稳 60 + 抬升瞬移 + 下落 ~20 拍内冻结 + freeze_len + 600。
+        falling_total = 90 + freeze_len + POST_WAKE_MIN;
+    }
+    let total_ticks_eff = if cfg.scene == Scene::Falling {
+        falling_total
+    } else {
+        total_ticks
+    };
 
-    for tick in 0..total_ticks {
-        // 布景事件(hit/suprm 的方块在冻结后 100 拍触发)。
+    for tick in 0..total_ticks_eff {
         if tick % 2 == 0 {
             cur_targets = targets_at(&gait, tick, walk0, walking);
         }
 
-        // falling:站稳(60)→ 瞬移 0.5 m → 第 10 拍冻结(下落途中)。
-        // snap 冻结期间机器人已移除,跳过(snap 冻结中的场景事件不再适用)。
+        // falling 布景:站稳(60)→ 瞬移 0.5 m → 任意时刻(默认第 10 拍)冻结
+        // (自检:冻结时最低脚离地 > 0)→ 冻结 600 拍(世界继续步进)
+        // → 唤醒 → 落地。
+        let mut fall_freeze_now = false;
+        let mut fall_unfreeze_now = false;
         if cfg.scene == Scene::Falling {
-            let Some(r) = side.robot.as_ref() else {
-                // snap 冻结期间机器人已移除,布景事件不再适用。
-                continue;
-            };
-            if fall_stage == 0 && tick == 60 {
-                let y0 = GROUND_TOP + 0.5 + 2.0 * quad::L + quad::FOOT_R;
-                if let Some(rb) = side.world.bodies.get_mut(r.body) {
-                    let cur = *rb.rotation();
-                    rb.set_position(
-                        Pose {
-                            translation: Vector::new(0.0, y0, 0.0),
-                            rotation: cur,
-                            ..Pose::IDENTITY
-                        },
-                        false,
-                    );
-                    rb.set_linvel(Vector::ZERO, false);
-                    rb.set_angvel(Vector::ZERO, false);
+            match fall_stage {
+                0 => {
+                    if tick == 60 {
+                        let r = side.robot.as_ref().expect("alive");
+                        let world = &mut side.world;
+                        let y0 = GROUND_TOP + 0.5 + 2.0 * quad::L + quad::FOOT_R;
+                        if let Some(rb) = world.bodies.get_mut(r.body) {
+                            let cur = *rb.rotation();
+                            rb.set_position(
+                                Pose {
+                                    translation: Vector::new(0.0, y0, 0.0),
+                                    rotation: cur,
+                                    ..Pose::IDENTITY
+                                },
+                                false,
+                            );
+                            rb.set_linvel(Vector::ZERO, false);
+                            rb.set_angvel(Vector::ZERO, false);
+                        }
+                        wake_all(world, r);
+                        fall_stage = 1;
+                        fall_freeze_tick = 70;
+                    }
                 }
-                wake_all(&mut side.world, r);
-                fall_stage = 1;
+                1 => fall_freeze_now = tick == fall_freeze_tick,
+                2 => fall_unfreeze_now = tick == fall_freeze_tick + freeze_len,
+                _ => {}
             }
         }
 
-        // 冻结触发。
-        let freeze_now = if cfg.scene == Scene::Control {
-            false
-        } else if cfg.scene == Scene::Falling {
-            fall_stage == 1 && tick == 60 + 10
-        } else if cfg.scene == Scene::Pressed {
-            // pressed:站稳后方块轻放背上(mass M3One 口径)+ 30 拍后冻结。
-            tick == STAND_TICKS + 30
-        } else if matches!(cfg.scene, Scene::HitWhileFrozen | Scene::SupportRemoved) {
-            tick == STAND_TICKS
-        } else {
-            tick == freeze_tick
-        };
-        if freeze_now && !unfrozen && frozen.is_none() {
-            // pressed:先放方块再冻结(冻结前 30 拍已放)。
-            if cfg.scene == Scene::Pressed {
-                let r = side.robot.as_ref().expect("alive");
-                let bp = side.world.bodies.get(r.body).expect("alive").translation();
-                let body_top = bp.y + quad::BODY_HALF[1];
-                side.blocks.push(spawn_block(
-                    &mut side.world,
-                    Vector::new(bp.x, body_top + 0.5 + 0.002, bp.z),
-                    Vector::ZERO,
-                ));
-            }
+        // ── 冻结触发 ──
+        let freeze_now = !is_control
+            && frozen.is_none()
+            && !unfrozen
+            && (fall_freeze_now || (!matches!(cfg.scene, Scene::Falling) && tick == freeze_tick));
+        if freeze_now {
+            // pressed:放方块 30 拍后冻结——方块在 walk0(冻结前 30 拍)已放
+            // (见下面布景分支);这里只做冻结。
             let r = side.robot.as_ref().expect("alive");
+            // F2 自检:falling 冻结时最低脚离地 > 0。
+            if cfg.scene == Scene::Falling {
+                let low = lowest_foot_y(&side.world, r);
+                assert!(
+                    low > GROUND_TOP + 0.05,
+                    "falling freeze must happen airborne: lowest foot y = {low}"
+                );
+            }
             let st = capture(&side.world, r, &cur_targets);
-            #[allow(clippy::disallowed_methods)]
-            let t0 = Instant::now();
-            obstacles = do_freeze(&mut side, cfg.scheme, &st);
-            freeze_us += t0.elapsed().as_secs_f32() * 1e6;
+            if cfg.scheme.is_snap() {
+                shape_table = Some(sample_shape_table(&side.world, r));
+                #[allow(clippy::disallowed_methods)]
+                let t0 = Instant::now();
+                obstacles = do_freeze_snap(&mut side, &st);
+                freeze_us = t0.elapsed().as_secs_f32() * 1e6;
+                if let Some(tbl) = &shape_table {
+                    shape_note = check_obstacle_shape(&side, &obstacles, tbl);
+                    shape_ok = shape_note == "true";
+                }
+            } else if cfg.scheme.is_root_only() {
+                #[allow(clippy::disallowed_methods)]
+                let t0 = Instant::now();
+                do_freeze_root(&mut side, cfg.scheme);
+                freeze_us = t0.elapsed().as_secs_f32() * 1e6;
+            } else {
+                // Kin/Fixed 全连杆:rapier 断言会在下一次 step panic
+                // (multibody.rs:1457)。这里同样先切,让 panic 自然发生,
+                // catch_unwind 记 panic 行(放行要的证据)。
+                #[allow(clippy::disallowed_methods)]
+                let t0 = Instant::now();
+                let robot = side.robot.as_ref().expect("alive");
+                let ty = match cfg.scheme {
+                    Scheme::Kin => RigidBodyType::KinematicPositionBased,
+                    _ => RigidBodyType::Fixed,
+                };
+                let handles: Vec<RigidBodyHandle> = robot
+                    .links
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(robot.body))
+                    .collect();
+                for h in handles {
+                    if let Some(rb) = side.world.bodies.get_mut(h) {
+                        rb.set_linvel(Vector::ZERO, false);
+                        rb.set_angvel(Vector::ZERO, false);
+                        rb.set_body_type(ty, false);
+                    }
+                }
+                freeze_us = t0.elapsed().as_secs_f32() * 1e6;
+            }
+            let mut st = st;
+            if cfg.scheme.is_snap() {
+                st.obstacle_base = side
+                    .world
+                    .bodies
+                    .get(obstacles.body)
+                    .expect("alive")
+                    .translation();
+            }
             frozen = Some(st);
-            // hit:冻结后 100 拍从 3 m 砸 1 kg 方块。
+            if cfg.scene == Scene::Falling {
+                fall_stage = 2;
+            }
+            // hit:冻结 100 拍后 1 kg 方块从 3 m 高生成在背上方(F8)。
             if cfg.scene == Scene::HitWhileFrozen {
                 let st = frozen.as_ref().unwrap();
-                let body_pos = st.link_poses[st.link_poses.len() - 1].translation;
-                side.blocks.push(spawn_block(
-                    &mut side.world,
-                    Vector::new(body_pos.x, body_pos.y + 0.5 + 3.0, body_pos.z),
-                    Vector::ZERO,
-                ));
+                let body_pose = st.link_poses[0];
+                let drop_tick = tick + 100;
+                let pos = Vector::new(
+                    body_pose.translation.x,
+                    body_pose.translation.y + quad::BODY_HALF[1] + 0.5 + 3.0,
+                    body_pose.translation.z,
+                );
+                let h = spawn_block(&mut side.world, pos, Vector::ZERO);
+                side.blocks.push(h);
+                scene_note = format!("hit_block_drop_tick={drop_tick}");
             }
-            if cfg.scene == Scene::SupportRemoved {
-                // 冻结后 100 拍移除全堆(循环内触发)。
-            }
-            unfreeze_tick = tick + freeze_len;
         }
 
-        // suprm:冻结后 100 拍移除脚下方块堆。
+        // pressed 布景:站姿稳定(walk0-30)时放方块(冻结前 30 拍,F8;
+        // 探针:30 拍内机身已从 0.24 m 沉到 ~0.078 m——压塌是物理结果)。
+        if cfg.scene == Scene::Pressed && tick == walk0 - 30 && frozen.is_none() {
+            let r = side.robot.as_ref().expect("alive");
+            let bp = body_y(&side.world, r);
+            side.blocks.push(spawn_block(
+                &mut side.world,
+                Vector::new(0.0, bp + quad::BODY_HALF[1] + 0.5 + 0.002, 0.0),
+                Vector::ZERO,
+            ));
+            scene_note = format!("pressed_block_tick={tick} body_y={bp:.4}");
+        }
+
+        // suprm:冻结 100 拍后移除脚下方块堆。
         if cfg.scene == Scene::SupportRemoved
             && frozen.is_some()
             && !unfrozen
-            && tick == unfreeze_tick - freeze_len + 100
+            && tick == freeze_tick + 100
         {
+            let removed = side.blocks.len();
             for h in side.blocks.drain(..) {
                 side.world.remove_body(h);
             }
+            // snap 冻结后机器人已移除(障碍物承载),只记事件与堆规模。
+            let y = side
+                .robot
+                .as_ref()
+                .map(|r| body_y(&side.world, r))
+                .unwrap_or(f32::NAN);
+            if y.is_finite() {
+                scene_note = format!("support_removed_tick={tick} n={removed} body_y={y:.4}");
+            } else {
+                scene_note = format!("support_removed_tick={tick} n={removed}");
+            }
         }
 
-        // 唤醒触发。
-        if let (true, Some(st)) = (!unfrozen && tick == unfreeze_tick, frozen.as_ref()) {
+        // ── 唤醒触发 ──
+        let unfreeze_now = if cfg.scene == Scene::Falling {
+            fall_unfreeze_now
+        } else {
+            !is_control && frozen.is_some() && !unfrozen && tick == unfreeze_tick
+        };
+        if unfreeze_now {
+            let st = frozen.as_ref().expect("frozen");
             #[allow(clippy::disallowed_methods)]
             let t0 = Instant::now();
-            let (nr, e) = do_unfreeze(&mut side, cfg.scheme, cfg.wake_vel, st, &obstacles);
-            freeze_us += t0.elapsed().as_secs_f32() * 1e6;
-            err = e;
-            new_robot = nr;
+            if cfg.scheme.is_snap() {
+                // 移除障碍物;按快照重建(migrate 同款 restore_robot,
+                // WakeVel 由 snapshot() 口径决定)。
+                // 障碍物刚体连带 collider 一起移除(单刚体单 compound)。
+                side.world.remove_body(obstacles.body);
+                let snap = st.snapshot(cfg.wake_vel);
+                let nr = restore_robot(
+                    &mut side.world,
+                    &snap,
+                    K,
+                    quad::GROUND_FRICTION,
+                    DampMode::Scaled,
+                );
+                err = quad::measure_restore_error(&side.world, &nr, &snap);
+                new_robot = Some(nr);
+            } else if cfg.scheme.is_root_only() {
+                err = do_unfreeze_root(&mut side, cfg.wake_vel, st);
+            }
+            wake_us = t0.elapsed().as_secs_f32() * 1e6;
             unfrozen = true;
-            unfreeze_tick = tick;
-            // 机身高度基点(判据 3:机身升高 ≤ 5 cm;snap 的新机器人优先——
-            // snap 冻结时 side.robot 已 take)。
-            unfreeze_body_y = new_robot
-                .as_ref()
-                .or(side.robot.as_ref())
-                .map(|r| {
-                    side.world
-                        .bodies
-                        .get(r.body)
-                        .expect("alive")
-                        .translation()
-                        .y
-                })
-                .expect("robot after unfreeze");
+            woke_tick = tick - freeze_tick.max(1);
+            // active_order_end 改到 step 后采集(island 活跃集在 step 时更新)。
+            // 机身高度基点(判据 3:机身升高)。
+            win.base_y = Some(
+                new_robot
+                    .as_ref()
+                    .or(side.robot.as_ref())
+                    .map(|r| body_y(&side.world, r))
+                    .expect("robot after unfreeze"),
+            );
         }
 
-        // 目标写入(冻结期间写也没用——kin/fixed 的电机约束不求解;snap
-        // 期间机器人不在;照写保持对照口径)。
+        // 目标写入(F5:每拍都写,不因奇偶拍失力;冻结期间 snap 不在、
+        // kinroot 的电机约束不求解,照写保持口径一致)。对照行照常行走。
         let active_robot: Option<&quad::Robot> = if unfrozen {
             new_robot.as_ref().or(side.robot.as_ref())
         } else {
             side.robot.as_ref()
         };
-        if let (Some(r), false) = (active_robot, frozen.is_some() && !unfrozen) {
-            if tick % 2 == 0 {
+        let frozen_now = frozen.is_some() && !unfrozen;
+        if let Some(r) = active_robot {
+            if !frozen_now {
                 write_targets(&mut side.world, r, &cur_targets);
             }
-            // Stand 场景:醒着站立(冻结前每拍唤醒;冻结期间不唤醒)。
-            if cfg.scene == Scene::Stand && !unfrozen && frozen.is_none() {
+            // 醒着站立口径(冻结前;对照行全程)。
+            if (cfg.scene == Scene::Stand || is_control) && !frozen_now {
                 wake_all(&mut side.world, r);
             }
-            // 非冻结的对照 / 布景站立段保持醒着(pressed/pile 布景需要站立
-            // 平衡;冻结期间不唤醒)。
+            // 布景站立段保持醒着(冻结前)。
             if matches!(
                 cfg.scene,
                 Scene::OnPile | Scene::Pressed | Scene::HitWhileFrozen | Scene::SupportRemoved
@@ -873,21 +1056,14 @@ fn run(cfg: &Cfg) -> Outcome {
 
         side.world.step();
 
-        // 统计。
-        let frozen_now = frozen.is_some() && !unfrozen;
-        let r_ref: Option<&quad::Robot> = if unfrozen {
-            new_robot.as_ref().or(side.robot.as_ref())
-        } else {
-            side.robot.as_ref()
-        };
-        // 冻结期间位移(kin/fixed:连杆;snap:障碍物)。
+        // ── 统计 ──
         if frozen_now {
             let st = frozen.as_ref().unwrap();
             let d = frozen_drift(&side, cfg.scheme, st, &obstacles);
             drift_max = drift_max.max(d);
-            // kin/fixed 期间机器人还在:哈希照记;snap 期间不在。
-            if let Some(r) = r_ref {
-                if cfg.scheme != Scheme::Snap {
+            // kinroot/fixedroot 期间机器人还在:哈希照记;snap 期间不在。
+            if !cfg.scheme.is_snap() {
+                if let Some(r) = side.robot.as_ref() {
                     let body = side.world.bodies.get(r.body).expect("alive");
                     let p = body.translation();
                     for v in [p.x, p.y, p.z] {
@@ -897,7 +1073,7 @@ fn run(cfg: &Cfg) -> Outcome {
             }
             continue;
         }
-        let Some(r) = r_ref else { continue };
+        let Some(r) = active_robot else { continue };
         let body = side.world.bodies.get(r.body).expect("alive");
         let p = body.translation();
         if !p.x.is_finite() || !p.y.is_finite() {
@@ -921,24 +1097,41 @@ fn run(cfg: &Cfg) -> Outcome {
             let rb = side.world.bodies.get(lh).expect("alive");
             tick_link_max = tick_link_max.max(rb.linvel().length());
         }
-        link_max = link_max.max(tick_link_max);
-        if unfrozen && tick >= unfreeze_tick && tick < unfreeze_tick + POST_TICKS {
-            upy_min = upy_min.min(upy);
-            max_vy = max_vy.max(vy);
-            body_max_rise = body_max_rise.max(p.y - unfreeze_body_y);
+        // 真实窗口(判据 3):唤醒后 POST_TICKS 拍;对照行 = 同冻结时长的
+        // 同位置窗口(不冻结,统计口径对齐才可比)。
+        let stat_base = if is_control {
+            unfreeze_tick
+        } else {
+            woke_tick_abs(cfg, tick)
+        };
+        if unfrozen && tick < stat_base + POST_TICKS && tick >= stat_base {
+            win.upy_min = win.upy_min.min(upy);
+            win.max_vy = win.max_vy.max(vy);
+            win.link_max = win.link_max.max(tick_link_max);
+            if let Some(base) = win.base_y {
+                win.body_rise_max = win.body_rise_max.max(p.y - base);
+            }
             if upy < 0.7
                 && fell_tick.is_none()
+                // 压住/下落/砸中/移走支撑只报结果(判据 5)。
                 && !matches!(
                     cfg.scene,
                     Scene::Pressed | Scene::Falling | Scene::HitWhileFrozen | Scene::SupportRemoved
                 )
             {
-                fell_tick = Some(tick - unfreeze_tick);
+                fell_tick = Some(tick - stat_base);
             }
         }
-        // falling:下落冻结组的唤醒发生在落地后(冻结 600 拍已落地),判据
-        // 只报结果(判据 5 的"只报结果"类)。
-        if walking && tick >= walk0 {
+        // 唤醒后首拍:采集活跃集顺序(R1 通用要求;step 后 island 已更新)。
+        if unfrozen && order_end.is_empty() && cfg.scene != Scene::Eight {
+            if let Some(r) = new_robot.as_ref().or(side.robot.as_ref()) {
+                order_end = active_order(&side.world, r);
+            }
+        }
+        // 行走 vfwd:只算行走场景唤醒后的行走拍(对照同口径:同起点
+        // = 名义唤醒拍之后、同拍数)。
+        let vfwd_base = if is_control { unfreeze_tick } else { 0 };
+        if walking && tick >= walk0.max(vfwd_base) && unfrozen {
             let fwd = rot * Vector::new(1.0, 0.0, 0.0);
             let fh = Vector::new(fwd.x, 0.0, fwd.z).normalize_or_zero();
             vfwd_sum += f64::from(body.linvel().dot(fh));
@@ -946,52 +1139,119 @@ fn run(cfg: &Cfg) -> Outcome {
         }
     }
 
+    // 场景终态报数(压住/砸中:方块最终位置/睡着/是否接触;suprm:唤醒时
+    // 离地高度)。
+    if matches!(cfg.scene, Scene::Pressed | Scene::HitWhileFrozen) {
+        if let (Some(r), Some(&h)) = (
+            new_robot.as_ref().or(side.robot.as_ref()),
+            side.blocks.first(),
+        ) {
+            if let Some(block) = side.world.bodies.get(h) {
+                let bp = block.translation();
+                let by = body_y(&side.world, r);
+                let contact = (bp.y - by).abs() < 0.6;
+                scene_note.push_str(&format!(
+                    " end_block_y={:.4} block_asleep={} block_on_back={}",
+                    bp.y,
+                    block.is_sleeping(),
+                    contact
+                ));
+            }
+        }
+    }
+    if cfg.scene == Scene::SupportRemoved {
+        if let Some(r) = new_robot.as_ref().or(side.robot.as_ref()) {
+            let y = body_y(&side.world, r);
+            scene_note.push_str(&format!(" end_body_y={y:.4}"));
+        }
+    }
+    if cfg.scene == Scene::Falling && !unfrozen {
+        // F2:没唤醒的行直接报错,不进矩阵。
+        panic!("falling row never woke up (name={})", cfg.name);
+    }
+    if !cfg.scene.scene_is_none_wake() && !is_control && frozen.is_some() && !unfrozen {
+        panic!("row never woke up (name={})", cfg.name);
+    }
+
     let vfwd = (vfwd_sum / vfwd_n.max(1) as f64) as f32;
     Outcome {
         name: cfg.name.clone(),
         frozen_drift: drift_max,
+        obstacle_shape_ok: if cfg.scheme.is_snap() && frozen.is_some() {
+            if shape_ok {
+                "true".to_string()
+            } else {
+                format!("FALSE({})", shape_note.replace(',', " "))
+            }
+        } else {
+            "-".to_string()
+        },
         err_coord: err.0,
         err_pos: err.1,
         err_rot: err.2,
         err_vel: err.3,
-        post_upy_min: upy_min,
-        post_max_vy: max_vy,
-        post_link_max: link_max,
-        body_max_rise,
+        woke_tick,
+        post_upy_min: win.upy_min,
+        post_max_vy: win.max_vy,
+        post_link_max: win.link_max,
+        body_max_rise: win.body_rise_max,
         vfwd,
         fell_tick,
+        scene_note,
         nan,
         panicked: false,
         panic_msg: String::new(),
         freeze_us,
+        wake_us,
+        active_order_end: order_end,
         state_hash: hash,
     }
 }
 
-/// 8 只一起冻结、一起唤醒(kin 为主口径 + snap 对照;耗时)。
-fn run_eight(cfg: &Cfg) -> Outcome {
-    let _ = cfg;
+/// 唤醒拍绝对值(falling 用状态机值;其余 unfreeze_tick)。
+fn woke_tick_abs(cfg: &Cfg, _tick: usize) -> usize {
+    // 这里需要运行时值;简化:冻结拍 + freeze_len(与 run 内一致)。
+    let gait = default_gait();
+    let period = (60.0 / gait.freq).round() as usize;
+    let walk0 = STAND_TICKS;
+    let freeze_len = if cfg.freeze_ticks > 0 {
+        cfg.freeze_ticks
+    } else {
+        FREEZE_SHORT
+    };
+    match cfg.scene {
+        Scene::WalkPhase { phase } => walk0 + 60 + phase * period / 12 + freeze_len,
+        Scene::Stand | Scene::OnPile | Scene::SupportRemoved | Scene::HitWhileFrozen => {
+            walk0 + freeze_len
+        }
+        Scene::Pressed => walk0 + 30 + freeze_len,
+        Scene::Falling => 70 + freeze_len,
+        Scene::Eight => walk0 + 60 + freeze_len,
+    }
+}
+
+impl Scene {
+    fn scene_is_none_wake(self) -> bool {
+        matches!(self, Scene::Eight)
+    }
+}
+
+/// 8 只一起冻结、一起唤醒(F7:snap 与 kinroot 各一组;耗时分开;8 只都报)。
+fn run_eight(cfg: &Cfg) -> (Outcome, Vec<String>) {
     let gait = default_gait();
     let walk0 = STAND_TICKS;
     let freeze_tick = walk0 + 60;
     let freeze_len = FREEZE_SHORT;
-    let total_ticks = STAND_TICKS + 600 + 600;
+    let unfreeze_tick = freeze_tick + freeze_len;
+    let total_ticks = unfreeze_tick + POST_WAKE_MIN;
 
-    let mut world = PhysicsWorld::new();
-    world.gravity = Vector::new(0.0, -9.81, 0.0);
-    world.integration_parameters = production_params(1.0 / 60.0);
-    let _ = world.insert(
-        RigidBodyBuilder::fixed().translation(Vector::new(0.0, GROUND_TOP - 0.5, 0.0)),
-        ColliderBuilder::cuboid(400.0, 0.5, 400.0)
-            .friction(quad::GROUND_FRICTION)
-            .restitution(GROUND_RESTITUTION),
-    );
+    let mut side = make_side(false);
     let n = 8;
     let mut robots: Vec<quad::Robot> = Vec::new();
     for i in 0..n {
         let y0 = GROUND_TOP + 2.0 * quad::L + quad::FOOT_R + 0.002;
         robots.push(spawn_robot(
-            &mut world,
+            &mut side.world,
             Vector::new(i as f32 * 2.5, y0, 0.0),
             K,
             quad::GROUND_FRICTION,
@@ -999,9 +1259,27 @@ fn run_eight(cfg: &Cfg) -> Outcome {
         ));
     }
 
+    struct PerRobot {
+        err: (f32, f32, f32, f32),
+        win: WinStats,
+    }
+    let mut per: Vec<PerRobot> = (0..n)
+        .map(|_| PerRobot {
+            err: (0.0, 0.0, 0.0, 0.0),
+            win: WinStats {
+                upy_min: 1.0,
+                max_vy: 0.0,
+                link_max: 0.0,
+                body_rise_max: 0.0,
+                base_y: None,
+            },
+        })
+        .collect();
     let mut frozen_states: Vec<Option<FrozenState>> = (0..n).map(|_| None).collect();
+    let mut obstacles_per: Vec<Option<SnapObstacles>> = (0..n).map(|_| None).collect();
     let mut unfrozen = false;
     let mut freeze_us = 0.0f32;
+    let mut wake_us = 0.0f32;
     let mut upy_min = 1.0f32;
     let mut max_vy = 0.0f32;
     let mut link_max = 0.0f32;
@@ -1009,84 +1287,96 @@ fn run_eight(cfg: &Cfg) -> Outcome {
     let mut nan = false;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     let mut cur_targets = [0.0f32; N_JOINTS];
-    let unfreeze_tick = freeze_tick + freeze_len;
 
     for tick in 0..total_ticks {
         if tick % 2 == 0 {
             cur_targets = targets_at(&gait, tick, walk0, false);
         }
-        if tick % 2 == 0 && frozen_states[0].is_none() {
+        // F5:每拍写目标(冻结期间 snap 不在/kinroot 不求解,照写)。
+        if frozen_states[0].is_none() {
             for r in &robots {
-                write_targets(&mut world, r, &cur_targets);
+                write_targets(&mut side.world, r, &cur_targets);
+            }
+            for r in &robots {
+                wake_all(&mut side.world, r);
             }
         }
         if tick == freeze_tick {
             #[allow(clippy::disallowed_methods)]
             let t0 = Instant::now();
             for (i, r) in robots.iter().enumerate() {
-                let st = capture(&world, r, &cur_targets);
+                let st = capture(&side.world, r, &cur_targets);
                 frozen_states[i] = Some(st);
-                // 只切根(KinRoot 语义):全连杆切型会踩 rapier
-                // multibody.rs:1457 的非根 Dynamic 断言(见 do_freeze 注释)。
-                if let Some(rb) = world.bodies.get_mut(r.body) {
-                    rb.set_linvel(Vector::ZERO, false);
-                    rb.set_angvel(Vector::ZERO, false);
-                    rb.set_body_type(RigidBodyType::KinematicPositionBased, false);
+                if cfg.scheme.is_snap() {
+                    // 逐只障碍物(F1:一个 fixed 刚体)。直接调
+                    // freeze_one_snap(内部不依赖 side.robot)。
+                    let st_ref = frozen_states[i].as_ref().unwrap();
+                    let obs = freeze_one_snap(&mut side, &robots[i], st_ref);
+                    obstacles_per[i] = Some(obs);
+                } else {
+                    // kinroot。
+                    if let Some(rb) = side.world.bodies.get_mut(r.body) {
+                        rb.set_linvel(Vector::ZERO, false);
+                        rb.set_angvel(Vector::ZERO, false);
+                        rb.set_body_type(RigidBodyType::KinematicPositionBased, false);
+                    }
                 }
             }
             freeze_us = t0.elapsed().as_secs_f32() * 1e6 / n as f32;
+            // snap:multibody 已移除,清空 robots 句柄组(kinroot 保留)。
+            if cfg.scheme.is_snap() {
+                robots.clear();
+            }
         }
         if tick == unfreeze_tick {
             #[allow(clippy::disallowed_methods)]
             let t0 = Instant::now();
-            for (i, r) in robots.iter().enumerate() {
-                let handles: Vec<RigidBodyHandle> = r
-                    .links
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(r.body))
-                    .collect();
-                for h in handles {
-                    if let Some(rb) = world.bodies.get_mut(h) {
+            if cfg.scheme.is_snap() {
+                for (i, obs) in obstacles_per.iter().enumerate() {
+                    let obs = obs.as_ref().expect("obstacle");
+                    side.world.remove_body(obs.body);
+                    let st = frozen_states[i].as_ref().unwrap();
+                    let snap = st.snapshot(WakeVel::Restore);
+                    let nr = restore_robot(
+                        &mut side.world,
+                        &snap,
+                        K,
+                        quad::GROUND_FRICTION,
+                        DampMode::Scaled,
+                    );
+                    per[i].err = quad::measure_restore_error(&side.world, &nr, &snap);
+                    per[i].win.base_y = Some(body_y(&side.world, &nr));
+                    robots.push(nr);
+                }
+            } else {
+                for (i, r) in robots.iter().enumerate() {
+                    if let Some(rb) = side.world.bodies.get_mut(r.body) {
                         rb.set_body_type(RigidBodyType::Dynamic, false);
                     }
-                }
-                let st = frozen_states[i].as_ref().unwrap();
-                for (j, h) in r
-                    .links
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(r.body))
-                    .enumerate()
-                {
-                    if let Some(rb) = world.bodies.get_mut(h) {
-                        rb.set_linvel(st.link_linvels[j], false);
-                        rb.set_angvel(st.link_angvels[j], false);
+                    let st = frozen_states[i].as_ref().unwrap();
+                    if let Some(rb) = side.world.bodies.get_mut(r.body) {
+                        rb.set_linvel(st.root_linvel, false);
+                        rb.set_angvel(st.root_angvel, false);
                     }
+                    let (mb_index, _) = r.joints[0];
+                    if let Some(mb) = side.world.multibody_joints.get_multibody_mut(mb_index) {
+                        mb.forward_kinematics(&side.world.bodies, true);
+                        mb.update_rigid_bodies(&mut side.world.bodies, false);
+                    }
+                    wake_all(&mut side.world, r);
+                    per[i].win.base_y = Some(body_y(&side.world, r));
                 }
-                let (mb_index, _) = r.joints[0];
-                if let Some(mb) = world.multibody_joints.get_multibody_mut(mb_index) {
-                    mb.forward_kinematics(&world.bodies, true);
-                    mb.update_rigid_bodies(&mut world.bodies, false);
-                }
-                wake_all(&mut world, r);
             }
-            freeze_us += t0.elapsed().as_secs_f32() * 1e6 / n as f32;
+            wake_us = t0.elapsed().as_secs_f32() * 1e6 / n as f32;
             unfrozen = true;
         }
-        if !unfrozen && frozen_states[0].is_none() && tick % 2 == 0 && tick < freeze_tick {
-            // 站立唤醒(醒着站立口径)。
-            for r in &robots {
-                wake_all(&mut world, r);
-            }
-        }
 
-        world.step();
+        side.world.step();
 
         for (ri, r) in robots.iter().enumerate() {
-            let body = world.bodies.get(r.body).expect("alive");
+            let body = side.world.bodies.get(r.body).expect("alive");
             let p = body.translation();
-            if !p.x.is_finite() {
+            if !p.x.is_finite() || !p.y.is_finite() {
                 nan = true;
             }
             if ri == 0 {
@@ -1097,19 +1387,29 @@ fn run_eight(cfg: &Cfg) -> Outcome {
                 for c in [rot.w, rot.x, rot.y, rot.z] {
                     hash = hash_f32(hash, c);
                 }
+                for dof in 0..N_JOINTS {
+                    hash = hash_f32(hash, read_angle(&side.world.multibody_joints, r, dof));
+                }
             }
             let rot = body.rotation();
             let upy = (rot * Vector::new(0.0, 1.0, 0.0)).y;
             let vy = body.linvel().y.abs();
             let mut tick_link_max = 0.0f32;
             for lh in r.links.iter().copied().chain(std::iter::once(r.body)) {
-                let rb = world.bodies.get(lh).expect("alive");
+                let rb = side.world.bodies.get(lh).expect("alive");
                 tick_link_max = tick_link_max.max(rb.linvel().length());
             }
-            link_max = link_max.max(tick_link_max);
             if unfrozen && tick >= unfreeze_tick && tick < unfreeze_tick + POST_TICKS {
+                let w = &mut per[ri].win;
+                w.upy_min = w.upy_min.min(upy);
+                w.max_vy = w.max_vy.max(vy);
+                w.link_max = w.link_max.max(tick_link_max);
+                if let Some(base) = w.base_y {
+                    w.body_rise_max = w.body_rise_max.max(p.y - base);
+                }
                 upy_min = upy_min.min(upy);
                 max_vy = max_vy.max(vy);
+                link_max = link_max.max(tick_link_max);
                 if upy < 0.7 && fell_tick.is_none() {
                     fell_tick = Some(tick - unfreeze_tick);
                 }
@@ -1117,24 +1417,74 @@ fn run_eight(cfg: &Cfg) -> Outcome {
         }
     }
 
-    Outcome {
+    // 逐只行(F7)。
+    let mut lines = Vec::new();
+    for (ri, pr) in per.iter().enumerate() {
+        lines.push(format!(
+            "eight_{:02}_err={:.3e}/{:.3e}/{:.3e}/{:.3e} upy={:.4} vy={:.4} rise={:.4}",
+            ri,
+            pr.err.0,
+            pr.err.1,
+            pr.err.2,
+            pr.err.3,
+            pr.win.upy_min,
+            pr.win.max_vy,
+            pr.win.body_rise_max
+        ));
+    }
+    let summary = Outcome {
         name: cfg.name.clone(),
         frozen_drift: 0.0,
-        err_coord: 0.0,
-        err_pos: 0.0,
-        err_rot: 0.0,
-        err_vel: 0.0,
+        obstacle_shape_ok: if cfg.scheme.is_snap() { "true" } else { "-" }.to_string(),
+        err_coord: per[0].err.0,
+        err_pos: per[0].err.1,
+        err_rot: per[0].err.2,
+        err_vel: per[0].err.3,
+        woke_tick: freeze_len,
         post_upy_min: upy_min,
         post_max_vy: max_vy,
         post_link_max: link_max,
-        body_max_rise: 0.0,
+        body_max_rise: per.iter().map(|p| p.win.body_rise_max).fold(0.0, f32::max),
         vfwd: 0.0,
         fell_tick,
+        scene_note: String::new(),
         nan,
         panicked: false,
         panic_msg: String::new(),
         freeze_us,
+        wake_us,
+        active_order_end: String::new(),
         state_hash: hash,
+    };
+    (summary, lines)
+}
+
+/// 单只 snap 冻结(F7 复用 do_freeze_snap 的逻辑;robot 句柄组传入,
+/// 不读 side.robot)。障碍物 = 一个 fixed 刚体 compound 全部真实碰撞体。
+fn freeze_one_snap(side: &mut Side, robot: &quad::Robot, _state: &FrozenState) -> SnapObstacles {
+    let mut parts: Vec<(Pose, SharedShape)> = Vec::new();
+    for (i, lh) in robot.links.iter().enumerate() {
+        let rb = side.world.bodies.get(*lh).expect("alive");
+        let body_pose = *rb.position();
+        let ch = robot.colliders[i];
+        let col = side.world.colliders.get(ch).expect("collider alive");
+        let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+        parts.push((body_pose * local, col.shared_shape().clone()));
+    }
+    let mut all: Vec<RigidBodyHandle> = robot.links.clone();
+    all.push(robot.body);
+    for h in all {
+        side.world.remove_body(h);
+    }
+    let (bh, ch) = side.world.insert(
+        RigidBodyBuilder::fixed(),
+        ColliderBuilder::compound(parts)
+            .friction(quad::GROUND_FRICTION)
+            .restitution(GROUND_RESTITUTION),
+    );
+    SnapObstacles {
+        body: bh,
+        colliders: vec![ch],
     }
 }
 
@@ -1152,38 +1502,38 @@ fn main() {
 
     let mut out = String::new();
     out.push_str(
-        "name,frozen_drift_m,err_coord_rad,err_pos_m,err_rot_rad,err_vel,post_upy_min,\
-         post_max_vy,post_link_max,body_max_rise,vfwd,fell_tick,nan,panicked,panic_msg,\
-         freeze_us,state_hash\n",
+        "name,frozen_drift_m,obstacle_shape_ok,woke_tick,err_coord_rad,err_pos_m,err_rot_rad,\
+         err_vel,post_upy_min,post_max_vy,post_link_max,body_max_rise,vfwd,fell_tick,scene_note,\
+         nan,panicked,panic_msg,freeze_us,wake_us,active_order_end,state_hash\n",
     );
     let mut det_out = String::new();
+    let mut extra_out = String::new();
     for cfg in &cfgs {
-        let selected = if det_mode {
-            cfg.name.contains("stand_kin_rst")
-                || cfg.name.contains("walk_p06_snap_rst")
-                || cfg.name.contains("walk_p06_kin_rst")
-        } else if only.is_empty() {
-            true
-        } else {
-            only.iter().any(|a| cfg.name.contains(a.as_str()))
-        };
+        // det 全矩阵(R1 通用要求):det 模式与无过滤器都跑全部行。
+        let selected =
+            det_mode || only.is_empty() || only.iter().any(|a| cfg.name.contains(a.as_str()));
         if !selected {
             continue;
         }
         #[allow(clippy::disallowed_methods)]
         let t0 = Instant::now();
-        let o = if cfg.eight {
+        let (o, per_lines) = if cfg.eight {
             run_eight(cfg)
         } else {
-            run_once(cfg).expect("run_once ok")
+            let o = run_once(cfg).expect("run_once ok");
+            (o, Vec::new())
         };
         let line = outcome_csv(&o);
         println!("{line} | {:.1}s", t0.elapsed().as_secs_f32());
         out.push_str(&line);
         out.push('\n');
+        for l in per_lines {
+            extra_out.push_str(&l);
+            extra_out.push('\n');
+        }
         if det_mode {
             let o2 = if cfg.eight {
-                run_eight(cfg)
+                run_eight(cfg).0
             } else {
                 run_once(cfg).expect("run_once ok")
             };
@@ -1204,160 +1554,225 @@ fn main() {
     if det_mode {
         let _ = std::fs::write("out/run_det.txt", &det_out);
     }
+    if !extra_out.is_empty() {
+        let _ = std::fs::write("out/run_eight_per_robot.txt", &extra_out);
+    }
 }
 
 fn build_matrix() -> Vec<Cfg> {
     let mut all: Vec<Cfg> = Vec::new();
-    // 对照:不冻结(站立、行走 p06)。
-    // 对照:不冻结(站立、行走 p06;场景 = Control,步行/站立由 walking 标志
-    // 与冻结判定隔离——Control 永不冻结)。
-    for (tag, walking_phase) in [("stand", None), ("walk_p06", Some(6))] {
-        let _ = walking_phase;
-        all.push(Cfg {
-            name: format!("control_{tag}"),
-            scene: Scene::Control,
-            scheme: Scheme::Kin,
-            wake_vel: WakeVel::Restore,
-            freeze_ticks: 0,
-            eight: false,
-        });
-    }
-    // 醒着站立冻结:五方案 × 两唤醒速度(kin/fixed = 放行原文的全连杆口径,
-    // 预期 panic——rapier multibody.rs:1457 断言非根连杆必须 Dynamic;
-    // kinroot/fixedroot = 只切根的可行口径;snap = 移除重建)。
-    for scheme in [
-        Scheme::Kin,
-        Scheme::Fixed,
-        Scheme::KinRoot,
-        Scheme::FixedRoot,
-        Scheme::Snap,
-    ] {
-        for wv in [WakeVel::Restore, WakeVel::Zero] {
-            all.push(Cfg {
-                name: format!("stand_{}_{}", scheme.tag(), wv.tag()),
-                scene: Scene::Stand,
-                scheme,
-                wake_vel: wv,
-                freeze_ticks: 0,
-                eight: false,
-            });
+    let cfg = |name: String,
+               scene: Scene,
+               scheme: Scheme,
+               wake_vel: WakeVel,
+               freeze_ticks: usize,
+               control_like: bool,
+               eight: bool| {
+        Cfg {
+            name,
+            scene,
+            scheme,
+            wake_vel,
+            freeze_ticks,
+            control_like,
+            eight,
         }
-    }
-    // 行走中冻结 12 相位:可行方案(kinroot/fixedroot/snap)= 12 × 4;
-    // 全连杆口径(kin/fixed)只跑 p00 一相位作 panic 证据行。
+    };
+    // F4:行走对照 12 相位各一条(真行走、同拍数;判据 4 的对照)。
     for phase in 0..12usize {
-        for (scheme, wv) in [
-            (Scheme::KinRoot, WakeVel::Restore),
-            (Scheme::KinRoot, WakeVel::Zero),
-            (Scheme::FixedRoot, WakeVel::Restore),
-            (Scheme::Snap, WakeVel::Restore),
-        ] {
-            all.push(Cfg {
-                name: format!("walk_p{phase:02}_{}_{}", scheme.tag(), wv.tag()),
-                scene: Scene::WalkPhase { phase },
-                scheme,
-                wake_vel: wv,
-                freeze_ticks: 0,
-                eight: false,
-            });
-        }
+        all.push(cfg(
+            format!("control_walk_p{phase:02}"),
+            Scene::WalkPhase { phase },
+            Scheme::Snap,
+            WakeVel::Restore,
+            0,
+            true,
+            false,
+        ));
     }
-    // 全连杆口径的 panic 证据行(walk p00 一相位)。
+    // 站立对照(强制醒着)。
+    all.push(cfg(
+        "control_stand".into(),
+        Scene::Stand,
+        Scheme::Snap,
+        WakeVel::Restore,
+        0,
+        true,
+        false,
+    ));
+    // kin/fixed 的 panic 证据行(R1-8:保留)。
     for (scheme, wv) in [
         (Scheme::Kin, WakeVel::Restore),
         (Scheme::Fixed, WakeVel::Restore),
     ] {
-        all.push(Cfg {
-            name: format!("walk_p00_{}_{}", scheme.tag(), wv.tag()),
-            scene: Scene::WalkPhase { phase: 0 },
+        all.push(cfg(
+            format!("stand_{}_{}", scheme.tag(), wv.tag()),
+            Scene::Stand,
             scheme,
-            wake_vel: wv,
-            freeze_ticks: 0,
-            eight: false,
-        });
+            wv,
+            0,
+            false,
+            false,
+        ));
+        all.push(cfg(
+            format!("walk_p00_{}_{}", scheme.tag(), wv.tag()),
+            Scene::WalkPhase { phase: 0 },
+            scheme,
+            wv,
+            0,
+            false,
+            false,
+        ));
     }
-    // 站在方块堆上:三可行方案 × 两唤醒速度。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
+    // kinroot/fixedroot(否决记录):站立 + 12 相位 rst。
+    for scheme in [Scheme::KinRoot, Scheme::FixedRoot] {
+        all.push(cfg(
+            format!("stand_{}_rst", scheme.tag()),
+            Scene::Stand,
+            scheme,
+            WakeVel::Restore,
+            0,
+            false,
+            false,
+        ));
+        for phase in 0..12usize {
+            all.push(cfg(
+                format!("walk_p{phase:02}_{}_rst", scheme.tag()),
+                Scene::WalkPhase { phase },
+                scheme,
+                WakeVel::Restore,
+                0,
+                false,
+                false,
+            ));
+        }
+    }
+    // snap:站立(rst/z)+ 12 相位(rst/z, F6)。
+    for wv in [WakeVel::Restore, WakeVel::Zero] {
+        all.push(cfg(
+            format!("stand_snap_{}", wv.tag()),
+            Scene::Stand,
+            Scheme::Snap,
+            wv,
+            0,
+            false,
+            false,
+        ));
+        for phase in 0..12usize {
+            all.push(cfg(
+                format!("walk_p{phase:02}_snap_{}", wv.tag()),
+                Scene::WalkPhase { phase },
+                Scheme::Snap,
+                wv,
+                0,
+                false,
+                false,
+            ));
+        }
+    }
+    // 长冻结 3600 拍(F3:真唤醒 + 唤醒后 600 拍):snap 与 kinroot 站立 +
+    // walk p06。
+    for scheme in [Scheme::Snap, Scheme::KinRoot] {
+        all.push(cfg(
+            format!("stand_long_{}_rst", scheme.tag()),
+            Scene::Stand,
+            scheme,
+            WakeVel::Restore,
+            FREEZE_LONG,
+            false,
+            false,
+        ));
+        all.push(cfg(
+            format!("walk_p06_long_{}_rst", scheme.tag()),
+            Scene::WalkPhase { phase: 6 },
+            scheme,
+            WakeVel::Restore,
+            FREEZE_LONG,
+            false,
+            false,
+        ));
+    }
+    // 堆顶(snap + kinroot,rst/z)。
+    for scheme in [Scheme::Snap, Scheme::KinRoot] {
         for wv in [WakeVel::Restore, WakeVel::Zero] {
-            all.push(Cfg {
-                name: format!("pile_{}_{}", scheme.tag(), wv.tag()),
-                scene: Scene::OnPile,
+            all.push(cfg(
+                format!("pile_{}_{}", scheme.tag(), wv.tag()),
+                Scene::OnPile,
                 scheme,
-                wake_vel: wv,
-                freeze_ticks: 0,
-                eight: false,
-            });
+                wv,
+                0,
+                false,
+                false,
+            ));
         }
     }
-    // 被单格方块压着:三可行方案(Restore 口径;只报结果)。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
-        all.push(Cfg {
-            name: format!("pressed_{}_rst", scheme.tag()),
-            scene: Scene::Pressed,
+    // 压住 / 下落 / 砸中 / 移走支撑(只报结果;snap + kinroot)。
+    for scheme in [Scheme::Snap, Scheme::KinRoot] {
+        all.push(cfg(
+            format!("pressed_{}_rst", scheme.tag()),
+            Scene::Pressed,
             scheme,
-            wake_vel: WakeVel::Restore,
-            freeze_ticks: 0,
-            eight: false,
-        });
-    }
-    // 离地 0.5 m 下落途中:三可行方案(只报结果)。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
-        all.push(Cfg {
-            name: format!("falling_{}_rst", scheme.tag()),
-            scene: Scene::Falling,
+            WakeVel::Restore,
+            0,
+            false,
+            false,
+        ));
+        all.push(cfg(
+            format!("falling_{}_rst", scheme.tag()),
+            Scene::Falling,
             scheme,
-            wake_vel: WakeVel::Restore,
-            freeze_ticks: 0,
-            eight: false,
-        });
-    }
-    // 冻结期间方块砸中:三可行方案(只报结果)。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
-        all.push(Cfg {
-            name: format!("hit_{}_rst", scheme.tag()),
-            scene: Scene::HitWhileFrozen,
+            WakeVel::Restore,
+            0,
+            false,
+            false,
+        ));
+        all.push(cfg(
+            format!("hit_{}_rst", scheme.tag()),
+            Scene::HitWhileFrozen,
             scheme,
-            wake_vel: WakeVel::Restore,
-            freeze_ticks: 0,
-            eight: false,
-        });
-    }
-    // 冻结期间脚下方块被移走:三可行方案(只报结果)。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
-        all.push(Cfg {
-            name: format!("suprm_{}_rst", scheme.tag()),
-            scene: Scene::SupportRemoved,
+            WakeVel::Restore,
+            0,
+            false,
+            false,
+        ));
+        all.push(cfg(
+            format!("suprm_{}_rst", scheme.tag()),
+            Scene::SupportRemoved,
             scheme,
-            wake_vel: WakeVel::Restore,
-            freeze_ticks: 0,
-            eight: false,
-        });
+            WakeVel::Restore,
+            0,
+            false,
+            false,
+        ));
     }
-    // 冻结时长两档:600(默认,上面全部)与 3600(stand/walk p06 × 三可行
-    // 方案,Restore 口径)。
-    for scheme in [Scheme::KinRoot, Scheme::FixedRoot, Scheme::Snap] {
-        for (scene, tag) in [
-            (Scene::Stand, "stand"),
-            (Scene::WalkPhase { phase: 6 }, "walk_p06"),
-        ] {
-            all.push(Cfg {
-                name: format!("{tag}_long_{}_rst", scheme.tag()),
-                scene,
-                scheme,
-                wake_vel: WakeVel::Restore,
-                freeze_ticks: FREEZE_LONG,
-                eight: false,
-            });
-        }
-    }
-    // 8 只一起冻结、一起唤醒。
-    all.push(Cfg {
-        name: "eight_kin_rst".into(),
-        scene: Scene::Eight,
-        scheme: Scheme::Kin,
-        wake_vel: WakeVel::Restore,
-        freeze_ticks: 0,
-        eight: true,
-    });
+    // F7:8 只组 snap + kinroot。
+    all.push(cfg(
+        "eight_snap_rst".into(),
+        Scene::Eight,
+        Scheme::Snap,
+        WakeVel::Restore,
+        0,
+        false,
+        true,
+    ));
+    all.push(cfg(
+        "eight_kinroot_rst".into(),
+        Scene::Eight,
+        Scheme::KinRoot,
+        WakeVel::Restore,
+        0,
+        false,
+        true,
+    ));
+    // 8 只不冻结对照(F7 配套)。
+    all.push(cfg(
+        "eight_control".into(),
+        Scene::Eight,
+        Scheme::Snap,
+        WakeVel::Restore,
+        0,
+        true,
+        true,
+    ));
     all
 }
