@@ -343,6 +343,10 @@ pub struct ActivationEvents {
     pub closure_deferred: u64,
     pub contact_wake_skipped_no_terrain: u64,
     pub actor_motion_capped: u64,
+    /// 本拍 chunk collider 重建次数(S03 遥测;只计数不进模拟):含生命周期
+    /// 路径的立即重建与批量写路径 flush 的统一重建,= `rebuild_chunk_collider`
+    /// 的真实执行次数。基线报告的"峰值拍重建次数"即本计数的峰值。
+    pub collider_rebuilds: u64,
 }
 
 /// 实体的分片侧记录(crate 内可见:snapshot.rs 的快照结构复用)。
@@ -522,6 +526,17 @@ pub struct ShardSim {
     /// 写入,`evaluate_fractures` 的新路径消费;**拍内有效**,每拍开头清空,
     /// 不进 checkpoint。
     pub(crate) impact_corrections_this_tick: BTreeMap<EntityId, Vec3>,
+    /// 待重建 ② 的 chunk(S03 去重;固定点统一重建):批量写路径(命令
+    /// SetBlock、BlockWrite 信封、爆炸、撞击、凝固桥、强制落地、承载转换)
+    /// 写体素后不再逐格立即 `rebuild_chunk_collider`,改为把目标 chunk 记入
+    /// 本集合,由各公开写入口退出前的 [`ShardSim::flush_collider_rebuilds`]
+    /// 按升序统一重建(仍只重建 `built_colliders` 中的)。chunk 生命周期路径
+    /// (装载/卸载/建 ②/拆 ②)保持立即重建,不经本集合。**不变量:每个公开
+    /// 写入口返回时本集合为空**(flush 点:apply_prefix、step 内撞击采样后
+    /// ——保住 F03b"同拍撞击重建后接触对句柄失效"的既有可见性、step 末、
+    /// run_transient_lifecycle;take_outbox 有 debug_assert 兜底)——外部
+    /// 看到的重建时序不变,检查点格式不变(集合只活在一拍内部,不入快照)。
+    pub(crate) pending_collider_rebuilds: BTreeSet<ChunkPos>,
 }
 
 /// 撞击冲量流的按实体事件累计(F02a,§5.7.1;`evaluate_impacts` 采样)。
@@ -580,6 +595,7 @@ impl ShardSim {
             #[cfg(test)]
             compound_flow_trace: Vec::new(),
             impact_corrections_this_tick: BTreeMap::new(),
+            pending_collider_rebuilds: BTreeSet::new(),
         }
     }
 
@@ -841,12 +857,9 @@ impl ShardSim {
                         // 触发登记与承载转换记录都要写前的方块(§4.6 第 2/3 条)。
                         let old_block = self.voxels.get_block(*pos);
                         if self.voxels.set_block(*pos, *block).is_ok() {
-                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
-                            for cp in expand_boundary([pos.chunk_of()], &self.voxels) {
-                                if self.built_colliders.contains(&cp) {
-                                    self.rebuild_chunk_collider(cp);
-                                }
-                            }
+                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫);S03 起
+                            // 记入待重建集合,apply_prefix 退出前统一重建。
+                            self.defer_chunk_collider_rebuild([pos.chunk_of()]);
                             // holder 侧同样登记(04c 风险 4):边界附近的
                             // holder 侧冻结实体失去支撑也须醒来。
                             self.register_terrain_write(*pos);
@@ -868,6 +881,10 @@ impl ShardSim {
             }
         }
         self.enforce_budget_after_command_wake();
+        // S03 去重收口:命令/信封/爆炸的全部写入在返回前统一重建——语义
+        // 不变(写入仍在同拍 `phys.step()` 之前生效),同一 chunk 的多次
+        // 写入只重建一次。
+        self.flush_collider_rebuilds();
     }
 
     /// 命令唤醒路径的预算强制(README 决策 6):观察者已注册过(激活生效中)
@@ -1062,6 +1079,12 @@ impl ShardSim {
         // 撞击破坏(REQ-009 §5,单元 06):物理步进之后、坍塌求值之前——本步
         // 解算写入的接触冲量在此采样,破坏格进入本拍坍塌的触发集。
         self.evaluate_impacts();
+        // S03 flush 点 A(审计结论,宁少去重不改行为):撞击写入延后重建后,
+        // 必须在 `evaluate_fractures` 读取接触对之前落重建——旧实现的立即重建
+        // 删除旧 chunk collider,F03b 的采样语义依赖该失效可见性(load_fracture
+        // 采样对"句柄失效只跳本侧"的处理以重建为前提);不在此 flush 会让
+        // 碎裂采样读到已被撞脱格的旧接触对,行为分叉。
+        self.flush_collider_rebuilds();
         // 碎裂(REQ-010 §7.3,单元 06):物理步进之后、凝固桥之前——同一拍
         // 先碎;碎了的复合体已删除,凝固段自然不再判整块凝固(§7.3 风险 4)。
         self.evaluate_fractures();
@@ -1213,11 +1236,8 @@ impl ShardSim {
                                 }
                                 let dirty: Vec<ChunkPos> =
                                     cells.iter().map(|(c, _)| c.chunk_of()).collect();
-                                for cp in expand_boundary(dirty, &self.voxels) {
-                                    if self.built_colliders.contains(&cp) {
-                                        self.rebuild_chunk_collider(cp);
-                                    }
-                                }
+                                // S03:整块凝固写入记入待重建集合,step 末统一重建。
+                                self.defer_chunk_collider_rebuild(dirty);
                                 self.entities.remove(&id).expect("存在");
                                 self.phys.remove_body(handle);
                                 self.outbox.despawned.push(id);
@@ -1307,12 +1327,9 @@ impl ShardSim {
                         // 睡眠兜底:睡着即无条件凝固;未睡但误差过大 → 继续等(升级路径)
                         let old_block = self.voxels.get_block(cell);
                         if self.voxels.set_block(cell, desc.block).is_ok() {
-                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫)。
-                            for cp in expand_boundary([cell.chunk_of()], &self.voxels) {
-                                if self.built_colliders.contains(&cp) {
-                                    self.rebuild_chunk_collider(cp);
-                                }
-                            }
+                            // 细则 4/5:只重建已建 ②(同 SetBlock 守卫);S03 起
+                            // 记入待重建集合,step 末统一重建。
+                            self.defer_chunk_collider_rebuild([cell.chunk_of()]);
                             self.entities.remove(&id).expect("存在");
                             self.phys.remove_body(handle);
                             self.outbox.despawned.push(id);
@@ -1368,10 +1385,21 @@ impl ShardSim {
         // 坍塌求值(REQ-009 §6.2.1,单元 04b):物理步进之后、交出 outbox
         // 之前;本拍外部写入与爆炸的结果都已落地(风险 3)。
         self.evaluate_collapse();
+        // S03 flush 点 B:凝固桥/坍塌/承载转换的写入在 step 返回前统一重建
+        // (凝固桥循环与坍塌求值只读体素、不读接触对,延后到此处不改变行为
+        // ——体素写入当拍已生效,后续求值看的都是体素真相)。
+        self.flush_collider_rebuilds();
     }
 
     /// 取走并清空本 tick 产出。
     pub fn take_outbox(&mut self) -> Outbox {
+        // S03 不变量兜底(worker 顺序 apply_prefix → step → run_transient_
+        // lifecycle 已各自 flush;出现残留 = 新写入口漏 flush,fail-stop)。
+        debug_assert!(
+            self.pending_collider_rebuilds.is_empty(),
+            "take_outbox 时仍有待重建 chunk {:?}(公开写入口漏 flush,fail-stop)",
+            self.pending_collider_rebuilds
+        );
         std::mem::take(&mut self.outbox)
     }
 
@@ -2668,11 +2696,8 @@ impl ShardSim {
                         }
                         let dirty: Vec<ChunkPos> =
                             cells.iter().map(|(c, _)| c.chunk_of()).collect();
-                        for ncp in expand_boundary(dirty, &self.voxels) {
-                            if self.built_colliders.contains(&ncp) {
-                                self.rebuild_chunk_collider(ncp);
-                            }
-                        }
+                        // S03:整块强制落地写入记入待重建集合,退出前统一重建。
+                        self.defer_chunk_collider_rebuild(dirty);
                         self.entities.remove(&id).expect("存在");
                         self.phys.remove_body(handle);
                         self.locomotion.remove(&id);
@@ -2756,11 +2781,8 @@ impl ShardSim {
                                     .chunk_of()
                             })
                             .collect();
-                        for ncp in expand_boundary(dirty, &self.voxels) {
-                            if self.built_colliders.contains(&ncp) {
-                                self.rebuild_chunk_collider(ncp);
-                            }
-                        }
+                        // S03:Fallback 逐格写入记入待重建集合,退出前统一重建。
+                        self.defer_chunk_collider_rebuild(dirty);
                         self.entities.remove(&id).expect("存在");
                         self.phys.remove_body(handle);
                         self.locomotion.remove(&id);
@@ -2830,11 +2852,8 @@ impl ShardSim {
             // 广播持久化)。
             let old_block = self.voxels.get_block(landing);
             let _ = self.voxels.set_block(landing, block_desc.block);
-            for ncp in expand_boundary([landing.chunk_of()], &self.voxels) {
-                if self.built_colliders.contains(&ncp) {
-                    self.rebuild_chunk_collider(ncp);
-                }
-            }
+            // S03:单格强制落地写入记入待重建集合,退出前统一重建。
+            self.defer_chunk_collider_rebuild([landing.chunk_of()]);
             self.outbox.block_updates.push(BlockWrite {
                 pos: landing,
                 block: block_desc.block,
@@ -2861,6 +2880,9 @@ impl ShardSim {
                 _ => self.activation_events.forced_landings_deadline += 1,
             }
         }
+        // S03 去重收口:本公开写入口(强制落地/虚空移除)的全部落点写入在
+        // 返回前统一重建——外部看到的时序不变。
+        self.flush_collider_rebuilds();
     }
 
     /// I2 断言(§14-7;debug):醒着的瞬态体当前足迹 ∩ 区域内缺 ② → panic。
@@ -3430,12 +3452,9 @@ impl ShardSim {
                 });
             dirty.push(cell.chunk_of());
         }
-        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain)。
-        for cp in expand_boundary(dirty, &self.voxels) {
-            if self.built_colliders.contains(&cp) {
-                self.rebuild_chunk_collider(cp);
-            }
-        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain);S03 起记入
+        // 待重建集合,本函数的调用方在碎裂采样读取接触对之前统一 flush。
+        self.defer_chunk_collider_rebuild(dirty);
         // 与同拍爆炸的脱落请求拼接后,保持整个 outbox 的 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
     }
@@ -3816,12 +3835,10 @@ impl ShardSim {
                         });
                 }
             }
-            // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain)。
-            for cp in expand_boundary(dirty, &self.voxels) {
-                if self.built_colliders.contains(&cp) {
-                    self.rebuild_chunk_collider(cp);
-                }
-            }
+            // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain);S03 起
+            // 记入待重建集合,evaluate_impacts 收尾统一 flush(在碎裂采样读
+            // 接触对之前,保住 F03b 的句柄失效可见性)。
+            self.defer_chunk_collider_rebuild(dirty);
         }
         // 与同拍爆炸/逐格路径的脱落请求拼接后,保持 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
@@ -4007,12 +4024,9 @@ impl ShardSim {
             dirty.push(cell.chunk_of());
             converted.push(cell);
         }
-        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain)。
-        for cp in expand_boundary(dirty, &self.voxels) {
-            if self.built_colliders.contains(&cp) {
-                self.rebuild_chunk_collider(cp);
-            }
-        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 detonate_terrain);S03 起记入
+        // 待重建集合,step 末统一重建。
+        self.defer_chunk_collider_rebuild(dirty);
         // 遥测(§8):本拍因名额不足未转换的本体区悬空格数(converted 只含
         // 本体区格,差值恒非负;saturating 防御遥测不 panic)。
         self.outbox.destruction_stats.collapse_deferred +=
@@ -4037,12 +4051,9 @@ impl ShardSim {
                 match edit.apply(&mut self.voxels) {
                     Ok(dirty) => {
                         // 细则 4/5:只重建已建 ②;有①无② 的 chunk 写块不新建
-                        // ②(未启用模式 ②⊆① 恒真,行为不变,§14-9)。
-                        for cp in expand_boundary(dirty, &self.voxels) {
-                            if self.built_colliders.contains(&cp) {
-                                self.rebuild_chunk_collider(cp);
-                            }
-                        }
+                        // ②(未启用模式 ②⊆① 恒真,行为不变,§14-9);S03 起
+                        // 记入待重建集合,apply_prefix 退出前统一重建。
+                        self.defer_chunk_collider_rebuild(dirty);
                         // 方块写入统一出口(REQ-005 D11):外部命令成功写体素
                         // 后记 `External`;调度器 `take_block_updates` 只发布
                         // owner 的条目(非 owner 副本的条目由调度器丢弃)。
@@ -4196,6 +4207,37 @@ impl ShardSim {
         );
         self.chunk_bodies.insert(cp, handle);
         self.outbox.dirty_chunks.insert(cp);
+        // S03 遥测(§4.16 同款;只计数不进模拟):本拍 collider 重建次数——
+        // 含生命周期路径的立即重建与 flush 的固定点重建,= 重建调用的真实
+        // 总数。随 ActivationEvents 取走(不入快照,纯计数)。
+        self.activation_events.collider_rebuilds += 1;
+    }
+
+    /// 批量写路径的重建登记(S03 去重):不立即重建,把 chunk(含已装载的
+    /// 边界邻居,与 `expand_boundary` 同口径)记入待重建集合;调用方在公开
+    /// 写入口退出前 [`Self::flush_collider_rebuilds`] 统一执行。只登记已建
+    /// ② 的 chunk(守卫与旧立即路径逐位一致;flush 时再查一次,防御登记与
+    /// 执行之间 ② 被生命周期路径拆掉的拍内交错)。
+    fn defer_chunk_collider_rebuild(&mut self, cps: impl IntoIterator<Item = ChunkPos>) {
+        for cp in expand_boundary(cps, &self.voxels) {
+            if self.built_colliders.contains(&cp) {
+                self.pending_collider_rebuilds.insert(cp);
+            }
+        }
+    }
+
+    /// 固定点统一重建(S03 去重):按 ChunkPos 升序重建全部待重建 chunk。
+    /// 重建序确定(BTreeSet 键序),句柄分配序随之确定;同一拍多写入不再
+    /// 重复重建同一 chunk。调用点 = 每个公开写入口退出前(见
+    /// [`ShardSim::pending_collider_rebuilds`]),返回时集合必空。
+    fn flush_collider_rebuilds(&mut self) {
+        let pending: Vec<ChunkPos> = self.pending_collider_rebuilds.iter().copied().collect();
+        self.pending_collider_rebuilds.clear();
+        for cp in pending {
+            if self.built_colliders.contains(&cp) {
+                self.rebuild_chunk_collider(cp);
+            }
+        }
     }
 
     fn spawn_entity(
@@ -4663,12 +4705,9 @@ impl ShardSim {
             }
             dirty.push(cell.pos.chunk_of());
         }
-        // 细则 4/5 同款守卫:只重建已建 ②。
-        for cp in expand_boundary(dirty, &self.voxels) {
-            if self.built_colliders.contains(&cp) {
-                self.rebuild_chunk_collider(cp);
-            }
-        }
+        // 细则 4/5 同款守卫:只重建已建 ②;S03 起记入待重建集合,apply_prefix
+        // 退出前统一重建。
+        self.defer_chunk_collider_rebuild(dirty);
         // 多个爆炸拼接后仍保持整个 outbox 的 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
     }
@@ -4685,17 +4724,11 @@ impl ShardSim {
     }
 }
 
-/// 包络半高换算成 wake/footprint 纯函数预期的"half_size"口径(REQ-010 §5.4
-/// 第 4 条的分叉点):单格 = `half_size` 原样(纯函数内部自乘 √3,浮点路径
-/// 逐位不变);复合体 = 包络半径 ρ ÷ √3(还原成"等效 half_size",纯函数乘
-/// 回 √3 即 ρ;保守包络 AABB)。凡按 half·√3 推算实体包络的调用点统一走它。
-fn envelope_half(desc: &EntityDesc) -> f32 {
-    if desc.shape().is_some() {
-        desc.envelope_radius() / crate::settle::SQRT_3
-    } else {
-        desc.half_size
-    }
-}
+/// 包络半高换算(settle::envelope_half 的模块内别名,S03 起**唯一实现**在
+/// [`crate::settle::envelope_half`]——调度器 `entity_motion_of` 与本 crate
+/// 的 wake/footprint 调用点共用,不写第二份):单格 = `half_size` 原样,
+/// 复合体 = 包络半径 ρ ÷ √3。
+use crate::settle::envelope_half;
 
 /// 位置 → 所在 chunk(floor 语义,负方向向下取整)。
 /// 支撑表查询(承载判定用;G1)。

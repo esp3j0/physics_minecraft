@@ -1192,12 +1192,9 @@ impl ShardSim {
                 self.load_pending.remove(&cell);
             }
         }
-        // 细则 4/5 同款守卫:只重建已建 ②(同 REQ-009 转换)。
-        for cp in expand_boundary(dirty, &self.voxels) {
-            if self.built_colliders.contains(&cp) {
-                self.rebuild_chunk_collider(cp);
-            }
-        }
+        // 细则 4/5 同款守卫:只重建已建 ②(同 REQ-009 转换);S03 起记入
+        // 待重建集合,step 末统一重建。
+        self.defer_chunk_collider_rebuild(dirty);
         // 与同拍爆炸/撞击的脱落请求拼接后,保持 BlockPos 升序不变量。
         self.outbox.detach_requests.sort_by_key(|req| req.cell);
         self.outbox.cohesion_stats.load_pending = self.load_pending.len() as u64;

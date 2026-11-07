@@ -14,6 +14,19 @@ use types::{WORLD_Y_MAX, WORLD_Y_MIN};
 /// `current_footprint`:ρ 已含 half·√3 项,除回 √3 即"等效 half_size")。
 pub(crate) const SQRT_3: f32 = 1.732_050_8;
 
+/// 实体足迹的"等效 half_size"口径(REQ-010 §5.4 第 4 条;S03 与调度器
+/// `entity_motion_of` 共用本实现,不写第二份):单格 = `half_size` 原样
+/// (纯函数内部自乘 √3,浮点路径逐位不变);复合体 = 包络半径 ρ ÷ √3
+/// (还原成"等效 half_size",纯函数乘回 √3 即 ρ;保守包络 AABB)。
+/// 凡按 half·√3 推算实体包络足迹的调用点统一走它。
+pub fn envelope_half(desc: &types::EntityDesc) -> f32 {
+    if desc.shape().is_some() {
+        desc.envelope_radius() / SQRT_3
+    } else {
+        desc.half_size
+    }
+}
+
 /// 实体所在格(与凝固桥同口径:中心取 floor)。
 pub fn cell_of(x: f32, y: f32, z: f32) -> BlockPos {
     BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32)

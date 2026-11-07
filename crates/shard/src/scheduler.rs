@@ -153,6 +153,10 @@ pub struct ActivationTelemetry {
     pub closure_deferred: u64,
     pub contact_wake_skipped_no_terrain: u64,
     pub actor_motion_capped: u64,
+    /// 本拍 chunk collider 重建次数(S03 遥测;只计数不进模拟):全部分片的
+    /// `ActivationEvents::collider_rebuilds` 合计(含生命周期路径的立即重建
+    /// 与批量写路径 flush 的统一重建)。
+    pub collider_rebuilds: u64,
 }
 
 impl ActivationTelemetry {
@@ -417,7 +421,14 @@ impl Scheduler {
         None
     }
 
-    /// 实体状态(位置 + 速度 + half_size;足迹解析输入;R1)。
+    /// 实体状态(位置 + 速度 + half_size;足迹解析输入;R1)。S03 足迹口径
+    /// 修正(REQ-010 §5 第 4 条):half_size 经 [`physics_sim::settle::
+    /// envelope_half`](与 `sim.rs` 的 wake/footprint 调用点**同一实现**)——
+    /// 单格 = `half_size` 原样(数值逐位不变);复合体 = 包络半径 ÷ √3
+    /// (保守包络 AABB,与 sim.rs:4692 同口径)。两个分支(在途迁移载荷 /
+    /// 分片内实体)同款:复合体的瞬态运动票足迹此前写死 0.5,漏装包络覆盖
+    /// 的 chunk(bridge 1024 三块 84 格冻在 y=−54.5 等 1200 拍强制落地的
+    /// 根因)。
     fn entity_motion_of(&self, entity: EntityId) -> Option<(Vec3, Vec3, f32)> {
         for env in self.router.in_transit_migrations() {
             if let messaging::EnvelopePayload::MigrateEntity {
@@ -428,16 +439,21 @@ impl Scheduler {
             } = &env.payload
                 && *e == entity
             {
-                return Some((state.translation, state.linvel, desc.half_size));
+                return Some((
+                    state.translation,
+                    state.linvel,
+                    physics_sim::settle::envelope_half(desc),
+                ));
             }
         }
         for shard in self.sims.keys() {
             if let Some(st) = self.entity_state(*shard, entity) {
-                // half_size 从实体 desc 无法直读(sim 未暴露);用默认 0.5
-                // (当前全部实体为半格立方体,EntityDesc::default;03 限度内)。
-                let _ = st;
-                let st = self.entity_state(*shard, entity)?;
-                return Some((st.translation, st.linvel, 0.5));
+                let desc = self.entity_desc(*shard, entity)?;
+                return Some((
+                    st.translation,
+                    st.linvel,
+                    physics_sim::settle::envelope_half(&desc),
+                ));
             }
         }
         None
@@ -1645,6 +1661,8 @@ impl Scheduler {
             events.closure_deferred += shard_events.closure_deferred;
             events.contact_wake_skipped_no_terrain += shard_events.contact_wake_skipped_no_terrain;
             events.actor_motion_capped += shard_events.actor_motion_capped;
+            // S03 遥测:collider 重建次数按分片合计(加法可交换)。
+            events.collider_rebuilds += shard_events.collider_rebuilds;
             // 涌现生成盖章(REQ-009 §7;单元 03;REQ-010 §5.5 第 4 条):本分片的
             // 单格脱落请求与复合体请求放在一起分配涌现 ID——片内按"实体的最小格"
             // 升序(单格 = 该格;复合体 = 原点 + 首格偏移,形状 canonical 序保证
@@ -2194,6 +2212,7 @@ impl Scheduler {
                 closure_deferred: events.closure_deferred,
                 contact_wake_skipped_no_terrain: events.contact_wake_skipped_no_terrain,
                 actor_motion_capped: events.actor_motion_capped,
+                collider_rebuilds: events.collider_rebuilds,
             },
         }
     }

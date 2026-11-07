@@ -309,6 +309,12 @@ pub(crate) struct Run {
     total_over_budget_ms: f64,
     /// R2:最差连续 60 拍均值(ms)(持久化字段)。
     worst_60_mean_ms: f64,
+    /// S03 遥测:峰值拍(整拍耗时最大那一拍)的 collider 重建次数
+    /// (TickSummary.telemetry.collider_rebuilds;只计数不进模拟)。
+    peak_tick_rebuilds: u64,
+    /// 每拍的 collider 重建次数(与 tick_ms 同序;峰值拍提取用,不入 json)。
+    #[serde(skip)]
+    tick_rebuilds: Vec<u64>,
     /// 最近一拍全世界实体数(R4 落定判据;measure_tick 内一次遍历顺带
     /// 计出——count 另走一遍 entity_states 会在 debug 下成倍拖慢冒烟)。
     #[serde(skip)]
@@ -1014,7 +1020,17 @@ fn run_once(def: &ScenarioDef) -> Run {
     run.max_over_budget_streak = run.max_over_budget_streak_fn();
     run.total_over_budget_ms = run.total_over_budget_ms_fn();
     run.worst_60_mean_ms = run.worst_60_mean_ms_fn();
-
+    // S03:峰值拍(整拍耗时最大)的重建次数——与 tick_ms 同下标提取;
+    // 窗口为空(不会发生,防御)时 0。
+    {
+        let max_ms = run.max_ms();
+        let idx = run
+            .tick_ms
+            .iter()
+            .position(|t| *t == max_ms)
+            .unwrap_or(usize::MAX);
+        run.peak_tick_rebuilds = run.tick_rebuilds.get(idx).copied().unwrap_or(0);
+    }
     // ---- 遥测断言:场景必须真的发生了,否则直接报错退出。
     let tag = format!("{} [{}]", def.scenario, def.scale);
     if setup.expect_min_entities > 0 {
@@ -1169,6 +1185,9 @@ fn measure_tick(rig: &mut Rig, run: &mut Run, totals: &mut WindowTotals) {
     totals.flow_events += summary.cohesion.impact_flow_events;
     totals.flow_prefiltered += summary.cohesion.impact_flow_prefiltered;
     totals.flow_breaks += summary.cohesion.impact_flow_breaks;
+    // S03:峰值拍(本拍整拍耗时为窗口内最大)的重建次数;最后按窗口重扫
+    // 一遍取"max 拍"的计数(见 run_once 收尾)。
+    run.tick_rebuilds.push(t.collider_rebuilds);
     run.peak_awake = run.peak_awake.max(t.entities_awake);
     run.peak_frozen = run.peak_frozen.max(t.entities_frozen);
     run.peak_awaiting = run.peak_awaiting.max(t.entities_awaiting_terrain);
@@ -1343,16 +1362,15 @@ fn render_md(report: &Report) -> String {
     ));
     md.push_str(&format!("- 说明:{}\n\n", report.note));
     md.push_str(
-        "| 场景 | 规模 | 观测拍数 | P50 (ms) | P95 (ms) | P99 (ms) | max (ms) | 超预算拍数 | 最长连续超预算 | 累计超预算 (ms) | 最差 60 拍均值 (ms) | 峰值实体 | 峰值醒体 | 峰值冻结/待地形 | 强制落地 | 落定拍 | 残留实体 | 破坏方块 | 凝固(非空气) | 空气写入 | 复合体 | 快照字节 | 快照耗时 (ms) |\n",
+        "| 场景 | 规模 | 观测拍数 | P50 (ms) | P95 (ms) | P99 (ms) | max (ms) | 超预算拍数 | 最长连续超预算 | 累计超预算 (ms) | 最差 60 拍均值 (ms) | 峰值实体 | 峰值醒体 | 峰值冻结/待地形 | 强制落地 | 落定拍 | 残留实体 | 破坏方块 | 凝固(非空气) | 空气写入 | 复合体 | 快照字节 | 快照耗时 (ms) | 峰值拍重建次数 |\n",
     );
     md.push_str(
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n",
     );
     for tier in &report.tiers {
         let r = tier.median_run();
         md.push_str(&format!(
-            "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {:.1} | {:.2} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {:.3} |\n",
+            "| {} | {} | {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {:.1} | {:.2} | {} | {} | {}/{} | {} | {} | {} | {} | {} | {} | {} | {} | {:.3} | {} |\n",
             tier.scenario,
             tier.scale,
             r.ticks_observed,
@@ -1380,6 +1398,7 @@ fn render_md(report: &Report) -> String {
             r.compounds_spawned,
             r.peak_snapshot_bytes,
             r.peak_snapshot_ms,
+            r.peak_tick_rebuilds,
         ));
         if let Some(reason) = &tier.stop_reason {
             md.push_str(&format!("\n> 停止:{reason}\n"));
