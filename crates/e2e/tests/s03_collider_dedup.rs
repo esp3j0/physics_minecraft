@@ -410,8 +410,9 @@ fn determinism_repeat_and_checkpoint_resume() {
 /// 新实现(ρ/√3)覆盖 ≥ 2 个。单格旧新一致(回归保护)。
 #[test]
 fn footprint_uses_envelope_for_compound_and_half_for_single() {
-    // 纯函数口径直测:复合体 (6,1,1) 格、half 0.45 → ρ = 6.033 + 0.45√3 ≈ 6.81,
-    // 等效 half = ρ/√3 ≈ 3.93;单格 half 0.45 原样。
+    // 纯函数口径直测:复合体 (6,1,1) 格、half 0.45 → ρ = 3 + 0.45√3 ≈ 3.78
+    // (最远偏移 |(3,0,0)| = 3,与同函数后文一致),等效 half = ρ/√3 ≈ 2.18;
+    // 单格 half 0.45 原样。
     let cells: Vec<(BlockPos, BlockId)> = (0..6)
         .map(|i| (BlockPos::new(i, 0, 0), builtin::STONE))
         .collect();

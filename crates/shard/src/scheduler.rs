@@ -4486,6 +4486,97 @@ mod tests {
         sched.shutdown();
     }
 
+    /// S03-R1(#24 验收补测):`entity_motion_of` 的**在途迁移分支**走
+    /// [`physics_sim::settle::envelope_half`] 同一口径——复合体返回 ρ/√3
+    /// (≠ `half_size`;此前写死 `desc.half_size`,瞬态票足迹漏装包络覆盖的
+    /// chunk,bridge 1024 挂 1100+ 拍的根因之一),单格仍 = `half_size` 原样。
+    /// 分片内分支已由 e2e `footprint_uses_envelope_...` 覆盖,本条补齐在途侧。
+    ///
+    /// 变红验证:把在途分支的 `envelope_half(desc)` 改回 `desc.half_size`
+    /// → 本条复合体断言红(单格断言天然仍绿,回归保护)。
+    #[test]
+    fn entity_motion_of_in_transit_migration_uses_envelope_half() {
+        let mut sched = Scheduler::new(sched_cfg(2));
+        // 信封 produced_at = 0 → apply_at = 1:collect_intents 后、任何 tick
+        // 前必在队列(未 dispatch),在途分支直达。不 tick 就不会触发信封
+        // 黑洞检查,目的分片无需注册。
+        let cells: Vec<(BlockPos, BlockId)> = (0..6)
+            .map(|i| (BlockPos::new(i, 0, 0), BlockId(1)))
+            .collect();
+        let compound_desc = types::EntityDesc::compound(
+            0.45,
+            types::CompoundShape::from_world(BlockPos::new(2, 0, 0), &cells).expect("6 格"),
+        );
+        // 前置:该形状包络口径确与 half_size 可区分(ρ = 3 + 0.45√3 ≈ 3.78
+        // → 等效 half ≈ 2.18)。
+        let env_half = physics_sim::settle::envelope_half(&compound_desc);
+        assert!(
+            env_half > compound_desc.half_size,
+            "前置:复合体包络 half {env_half} 应大于 half_size {}",
+            compound_desc.half_size
+        );
+
+        let compound_id = EntityId::from_parts(0, 1);
+        sched
+            .router
+            .collect_intents(
+                shard_id(0, 0),
+                &[messaging::Intent {
+                    destination: shard_id(1, 0),
+                    payload: messaging::EnvelopePayload::MigrateEntity {
+                        entity: compound_id,
+                        state: types::EntityState {
+                            translation: types::glam::Vec3::new(140.0, 10.0, 8.0),
+                            linvel: types::glam::Vec3::new(1.0, 0.0, 0.0),
+                            ..types::EntityState::default()
+                        },
+                        desc: compound_desc.clone(),
+                        actor: false,
+                        source: None,
+                        actor_motion_ticks: None,
+                    },
+                }],
+                Tick::ZERO,
+            )
+            .expect("队列未满");
+        let (pos, vel, h) = sched
+            .entity_motion_of(compound_id)
+            .expect("在途复合体可解析");
+        assert_eq!(
+            pos,
+            types::glam::Vec3::new(140.0, 10.0, 8.0),
+            "在途锚点 = 信封载荷位姿"
+        );
+        assert_eq!(vel, types::glam::Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(h, env_half, "在途复合体 half 走 envelope_half(ρ/√3)");
+        assert_ne!(h, compound_desc.half_size);
+
+        // 单格在途:数值原样(回归保护)。
+        let single_id = EntityId::from_parts(0, 2);
+        sched
+            .router
+            .collect_intents(
+                shard_id(0, 0),
+                &[messaging::Intent {
+                    destination: shard_id(1, 0),
+                    payload: messaging::EnvelopePayload::MigrateEntity {
+                        entity: single_id,
+                        state: types::EntityState::default(),
+                        desc: types::EntityDesc::default(),
+                        actor: false,
+                        source: None,
+                        actor_motion_ticks: None,
+                    },
+                }],
+                Tick::ZERO,
+            )
+            .expect("队列未满");
+        let (_, _, h) = sched.entity_motion_of(single_id).expect("在途单格可解析");
+        assert_eq!(h, 0.5, "在途单格 half = half_size 原样");
+
+        sched.shutdown();
+    }
+
     /// 任务书测试 3(REQ-005 任务 04 补强):两分片 + 一观察者贴边界——
     /// ① 各自激活请求只落自己的 core ∪ margin(D4);② **core 装载请求只
     /// 来自 owner(精确集合)**:被请求 chunk 的「把它当 core 的请求者」
