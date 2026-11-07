@@ -43,3 +43,27 @@ Go2 尺度四足模型、足端逆解、开环步态、运行时电机目标(`se
 2. island 睡眠后电机约束不被求解——目标变化须 `wake_up`;
 3. 关节默认阻尼是绝对常量 0.1,不随质量缩放(×0.01 档不缩放则 vfwd
    0.53 → 0.088)。
+
+## A00-3 追加(2026-11-07):快照 / 恢复 API
+
+`migrate` / `freeze` 两个 demo 共用的追加(放行:quad 只允许追加,追加后
+`gait` 168 行、`terrain` 85 行、`mass` 5313 行状态哈希与提交数据逐位相同,
+重跑比对已验证):
+
+- `AgentSnapshot`:迁移信封(根位姿、根速度、关节坐标、关节速度、目标;
+  另带连杆位姿作判据 1 的核对基准);`snapshot_robot(world, robot, targets,
+  full)` 读取,`full = false` 时速度字段清零("不带速度的快照"对照);
+- `restore_robot(world, snap, ...)`:fresh `spawn_robot_yawed` + 写回。
+  坐标恢复的唯一公开路径 = `Multibody::apply_displacements`(增量位移;
+  `coords` 是 `pub(crate)`,revolute 等价 `coords[AngX] += disp` 并重建
+  `joint_rot`)+ `forward_kinematics(bodies, true)`(从根刚体位姿重算全部
+  连杆)+ `update_rigid_bodies`(位姿写回刚体);广义速度走
+  `generalized_velocity_mut`,根刚体 `linvel/angvel` 同时直写;最后整只
+  `wake_up(true)`(生产"目标变化即唤醒"语义);
+- `measure_restore_error`:重建后、步进前的误差核对(关节坐标 rad /
+  连杆位置 m / 连杆转角 rad / 速度)。关节速度读
+  `Multibody::generalized_velocity()`(`link.joint_velocity` 是 solver
+  每拍回写的字段,步进前恒 0,不适用)。
+
+实测:完整快照重建误差**逐位为 0**(migrate 全矩阵 97 个 full 行、
+freeze snap 全部 21 行)。

@@ -1,0 +1,4 @@
+/target/
+/out/*
+!out/matrix_submitted.txt
+!out/det_submitted.txt

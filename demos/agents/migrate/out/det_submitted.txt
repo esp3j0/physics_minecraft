@@ -1,0 +1,9 @@
+walk_p00_same_full_T0,0.000e0,0.000e0,0.000e0,0.000e0,0.9889,0.2511,2.0174,-0.0043,1,0.5156,-,false,false,,77.9,-,-,52d84780ea5d9530 | 0.2s
+determinism: walk_p00_same_full_T0 -> IDENTICAL
+walk_p06_same_full_T0,0.000e0,0.000e0,0.000e0,0.000e0,0.9890,0.2511,2.0181,-0.0043,1,0.5152,-,false,false,,56.1,-,-,0a6c0129e0208229 | 0.2s
+determinism: walk_p06_same_full_T0 -> IDENTICAL
+walk_p06_cross_full_T1,0.000e0,0.000e0,0.000e0,0.000e0,0.9890,0.2511,2.0437,-0.0052,1,0.5114,-,false,false,,47.4,-,-,59180b55383ef0cd | 0.2s
+determinism: walk_p06_cross_full_T1 -> IDENTICAL
+pingpong_g30_same_full_T0,0.000e0,0.000e0,0.000e0,0.000e0,0.9850,0.4049,2.0524,-0.0056,1,0.4961,-,false,false,,35.5,-,-,98c5daa84e72123b | 0.5s
+determinism: pingpong_g30_same_full_T0 -> IDENTICAL
+eight_same_full_T0,0.000e0,0.000e0,0.000e0,0.000e0,0.9783,0.3632,2.0344,0.0000,-,0.5196,-,false,false,,37.8,-,-,a047a71303143008 | 2.3s

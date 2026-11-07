@@ -467,3 +467,218 @@ pub fn stand_targets(gait: &Gait) -> [f32; N_JOINTS] {
     }
     out
 }
+
+// ── 快照 / 恢复(A00-3 放行追加;migrate / freeze 共用) ─────────────────
+//
+// 追加纪律(A00-3 放行原文):quad 只允许追加,追加后 `gait` / `terrain` /
+// `mass` 的状态哈希必须与当前提交逐位相同。本节只新增类型与函数,不触碰
+// 上面的常量、`spawn_robot(_yawed)`、`set_target`、`ik`、`Gait` 的任何
+// 数值路径。
+//
+// rapier 0.36.1 依据(实测侦察,坐标恢复的唯一公开路径):
+// - `MultibodyJoint::apply_displacement` → `integrate(1.0, disp)`:对 revolute
+//   单自由度关节 = `coords[AngX] += disp` 并按新角重建 `joint_rot`(`coords`
+//   是 `pub(crate)`,无 setter,这是唯一公开的坐标写入路径);
+// - `Multibody::forward_kinematics(bodies, true)` 从根刚体位姿重算全部连杆
+//   `local_to_world`(内部先 `update_root_type`:根刚体 `is_dynamic()` 与
+//   `root_is_dynamic` 不符时重建 free/fixed 根关节——freeze demo 实证点,
+//   rapier multibody.rs ~:1290);
+// - `Multibody::update_rigid_bodies` 把连杆位姿写回各刚体 position/next;
+// - `Multibody::generalized_velocity_mut` 写广义速度;下一拍 solver 的
+//   `update_velocities` 从 `self.velocities` 重建各连杆刚体速度
+//   (staged_island_solver/helpers.rs:108)。
+
+/// 一只主体的迁移信封(REQ-012 §3 `MigrateAgent` 的 demo 口径):根状态、
+/// 关节坐标、关节速度、最后的目标 + 连杆位姿(判据 1 的"连杆位置误差"
+/// 核对基准;生产信封不带,连杆位姿由根状态 + 关节坐标唯一决定)。
+///
+/// `full = false` 时 `root_linvel/root_angvel/joint_vels` 清零——
+/// "不带速度的快照"对照(证明速度是否必须带)。
+#[derive(Clone)]
+pub struct AgentSnapshot {
+    /// 根刚体位姿(世界系)。
+    pub root_pose: Pose,
+    /// 根刚体线速度 / 角速度(full 快照才有值)。
+    pub root_linvel: Vector,
+    pub root_angvel: Vector,
+    /// 12 个关节角(rad;`link.joint.coords()[ANG_X]`,与 `read_angle` 同源)。
+    pub joint_coords: [f32; N_JOINTS],
+    /// 12 个关节角速度(rad/s;`Multibody::joint_velocity(link)[0]`,
+    /// 与 `joint_velocity()` 读数同源;full 快照才有值)。
+    pub joint_vels: [f32; N_JOINTS],
+    /// 全部 13 个连杆刚体的世界位姿(顺序同 `Robot.links` 再根放最后;
+    /// 判据 1 的连杆位置误差核对基准)。
+    pub link_poses: Vec<Pose>,
+    /// 迁移时生效的 12 个电机目标(迁移后照写,不重算)。
+    pub targets: [f32; N_JOINTS],
+}
+
+/// 从世界读一只主体的完整快照;`full = false` 时速度字段清零。
+pub fn snapshot_robot(
+    world: &PhysicsWorld,
+    robot: &Robot,
+    targets: &[f32; N_JOINTS],
+    full: bool,
+) -> AgentSnapshot {
+    let body = world.bodies.get(robot.body).expect("root alive");
+    let mut coords = [0.0f32; N_JOINTS];
+    let mut vels = [0.0f32; N_JOINTS];
+    for dof in 0..N_JOINTS {
+        coords[dof] = read_angle(&world.multibody_joints, robot, dof);
+        if full {
+            vels[dof] = joint_velocity(&world.multibody_joints, robot, dof);
+        }
+    }
+    let mut link_poses = Vec::with_capacity(robot.links.len());
+    for lh in &robot.links {
+        let rb = world.bodies.get(*lh).expect("link alive");
+        link_poses.push(*rb.position());
+    }
+    AgentSnapshot {
+        root_pose: *body.position(),
+        root_linvel: if full { body.linvel() } else { Vector::ZERO },
+        root_angvel: if full { body.angvel() } else { Vector::ZERO },
+        joint_coords: coords,
+        joint_vels: vels,
+        link_poses,
+        targets: *targets,
+    }
+}
+
+/// 在 `world` 里按快照重建一只机器人(fresh `spawn_robot_yawed` + 写回),
+/// 返回新句柄组。`same` / `cross` / `cross_hist` 三种重建、`freeze` 的
+/// `snap` 方案共用;差异只在调用方(同世界/跨世界/目标世界历史)。
+pub fn restore_robot(
+    world: &mut PhysicsWorld,
+    snap: &AgentSnapshot,
+    mass_scale: f32,
+    foot_mu: f32,
+    damp_mode: DampMode,
+) -> Robot {
+    let robot = spawn_robot_yawed(
+        world,
+        snap.root_pose.translation,
+        snap.root_pose.rotation,
+        mass_scale,
+        foot_mu,
+        damp_mode,
+    );
+    let (mb_index, _) = robot.joints[0];
+    {
+        let mb = world
+            .multibody_joints
+            .get_multibody_mut(mb_index)
+            .expect("multibody alive");
+        // 广义坐标增量:fresh revolute 关节坐标恒 0,delta = 快照角。
+        // disp 按 assembly_id 落位(根 free 6 维 + 每关节 1 维)。
+        let mut disp = vec![0.0f32; mb.ndofs()];
+        for dof in 0..N_JOINTS {
+            let (_, link_id) = robot.joints[dof];
+            let aid = mb.link(link_id).expect("link alive").assembly_id();
+            disp[aid] = snap.joint_coords[dof];
+        }
+        mb.apply_displacements(&disp);
+        if snap.joint_vels.iter().any(|v| *v != 0.0) {
+            let aids: Vec<usize> = (0..N_JOINTS)
+                .map(|dof| {
+                    let (_, link_id) = robot.joints[dof];
+                    mb.link(link_id).expect("link alive").assembly_id()
+                })
+                .collect();
+            let mut gv = mb.generalized_velocity_mut();
+            for dof in 0..N_JOINTS {
+                gv[aids[dof]] = snap.joint_vels[dof];
+            }
+        }
+    }
+    // 根速度:广义速度(根 free 关节前 3 维线性 / 后 3 维角)与刚体各写一份
+    // ——刚体速度供接触/读数,multibody velocities 供下一拍 solver 的
+    // update_velocities 重建连杆速度。
+    {
+        let mb = world
+            .multibody_joints
+            .get_multibody_mut(mb_index)
+            .expect("multibody alive");
+        let mut gv = mb.generalized_velocity_mut();
+        gv[0] = snap.root_linvel.x;
+        gv[1] = snap.root_linvel.y;
+        gv[2] = snap.root_linvel.z;
+        gv[3] = snap.root_angvel.x;
+        gv[4] = snap.root_angvel.y;
+        gv[5] = snap.root_angvel.z;
+    }
+    if let Some(rb) = world.bodies.get_mut(robot.body) {
+        rb.set_linvel(snap.root_linvel, false);
+        rb.set_angvel(snap.root_angvel, false);
+    }
+    {
+        let mb = world
+            .multibody_joints
+            .get_multibody_mut(mb_index)
+            .expect("multibody alive");
+        mb.forward_kinematics(&world.bodies, true);
+        mb.update_rigid_bodies(&mut world.bodies, false);
+    }
+    // 状态注入 = "目标变化"级事件,按生产语义强唤醒整只(根 + 全部连杆)。
+    for h in robot
+        .links
+        .iter()
+        .copied()
+        .chain(std::iter::once(robot.body))
+    {
+        if let Some(rb) = world.bodies.get_mut(h) {
+            rb.wake_up(true);
+        }
+    }
+    robot
+}
+
+/// 重建误差核对(migrate 判据 1 / freeze 判据 2):重建后与快照逐项比较。
+/// 返回(关节坐标最大绝对误差 rad,连杆位置最大误差 m,连杆转角最大误差
+/// rad,速度误差最大 m/s 或 rad/s;速度误差 = 关节速度/根线/根角取大)。
+///
+/// - 连杆位置/转角误差用**刚体位姿**逐个比较(`link_poses` 与
+///   `Robot.links` 同序;转角差 = 旋转差向量长度);
+/// - 关节速度误差读 `Multibody::generalized_velocity()`(公开只读口;
+///   `link.joint_velocity` 是 solver 每拍回写的字段,步进前恒 0,不适用)。
+pub fn measure_restore_error(
+    world: &PhysicsWorld,
+    robot: &Robot,
+    snap: &AgentSnapshot,
+) -> (f32, f32, f32, f32) {
+    let mut max_coord_err = 0.0f32;
+    let mut max_vel_err = 0.0f32;
+    for dof in 0..N_JOINTS {
+        let q = read_angle(&world.multibody_joints, robot, dof);
+        max_coord_err = max_coord_err.max((q - snap.joint_coords[dof]).abs());
+    }
+    let (mb_index, _) = robot.joints[0];
+    if let Some(mb) = world.multibody_joints.get_multibody(mb_index) {
+        let gv = mb.generalized_velocity();
+        for dof in 0..N_JOINTS {
+            let (_, link_id) = robot.joints[dof];
+            let aid = mb.link(link_id).expect("link alive").assembly_id();
+            max_vel_err = max_vel_err.max((gv[aid] - snap.joint_vels[dof]).abs());
+        }
+    }
+    let mut max_pos_err = 0.0f32;
+    let mut max_rot_err = 0.0f32;
+    for (lh, pose) in robot.links.iter().zip(&snap.link_poses) {
+        let rb = world.bodies.get(*lh).expect("link alive");
+        let d = rb.translation() - pose.translation;
+        max_pos_err = max_pos_err.max(d.length());
+        // 旋转差:两个单位四元数夹角的 2·|sin(θ/2)| ≈ 相对转角(小角下)。
+        let dq = rb.rotation() * pose.rotation.inverse();
+        let rot_err = 2.0 * Vector::new(dq.x, dq.y, dq.z).length();
+        max_rot_err = max_rot_err.max(rot_err);
+    }
+    let body = world.bodies.get(robot.body).expect("root alive");
+    let root_lin_err = (body.linvel() - snap.root_linvel).length();
+    let root_ang_err = (body.angvel() - snap.root_angvel).length();
+    (
+        max_coord_err,
+        max_pos_err,
+        max_rot_err,
+        max_vel_err.max(root_lin_err).max(root_ang_err),
+    )
+}

@@ -1,0 +1,100 @@
+name,frozen_drift_m,err_coord_rad,err_pos_m,err_rot_rad,err_vel,post_upy_min,post_max_vy,post_link_max,body_max_rise,vfwd,fell_tick,nan,panicked,panic_msg,freeze_us,state_hash
+control_stand,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,0.2841,0.0000,0,-,false,false,,0.0,6c15bba53f30913a
+control_walk_p06,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,0.2841,0.0000,0,-,false,false,,0.0,6c15bba53f30913a
+stand_kin_rst,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: KinematicPositionBased
+ right: Dynamic",0,0000000000000000
+stand_kin_z,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: KinematicPositionBased
+ right: Dynamic",0,0000000000000000
+stand_fixed_rst,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: Fixed
+ right: Dynamic",0,0000000000000000
+stand_fixed_z,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: Fixed
+ right: Dynamic",0,0000000000000000
+stand_kinroot_rst,1.867e-2,6.940e-2,1.867e-2,1.030e-1,1.0946,0.9964,0.0222,0.2841,0.0008,0,-,false,false,,9.6,12436f6529deb8a2
+stand_kinroot_z,1.867e-2,6.940e-2,1.867e-2,1.030e-1,1.0946,0.9964,0.0222,0.2841,0.0008,0,-,false,false,,7.6,12436f6529deb8a2
+stand_fixedroot_rst,3.925e-1,1.779e0,2.904e-1,1.239e0,1.3823,-1.0000,0.8030,4.9649,0.0000,0,43,false,false,,7.0,dbab5a4f300b5c69
+stand_fixedroot_z,3.925e-1,1.779e0,2.904e-1,1.239e0,1.3823,-1.0000,0.8030,4.9649,0.0000,0,43,false,false,,9.7,dbab5a4f300b5c69
+stand_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9983,0.0259,0.2841,0.0002,0,-,false,false,,105.2,08cd78052bbf7f8d
+stand_snap_z,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9984,0.0293,0.2841,0.0002,0,-,false,false,,67.4,6fa171eac91d13c0
+walk_p00_kinroot_rst,3.852e-2,1.880e-1,3.852e-2,1.896e-1,3.8679,0.9841,0.1942,2.0209,0.0102,0.4856869,-,false,false,,8.4,ce1cc5b008f8ec4a
+walk_p00_kinroot_z,3.852e-2,1.880e-1,3.852e-2,1.896e-1,3.8679,0.9841,0.1942,2.0209,0.0102,0.4856869,-,false,false,,7.0,ce1cc5b008f8ec4a
+walk_p00_fixedroot_rst,4.003e-1,1.984e0,2.896e-1,1.336e0,3.8795,-1.0000,0.8574,4.8519,0.0159,0.013628978,43,false,false,,7.8,885bf3f79fcf6883
+walk_p00_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9888,0.1840,2.0172,0.0088,0.48643652,-,false,false,,85.9,1fcd90403d285973
+walk_p01_kinroot_rst,6.724e-2,3.290e-1,6.724e-2,3.275e-1,5.5471,0.9752,0.1989,2.0248,0.0115,0.48935622,-,false,false,,7.1,20b1c331db208ce9
+walk_p01_kinroot_z,6.724e-2,3.290e-1,6.724e-2,3.275e-1,5.5471,0.9752,0.1989,2.0248,0.0115,0.48935622,-,false,false,,15.0,20b1c331db208ce9
+walk_p01_fixedroot_rst,4.068e-1,1.929e0,2.900e-1,1.354e0,5.5097,-0.9999,0.8652,4.8732,0.0200,0.0034903018,60,false,false,,7.6,80aebe24181114d8
+walk_p01_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9858,0.2776,2.0658,0.0102,0.4884109,-,false,false,,62.6,b8115779b3de4108
+walk_p02_kinroot_rst,4.556e-2,2.357e-1,4.556e-2,2.426e-1,6.3386,0.9797,0.2064,2.0251,0.0047,0.48478395,-,false,false,,9.3,5cb15221734626c6
+walk_p02_kinroot_z,4.556e-2,2.357e-1,4.556e-2,2.426e-1,6.3386,0.9797,0.2064,2.0251,0.0047,0.48478395,-,false,false,,6.6,5cb15221734626c6
+walk_p02_fixedroot_rst,3.908e-1,1.875e0,2.866e-1,1.354e0,6.7733,0.9784,0.4516,3.9922,0.0232,0.057698935,-,false,false,,7.2,836c9086d7659340
+walk_p02_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9895,0.2038,2.0172,0.0026,0.48532024,-,false,false,,56.7,e3751a79f1038565
+walk_p03_kinroot_rst,2.046e-2,1.318e-1,2.001e-2,1.348e-1,4.1658,0.9875,0.2041,2.0226,0.0023,0.47972435,-,false,false,,14.1,c5919322db57f8bd
+walk_p03_kinroot_z,2.046e-2,1.318e-1,2.001e-2,1.348e-1,4.1658,0.9875,0.2041,2.0226,0.0023,0.47972435,-,false,false,,14.8,c5919322db57f8bd
+walk_p03_fixedroot_rst,3.892e-1,1.946e0,2.848e-1,1.341e0,4.1569,-1.0000,0.7770,3.7621,0.0106,0.0055260207,41,false,false,,14.7,2330669299b72690
+walk_p03_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9927,0.1950,2.0286,0.0020,0.4825718,-,false,false,,92.1,a9c2d6d13a9ad290
+walk_p04_kinroot_rst,1.626e-2,9.707e-2,1.605e-2,1.006e-1,2.5818,0.9884,0.1885,2.0206,0.0050,0.47888628,-,false,false,,17.2,4af50ec12d4e6334
+walk_p04_kinroot_z,1.626e-2,9.707e-2,1.605e-2,1.006e-1,2.5818,0.9884,0.1885,2.0206,0.0050,0.47888628,-,false,false,,17.2,4af50ec12d4e6334
+walk_p04_fixedroot_rst,3.890e-1,1.984e0,2.848e-1,1.341e0,2.5729,-0.9999,0.8858,5.0762,0.0000,0.0076406295,26,false,false,,13.6,0152bf9a8f325170
+walk_p04_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9900,0.1884,2.0243,0.0024,0.48384494,-,false,false,,91.9,ecdcd1947476fdcb
+walk_p05_kinroot_rst,2.764e-2,1.013e-1,2.764e-2,1.436e-1,3.1042,0.9897,0.2053,2.0326,0.0089,0.4738704,-,false,false,,17.2,da22ff427df25fc2
+walk_p05_kinroot_z,2.764e-2,1.013e-1,2.764e-2,1.436e-1,3.1042,0.9897,0.2053,2.0326,0.0089,0.4738704,-,false,false,,23.6,da22ff427df25fc2
+walk_p05_fixedroot_rst,3.886e-1,2.031e0,2.811e-1,1.349e0,3.1204,-0.9999,0.8854,4.0861,0.0284,-0.0012920047,61,false,false,,15.1,4b548bd1e0c5f615
+walk_p05_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9893,0.1874,2.0228,0.0050,0.4839649,-,false,false,,146.6,8f4322a822add34f
+walk_p06_kinroot_rst,4.566e-2,2.036e-1,4.566e-2,2.175e-1,4.1662,0.9868,0.2052,2.0280,0.0073,0.47639847,-,false,false,,17.4,57ca7d465ad34361
+walk_p06_kinroot_z,4.566e-2,2.036e-1,4.566e-2,2.175e-1,4.1662,0.9868,0.2052,2.0280,0.0073,0.47639847,-,false,false,,20.9,57ca7d465ad34361
+walk_p06_fixedroot_rst,3.999e-1,1.995e0,2.872e-1,1.361e0,4.1777,-0.9996,1.0837,4.2575,0.0272,-0.007980129,60,false,false,,31.5,fba2b11b70bafbdd
+walk_p06_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9888,0.1918,2.0234,0.0064,0.4838885,-,false,false,,136.0,13b0ed1cb314a14f
+walk_p07_kinroot_rst,7.225e-2,3.400e-1,7.225e-2,3.430e-1,5.6167,0.9767,0.1981,2.0298,0.0098,0.48262978,-,false,false,,12.6,ab4b22dc7543539a
+walk_p07_kinroot_z,7.225e-2,3.400e-1,7.225e-2,3.430e-1,5.6167,0.9767,0.1981,2.0298,0.0098,0.48262978,-,false,false,,12.8,ab4b22dc7543539a
+walk_p07_fixedroot_rst,4.078e-1,1.937e0,2.890e-1,1.398e0,5.6202,-0.9999,0.9460,5.4514,0.0204,0.0017290215,43,false,false,,15.1,27f6da499e10ebe8
+walk_p07_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9878,0.3094,2.0233,0.0083,0.48397356,-,false,false,,154.7,c70d29930f86e980
+walk_p08_kinroot_rst,4.723e-2,2.397e-1,4.723e-2,2.402e-1,6.0009,0.9792,0.2045,2.0295,0.0042,0.4799539,-,false,false,,19.1,3f98b468d248c3e9
+walk_p08_kinroot_z,4.723e-2,2.397e-1,4.723e-2,2.402e-1,6.0009,0.9792,0.2045,2.0295,0.0042,0.4799539,-,false,false,,19.3,3f98b468d248c3e9
+walk_p08_fixedroot_rst,3.932e-1,1.881e0,2.865e-1,1.408e0,6.4239,-1.0000,0.8192,4.6110,0.0170,0.005617171,59,false,false,,19.6,5805a65b285da76a
+walk_p08_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9899,0.2210,2.0173,0.0010,0.4836609,-,false,false,,147.2,56dd35b1d96ac2d7
+walk_p09_kinroot_rst,2.081e-2,1.311e-1,1.864e-2,1.293e-1,4.1871,0.9852,0.1999,2.0282,0.0020,0.47480354,-,false,false,,16.3,bfcd28438797d7c1
+walk_p09_kinroot_z,2.081e-2,1.311e-1,1.864e-2,1.293e-1,4.1871,0.9852,0.1999,2.0282,0.0020,0.47480354,-,false,false,,17.3,bfcd28438797d7c1
+walk_p09_fixedroot_rst,3.772e-1,1.963e0,2.815e-1,1.390e0,4.1784,-0.9996,0.8942,4.9796,0.0190,0.012067465,75,false,false,,12.5,59fda3d3a9249280
+walk_p09_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9924,0.2021,2.0181,0.0007,0.4855499,-,false,false,,101.1,f951a75716a60094
+walk_p10_kinroot_rst,1.139e-2,7.807e-2,1.139e-2,8.409e-2,2.6123,0.9873,0.1962,2.0281,0.0059,0.47144562,-,false,false,,12.8,a38bb40cbfd74179
+walk_p10_kinroot_z,1.139e-2,7.807e-2,1.139e-2,8.409e-2,3.0776,0.9873,0.1962,2.0281,0.0059,0.47144562,-,false,false,,15.6,a38bb40cbfd74179
+walk_p10_fixedroot_rst,3.845e-1,2.005e0,2.819e-1,1.377e0,2.6036,-1.0000,0.7917,5.0367,0.0189,0.009375054,76,false,false,,14.0,b57e882095aa917a
+walk_p10_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9928,0.1898,2.0200,0.0027,0.4857377,-,false,false,,143.9,98d9af38abbf15c9
+walk_p11_kinroot_rst,2.277e-2,9.581e-2,2.277e-2,1.241e-1,2.9367,0.9894,0.2231,2.0184,0.0100,0.47141272,-,false,false,,13.1,8b1144aa41acc51b
+walk_p11_kinroot_z,2.277e-2,9.581e-2,2.277e-2,1.241e-1,2.9367,0.9894,0.2231,2.0184,0.0100,0.47141272,-,false,false,,10.9,8b1144aa41acc51b
+walk_p11_fixedroot_rst,3.913e-1,2.037e0,2.854e-1,1.355e0,2.9529,-1.0000,0.8065,3.9866,0.0162,0.022882052,49,false,false,,11.2,427f183f57472835
+walk_p11_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9930,0.1829,2.0200,0.0062,0.48578534,-,false,false,,98.8,8a090a79ac98dc2f
+walk_p00_kin_rst,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: KinematicPositionBased
+ right: Dynamic",0,0000000000000000
+walk_p00_fixed_rst,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: Fixed
+ right: Dynamic",0,0000000000000000
+pile_kinroot_rst,1.911e-2,7.196e-2,1.911e-2,1.032e-1,1.1073,0.9953,0.0395,1.4299,0.0021,0,-,false,false,,15.4,a89f050eb0be5151
+pile_kinroot_z,1.911e-2,7.196e-2,1.911e-2,1.032e-1,1.1073,0.9953,0.0395,1.4299,0.0021,0,-,false,false,,14.0,a89f050eb0be5151
+pile_fixedroot_rst,3.911e-1,1.779e0,2.894e-1,1.247e0,1.3671,0.2173,0.9025,3.9691,0.0000,0,27,false,false,,13.3,b6579781429cc926
+pile_fixedroot_z,3.911e-1,1.779e0,2.894e-1,1.247e0,1.3671,0.2173,0.9025,3.9691,0.0000,0,27,false,false,,15.7,b6579781429cc926
+pile_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9948,0.0339,1.4299,0.0012,0,-,false,false,,195.6,faf5d2e14aed351c
+pile_snap_z,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9947,0.0304,1.4299,0.0012,0,-,false,false,,151.5,64dd51b60f239e0a
+pressed_kinroot_rst,3.845e-2,1.423e-1,3.644e-2,1.972e-1,1.2795,0.9537,1.0074,1.0140,0.0000,0,-,false,false,,13.4,c8945e5e92bb7202
+pressed_fixedroot_rst,3.928e-1,1.780e0,2.906e-1,1.237e0,1.3513,-0.7252,0.8484,4.0781,0.0000,0,-,false,false,,13.8,f0c5763822023330
+pressed_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9983,0.0273,0.2841,0.0001,0,-,false,false,,137.0,c9859f9e31c3e50c
+falling_kinroot_rst,5.371e-3,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.5124,0.0000,0,-,false,false,,0.4,ef88562bf1a7775b
+falling_fixedroot_rst,3.777e-1,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.5124,0.0000,0,-,false,false,,0.6,ef88562bf1a7775b
+falling_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.5124,0.0000,0,-,false,false,,73.0,464b589dad2d5b33
+hit_kinroot_rst,4.675e-1,6.941e-2,1.867e-2,1.030e-1,1.0946,0.9964,0.0222,0.2841,0.0008,0,-,false,false,,28.7,84815047989cc6db
+hit_fixedroot_rst,3.922e-1,1.779e0,2.907e-1,1.239e0,1.4141,-1.0000,0.8098,5.0453,0.0000,0,-,false,false,,15.8,5f0ce298a3ce5704
+hit_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9983,0.0262,0.2841,0.0002,0,-,false,false,,160.2,eccdb33f0e2a87db
+suprm_kinroot_rst,5.298e-2,2.079e-1,5.119e-2,2.406e-1,1.3923,0.7217,4.3778,4.4799,0.0000,0,-,false,false,,25.5,bc80cbaf187d0248
+suprm_fixedroot_rst,3.911e-1,1.778e0,2.893e-1,1.247e0,1.3707,0.7281,4.2108,4.7556,0.0000,0,-,false,false,,14.1,df5d6161fb62441a
+suprm_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,-0.9996,4.2231,4.4540,0.0000,0,-,false,false,,162.8,e17d0d7e8b8517ed
+stand_long_kinroot_rst,1.867e-2,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,0.2841,0.0000,0,-,false,false,,0.6,45915d9794ef9c62
+walk_p06_long_kinroot_rst,4.566e-2,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.6277,0.0000,0.08312227,-,false,false,,0.7,4ec51e6709751b4a
+stand_long_fixedroot_rst,3.925e-1,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,0.2841,0.0000,0,-,false,false,,0.7,45915d9794ef9c62
+walk_p06_long_fixedroot_rst,3.999e-1,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.6277,0.0000,0.08312227,-,false,false,,0.8,4ec51e6709751b4a
+stand_long_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,0.2841,0.0000,0,-,false,false,,107.7,0dc78e707056f182
+walk_p06_long_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,1.0000,0.0000,1.6277,0.0000,0.08312227,-,false,false,,91.5,e4c13db54bbe25ca
+eight_kin_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9964,0.0235,0.2843,0.0000,0,-,false,false,,7.3,41a4dccd9a3a718e

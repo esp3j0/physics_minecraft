@@ -1,0 +1,6 @@
+stand_kin_rst,-,-,-,-,-,-,-,-,-,-,-,false,true,"assertion `left == right` failed: A rigid-body that is not at the root of a multibody must be dynamic.
+  left: KinematicPositionBased
+ right: Dynamic",0,0000000000000000 | 0.0s
+determinism: stand_kin_rst -> IDENTICAL
+walk_p06_snap_rst,0.000e0,0.000e0,0.000e0,0.000e0,0.0000,0.9888,0.1918,2.0234,0.0064,0.4838885,-,false,false,,92.0,13b0ed1cb314a14f | 0.1s
+determinism: walk_p06_snap_rst -> IDENTICAL
