@@ -1,0 +1,17 @@
+/target/
+/out/*
+!out/*.csv
+!out/*.txt
+!out/*.log
+!out/s0_policy.onnx
+!out/s1_policy.onnx
+!out/s2_hz60_policy.onnx
+!out/s1_l5_ft_policy.onnx
+!out/s0_policy.toml
+!out/s1_policy.toml
+!out/s2_hz60_policy.toml
+!out/s1_l5_ft_policy.toml
+!out/l3_s1_torch_obs.bin
+!out/l3_s1_torch_out.bin
+!out/l3_l5_torch_obs.bin
+!out/l3_l5_torch_out.bin

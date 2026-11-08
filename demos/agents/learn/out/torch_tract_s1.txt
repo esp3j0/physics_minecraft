@@ -1,0 +1,3 @@
+n,1000
+max_abs_diff,4.768e-7
+nan,false

@@ -1,0 +1,29 @@
+# REQ-012 §5.2 策略包(ARM 任务;demo learn R2 导出)
+body_hash = "arm-demo"
+control_hz = 30
+obs_layout = [
+  "q1_sin",
+  "q1_cos",
+  "q2_sin",
+  "q2_cos",
+  "q1_vel",
+  "q2_vel",
+  "target_x",
+  "target_y",
+  "tip_x",
+  "tip_y",
+  "target_minus_tip_x",
+  "target_minus_tip_y",
+  "last_act1",
+  "last_act2",
+]
+act_dim = 2
+act_scale = 0.05
+act_mode = "incremental"
+joint_limit_rad = 2.967060
+norm = "obs_mean[14] | obs_inv_std[14](f32)"
+obs_mean = [0.11228023, 0.94175008, -0.15499027, 0.93897452, 0.04130112, -0.044499413, -0.041809046, 0.0012027137, 0.035008103, -0.93855915, -0.076817143, 0.93976186, 0.020857621, -0.021878557]
+obs_inv_std = [3.2758527, 11.693052, 3.3907181, 11.683761, 0.73319636, 1.25862, 2.2002756, 2.0151973, 3.5588306, 11.033618, 2.0708998, 1.984694, 1.7885438, 1.8066709]
+hidden_act = "tanh"
+onnx_inputs = "obs[1,12](归一化后)"
+onnx_outputs = "action[1,2]"

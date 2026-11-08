@@ -1,0 +1,7 @@
+# REQ-012 A00-5 R2:tools/train 依赖(锁定版本;只装 CPU 版 torch)。
+# 安装方式(R2 放行):torch 用 --index-url https://download.pytorch.org/whl/cpu,
+# 其余用 PyPI;全部装进 tools/train/.venv,不动系统 Python。
+torch==2.15.0
+numpy==2.5.4
+gymnasium==1.4.0
+maturin==1.16.0

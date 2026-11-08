@@ -1,0 +1,32 @@
+[package]
+name = "learn-demo"
+version = "0.1.0"
+edition = "2021"
+
+default-run = "learn"
+
+[lib]
+name = "learn_env"
+path = "src/lib.rs"
+# rlib 给 `learn` 二进制用;cdylib 给 maturin(--features pyo3)装进 venv 用。
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "learn"
+path = "src/main.rs"
+
+[features]
+# PyO3 Python 模块(maturin develop --release 经 pyproject.toml 启用)。
+# 二进制默认不启用:不链接 Python,workspace 门禁不受影响。
+pyo3 = ["dep:pyo3", "dep:numpy", "dep:ndarray"]
+
+[dependencies]
+rapier3d = { version = "=0.36.1", features = ["serde-serialize"] }
+rand = "0.9"
+rand_chacha = "0.9"
+tract-onnx = "0.23.10"
+pyo3 = { version = "0.24", optional = true, features = ["extension-module"] }
+numpy = { version = "0.24", optional = true }
+ndarray = { version = "0.16", optional = true }
+
+[workspace]

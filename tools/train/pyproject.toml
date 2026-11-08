@@ -1,0 +1,17 @@
+# learn_env PyO3 模块(maturin 装 tools/train/.venv)。
+# 真正的 crate 在 ../demos/agents/learn(pyproject 放这里是为了 maturin
+# 的 manifest 路径约定;R2 补充:venv 在 tools/train/.venv)。
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "learn_env"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.maturin]
+manifest-path = "../../demos/agents/learn/Cargo.toml"
+# cdylib 特性:crate 里 PyO3 模块挂在 pyo3 feature 下。
+features = ["pyo3"]
+module-name = "learn_env"
