@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """从 out/ 提交数据计算 README 的全部总结数字。
 
-A00-4 数据要求(放行):按完整名字段筛行,不用子串;CSV 列头与数据列数
-一致(脚本断言);对照/基线行不做被测的操作;判据没过门槛不打 ✅。
+A00-4 R1 数据要求(放行):按完整名字段筛行,不用子串;CSV 列头与数据列数
+一致(脚本断言);对照/基线行不做被测的操作;判据没过门槛不打 ✅;
+数字范围覆盖全部行,不挑行;算不出的写 "-"。
 用法:python scripts/summary.py  (在 demos/agents/capsule/ 下运行)
 """
 from __future__ import annotations
@@ -73,8 +74,7 @@ def main() -> int:
               if r["speed_target"] == sp]
         ok = sum(1 for e in es if e <= 5.0)
         print(f"== sweepA s{sp} == err min={min(es):.2f}% "
-              f"max(排除 no-move)={max([e for e in es if e < 99]):.2f}% "
-              f"(no-move {sum(1 for e in es if e >= 99)} 行);≤5% {ok}/{len(es)}")
+              f"max={max(es):.2f}% ≤5% {ok}/{len(es)}")
 
     # ── 候选 ──
     cands: dict[str, dict[str, str]] = {}
@@ -95,6 +95,8 @@ def main() -> int:
     print("panic 行:", panic_rows if panic_rows else "无")
     nan_rows = [r["name"] for r in rows if r["nan"] == "true"]
     print("NaN 行:", nan_rows if nan_rows else "无")
+    ood_rows = [r["name"] for r in rows if r["end_reason"] == "out_of_domain"]
+    print("out_of_domain 行:", ood_rows if ood_rows else "无")
 
     def sel(pred) -> list[dict]:
         return [r for r in rows if pred(r["name"])]
@@ -109,11 +111,20 @@ def main() -> int:
         print(f"== 判据1 [{tag}] == 行 {len(w)} err max={emax:.2f}% "
               f">5% {len(bad)} 行")
         for sp, lbl in (("s1p5", "1.5"), ("s4p3", "4.3"), ("s5p6", "5.6")):
-            sub = [r for r in w if f"_{sp}_h" in r["name"]]
-            es = [f(r["speed_err_pct"]) for r in sub]
-            okn = sum(1 for e in es if e <= 5.0)
-            print(f"== 判据1 [{tag}] s{lbl} == err "
-                  f"{min(es):.2f}–{max(es):.2f}% ≤5% {okn}/{len(es)}")
+            for tt in ("T0", "T1"):
+                sub = [r for r in w if f"_{tt}_{sp}_h" in r["name"]]
+                es = [f(r["speed_err_pct"]) for r in sub]
+                okn = sum(1 for e in es if e <= 5.0)
+                print(f"== 判据1 [{tag}] {tt} s{lbl} == err "
+                      f"{min(es):.2f}–{max(es):.2f}% ≤5% {okn}/{len(es)}")
+        # 判据 1 附:ground_frac(两种判定方式都报,R1/第 2 条)
+        for tt, sp in (("T0", "s1p5"), ("T0", "s4p3"), ("T0", "s5p6"),
+                       ("T1", "s1p5"), ("T1", "s4p3"), ("T1", "s5p6")):
+            sub = [r for r in w if f"_{tt}_{sp}_h" in r["name"]]
+            gf = [f(r["ground_frac"]) for r in sub]
+            print(f"== ground_frac [{tag}] {tt} {sp} == "
+                  f"min={min(gf):.4f} max={max(gf):.4f} "
+                  f"==1.0000 {sum(1 for g in gf if g == 1.0)}/{len(gf)}")
         # 判据 2:台阶
         for lbl, pre in (("1run", "step_1run_"), ("1stand", "step_1stand_"),
                          ("2run", "step_2run_"), ("2stand", "step_2stand_")):
@@ -138,20 +149,50 @@ def main() -> int:
             print(f"== 判据4 [{tag}] == {r['name']}: drift={r['drift_m']} m "
                   f"sink={r['sink_m']} m sleep_ratio={r['sleep_ratio']} "
                   f"slept={r['slept']}")
-        # 判据 5:接缝(8 航向)
-        sm = sel(lambda n: n.startswith("seam_h") and n.endswith(sfx))
-        stuck_rows = [r["name"] for r in sm if r["stuck"] == "true"]
-        vy_max = max(f(r["vy_peak"]) for r in sm)
-        dips = [f(r["dip_pct"]) for r in sm if r["dip_pct"] != "-"]
-        fell = [r["name"] for r in sm if r["end_reason"] != "completed"]
-        print(f"== 判据5 [{tag}] == 行 {len(sm)} 卡住: "
-              f"{stuck_rows if stuck_rows else '无'} vy_peak max={vy_max:.4f} "
-              f"dip max={max(dips):.2f}% 提前结束: "
-              f"{fell if fell else '无'}")
-        # 场景 6:方块堆
+        # 判据 5:接缝(R1/CR7:三档速度 × 8 航向 × fix 开/关;按 fix1 判)
+        for spd in ("s1p5", "s4p3", "s5p6"):
+            for fx in ("fix1", "fix0"):
+                sm = sel(lambda n: n.startswith(f"seam_{spd}_h")
+                         and f"_{fx}_" in n and n.endswith(sfx))
+                if not sm:
+                    continue
+                stuck_rows = [r["name"] for r in sm if r["stuck"] == "true"]
+                vy_max = max(f(r["vy_peak"]) for r in sm)
+                dips = [f(r["dip_pct"]) for r in sm if r["dip_pct"] != "-"]
+                dip_max = max(dips) if dips else float("nan")
+                snaps = sum(int(r["edge_snaps"]) for r in sm)
+                ends: dict[str, int] = {}
+                for r in sm:
+                    ends[r["end_reason"]] = ends.get(r["end_reason"], 0) + 1
+                gf = [f(r["ground_frac"]) for r in sm]
+                print(f"== 判据5 [{tag}] {spd} {fx} == 行 {len(sm)} "
+                      f"卡住: {stuck_rows if stuck_rows else '无'} "
+                      f"vy_peak max={vy_max:.4f} dip max={dip_max:.2f}% "
+                      f"edge_snaps 合计={snaps} "
+                      f"ground_frac min={min(gf):.4f} "
+                      f"end={ends}")
+        # 接缝 fix1 vs fix0 对照(同速度同航向逐行 vy_peak 差)
+        for spd in ("s1p5", "s4p3", "s5p6"):
+            by = {}
+            for r in sel(lambda n: n.startswith(f"seam_{spd}_h")
+                         and n.endswith(sfx)):
+                head, fx, _tag = r["name"].rsplit("_", 2)
+                h = head.split("_h")[1]
+                by.setdefault(fx, {})[h] = r
+            f1, f0 = by.get("fix1", {}), by.get("fix0", {})
+            diffs = [f(v0["vy_peak"]) - f(v1["vy_peak"])
+                     for h, v1 in f1.items() if (v0 := f0.get(h))]
+            if diffs:
+                print(f"== 判据5对照 [{tag}] {spd} == fix0−fix1 vy_peak 差 "
+                      f"min={min(diffs):+.4f} max={max(diffs):+.4f} "
+                      f"(正 = 关钩子更糟)")
+
+        # 场景 6:方块堆(R1/第 10 条:pile_land 两列)
         for r in sel(lambda n: n.startswith("pile_") and n.endswith(sfx)):
             print(f"== 场景6 [{tag}] == {r['name']}: disp={r['block_disp_max']} "
-                  f"woken={r['blocks_woken']} vy_peak={r['vy_peak']}")
+                  f"woken={r['blocks_woken']} vy_peak={r['vy_peak']} "
+                  f"pile_land_pen={r['pile_land_pen']} "
+                  f"pile_land_vy={r['pile_land_vy']}")
         # 场景 6b:推方块
         for r in sel(lambda n: n == f"push_one_{tag}"):
             print(f"== 场景6b [{tag}] == disp={r['block_disp_max']}")

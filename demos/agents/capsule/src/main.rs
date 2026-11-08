@@ -1,4 +1,4 @@
-//! REQ-012 A00-4 demo `capsule`(2026-11-07)。
+//! REQ-012 A00-4 demo `capsule`(2026-11-07,R1 返修)。
 //!
 //! 问题(放行原文):玩家的单连杆胶囊能不能走得稳、跳得准?行走控制器(§2.2)
 //! 的参数取多少?胶囊被砸、站在方块堆上、走过 chunk 接缝时会不会出问题?
@@ -8,35 +8,50 @@
 //!
 //! 身体(放行):总高 1.8 m、半径 0.3 m 的 y 向胶囊(`capsule_y(0.6, 0.3)`,
 //! 2·(0.6+0.3) = 1.8),质量 0.8,`lock_rotations()`,朝向按意图 yaw 直接
-//! `set_rotation`(只在变化时写,允许入睡)。摩擦是矩阵参数,restitution 0
+//! `set_rotation`(只在变化时写,允许入睡)。摩擦是矩阵参数,与地面按
+//! **Min 规则**合成(R1/CR1:胶囊侧 `friction_combine_rule(Min)` 优先于
+//! 地面默认 Average,合成有效值 = min(μ, 对方)),restitution 0
 //! (放行未列,取 0,README 写明)。
 //!
 //! 控制器(§2.2,只用力和冲量,不直接设速度):
 //! - 水平力 `F = clamp(m·(v_target − v_h)/τ, F_max)`;空中乘 `air`;
 //! - 跳跃冲量只在接地时生效:先把竖直速度清零,再加 `m·sqrt(2 g h_jump)`;
-//! - 控制周期 2 拍(30 Hz,D10 默认);力在非控制拍**重施加**(rapier 的力
-//!   每步后清零,不重施加等于 30 Hz 决策的力被减半);`|F| < 0.01 N` 不施加
-//!   (允许入睡,站立判据依赖);
+//! - 控制周期 2 拍(30 Hz,D10 默认);rapier 0.36.1 的 `add_force`
+//!   **不自动清零**(持续生效到 `reset_forces`)→ 每拍先 `reset_forces`
+//!   再施加本次;`|F| < 0.01 N` 不施加(允许入睡,站立判据依赖);
 //! - 接地判定两种都实现并在矩阵比较:射线(胶囊底部向下,行程 ground_eps)
-//!   与形状投射(整个胶囊下扫 ground_eps);命中面法线 y ≥ 0.7 才算接地。
+//!   与球投射(半径 CAP_R − 0.02 的球,从下半球球心上方 5 mm 下扫
+//!   ground_eps + 0.02 + 0.005,R1/CR2);命中面法线 y ≥ 0.7 才算接地。
 //!
-//! 场景(README 有逐条判据):平地行走 / 站立 / 台阶 / 空中连按跳 / 接缝 /
-//! 方块堆+推方块 / 被砸 / 重物(无防护 + V_GUARD=200)/ 连杆顺序对照 / det。
+//! 接缝修正钩子(R1/CR3):胶囊碰撞体挂 `MODIFY_SOLVER_CONTACTS`,
+//! 每拍 `step_with_events` 步进;钩子把"推测接触打在下一个 chunk 碰撞体
+//! 顶边"的斜法线摆成竖直(条件:法线 |n.y| ∈ [0.7, 0.99999)、对固定
+//! 刚体、全部接触点在地形一侧的 y 都在胶囊底部 ±3 cm 内),dist 改成
+//! 竖直间隙。`edgefix=off` 只用于接缝对照行。
+//!
+//! 场景(README 有逐条判据):平地行走 / 站立 / 台阶(d = 胶囊表面到台阶面
+//! 的间隙,R1/CR5) / 空中连按跳 / 接缝(三档速度 × 8 航向 × fix 开关,
+//! R1/CR7) / 方块堆+推方块 / 被砸 / 重物(无防护 + V_GUARD=200) /
+//! 连杆顺序对照 / det。T1 域扩到装下全部航向全速度完整路径 + 16 m 余量
+//! (R1/CR4),`end_reason` 区分 `out_of_domain` 与 `fell`。
 //!
 //! 流程:`sweep`(平地 648 全组合 × 3 速度 + 1 格台阶 h_jump 扫描,机械规则
 //! 选 3 套候选写 `out/cands.txt`)→ `matrix`(候选跑全部场景)→ `det`
 //! (全矩阵双跑逐行哈希)。提交件 = `*_submitted.txt`(手动拷贝,不覆盖)。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Instant;
 
 use physics_sim::collider_build::{greedy_colliders, BoxCollider, NeighborChunks};
 use quad::{production_params, yaw_quat, GROUND_FRICTION, GROUND_RESTITUTION};
-use rapier3d::dynamics::{RigidBodyBuilder, RigidBodyHandle};
+use rapier3d::dynamics::{CoefficientCombineRule, RigidBodyBuilder, RigidBodyHandle};
 use rapier3d::geometry::{ColliderBuilder, ColliderHandle, PairContacts, Ray, SharedShape};
 use rapier3d::math::{Pose, Vector};
 use rapier3d::parry::query::ShapeCastOptions;
-use rapier3d::pipeline::{PhysicsWorld, QueryFilter};
+use rapier3d::pipeline::{
+    ActiveHooks, ContactModificationContext, PhysicsHooks, PhysicsWorld, QueryFilter,
+};
 use types::{ChunkPos, WorldSeed};
 use voxel::{BlockRegistry as _, WorldGenerator as _};
 use voxel::{Chunk, SimpleRegistry, Superflat};
@@ -55,12 +70,15 @@ const CAP_MASS: f32 = 0.8;
 const GROUND_TOP: f32 = 0.0;
 /// T1 体素地面顶面(Superflat classic,同 terrain/migrate:世界 y = −60)。
 const GROUND_TOP_T1: f32 = -60.0;
-/// T1 域:chunk x ∈ −2..22(世界 x −32..352)、z ∈ −6..=5(世界 z −96..96)。
-/// 8 航向 × 5.6 m/s × 1500 拍的最远点 (x≈+105, z≈±90) 都在域内。
-const CHUNK_X_LO: i32 = -2;
-const CHUNK_X_HI: i32 = 22;
-const CHUNK_Z_LO: i32 = -6;
-const CHUNK_Z_HI: i32 = 5;
+/// T1 域(R1/CR4:扩到装下全部航向 × 全速度完整路径含制动 + ≥16 m 余量)。
+/// 最远路径:5.6 m/s × 1080 拍意图 = 100.8 m + 制动 ~1 m。8 航向各分量
+/// 最大 ~101 m → 出生 ±101 m 再 +16 m 余量 = 世界 x ∈ [−120, 280]、
+/// z ∈ [−120, 120]。chunk 16 m:z −8..=8(z −128..144)、x −8..=18
+/// (x −128..304)。
+const CHUNK_X_LO: i32 = -8;
+const CHUNK_X_HI: i32 = 19;
+const CHUNK_Z_LO: i32 = -8;
+const CHUNK_Z_HI: i32 = 9;
 /// T1 出生点:x=160 = 16×10、z=0 都是 chunk 边界——出生点正好是 4-chunk 角,
 /// h0/h180 沿 z=0 缝走、h90/h270 沿 x=160 缝走(放行"包括正好沿接缝走")。
 const T1_SPAWN_X: f32 = 160.0;
@@ -69,8 +87,15 @@ const T1_SPAWN_X: f32 = 160.0;
 const STEP_FACE_X: f32 = 6.0;
 /// 台阶成功判定的 x 上界(台深 8:面 6 → 尾 14)。
 const STEP_TAIL_X: f32 = 14.0;
-/// 接缝/行走场景速度(接缝场景放行未指定速度,取中档 4.3,README 写明)。
+/// 接缝场景三档速度(R1/CR7)。
+const SEAM_SPEEDS: [f32; 3] = [1.5, 4.3, 5.6];
+/// 接缝/行走场景默认速度(行走/顺序场景用中档)。
 const SEAM_SPEED: f32 = 4.3;
+/// 球投射(R1/CR2):半径 = CAP_R − 0.02,起点 = 下半球球心上方 5 mm,
+/// 行程 = ground_eps + 0.02 + 0.005。
+const BALL_CAST_R: f32 = CAP_R - 0.02;
+/// 接缝钩子(R1/CR3):接触点在地形一侧 y 与胶囊底部差 ≤ 此值才算共面缝。
+const EDGE_BAND: f32 = 0.03;
 /// 卡住判定:连续 30 拍水平速度 < 目标的 50%。
 const STUCK_TICKS: u32 = 30;
 /// 制动停止阈值。
@@ -127,7 +152,7 @@ struct Params {
     tau: f32,
     /// 力上限倍数(× m·g)。
     fmax_mul: f32,
-    /// 胶囊摩擦系数(与地面 0.6 按默认 average 规则合成)。
+    /// 胶囊摩擦系数(与对方按 Min 规则合成,有效值 = min(μ, 对方))。
     mu: f32,
     /// 空中力系数。
     air: f32,
@@ -135,8 +160,15 @@ struct Params {
     h_jump: f32,
     /// 接地判定距离(m)。
     ground_eps: f32,
-    /// true = 形状投射,false = 射线。
+    /// true = 球投射,false = 射线。
     shape_cast: bool,
+}
+
+/// R1/CR7:接缝场景的 edgefix 开关(true = 钩子开,false = 对照行)。
+#[derive(Clone, Copy, PartialEq)]
+enum EdgeFix {
+    Fix1,
+    Fix0,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -150,8 +182,8 @@ enum Scene {
     },
     /// 场景 2:站立 3600 拍(零意图 = 控制器目标速度 0,主动保持)。
     Stand { t1: bool },
-    /// 场景 3:台阶(height 1|2;run = 跑动起跳;d = 按跳距离(中心到面);
-    /// trial = 微扰号)。
+    /// 场景 3:台阶(height 1|2;run = 跑动起跳;d = 胶囊表面到台阶面的
+    /// 间隙(R1/CR5);trial = 微扰号)。
     Step {
         height: i32,
         run: bool,
@@ -160,8 +192,13 @@ enum Scene {
     },
     /// 场景 4:空中连按跳(repeat)/ 单次跳对照。
     AirJump { repeat: bool },
-    /// 场景 5:接缝(出生 (160,0) = 4-chunk 角,8 航向)。
-    Seam { heading: usize },
+    /// 场景 5:接缝(R1/CR7:出生 (160,0) = 4-chunk 角,三档速度 × 8 航向
+    /// × edgefix 开/关;fix0 = 对照行)。
+    Seam {
+        speed: f32,
+        heading: usize,
+        fix: EdgeFix,
+    },
     /// 场景 6:方块堆(layers 1|2,已睡着,自动连跳走过去)。
     Pile { layers: i32 },
     /// 场景 6b:推一块静止(睡着)单格方块,只报位移。
@@ -174,6 +211,16 @@ enum Scene {
     /// 场景 9:连杆顺序对照(主体之前插入 16 个会睡着的刚体;ball = migrate
     /// 式 1 cm 球、醒着落地后入睡;否则 = 放行字面:无碰撞体、出生即睡)。
     Order { ball: bool, heading: usize },
+}
+
+impl Scene {
+    /// 跑在 T1 体素域上的场景(域断言用)。
+    fn t1_domain(&self) -> bool {
+        matches!(
+            self,
+            Scene::Walk { t1: true, .. } | Scene::Seam { .. } | Scene::Stand { t1: true }
+        )
+    }
 }
 
 struct Cfg {
@@ -284,6 +331,11 @@ fn spawn_capsule(
         ColliderBuilder::capsule_y(HALF_H, CAP_R)
             .mass(CAP_MASS)
             .friction(p.mu)
+            // R1/CR1:Min 优先于地面默认 Average → 合成 μ_eff = min(μ, 0.6)。
+            .friction_combine_rule(CoefficientCombineRule::Min)
+            // R1/CR3:接缝修正钩子挂在胶囊碰撞体上(edgefix=off 时世界照跑,
+            // 钩子在步进侧判断开关)。
+            .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
             .restitution(0.0),
     );
     (body, collider)
@@ -311,6 +363,124 @@ fn spawn_block(
             .friction(0.6)
             .restitution(0.1),
     )
+}
+
+// ── 接缝修正钩子(R1/CR3) ────────────────────────────────────────────────
+
+/// 把"推测接触打在下一个 chunk 碰撞体顶边"的斜法线摆成竖直。探针实测
+/// (验收 CR3):跨 chunk 边界时前方 chunk 顶边进入预测距离,生成法线
+/// (0, 0.957, 0.290) 的倾斜接触,solver 挡住沿法线的接近速度 → 竖直
+/// 速度 1.54 m/s 腾空 ~20 拍。条件全满足时把法线摆成 (0,±1,0)、dist 改
+/// 竖直间隙。只处理胶囊对固定刚体(地形);动态方块不处理。
+/// `PhysicsHooks: MaybeSync`(默认要求 `Sync`,demo 不开 `unsync-callbacks`):
+/// 内部用原子类型记开关与本拍摆正次数。
+struct EdgeFixHooks {
+    cap_collider: AtomicU32,
+    cap_gen: AtomicU32,
+    enabled: AtomicBool,
+    /// 本拍被摆正的流形次数(每拍步进前清零,步进后采样)。
+    fixed: AtomicU32,
+}
+
+impl EdgeFixHooks {
+    fn set_cap(&self, h: ColliderHandle) {
+        let (idx, gen) = h.into_raw_parts();
+        // 索引与代数各占一半(u32 对,合存 u64 不必要:demo 单世界、代数增量小)。
+        self.cap_collider.store(idx, Ordering::Relaxed);
+        self.cap_gen.store(gen, Ordering::Relaxed);
+    }
+
+    fn cap(&self) -> ColliderHandle {
+        ColliderHandle::from_raw_parts(
+            self.cap_collider.load(Ordering::Relaxed),
+            self.cap_gen.load(Ordering::Relaxed),
+        )
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    fn reset_fixed(&self) {
+        self.fixed.store(0, Ordering::Relaxed);
+    }
+
+    fn take_fixed(&self) -> u32 {
+        self.fixed.load(Ordering::Relaxed)
+    }
+
+    fn bump_fixed(&self) {
+        self.fixed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl PhysicsHooks for EdgeFixHooks {
+    fn modify_solver_contacts(&self, ctx: &mut ContactModificationContext) {
+        if !self.enabled() {
+            return;
+        }
+        let cap = self.cap();
+        let cap1 = ctx.collider1 == cap;
+        let cap2 = ctx.collider2 == cap;
+        if !(cap1 || cap2) {
+            return;
+        }
+        // 只处理胶囊对固定刚体(地形 compound);动态方块不处理。
+        let other_handle = if cap1 {
+            ctx.rigid_body2
+        } else {
+            ctx.rigid_body1
+        };
+        let other_fixed = other_handle
+            .and_then(|h| ctx.bodies.get(h))
+            .is_some_and(|rb| rb.is_fixed());
+        if !other_fixed {
+            return;
+        }
+        // 胶囊底部 y(先取:rigid_mut 可变借用 ctx 后不能再读 ctx 字段)。
+        let cap_handle = if cap1 {
+            ctx.rigid_body1
+        } else {
+            ctx.rigid_body2
+        };
+        let Some(cap_y) = cap_handle
+            .and_then(|h| ctx.bodies.get(h))
+            .map(|rb| rb.translation().y)
+        else {
+            return;
+        };
+        let rigid = match ctx.rigid_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let ny = rigid.normal.y;
+        // 斜向上(|n.y| ≥ 0.7)但不是竖直:共面缝的推测接触特征。
+        if ny.abs() < 0.7 || ny.abs() >= 0.99999 {
+            return;
+        }
+        let cap_bottom = cap_y - HALF_H - CAP_R;
+        // 全部接触点在地形一侧的 y 都在胶囊底部 ±3 cm 以内(共面接缝,
+        // 不是台阶边):台阶边的接触点在地形侧 y 跨度大,不满足。
+        let in_band = rigid.solver_contacts.iter().all(|sc| {
+            // 锚点在钩子内是世界空间;地形侧 = 与胶囊相反的一侧。
+            let terrain_pt = if cap1 { sc.anchor2 } else { sc.anchor1 };
+            (terrain_pt.y - cap_bottom).abs() <= EDGE_BAND
+        });
+        if !in_band {
+            return;
+        }
+        // 法线摆成竖直(符号同原法线 y);dist 改成竖直间隙。
+        let sign = ny.signum();
+        *rigid.normal = Vector::new(0.0, sign, 0.0);
+        for sc in rigid.solver_contacts.iter_mut() {
+            let (a1, a2) = (sc.anchor1, sc.anchor2);
+            let cap_pt = if cap1 { a1 } else { a2 };
+            let terrain_pt = if cap1 { a2 } else { a1 };
+            let vert_gap = cap_pt.y - terrain_pt.y;
+            sc.dist = (vert_gap * sign).max(sc.dist.min(0.0));
+        }
+        self.bump_fixed();
+    }
 }
 
 fn hash_f32(h: u64, v: f32) -> u64 {
@@ -380,31 +550,34 @@ fn build_terrain_t1(world: &mut PhysicsWorld) -> Vec<ColliderHandle> {
 
 /// 返回 Some(命中面法线 y) = 行程内有命中;调用方判 ny ≥ 0.7。
 /// 射线从胶囊底部上提 5 mm 起点向下(resting 时 toi≈0 的法线不可靠,故上提);
-/// 形状投射用整胶囊下扫(stop_at_penetration = true 使 resting 也命中)。
+/// 球投射(R1/CR2):半径 CAP_R − 0.02 的球,从下半球球心上方 5 mm 向下,
+/// 行程 ground_eps + 0.02 + 0.005——验收实证整胶囊投射在贴地行走时
+/// 614/1500 拍返回 None、481 拍法线 y≈0(推测接触把整胶囊判离地),
+/// 小球只测底弧正下方,贴地静止/行走都稳定命中。
 fn ground_ny(
     world: &PhysicsWorld,
     cap_collider: ColliderHandle,
     pos: Vector,
     p: &Params,
-    cap_shape: &SharedShape,
+    ball_shape: &SharedShape,
 ) -> Option<f32> {
     let lift = 0.005;
-    let max_d = p.ground_eps + lift;
     let filter = QueryFilter::default().exclude_collider(cap_collider);
     if p.shape_cast {
-        // target_distance 必须 > 0:静止 resting 时 solver 把接触推到 slop 内
-        // (微穿透/零间隙),target=0 时 cast_shape 返回 None(探针 probe_cast2
-        // 实测:tgt=0 全 None,tgt=0.002 全命中);2 mm 与 lift 同量级,
-        // 远小于 ground_eps 档位(0.02/0.05),不改变判定的物理含义。
+        let max_d = p.ground_eps + 0.02 + lift;
+        // 球心起点:下半球球心(胶囊底部圆心)上方 5 mm。
+        let origin = Vector::new(pos.x, pos.y - HALF_H + lift, pos.z);
         let hit = world.cast_shape(
             &Pose {
-                translation: pos,
+                translation: origin,
                 ..Pose::IDENTITY
             },
             Vector::new(0.0, -max_d, 0.0),
-            &**cap_shape,
+            &**ball_shape,
             ShapeCastOptions {
                 max_time_of_impact: 1.0,
+                // target_distance 必须 > 0:resting 时接触被推到 slop 内,
+                // target=0 返回 None(探针 probe_cast2 实测)。
                 target_distance: 0.002,
                 stop_at_penetration: true,
                 compute_impact_geometry_on_penetration: true,
@@ -413,6 +586,7 @@ fn ground_ny(
         )?;
         Some(hit.1.normal1.y)
     } else {
+        let max_d = p.ground_eps + lift;
         let ray = Ray {
             origin: Vector::new(pos.x, pos.y - HALF_H - CAP_R + lift, pos.z),
             dir: Vector::new(0.0, -1.0, 0.0),
@@ -435,10 +609,23 @@ struct Outcome {
     speed_target: Option<f32>,
     v_mean: Option<f32>,
     speed_err_pct: Option<f32>,
+    /// R1/CR6:从意图开始(第 60 拍)到水平速度首 ≥ 90% 目标的毫秒数;
+    /// 到稳态窗口结束都没达到 = None(输出 "-")。
     t90_ms: Option<f32>,
     stop_dist_m: Option<f32>,
     stop_end_v: Option<f32>,
+    /// R1/第 7 条:从第 60 拍(意图起)统计的 |vy| 峰值,出生落地不计。
     vy_peak: f32,
+    /// 第 0–59 拍的 |vy| 峰值(出生落地)。
+    vy_peak_settle: f32,
+    /// 行走稳态窗口内控制拍判为接地的比例(R1/第 2 条)。
+    ground_frac: Option<f32>,
+    /// 全程被接缝钩子摆正的流形次数(R1/第 3 条)。
+    edge_snaps: u32,
+    /// 方块堆场景:最后一块方块落回地面那一拍的对地最深穿透(R1/第 10 条)。
+    pile_land_pen: Option<f32>,
+    /// 同一拍胶囊的竖直速度(R1/第 10 条)。
+    pile_land_vy: Option<f32>,
     pen_min: Option<f32>,
     pen_obj_min: Option<f32>,
     drift_m: Option<f32>,
@@ -475,7 +662,7 @@ fn fmt4(v: f32) -> String {
 }
 
 fn outcome_csv(o: &Outcome) -> String {
-    // 列头(31 列)见 main 的 MATRIX_HEADER;panic 行除前 7 列全 "-"。
+    // 列头(34 列)见 main 的 MATRIX_HEADER;panic 行除前 7 列全 "-"。
     let hash_cell = if o.panicked {
         "PANIC".to_string()
     } else {
@@ -496,6 +683,11 @@ fn outcome_csv(o: &Outcome) -> String {
         opt_f(o.stop_dist_m),
         opt_f(o.stop_end_v),
         fmt4(o.vy_peak),
+        fmt4(o.vy_peak_settle),
+        opt_f(o.ground_frac),
+        o.edge_snaps.to_string(),
+        opt_f(o.pile_land_pen),
+        opt_f(o.pile_land_vy),
         opt_f(o.pen_min),
         opt_f(o.pen_obj_min),
         opt_f(o.drift_m),
@@ -533,6 +725,11 @@ fn panic_row(cfg: &Cfg, msg: &str) -> Outcome {
         stop_dist_m: None,
         stop_end_v: None,
         vy_peak: 0.0,
+        vy_peak_settle: 0.0,
+        ground_frac: None,
+        edge_snaps: 0,
+        pile_land_pen: None,
+        pile_land_vy: None,
         pen_min: None,
         pen_obj_min: None,
         drift_m: None,
@@ -574,6 +771,11 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let mut world = PhysicsWorld::new();
     world.gravity = Vector::new(0.0, -GRAVITY, 0.0);
     world.integration_parameters = production_params(1.0 / 60.0);
+    // R1/CR7:edgefix 开关(只有接缝 fix0 行关,其余全开)。
+    let edgefix_on = match cfg.scene {
+        Scene::Seam { fix, .. } => fix == EdgeFix::Fix1,
+        _ => true,
+    };
 
     // ── 布景 ──
     let t1 = match cfg.scene {
@@ -645,7 +847,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             if run {
                 Vector::new(dx, GROUND_TOP + 0.902, dz)
             } else {
-                Vector::new(STEP_FACE_X - d + dx, GROUND_TOP + 0.902, dz)
+                // R1/CR5:d = 胶囊表面到台阶面的间隙 → 中心 x = 面 x − CAP_R − d。
+                Vector::new(STEP_FACE_X - CAP_R - d + dx, GROUND_TOP + 0.902, dz)
             }
         }
         _ => Vector::new(0.0, GROUND_TOP + 0.902, 0.0),
@@ -656,7 +859,16 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         (cap_mass - CAP_MASS).abs() < 1e-4,
         "capsule mass {cap_mass}"
     );
-    let cap_shape = SharedShape::capsule_y(HALF_H, CAP_R);
+    // R1/CR2:球投射形状(半径 CAP_R − 0.02)。
+    let ball_shape = SharedShape::ball(BALL_CAST_R);
+    // R1/CR3:接缝修正钩子(每拍 step_with_events 步进)。
+    let hooks = EdgeFixHooks {
+        cap_collider: AtomicU32::new(0),
+        cap_gen: AtomicU32::new(0),
+        enabled: AtomicBool::new(edgefix_on),
+        fixed: AtomicU32::new(0),
+    };
+    hooks.set_cap(cap_collider);
 
     // ── 场景方块(方块堆/推方块:出生即睡)──
     let mut blocks: Vec<(RigidBodyHandle, ColliderHandle, Vector)> = Vec::new();
@@ -691,16 +903,16 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         Scene::Walk { .. } | Scene::Seam { .. } | Scene::Order { .. }
     );
     let target_speed = match cfg.scene {
-        Scene::Walk { speed, .. } => Some(speed),
-        Scene::Seam { .. } | Scene::Order { .. } => Some(SEAM_SPEED),
+        Scene::Walk { speed, .. } | Scene::Seam { speed, .. } => Some(speed),
+        Scene::Order { .. } => Some(SEAM_SPEED),
         Scene::Pile { .. } => Some(2.0),
         Scene::Push => Some(4.3),
         _ => None,
     };
     let course_dir = match cfg.scene {
-        Scene::Walk { heading, .. } | Scene::Seam { heading } | Scene::Order { heading, .. } => {
-            Some(heading_dir(heading))
-        }
+        Scene::Walk { heading, .. }
+        | Scene::Seam { heading, .. }
+        | Scene::Order { heading, .. } => Some(heading_dir(heading)),
         _ => None,
     };
     let mut pressed = false;
@@ -714,7 +926,9 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let mut end_reason = "completed";
     let mut end_tick = total;
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    // R1/第 7 条:vy_peak 从第 60 拍起统计(出生落地不计),另报第 0–59 拍。
     let mut vy_peak = 0.0f32;
+    let mut vy_peak_settle = 0.0f32;
     let mut speed_max = 0.0f32;
     let mut pen_min = f32::INFINITY;
     let mut pen_obj = f32::INFINITY;
@@ -722,7 +936,12 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let mut v_n = 0u64;
     let mut c_dot = 0.0f64;
     let mut c_cross = 0.0f64;
+    // R1/CR6:t90 从意图开始拍(60)起算,窗口扩到整个意图期;稳态窗内没
+    // 达到就保持 None(输出 "-")。dip/stuck 仍在稳态窗(t90 达到后)。
     let mut t90: Option<usize> = None;
+    let mut ground_hits = 0u64;
+    let mut ground_n = 0u64;
+    let mut edge_snaps = 0u32;
     let mut dip = 0.0f32;
     let mut stuck_run = 0u32;
     let mut stuck_max = 0u32;
@@ -785,7 +1004,19 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                         false,
                     )
                 }
-                Scene::Seam { heading } | Scene::Order { heading, .. } => {
+                Scene::Seam { speed, heading, .. } => {
+                    let act = tick >= 60 && tick < rel;
+                    (
+                        if act {
+                            heading_dir(heading) * speed
+                        } else {
+                            Vector::ZERO
+                        },
+                        heading_rad(heading),
+                        false,
+                    )
+                }
+                Scene::Order { heading, .. } => {
                     let act = tick >= 60 && tick < rel;
                     (
                         if act {
@@ -801,11 +1032,11 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                 Scene::Step { run, d, .. } => {
                     let mut want = false;
                     if run {
-                        // 跑动起跳:意图从 60 拍起,中心到面距离 ≤ d 时按跳
+                        // 跑动起跳:意图从 60 拍起,表面到面间隙 ≤ d 时按跳
                         // (帧量化:4.3 m/s 每拍 0.072 m,实际按跳距离 ∈ (d−0.072, d])。
                         if !pressed {
                             let cap_x = world.bodies.get(cap_body).expect("alive").translation().x;
-                            if STEP_FACE_X - cap_x <= d {
+                            if STEP_FACE_X - cap_x - CAP_R <= d {
                                 pressed = true;
                                 move_until = tick + 72;
                                 want = true;
@@ -857,8 +1088,15 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             };
             // 接地判定(只在控制拍做)。
             let cap_pos = world.bodies.get(cap_body).expect("alive").translation();
-            let grounded = ground_ny(&world, cap_collider, cap_pos, &p, &cap_shape)
+            let grounded = ground_ny(&world, cap_collider, cap_pos, &p, &ball_shape)
                 .is_some_and(|ny| ny >= 0.7);
+            // R1/第 2 条:稳态窗内控制拍判为接地的比例(与驱动力同一判定)。
+            if tick >= s0 && tick < rel {
+                ground_n += 1;
+                if grounded {
+                    ground_hits += 1;
+                }
+            }
             // 水平力:F = clamp(m·(v_target − v_h)/τ, F_max);空中 × air。
             let v = world.bodies.get(cap_body).expect("alive").linvel();
             let vh = Vector::new(v.x, 0.0, v.z);
@@ -903,7 +1141,10 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             }
         }
 
-        world.step();
+        // R1/CR3:接缝修正钩子步进(每拍清零计数,步进后采样)。
+        hooks.reset_fixed();
+        world.step_with_events(&hooks, &());
+        edge_snaps += hooks.take_fixed();
 
         // 失控防护(重物 vg 行;先查非有限再查阈值)。
         if cap_alive && cfg.v_guard.is_some() {
@@ -958,13 +1199,35 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             for c in [v.x, v.y, v.z] {
                 hash = hash_f32(hash, c);
             }
-            vy_peak = vy_peak.max(v.y.abs());
+            // R1/第 7 条:vy_peak 分窗——第 0–59 拍(出生落地)单独报,
+            // 意图期起的另报 vy_peak。
+            if tick < 60 {
+                vy_peak_settle = vy_peak_settle.max(v.y.abs());
+            } else {
+                vy_peak = vy_peak.max(v.y.abs());
+            }
             speed_max = speed_max.max(v.length());
             if pv.y < ground_top - 5.0 {
                 end_reason = "fell";
                 end_tick = tick;
                 break;
             }
+            // R1/CR4:水平位置离开 T1 域(世界 x ∈ chunk 域、z 同)。
+            if t1 {
+                let x_lo = (CHUNK_X_LO as f32) * 16.0;
+                let x_hi = (CHUNK_X_HI as f32) * 16.0;
+                let z_lo = (CHUNK_Z_LO as f32) * 16.0;
+                let z_hi = (CHUNK_Z_HI as f32) * 16.0;
+                if pv.x < x_lo || pv.x > x_hi || pv.z < z_lo || pv.z > z_hi {
+                    end_reason = "out_of_domain";
+                    end_tick = tick;
+                    break;
+                }
+            }
+            // R1/第 10 条:方块堆场景只报结果——对地最深穿透(pen_min,全程;
+            // 落回地面拍即全程最深,上一版口径 −0.0633 m)与第 60 拍后的
+            // |vy| 峰值(= 落回地面时刻的竖直速度,上一版 6.86 m/s)。
+            // 收尾时:pile_land_pen = pen_min、pile_land_vy = vy_peak。
             if matches!(cfg.scene, Scene::Stand { .. }) {
                 if tick == 120 {
                     stand_base = Some(pv);
@@ -975,6 +1238,14 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             }
             let vh2 = (v.x * v.x + v.z * v.z).sqrt();
             if walk_like {
+                // R1/CR6:t90 从意图开始拍起,整个意图窗内找首 ≥ 90%。
+                if tick >= 60
+                    && tick < rel
+                    && t90.is_none()
+                    && vh2 >= 0.9 * target_speed.unwrap_or(0.0)
+                {
+                    t90 = Some(tick);
+                }
                 if tick >= s0 && tick < rel {
                     let ts = target_speed.expect("walk-like has target");
                     v_sum += f64::from(vh2);
@@ -982,9 +1253,6 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                     let dir = course_dir.expect("walk-like has dir");
                     c_dot += f64::from(dir.x * v.x + dir.z * v.z);
                     c_cross += f64::from(dir.x * v.z - dir.z * v.x);
-                    if t90.is_none() && vh2 >= 0.9 * ts {
-                        t90 = Some(tick);
-                    }
                     if t90.is_some() {
                         dip = dip.max((ts - vh2) / ts);
                         if vh2 < 0.5 * ts {
@@ -1101,6 +1369,25 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         None
     };
     let t90_ms = t90.map(|t| (t - 60) as f32 * 1000.0 / 60.0);
+    let ground_frac = if walk_like && ground_n > 0 {
+        Some(ground_hits as f32 / ground_n as f32)
+    } else {
+        None
+    };
+    // R1/第 10 条:方块堆场景只报结果(落回地面拍 = 全程对地最深穿透 +
+    // 第 60 拍起 |vy| 峰值;口径见采样段注释)。
+    let (pile_land_pen, pile_land_vy) = if matches!(cfg.scene, Scene::Pile { .. }) {
+        (
+            if pen_min.is_finite() {
+                Some(pen_min)
+            } else {
+                None
+            },
+            Some(vy_peak),
+        )
+    } else {
+        (None, None)
+    };
     let stop_fields = if walk_like {
         Some((stop_dist, stop_v_end))
     } else {
@@ -1188,6 +1475,11 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         stop_dist_m: stop_fields.map(|s| s.0),
         stop_end_v: stop_fields.map(|s| s.1),
         vy_peak,
+        vy_peak_settle,
+        ground_frac,
+        edge_snaps,
+        pile_land_pen,
+        pile_land_vy,
         pen_min: opt_pen(pen_min),
         pen_obj_min: opt_pen(pen_obj),
         drift_m,
@@ -1271,9 +1563,9 @@ fn sweep_row_csv(r: &SweepRow) -> String {
 /// tau, fmax, mu, air, ge 升序, shape=false<true, h_jump 升序) 全序排序,
 /// 取 首 / 中 / 尾 各一套(去重)。passB 为空时分层回退:passA(三档 ≤5%)
 /// → pass_hi(仅 4.3/5.6 档 ≤5%,hj=1.25)→ 全部元组(err_max 排序,
-/// hj=1.25;判据 1 缺口如实上报)。纯 P 控制器稳态误差 = τ·μ_eff·g,
-/// s1.5 档在放行网格(τ≥0.05、μ_eff≥0.3)内必然 >5%(9.8% 起),
-/// 回退层保证仍有候选推荐。
+/// hj=1.25;判据 1 缺口如实上报)。
+/// R1:Min 摩擦合成下 μ_eff = min(μ, 0.6),μ=0 → 0,纯 P 律稳态误差不再
+/// 含摩擦项,τ·μ_eff·g = 0,网格内三档均可过(实际见 sweep 输出)。
 fn select_candidates(aggs: &[TupleAgg], jumps: &[JumpAgg]) -> Vec<(String, Params)> {
     let mut items: Vec<(f32, u32, Params)> = jumps
         .iter()
@@ -1351,13 +1643,13 @@ fn same_tuple(a: &Params, b: &Params) -> bool {
 
 fn write_cands(path: &str, cands: &[(String, Params)]) {
     let mut s = String::from(
-        "# capsule A00-4 候选(sweep 机械规则选出;规则见 README):\n\
+        "# capsule A00-4 R1 候选(sweep 机械规则选出;规则见 README):\n\
          # 首选 passB(step 1 格跑跳 d=1.0,3/3 成功)项;为空时分层回退:\n\
          # passA(三速度档 err≤5%)→ pass_hi(仅 4.3/5.6 档 ≤5%,hj=1.25)\n\
          # → 全部元组(按 4.3 档 err 排序,hj=1.25)。\n\
          # 层内排序:(err 升序, step 失败数升序, tau, fmax, mu, air, ge 升序,\n\
          # shape=false<true, h_jump 升序) 全序,取首/中/尾。\n\
-         # 背景:纯 P 稳态误差 = τ·μ_eff·g,s1.5 档在网格内必然 >5%(README)。\n",
+         # R1:摩擦 Min 合成,μ_eff = min(μ, 对方);合成后 μ=0 → 0。\n",
     );
     for (tag, p) in cands {
         s.push_str(&format!(
@@ -1501,11 +1793,9 @@ fn run_sweep() {
         }
     }
 
-    // 阶段 B:1 格台阶跑跳 d=1.0(扫跳距离里唯一能过 1 m 台阶的档:
-    // 4.3 m/s 下升到 1 m 需 ~0.24 s = 前进 ~1.03 m,d=0.3/0.6 到墙时
-    // 高度 0.02/0.11 m 物理上不可能越过),3 次微扰,对 passA 元组 ×
-    // 3 档 h_jump;passA 为空(纯 P 下 s1.5 档不可达)时对 pass_hi
-    // 元组跑(README 写明)。
+    // 阶段 B:1 格台阶跑跳 d=1.0(表面间隙口径,R1/CR5),3 次微扰,
+    // 对 passA 元组 × 3 档 h_jump;passA 为空时对 pass_hi 元组跑(README 写明)。
+    // (d=1.0 保留:Min 合成后按跳判定更可靠,但跑跳可用距离仍由滞空决定。)
     let b_pool: Vec<&TupleAgg> = if aggs.iter().any(|t| t.pass_a) {
         aggs.iter().filter(|t| t.pass_a).collect()
     } else {
@@ -1666,14 +1956,23 @@ fn build_matrix(cands: &[(String, Params)]) -> Vec<Cfg> {
                 v_guard: None,
             });
         }
-        // 5 接缝:8 航向(出生在 4-chunk 角)。
-        for h in 0..8usize {
-            out.push(Cfg {
-                name: format!("seam_h{}_{}", h, tag),
-                scene: Scene::Seam { heading: h },
-                p: *p,
-                v_guard: None,
-            });
+        // 5 接缝(R1/CR7):三档速度 × 8 航向 × edgefix 开/关;
+        // 判据 5 按 fix1 行判,fix0 行只作对照。
+        for &spd in &SEAM_SPEEDS {
+            for h in 0..8usize {
+                for (fix, fx) in [(EdgeFix::Fix1, "fix1"), (EdgeFix::Fix0, "fix0")] {
+                    out.push(Cfg {
+                        name: format!("seam_s{}_h{}_{}_{}", fp(spd), h, fx, tag),
+                        scene: Scene::Seam {
+                            speed: spd,
+                            heading: h,
+                            fix,
+                        },
+                        p: *p,
+                        v_guard: None,
+                    });
+                }
+            }
         }
         // 6 方块堆(3×3×1、3×3×2,睡着)+ 推静止单格。
         for layers in [1, 2] {
@@ -1753,6 +2052,14 @@ fn run_matrix(cands: &[(String, Params)]) {
         #[allow(clippy::disallowed_methods)] // demo 自身要报每行耗时;纪律自束(同 terrain/gait)
         let t0 = Instant::now();
         let o = run(cfg);
+        // R1/CR4:推荐参数的行走行不允许走出域(域扩过就断言住)。
+        if cfg.scene.t1_domain() && matches!(cfg.scene, Scene::Walk { .. }) {
+            assert!(
+                o.end_reason != "out_of_domain",
+                "walk row {} left T1 domain",
+                o.name
+            );
+        }
         println!("{} | {:.1}s", outcome_csv(&o), t0.elapsed().as_secs_f32());
         csv.push_str(&outcome_csv(&o));
         csv.push('\n');
@@ -1821,7 +2128,8 @@ fn run_smoke() {
         "step_1run_0p6_t0",
         "step_1stand_0p6_t0",
         "step_2run_0p6_t0",
-        "seam_h0",
+        "seam_s4p3_h0_fix1",
+        "seam_s4p3_h0_fix0",
         "pile_331",
         "push_one",
         "hit_ox0_oz0_d0",
@@ -1845,7 +2153,8 @@ fn run_smoke() {
 }
 
 const MATRIX_HEADER: &str = "name,end_tick,end_reason,nan,panicked,guard_removed,panic_msg,\
-     speed_target,v_mean,speed_err_pct,t90_ms,stop_dist_m,stop_end_v,vy_peak,pen_min,\
+     speed_target,v_mean,speed_err_pct,t90_ms,stop_dist_m,stop_end_v,vy_peak,vy_peak_settle,\
+     ground_frac,edge_snaps,pile_land_pen,pile_land_vy,pen_min,\
      pen_obj_min,drift_m,sink_m,sleep_ratio,slept,jump_max_h,bounce_vy,hit_disp_h,\
      speed_max,block_disp_max,blocks_woken,dip_pct,stuck,step_success,course_err_deg,\
      state_hash";
