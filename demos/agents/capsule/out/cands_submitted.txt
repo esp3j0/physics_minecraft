@@ -5,6 +5,6 @@
 # 层内排序:(err 升序, step 失败数升序, tau, fmax, mu, air, ge 升序,
 # shape=false<true, h_jump 升序) 全序,取首/中/尾。
 # R1:摩擦 Min 合成,μ_eff = min(μ, 对方);合成后 μ=0 → 0。
-c1 tau=0.05 fmax=2 mu=0 air=0 hj=1.15 ge=0.02 mode=ray
-c2 tau=0.1 fmax=4 mu=0 air=0.2 hj=1.15 ge=0.02 mode=ray
-c3 tau=0.2 fmax=8 mu=0 air=0.2 hj=1.4 ge=0.05 mode=shape
+c1 tau=0.05 fmax=2 mu=0.3 air=0 hj=1.15 ge=0.02 mode=ray
+c2 tau=0.1 fmax=4 mu=0.3 air=0.2 hj=1.15 ge=0.02 mode=ray
+c3 tau=0.2 fmax=8 mu=0.3 air=0.2 hj=1.4 ge=0.05 mode=shape

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """从 out/ 提交数据计算 README 的全部总结数字。
 
-A00-4 R1 数据要求(放行):按完整名字段筛行,不用子串;CSV 列头与数据列数
+A00-4 R2 数据要求(放行):按完整名字段筛行,不用子串;CSV 列头与数据列数
 一致(脚本断言);对照/基线行不做被测的操作;判据没过门槛不打 ✅;
 数字范围覆盖全部行,不挑行;算不出的写 "-"。
 用法:python scripts/summary.py  (在 demos/agents/capsule/ 下运行)
@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import os
+import statistics
 import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -17,6 +18,9 @@ SWEEP = os.path.join(HERE, "out", "sweep_submitted.txt")
 MATRIX = os.path.join(HERE, "out", "matrix_submitted.txt")
 DET = os.path.join(HERE, "out", "det_submitted.txt")
 CANDS = os.path.join(HERE, "out", "cands.txt")
+
+# R2:μ 三档扫描的推荐候选(README 写明推荐与理由)。
+MU_TAG = "c3"
 
 
 def f(v: str) -> float:
@@ -104,7 +108,8 @@ def main() -> int:
     for tag in cands:
         sfx = "_" + tag
         # 判据 1:平地(T0/T1 × 3 速度 × 8 航向)稳态 err ≤5%
-        w = sel(lambda n: n.startswith("walk_") and n.endswith(sfx))
+        w = sel(lambda n: n.startswith("walk_") and n.endswith(sfx)
+                and "_late_" not in n)
         bad = [r["name"] for r in w
                if not f(r["speed_err_pct"]) <= 5.0]
         emax = max(f(r["speed_err_pct"]) for r in w)
@@ -161,6 +166,7 @@ def main() -> int:
                 dips = [f(r["dip_pct"]) for r in sm if r["dip_pct"] != "-"]
                 dip_max = max(dips) if dips else float("nan")
                 snaps = sum(int(r["edge_snaps"]) for r in sm)
+                fz = sum(int(r["fric_zeroed"]) for r in sm)
                 ends: dict[str, int] = {}
                 for r in sm:
                     ends[r["end_reason"]] = ends.get(r["end_reason"], 0) + 1
@@ -168,7 +174,7 @@ def main() -> int:
                 print(f"== 判据5 [{tag}] {spd} {fx} == 行 {len(sm)} "
                       f"卡住: {stuck_rows if stuck_rows else '无'} "
                       f"vy_peak max={vy_max:.4f} dip max={dip_max:.2f}% "
-                      f"edge_snaps 合计={snaps} "
+                      f"edge_snaps 合计={snaps} fric_zeroed 合计={fz} "
                       f"ground_frac min={min(gf):.4f} "
                       f"end={ends}")
         # 接缝 fix1 vs fix0 对照(同速度同航向逐行 vy_peak 差)
@@ -187,17 +193,36 @@ def main() -> int:
                       f"min={min(diffs):+.4f} max={max(diffs):+.4f} "
                       f"(正 = 关钩子更糟)")
 
+        # R2/DR2:walk_T1_late 对照行(先插胶囊再建地形;vy_peak 门槛 ≤0.5)
+        late = sel(lambda n: n.startswith("walk_T1_late_s4p3_h")
+                   and n.endswith(sfx))
+        if late:
+            vy_max = max(f(r["vy_peak"]) for r in late)
+            c1 = sum(int(r["cap_is_c1"]) for r in late)
+            snaps = sum(int(r["edge_snaps"]) for r in late)
+            errs = [f(r["speed_err_pct"]) for r in late]
+            print(f"== 判据2late [{tag}] == 行 {len(late)} "
+                  f"vy_peak max={vy_max:.4f}(门槛 ≤0.5) "
+                  f"cap_is_c1 合计={c1}(>0 = 胶囊至少一次是 collider1) "
+                  f"edge_snaps 合计={snaps} "
+                  f"err {min(errs):.2f}–{max(errs):.2f}% "
+                  f"end={ {r['end_reason'] for r in late} }")
+
         # 场景 6:方块堆(R1/第 10 条:pile_land 两列)
-        for r in sel(lambda n: n.startswith("pile_") and n.endswith(sfx)):
+        for r in sel(lambda n: n.startswith("pile_") and n.endswith(sfx)
+                     and "_mu" not in n):
             print(f"== 场景6 [{tag}] == {r['name']}: disp={r['block_disp_max']} "
                   f"woken={r['blocks_woken']} vy_peak={r['vy_peak']} "
                   f"pile_land_pen={r['pile_land_pen']} "
-                  f"pile_land_vy={r['pile_land_vy']}")
+                  f"pile_land_vy={r['pile_land_vy']} "
+                  f"fric_zeroed={r['fric_zeroed']}")
         # 场景 6b:推方块
         for r in sel(lambda n: n == f"push_one_{tag}"):
-            print(f"== 场景6b [{tag}] == disp={r['block_disp_max']}")
+            print(f"== 场景6b [{tag}] == disp={r['block_disp_max']} "
+                  f"fric_zeroed={r['fric_zeroed']}")
         # 场景 7:被砸(125 行)
-        hit = sel(lambda n: n.startswith("hit_") and n.endswith(sfx))
+        hit = sel(lambda n: n.startswith("hit_") and n.endswith(sfx)
+                  and "_mu" not in n)
         hd = [f(r["hit_disp_h"]) for r in hit]
         nz = [r["name"] for r in hit if f(r["hit_disp_h"]) > 0.0]
         hs = [f(r["speed_max"]) for r in hit]
@@ -206,8 +231,9 @@ def main() -> int:
         print(f"== 场景7 [{tag}] == 行 {len(hit)} 位移>0 {len(nz)} 行 "
               f"(disp max {max(hd):.4f});speed max={max(hs):.4f};"
               f"对方块穿透 min={hp:.4f} 对地 min={hg:.4f}")
-        # 场景 8:重物
-        hv_all = sel(lambda n: n.startswith("heavy_m") and n.endswith(sfx))
+        # 场景 8:重物(R2:按质量报 hit_disp_h 最大值/中位数 + 速度峰值)
+        hv_all = sel(lambda n: n.startswith("heavy_m") and n.endswith(sfx)
+                     and "_mu" not in n)
         hv = [r for r in hv_all if "_vg200_" not in r["name"]]
         hv200 = [r for r in hv_all if "_vg200_" in r["name"]]
         for lbl, grp in (("无防护", hv), ("vg200", hv200)):
@@ -219,9 +245,39 @@ def main() -> int:
                 nans = sum(1 for r in sub if r["nan"] == "true")
                 guards = sum(int(r["guard_removed"]) for r in sub)
                 sp_max = max(f(r["speed_max"]) for r in sub)
+                disp = [f(r["hit_disp_h"]) for r in sub]
                 print(f"== 场景8 [{tag}] {lbl} {m} == 行 {len(sub)} panic "
                       f"{panics} NaN {nans} guard {guards} speed max="
-                      f"{sp_max:.4f}")
+                      f"{sp_max:.4f} disp max={max(disp):.4f} "
+                      f"median={statistics.median(disp):.4f}")
+
+        # R2:μ 三档(推荐候选;场景 6、6b、7、8)——按"重物位移最大值、
+        # 速度峰值最小,并且无 panic、无 NaN"排序定 μ。
+        mu_rows = sel(lambda n: "_mu" in n and n.endswith(sfx))
+        if mu_rows:
+            for mu_lbl in ("mu0", "mu0p3", "mu0p6"):
+                grp = [r for r in mu_rows if f"_{mu_lbl}_" in r["name"]]
+                if not grp:
+                    continue
+                hv_g = [r for r in grp if r["name"].startswith("heavy_m")
+                        and "_vg200_" not in r["name"]]
+                disp_max = max(f(r["hit_disp_h"]) for r in hv_g)
+                sp_max = max(f(r["speed_max"]) for r in grp)
+                panics = sum(1 for r in grp if r["panicked"] == "true")
+                nans = sum(1 for r in grp if r["nan"] == "true")
+                hit_g = [r for r in grp if r["name"].startswith("hit_")]
+                hit_disp = max(f(r["hit_disp_h"]) for r in hit_g)
+                push = [r for r in grp if r["name"].startswith("push_one_")]
+                pile = [r for r in grp if r["name"].startswith("pile_")]
+                print(f"== mu三档 [{tag}] {mu_lbl} == 行 {len(grp)} "
+                      f"panic {panics} NaN {nans} "
+                      f"heavy disp max={disp_max:.4f} "
+                      f"speed max={sp_max:.4f} "
+                      f"hit disp max={hit_disp:.4f} "
+                      f"push disp={f(push[0]['block_disp_max']):.4f} "
+                      f"pile disp max="
+                      f"{max(f(r['block_disp_max']) for r in pile):.4f}")
+
         # 场景 9:连杆顺序对照(与 walk_T0_s4p3 同航向 v_mean 比)
         base = {n.split("_h")[1].split("_")[0]: f(r["v_mean"])
                 for r in rows

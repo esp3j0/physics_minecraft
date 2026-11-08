@@ -1,4 +1,4 @@
-//! REQ-012 A00-4 demo `capsule`(2026-11-07,R1 返修)。
+//! REQ-012 A00-4 demo `capsule`(2026-11-07,R2 返修)。
 //!
 //! 问题(放行原文):玩家的单连杆胶囊能不能走得稳、跳得准?行走控制器(§2.2)
 //! 的参数取多少?胶囊被砸、站在方块堆上、走过 chunk 接缝时会不会出问题?
@@ -8,10 +8,11 @@
 //!
 //! 身体(放行):总高 1.8 m、半径 0.3 m 的 y 向胶囊(`capsule_y(0.6, 0.3)`,
 //! 2·(0.6+0.3) = 1.8),质量 0.8,`lock_rotations()`,朝向按意图 yaw 直接
-//! `set_rotation`(只在变化时写,允许入睡)。摩擦是矩阵参数,与地面按
-//! **Min 规则**合成(R1/CR1:胶囊侧 `friction_combine_rule(Min)` 优先于
-//! 地面默认 Average,合成有效值 = min(μ, 对方)),restitution 0
-//! (放行未列,取 0,README 写明)。
+//! `set_rotation`(只在变化时写,允许入睡)。摩擦(AR2/DR1 总架构师裁定,
+//! 替换 R1 的 Min):胶囊用默认 Average 合成;μ 只决定胶囊对**动态方块**
+//! 的摩擦(Average 合成 μ_eff = (μ+0.6)/2);胶囊对**固定刚体**(地面、
+//! 墙面)的摩擦在接缝钩子里逐流形清零。restitution 0(放行未列,取 0,
+//! README 写明)。
 //!
 //! 控制器(§2.2,只用力和冲量,不直接设速度):
 //! - 水平力 `F = clamp(m·(v_target − v_h)/τ, F_max)`;空中乘 `air`;
@@ -23,20 +24,26 @@
 //!   与球投射(半径 CAP_R − 0.02 的球,从下半球球心上方 5 mm 下扫
 //!   ground_eps + 0.02 + 0.005,R1/CR2);命中面法线 y ≥ 0.7 才算接地。
 //!
-//! 接缝修正钩子(R1/CR3):胶囊碰撞体挂 `MODIFY_SOLVER_CONTACTS`,
-//! 每拍 `step_with_events` 步进;钩子把"推测接触打在下一个 chunk 碰撞体
+//! 接缝修正钩子(R1/CR3 + R2/DR1、DR2):胶囊碰撞体挂
+//! `MODIFY_SOLVER_CONTACTS`,每拍 `step_with_events` 步进。钩子先做摩擦
+//! 清零(DR1:对固定刚体的**每个流形** `*friction = 0`,放在法线条件判断
+//! 之前,墙面也包括;动态方块不改),再把"推测接触打在下一个 chunk 碰撞体
 //! 顶边"的斜法线摆成竖直(条件:法线 |n.y| ∈ [0.7, 0.99999)、对固定
 //! 刚体、全部接触点在地形一侧的 y 都在胶囊底部 ±3 cm 内),dist 改成
-//! 竖直间隙。`edgefix=off` 只用于接缝对照行。
+//! 竖直间隙(R2/DR2:`vert_gap.max(sc.dist.min(0.0))`,不乘法线符号——
+//! 分离距离沿法线投影恒等于竖直间隙,与法线朝向无关)。
+//! `edgefix=off` 只用于接缝对照行。
 //!
 //! 场景(README 有逐条判据):平地行走 / 站立 / 台阶(d = 胶囊表面到台阶面
 //! 的间隙,R1/CR5) / 空中连按跳 / 接缝(三档速度 × 8 航向 × fix 开关,
-//! R1/CR7) / 方块堆+推方块 / 被砸 / 重物(无防护 + V_GUARD=200) /
-//! 连杆顺序对照 / det。T1 域扩到装下全部航向全速度完整路径 + 16 m 余量
-//! (R1/CR4),`end_reason` 区分 `out_of_domain` 与 `fell`。
+//! R1/CR7) / walk_T1_late 对照(DR2:先插胶囊再建 T1 地形) / 方块堆+推
+//! 方块 / 被砸 / 重物(无防护 + V_GUARD=200) / 连杆顺序对照 / det。
+//! T1 域扩到装下全部航向全速度完整路径 + 16 m 余量(R1/CR4),
+//! `end_reason` 区分 `out_of_domain` 与 `fell`。
 //!
-//! 流程:`sweep`(平地 648 全组合 × 3 速度 + 1 格台阶 h_jump 扫描,机械规则
-//! 选 3 套候选写 `out/cands.txt`)→ `matrix`(候选跑全部场景)→ `det`
+//! 流程:`sweep`(平地 216 全组合 × 3 速度 + 1 格台阶 h_jump 扫描,μ 固定
+//! 0.3,机械规则选 3 套候选写 `out/cands.txt`)→ `matrix`(候选跑全部
+//! 场景;推荐候选另跑 μ ∈ {0, 0.3, 0.6} × 场景 6、6b、7、8)→ `det`
 //! (全矩阵双跑逐行哈希)。提交件 = `*_submitted.txt`(手动拷贝,不覆盖)。
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -45,7 +52,7 @@ use std::time::Instant;
 
 use physics_sim::collider_build::{greedy_colliders, BoxCollider, NeighborChunks};
 use quad::{production_params, yaw_quat, GROUND_FRICTION, GROUND_RESTITUTION};
-use rapier3d::dynamics::{CoefficientCombineRule, RigidBodyBuilder, RigidBodyHandle};
+use rapier3d::dynamics::{RigidBodyBuilder, RigidBodyHandle};
 use rapier3d::geometry::{ColliderBuilder, ColliderHandle, PairContacts, Ray, SharedShape};
 use rapier3d::math::{Pose, Vector};
 use rapier3d::parry::query::ShapeCastOptions;
@@ -111,9 +118,13 @@ const STEADY0: usize = 300;
 const SWEEP_RELEASE: usize = 780;
 const SWEEP_TOTAL: usize = 900;
 
-/// 扫描网格(放行)。
+/// 扫描网格(R2:μ 维度在平地和台阶上不起作用——μ_eff 只进摩擦,平地
+/// 行走摩擦在钩子里清零——扫描阶段固定 μ = 0.3,其余网格不变;推荐候选
+/// 选出后另跑 μ 三档 × 场景 6、6b、7、8)。
 const TAUS: [f32; 3] = [0.05, 0.1, 0.2];
 const FMAXS: [f32; 3] = [2.0, 4.0, 8.0];
+const SCAN_MU: f32 = 0.3;
+/// μ 三档(AR2:推荐候选 × 场景 6、6b、7、8)。
 const MUS: [f32; 3] = [0.0, 0.3, 0.6];
 const AIRS: [f32; 2] = [0.0, 0.2];
 const HJUMPS: [f32; 3] = [1.15, 1.25, 1.4];
@@ -152,7 +163,8 @@ struct Params {
     tau: f32,
     /// 力上限倍数(× m·g)。
     fmax_mul: f32,
-    /// 胶囊摩擦系数(与对方按 Min 规则合成,有效值 = min(μ, 对方))。
+    /// 胶囊摩擦系数(R2/DR1:只与**动态方块**按 Average 合成;对固定刚体
+    /// (地面/墙面)的摩擦在钩子里逐流形清零)。
     mu: f32,
     /// 空中力系数。
     air: f32,
@@ -173,12 +185,14 @@ enum EdgeFix {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Scene {
-    /// 场景 1:平地行走(sweep_a = 扫描短版,只跑 h0)。
+    /// 场景 1:平地行走(sweep_a = 扫描短版,只跑 h0;late = DR2 对照:
+    /// 先插胶囊再建 T1 地形,其余同 T1 行——胶囊在 pair 里成为 collider1)。
     Walk {
         t1: bool,
         speed: f32,
         heading: usize,
         sweep_a: bool,
+        late: bool,
     },
     /// 场景 2:站立 3600 拍(零意图 = 控制器目标速度 0,主动保持)。
     Stand { t1: bool },
@@ -220,6 +234,11 @@ impl Scene {
             self,
             Scene::Walk { t1: true, .. } | Scene::Seam { .. } | Scene::Stand { t1: true }
         )
+    }
+
+    /// DR2:先插胶囊再建地形(胶囊是 collider1 的对照行)。
+    fn late_terrain(&self) -> bool {
+        matches!(self, Scene::Walk { late: true, .. })
     }
 }
 
@@ -331,8 +350,8 @@ fn spawn_capsule(
         ColliderBuilder::capsule_y(HALF_H, CAP_R)
             .mass(CAP_MASS)
             .friction(p.mu)
-            // R1/CR1:Min 优先于地面默认 Average → 合成 μ_eff = min(μ, 0.6)。
-            .friction_combine_rule(CoefficientCombineRule::Min)
+            // R2/DR1:默认 Average 合成(撤 R1 的 Min);对固定刚体的摩擦
+            // 由接缝钩子逐流形清零,μ 只决定对动态方块的摩擦。
             // R1/CR3:接缝修正钩子挂在胶囊碰撞体上(edgefix=off 时世界照跑,
             // 钩子在步进侧判断开关)。
             .active_hooks(ActiveHooks::MODIFY_SOLVER_CONTACTS)
@@ -367,19 +386,44 @@ fn spawn_block(
 
 // ── 接缝修正钩子(R1/CR3) ────────────────────────────────────────────────
 
-/// 把"推测接触打在下一个 chunk 碰撞体顶边"的斜法线摆成竖直。探针实测
-/// (验收 CR3):跨 chunk 边界时前方 chunk 顶边进入预测距离,生成法线
-/// (0, 0.957, 0.290) 的倾斜接触,solver 挡住沿法线的接近速度 → 竖直
-/// 速度 1.54 m/s 腾空 ~20 拍。条件全满足时把法线摆成 (0,±1,0)、dist 改
-/// 竖直间隙。只处理胶囊对固定刚体(地形);动态方块不处理。
+/// 接缝修正钩子(R1/CR3 + R2/DR1、DR2)。做两件事,顺序固定:
+///
+/// 1. **摩擦清零(DR1,先做,放在法线条件判断之前)**:胶囊对**固定刚体**
+///    的每一个流形 `*friction = 0`(地面、墙面都包括——法线条件尚未判断;
+///    per-manifold API,`friction` 应用到流形内全部接触点);对动态刚体
+///    (方块)的流形不改。R1 的 Min 合成副作用:胶囊对地面/方块都无摩擦,
+///    重物倾斜接触把胶囊横向挤出 ~100 m;改为钩子清零后胶囊对固定刚体
+///    无摩擦(平地行走由控制器直接控制速度,不需要地面摩擦),对动态方块
+///    保留 Average 合成摩擦(μ 只决定这一半)。计数写入 `fric_zeroed` 列。
+///    开关 `fric_zero_on` 独立于法线摆正:fix0 接缝对照行**保留**摩擦方案
+///    (对照行不做被测的操作,被测的是接缝修正)。
+/// 2. **斜法线摆正(R1/CR3,受 `enabled` 开关)**:把"推测接触打在下一个
+///    chunk 碰撞体顶边"的斜法线摆成竖直(条件:法线 |n.y| ∈ [0.7, 0.99999)、
+///    对固定刚体、全部接触点在地形一侧的 y 都在胶囊底部 ±3 cm 内),dist 改
+///    竖直间隙(R2/DR2:`vert_gap.max(sc.dist.min(0.0))`,不乘法线符号:
+///    分离距离沿法线投影 = 竖直间隙,与法线朝向无关;R1 的 `vert_gap·sign`
+///    在胶囊为 collider1(法线朝下)时把间隙当穿透,潜在符号错误)。
+///    计数写入 `edge_snaps` 列。
+///
+/// 另有纯观测计数 `cap_is_c1`(DR2:胶囊以 collider1 进入钩子的次数,
+/// 不受任何开关影响,late 对照行的断言列)。
+///
 /// `PhysicsHooks: MaybeSync`(默认要求 `Sync`,demo 不开 `unsync-callbacks`):
-/// 内部用原子类型记开关与本拍摆正次数。
+/// 内部用原子类型记开关与计数。
 struct EdgeFixHooks {
     cap_collider: AtomicU32,
     cap_gen: AtomicU32,
     enabled: AtomicBool,
     /// 本拍被摆正的流形次数(每拍步进前清零,步进后采样)。
     fixed: AtomicU32,
+    /// 本拍被清零摩擦的流形次数(每拍步进前清零,步进后采样)。
+    fric: AtomicU32,
+    /// 本拍胶囊以 collider1 进入钩子的次数(纯观测,不受 enabled 影响——
+    /// DR2 late 对照行靠它断言"胶囊至少一次是 collider1")。
+    c1: AtomicU32,
+    /// DR1 摩擦清零开关(fix0 对照行仍开——摩擦方案是全局背景配置,不是
+    /// 接缝对照的被测操作;对照行不做被测的操作)。
+    fric_zero_on: AtomicBool,
 }
 
 impl EdgeFixHooks {
@@ -403,6 +447,7 @@ impl EdgeFixHooks {
 
     fn reset_fixed(&self) {
         self.fixed.store(0, Ordering::Relaxed);
+        self.fric.store(0, Ordering::Relaxed);
     }
 
     fn take_fixed(&self) -> u32 {
@@ -412,18 +457,31 @@ impl EdgeFixHooks {
     fn bump_fixed(&self) {
         self.fixed.fetch_add(1, Ordering::Relaxed);
     }
+
+    fn take_fric(&self) -> u32 {
+        self.fric.load(Ordering::Relaxed)
+    }
+
+    fn reset_c1(&self) {
+        self.c1.store(0, Ordering::Relaxed);
+    }
+
+    fn take_c1(&self) -> u32 {
+        self.c1.load(Ordering::Relaxed)
+    }
 }
 
 impl PhysicsHooks for EdgeFixHooks {
     fn modify_solver_contacts(&self, ctx: &mut ContactModificationContext) {
-        if !self.enabled() {
-            return;
-        }
         let cap = self.cap();
         let cap1 = ctx.collider1 == cap;
         let cap2 = ctx.collider2 == cap;
         if !(cap1 || cap2) {
             return;
+        }
+        // DR2:纯观测计数(先于一切开关,late 对照行要能断言)。
+        if cap1 {
+            self.c1.fetch_add(1, Ordering::Relaxed);
         }
         // 只处理胶囊对固定刚体(地形 compound);动态方块不处理。
         let other_handle = if cap1 {
@@ -435,6 +493,23 @@ impl PhysicsHooks for EdgeFixHooks {
             .and_then(|h| ctx.bodies.get(h))
             .is_some_and(|rb| rb.is_fixed());
         if !other_fixed {
+            return;
+        }
+        // DR1 摩擦清零:该流形的摩擦置 0(per-manifold API:
+        // `ModifiableManifold.friction` 应用到流形内全部接触点),放在法线
+        // 条件判断之前——墙面(斜法线)也包括。撤 Min 后胶囊对地面摩擦恢复
+        // Average 合成 (μ+0.6)/2,会把平地行走拖出稳态误差并把站立锁死;
+        // 控制器直接控制水平速度,地面摩擦无益(总架构师裁定,验收探针
+        // 证实:无此步则重物擦边仍把胶囊横向挤出 ~100 m)。
+        // 开关独立于法线摆正(fix0 对照行保留摩擦方案、只关法线摆正——
+        // 接缝对照的被测操作是接缝修正,不是摩擦)。
+        if self.fric_zero_on.load(Ordering::Relaxed) {
+            if let Some(r) = ctx.rigid_mut() {
+                *r.friction = 0.0;
+                self.fric.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if !self.enabled() {
             return;
         }
         // 胶囊底部 y(先取:rigid_mut 可变借用 ctx 后不能再读 ctx 字段)。
@@ -469,7 +544,9 @@ impl PhysicsHooks for EdgeFixHooks {
         if !in_band {
             return;
         }
-        // 法线摆成竖直(符号同原法线 y);dist 改成竖直间隙。
+        // 法线摆成竖直(符号同原法线 y);dist 改竖直间隙(R2/DR2:分离
+        // 距离沿法线投影就等于 vert_gap,与法线朝哪边无关——不乘 sign;
+        // 保留原 dist 若已更深(负得更多),即 .max(dist.min(0.0))。
         let sign = ny.signum();
         *rigid.normal = Vector::new(0.0, sign, 0.0);
         for sc in rigid.solver_contacts.iter_mut() {
@@ -477,7 +554,7 @@ impl PhysicsHooks for EdgeFixHooks {
             let cap_pt = if cap1 { a1 } else { a2 };
             let terrain_pt = if cap1 { a2 } else { a1 };
             let vert_gap = cap_pt.y - terrain_pt.y;
-            sc.dist = (vert_gap * sign).max(sc.dist.min(0.0));
+            sc.dist = vert_gap.max(sc.dist.min(0.0));
         }
         self.bump_fixed();
     }
@@ -622,6 +699,11 @@ struct Outcome {
     ground_frac: Option<f32>,
     /// 全程被接缝钩子摆正的流形次数(R1/第 3 条)。
     edge_snaps: u32,
+    /// R2/DR1:全程被钩子清零摩擦的流形次数(胶囊对固定刚体的每流形一次)。
+    fric_zeroed: u32,
+    /// R2/DR2:胶囊以 collider1 进入钩子的次数(late 对照行的断言列;
+    /// 钩子 enabled=false 时为 0——对照行不观测)。
+    cap_is_c1: u32,
     /// 方块堆场景:最后一块方块落回地面那一拍的对地最深穿透(R1/第 10 条)。
     pile_land_pen: Option<f32>,
     /// 同一拍胶囊的竖直速度(R1/第 10 条)。
@@ -686,6 +768,8 @@ fn outcome_csv(o: &Outcome) -> String {
         fmt4(o.vy_peak_settle),
         opt_f(o.ground_frac),
         o.edge_snaps.to_string(),
+        o.fric_zeroed.to_string(),
+        o.cap_is_c1.to_string(),
         opt_f(o.pile_land_pen),
         opt_f(o.pile_land_vy),
         opt_f(o.pen_min),
@@ -728,6 +812,8 @@ fn panic_row(cfg: &Cfg, msg: &str) -> Outcome {
         vy_peak_settle: 0.0,
         ground_frac: None,
         edge_snaps: 0,
+        fric_zeroed: 0,
+        cap_is_c1: 0,
         pile_land_pen: None,
         pile_land_vy: None,
         pen_min: None,
@@ -783,8 +869,21 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         Scene::Seam { .. } => true,
         _ => false,
     };
+    let late = cfg.scene.late_terrain();
     let ground_top = if t1 { GROUND_TOP_T1 } else { GROUND_TOP };
+    // DR2:late 行先插胶囊再建 T1 地形(其余同 walk_T1)——broad phase 的
+    // pair 顺序按 collider 索引规范(colliders 索引小者为 collider1),先插
+    // 胶囊 → 胶囊索引最小 → 胶囊是 collider1(R1 代码路径只在 collider2
+    // 侧被走过;生产环境 chunk 可能在主体之后加载,此对照验证该顺序)。
+    // 胶囊出生点与 walk_T1 同,但地形插入发生在主体之后,因此 spawn 表达
+    // 式放在建地形之前先算好。
     let mut terrain: Vec<ColliderHandle> = Vec::new();
+    let spawn_early = late.then(|| Vector::new(T1_SPAWN_X, GROUND_TOP_T1 + 0.902, 0.0));
+    let (cap_body, cap_collider) = if let Some(sp) = spawn_early {
+        spawn_capsule(&mut world, sp, &p)
+    } else {
+        (RigidBodyHandle::invalid(), ColliderHandle::invalid())
+    };
     if t1 {
         terrain = build_terrain_t1(&mut world);
     } else {
@@ -833,27 +932,30 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             }
         }
     }
-
-    // ── 主体出生 ──
-    let spawn = match cfg.scene {
-        Scene::Walk { t1: true, .. } | Scene::Seam { .. } => {
-            Vector::new(T1_SPAWN_X, GROUND_TOP_T1 + 0.902, 0.0)
-        }
-        Scene::Walk { .. } => Vector::new(0.0, GROUND_TOP + 0.902, 0.0),
-        Scene::Stand { t1: true } => Vector::new(168.0, GROUND_TOP_T1 + 0.902, 8.0),
-        Scene::Stand { .. } => Vector::new(8.0, GROUND_TOP + 0.902, 8.0),
-        Scene::Step { run, d, trial, .. } => {
-            let (dx, dz) = PERTURB[trial % PERTURB.len()];
-            if run {
-                Vector::new(dx, GROUND_TOP + 0.902, dz)
-            } else {
-                // R1/CR5:d = 胶囊表面到台阶面的间隙 → 中心 x = 面 x − CAP_R − d。
-                Vector::new(STEP_FACE_X - CAP_R - d + dx, GROUND_TOP + 0.902, dz)
+    // ── 主体出生(late 行已在建地形前插入)──
+    let (cap_body, cap_collider) = if late {
+        (cap_body, cap_collider)
+    } else {
+        let spawn = match cfg.scene {
+            Scene::Walk { t1: true, .. } | Scene::Seam { .. } => {
+                Vector::new(T1_SPAWN_X, GROUND_TOP_T1 + 0.902, 0.0)
             }
-        }
-        _ => Vector::new(0.0, GROUND_TOP + 0.902, 0.0),
+            Scene::Walk { .. } => Vector::new(0.0, GROUND_TOP + 0.902, 0.0),
+            Scene::Stand { t1: true } => Vector::new(168.0, GROUND_TOP_T1 + 0.902, 8.0),
+            Scene::Stand { .. } => Vector::new(8.0, GROUND_TOP + 0.902, 8.0),
+            Scene::Step { run, d, trial, .. } => {
+                let (dx, dz) = PERTURB[trial % PERTURB.len()];
+                if run {
+                    Vector::new(dx, GROUND_TOP + 0.902, dz)
+                } else {
+                    // R1/CR5:d = 胶囊表面到台阶面的间隙 → 中心 x = 面 x − CAP_R − d。
+                    Vector::new(STEP_FACE_X - CAP_R - d + dx, GROUND_TOP + 0.902, dz)
+                }
+            }
+            _ => Vector::new(0.0, GROUND_TOP + 0.902, 0.0),
+        };
+        spawn_capsule(&mut world, spawn, &p)
     };
-    let (cap_body, cap_collider) = spawn_capsule(&mut world, spawn, &p);
     let cap_mass = world.bodies.get(cap_body).expect("alive").mass();
     assert!(
         (cap_mass - CAP_MASS).abs() < 1e-4,
@@ -861,12 +963,15 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     );
     // R1/CR2:球投射形状(半径 CAP_R − 0.02)。
     let ball_shape = SharedShape::ball(BALL_CAST_R);
-    // R1/CR3:接缝修正钩子(每拍 step_with_events 步进)。
+    // R1/CR3 + R2:接缝修正钩子(每拍 step_with_events 步进)。
     let hooks = EdgeFixHooks {
         cap_collider: AtomicU32::new(0),
         cap_gen: AtomicU32::new(0),
         enabled: AtomicBool::new(edgefix_on),
         fixed: AtomicU32::new(0),
+        fric: AtomicU32::new(0),
+        c1: AtomicU32::new(0),
+        fric_zero_on: AtomicBool::new(true),
     };
     hooks.set_cap(cap_collider);
 
@@ -942,6 +1047,9 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let mut ground_hits = 0u64;
     let mut ground_n = 0u64;
     let mut edge_snaps = 0u32;
+    // R2/DR1:清零摩擦的流形次数;DR2:胶囊为 collider1 的钩子进入次数。
+    let mut fric_zeroed = 0u32;
+    let mut cap_is_c1 = 0u32;
     let mut dip = 0.0f32;
     let mut stuck_run = 0u32;
     let mut stuck_max = 0u32;
@@ -1141,10 +1249,13 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             }
         }
 
-        // R1/CR3:接缝修正钩子步进(每拍清零计数,步进后采样)。
+        // R1/CR3 + R2:接缝修正钩子步进(每拍清零计数,步进后采样)。
         hooks.reset_fixed();
+        hooks.reset_c1();
         world.step_with_events(&hooks, &());
         edge_snaps += hooks.take_fixed();
+        fric_zeroed += hooks.take_fric();
+        cap_is_c1 += hooks.take_c1();
 
         // 失控防护(重物 vg 行;先查非有限再查阈值)。
         if cap_alive && cfg.v_guard.is_some() {
@@ -1355,6 +1466,14 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     }
 
     // ── 收尾 ──
+    // R2/DR2:late 对照行断言——钩子(纯观测计数,不受 edgefix 开关影响)
+    // 里胶囊至少有一次是 collider1,否则说明 pair 顺序假设不成立,fail-stop。
+    if late {
+        assert!(
+            cap_is_c1 > 0,
+            "late 行胶囊从未以 collider1 进入钩子(pair 顺序假设不成立)"
+        );
+    }
     let v_mean = if v_n > 0 {
         (v_sum / v_n as f64) as f32
     } else {
@@ -1478,6 +1597,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         vy_peak_settle,
         ground_frac,
         edge_snaps,
+        fric_zeroed,
+        cap_is_c1,
         pile_land_pen,
         pile_land_vy,
         pen_min: opt_pen(pen_min),
@@ -1706,86 +1827,88 @@ fn run_sweep() {
     let mut aggs: Vec<TupleAgg> = Vec::new();
     let mut jumps: Vec<JumpAgg> = Vec::new();
 
-    // 阶段 A:平地(T0)行走 648 元组 × 3 速度,heading 0。
+    // 阶段 A:平地(T0)行走 72 元组(μ 固定 0.3,R2:μ 维度在平地和台阶
+    // 上不起作用——摩擦在钩子里对固定刚体清零,μ 只进动态方块)× 3 速度,
+    // heading 0。
     for &tau in &TAUS {
         for &fmax in &FMAXS {
-            for &mu in &MUS {
-                for &air in &AIRS {
-                    for &ge in &GES {
-                        for &shape in &[false, true] {
-                            let p = Params {
-                                tau,
-                                fmax_mul: fmax,
-                                mu,
-                                air,
-                                h_jump: 1.25,
-                                ground_eps: ge,
-                                shape_cast: shape,
-                            };
-                            let tuple = p.tuple_tag();
-                            let mut err_max = 0.0f32;
-                            let mut err_by_speed = [0.0f32; 3];
-                            let mut any_nan = false;
-                            let mut all_pass = true;
-                            let mut all_vy_ok = true;
-                            for (si, &speed) in WALK_SPEEDS.iter().enumerate() {
-                                let name = format!("swA_s{}_{}", fp(speed), tuple);
-                                let cfg = Cfg {
-                                    name: name.clone(),
-                                    scene: Scene::Walk {
-                                        t1: false,
-                                        speed,
-                                        heading: 0,
-                                        sweep_a: true,
-                                    },
-                                    p,
-                                    v_guard: None,
-                                };
-                                let o = run(&cfg);
-                                let err = o.speed_err_pct.unwrap_or(100.0);
-                                err_max = err_max.max(err);
-                                err_by_speed[si] = err;
-                                any_nan |= o.nan || o.panicked;
-                                let row_pass = err <= 5.0 && o.vy_peak <= 0.5 && !o.nan;
-                                all_pass &= row_pass;
-                                all_vy_ok &= o.vy_peak <= 0.5;
-                                rows.push(SweepRow {
-                                    pass: "-".into(), // 元组级 flag 收齐后回填
-                                    name,
-                                    stage: "A",
-                                    speed_target: format!("{speed:.1}"),
-                                    v_mean: opt_f(o.v_mean),
-                                    speed_err_pct: opt_f(o.speed_err_pct),
-                                    t90_ms: opt_f(o.t90_ms),
-                                    vy_peak: format!("{:.4}", o.vy_peak),
-                                    step_ok: "-".into(),
-                                    step_n: "-".into(),
-                                    nan: o.nan || o.panicked,
-                                    state_hash: if o.panicked {
-                                        "PANIC".into()
-                                    } else {
-                                        format!("{:016x}", o.state_hash)
-                                    },
-                                });
-                            }
-                            // 回退层(README 同文):4.3/5.6 档 ≤5% 且 vy OK。
-                            let pass_hi = err_by_speed[1] <= 5.0
-                                && err_by_speed[2] <= 5.0
-                                && all_vy_ok
-                                && !any_nan;
-                            aggs.push(TupleAgg {
+            let mu = SCAN_MU;
+            for &air in &AIRS {
+                for &ge in &GES {
+                    for &shape in &[false, true] {
+                        let p = Params {
+                            tau,
+                            fmax_mul: fmax,
+                            mu,
+                            air,
+                            h_jump: 1.25,
+                            ground_eps: ge,
+                            shape_cast: shape,
+                        };
+                        let tuple = p.tuple_tag();
+                        let mut err_max = 0.0f32;
+                        let mut err_by_speed = [0.0f32; 3];
+                        let mut any_nan = false;
+                        let mut all_pass = true;
+                        let mut all_vy_ok = true;
+                        for (si, &speed) in WALK_SPEEDS.iter().enumerate() {
+                            let name = format!("swA_s{}_{}", fp(speed), tuple);
+                            let cfg = Cfg {
+                                name: name.clone(),
+                                scene: Scene::Walk {
+                                    t1: false,
+                                    speed,
+                                    heading: 0,
+                                    sweep_a: true,
+                                    late: false,
+                                },
                                 p,
-                                err_max,
-                                err_by_speed,
-                                pass_a: all_pass && !any_nan,
-                                pass_hi,
+                                v_guard: None,
+                            };
+                            let o = run(&cfg);
+                            let err = o.speed_err_pct.unwrap_or(100.0);
+                            err_max = err_max.max(err);
+                            err_by_speed[si] = err;
+                            any_nan |= o.nan || o.panicked;
+                            let row_pass = err <= 5.0 && o.vy_peak <= 0.5 && !o.nan;
+                            all_pass &= row_pass;
+                            all_vy_ok &= o.vy_peak <= 0.5;
+                            rows.push(SweepRow {
+                                pass: "-".into(), // 元组级 flag 收齐后回填
+                                name,
+                                stage: "A",
+                                speed_target: format!("{speed:.1}"),
+                                v_mean: opt_f(o.v_mean),
+                                speed_err_pct: opt_f(o.speed_err_pct),
+                                t90_ms: opt_f(o.t90_ms),
+                                vy_peak: format!("{:.4}", o.vy_peak),
+                                step_ok: "-".into(),
+                                step_n: "-".into(),
+                                nan: o.nan || o.panicked,
+                                state_hash: if o.panicked {
+                                    "PANIC".into()
+                                } else {
+                                    format!("{:016x}", o.state_hash)
+                                },
                             });
-                            // 回填元组级 pass。
-                            let back = if all_pass && !any_nan { "A" } else { "-" };
-                            let tail = rows.len();
-                            for r in &mut rows[tail - WALK_SPEEDS.len()..] {
-                                r.pass = back.into();
-                            }
+                        }
+                        // 回退层(README 同文):4.3/5.6 档 ≤5% 且 vy OK。
+                        let pass_hi = err_by_speed[1] <= 5.0
+                            && err_by_speed[2] <= 5.0
+                            && all_vy_ok
+                            && !any_nan;
+                        aggs.push(TupleAgg {
+                            p,
+                            err_max,
+                            err_by_speed,
+                            pass_a: all_pass && !any_nan,
+                            pass_hi,
+                        });
+                        // 回填元组级 pass。
+                        let back = if all_pass && !any_nan { "A" } else { "-" };
+                        let tail = rows.len();
+                        for r in &mut rows[tail - WALK_SPEEDS.len()..] {
+                            r.pass = back.into();
                         }
                     }
                 }
@@ -1885,6 +2008,13 @@ fn run_sweep() {
 // ── 全矩阵 ──────────────────────────────────────────────────────────────
 
 fn build_matrix(cands: &[(String, Params)]) -> Vec<Cfg> {
+    build_matrix_with_mu(cands, &[])
+}
+
+/// `mu_cands` = 推荐候选(R2:对其追加 μ ∈ {0,0.3,0.6} × 场景 6、6b、7、8;
+/// 其余候选不追加)。
+fn build_matrix_with_mu(cands: &[(String, Params)], mu_cands: &[(String, Params)]) -> Vec<Cfg> {
+    let cands_mu_scan = mu_cands;
     let mut out = Vec::new();
     for (tag, p) in cands {
         // 1 平地行走:3 速度 × 8 航向 × T0/T1。
@@ -1904,6 +2034,7 @@ fn build_matrix(cands: &[(String, Params)]) -> Vec<Cfg> {
                             speed,
                             heading: h,
                             sweep_a: false,
+                            late: false,
                         },
                         p: *p,
                         v_guard: None,
@@ -2039,12 +2170,108 @@ fn build_matrix(cands: &[(String, Params)]) -> Vec<Cfg> {
                 });
             }
         }
+        // R2/DR2:walk_T1_late 对照行(先插胶囊再建 T1 地形,其余同 walk_T1;
+        // 中档速度 × 8 航向)。
+        for h in 0..8usize {
+            out.push(Cfg {
+                name: format!("walk_T1_late_s4p3_h{}_{}", h, tag),
+                scene: Scene::Walk {
+                    t1: true,
+                    speed: SEAM_SPEED,
+                    heading: h,
+                    sweep_a: false,
+                    late: true,
+                },
+                p: *p,
+                v_guard: None,
+            });
+        }
+    }
+    // R2:μ 三档(推荐候选 = cands 里最后一个约定俗成的推荐?——不放行约定,
+    // 由调用方传入;这里只对"推荐候选"(调用方标记)追加 μ ∈ {0,0.3,0.6}
+    // × 场景 6、6b、7、8)。名字段 `_mu0` / `_mu0p3` / `_mu0p6`。
+    for (tag, p0) in cands_mu_scan {
+        for &mu in &MUS {
+            let mut p = *p0;
+            p.mu = mu;
+            let mus = fp(mu);
+            // 6 方块堆
+            for layers in [1, 2] {
+                out.push(Cfg {
+                    name: format!("pile_33{}_mu{}_{}", layers, mus, tag),
+                    scene: Scene::Pile { layers },
+                    p,
+                    v_guard: None,
+                });
+            }
+            // 6b 推方块
+            out.push(Cfg {
+                name: format!("push_one_mu{}_{}", mus, tag),
+                scene: Scene::Push,
+                p,
+                v_guard: None,
+            });
+            // 7 被砸
+            for &ox in &HIT_GRID {
+                for &oz in &HIT_GRID {
+                    for &d in &D_GRID {
+                        out.push(Cfg {
+                            name: format!(
+                                "hit_ox{}_oz{}_d{}_mu{}_{}",
+                                f3(ox),
+                                f3(oz),
+                                f3(d),
+                                mus,
+                                tag
+                            ),
+                            scene: Scene::Hit { ox, oz, d },
+                            p,
+                            v_guard: None,
+                        });
+                    }
+                }
+            }
+            // 8 重物(无防护 + vg200)
+            for h in [1.0f32, 2.0, 4.0] {
+                for &ox in &HEAVY_GRID {
+                    for &oz in &HEAVY_GRID {
+                        for &d in &D_GRID {
+                            for vg in [None, Some(V_GUARD)] {
+                                let vg_seg = if vg.is_some() { "_vg200" } else { "" };
+                                out.push(Cfg {
+                                    name: format!(
+                                        "heavy_m{}_ox{}_oz{}_d{}{}_mu{}_{}",
+                                        (8.0 * h * h * h) as i32,
+                                        f3(ox),
+                                        f3(oz),
+                                        f3(d),
+                                        vg_seg,
+                                        mus,
+                                        tag
+                                    ),
+                                    scene: Scene::Heavy { h, ox, oz, d },
+                                    p,
+                                    v_guard: vg,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     out
 }
 
-fn run_matrix(cands: &[(String, Params)]) {
-    let all = build_matrix(cands);
+fn run_matrix(cands: &[(String, Params)], mu_tag: &str) {
+    // R2:μ 三档只跑推荐候选(README 写明推荐与理由;默认 c3)。
+    let mu_cands: Vec<(String, Params)> =
+        cands.iter().filter(|(t, _)| t == mu_tag).cloned().collect();
+    assert!(
+        !mu_cands.is_empty(),
+        "mu 扫描的推荐候选 {mu_tag} 不在 cands.txt 里"
+    );
+    let all = build_matrix_with_mu(cands, &mu_cands);
     let _ = std::fs::create_dir_all("out");
     let mut csv = String::from(MATRIX_HEADER);
     csv.push('\n');
@@ -2067,8 +2294,10 @@ fn run_matrix(cands: &[(String, Params)]) {
     std::fs::write("out/matrix_run.csv", &csv).expect("write matrix");
 }
 
-fn run_det(cands: &[(String, Params)]) {
-    let all = build_matrix(cands);
+fn run_det(cands: &[(String, Params)], mu_tag: &str) {
+    let mu_cands: Vec<(String, Params)> =
+        cands.iter().filter(|(t, _)| t == mu_tag).cloned().collect();
+    let all = build_matrix_with_mu(cands, &mu_cands);
     let _ = std::fs::create_dir_all("out");
     let mut txt = String::new();
     for cfg in &all {
@@ -2122,6 +2351,7 @@ fn run_smoke() {
     let keep = [
         "walk_T0_s4p3_h0",
         "walk_T1_s4p3_h0",
+        "walk_T1_late_s4p3_h0",
         "stand_T0",
         "airjump_single",
         "airjump_repeat",
@@ -2154,7 +2384,7 @@ fn run_smoke() {
 
 const MATRIX_HEADER: &str = "name,end_tick,end_reason,nan,panicked,guard_removed,panic_msg,\
      speed_target,v_mean,speed_err_pct,t90_ms,stop_dist_m,stop_end_v,vy_peak,vy_peak_settle,\
-     ground_frac,edge_snaps,pile_land_pen,pile_land_vy,pen_min,\
+     ground_frac,edge_snaps,fric_zeroed,cap_is_c1,pile_land_pen,pile_land_vy,pen_min,\
      pen_obj_min,drift_m,sink_m,sleep_ratio,slept,jump_max_h,bounce_vy,hit_disp_h,\
      speed_max,block_disp_max,blocks_woken,dip_pct,stuck,step_success,course_err_deg,\
      state_hash";
@@ -2162,6 +2392,13 @@ const MATRIX_HEADER: &str = "name,end_tick,end_reason,nan,panicked,guard_removed
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("");
+    // R2:μ 三档扫描跑哪个候选(推荐候选,README 论证;默认 c3)。
+    let mu_tag = args
+        .iter()
+        .skip_while(|a| a.starts_with("--") || a == &mode)
+        .find(|a| a.starts_with("c"))
+        .cloned()
+        .unwrap_or_else(|| "c3".to_string());
     // 预期内的重物 panic:行内已捕获 payload 并写入 panic 行,免刷屏。
     std::panic::set_hook(Box::new(|info| {
         eprintln!("PANIC: {info}");
@@ -2169,22 +2406,24 @@ fn main() {
     match mode {
         "--list" => {
             println!("modes: sweep | matrix | det | smoke");
-            println!("sweep: 平地 648 元组 × 3 速度 + 1 格台阶 hj 扫描 → out/sweep_raw.csv + out/cands.txt");
-            println!("matrix: 读 out/cands.txt 跑全部场景 → out/matrix_run.csv");
+            println!("sweep: 平地 72 元组 × 3 速度 + 1 格台阶 hj 扫描 → out/sweep_raw.csv + out/cands.txt");
+            println!(
+                "matrix: 读 out/cands.txt 跑全部场景(推荐候选另跑 μ 三档)→ out/matrix_run.csv"
+            );
             println!("det: 全矩阵双跑逐行哈希 → out/det_run.txt");
         }
         "sweep" => run_sweep(),
         "matrix" => {
             let cands = parse_cands("out/cands.txt");
-            run_matrix(&cands);
+            run_matrix(&cands, &mu_tag);
         }
         "det" => {
             let cands = parse_cands("out/cands.txt");
-            run_det(&cands);
+            run_det(&cands, &mu_tag);
         }
         "smoke" => run_smoke(),
         _ => {
-            println!("usage: capsule [--list|sweep|matrix|det|smoke]");
+            println!("usage: capsule [--list|sweep|matrix|det|smoke] [c1|c2|c3]");
             std::process::exit(if mode.is_empty() { 0 } else { 1 });
         }
     }
