@@ -1,0 +1,19 @@
+[package]
+name = "capsule-demo"
+version = "0.1.0"
+edition = "2021"
+
+default-run = "capsule"
+
+[[bin]]
+name = "capsule"
+path = "src/main.rs"
+
+[dependencies]
+quad = { path = "../quad" }
+physics-sim = { path = "../../../crates/physics-sim" }
+types = { path = "../../../crates/types" }
+voxel = { path = "../../../crates/voxel" }
+rapier3d = { version = "=0.36.1", features = ["serde-serialize"] }
+
+[workspace]

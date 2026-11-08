@@ -1,0 +1,6 @@
+/target/
+/out/*
+!out/sweep_submitted.txt
+!out/cands_submitted.txt
+!out/matrix_submitted.txt
+!out/det_submitted.txt
