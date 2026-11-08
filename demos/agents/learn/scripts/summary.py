@@ -105,7 +105,7 @@ def main() -> int:
         )
 
     # ── det(双跑逐位)──
-    for name in ("det_s0.txt", "det_s1_l5_ft.txt"):
+    for name in ("det_s1.txt", "det_s1_l5_ft.txt"):
         lines = [l.strip() for l in open(os.path.join(OUT, name), encoding="utf-8") if l.strip()]
         ident = sum(1 for l in lines if l.endswith("IDENTICAL"))
         differ = sum(1 for l in lines if l.endswith("DIFFER"))
