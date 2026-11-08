@@ -171,6 +171,8 @@ assets/policies/<名>/
 4. **零样本评估**:不改权重,直接在本项目物理里评估,报迁移差距;
 5. **微调**:在 `agent-env` 里用 PPO 继续训练,直到满足 AC-E2。阶段 E 的验收全部在本项目物理里判。
 
+**训练代码与后端无关**(用户 2026-11-08 要求):PPO、奖励、导出放在 `tools/train/`,通过统一的后端接口驱动环境。rapier 和 MuJoCo 各写一个适配器,共用一份 `BackendSpec`(观测布局、动作映射、控制频率、`reward_inputs` 的键、身体标识)。检查点带 `spec`,`--init-from` 可以换后端继续训练,`spec` 不一致就拒绝。三步路线:demo `learn` 先在 rapier 上跑通;`transfer` 接 MuJoCo 主训练;最后回到 rapier 微调。
+
 `crates/agent-env` 负责第 4、5 步:进程内直接驱动 `ShardSim`,不走网络、不走 tick 节拍,跑的是和服务器**同一份物理代码**。
 
 - Rust API:`reset(seed)`、`step(actions) → (obs, reward_inputs, done)`,一个环境可以有 N 个并行实例,各用独立线程;
