@@ -134,7 +134,8 @@ type CommandGuard = Result<(), &'static str>;
 ///   `origin_shard`/路由分片查实体**;
 /// - `MarkActor` → 仅服务端(网络来源拒绝),owner 必须存在;
 /// - `SpawnDynamic` → 仅 commands 通道/内部受信路径;外部网络已由
-///   `C2S::Spawn` 取代(REQ-006 任务 02);
+///   `C2S::Spawn` 取代(REQ-006 任务 02);`SpawnAgent` 同口径(R1-P3:
+///   commands 通道 None 接受,网络来源拒绝);
 /// - `Detonate` → **只做参数校验**且**先于**分片注册检查(REQ-005 任务 03)。
 pub fn validate_external_command(
     session: &sim_api::session::Session,
@@ -230,11 +231,18 @@ pub fn validate_external_command(
         // 复合体生成(K02 §5.6):调度器从模拟产出再注入的专用内部载荷,
         // 外部一律拒绝(无论来源;防御层与 net::command_shard 同口径)。
         messaging::SimCommand::SpawnCompound { .. } => Err("SpawnCompound 是调度器专用命令"),
-        // 主体生成(REQ-012 A01 第 2 节):本地受信通道专用(Session 直发,
-        // 与 SetAreaTicket 同款);不进 C2S 白名单(net::command_shard 返回
-        // None → translate 拒绝)——协议与附身面在 A03 开。经外部缝到达 =
-        // 拒绝丢弃。
-        messaging::SimCommand::SpawnAgent { .. } => Err("SpawnAgent 走本地受信通道(协议面 A03 开)"),
+        // 主体生成(REQ-012 A01 第 2 节,R1-P3):本地受信通道(commands,
+        // source = None)接受,口径与 `SpawnDynamic` 一致(正路 =
+        // `Session::spawn_agent` 盖章入日志);网络来源照旧拒绝——不进 C2S
+        // 白名单(net::command_shard 返回 None → translate 拒绝)——协议与
+        // 附身面在 A03 开。经网络缝到达 = 拒绝丢弃。
+        messaging::SimCommand::SpawnAgent { .. } => {
+            if source.is_some() {
+                Err("SpawnAgent 网络来源拒绝(本地受信通道专用;协议面 A03 开)")
+            } else {
+                Ok(())
+            }
+        }
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
@@ -2387,8 +2395,8 @@ mod tests {
             .is_err(),
             "MarkActor 服务端专用"
         );
-        // SpawnAgent 外部拒绝(REQ-012 A01 第 2 节:本地受信通道专用,协议
-        // 面 A03 开;net::command_shard 返回 None 同口径)。
+        // SpawnAgent 网络来源拒绝;commands 通道(None)接受(R1-P3,口径
+        // 与 SpawnDynamic 一致;net::command_shard 返回 None 同口径)。
         let spawn_agent = messaging::SimCommand::SpawnAgent {
             entity: e,
             body: types::BodyHash([0u8; 8]),
@@ -2402,7 +2410,11 @@ mod tests {
                 &spawn_agent
             )
             .is_err(),
-            "SpawnAgent 走本地受信通道(协议面 A03 开)"
+            "SpawnAgent 网络来源拒绝(本地受信通道专用;协议面 A03 开)"
+        );
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &spawn_agent).is_ok(),
+            "SpawnAgent commands 通道(None)接受(与 SpawnDynamic 同口径)"
         );
         session.shutdown();
     }

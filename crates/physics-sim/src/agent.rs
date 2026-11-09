@@ -344,10 +344,10 @@ mod tests {
         bodies
     }
 
-    /// 凝固关闭的测试配置(与既有测试同风格)+ capsule 注册表。
+    /// 测试用配置(默认凝固配置,REQ-012 A01 R1-P1:判据布景凝固开启;
+    /// 需要关闭的用例自行覆写)+ capsule 注册表。
     pub(crate) fn test_sim() -> (crate::sim::ShardSim, BodyHash) {
-        let mut cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
-        cfg.solidify.enabled = false;
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
         let mut bodies = BodyRegistry::new();
         let hash = bodies
             .insert_toml(capsule_toml())
@@ -371,6 +371,103 @@ mod tests {
                 sim.load_chunk(types::ChunkPos::new(cx, cz), chunk);
             }
         }
+    }
+
+    /// 装载后的实心方块数(基准 2304 = 3×3 chunk × 16×16 地面层;R1-P1:
+    /// "体素计数不变"按**实心方块**数,不按 chunk 数——凝固写方块不新建
+    /// chunk,chunk 计数测不到)。
+    fn count_solid_blocks(sim: &crate::sim::ShardSim) -> usize {
+        let mut n = 0usize;
+        for cp in sim.voxel().chunk_positions().collect::<Vec<_>>() {
+            let min = cp.block_min();
+            for x in 0..voxel::CHUNK_X {
+                for y in 0..voxel::CHUNK_Y {
+                    for z in 0..voxel::CHUNK_Z {
+                        if !sim
+                            .voxel()
+                            .get_block(types::BlockPos::new(
+                                min.x + x as i32,
+                                min.y + y as i32,
+                                min.z + z as i32,
+                            ))
+                            .is_air()
+                        {
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        n
+    }
+
+    /// SpawnAgent 的盖章输入(REQ-012 A01 R1-P3b:AC-A6/判据布景的主体生成
+    /// 走**命令路径**(apply_prefix → apply_command → spawn_agent),不再直调;
+    /// SCHEDULER 来源 = 服务端注入,与 SpawnDynamic 测试同款)。
+    fn spawn_agent_input(
+        entity: types::EntityId,
+        body: BodyHash,
+        pos: Vec3,
+    ) -> messaging::StampedInput {
+        messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnAgent {
+                entity,
+                body,
+                state: types::EntityState {
+                    translation: pos,
+                    ..types::EntityState::default()
+                },
+            }),
+        }
+    }
+
+    /// SpawnDynamic 盖章输入(对照布景;sim.rs 测试 spawn_input 同款)。
+    fn spawn_dynamic_input(
+        entity: types::EntityId,
+        pos: Vec3,
+        seq: u64,
+    ) -> messaging::StampedInput {
+        messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity,
+                state: types::EntityState {
+                    translation: pos,
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::default(),
+            }),
+        }
+    }
+
+    /// MarkActor 常驻化盖章输入(sim.rs 测试 mark_actor_input 同款)。
+    fn mark_actor_input(entity: types::EntityId, seq: u64) -> messaging::StampedInput {
+        messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::MarkActor {
+                entity,
+                actor: true,
+            }),
+        }
+    }
+
+    /// 生产节奏的一拍(调度器 worker 同序:scheduler.rs apply_prefix → step →
+    /// run_transient_lifecycle → take_outbox;激活刷新每拍先行——scheduler.
+    /// tick 里 activation_enabled 时每分片逐拍 apply_activation_tickets)。
+    fn production_tick(sim: &mut crate::sim::ShardSim, observers: &[Vec3]) {
+        if !observers.is_empty() {
+            sim.apply_activation(observers);
+        }
+        sim.step();
+        sim.run_transient_lifecycle();
+        let _ = sim.take_outbox();
     }
 
     #[test]
@@ -470,42 +567,29 @@ mod tests {
         (i, g)
     }
 
-    /// 判据 A01-1:静止 3600 拍——主体还在、体素计数不变、下沉 ≤ 1 cm、
-    /// 水平漂移 ≤ 1 cm;期间不加任何控制力。全程 `run_transient_lifecycle`
-    /// 照常跑(凝固/强制落地/兜底冻结各路径都过一遍,主体都不受影响)。
+    /// 判据 A01-1(R1-P1 重做):**默认凝固配置** + 生产节奏(激活开启、有
+    /// 观察者、每拍 step → run_transient_lifecycle → take_outbox)静止 3600
+    /// 拍——主体还在、实心方块数不变、下沉/漂移 ≤ 1 cm;期间不加任何控制力。
+    /// 主体生成走命令路径(SpawnAgent 盖章输入)。
     #[test]
     fn agent_stands_3600_ticks_on_flat_ground() {
         let (mut s, hash) = test_sim();
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            types::EntityState {
-                translation: Vec3::new(24.0, 1.95, 24.0),
-                ..types::EntityState::default()
-            },
-        )
-        .expect("capsule 可生成");
-        let chunks_before = s.voxel().chunk_count();
-        let mut solidified = 0usize;
+        let baseline_solid = count_solid_blocks(&s);
+        s.apply_prefix(&[spawn_agent_input(a, hash, Vec3::new(24.0, 1.95, 24.0))]);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        assert!(s.is_agent(a), "命令路径生成主体成功(布景自检)");
         for _ in 0..3600 {
-            s.step();
-            let out = s.take_outbox();
-            solidified += out
-                .block_updates
-                .iter()
-                .filter(|w| w.kind == crate::sim::BlockWriteKind::Emergent)
-                .count();
+            production_tick(&mut s, &observers);
         }
-        s.run_transient_lifecycle();
         let st = s.entity_state(a).expect("主体还在(不移除、不凝固)");
+        assert!(s.is_agent(a), "agents 表仍在");
         assert_eq!(
-            s.voxel().chunk_count(),
-            chunks_before,
-            "体素计数不变(不凝固)"
+            count_solid_blocks(&s),
+            baseline_solid,
+            "实心方块数不变(主体永不凝固写块;R1-P1 按方块数不按 chunk 数)"
         );
-        assert_eq!(solidified, 0, "无任何 Emergent 写入(主体永不写方块)");
         assert!(
             (st.translation.y - 1.9).abs() <= 0.01,
             "下沉 ≤ 1 cm(站面 y=1、半高 0.9 → 静止中心 1.9):y={}",
@@ -517,64 +601,194 @@ mod tests {
             st.translation.x,
             st.translation.z
         );
+        assert!(!s.forced_pending.contains(&a), "主体不进强制落地队列");
     }
 
-    /// 判据 A01-1(预算豁免):会让普通实体被预算冻结的配置下,主体不被
-    /// 预算冻结(用现有预算测试的布景:budget_cfg(1),观察者 + 远距实体)。
-    /// 常规实体在同布景下被淘汰(前置自证),主体同位不被冻、不被强制落地。
+    /// 判据 A01-1 前置对照(R1-P1):**同一布景**(默认凝固配置、生产节奏、
+    /// 同观察者、同位置)放一个普通方块实体,它在 3600 拍内凝固——证明该
+    /// 布景真的会触发凝固,站立测试的"主体不凝固"不是布景太弱。
     #[test]
-    fn agent_exempt_from_budget_freeze_and_forced_landing() {
+    fn plain_entity_at_same_spot_solidifies_under_production_tick() {
+        let (mut s, _hash) = test_sim();
+        load_flat_ground(&mut s);
+        let plain = types::EntityId::from_parts(1, 2);
+        s.spawn_entity_for_test(plain, Vec3::new(24.0, 1.95, 24.0));
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        let baseline_solid = count_solid_blocks(&s);
+        let mut solidified_at = None;
+        for tick in 0..3600u32 {
+            production_tick(&mut s, &observers);
+            if solidified_at.is_none() && !s.entities.contains_key(&plain) {
+                solidified_at = Some(tick);
+            }
+        }
+        let tick = solidified_at.expect("对照:普通实体须在 3600 拍内凝固(实体消失)");
+        let grown = count_solid_blocks(&s) - baseline_solid;
+        assert_eq!(
+            grown, 1,
+            "凝固恰好写入 1 格(拍 {tick} 实体消失 = Emergent 写块)"
+        );
+    }
+
+    /// 判据 A01-1(预算豁免,R1-P2:**主体是淘汰池第一个**):预算 1、两个
+    /// 醒者,主体 (31,3,0) 距观察者 31 m、普通实体 (5,3,0) 距 5 m——按距离
+    /// 降序主体排第一,`enforce_budget_cells` 选中的就是主体,豁免分支真正
+    /// 走到。路径 = plan 超预算淘汰(apply_activation 落实,豁免点在
+    /// entities_to_freeze 段)。对照(R1-P2 第 2 条):同布景把主体换成普通
+    /// 常驻实体,它会被冻结(见 plain_pool_evicts_farthest)。
+    ///
+    /// 布景参数:零重力(实体静止 = 可冻结/可淘汰;同既有预算测试);
+    /// 凝固关(排除凝固路径干扰,被测对象 = 预算强制);两实体都在
+    /// awake_unload(32 m)内(排除滞回冻结:31 m 与 5 m 都不满足出范围)。
+    fn budget_pool_cfg() -> crate::sim::ShardSimConfig {
         let mut cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
         cfg.solidify.enabled = false;
-        cfg.gravity = Vec3::ZERO; // 同 budget_cfg:零重力静止 = 可冻结
+        cfg.gravity = Vec3::ZERO;
         cfg.activation.max_awake_dynamic = 1;
-        let mut bodies = BodyRegistry::new();
-        let hash = bodies
-            .insert_toml(capsule_toml())
-            .expect("capsule.body.toml 合法");
-        let mut s =
-            crate::sim::ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies);
+        cfg
+    }
+
+    fn budget_sim() -> (crate::sim::ShardSim, BodyHash) {
+        let bodies = fresh_capsule_registry();
+        let hash = bodies.hash_of("capsule").expect("capsule 已装");
+        let mut sim = crate::sim::ShardSim::new_with_bodies(
+            budget_pool_cfg(),
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        );
+        // 平板地形:无 ①② 的实体会进待地形(kinematic),那样"被冻结"断言
+        // 测不到预算路径(上一轮"前置自证"测到的其实是待地形)。
+        load_flat_ground(&mut sim);
+        (sim, hash)
+    }
+
+    /// plan 路径(apply_activation 内落实;豁免点 sim.rs entities_to_freeze 段)。
+    /// 布景:两实体与观察者都落在 3×3 平板([0,48)²)内部,足迹不跨界缺 ①
+    /// (跨界缺块会进待地形 kinematic——上一轮"前置自证"测到的其实是待地形,
+    /// 不是预算冻结);主体距观察者 23 m(> 普通的 8 m,淘汰池排第一)、仍在
+    /// awake_load/unload 内(不滞回冻结)。
+    #[test]
+    fn budget_eviction_selects_agent_first_and_exempts_it() {
+        let (mut s, hash) = budget_sim();
         let a = types::EntityId::from_parts(1, 1);
         let plain = types::EntityId::from_parts(1, 2);
         s.spawn_agent(
             a,
             hash,
             types::EntityState {
-                translation: Vec3::new(20.0, 3.0, 8.0),
+                translation: Vec3::new(31.0, 3.0, 8.0),
                 ..types::EntityState::default()
             },
         )
         .expect("capsule 可生成");
-        s.spawn_entity_for_test(plain, Vec3::new(100.0, 3.0, 100.0));
-        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]); // 预算 1,两个醒者
+        s.spawn_entity_for_test(plain, Vec3::new(16.0, 3.0, 8.0));
+        // 单拍激活刷新(生产路径):预算 1,醒者 2(格数和 2),淘汰池距离
+        // 降序 = [主体(23 m), 普通(8 m)] → 主体被选中 → 豁免 continue,
+        // 预算收缩到此为止(普通实体不再被淘汰)。
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
         for _ in 0..21 {
             s.step();
         }
         s.run_transient_lifecycle();
-        // 前置自证:普通常驻体已被预算冻结(速度清零 + kinematic)。
-        {
-            let rec = s.entities.get(&plain).expect("普通实体还在");
-            let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
-            assert!(
-                b.is_kinematic(),
-                "前置:预算 1 下普通常驻体被淘汰冻结(同布景对照)"
-            );
-        }
-        // 主体同布景:仍醒着(Dynamic)、速度未清零。
+        let _ = s.take_outbox();
+        // 豁免生效:主体仍醒着(Dynamic)、不被 kinematic 化、不进强制落地。
         {
             let rec = s.entities.get(&a).expect("主体还在");
             assert!(rec.actor);
             let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
-            assert!(b.is_dynamic(), "主体豁免预算冻结(不被 kinematic 化)");
+            assert!(
+                b.is_dynamic(),
+                "主体被淘汰池选中仍豁免:不冻结(变异 M1 会被本断言抓住)"
+            );
         }
         assert!(!s.forced_pending.contains(&a), "主体不进强制落地队列");
+        // 普通实体:预算已被主体豁免消耗(主体占池 1 格,over 归零),仍醒着。
+        {
+            let rec = s.entities.get(&plain).expect("普通实体还在");
+            let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
+            assert!(b.is_dynamic(), "预算收缩由主体豁免承担,普通实体不再淘汰");
+        }
     }
 
-    /// 判据 A01-1(移除无残留):移除后刚体、碰撞体、归因表、agents、
-    /// 实体表、spawned/despawned 簿记全部回到生成前状态(逐项断言数量
-    /// 与键集合)。
+    /// 命令唤醒路径(R1-P2/原 README 决策 6;豁免点 enforce_budget_after_
+    /// command_wake):同布景,主体经 apply_prefix(SpawnAgent)进世界——
+    /// 命令唤醒的预算强制在 apply 末尾立即落实,主体被选中(距离最大)→
+    /// 豁免。这条测试独立钉住命令唤醒半边(M1 删该处豁免时变红)。
     #[test]
-    fn despawn_agent_leaves_no_residue() {
+    fn budget_after_command_wake_exempts_agent() {
+        let (mut s, hash) = budget_sim();
+        let a = types::EntityId::from_parts(1, 1);
+        let plain = types::EntityId::from_parts(1, 2);
+        s.spawn_entity_for_test(plain, Vec3::new(16.0, 3.0, 8.0));
+        // 注册观察者(observed = Some 是命令唤醒预算强制的前置)。
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        let _ = s.take_outbox();
+        // 主体走命令路径(同时钉 M5:apply_command 的 SpawnAgent 分支)。
+        s.apply_prefix(&[spawn_agent_input(a, hash, Vec3::new(31.0, 3.0, 8.0))]);
+        assert!(s.is_agent(a), "命令路径生成成功(布景自检)");
+        for _ in 0..21 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        let _ = s.take_outbox();
+        let rec = s.entities.get(&a).expect("主体还在");
+        let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
+        assert!(
+            b.is_dynamic(),
+            "命令唤醒路径:主体被淘汰池选中仍豁免(不冻结、不被强制落地)"
+        );
+        assert!(!s.forced_pending.contains(&a), "主体不进强制落地队列");
+        let rec = s.entities.get(&plain).expect("普通实体还在");
+        let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
+        assert!(b.is_dynamic(), "普通实体不被连带淘汰(豁免已使预算达标)");
+    }
+
+    /// 对照(R1-P2 第 2 条):同一布景把主体换成普通常驻实体——距离最大者
+    /// 被预算淘汰冻结(kinematic + 速度清零)。证明淘汰池真的会选距离最大
+    /// 者:上一测试里主体的幸存来自豁免,不是布景选不中它。
+    #[test]
+    fn plain_pool_evicts_farthest() {
+        let cfg = budget_pool_cfg();
+        let mut s = crate::sim::ShardSim::new(cfg, Box::new(SimpleRegistry::builtin()));
+        load_flat_ground(&mut s);
+        let far = types::EntityId::from_parts(1, 1);
+        let near = types::EntityId::from_parts(1, 2);
+        // 主体位 → 换成普通**常驻**体(MarkActor 常驻化,既有预算测试同款;
+        // 瞬态被淘汰走强制落地移除而非冻结,对照要测的是"冻结")。
+        s.apply_prefix(&[
+            spawn_dynamic_input(far, Vec3::new(31.0, 3.0, 8.0), 0),
+            spawn_dynamic_input(near, Vec3::new(16.0, 3.0, 8.0), 1),
+            mark_actor_input(far, 2),
+            mark_actor_input(near, 3),
+        ]);
+        s.apply_activation(&[Vec3::new(8.0, 3.0, 8.0)]);
+        for _ in 0..21 {
+            s.step();
+        }
+        s.run_transient_lifecycle();
+        let _ = s.take_outbox();
+        {
+            let rec = s.entities.get(&far).expect("远实体还在(被冻结非移除)");
+            let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
+            assert!(
+                b.is_kinematic(),
+                "对照:同位普通常驻体被预算淘汰冻结(主体幸存 = 豁免所致)"
+            );
+        }
+        {
+            let rec = s.entities.get(&near).expect("近实体还在");
+            let b = s.phys.bodies.get(rec.handle).expect("handle 有效");
+            assert!(b.is_dynamic(), "预算 1:近者保留(over 归零)");
+        }
+    }
+
+    /// 强制落地挡板(R1-P2/M6):调度器 7.5 的 TransientMotion 到期指令入口
+    /// `apply_forced_landing_directive` 让主体进 `forced_pending`(生产上主体
+    /// 常驻不进到期扫描,此为该入口的防御路径),lifecycle 的强制落地段必须
+    /// 出队跳过:不移除、不写体素。变异 M6(删挡板)→ 主体被单格强制落地
+    /// 写块移除,本测试红。
+    #[test]
+    fn forced_landing_directive_skips_agent() {
         let (mut s, hash) = test_sim();
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
@@ -587,26 +801,105 @@ mod tests {
             },
         )
         .expect("capsule 可生成");
+        let baseline_solid = count_solid_blocks(&s);
+        s.apply_forced_landing_directive(a);
+        assert!(
+            s.forced_pending.contains(&a),
+            "布景自检:主体已进待执行集合(指令入口无来源过滤)"
+        );
         s.step();
+        s.run_transient_lifecycle();
+        let out = s.take_outbox();
+        assert!(s.is_agent(a), "主体不因强制落地指令被移除(挡板生效)");
+        assert!(!s.forced_pending.contains(&a), "挡板出队(不无限堆积)");
+        assert_eq!(
+            count_solid_blocks(&s),
+            baseline_solid,
+            "主体强制落地不写任何方块"
+        );
+        assert!(!out.despawned.contains(&a), "主体不进 despawned(不移除)");
+        assert!(
+            out.forced_landings.is_empty(),
+            "无强制落地遥测(主体从未落地)"
+        );
+    }
+
+    /// 判据 A01-1(移除无残留,R1-P6 按**生成前**对比):移除后刚体/碰撞体
+    /// 数量、`collider_to_entity`、`agents`、`entities` 的键集合全部与生成前
+    /// 逐项相等。
+    #[test]
+    fn despawn_agent_leaves_no_residue() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        // ---- 生成前基线 ----
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let attribution_before = s.collider_to_entity_of();
+        let agents_before: Vec<_> = s.agents.keys().copied().collect();
+        let entities_before: Vec<_> = s.entities.keys().copied().collect();
+        // ---- 生成 + 跑一拍(经历凝固桥/归因表重建)----
+        s.apply_prefix(&[spawn_agent_input(a, hash, Vec3::new(24.0, 1.95, 24.0))]);
+        assert!(s.is_agent(a), "布景自检:主体已生成");
+        s.step();
+        s.run_transient_lifecycle();
         let _ = s.take_outbox();
-        let (bodies_before, colliders_before) = (s.phys.bodies.len(), s.phys.colliders.len());
-        let collider = s.entities.get(&a).expect("存在").collider;
+        assert!(
+            s.entities.contains_key(&a),
+            "布景自检:主体经历一拍仍在(凝固豁免)"
+        );
+        // ---- 移除,逐项与生成前相等 ----
         s.despawn_agent(a);
         assert_eq!(s.agent_count(), 0, "agents 表清空");
+        let agents_after: Vec<_> = s.agents.keys().copied().collect();
+        assert_eq!(agents_after, agents_before, "agents 键集合回到生成前");
         assert!(!s.entities.contains_key(&a), "实体记录清空");
         assert!(s.entity_state(a).is_none());
-        let (bodies_after, colliders_after) = (s.phys.bodies.len(), s.phys.colliders.len());
-        assert_eq!(bodies_after, bodies_before - 1, "刚体回到生成前");
-        assert_eq!(colliders_after, colliders_before - 1, "碰撞体回到生成前");
-        let table = s.collider_to_entity_of();
-        assert!(
-            !table.contains_key(&collider_key(collider)),
-            "collider_to_entity 不再有主体条目"
+        let entities_after: Vec<_> = s.entities.keys().copied().collect();
+        assert_eq!(entities_after, entities_before, "entities 键集合回到生成前");
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体数回到生成前");
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before,
+            "碰撞体数回到生成前"
+        );
+        let attribution_after = s.collider_to_entity_of();
+        assert_eq!(
+            attribution_after, attribution_before,
+            "collider_to_entity 键值映射回到生成前"
         );
         let out = s.take_outbox();
         assert!(
             out.despawned.contains(&a),
             "despawned 照常(release ownership)"
+        );
+    }
+
+    /// 判据 A01-4/R1-P5:`EntityStates` 下行不含主体——主体与一个普通实体
+    /// 同时在场时,`entity_states()` 只含普通实体。
+    #[test]
+    fn entity_states_exclude_agents() {
+        let (mut s, hash) = test_sim();
+        let a = types::EntityId::from_parts(1, 1);
+        let plain = types::EntityId::from_parts(1, 2);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("capsule 可生成");
+        s.spawn_entity_for_test(plain, Vec3::new(60.0, 3.0, 60.0));
+        let listed: Vec<_> = s.entity_states().into_iter().map(|(id, _)| id).collect();
+        assert!(
+            !listed.contains(&a),
+            "主体不在 EntityStates 下行(S2C::AgentStates 在 A03;R1-P5)"
+        );
+        assert!(
+            listed.contains(&plain),
+            "普通实体照常在下行(列表 = {listed:?})"
         );
     }
 
@@ -740,106 +1033,31 @@ anchor = [0.0, 0.0, 0.0]
 
     // ---- 判据 A01-2(AC-A6):撞击 + 爆炸 3600 拍,回放/检查点逐位 ----
 
-    /// AC-A6 布景时间线(3600 拍):站着的胶囊 + 第 500 拍生成一个方块实体
-    /// 在其正上方(重力下落砸中)、第 1500 拍附近一次爆炸。同一输入序列在
-    /// 新实例上重放,每拍主体状态逐位相同。
+    /// AC-A6 布景时间线(3600 拍,R1-P3b:主体生成走**输入日志**):拍 0
+    /// SpawnAgent 生成站着的胶囊、拍 500 SpawnDynamic 生成一个方块实体在其
+    /// 正上方(重力下落砸中)、拍 1500 Detonate 爆炸。同一输入序列在新实例
+    /// 上重放,每拍主体状态逐位相同。全程按生产节奏跑(激活开启 + 观察者;
+    /// 每拍 apply_activation → step → run_transient_lifecycle → take_outbox)。
     ///
     /// 布景参数:砸块从头顶 4 m 落下(~26 拍触顶),质量 0.729 vs 胶囊 0.8,
-    /// 砸中后弹落在地面滚走凝固;爆炸 power 12 / radius 5,中心 (21.5, 1, 24)
-    /// (距主体 2.5 m,斜向冲量把主体沿 +x 推开、阻尼停住;地面炸坑但 3×3
-    /// 平板足够大,主体不出本体区)。
-    fn ac_a6_run(s: &mut crate::sim::ShardSim, _hash: BodyHash) -> Vec<types::EntityState> {
-        let a = types::EntityId::from_parts(1, 1);
-        let mut trace = Vec::with_capacity(3600);
-        for tick in 0..3600u32 {
-            s.apply_prefix(&ac_a6_inputs(tick));
-            s.step();
-            let _ = s.take_outbox();
-            trace.push(s.entity_state(a).expect("主体全程在(布景约束:不出本体区)"));
-        }
-        trace
-    }
-
-    fn ac_a6_sim() -> (crate::sim::ShardSim, BodyHash) {
-        let (mut s, hash) = test_sim();
-        load_flat_ground(&mut s);
-        let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            types::EntityState {
-                translation: Vec3::new(24.0, 1.95, 24.0),
-                ..types::EntityState::default()
-            },
-        )
-        .expect("capsule 可生成");
-        (s, hash)
-    }
-
-    /// 判据 A01-2 前半:同一输入日志回放两次,每拍主体状态逐位相同。
-    /// 布景自检:撞击与爆炸都实际发生(爆炸后主体被推动)。
-    #[test]
-    fn ac_a6_replay_is_bitwise_identical() {
-        let (mut s1, hash) = ac_a6_sim();
-        let trace1 = ac_a6_run(&mut s1, hash);
-        let (mut s2, _) = ac_a6_sim();
-        let trace2 = ac_a6_run(&mut s2, hash);
-        assert_eq!(trace1.len(), 3600);
-        for (t, (x, y)) in trace1.iter().zip(trace2.iter()).enumerate() {
-            assert_eq!(x, y, "拍 {t} 主体状态逐位不同");
-        }
-        // 布景自检:爆炸后主体确实被推动(否则布景没有扰动,测试空转)。
-        let (before, after) = (trace1[1499].translation, trace1[1520].translation);
-        assert!(
-            (before - after).length() > 0.01,
-            "爆炸须实际推动主体:前 {before:?} 后 {after:?}"
-        );
-    }
-
-    /// 判据 A01-2 后半:第 1000 拍检查点、恢复后续跑,与不中断的那一线
-    /// 逐位相同;另做一组检查点落在方块撞胶囊的那几拍之间(砸块 ~26 拍
-    /// 触顶,取拍 525 = 接触前一拍恢复)。
-    #[test]
-    fn ac_a6_checkpoint_resume_is_bitwise_identical() {
-        let (mut golden, hash) = ac_a6_sim();
-        let golden_trace = ac_a6_run(&mut golden, hash);
-        for (cp_tick, label) in [(1000u32, "拍 1000"), (525u32, "拍 525(撞前)")] {
-            let (mut s, _) = ac_a6_sim();
-            let mut resume = Vec::new();
-            let a = types::EntityId::from_parts(1, 1);
-            for tick in 0..3600u32 {
-                if tick == cp_tick {
-                    let bytes = s.snapshot();
-                    s = crate::sim::ShardSim::restore_with_bodies(
-                        &bytes,
-                        Box::new(SimpleRegistry::builtin()),
-                        fresh_capsule_registry(),
-                    )
-                    .expect("检查点恢复");
-                }
-                // 每拍重演输入(与 ac_a6_run 同一序列)。
-                s.apply_prefix(&ac_a6_inputs(tick));
-                s.step();
-                let _ = s.take_outbox();
-                resume.push(s.entity_state(a).expect("主体全程在"));
-            }
-            for (t, (x, y)) in golden_trace.iter().zip(resume.iter()).enumerate() {
-                assert_eq!(x, y, "{label} 检查点续跑:拍 {t} 主体状态逐位不同");
-            }
-        }
-    }
-
-    /// AC-A6 时间线的单拍输入(回放/检查点续跑共用;与 ac_a6_run 一致)。
-    fn ac_a6_inputs(tick: u32) -> Vec<messaging::StampedInput> {
-        use messaging::{InputPayload, SimCommand, StampedInput};
-        use types::Tick;
+    /// 砸中后弹落滚走、静止后凝固成方块(默认凝固配置;主体 actor 恒豁免);
+    /// 爆炸 power 12 / radius 5,中心 (21.5, 1, 24)(距主体 2.5 m,斜向冲量
+    /// 把主体沿 +x 推开;地面炸坑但 3×3 平板足够大)。
+    fn ac_a6_inputs(tick: u32, hash: BodyHash) -> Vec<messaging::StampedInput> {
         let mut inputs = Vec::new();
+        if tick == 0 {
+            inputs.push(spawn_agent_input(
+                types::EntityId::from_parts(1, 1),
+                hash,
+                Vec3::new(24.0, 1.95, 24.0),
+            ));
+        }
         if tick == 500 {
-            inputs.push(StampedInput {
-                apply_at: Tick::ZERO,
+            inputs.push(messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
                 source: messaging::InputSource::SCHEDULER,
                 sequence: 1,
-                payload: InputPayload::Command(SimCommand::SpawnDynamic {
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
                     entity: types::EntityId::from_parts(1, 2),
                     state: types::EntityState {
                         translation: Vec3::new(24.0, 5.9, 24.0),
@@ -850,11 +1068,11 @@ anchor = [0.0, 0.0, 0.0]
             });
         }
         if tick == 1500 {
-            inputs.push(StampedInput {
-                apply_at: Tick::ZERO,
+            inputs.push(messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
                 source: messaging::InputSource::SCHEDULER,
                 sequence: 2,
-                payload: InputPayload::Command(SimCommand::Detonate {
+                payload: messaging::InputPayload::Command(messaging::SimCommand::Detonate {
                     center: Vec3::new(21.5, 1.0, 24.0),
                     power: 12.0,
                     radius: 5.0,
@@ -862,5 +1080,144 @@ anchor = [0.0, 0.0, 0.0]
             });
         }
         inputs
+    }
+
+    /// 每拍探针(布景自检用):拍号 + 当拍分片只读视图。
+    type TickProbe<'a> = dyn FnMut(u32, &crate::sim::ShardSim) + 'a;
+
+    fn ac_a6_run(
+        s: &mut crate::sim::ShardSim,
+        hash: BodyHash,
+        mut on_tick: Option<&mut TickProbe<'_>>,
+    ) -> Vec<types::EntityState> {
+        let a = types::EntityId::from_parts(1, 1);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        let mut trace = Vec::with_capacity(3600);
+        for tick in 0..3600u32 {
+            s.apply_prefix(&ac_a6_inputs(tick, hash));
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            if let Some(cb) = on_tick.as_deref_mut() {
+                cb(tick, s);
+            }
+            trace.push(s.entity_state(a).expect("主体全程在(布景约束:不出本体区)"));
+        }
+        trace
+    }
+
+    fn ac_a6_sim() -> crate::sim::ShardSim {
+        let (s, _hash) = test_sim();
+        let mut s = s;
+        load_flat_ground(&mut s);
+        s
+    }
+
+    /// 布景自检(R1-P4):方块实体 (1,2) 与胶囊 (1,1) 当拍是否有接触对。
+    fn agents_hit_by_block(s: &crate::sim::ShardSim) -> bool {
+        let (Some(a), Some(b)) = (
+            s.entities
+                .get(&types::EntityId::from_parts(1, 1))
+                .map(|r| r.collider),
+            s.entities
+                .get(&types::EntityId::from_parts(1, 2))
+                .map(|r| r.collider),
+        ) else {
+            return false;
+        };
+        s.phys
+            .narrow_phase
+            .contact_pairs_with(a)
+            .any(|pair| pair.collider1 == b || pair.collider2 == b)
+    }
+
+    /// 判据 A01-2 前半:同一输入日志回放两次,每拍主体状态逐位相同。
+    /// 布景自检(R1-P4):方块与胶囊的接触拍数 > 0;爆炸后主体确实被推动。
+    #[test]
+    fn ac_a6_replay_is_bitwise_identical() {
+        let hash = fresh_capsule_registry()
+            .hash_of("capsule")
+            .expect("capsule 已装");
+        let mut s1 = ac_a6_sim();
+        let mut contact_ticks = Vec::new();
+        let mut probe = |tick: u32, s: &crate::sim::ShardSim| {
+            if agents_hit_by_block(s) {
+                contact_ticks.push(tick);
+            }
+        };
+        let trace1 = ac_a6_run(&mut s1, hash, Some(&mut probe));
+        let mut s2 = ac_a6_sim();
+        let trace2 = ac_a6_run(&mut s2, hash, None);
+        assert_eq!(trace1.len(), 3600);
+        for (t, (x, y)) in trace1.iter().zip(trace2.iter()).enumerate() {
+            assert_eq!(x, y, "拍 {t} 主体状态逐位不同");
+        }
+        // 布景自检(R1-P4):方块确实砸中了胶囊。
+        assert!(
+            !contact_ticks.is_empty(),
+            "方块与胶囊的接触拍数 > 0(砸块布景自检;R1-P4)"
+        );
+        // 布景自检:爆炸后主体确实被推动(否则布景没有扰动,测试空转)。
+        let (before, after) = (trace1[1499].translation, trace1[1520].translation);
+        assert!(
+            (before - after).length() > 0.01,
+            "爆炸须实际推动主体:前 {before:?} 后 {after:?}"
+        );
+    }
+
+    /// 判据 A01-2 后半(R1-P4):检查点落在**接触期间的某一拍**(取接触拍
+    /// 序列的中点;该拍 step 完成后的状态 = 方块压在胶囊上的瞬间),恢复续跑
+    /// 与不中断那一线逐位相同;另保留拍 1000 的常规检查点。
+    #[test]
+    fn ac_a6_checkpoint_resume_is_bitwise_identical() {
+        let hash = fresh_capsule_registry()
+            .hash_of("capsule")
+            .expect("capsule 已装");
+        let mut golden = ac_a6_sim();
+        let mut contact_ticks = Vec::new();
+        let mut probe = |tick: u32, s: &crate::sim::ShardSim| {
+            if agents_hit_by_block(s) {
+                contact_ticks.push(tick);
+            }
+        };
+        let golden_trace = ac_a6_run(&mut golden, hash, Some(&mut probe));
+        assert!(
+            !contact_ticks.is_empty(),
+            "布景自检:接触拍数 > 0(R1-P4;检查点取自该序列)"
+        );
+        // 检查点拍 = 接触序列中点(该拍 step 后 = 接触进行中)。
+        let mid = contact_ticks.len() / 2;
+        let impact_cp = contact_ticks[mid];
+        for (cp_tick, label) in [(1000u32, "拍 1000"), (impact_cp, "接触期间")] {
+            let mut s = ac_a6_sim();
+            let mut resume = Vec::new();
+            let a = types::EntityId::from_parts(1, 1);
+            let observers = [Vec3::new(24.0, 3.0, 24.0)];
+            for tick in 0..3600u32 {
+                s.apply_prefix(&ac_a6_inputs(tick, hash));
+                s.apply_activation(&observers);
+                s.step();
+                s.run_transient_lifecycle();
+                let _ = s.take_outbox();
+                if tick == cp_tick {
+                    // 检查点 = 该拍完成后(接触进行中;R1-P4 不取接触前)。
+                    let bytes = s.snapshot();
+                    s = crate::sim::ShardSim::restore_with_bodies(
+                        &bytes,
+                        Box::new(SimpleRegistry::builtin()),
+                        fresh_capsule_registry(),
+                    )
+                    .expect("检查点恢复");
+                }
+                resume.push(s.entity_state(a).expect("主体全程在"));
+            }
+            for (t, (x, y)) in golden_trace.iter().zip(resume.iter()).enumerate() {
+                assert_eq!(
+                    x, y,
+                    "{label}(拍 {cp_tick})检查点续跑:拍 {t} 主体状态逐位不同"
+                );
+            }
+        }
     }
 }
