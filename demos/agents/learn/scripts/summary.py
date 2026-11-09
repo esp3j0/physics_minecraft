@@ -93,6 +93,10 @@ def main() -> int:
 
     # ── order(连杆顺序打乱;s1)──
     _, rows = load("eval_order_s1.csv")
+    # 干净世界的对照行数(从 eval_s1.csv 现算,不写死)。
+    _, clean = load("eval_s1.csv")
+    clean_holds = sum(1 for r in clean if r["hold"] == "1")
+    clean_med = sorted(f(r["d_end"]) for r in clean)[len(clean) // 2]
     for setup in ("insert1", "insert4", "insert16"):
         sub = [r for r in rows if r["setup"] == setup]
         holds = sum(1 for r in sub if r["hold"] == "1")
@@ -101,7 +105,8 @@ def main() -> int:
         print(
             f"== order [{setup}] == 行 {len(sub)} 保持 {holds}/{len(sub)}"
             f" d_end 中位数 {d[len(sub) // 2]:.4f} nan {nan_rows}"
-            f"(与干净世界 s1 = 0/200 同水平 → 打乱无影响)"
+            f"(干净世界 s1 = {clean_holds}/{len(clean)}"
+            f" 中位 {clean_med:.4f} → 同水平,打乱无影响)"
         )
 
     # ── det(双跑逐位)──
@@ -117,9 +122,11 @@ def main() -> int:
         if line.startswith("threads_"):
             print("== L2 ==", line.strip())
 
-    # ── L3(torch vs tract)──
-    for line in open(os.path.join(OUT, "torch_tract_s1.txt"), encoding="utf-8"):
-        print("== L3 ==", line.strip())
+    # ── L3(torch vs tract;s1 与 l5_ft 两份)──
+    for name in ("torch_tract_s1.txt", "torch_tract_s1_l5_ft.txt"):
+        for line in open(os.path.join(OUT, name), encoding="utf-8"):
+            print(f"== L3 [{name.replace('torch_tract_', '').replace('.txt', '')}] ==",
+                  line.strip())
 
     # ── L4(微调接续)──
     for line in open(os.path.join(OUT, "l4_result.txt"), encoding="utf-8"):

@@ -1,12 +1,15 @@
-"""PPO(CleanRL 底本改写)——REQ-012 A00-5 R2。
+"""PPO(CleanRL 底本改写)——REQ-012 A00-5 R3。
 
 来源:CleanRL `ppo_continuous_action.py`(MIT 许可,https://github.com/vwxyzjn/cleanrl),
 文件头注明来源(R2 要求)。算法主体(网络、GAE、clip 目标、优化循环)
-保持 CleanRL 原样;改动只有两处(放行允许):
+保持 CleanRL 原样;改动只有三处(放行允许,README 逐条写明):
 1. 环境接口:直接用后端无关的 VecBackend(tools/train/train/backends/base.py),
    不走 gymnasium 的向量包装;
-2. 奖励:train/rewards.py 按 reward_inputs 计算(legged_gym 常用组合的
-   摆臂版:−距离 − 小权重×动作变化 + 到达奖励)。
+2. 奖励:train/rewards.py 按 reward_inputs 计算(R3/P1 简单基线
+   −dist − 0.01‖Δa‖² + 1[dist≤3cm]);
+3. done 约定(R3/P6)= CleanRL 原样:dones[step] 表示 obs[step] 是新回合
+   第一帧;后端到时步返回 reset 前最后一次转移的 reward_inputs,奖励
+   不置 0。
 
 检查点(R2 补充):actor、critic、log σ、观测归一化统计、优化器状态、
 spec、超参,一包存尽;`--init-from` 可以跨后端(spec 不一致就拒绝,
@@ -17,6 +20,8 @@ spec、超参,一包存尽;`--init-from` 可以跨后端(spec 不一致就拒绝
   python -m train.ppo --backend rapier --seed 1 --hz60 --out out/arm_s1_hz60
   python -m train.ppo --init-from out/arm_s0/ckpt_final.pt --out out/arm_ft
 预算:1e7 控制步或 30 分钟墙钟,先到为准(R2 再补充)。
+超参(R3/P2):默认 = CleanRL(num-minibatches 32、update-epochs 10、
+gamma 0.99、anneal-lr 开、不设 target-kl)。
 """
 
 from __future__ import annotations
@@ -161,8 +166,10 @@ def main() -> None:
     cli.add_argument("--total-timesteps", type=int, default=10_000_000, help="预算:1e7(R2 再补充)")
     cli.add_argument("--max-minutes", type=float, default=30.0, help="预算:30 分钟墙钟,先到为准")
     cli.add_argument("--num-steps", type=int, default=90, help="每次迭代每环境收集的控制步 = 一个回合长")
-    cli.add_argument("--num-minibatches", type=int, default=4)
-    cli.add_argument("--update-epochs", type=int, default=4)
+    # R3/P2:默认对齐 CleanRL(32 minibatch × 10 epoch = 每迭代 320 梯度步;
+    # R2 的 4×4=16 步太少,README 曾误写"其余按 CleanRL 默认")。
+    cli.add_argument("--num-minibatches", type=int, default=32)
+    cli.add_argument("--update-epochs", type=int, default=10)
     cli.add_argument("--lr", type=float, default=3e-4)
     cli.add_argument("--gamma", type=float, default=0.99)
     cli.add_argument("--gae-lambda", type=float, default=0.95)
@@ -171,13 +178,16 @@ def main() -> None:
     cli.add_argument("--vf-coef", type=float, default=0.5)
     cli.add_argument("--max-grad-norm", type=float, default=0.5)
     cli.add_argument("--norm-adv", type=lambda s: s == "1", default=True)
-    cli.add_argument("--target-kl", type=float, default=None)
-    cli.add_argument("--anneal-lr", type=lambda s: s == "1", default=True)
+    cli.add_argument("--target-kl", type=float, default=None,
+                     help="R3/P2:默认不设(CleanRL 同);早停会砍掉大部分更新")
+    cli.add_argument("--anneal-lr", type=lambda s: s == "1", default=True,
+                     help="R3/P2:默认开(CleanRL 同)")
     cli.add_argument("--init-from", default=None, help="从检查点继续训练(可换后端,spec 不一致拒绝)")
     cli.add_argument("--freeze-obs-norm", action="store_true", help="微调时冻结归一化统计")
     cli.add_argument("--freeze-norm-after", type=int, default=10, help="预热 N 迭代后冻结归一化统计(V 目标不漂移)")
-    cli.add_argument("--reward-scale", type=float, default=0.01,
-                     help="奖励缩放(进 buffer 前;回合 return 尺度 -100 级 → critic 可拟合;legged_gym 惯例)")
+    cli.add_argument("--reward-scale", type=float, default=0.1,
+                     help="奖励缩放(进 buffer 前;R3/P1 基线 = 总架构师探针口径 0.1:"
+                          "简单奖励下回合 return ≈ −dist×90 ≈ −65,×0.1 → critic 可拟合)")
     cli.add_argument("--mass-mult", type=float, default=1.0, help="L5:连杆质量倍数(只改物理,spec 不变)")
     cli.add_argument("--gain-mult", type=float, default=1.0, help="L5:增益倍数 kp/kd 同乘(ζ 不变;spec 不变)")
     cli.add_argument("--report-every", type=int, default=10, help="每 N 迭代写曲线/检查点")
@@ -244,7 +254,11 @@ def main() -> None:
     t0 = time.time()
     iterno = init_iter
     stop = False
-    next_done = np.zeros(args.n_envs, dtype=np.float32)
+    # R3/P6(CleanRL 约定):dones[step] = obs[step] 是不是新回合第一帧
+    # (= 上一步之后是否 done)。obs 是 reset 后首帧时 done=1,该帧的
+    # 奖励是"新回合从出生状态的零步回报"(= 出生距离的负值),与
+    # dones[step]=1 自洽:GAE 在该帧断开自举。
+    next_done = np.ones(args.n_envs, dtype=np.float32)
     # 自动迭代:先写 rollout 再更新(CleanRL 结构;退出条件在循环头检查)。
     while not stop:
         if args.anneal_lr and not args.init_from:
@@ -258,6 +272,7 @@ def main() -> None:
             global_step += args.n_envs
             o_norm = rms.normalize(obs)
             obs_buf[step] = o_norm  # 网络输入口径(CleanRL:b_obs 即网络输入)
+            done_buf[step] = next_done  # 本帧是否新回合首帧(CleanRL 原样)
             with torch.no_grad():
                 t_o = torch.from_numpy(o_norm).to(device)
                 a, logp, _, v = agent.get_action_and_value(t_o)
@@ -265,19 +280,21 @@ def main() -> None:
             logp_buf[step] = logp.numpy()
             val_buf[step] = v.numpy().reshape(-1)
             obs, ri, terminated, truncated = backend.step(act_buf[step])
+            # R3/P6:到时步的 reward_inputs = reset 前最后一次转移的值
+            # (Rust 侧已改),奖励**不再置 0**;终止语义全在 done 里。
             r = reward(ri, act_buf[step], last_action, step)
-            # truncated 步(自动 reset)的奖励不可靠(reset 后首步的
-            # reward_inputs):置 done 并用 0 奖励 —— CleanRL 的 done 语义
-            # 本来就跨回合。
-            r = np.where(truncated, 0.0, r)
             rew_buf[step] = r * args.reward_scale
-            done_buf[step] = np.maximum(terminated.astype(np.float32), truncated.astype(np.float32))
-            last_action = act_buf[step].copy()
+            next_done = np.maximum(
+                terminated.astype(np.float32), truncated.astype(np.float32)
+            )
+            last_action = np.where(
+                truncated[:, None] | terminated[:, None], 0.0, act_buf[step]
+            ).astype(np.float32)
             dist_sum += float(ri["dist"][:, 0].sum())
             reach_count += int((ri["dist"][:, 0] <= spec.REACH_DIST).sum())
             step_count += args.n_envs
             ep_rew += r
-            newly = done_buf[step].astype(bool)
+            newly = next_done.astype(bool)
             if newly.any():
                 m = ep_rew[newly].mean()
                 ep_rew_mean = m if np.isnan(ep_rew_mean) else 0.95 * ep_rew_mean + 0.05 * m
@@ -285,7 +302,8 @@ def main() -> None:
             if not args.freeze_obs_norm and iterno <= args.freeze_norm_after:
                 rms.update(obs)
 
-        # ── GAE(CleanRL 原样)──
+        # ── GAE(CleanRL 原样;R3/P6 后 done_t = dones[step] 是新回合首帧
+        # 标记,与 CleanRL 逐行对应)──
         with torch.no_grad():
             o_norm = rms.normalize(obs)
             next_value = agent.get_value(torch.from_numpy(o_norm).to(device)).reshape(1, -1)

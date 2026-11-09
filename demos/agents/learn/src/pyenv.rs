@@ -96,8 +96,10 @@ impl VecEnv {
 
     /// 一个控制周期。actions [-1,1] [n_envs, act_dim];返回
     /// (obs, reward_inputs, terminated, truncated)。回合到时的实例自动
-    /// reset(obs/reward_inputs 是 reset 后新回合首步的值;truncated[i] =
-    /// 该实例本步到时)。terminated 恒 false(本任务不设提前终止)。
+    /// reset(**obs** = reset 后新回合首步的值;**reward_inputs** = reset
+    /// 前最后一次转移的值——R3/P6,配套 CleanRL 的 dones[step] = 本步之后
+    /// 是否 done 的约定,奖励不置 0;truncated[i] = 该实例本步到时)。
+    /// terminated 恒 false(本任务不设提前终止)。
     #[allow(clippy::type_complexity)] // PyO3 签名要求的多路返回;拆 type 反而绕
     fn step<'py>(
         &mut self,
@@ -155,26 +157,20 @@ impl VecEnv {
                             }
                             let mut e = slot.lock().expect("env lock");
                             let rin = e.control_step(&a, hz60);
+                            // R3/P6:到时步返回 **reset 前最后一次转移** 的
+                            // reward_inputs(奖励不再置 0,与 CleanRL 的
+                            // dones[step] = done-after-step 约定配套);
+                            // obs 照旧给 reset 后新回合首帧。
                             let o;
                             if e.done {
-                                // 到时:truncated 置位,同步 auto-reset
-                                // (obs/reward_inputs = 新回合首步;与主
-                                // 线程 reset 用同一派生种子 → 逐位确定)。
                                 trunc_block[k] = true;
                                 let es = env_seed(base_seed, env_id).wrapping_add(0xAB00);
                                 let mut rng = ChaCha8Rng::seed_from_u64(es);
                                 o = e.reset(&mut rng);
-                                let tip = arm::tip_position(&e.world, &e.arm);
-                                let d = (tip - e.target).length();
-                                let mut r0 = [0.0f32; REWARD_KEYS];
-                                r0[0] = d;
-                                rew_block[k * REWARD_KEYS..(k + 1) * REWARD_KEYS]
-                                    .copy_from_slice(&r0);
                             } else {
                                 o = arm::observe(&e.world, &e.arm, e.target, &e.last_action);
-                                rew_block[k * REWARD_KEYS..(k + 1) * REWARD_KEYS]
-                                    .copy_from_slice(&rin);
                             }
+                            rew_block[k * REWARD_KEYS..(k + 1) * REWARD_KEYS].copy_from_slice(&rin);
                             obs_block[k * OBS_DIM..(k + 1) * OBS_DIM].copy_from_slice(&o);
                         }
                     }));
@@ -244,9 +240,31 @@ fn env_seed(base: u64, i: usize) -> u64 {
     base ^ ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
 }
 
-/// Python 模块注册(maturin cdylib 入口)。
+/// Python 模块注册(maturin cdylib 入口)。R3/P3:环境常量从这里导出,
+/// check.py 逐项与 spec.py 比对(Rust arm.rs 与 spec.py 曾在 ACT_SCALE
+/// 上各写各的、训练/评估实际走 Rust 值的不一致——单一事实来源 =
+/// Rust 导出值,Python 侧核对)。
 #[pymodule]
 fn learn_env(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    use crate::arm as a;
     m.add_class::<VecEnv>()?;
+    m.add("DT", a::DT)?;
+    m.add("TICKS_PER_CONTROL", a::TICKS_PER_CONTROL)?;
+    m.add("EPISODE_CONTROLS", a::EPISODE_CONTROLS)?;
+    m.add("LINK_LEN", a::LINK_LEN)?;
+    m.add("LINK_MASS", a::LINK_MASS)?;
+    m.add("TIP_MASS", a::TIP_MASS)?;
+    m.add("JOINT_LIMIT", a::JOINT_LIMIT)?;
+    m.add("KP", a::KP)?;
+    m.add("KD", a::KD)?;
+    m.add("TAU_LIMIT", a::TAU_LIMIT)?;
+    m.add("ACT_SCALE", a::ACT_SCALE)?;
+    m.add("OBS_DIM", a::OBS_DIM)?;
+    m.add("ACT_DIM", a::ACT_DIM)?;
+    m.add("REWARD_KEYS", a::REWARD_KEYS)?;
+    m.add("TARGET_R_MIN", a::TARGET_R_MIN)?;
+    m.add("TARGET_R_MAX", a::TARGET_R_MAX)?;
+    m.add("INIT_Q_RANGE", a::INIT_Q_RANGE)?;
+    m.add("REACH_DIST", a::REACH_DIST)?;
     Ok(())
 }

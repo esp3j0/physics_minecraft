@@ -49,20 +49,20 @@ INIT_Q_RANGE = 0.5      # 出生角 ±0.5 rad
 REACH_DIST = 0.03       # 到达门槛(3 cm)
 
 # ── 动作映射(增量式;选型 README 记录)────────────────────────────────
-ACT_SCALE = 0.05
+# R3/P3:统一 0.1(Rust arm.rs 同值;两边曾经各写各的——Rust 0.1、这里
+# 0.05,实际训练/评估都走 Rust 值。单一事实来源 = learn_env 导出常量,
+# check.py 逐项核对)。
+ACT_SCALE = 0.1
 # 目标角_{t+1} = clamp(目标角_t + ACT_SCALE × action, −JOINT_LIMIT, +JOINT_LIMIT)
 # 目标角从出生角起步;动作 ∈ [−1, 1] 由后端钳位。
 
-# ── 奖励权重(rewards.py 用;初值与最终值都写 README)──────────────────
+# ── 奖励权重(R3/P1 简单基线:总架构师探针行三;每项见 rewards.py)──────
 REWARD_W = {
-    # 距离项:−tanh(4·dist)——远处梯度平(不被甩臂距离淹没)、近处陡
-    # (鼓励精修);scout3(s1.64 恒动作)的教训:线性 −dist 时"匀速撞到
-    # 再过冲"与"精修停在目标"回报接近,学不出反馈减速。
-    "dist": 1.0,
+    "dist": 1.0,        # −dist
     "act_rate": 0.01,   # −w·‖a_t − a_{t−1}‖²
-    "reach": 2.0,       # dist ≤ REACH_DIST 时 +w(逐步给,到达即持续)
-    "align": 1.0,       # +w·max(0, tip_v·u)·(dist>REACH_DIST)(未达时对齐)
-    "tip_speed": 0.0,   # 备用:−w·‖末端速度‖²(初版不用,置 0)
+    "reach": 1.0,       # +1·[dist ≤ REACH_DIST](稀疏到达项)
+    "align": 0.0,       # P1 主因项,撤(可加项须 README 给对照;当前 0 = 不加)
+    "tip_speed": 0.0,   # 备用:−w·‖末端速度‖²(不用,置 0)
 }
 
 

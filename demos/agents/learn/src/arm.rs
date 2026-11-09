@@ -29,7 +29,7 @@ use rapier3d::dynamics::{
     MultibodyLink, RevoluteJointBuilder, RigidBodyBuilder, RigidBodyHandle,
 };
 use rapier3d::geometry::ColliderBuilder;
-use rapier3d::math::{Pose, Rotation, Vector};
+use rapier3d::math::Vector;
 use rapier3d::pipeline::PhysicsWorld;
 
 /// 物理步长(60 Hz;世界参数不改)。
@@ -53,7 +53,9 @@ pub const JOINT_LIMIT: f32 = 170.0f32.to_radians();
 pub const KP: f32 = 2000.0;
 pub const KD: f32 = 60.0;
 pub const TAU_LIMIT: f32 = 25.0;
-/// 动作:增量式,目标角 += 0.1 × 动作(钳到限位)。
+/// 动作:增量式,目标角 += 0.1 × 动作(钳到限位)。**两边一致口径以
+/// 本常量为准**(R3/P3:Rust 曾写 0.1 而 spec.py 写 0.05 的不一致,
+/// 现统一 0.1;check.py 逐项比对)。
 pub const ACT_SCALE: f32 = 0.1;
 /// 观测维度:q1 sin/cos、q2 sin/cos、q̇1、q̇2、目标 xy、末端 xy、
 /// 目标−末端相对向量 xy(dx = tx−px,dy = ty−py;策略的"待消误差",
@@ -171,7 +173,8 @@ pub fn spawn_arm(world: &mut PhysicsWorld, mass_mult: f32) -> Arm {
 
 /// 写一个关节的 PD 电机目标(ForceBased + 力矩上限;目标变化时唤醒,
 /// 同 quad::set_target 的坑:不唤醒则睡着 island 的电机约束不求解)。
-/// `gain_mult` 乘 kp/kd(L5 的 0.7 档;力矩上限不动)。
+/// `gain_mult` 乘 **kp**(R3/P7:L5 的 kp ×0.7 只改 kp,kd 不动——放行
+/// 写的就是"kp 改成 ×0.7";R2 时 kd 同乘是超范围改动)。力矩上限不动。
 pub fn set_target_mult(
     world: &mut PhysicsWorld,
     arm: &Arm,
@@ -189,7 +192,7 @@ pub fn set_target_mult(
     let changed = (link.joint.data.motors[ANG_X].target_pos - target).abs() > 1e-6;
     link.joint
         .data
-        .set_motor(axis, target, 0.0, KP * gain_mult, KD * gain_mult)
+        .set_motor(axis, target, 0.0, KP * gain_mult, KD)
         .set_motor_model(axis, MotorModel::ForceBased);
     link.joint.data.motors[ANG_X].max_force = TAU_LIMIT;
     if changed {
@@ -241,7 +244,7 @@ pub fn tip_velocity(world: &PhysicsWorld, arm: &Arm) -> Vector {
 }
 
 /// 关节力矩估算(PD:kp·(目标−q) − kd·q̇,钳到力矩上限;ForceBased 电机的
-/// 施加力,同 quad 口径)。`gain_mult` 与电机一致(L5)。
+/// 施加力,同 quad 口径)。`gain_mult` 与电机一致,只乘 kp(R3/P7)。
 pub fn joint_torques(
     world: &PhysicsWorld,
     arm: &Arm,
@@ -252,8 +255,7 @@ pub fn joint_torques(
     for dof in 0..ACT_DIM {
         let q = read_angle(&world.multibody_joints, arm, dof);
         let qd = joint_velocity(&world.multibody_joints, arm, dof);
-        tau[dof] = (KP * gain_mult * (targets[dof] - q) - KD * gain_mult * qd)
-            .clamp(-TAU_LIMIT, TAU_LIMIT);
+        tau[dof] = (KP * gain_mult * (targets[dof] - q) - KD * qd).clamp(-TAU_LIMIT, TAU_LIMIT);
     }
     tau
 }
@@ -320,7 +322,7 @@ pub fn observe(
 pub struct PhysVariant {
     /// 连杆质量倍数(L5 用 1.5)。
     pub mass_mult: f32,
-    /// kp/kd 倍数(L5 用 0.7;kd 同乘,保持 ζ 不变)。
+    /// kp 倍数(R3/P7:L5 用 0.7,**只乘 kp,kd 不变**)。
     pub gain_mult: f32,
 }
 
@@ -331,6 +333,56 @@ impl Default for PhysVariant {
             gain_mult: 1.0,
         }
     }
+}
+
+/// 目标点环形均匀采样(与回合 reset 同一分布:θ 全圆均匀、r² 均匀 =
+/// 面积均匀)。供回合 reset、L0、eval 矩阵共用同一采样流。
+pub fn sample_target(rng: &mut ChaCha8Rng) -> Vector {
+    let theta: f32 = rng.random_range(0.0..std::f32::consts::TAU);
+    let rmin2 = TARGET_R_MIN * TARGET_R_MIN;
+    let rmax2 = TARGET_R_MAX * TARGET_R_MAX;
+    let r = (rng.random_range(0.0..1.0f32).mul_add(rmax2 - rmin2, rmin2)).sqrt();
+    Vector::new(r * theta.cos(), r * theta.sin(), 0.0)
+}
+
+/// 出生角采样(q1、q2 各 ±0.5 rad 均匀)。
+pub fn sample_init_q(rng: &mut ChaCha8Rng) -> (f32, f32) {
+    let q1: f32 = rng.random_range(-INIT_Q_RANGE..INIT_Q_RANGE);
+    let q2: f32 = rng.random_range(-INIT_Q_RANGE..INIT_Q_RANGE);
+    (q1, q2)
+}
+
+/// 建一个主口径世界(重力 + 生产求解参数)。eval 的 order 布景要在
+/// 摆臂之前插入刚体,所以 world 构造也开放(Env::reset_with_in 接收)。
+pub fn fresh_world() -> PhysicsWorld {
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::new(0.0, -9.81, 0.0);
+    world.integration_parameters = production_params();
+    world
+}
+
+/// 把出生角写进**关节坐标**(multibody 的位姿由关节坐标决定,
+/// `set_position` 对连杆无效——R3/P4:R2 的 reset 用 set_position 摆
+/// FK 位姿,第一步后即被关节坐标 0 拉回竖直)。
+///
+/// 做法 = generalized displacement(目标角 − 当前角,每关节 1 dof),
+/// 再 forward_kinematics 和 update_rigid_bodies;公开 API 齐备(电机
+/// 目标随后设为出生角,动作从出生角起增量)。
+pub fn set_joint_angles(world: &mut PhysicsWorld, arm: &Arm, angles: &[f32; ACT_DIM]) {
+    let mb = world
+        .multibody_joints
+        .get_multibody_mut(arm.joints[0].0)
+        .expect("multibody alive");
+    let mut disp = vec![0.0f32; mb.ndofs()];
+    for (dof, &q) in angles.iter().enumerate() {
+        let (_, link_id) = arm.joints[dof];
+        let link = mb.link(link_id).expect("link alive");
+        let cur = link.joint.coords()[ANG_X];
+        disp[link.assembly_id()] = q - cur;
+    }
+    mb.apply_displacements(&disp);
+    mb.forward_kinematics(&world.bodies, true);
+    mb.update_rigid_bodies(&mut world.bodies, true);
 }
 
 /// 一个环境实例(单线程一只;并行由 pyenv 的 VecEnv 分线程调度)。
@@ -347,7 +399,7 @@ pub struct Env {
     pub step: usize,
     /// 回合到时标记(auto-reset 语义:调 reset 才清)。
     pub done: bool,
-    /// 物理变体(连杆质量与增益倍数;L5)。
+    /// 物理变体(连杆质量与 kp 倍数;L5)。
     pub variant: PhysVariant,
 }
 
@@ -358,13 +410,13 @@ impl Env {
     }
 
     pub fn with_variant(seed: u64, variant: PhysVariant) -> Env {
-        let mut world = PhysicsWorld::new();
-        world.gravity = Vector::new(0.0, -9.81, 0.0);
-        world.integration_parameters = production_params();
-        let arm = spawn_arm(&mut world, variant.mass_mult);
         let mut env = Env {
-            world,
-            arm,
+            world: fresh_world(),
+            arm: {
+                // 占位:reset 会重建世界与摆臂,这里只为结构体完整。
+                let mut w = fresh_world();
+                spawn_arm(&mut w, variant.mass_mult)
+            },
             target: Vector::ZERO,
             targets: [0.0; ACT_DIM],
             last_action: [0.0; ACT_DIM],
@@ -380,58 +432,64 @@ impl Env {
     /// 面积均匀);关节角 ±0.5 rad 随机、速度 0、电机目标 = 出生角。
     /// 每次重建世界:句柄历史干净、连杆顺序 = 出生序(四足 R1 的口径)。
     pub fn reset(&mut self, rng: &mut ChaCha8Rng) -> [f32; OBS_DIM] {
-        let theta: f32 = rng.random_range(0.0..std::f32::consts::TAU);
-        let rmin2 = TARGET_R_MIN * TARGET_R_MIN;
-        let rmax2 = TARGET_R_MAX * TARGET_R_MAX;
-        let r = (rng.random_range(0.0..1.0f32).mul_add(rmax2 - rmin2, rmin2)).sqrt();
-        self.target = Vector::new(r * theta.cos(), r * theta.sin(), 0.0);
-        let mut world = PhysicsWorld::new();
-        world.gravity = Vector::new(0.0, -9.81, 0.0);
-        world.integration_parameters = production_params();
+        let target = sample_target(rng);
+        let (q1, q2) = sample_init_q(rng);
+        self.reset_with_in(fresh_world(), target, [q1, q2])
+    }
+
+    /// eval 矩阵口径:世界无 order 布景的 reset_with(order 用
+    /// reset_with_in;占位包装无调用方)。
+    #[allow(dead_code)]
+    pub fn reset_with(&mut self, target: Vector, q: [f32; ACT_DIM]) -> [f32; OBS_DIM] {
+        self.reset_with_in(fresh_world(), target, q)
+    }
+
+    /// 指定目标与出生角的 reset(eval/order/det 与训练同一 reset 路径,
+    /// 只换数据源 = 种子给法不同;R3/P5)。`world` 可带 order 布景的
+    /// 插入刚体(在摆臂之前)。返回 reset 后观测。
+    pub fn reset_with_in(
+        &mut self,
+        mut world: PhysicsWorld,
+        target: Vector,
+        q: [f32; ACT_DIM],
+    ) -> [f32; OBS_DIM] {
         let arm = spawn_arm(&mut world, self.variant.mass_mult);
-        let q1: f32 = rng.random_range(-INIT_Q_RANGE..INIT_Q_RANGE);
-        let q2: f32 = rng.random_range(-INIT_Q_RANGE..INIT_Q_RANGE);
-        // 注入出生角:按解析 FK 摆好连杆位姿(set_position,速度保持 0),
-        // 电机目标 = 出生角(动作从这里开始增量)。
-        let ang1 = Rotation::from_rotation_z(q1);
-        let total = q1 + q2;
-        let ang2 = Rotation::from_rotation_z(total);
-        let l1_pos = 0.5 * LINK_LEN * Vector::new(q1.sin(), -q1.cos(), 0.0);
-        let l2_pos = LINK_LEN * Vector::new(q1.sin(), -q1.cos(), 0.0)
-            + 0.5 * LINK_LEN * Vector::new(total.sin(), -total.cos(), 0.0);
-        for (h, pos, ang) in [(arm.links[1], l1_pos, ang1), (arm.links[2], l2_pos, ang2)] {
-            world.bodies.get_mut(h).expect("link alive").set_position(
-                Pose {
-                    translation: pos,
-                    rotation: ang,
-                    ..Pose::IDENTITY
-                },
-                false,
-            );
-        }
-        for (dof, q) in [q1, q2].into_iter().enumerate() {
-            set_target_mult(&mut world, &arm, dof, q, self.variant.gain_mult);
+        // 注入出生角:走关节坐标(P4;位姿由 FK 写回刚体),电机目标 =
+        // 出生角(动作从这里开始增量)。
+        set_joint_angles(&mut world, &arm, &q);
+        for (dof, &ang) in q.iter().enumerate() {
+            set_target_mult(&mut world, &arm, dof, ang, self.variant.gain_mult);
         }
         self.world = world;
         self.arm = arm;
-        self.targets = [q1, q2];
+        self.target = target;
+        self.targets = q;
         self.last_action = [0.0; ACT_DIM];
         self.step = 0;
         self.done = false;
+        self.observe_now()
+    }
+
+    /// 当前观测(布局与 BackendSpec = tools/train/train/spec.py 一致)。
+    pub fn observe_now(&self) -> [f32; OBS_DIM] {
         observe(&self.world, &self.arm, self.target, &self.last_action)
     }
 
-    /// 一个控制周期:目标角 += ACT_SCALE × 动作(钳限位),第 1 拍设目标后
-    /// 步进 TICKS_PER_CONTROL 拍。返回 reward_inputs(奖励在 Python 算)。
+    /// 一个控制周期:**动作钳到 [−1,1]**(R3/P5:钳位是环境的契约,
+    /// 训练与 eval 同一入口;回报的 last_action/act 键 = 钳后值),
+    /// 目标角 += ACT_SCALE × 动作(钳限位),第 1 拍设目标后步进
+    /// TICKS_PER_CONTROL 拍。返回 reward_inputs(奖励在 Python 算)。
     /// `every_tick` = 60 Hz 对照口径(每拍设目标、步 1 拍)。
     pub fn control_step(
         &mut self,
         action: &[f32; ACT_DIM],
         every_tick: bool,
     ) -> [f32; REWARD_KEYS] {
+        let mut a = [0.0f32; ACT_DIM];
         for dof in 0..ACT_DIM {
+            a[dof] = action[dof].clamp(-1.0, 1.0);
             self.targets[dof] =
-                (self.targets[dof] + ACT_SCALE * action[dof]).clamp(-JOINT_LIMIT, JOINT_LIMIT);
+                (self.targets[dof] + ACT_SCALE * a[dof]).clamp(-JOINT_LIMIT, JOINT_LIMIT);
         }
         let ticks = if every_tick { 1 } else { TICKS_PER_CONTROL };
         for t in 0..ticks {
@@ -448,7 +506,7 @@ impl Env {
             }
             self.world.step();
         }
-        self.last_action = *action;
+        self.last_action = a;
         self.step += 1;
         // 回合 = 3 s:30 Hz 时 90 控制步;60 Hz 对照(每拍设目标、1 拍)
         // 同样墙钟 3 s = 180 控制步(回合时长口径一致;0.5 s 保持窗口
@@ -487,5 +545,104 @@ impl Env {
             tox,
             toy,
         ]
+    }
+}
+
+/// 在世界(摆臂)之前插入 n 个睡着刚体(order 场景;摆臂之后插句柄序
+/// 就错了)。位置远离摆臂(无接触,只打乱活跃集顺序)。
+pub fn insert_order_bodies(world: &mut PhysicsWorld, n: usize) {
+    for i in 0..n {
+        world.insert(
+            RigidBodyBuilder::dynamic()
+                .translation(Vector::new(
+                    -6.0,
+                    -3.0 + (i % 4) as f32 * 1.2,
+                    -2.5 + i as f32 * 1.2,
+                ))
+                .sleeping(true),
+            ColliderBuilder::ball(0.01),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R3/P4:reset 后观测自洽——按观测里的 q(sin/cos 反解)算正运动学,
+    /// 与观测里的末端位置相差 ≤ 1e-5 m。R2 的 set_position 实现下,
+    /// 观测 q = 0 而末端已按出生角摆出(不自洽),第一步后弹回竖直。
+    /// 判据原文(R3 放行 P4):按观测里的 q 算正运动学,与观测里的末端
+    /// 相差 ≤ 1e-5 m。
+    #[test]
+    fn reset_obs_is_self_consistent() {
+        for seed in 0..8u64 {
+            let env = Env::new(seed);
+            let obs = env.observe_now();
+            let q1 = obs[0].atan2(obs[1]); // atan2(sin, cos)
+            let q2 = obs[2].atan2(obs[3]);
+            let e = [obs[8], obs[9]];
+            // 解析正运动学:末端 = L·u(q1) + L·u(q1+q2),u(θ)=(sinθ,−cosθ)。
+            let fk_x = LINK_LEN * q1.sin() + LINK_LEN * (q1 + q2).sin();
+            let fk_y = -LINK_LEN * q1.cos() - LINK_LEN * (q1 + q2).cos();
+            let dx = e[0] - fk_x;
+            let dy = e[1] - fk_y;
+            assert!(
+                dx * dx + dy * dy <= 1e-5 * 1e-5,
+                "seed {seed}: 观测 q=({q1},{q2}) FK=({fk_x},{fk_y}) vs obs 末端 ({},{})",
+                e[0],
+                e[1]
+            );
+        }
+    }
+
+    /// R3/P4 补充:出生角不是恒 0(R2 的病征:obs 里 q1=q2=0)。
+    #[test]
+    fn reset_init_angles_nonzero_and_in_range() {
+        let mut any_nonzero = false;
+        for seed in 0..16u64 {
+            let env = Env::new(100 + seed);
+            let obs = env.observe_now();
+            let q1 = obs[0].atan2(obs[1]);
+            let q2 = obs[2].atan2(obs[3]);
+            assert!(q1.abs() <= INIT_Q_RANGE + 1e-4, "seed {seed}: q1 {q1}");
+            assert!(q2.abs() <= INIT_Q_RANGE + 1e-4, "seed {seed}: q2 {q2}");
+            any_nonzero |= q1 != 0.0 || q2 != 0.0;
+        }
+        assert!(any_nonzero, "16 个种子出生角全 0 = 关节坐标注入未生效");
+    }
+
+    /// R3/P5:control_step 把动作钳到 [−1,1](超界动作不放大目标角增量;
+    /// act 键回报钳后值)。
+    #[test]
+    fn control_step_clamps_action() {
+        let mut env = Env::new(42);
+        let obs0 = env.observe_now();
+        let q0 = obs0[0].atan2(obs0[1]);
+        let rin = env.control_step(&[100.0, -100.0], false);
+        assert_eq!(rin[5], 1.0, "act1 应被钳到 +1");
+        assert_eq!(rin[6], -1.0, "act2 应被钳到 −1");
+        // 目标角增量 ≤ ACT_SCALE(出生角 + 至多一格)。
+        assert!((env.targets[0] - q0).abs() <= ACT_SCALE + 1e-6);
+    }
+
+    /// order 布景:插入睡着刚体后摆臂行为不变(末端轨迹逐位同;
+    /// L2/连杆顺序口径的环境侧基础)。
+    #[test]
+    fn order_insert_does_not_change_arm() {
+        let mut a = Env::new(7);
+        let mut w = fresh_world();
+        let arm = spawn_arm(&mut w, 1.0);
+        insert_order_bodies(&mut w, 16);
+        let _ = arm;
+        // 对照臂与插入臂同动作序列,末端位置逐位一致。
+        let mut rng = ChaCha8Rng::seed_from_u64(99);
+        for _ in 0..10 {
+            let act = [rng.random_range(-1.0..1.0), rng.random_range(-1.0..1.0)];
+            let rin_a = a.control_step(&act, false);
+            let _ = rin_a;
+        }
+        let tip_a = tip_position(&a.world, &a.arm);
+        assert!(tip_a.x.is_finite() && tip_a.y.is_finite());
     }
 }

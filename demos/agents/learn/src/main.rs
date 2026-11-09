@@ -25,13 +25,9 @@ mod arm;
 
 use std::time::Instant;
 
-use arm::{Env, ACT_DIM, EPISODE_CONTROLS, OBS_DIM, TARGET_R_MAX, TARGET_R_MIN};
+use arm::{Env, ACT_DIM, EPISODE_CONTROLS, OBS_DIM};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rapier3d::dynamics::RigidBodyBuilder;
-use rapier3d::geometry::ColliderBuilder;
-use rapier3d::math::{Pose, Vector};
-use rapier3d::pipeline::PhysicsWorld;
 
 /// 策略包的归一化参数(obs_mean | obs_inv_std,各 OBS_DIM f32;REQ-012
 /// §5.2:推理 = (obs − mean) × inv_std,clip ±10 后喂 ONNX)。
@@ -171,11 +167,7 @@ fn l0(seed: u64, n: usize) {
     let mut passed = 0usize;
     let t0 = Instant::now();
     for i in 0..n {
-        let theta: f32 = rng.random_range(0.0..std::f32::consts::TAU);
-        let rmin2 = TARGET_R_MIN * TARGET_R_MIN;
-        let rmax2 = TARGET_R_MAX * TARGET_R_MAX;
-        let r = (rng.random_range(0.0..1.0f32).mul_add(rmax2 - rmin2, rmin2)).sqrt();
-        let target = Vector::new(r * theta.cos(), r * theta.sin(), 0.0);
+        let target = arm::sample_target(&mut rng);
         let (q1t, q2t) = arm::ik(target.x, target.y).expect("可达域内");
         // 手动回合:出生与训练一致(Env::new 的 reset),电机目标直接设
         // 逆解角(不做增量式,绕过策略;这是"物理 + 电机参数能否完成
@@ -286,7 +278,10 @@ pub struct EpResult {
 }
 
 /// 跑一个评估回合:种子决定目标与出生;策略 = tract ONNX(确定性均值)。
-/// 返回逐拍末端距离(det 双跑哈希用Vec<f32> 的位模式哈希)。
+/// **复用 Env 的 reset/control_step(R3/P5)**:与训练同一钳位、增量、
+/// 步进路径;eval 的数据源 = 目标与出生角从回合种子采样后走 reset_with
+/// (order 布景经 reset_with_in 在摆臂之前插入)。返回逐拍末端位置
+/// (det 双跑哈希用 Vec<f32> 的位模式哈希)与活跃集顺序。
 #[allow(clippy::too_many_arguments)]
 fn run_episode(
     model: &RunnableModel,
@@ -297,72 +292,20 @@ fn run_episode(
     variant: arm::PhysVariant,
     args_norm: &Norm,
 ) -> (EpResult, Vec<u64>) {
+    let mut env = Env::with_variant(0, variant);
+    // 目标与出生角从回合种子采样(与训练 reset 同分布、同采样顺序)。
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
-    let theta: f32 = rng.random_range(0.0..std::f32::consts::TAU);
-    let rmin2 = TARGET_R_MIN * TARGET_R_MIN;
-    let rmax2 = TARGET_R_MAX * TARGET_R_MAX;
-    let r = (rng.random_range(0.0..1.0f32).mul_add(rmax2 - rmin2, rmin2)).sqrt();
-    let target = Vector::new(r * theta.cos(), r * theta.sin(), 0.0);
-    let mut world = PhysicsWorld::new();
-    world.gravity = Vector::new(0.0, -9.81, 0.0);
-    world.integration_parameters = arm::production_params();
-    if let Some(n) = order_insert {
-        for i in 0..n {
-            world.insert(
-                RigidBodyBuilder::dynamic()
-                    .translation(Vector::new(
-                        -6.0,
-                        -3.0 + (i % 4) as f32 * 1.2,
-                        -2.5 + i as f32 * 1.2,
-                    ))
-                    .sleeping(true),
-                ColliderBuilder::ball(0.01),
-            );
+    let target = arm::sample_target(&mut rng);
+    let (q1, q2) = arm::sample_init_q(&mut rng);
+    let world = {
+        let mut w = arm::fresh_world();
+        if let Some(n) = order_insert {
+            arm::insert_order_bodies(&mut w, n);
         }
-    }
-    let arm = arm::spawn_arm(&mut world, variant.mass_mult);
-    let mut env = Env {
-        world,
-        arm,
-        target,
-        targets: [0.0; ACT_DIM],
-        last_action: [0.0; ACT_DIM],
-        step: 0,
-        done: false,
-        variant,
+        w
     };
-    // 出生角:与 Env::reset 同流(前 3 个随机数 = θ、r、q1;第 4 = q2)。
-    let _ = theta;
-    let _ = r;
-    let q1: f32 = rng.random_range(-arm::INIT_Q_RANGE..arm::INIT_Q_RANGE);
-    let q2: f32 = rng.random_range(-arm::INIT_Q_RANGE..arm::INIT_Q_RANGE);
-    // 按 FK 摆出生位姿(同 Env::reset)。
-    use rapier3d::math::Rotation;
-    let ang1 = Rotation::from_rotation_z(q1);
-    let total = q1 + q2;
-    let ang2 = Rotation::from_rotation_z(total);
-    let l1_pos = 0.5 * arm::LINK_LEN * Vector::new(q1.sin(), -q1.cos(), 0.0);
-    let l2_pos = arm::LINK_LEN * Vector::new(q1.sin(), -q1.cos(), 0.0)
-        + 0.5 * arm::LINK_LEN * Vector::new(total.sin(), -total.cos(), 0.0);
-    for (h, pos, ang) in [
-        (env.arm.links[1], l1_pos, ang1),
-        (env.arm.links[2], l2_pos, ang2),
-    ] {
-        env.world.bodies.get_mut(h).expect("link").set_position(
-            Pose {
-                translation: pos,
-                rotation: ang,
-                ..Pose::IDENTITY
-            },
-            false,
-        );
-    }
-    for (dof, q) in [q1, q2].into_iter().enumerate() {
-        arm::set_target(&mut env.world, &env.arm, dof, q);
-    }
-    env.targets = [q1, q2];
+    let _ = env.reset_with_in(world, target, [q1, q2]);
 
-    let ticks_per = if hz60 { 1 } else { arm::TICKS_PER_CONTROL };
     let mut last15: Vec<f32> = Vec::with_capacity(15);
     let mut hashes: Vec<u64> = Vec::new();
     let mut nan = false;
@@ -372,28 +315,16 @@ fn run_episode(
         EPISODE_CONTROLS
     };
     for step in 0..controls {
-        let obs = arm::observe(&env.world, &env.arm, env.target, &env.last_action);
+        let obs = env.observe_now();
         if !obs.iter().all(|v| v.is_finite()) {
             nan = true;
             break;
         }
         let nobs = args_norm.apply(&obs);
         let action = policy_action(model, &nobs);
-        // 增量式目标(同训练口径)。
-        for dof in 0..ACT_DIM {
-            env.targets[dof] = (env.targets[dof] + arm::ACT_SCALE * action[dof])
-                .clamp(-arm::JOINT_LIMIT, arm::JOINT_LIMIT);
-        }
-        for t in 0..ticks_per {
-            if t == 0 || hz60 {
-                for dof in 0..ACT_DIM {
-                    arm::set_target(&mut env.world, &env.arm, dof, env.targets[dof]);
-                }
-            }
-            env.world.step();
-        }
-        env.last_action = action;
-        env.step += 1;
+        // 钳位在 Env::control_step 内(P5);eval 不再自钳。
+        let rin = env.control_step(&action, hz60);
+        let _ = rin;
         let tip = arm::tip_position(&env.world, &env.arm);
         let d = (tip - target).length();
         if step >= controls - 15 {
@@ -409,7 +340,6 @@ fn run_episode(
             }
             hashes.push(th);
         }
-        let _ = step;
     }
     let hold = last15.len() == 15 && last15.iter().all(|d| *d <= arm::REACH_DIST);
     let d_end = last15.last().copied().unwrap_or(f32::NAN);

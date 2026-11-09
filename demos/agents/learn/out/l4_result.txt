@@ -1,5 +1,5 @@
-ckpt_last20_avg,-115.3107
-ft_first_iter,-111.7602
-diff_pct,3.08
+ckpt_last20_avg,44.6886
+ft_first_iter,39.1224
+diff_pct,12.46
 pass_20pct,PASS
 nan_in_ft_run,0
