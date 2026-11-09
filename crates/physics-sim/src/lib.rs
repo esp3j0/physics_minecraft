@@ -25,6 +25,7 @@ pub mod wake;
 
 mod conv;
 mod solidify;
+mod walker;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
 pub use agent::{AgentRecord, AgentSpawnError, BodyRegistry, BodyRegistryError};
@@ -36,3 +37,4 @@ pub use snapshot::SimSnapshotError;
 pub use tickets::{
     AreaId, RegionSpec, TicketClock, TicketHolder, TicketKind, TicketState, TicketView, WakeSpec,
 };
+pub use walker::seam_corrected_dist;

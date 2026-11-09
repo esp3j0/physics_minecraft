@@ -17,7 +17,7 @@ pub mod tick;
 
 pub use body::{
     BodyDef, BodyDefError, BodyHash, JointDef, JointKind, JointLimits, JointParams, JointType,
-    LinkDef, SelfCollisionDef, ShapeDef,
+    LinkDef, SelfCollisionDef, ShapeDef, WalkerParams,
 };
 pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, ChunkRegion, WORLD_Y_MAX, WORLD_Y_MIN};
 pub use ids::{

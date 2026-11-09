@@ -884,6 +884,14 @@ impl Scheduler {
             .is_some_and(|sim| sim.is_carried(entity))
     }
 
+    /// 实体是否是主体(REQ-012 A02a 第 2 节:`AgentIntent` 的驱动侧前置
+    /// 校验——不是主体的实体在驱动侧丢弃,不进内核)。实体属于任一**已
+    /// 注册**分片且该分片的 `agents` 表含它 → true;查不到 → false(不存
+    /// 在的实体同口径)。任一分片即可:主体唯一占一个 EntityId。
+    pub fn is_agent(&self, entity: EntityId) -> bool {
+        self.sims.values().any(|sim| sim.is_agent(entity))
+    }
+
     /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
     /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
     /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内

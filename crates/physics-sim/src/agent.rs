@@ -96,7 +96,8 @@ impl BodyRegistry {
 }
 
 /// 主体的分片侧附加记录(REQ-012 §3):`EntityRecord` 之外,连杆句柄表与
-/// 身体哈希。**随快照走**(A01 第 4 节)。
+/// 身体哈希。**随快照走**(A01 第 4 节;A02a 第 2 节:意图是保持状态,也在
+/// 本记录里随快照走)。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentRecord {
     /// 身体内容哈希(restore 时校验注册表可解析,缺失 = 类型化错误)。
@@ -105,6 +106,15 @@ pub struct AgentRecord {
     pub links: BTreeMap<String, rapier3d::prelude::RigidBodyHandle>,
     /// 连杆碰撞体句柄(与 links 同序;登记进撞击归因表,A05 用)。
     pub colliders: Vec<rapier3d::prelude::ColliderHandle>,
+    /// 最近一条意图的水平分量(世界系 m/s;None = 尚无意图,控制器不动)。
+    /// 保持状态:直到下一条意图到来;随快照走(A02a 第 2 节)。
+    pub intent_move: Option<(f32, f32)>,
+    /// 最近一条意图的朝向(rad;内核规范化到 (−π, π])。随快照走。
+    pub intent_yaw: Option<f32>,
+    /// 一次性跳请求(A02a 第 2 节):置位后在下一个控制拍被消费——不管当时
+    /// 接没接地;没接地就丢掉,不缓存。随快照走(检查点落在置位与消费之间
+    /// 时,恢复线同样消费)。
+    pub intent_jump: bool,
 }
 
 /// 主体生成失败原因(类型化拒绝;不 panic)。
@@ -121,10 +131,37 @@ pub enum AgentSpawnError {
     InvalidBody(String),
 }
 
+/// 主体意图的内核侧拒绝原因(A02a 第 2 节;类型化,计数在 apply_command)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentIntentError {
+    /// 实体不存在或不是主体。
+    NotAgent,
+    /// 身体没有 `[walker]` 段(多连杆身体或未配行走的单连杆)。
+    NoWalker,
+    /// move_xz/yaw 非有限(NaN/inf)。
+    NonFinite,
+}
+
 impl ShardSim {
     /// 主体是否存在。
     pub fn is_agent(&self, id: EntityId) -> bool {
         self.agents.contains_key(&id)
+    }
+
+    /// 主体是否接地(A02a 第 3 节的接地判定;判据布景的接地自检观测口)。
+    /// 主体不存在/无碰撞体/几何非胶囊 → false。
+    pub fn agent_is_grounded(&self, id: EntityId, ground_eps: f32) -> bool {
+        if !self.agents.contains_key(&id) {
+            return false;
+        }
+        let Some(rec) = self.entities.get(&id) else {
+            return false;
+        };
+        let Some(rb) = self.phys.bodies.get(rec.handle) else {
+            return false;
+        };
+        let pos = crate::conv::rapier_to_vec3(rb.translation());
+        self.agent_ground_check_pub(rec.handle, rec.collider, pos, ground_eps)
     }
 
     /// 主体的身体哈希;非主体/不存在 → None。
@@ -190,7 +227,11 @@ impl ShardSim {
         let mut collider_builder = agent_collider_builder(&link.shapes, mass);
         collider_builder = collider_builder
             .friction(link.friction)
-            .restitution(link.restitution);
+            .restitution(link.restitution)
+            // A02a 第 4 节:接触钩子只挂在主体碰撞体上(摩擦清零 + 接缝
+            // 修正;钩子本身见 walker.rs——世界里没有主体时无碰撞体挂钩,
+            // 钩子不触发,AC-A8)。
+            .active_hooks(rapier3d::prelude::ActiveHooks::MODIFY_SOLVER_CONTACTS);
         let (handle, collider) = self.phys.insert(body_builder, collider_builder);
 
         // 主体描述:凝固路径按 actor 豁免永不使用 `desc.block`;`half_size`
@@ -223,6 +264,9 @@ impl ShardSim {
                 body_hash: body,
                 links,
                 colliders: vec![collider],
+                intent_move: None,
+                intent_yaw: None,
+                intent_jump: false,
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
@@ -241,8 +285,69 @@ impl ShardSim {
         );
         let rec = self.entities.remove(&id).expect("实体记录存在(fail-stop)");
         self.phys.remove_body(rec.handle);
+        // A02a:控制器保持态随主体增删(移除后不残留)。
+        self.walker_holds.remove(&id);
         // 调度器据此 release 全局 ownership(REQ-006 任务 00)。
         self.outbox.despawned.push(id);
+    }
+
+    /// 主体意图的内核侧接受(A02a 第 2 节):命令可能来自日志回放,内核
+    /// **不信任它、不 panic**。检查(任一失败即 `Err`,类型见
+    /// [`AgentIntentError`]):
+    /// - 实体不存在/不是主体;
+    /// - 无 `[walker]` 段;
+    /// - 非有限值(NaN/inf;保持状态不写入)。
+    ///
+    /// 通过后:`move_xz` 长度超过 `[walker].max_speed` 按比例钳(遥测
+    /// `agent_intent_clamped` +1)、`yaw` 规范化到 (−π, π],合法意图写入
+    /// `AgentRecord` 保持状态(`intent_move`/`intent_yaw`);`jump` 置一次性
+    /// 标志,由控制器在下一个控制拍消费。遥测拒绝计数在 `apply_command`
+    /// 分支统一 +1(本函数只报类型)。
+    pub(crate) fn apply_agent_intent(
+        &mut self,
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    ) -> Result<(), AgentIntentError> {
+        let body_hash = match self.agents.get(&entity) {
+            Some(record) => record.body_hash,
+            None => return Err(AgentIntentError::NotAgent),
+        };
+        let Some(walker) = self.bodies.get(&body_hash).and_then(|def| def.walker) else {
+            return Err(AgentIntentError::NoWalker);
+        };
+        let (mx, mz) = move_xz;
+        if !mx.is_finite() || !mz.is_finite() || !yaw.is_finite() {
+            return Err(AgentIntentError::NonFinite);
+        }
+        // 钳制:长度超过 max_speed 按比例缩(方向不变)。
+        let len = (mx * mx + mz * mz).sqrt();
+        let (mx, mz) = if len > walker.max_speed {
+            let s = walker.max_speed / len;
+            self.outbox.agent_intent_clamped += 1;
+            (mx * s, mz * s)
+        } else {
+            (mx, mz)
+        };
+        // yaw 规范化到 (−π, π](§13:与 capsule demo 的 heading_rad 同域;
+        // rem_euclid 到 [0, 2π) 再折回)。
+        let yaw_norm = {
+            let two_pi = std::f32::consts::TAU;
+            let mut y = yaw.rem_euclid(two_pi);
+            if y > std::f32::consts::PI {
+                y -= two_pi;
+            }
+            // rem_euclid 后 y ∈ [0, 2π);y = 0 保持 0((−π, π] 的 0);
+            // y = 2π 不可能出现(rem_euclid 半开区间),负零折正零不强制
+            // (f32 位模式:−0.0 − 2π ≠ 0 路径不会到;0.0 走不到减法)。
+            y
+        };
+        let record = self.agents.get_mut(&entity).expect("前面已查存在");
+        record.intent_move = Some((mx, mz));
+        record.intent_yaw = Some(yaw_norm);
+        record.intent_jump = jump;
+        Ok(())
     }
 }
 
@@ -1043,6 +1148,11 @@ anchor = [0.0, 0.0, 0.0]
     /// 砸中后弹落滚走、静止后凝固成方块(默认凝固配置;主体 actor 恒豁免);
     /// 爆炸 power 12 / radius 5,中心 (21.5, 1, 24)(距主体 2.5 m,斜向冲量
     /// 把主体沿 +x 推开;地面炸坑但 3×3 平板足够大)。
+    /// A02a:主体有了行走控制器与接触钩子(摩擦清零)——爆炸冲量推主体
+    /// 后地面不再有摩擦阻力,主体会一直滑出本体区(触发 A01 迁移 fail-stop,
+    /// 判据 A01-2 的"主体全程在"布景约束被打破)。布景补一条**零意图**:
+    /// 意图 = 零速时控制器按控制律刹车(F = clamp(m(0 − v)/τ)),主体被推
+    /// 出 ~3.4 m 后停住(探针实测),不出本体区。判据期望值不动。
     fn ac_a6_inputs(tick: u32, hash: BodyHash) -> Vec<messaging::StampedInput> {
         let mut inputs = Vec::new();
         if tick == 0 {
@@ -1051,6 +1161,17 @@ anchor = [0.0, 0.0, 0.0]
                 hash,
                 Vec3::new(24.0, 1.95, 24.0),
             ));
+            inputs.push(messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 3,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::AgentIntent {
+                    entity: types::EntityId::from_parts(1, 1),
+                    move_xz: (0.0, 0.0),
+                    yaw: 0.0,
+                    jump: false,
+                }),
+            });
         }
         if tick == 500 {
             inputs.push(messaging::StampedInput {
@@ -1219,5 +1340,294 @@ anchor = [0.0, 0.0, 0.0]
                 );
             }
         }
+    }
+    // ---- REQ-012 A02a 第 2 节:AgentIntent 内核校验(A02-10 内核半边)----
+
+    /// 盖章的 AgentIntent 输入(apply_prefix 直发;网络前置校验在 driver)。
+    fn intent_input(
+        entity: types::EntityId,
+        seq: u64,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    ) -> messaging::StampedInput {
+        messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: seq,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            }),
+        }
+    }
+
+    /// 判据 A02-10(内核不信任回放命令):非主体实体、不存在的实体的意图
+    /// = 类型化拒绝 + 遥测(agent_intent_rejected),世界不 panic。
+    #[test]
+    fn intent_rejects_non_agent_entity_with_telemetry() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        let plain = types::EntityId::from_parts(1, 2);
+        let ghost = types::EntityId::from_parts(9, 9);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("capsule 可生成");
+        s.spawn_entity_for_test(plain, Vec3::new(60.0, 3.0, 60.0));
+        // 普通实体:不是主体 → 拒绝。
+        s.apply_prefix(&[intent_input(plain, 0, (1.0, 0.0), 0.0, false)]);
+        assert_eq!(s.outbox.agent_intent_rejected, 1, "非主体的实体:遥测计数 1");
+        // 不存在的实体:拒绝。
+        s.apply_prefix(&[intent_input(ghost, 1, (1.0, 0.0), 0.0, false)]);
+        assert_eq!(s.outbox.agent_intent_rejected, 2, "不存在实体:计数 2");
+        // 主体本身:接受(计数不动)。
+        s.apply_prefix(&[intent_input(a, 2, (1.0, 0.0), 0.0, false)]);
+        assert_eq!(
+            s.outbox.agent_intent_rejected, 2,
+            "主体意图被接受(拒绝计数不变)"
+        );
+        let record = s.agents.get(&a).expect("主体在表");
+        assert_eq!(record.intent_move, Some((1.0, 0.0)), "合法意图写入保持状态");
+    }
+
+    /// 判据 A02-10(无 `[walker]` 段):单连杆身体但 toml 无 walker 段 →
+    /// 意图类型化拒绝 + 遥测。
+    #[test]
+    fn intent_rejects_body_without_walker() {
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
+        let mut bodies = BodyRegistry::new();
+        // 与 capsule 同形但去掉 [walker] 段(头部 + 连杆段拼回,无 walker)。
+        let head = capsule_toml().split("[walker]").next().expect("段存在");
+        let links = format!(
+            "[[links]]{}",
+            capsule_toml().split("[[links]]").nth(1).expect("段存在")
+        );
+        let no_walker = format!("{head}{links}");
+        let h = bodies.insert_toml(&no_walker).expect("无 walker 段合法");
+        let mut s =
+            crate::sim::ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            h,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("无 walker 身体可生成");
+        s.apply_prefix(&[intent_input(a, 0, (1.0, 0.0), 0.0, false)]);
+        assert_eq!(
+            s.outbox.agent_intent_rejected, 1,
+            "无 [walker] 段:类型化拒绝 + 遥测"
+        );
+        let record = s.agents.get(&a).expect("主体在表");
+        assert_eq!(record.intent_move, None, "保持状态未被写入");
+    }
+
+    /// 判据 A02-10(非有限值):move_xz/yaw 带 NaN/inf → 拒绝 + 遥测,
+    /// 保持状态不写入(不传播 NaN 进内核)。
+    #[test]
+    fn intent_rejects_non_finite_values() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("capsule 可生成");
+        for (i, (mx, mz, y)) in [
+            (f32::NAN, 0.0, 0.0),
+            (0.0, f32::INFINITY, 0.0),
+            (0.0, 0.0, f32::NAN),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.apply_prefix(&[intent_input(a, i as u64, (mx, mz), y, false)]);
+        }
+        assert_eq!(
+            s.outbox.agent_intent_rejected, 3,
+            "三个非有限组合全拒绝(遥测各 +1)"
+        );
+        let record = s.agents.get(&a).expect("主体在表");
+        assert_eq!(record.intent_move, None, "保持状态未被污染");
+    }
+
+    /// 判据 A02-10(钳制):move_xz 长度超过 max_speed(5.6)→ 按比例钳到
+    /// max_speed + 遥测(agent_intent_clamped);方向不变。
+    #[test]
+    fn intent_clamps_move_over_max_speed_with_telemetry() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("capsule 可生成");
+        // (3, 4) 长 5 < 5.6:不钳。
+        s.apply_prefix(&[intent_input(a, 0, (3.0, 4.0), 0.0, false)]);
+        assert_eq!(s.outbox.agent_intent_clamped, 0, "5 m/s 不钳");
+        // (30, 40) 长 50 > 5.6:按比例钳到 5.6(方向不变)。
+        s.apply_prefix(&[intent_input(a, 1, (30.0, 40.0), 0.0, false)]);
+        assert_eq!(s.outbox.agent_intent_clamped, 1, "50 m/s 被钳,遥测 +1");
+        let record = s.agents.get(&a).expect("主体在表");
+        let (mx, mz) = record.intent_move.expect("钳后的意图已写入");
+        let len = (mx * mx + mz * mz).sqrt();
+        assert!(
+            (len - 5.6).abs() < 1e-4,
+            "钳后长度 = max_speed 5.6,实为 {len}"
+        );
+        assert!((mx / mz - 30.0 / 40.0).abs() < 1e-4, "方向不变(比例钳制)");
+    }
+
+    /// 判据 A02-10(yaw 规范化):yaw 规范化到 (−π, π]——3π → π,
+    /// −3π/2 → +π/2,4π → 0,−π → +π(半开区间折到上界)。
+    #[test]
+    fn intent_normalizes_yaw_to_pi_range() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+        )
+        .expect("capsule 可生成");
+        let pi = core::f32::consts::PI;
+        let cases: [(f32, f32); 4] = [
+            (3.0 * pi, pi),        // 3π ≡ π((−π, π] 上界)
+            (-1.5 * pi, 0.5 * pi), // −3π/2 ≡ +π/2
+            (4.0 * pi, 0.0),       // 4π ≡ 0
+            (-pi, pi),             // −π ≡ +π(半开区间折到上界)
+        ];
+        for (i, (yaw_in, expect)) in cases.iter().enumerate() {
+            s.apply_prefix(&[intent_input(a, i as u64, (0.0, 0.0), *yaw_in, false)]);
+            let record = s.agents.get(&a).expect("主体在表");
+            let yaw = record.intent_yaw.expect("yaw 已写入");
+            assert!(
+                (yaw - *expect).abs() < 1e-5,
+                "yaw {yaw_in} 规范化到 (−π, π],期望 {expect},实得 {yaw}"
+            );
+        }
+    }
+
+    /// 意图是保持状态(A02a 第 2 节):下一条意图到来前持续生效(只发一条
+    /// 1.5 m/s 意图,主体持续走;发零意图后刹车停住)。
+    #[test]
+    fn intent_is_held_state_until_next_intent() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.apply_prefix(&[
+            spawn_agent_input(a, hash, Vec3::new(24.0, 1.95, 24.0)),
+            intent_input(a, 0, (1.5, 0.0), 0.0, false),
+        ]);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        // 跑 120 拍(意图只发一条)。
+        for _ in 0..120 {
+            if !observers.is_empty() {
+                s.apply_activation(&observers);
+            }
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+        }
+        let st = s.entity_state(a).expect("主体还在");
+        assert!(
+            st.linvel.x > 1.2,
+            "意图保持:120 拍后仍在按 1.5 m/s 意图行走,vx={}",
+            st.linvel.x
+        );
+        // 再发零意图:主体刹车停下(保持状态被覆盖)。
+        s.apply_prefix(&[intent_input(a, 1, (0.0, 0.0), 0.0, false)]);
+        for _ in 0..120 {
+            if !observers.is_empty() {
+                s.apply_activation(&observers);
+            }
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+        }
+        let st = s.entity_state(a).expect("主体还在");
+        assert!(
+            st.linvel.x.abs() < 0.15,
+            "零意图覆盖后刹车:vx={}",
+            st.linvel.x
+        );
+    }
+
+    /// jump 一次性(A02a 第 2 节):置位后在下一个控制拍被消费,消费即清零
+    /// (接没接地都在控制拍消费;没接地就丢掉,不缓存)。
+    #[test]
+    fn jump_is_consumed_once_not_cached() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.apply_prefix(&[
+            spawn_agent_input(a, hash, Vec3::new(24.0, 1.95, 24.0)),
+            intent_input(a, 0, (0.0, 0.0), 0.0, false),
+        ]);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        for _ in 0..60 {
+            if !observers.is_empty() {
+                s.apply_activation(&observers);
+            }
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+        }
+        assert!(
+            s.agent_is_grounded(a, 0.05),
+            "布景自检:安定 60 拍后主体接地"
+        );
+        // 发 jump = true(接地)→ 下一个控制拍起跳且标志清零。
+        s.apply_prefix(&[intent_input(a, 1, (0.0, 0.0), 0.0, true)]);
+        let record = s.agents.get(&a).expect("主体在表");
+        assert!(record.intent_jump, "布景自检:jump 已置位(命令当拍应用)");
+        // 跑 2 拍必跨一个控制拍(控制拍 = tick % 2 == 0,60 Hz 施力 / 30 Hz
+        // 决策)。
+        let mut jumped_vy = None;
+        for _ in 0..2 {
+            if !observers.is_empty() {
+                s.apply_activation(&observers);
+            }
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            if jumped_vy.is_none() {
+                let st = s.entity_state(a).expect("主体还在");
+                if st.linvel.y > 1.0 {
+                    jumped_vy = Some(st.linvel.y);
+                }
+            }
+        }
+        let record = s.agents.get(&a).expect("主体在表");
+        assert!(!record.intent_jump, "jump 一次性:控制拍消费后标志清零");
+        let vy = jumped_vy.expect("接地起跳:竖直速度应达到起跳量级(> 1 m/s)");
+        assert!(vy > 1.0, "起跳速度量级 sqrt(2·9.81·1.4) ≈ 5.24 m/s");
     }
 }

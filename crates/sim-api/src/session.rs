@@ -545,6 +545,31 @@ impl Session {
         )
     }
 
+    /// 主体意图(REQ-012 A02a 第 2 节):本地受信通道正路——与 `spawn_agent`
+    /// 同款盖章(`apply_at = tick_now()`、source = 会话、sequence 沿会话
+    /// 单调)入**分片收件箱**与外部命令日志(回放再生;§2 意图是保持状态,
+    /// 随快照走,所以必须走日志)。不进 C2S 白名单(`net::command_shard`
+    /// 返回 None、`validate_external_command` 同口径拒绝;协议与附身面在
+    /// A03 开)。分片未注册 → panic(调度器语义,同 `send`)。
+    pub fn agent_intent(
+        &mut self,
+        shard: ShardId,
+        entity: types::EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    ) -> Result<LogEntry, SessionError> {
+        self.send(
+            shard,
+            SimCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            },
+        )
+    }
+
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
     /// REQ-007 任务 01(①② 拆分/D17):激活已启用 → 只装 ①(体素),② 由
     /// 下一拍激活决策构建(细则 11);未启用 → 合一装 ①②(现状,§14-9)。
@@ -714,6 +739,12 @@ impl Session {
     /// 实体当前权威归属(REQ-006 任务 01);迁移窗口/不存在 → None。
     pub fn entity_owner(&self, entity: EntityId) -> Option<shard::EntityOwner> {
         self.scheduler.owner_of_entity(entity)
+    }
+
+    /// 实体是否是主体(REQ-012 A02a 第 2 节;透传调度器,`AgentIntent`
+    /// 驱动侧前置校验用)。不存在/迁移窗口 → false。
+    pub fn is_agent(&self, entity: EntityId) -> bool {
+        self.scheduler.is_agent(entity)
     }
 
     /// 按实体 owner 投递命令(REQ-006 任务 01):不再由调用方猜分片。

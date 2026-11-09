@@ -207,6 +207,10 @@ pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
         // 主体生成(REQ-012 A01 第 2 节):本地受信通道专用,不走 C2S 白名单
         // (无上行映射;协议与附身面在 A03 开)。
         SimCommand::SpawnAgent { .. } => return None,
+        // 主体意图(REQ-012 A02a 第 2 节):本地受信通道专用,与 SpawnAgent
+        // 同款(不走分片前缀——意图经 Session 入口盖章入日志与分片收件箱;
+        // C2S 白名单 A03 开)。
+        SimCommand::AgentIntent { .. } => return None,
         // 观察者移除(REQ-005 D9):观察者收件箱专用命令,不走分片前缀——
         // 无上行映射(客户端白名单拒绝;driver::validate_external_command
         // 同口径防御层)。

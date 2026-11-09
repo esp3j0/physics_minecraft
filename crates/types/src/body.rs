@@ -163,6 +163,50 @@ fn default_friction() -> f32 {
     0.6
 }
 
+/// 行走控制器参数(REQ-012 A02a 第 1 节;`capsule` demo §13 定值)。只对
+/// 单连杆身体有效:多连杆身体带 `[walker]` 段 = 校验错误(`BadWalker`,
+/// A02a 第 1 节)。公式里的 m 取 rapier 刚体实际质量(乘过 k 的),不在
+/// 本结构里乘。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WalkerParams {
+    /// 速度误差时间常数(s;capsule 0.2)。
+    pub tau: f32,
+    /// 力上限倍数:F_max = fmax_g · m · g(capsule 8.0)。
+    pub fmax_g: f32,
+    /// 空中力系数(capsule 0.2;可 = 0,其余字段须 > 0)。六字段在 toml
+    /// 全部必填(无 serde 缺省:缺字段 = 解析层类型化错误)。
+    pub air: f32,
+    /// 跳跃高度(m;capsule 1.4)。
+    pub jump_h: f32,
+    /// 接地容差(m;capsule 0.05)。
+    pub ground_eps: f32,
+    /// 意图水平速度钳制(m/s;capsule 5.6)。
+    pub max_speed: f32,
+}
+
+impl WalkerParams {
+    pub fn validate(&self) -> Result<(), BodyDefError> {
+        for (name, v) in [
+            ("tau", self.tau),
+            ("fmax_g", self.fmax_g),
+            ("air", self.air),
+            ("jump_h", self.jump_h),
+            ("ground_eps", self.ground_eps),
+            ("max_speed", self.max_speed),
+        ] {
+            if !v.is_finite() {
+                return Err(BodyDefError::NonFinite(format!("walker.{name}")));
+            }
+            // air 允许 = 0(零空中控制),其余字段须 > 0(A02a 第 1 节)。
+            let positive_ok = if name == "air" { v >= 0.0 } else { v > 0.0 };
+            if !positive_ok {
+                return Err(BodyDefError::BadWalker(format!("walker.{name} 须 > 0")));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 身体定义(REQ-012 §2.1)。单连杆是退化情况(1 连杆、0 关节)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BodyDef {
@@ -179,6 +223,9 @@ pub struct BodyDef {
     /// 自碰撞(默认全关)。
     #[serde(default)]
     pub self_collision: SelfCollisionDef,
+    /// 行走控制器参数(REQ-012 A02a 第 1 节;可选,只对单连杆身体有效)。
+    #[serde(default)]
+    pub walker: Option<WalkerParams>,
 }
 
 /// 解析与校验失败原因(类型化,不 panic)。
@@ -202,6 +249,9 @@ pub enum BodyDefError {
     BadMass(String),
     #[error("字段 {0} 数值非有限")]
     NonFinite(String),
+    /// 行走段非法:多连杆身体带 `[walker]`、字段非有限或非正(A02a 第 1 节)。
+    #[error("行走参数非法:{0}")]
+    BadWalker(String),
     #[error("关节 {joint} 上限 {upper} 小于下限 {lower}")]
     BadLimits {
         joint: String,
@@ -225,6 +275,17 @@ impl BodyDef {
     pub fn validate(&self) -> Result<(), BodyDefError> {
         if self.links.is_empty() {
             return Err(BodyDefError::EmptyLinks);
+        }
+        // ---- 行走段(A02a 第 1 节):只对单连杆身体有效;多连杆带段 =
+        // 类型化错误;字段有限且 > 0(air 可 = 0)----
+        if let Some(w) = &self.walker {
+            if self.links.len() != 1 {
+                return Err(BodyDefError::BadWalker(format!(
+                    "[walker] 只对单连杆身体有效,本身体有 {} 个连杆",
+                    self.links.len()
+                )));
+            }
+            w.validate()?;
         }
         // 连杆名唯一。
         let mut seen = std::collections::BTreeSet::new();
@@ -513,6 +574,17 @@ impl BodyDef {
             put_str(&mut b, &pair[0]);
             put_str(&mut b, &pair[1]);
         }
+        // 行走段(A02a 第 1 节):进规范形式与哈希——capsule 的哈希随本段
+        // 新增而变(A02-12 点名的例外,旧哈希测试按新值更新)。
+        match &self.walker {
+            None => b.push(0),
+            Some(w) => {
+                b.push(1);
+                for v in [w.tau, w.fmax_g, w.air, w.jump_h, w.ground_eps, w.max_speed] {
+                    put_f32(&mut b, v);
+                }
+            }
+        }
         b
     }
 }
@@ -684,6 +756,7 @@ half_height = 0.6
             links: l,
             joints: j,
             self_collision: SelfCollisionDef::default(),
+            walker: None,
         };
 
         // 闭环:a→b→a(无根)。
@@ -747,6 +820,7 @@ half_height = 0.6
             links: vec![link(count)],
             joints: Vec::new(),
             self_collision: SelfCollisionDef::default(),
+            walker: None,
         };
         assert!(mk(8).validate().is_ok(), "恰 8 个合法");
         assert_eq!(
@@ -885,5 +959,146 @@ extra_pairs = [["base", "arm"]]
             BodyDef::from_toml_str(&bad_shape),
             Err(BodyDefError::Parse(_))
         ));
+    }
+
+    // ---- REQ-012 A02a 第 1 节:[walker] 段 ----
+
+    /// walker 缺省:无 `[walker]` 段合法(可选段);带段单连杆合法,字段
+    /// 齐全进结构;带段与不带段哈希必不同(段进规范形式)。
+    #[test]
+    fn walker_optional_but_hashed() {
+        let plain = BodyDef::from_toml_str(&capsule_toml()).expect("无 walker 段合法");
+        assert!(plain.walker.is_none());
+        let with = r#"
+name = "capsule"
+lock_rotations = true
+
+[walker]
+tau = 0.2
+fmax_g = 8.0
+air = 0.2
+jump_h = 1.4
+ground_eps = 0.05
+max_speed = 5.6
+
+[[links]]
+name = "torso"
+mass = 80.0
+friction = 0.3
+restitution = 0.0
+
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.6
+radius = 0.3
+"#;
+        let def = BodyDef::from_toml_str(with).expect("带 walker 段的单连杆合法");
+        let w = def.walker.expect("段已解析");
+        assert_eq!(
+            w,
+            WalkerParams {
+                tau: 0.2,
+                fmax_g: 8.0,
+                air: 0.2,
+                jump_h: 1.4,
+                ground_eps: 0.05,
+                max_speed: 5.6,
+            },
+            "字段齐全(A02a 第 1 节 capsule 取值)"
+        );
+        assert_ne!(
+            plain.hash(),
+            def.hash(),
+            "walker 段进哈希:带段与不带段必不同"
+        );
+        // 段内任一数值变化必改哈希。
+        let changed = with.replace("tau = 0.2", "tau = 0.3");
+        let other = BodyDef::from_toml_str(&changed).expect("合法");
+        assert_ne!(def.hash(), other.hash(), "walker 数值变化必改哈希");
+    }
+
+    /// 多连杆身体带 `[walker]` 段:类型化拒绝(A02a 第 1 节)。
+    #[test]
+    fn walker_on_multi_link_body_rejected() {
+        let two_link_with_walker = r#"
+name = "two"
+[walker]
+tau = 0.2
+fmax_g = 8.0
+air = 0.2
+jump_h = 1.4
+ground_eps = 0.05
+max_speed = 5.6
+
+[[links]]
+name = "base"
+mass = 10.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[links]]
+name = "arm"
+mass = 1.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[joints]]
+parent = "base"
+child = "arm"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+"#;
+        let def = BodyDef::from_toml_str(two_link_with_walker)
+            .expect_err("多连杆带 walker 段在校验层拒绝");
+        assert!(
+            matches!(def, BodyDefError::BadWalker(_)),
+            "多连杆带 walker 段 = BadWalker"
+        );
+    }
+
+    /// walker 字段校验(A02a 第 1 节):每个字段非有限拒绝、非正拒绝
+    /// (air = 0 例外,合法);toml 缺字段 = 解析层类型化错误(六字段全必填)。
+    #[test]
+    fn walker_field_validation() {
+        let full = |f: f32| WalkerParams {
+            tau: f,
+            fmax_g: f,
+            air: f,
+            jump_h: f,
+            ground_eps: f,
+            max_speed: f,
+        };
+        assert!(full(0.1).validate().is_ok(), "全字段正数合法");
+        assert!(full(f32::NAN).validate().is_err(), "NaN 拒绝");
+        assert!(full(f32::INFINITY).validate().is_err(), "inf 拒绝");
+        assert!(full(0.0).validate().is_err(), "全 0 拒绝(air 除外)");
+        // air = 0 合法(A02a 第 1 节:air 可以 = 0)。
+        let mut zero_air = full(0.1);
+        zero_air.air = 0.0;
+        assert!(zero_air.validate().is_ok(), "air = 0 合法");
+        let mut neg_air = full(0.1);
+        neg_air.air = -0.1;
+        assert!(neg_air.validate().is_err(), "air < 0 拒绝");
+        // 字段名报进错误(NaN 定位)。
+        let mut bad_tau = full(0.1);
+        bad_tau.tau = f32::NAN;
+        assert_eq!(
+            bad_tau.validate(),
+            Err(BodyDefError::NonFinite("walker.tau".to_owned())),
+            "非有限错误点名字段"
+        );
+        // toml 缺任一字段 = 解析层类型化错误(serde 无缺省,Walk 十字段必填)。
+        let missing = capsule_toml().replace(
+            "name = \"capsule\"\nlock_rotations = true",
+            "name = \"capsule\"\nlock_rotations = true\n\n[walker]\ntau = 0.2",
+        );
+        assert!(
+            matches!(
+                BodyDef::from_toml_str(&missing),
+                Err(BodyDefError::Parse(_))
+            ),
+            "缺 fmax_g/air/jump_h/ground_eps/max_speed = 解析层拒绝"
+        );
     }
 }

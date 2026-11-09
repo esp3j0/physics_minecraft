@@ -243,6 +243,31 @@ pub fn validate_external_command(
                 Ok(())
             }
         }
+        // 主体意图(REQ-012 A02a 第 2 节):本地受信通道(commands,source =
+        // None)接受,进内核前拒绝——非有限值(NaN/inf)、不存在的实体、不是
+        // 主体的实体(被拒的不进日志,驱动侧计数)。网络来源拒绝(协议面
+        // A03 开)。
+        messaging::SimCommand::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            ..
+        } => {
+            if source.is_some() {
+                return Err("AgentIntent 网络来源拒绝(本地受信通道专用;协议面 A03 开)");
+            }
+            let (mx, mz) = *move_xz;
+            if !mx.is_finite() || !mz.is_finite() || !yaw.is_finite() {
+                return Err("AgentIntent 参数非法(需有限 move_xz/yaw)");
+            }
+            if session.entity_owner(*entity).is_none() {
+                return Err("AgentIntent 实体不存在或迁移窗口");
+            }
+            if !session.is_agent(*entity) {
+                return Err("AgentIntent 目标不是主体");
+            }
+            Ok(())
+        }
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
@@ -2415,6 +2440,129 @@ mod tests {
         assert!(
             validate_external_command(&session, None, shard_id(0, 0), &spawn_agent).is_ok(),
             "SpawnAgent commands 通道(None)接受(与 SpawnDynamic 同口径)"
+        );
+        session.shutdown();
+    }
+
+    /// 判据 A02-10(driver 半边;REQ-012 A02a 第 2 节):`AgentIntent` 进内核
+    /// 前的 `validate_external_command` 拒绝——网络来源、非有限值、不存在的
+    /// 实体、不是主体的实体;本地来源(commands,None)对真实主体接受。被拒
+    /// 的不进日志(拒绝即返回 Err,dispatch_external 不投递)。
+    #[test]
+    fn agent_intent_validated_before_kernel() {
+        let config = Config::default();
+        let mut session = sim_api::session::Session::new(config.session_config());
+        // 分片 0 带 capsule 注册表(真实主体布景)。
+        let mut bodies = physics_sim::BodyRegistry::new();
+        let hash = bodies
+            .insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+            .expect("capsule.body.toml 合法");
+        let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+        cfg.solidify = SolidifyConfig {
+            enabled: false,
+            ..SolidifyConfig::default()
+        };
+        cfg.cohesion.enabled = false;
+        session.register(ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        ));
+        session.register(sim(1, 0));
+        let a = EntityId::from_parts(1, 1);
+        let plain = EntityId::from_parts(1, 2);
+        session
+            .spawn_agent(
+                shard_id(0, 0),
+                a,
+                hash,
+                EntityState {
+                    translation: Vec3::new(24.0, 1.95, 24.0),
+                    ..EntityState::default()
+                },
+            )
+            .expect("主体生成入箱");
+        session
+            .send_from(
+                messaging::InputSource(7),
+                shard_id(0, 0),
+                messaging::SimCommand::SpawnDynamic {
+                    entity: plain,
+                    state: EntityState {
+                        translation: Vec3::new(60.0, 3.0, 60.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("普通实体入箱");
+        session.tick();
+
+        let intent = |entity, mx, mz, yaw| messaging::SimCommand::AgentIntent {
+            entity,
+            move_xz: (mx, mz),
+            yaw,
+            jump: false,
+        };
+        // 网络来源拒绝(本地受信通道专用;协议面 A03 开)。
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &intent(a, 1.0, 0.0, 0.0)
+            )
+            .is_err(),
+            "AgentIntent 网络来源拒绝"
+        );
+        // 非有限值(move_xz NaN / yaw inf)拒绝。
+        assert!(
+            validate_external_command(
+                &session,
+                None,
+                shard_id(0, 0),
+                &intent(a, f32::NAN, 0.0, 0.0)
+            )
+            .is_err(),
+            "AgentIntent NaN move_xz 拒绝"
+        );
+        assert!(
+            validate_external_command(
+                &session,
+                None,
+                shard_id(0, 0),
+                &intent(a, 0.0, 0.0, f32::INFINITY)
+            )
+            .is_err(),
+            "AgentIntent inf yaw 拒绝"
+        );
+        // 不存在的实体 / 不是主体的实体。
+        let ghost = EntityId::from_parts(9, 9);
+        assert!(
+            validate_external_command(
+                &session,
+                None,
+                shard_id(0, 0),
+                &intent(ghost, 1.0, 0.0, 0.0)
+            )
+            .is_err(),
+            "AgentIntent 不存在的实体拒绝"
+        );
+        assert!(
+            validate_external_command(
+                &session,
+                None,
+                shard_id(0, 0),
+                &intent(plain, 1.0, 0.0, 0.0)
+            )
+            .is_err(),
+            "AgentIntent 非主体的实体拒绝"
+        );
+        // 本地来源 + 真实主体:接受。
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &intent(a, 1.0, 0.0, 0.0))
+                .is_ok(),
+            "AgentIntent commands 通道对真实主体接受"
         );
         session.shutdown();
     }

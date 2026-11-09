@@ -101,7 +101,17 @@ struct ShardSimSnapshot {
     /// 句柄表(碰撞体句柄随 rapier PhysicsWorld 整体往返,本表只存句柄)。
     /// restore 时逐条校验身体哈希在注册表(`SimSnapshotError::UnknownBody`)。
     /// **布局变化**:v7 档解码失败——需清 data_dir(REQ-012 A01 第 4 节)。
+    /// A02a:AgentRecord 内含意图保持状态(随本表逐位往返)。
     agents: BTreeMap<EntityId, crate::agent::AgentRecord>,
+    /// 分片步进计数(**v8 内追加,A02a 第 3 节**):`step()` 已执行次数 =
+    /// 全局 tick。控制拍判定 `tick % 2 == 0` 以它为准——回放与检查点恢复后
+    /// 相位一致(计数随快照走;`step` 末 +1,恢复后从断点续计)。**布局变
+    /// 化**:v7 档解码失败——需清 data_dir(与 agents 同一批 v8 档)。
+    step_tick: Tick,
+    /// 行走控制器保持态(**v8 内追加,A02a 第 3 节**):主体 → 保持的水平
+    /// 力与朝向去重记忆。checkpoint 落在两个控制拍之间时保持的力非零,
+    /// 恢复线必须继续施加(A02-9)。随快照走。
+    walker_holds: BTreeMap<EntityId, crate::walker::WalkerHold>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -191,6 +201,8 @@ impl ShardSim {
             collapse_deferred: self.collapse_deferred.clone(),
             load_pending: self.load_pending.clone(),
             agents: self.agents.clone(),
+            step_tick: self.step_tick,
+            walker_holds: self.walker_holds.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -257,6 +269,12 @@ impl ShardSim {
             phys,
             entities,
             agents: snap.agents,
+            // 控制拍计数与保持力随快照走(A02a 第 3 节:恢复后相位一致、
+            // 保持的力继续施加)。
+            step_tick: snap.step_tick,
+            walker_holds: snap.walker_holds,
+            // 接缝修正开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
+            seam_fix_enabled: true,
             bodies,
             chunk_bodies: snap.chunk_bodies,
             built_colliders: snap.built_colliders,

@@ -303,6 +303,13 @@ pub struct Outbox {
     /// 定义非法;重复 EntityId 走 fail-stop 不计)。纯计数(随 Outbox 走,
     /// v8 起随快照;计数不影响确定性)。
     pub agent_spawn_rejected: u64,
+    /// 本拍主体意图的内核侧拒绝数(REQ-012 A02a 第 2 节:回放的命令不可信
+    /// ——实体不是主体、没有 `[walker]` 段、非有限值;进内核前的拒绝在驱动
+    /// 侧 `validate_external_command`,不进本计数)。纯计数(随 Outbox 走)。
+    pub agent_intent_rejected: u64,
+    /// 本拍主体意图被钳制的次数(A02a 第 2 节:`move_xz` 长度超过
+    /// `[walker].max_speed` 按比例钳到 max_speed)。纯计数(随 Outbox 走)。
+    pub agent_intent_clamped: u64,
     /// 实体票状态操作(REQ-007 任务 03;S5:分片只产出状态依赖操作,签发
     /// 单点在调度器 claim/补签)。调度器按 TicketKey 序应用,N 拍产生 N+1 生效
     /// (§14-6);幂等由 TicketTable 保证。
@@ -559,6 +566,19 @@ pub struct ShardSim {
     /// run_transient_lifecycle;take_outbox 有 debug_assert 兜底)——外部
     /// 看到的重建时序不变,检查点格式不变(集合只活在一拍内部,不入快照)。
     pub(crate) pending_collider_rebuilds: BTreeSet<ChunkPos>,
+    /// 分片步进计数(REQ-012 A02a 第 3 节):`step()` 已执行次数 = 全局
+    /// tick。行走控制器的控制拍判定(`tick % 2 == 0`)以它为准——回放与
+    /// 检查点恢复后相位一致(随快照走,恢复后从断点续计)。step 末 +1。
+    pub(crate) step_tick: Tick,
+    /// 行走控制器的保持态(A02a 第 3 节):主体 → 保持力与朝向去重记忆。
+    /// 力在两个控制拍之间保持,**随快照走**(A02-9:检查点落在两个控制拍
+    /// 之间时保持的力非零,恢复后继续施加)。随主体增删。
+    pub(crate) walker_holds: BTreeMap<EntityId, crate::walker::WalkerHold>,
+    /// 接缝修正开关(**测试对照专用**,A02-3:关掉接缝修正的对照组证明
+    /// 布景真的会碰接缝问题;生产恒 true,不入快照——对照布景不进检查点)。
+    /// 摩擦清零不受本开关影响(对照的被测操作是接缝修正,不是摩擦方案,
+    /// capsule demo fix0 同款口径)。
+    pub(crate) seam_fix_enabled: bool,
 }
 
 /// 撞击冲量流的按实体事件累计(F02a,§5.7.1;`evaluate_impacts` 采样)。
@@ -631,11 +651,20 @@ impl ShardSim {
             compound_flow_trace: Vec::new(),
             impact_corrections_this_tick: BTreeMap::new(),
             pending_collider_rebuilds: BTreeSet::new(),
+            step_tick: Tick::ZERO,
+            walker_holds: BTreeMap::new(),
+            seam_fix_enabled: true,
         }
     }
 
     pub fn shard(&self) -> ShardId {
         self.cfg.shard
+    }
+
+    /// 接缝修正开关(**测试对照专用**,A02-3:关掉接缝修正的对照组证明
+    /// 布景真的会碰接缝问题)。生产路径恒开(默认 true,不入快照)。
+    pub fn set_seam_fix_for_test(&mut self, enabled: bool) {
+        self.seam_fix_enabled = enabled;
     }
 
     /// 体素世界只读视图(测试/导出用)。
@@ -1137,7 +1166,14 @@ impl ShardSim {
                 })
             })
             .collect();
-        self.phys.step();
+        // REQ-012 A02a 第 3/4 节:行走控制器(控制拍判定按本拍 tick = 当前
+        // step_tick;力的施加在 phys.step 之前)与接触钩子输入(当拍采样,
+        // 纯函数)。step_tick 是"下一次 step 的拍号"(step 末 +1),与调度器
+        // 全局 tick 同语义。无主体时控制器早退、钩子输入为空表 →
+        // step_with_events 与 phys.step 行为逐位一致(AC-A8)。
+        self.walker_control_tick();
+        let hooks = crate::walker::AgentContactInput::sample(self);
+        self.phys.step_with_events(&hooks, &());
         self.collect_contact_wake_compensation();
         // §5.7 修正扣除表(G02,§5.8.1):拍内有效,每拍清空(上一拍的修正
         // 不扣到本拍事件上)。
@@ -1461,6 +1497,9 @@ impl ShardSim {
         // (凝固桥循环与坍塌求值只读体素、不读接触对,延后到此处不改变行为
         // ——体素写入当拍已生效,后续求值看的都是体素真相)。
         self.flush_collider_rebuilds();
+        // A02a 第 3 节:本拍完成,步进计数 +1(下一拍的 tick;控制拍相位、
+        // 检查点恢复后续计都以此为准)。
+        self.step_tick = Tick(self.step_tick.0 + 1);
     }
 
     /// 取走并清空本 tick 产出。
@@ -4253,6 +4292,26 @@ impl ShardSim {
                 };
                 if let Err(_e) = self.spawn_agent(entity, body, state) {
                     // 遥测在 spawn_agent 内计数(类型化拒绝不断链)。
+                }
+            }
+            SimCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            } => {
+                // 主体意图(REQ-012 A02a 第 2 节):**内核不信任它**——本命令
+                // 可能来自日志回放,所以这里重做全部检查,不 panic:
+                // - 实体不存在 / 不是主体 / 无 `[walker]` 段 → 类型化拒绝 +
+                //   遥测(命令来自日志,拒绝是"这拍没生效",不是一致性违规);
+                // - 非有限值(NaN/inf)→ 拒绝 + 遥测(不写进保持状态);
+                // - `move_xz` 超过 `[walker].max_speed` → 按比例钳 + 遥测;
+                // - `yaw` 规范化到 (−π, π]。
+                // 合法意图写进 `AgentRecord` 保持状态(直到下一条意图到来,
+                // 随快照走);`jump` 一次性,下一控制拍消费。计数与写入都
+                // 收口在 `apply_agent_intent`(agent.rs)。
+                if self.apply_agent_intent(entity, move_xz, yaw, jump).is_err() {
+                    self.outbox.agent_intent_rejected += 1;
                 }
             }
             SimCommand::RemoveEntity { entity } => {

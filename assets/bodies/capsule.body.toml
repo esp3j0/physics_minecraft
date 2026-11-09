@@ -9,6 +9,18 @@
 name = "capsule"
 lock_rotations = true
 
+# 行走控制器(REQ-012 A02a 第 1 节,capsule demo §13 定值):
+# τ 0.2 s、F_max = 8·m·g、空中力系数 0.2、跳高 1.4 m、接地容差 0.05 m、
+# 意图水平速度钳制 5.6 m/s。公式里的 m 取 rapier 刚体实际质量(乘过 k 的
+# 0.8),不是这里的 80。
+[walker]
+tau = 0.2
+fmax_g = 8.0
+air = 0.2
+jump_h = 1.4
+ground_eps = 0.05
+max_speed = 5.6
+
 [[links]]
 name = "torso"
 mass = 80.0

@@ -111,6 +111,19 @@ pub enum SimCommand {
         body: types::BodyHash,
         state: EntityState,
     },
+    /// 主体意图(REQ-012 A02a 第 2 节;§2.2 意图层级):`move_xz` = 世界系
+    /// 水平目标速度(m/s;内核钳到 `[walker].max_speed`)、`yaw` = 期望朝向
+    /// (rad;内核规范化到 (−π, π])、`jump` = 本拍请求起跳(**一次性**:下一
+    /// 个控制拍消费,未接地即丢弃不缓存)。**本地受信通道专用**(与
+    /// `SpawnAgent` 同款:不进 C2S 白名单,协议面 A03 开),照常盖章入外部
+    /// 命令日志(回放再生)。内核不信任它(可能来自日志回放):非主体/
+    /// 无 `[walker]` 段/非有限值 = 类型化拒绝 + 遥测,不 panic。
+    AgentIntent {
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    },
 }
 
 impl SimCommand {
@@ -129,6 +142,7 @@ impl SimCommand {
             Self::RemoveAreaTicket { .. } => 9,
             Self::SpawnCompound { .. } => 10,
             Self::SpawnAgent { .. } => 11,
+            Self::AgentIntent { .. } => 12,
         }
     }
 }
@@ -291,6 +305,18 @@ mod tests {
             .ordinal(),
             11,
             "SpawnAgent = 追加序 11(枚举只许追加,REQ-012 §3 A01)"
+        );
+        // REQ-012 A02a:AgentIntent 追加在尾(ordinal = 12),旧 0–11 不变。
+        assert_eq!(
+            SimCommand::AgentIntent {
+                entity: EntityId::from_parts(1, 1),
+                move_xz: (1.0, 0.0),
+                yaw: 0.0,
+                jump: false,
+            }
+            .ordinal(),
+            12,
+            "AgentIntent = 追加序 12(枚举只许追加,REQ-012 A02a 第 2 节)"
         );
         assert_eq!(
             SimCommand::SpawnCompound {
