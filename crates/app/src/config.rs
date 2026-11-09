@@ -230,6 +230,10 @@ pub struct Config {
     pub world_seed: WorldSeed,
     /// 世界种类(REQ-002 §4.1;决定 bootstrap 装配的生成器)。
     pub world_kind: WorldKind,
+    /// 身体资产目录(REQ-012 A01 第 1 节;装配参数):启动时加载
+    /// `*.body.toml` 进 `BodyRegistry` 注入每个 `ShardSim`(不进快照,
+    /// restore 重新注入,做法与 BlockRegistry 一致)。目录不存在 = 空注册表。
+    pub bodies_dir: PathBuf,
     /// 服务器监听地址(REQ-004A 决策 4;main 网络装配 `assemble_network`
     /// 的 listen 输入;端口 0 = OS 分配,测试用)。
     pub listen_addr: String,
@@ -257,6 +261,7 @@ impl Default for Config {
             data_dir: PathBuf::from("data"),
             world_seed: WorldSeed(0),
             world_kind: WorldKind::Superflat,
+            bodies_dir: PathBuf::from("assets/bodies"),
             listen_addr: "127.0.0.1:25565".to_string(),
         }
     }
@@ -593,6 +598,9 @@ impl Config {
                 impact_flow_max_events_per_tick: self.cohesion.impact_flow_max_events_per_tick,
                 compound_flow: self.cohesion.compound_flow,
             },
+            // REQ-012 §4(质量比例):生成主体时质量/惯量乘本系数;demo `mass`
+            // 定值 1/100(D9),默认核内 `ShardSimConfig::new` 同值。
+            agent_mass_scale: physics_sim::ShardSimConfig::new(shard).agent_mass_scale,
         }
     }
 

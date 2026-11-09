@@ -9,11 +9,16 @@
 //!
 //! 图纸:[docs/design/codebase-layout.md §3 types](../../docs/design/codebase-layout.md)
 
+pub mod body;
 pub mod coords;
 pub mod ids;
 pub mod state;
 pub mod tick;
 
+pub use body::{
+    BodyDef, BodyDefError, BodyHash, JointDef, JointKind, JointLimits, JointParams, JointType,
+    LinkDef, SelfCollisionDef, ShapeDef,
+};
 pub use coords::{BlockPos, CHUNK_SIZE, ChunkPos, ChunkRegion, WORLD_Y_MAX, WORLD_Y_MIN};
 pub use ids::{
     BlockId, DimensionId, EMERGENT_ORIGIN, EntityId, SHARD_CHUNKS, ShardId, ShardPos, WorldId,

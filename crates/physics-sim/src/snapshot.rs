@@ -27,6 +27,16 @@ use types::{ChunkPos, EntityDesc, EntityId, Tick};
 pub enum SimSnapshotError {
     #[error("快照解码失败:{0}")]
     Decode(String),
+    /// 主体身体哈希不在注册表(REQ-012 A01 第 4 节:restore 时注册表里
+    /// 找不到某个主体的身体哈希 = 类型化错误,不 panic)。启动加载的
+    /// `BodyRegistry` 缺该身体(旧档/注册表不一致)。
+    #[error(
+        "快照中的主体 {entity:?} 身体哈希 {hash} 不在注册表(启动加载 assets/bodies 不完整或旧档)"
+    )]
+    UnknownBody {
+        entity: types::EntityId,
+        hash: types::BodyHash,
+    },
 }
 
 /// 快照私有结构(接口细则 1):字段顺序即 bincode 序列化顺序,不得调整。
@@ -87,6 +97,11 @@ struct ShardSimSnapshot {
     /// 转换之间时恢复线不得丢(acc_c2_pending)。随快照走。**布局变化**:
     /// v6 档解码失败——需清 data_dir(REQ-010 §4.6 第 8 条)。
     load_pending: BTreeSet<types::BlockPos>,
+    /// 主体附加记录(REQ-012 §3;**v8 追加**):EntityId → 身体哈希 + 连杆
+    /// 句柄表(碰撞体句柄随 rapier PhysicsWorld 整体往返,本表只存句柄)。
+    /// restore 时逐条校验身体哈希在注册表(`SimSnapshotError::UnknownBody`)。
+    /// **布局变化**:v7 档解码失败——需清 data_dir(REQ-012 A01 第 4 节)。
+    agents: BTreeMap<EntityId, crate::agent::AgentRecord>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -175,19 +190,43 @@ impl ShardSim {
             wake_centers: self.wake_centers.clone(),
             collapse_deferred: self.collapse_deferred.clone(),
             load_pending: self.load_pending.clone(),
+            agents: self.agents.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
     }
 
     /// 从快照恢复。registry 必须与原实例语义一致(SimpleRegistry::builtin 稳定)。
+    ///
+    /// REQ-012 A01 第 4 节:主体哈希校验走 `restore_with_bodies`;本签名 =
+    /// 空身体注册表(快照含主体 → `Err(UnknownBody)`,类型化拒绝)。
     pub fn restore(
         bytes: &[u8],
         registry: Box<dyn BlockRegistry>,
     ) -> Result<Self, SimSnapshotError> {
+        Self::restore_with_bodies(bytes, registry, crate::agent::BodyRegistry::new())
+    }
+
+    /// 从快照恢复并注入身体注册表(REQ-012 A01 第 1/4 节:注册表不进快照、
+    /// restore 重新注入;快照里某个主体的哈希不在注册表 →
+    /// `Err(SimSnapshotError::UnknownBody)`,不 panic)。
+    pub fn restore_with_bodies(
+        bytes: &[u8],
+        registry: Box<dyn BlockRegistry>,
+        bodies: crate::agent::BodyRegistry,
+    ) -> Result<Self, SimSnapshotError> {
         let (snap, _len): (ShardSimSnapshot, usize) =
             bincode::serde::decode_from_slice(bytes, bincode::config::standard())
                 .map_err(|e| SimSnapshotError::Decode(e.to_string()))?;
+        // 主体哈希必须在注册表(REQ-012 A01 第 4 节;类型化错误,不 panic)。
+        for (entity, record) in &snap.agents {
+            if bodies.get(&record.body_hash).is_none() {
+                return Err(SimSnapshotError::UnknownBody {
+                    entity: *entity,
+                    hash: record.body_hash,
+                });
+            }
+        }
         // 官方反序列化:serde(skip) 工作区字段经 Default 补齐,状态字段全量还原。
         let phys = snap.phys;
         let entities: BTreeMap<EntityId, crate::sim::EntityRecord> = snap
@@ -217,6 +256,8 @@ impl ShardSim {
             voxels: snap.voxels,
             phys,
             entities,
+            agents: snap.agents,
+            bodies,
             chunk_bodies: snap.chunk_bodies,
             built_colliders: snap.built_colliders,
             pending_collider_builds: snap.pending_collider_builds,

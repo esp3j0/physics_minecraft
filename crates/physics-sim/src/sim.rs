@@ -115,6 +115,16 @@ pub struct ShardSimConfig {
     pub destruction: crate::destruction::DestructionConfig,
     /// 粘结与整块塌落(REQ-010 §4.6;单元 08 之前默认关闭)。
     pub cohesion: crate::cohesion::CohesionConfig,
+    /// 主体质量比例系数 k(REQ-012 §4,demo `mass` 定值 1/100):生成主体时
+    /// 质量/惯量/PD 增益乘本系数,加速度不变。默认 0.01(REQ-012 A01 第 1 节:
+    /// 胶囊进世界后质量 = 80 kg × 0.01 = 0.8)。
+    #[serde(default = "default_agent_mass_scale")]
+    pub agent_mass_scale: f32,
+}
+
+/// §4 压缩比例默认(REQ-012 demo `mass` 确认 D9 = 1/100)。
+fn default_agent_mass_scale() -> f32 {
+    0.01
 }
 
 impl ShardSimConfig {
@@ -127,6 +137,7 @@ impl ShardSimConfig {
             activation: crate::activation::ActivationConfig::default(),
             destruction: crate::destruction::DestructionConfig::default(),
             cohesion: crate::cohesion::CohesionConfig::default(),
+            agent_mass_scale: default_agent_mass_scale(),
         }
     }
 }
@@ -247,8 +258,7 @@ pub struct Outbox {
     /// 本拍冲量流事件摘要(REQ-011 §3.5.1;W03):"最危险"的一条(`s / C`
     /// 最大,C=0 视为 ∞;并列按 kind、position 位模式升序决出)。
     /// **不入快照**(`#[serde(skip)]`:Outbox 随检查点序列化,跳过该字段
-    /// 使检查点格式逐字节不变,`CHECKPOINT_FORMAT_VERSION` 保持 7);每拍
-    /// 重算、outbox 取走即清。
+    /// 使检查点格式逐字节不变);每拍重算、outbox 取走即清。
     #[serde(skip)]
     pub flow_event: Option<FlowEventInfo>,
     /// 迁移意图(调度器盖章成信封,REQ-001 §4.2 (b))。
@@ -289,6 +299,10 @@ pub struct Outbox {
     /// 本拍删除的实体(REQ-006 任务 00):调度器据此 release ownership。
     /// 迁移源删除、RemoveEntity、凝固都记录;与 `spawned` 同拍时先 release。
     pub despawned: Vec<EntityId>,
+    /// 本拍主体生成的类型化拒绝数(REQ-012 A01 第 3 节:未知哈希/多连杆/
+    /// 定义非法;重复 EntityId 走 fail-stop 不计)。纯计数(随 Outbox 走,
+    /// v8 起随快照;计数不影响确定性)。
+    pub agent_spawn_rejected: u64,
     /// 实体票状态操作(REQ-007 任务 03;S5:分片只产出状态依赖操作,签发
     /// 单点在调度器 claim/补签)。调度器按 TicketKey 序应用,N 拍产生 N+1 生效
     /// (§14-6);幂等由 TicketTable 保证。
@@ -396,6 +410,14 @@ pub struct ShardSim {
     pub(crate) voxels: VoxelWorld,
     pub(crate) phys: PhysicsWorld,
     pub(crate) entities: BTreeMap<EntityId, EntityRecord>,
+    /// 主体附加记录(REQ-012 §3,A01):EntityId → 身体哈希 + 连杆句柄表。
+    /// 一个主体占一个 `EntityId`(主体同时有 `EntityRecord`,handle = 根连杆);
+    /// 本表随快照走。所有"把实体写成方块/迁移/下行 EntityStates"的路径以
+    /// `agents.contains_key` 或主体 `actor = true` 挡住(路径表见 A01 提交)。
+    pub(crate) agents: BTreeMap<EntityId, crate::agent::AgentRecord>,
+    /// 身体注册表(REQ-012 A01 第 1 节):启动时加载注入,做法与
+    /// `BlockRegistry` 一样——不进快照,restore 时重新注入。
+    pub(crate) bodies: crate::agent::BodyRegistry,
     pub(crate) chunk_bodies: BTreeMap<ChunkPos, RigidBodyHandle>,
     /// ② 已建集合(修订 5 D18:**独立状态**,与 chunk 是否生成了碰撞盒无关)。
     /// 全空气 chunk 的碰撞体为空(chunk_bodies 无条目),但同样算 ② 已建——
@@ -554,6 +576,17 @@ struct ImpactFlowSample {
 
 impl ShardSim {
     pub fn new(cfg: ShardSimConfig, registry: Box<dyn BlockRegistry>) -> Self {
+        Self::new_with_bodies(cfg, registry, crate::agent::BodyRegistry::new())
+    }
+
+    /// 带身体注册表构造(REQ-012 A01 第 1 节):生产装配(app bootstrap /
+    /// wire_provider_and_new_sim)在启动时加载 `assets/bodies/` 注入;普通
+    /// `new` = 空注册表(生成主体会类型化拒绝)。快照布局无关(注册表不入档)。
+    pub fn new_with_bodies(
+        cfg: ShardSimConfig,
+        registry: Box<dyn BlockRegistry>,
+        bodies: crate::agent::BodyRegistry,
+    ) -> Self {
         let mut phys = PhysicsWorld::new();
         phys.gravity = conv::vec3_to_rapier(cfg.gravity);
         phys.integration_parameters.dt = cfg.dt;
@@ -564,6 +597,8 @@ impl ShardSim {
             voxels: VoxelWorld::new(),
             phys,
             entities: BTreeMap::new(),
+            agents: BTreeMap::new(),
+            bodies,
             chunk_bodies: BTreeMap::new(),
             built_colliders: BTreeSet::new(),
             pending_collider_builds: BTreeSet::new(),
@@ -668,6 +703,22 @@ impl ShardSim {
         }
     }
 
+    /// 直接生成一个普通实体(REQ-012 A01 判据测试的对照布景口:零重力预算
+    /// 场景等不需要命令盖章路径的测试;主体布景见 agent.rs)。生产路径仍只
+    /// 经 SpawnDynamic。
+    pub fn spawn_entity_for_test(&mut self, id: EntityId, pos: Vec3) {
+        self.spawn_entity(
+            id,
+            types::EntityState {
+                translation: pos,
+                ..types::EntityState::default()
+            },
+            types::EntityDesc::default(),
+            None,
+            false,
+        );
+    }
+
     /// 写入一个体素并登记地形变更唤醒(REQ-010 单元 03a 测试观测口:不经
     /// apply_command,直接驱动 §4.11 的生产路径)。越界/未装载 → None。
     pub fn write_voxel_for_test(&mut self, pos: BlockPos, block: BlockId) -> Option<()> {
@@ -684,9 +735,13 @@ impl ShardSim {
 
     /// 全实体表(观察输出用,REQ-003 §4.4):`(EntityId, EntityState)` 列表,
     /// 按 EntityId 升序(底层 BTreeMap 键序,确定性)。空表 → 空列表。
+    ///
+    /// REQ-012 A01(§3):**主体不在下行**(S2C::AgentStates 在 A03 做;在那
+    /// 之前 viewer 会把胶囊画成方块)——过滤 `agents` 表中的条目。
     pub fn entity_states(&self) -> Vec<(EntityId, EntityState)> {
         self.entities
             .iter()
+            .filter(|(id, _)| !self.agents.contains_key(id))
             .map(|(id, rec)| (*id, self.read_state(rec)))
             .collect()
     }
@@ -922,6 +977,12 @@ impl ShardSim {
             // §9-2/任务书细则 10(瞬态半边):被淘汰的**瞬态体 → 强制落地**
             // (产出同 §4.8;非冻结);常驻体 → 冻结 + End ActorMotion
             // (04a:I3 第 4 条,预算强制不受静止前置约束)。
+            // REQ-012 A01(判据 A01-1):**主体豁免预算强制**——不被预算
+            // 冻结、不被强制落地(淘汰池里选中主体 = 跳过,预算继续收缩的
+            // 正路是淘汰其余实体;主体常驻,A05 后按 §6 规则演进)。
+            if self.agents.contains_key(&id) {
+                continue;
+            }
             let is_transient = self.entities.get(&id).is_some_and(|rec| !rec.actor);
             if is_transient {
                 // 06c 遥测:超预算淘汰归因(§4.16"预算分计")。
@@ -949,6 +1010,11 @@ impl ShardSim {
         let mut to_freeze: Vec<EntityId> = Vec::new();
         let skin = self.cfg.activation.contact_wake_skin_m;
         while let Some(cur) = stack.pop() {
+            // REQ-012 A01:主体不进冻结闭包(支撑者被滞回冻结时,压在其上的
+            // 主体不被连带冻结;主体冻结语义在 B03 = 快照+障碍物)。
+            if self.agents.contains_key(&cur) {
+                continue;
+            }
             to_freeze.push(cur);
             let Some((cc, ch)) = self.entities.get(&cur).and_then(|rec| {
                 self.phys.bodies.get(rec.handle).map(|b| {
@@ -1358,7 +1424,13 @@ impl ShardSim {
             }
 
             // ---- 迁移检测(实体中心离开本体区,demo A)----
+            // REQ-012 A01(放行第 2 节):主体迁移在 A04 实现——主体走到
+            // 本路径 = fail-stop(测试布景让主体远离分片边界)。
             if !self.core_contains(state.translation) {
+                assert!(
+                    !self.agents.contains_key(&id),
+                    "主体 {id:?} 走到迁移检测路径(REQ-012 A01:主体迁移在 A04 实现,fail-stop)"
+                );
                 let dest = ShardId::new(
                     self.cfg.shard.world,
                     self.cfg.shard.dimension,
@@ -1618,6 +1690,11 @@ impl ShardSim {
             // 的**瞬态体 → 强制落地**(非冻结;与命令唤醒路径的 enforce_
             // budget 同式);常驻体照旧冻结 + End。此前瞬态淘汰被冻结悬停,
             // over_budget_freeze 字段无消费者(06c 接线补齐,非行为面外扩)。
+            // REQ-012 A01(判据 A01-1):**主体豁免预算淘汰**(不被预算冻结、
+            // 不被强制落地;跳过,不烧簿记)。
+            if self.agents.contains_key(id) {
+                continue;
+            }
             if decisions.over_budget_freeze.contains(id) && !is_actor && !is_transient_carried {
                 self.forced_reasons.insert(*id, ForcedLandingReason::Budget);
                 self.forced_pending.insert(*id);
@@ -2614,6 +2691,11 @@ impl ShardSim {
             let Some(rec) = self.entities.get(&id) else {
                 continue;
             };
+            // REQ-012 A01:主体不进兜底冻结(常驻运动票触顶的降级对主体不
+            // 生效;主体冻结语义在 B03)。
+            if self.agents.contains_key(&id) {
+                continue;
+            }
             let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
             if body.is_kinematic() {
                 continue; // 已冻结(滞回静止冻结)——幂等
@@ -2633,6 +2715,9 @@ impl ShardSim {
                     (rec.handle, conv::rapier_to_vec3(body.translation()).y)
                 };
                 if y < threshold {
+                    // REQ-012 A01(§6"掉出世界"):主体按"AI 主体移除"走同
+                    // 一路径(清 agents 表;玩家回出生点在 A06 接线)。
+                    self.agents.remove(&id);
                     self.entities.remove(&id).expect("存在");
                     self.phys.remove_body(handle);
                     self.locomotion.remove(&id);
@@ -2654,6 +2739,12 @@ impl ShardSim {
                 self.forced_pending.remove(&id);
                 continue;
             };
+            // REQ-012 A01(判据 A01-1):主体不进强制落地——出队跳过,不写
+            // 体素、不移除(主体不该进 forced_pending;调度器侧来源防御)。
+            if self.agents.contains_key(&id) {
+                self.forced_pending.remove(&id);
+                continue;
+            }
             let (handle, block_desc) = (rec.handle, rec.desc.clone());
             // 复合体不再跳过(REQ-010 §8.3 第 8 条,修订 6):整块强制落地
             // (§8.2、§8.3 第 5、6 条)——朝向与目标格同凝固的吸附;前置条件
@@ -3006,6 +3097,25 @@ impl ShardSim {
     /// `BlockPos` 升序)取前者;其余本拍不破坏、**也不推迟**(落定后没有冲量)。
     /// 写入同爆炸:air、`Emergent`、§4.11 唤醒、重建 collider;撞击写入进入
     /// 本拍坍塌的触发集。遥测:`cells_impacted`、`detached`。总开关关闭不检测。
+    /// collider → 实体归因表(collider_to_entity;evaluate_impacts 与测试
+    /// 共用一份构建逻辑,REQ-012 A01):单格 = 代表 collider;复合体与主体
+    /// = 全部连杆碰撞体。键取 handle 的 (index, generation)。
+    pub(crate) fn collider_to_entity_of(&self) -> BTreeMap<(u32, u32), EntityId> {
+        let mut table: BTreeMap<(u32, u32), EntityId> = BTreeMap::new();
+        for (id, rec) in &self.entities {
+            let idx = rec.collider.into_raw_parts();
+            table.insert((idx.0, idx.1), *id);
+            if rec.desc.shape().is_some() || self.agents.contains_key(id) {
+                let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
+                for ch in body.colliders() {
+                    let idx = ch.into_raw_parts();
+                    table.insert((idx.0, idx.1), *id);
+                }
+            }
+        }
+        table
+    }
+
     fn evaluate_impacts(&mut self) {
         if !self.cfg.destruction.enabled {
             return;
@@ -3013,18 +3123,9 @@ impl ShardSim {
         // collider → 实体:单格 = 代表 collider(1:1,原键集合逐位不变);复合体
         // = 全部格 collider(REQ-010 §7.3 第 7 条:砸地形按均摊口径,须采样
         // 每格的接触点)。键取 handle 的 (index, generation)。
-        let mut collider_to_entity: BTreeMap<(u32, u32), EntityId> = BTreeMap::new();
-        for (id, rec) in &self.entities {
-            let idx = rec.collider.into_raw_parts();
-            collider_to_entity.insert((idx.0, idx.1), *id);
-            if rec.desc.shape().is_some() {
-                let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
-                for ch in body.colliders() {
-                    let idx = ch.into_raw_parts();
-                    collider_to_entity.insert((idx.0, idx.1), *id);
-                }
-            }
-        }
+        // REQ-012 A01(§3):主体的连杆碰撞体同样登记(归因结构就位,A05
+        // 细化破坏交互规则)。
+        let collider_to_entity = self.collider_to_entity_of();
         if collider_to_entity.is_empty() {
             return;
         }
@@ -3108,6 +3209,12 @@ impl ShardSim {
                 .get(rec.handle)
                 .is_some_and(|b| b.is_dynamic() && !b.is_sleeping())
             {
+                continue;
+            }
+            // REQ-012 §6 D8(主体作为撞击源不触发地形破坏/冲量流;A01 起
+            // 生效,A05 细化):主体对地形的接触不进破坏采样——走路与摔落
+            // 都不破坏地形。物理接触本身不受影响(rapier 冲量照常解算)。
+            if self.agents.contains_key(&id) {
                 continue;
             }
             // 复合体走均摊口径(§7.3 第 7 条;开关同 §7.3 第 1 条,关闭时按
@@ -4128,18 +4235,48 @@ impl ShardSim {
                 self.spawn_entity(entity, state, desc, None, false);
                 self.apply_knockback(entity, impulses);
             }
+            SimCommand::SpawnAgent {
+                entity,
+                body,
+                state,
+            } => {
+                // 主体生成(REQ-012 §3,A01):本地受信通道专用命令(不进
+                // C2S 白名单;net/command_shard 与 validate_external_command
+                // 同口径拒绝)。类型化拒绝 → 遥测计数(Outbox.
+                // agent_spawn_rejected),不断链;重复 EntityId 与 SpawnDynamic
+                // 同口径(fail-stop assert,spawn_agent 内)。
+                // 来源换算与 SpawnDynamic 一致(调度器注入 = 服务端实体)。
+                let _owner_source = if source == InputSource::SCHEDULER {
+                    None
+                } else {
+                    Some(source)
+                };
+                if let Err(_e) = self.spawn_agent(entity, body, state) {
+                    // 遥测在 spawn_agent 内计数(类型化拒绝不断链)。
+                }
+            }
             SimCommand::RemoveEntity { entity } => {
                 // 幂等(REQ-007 任务 03 生产接入后):实体可能已在本拍前的
                 // 生命周期段合法终结(凝固/强制落地/虚空)——不存在 = 无操作,
                 // 不再 fail-stop(回评请求追认;网络路径本就经
                 // validate_external_command 前置挡未知实体)。
-                if self.entities.contains_key(&entity) {
+                // REQ-012 A01:主体走 despawn_agent(清理 agents 表 + 回到
+                // 生成前状态;判据 A01-1"移除后无残留")。
+                if self.agents.contains_key(&entity) {
+                    self.despawn_agent(entity);
+                } else if self.entities.contains_key(&entity) {
                     self.despawn_entity(entity);
                 }
             }
             SimCommand::TeleportEntity { entity, state } => {
                 // 一切位姿变更 = 删除 + 重建(REQ-001 §5 行 10);actor/source
                 // 是政策状态,必须跨重建保留(REQ-006 任务 00)。
+                // REQ-012 A01:主体不经 Teleport(删除+重建会丢 agents 表的
+                // 连杆句柄;主体的位姿变更属 A02/A04 的控制器与迁移)。
+                assert!(
+                    !self.agents.contains_key(&entity),
+                    "主体 {entity:?} 不支持 TeleportEntity(REQ-012 A01:主体的位姿变更走 A02 控制器/A04 迁移,fail-stop)"
+                );
                 let (_, desc, owner_source, actor) = self.despawn_entity(entity);
                 self.spawn_entity(entity, state, desc, owner_source, actor);
             }
@@ -4149,11 +4286,25 @@ impl ShardSim {
                 radius,
             } => self.detonate(center, power, radius),
             SimCommand::MarkActor { entity, actor } => {
-                let rec = self
-                    .entities
-                    .get_mut(&entity)
-                    .expect("MarkActor 触及不存在实体(fail-stop)");
-                rec.actor = actor;
+                // REQ-012 A01:主体 `actor` 恒为 true(§3)——MarkActor{false}
+                // 会让凝固桥/冻结把主体写进体素或冻结,fail-stop 挡下。
+                if actor {
+                    let rec = self
+                        .entities
+                        .get_mut(&entity)
+                        .expect("MarkActor 触及不存在实体(fail-stop)");
+                    rec.actor = actor;
+                } else {
+                    assert!(
+                        !self.agents.contains_key(&entity),
+                        "主体 {entity:?} 不支持 MarkActor{{false}}(REQ-012 A01:主体 actor 恒为 true,fail-stop)"
+                    );
+                    let rec = self
+                        .entities
+                        .get_mut(&entity)
+                        .expect("MarkActor 触及不存在实体(fail-stop)");
+                    rec.actor = actor;
+                }
             }
             // SetObserverPosition 永不走本路径(REQ-002 §4.2:调度器级专用
             // 收件箱消费,分片输入前缀里不出现)→ 出现即一致性违规 fail-stop。

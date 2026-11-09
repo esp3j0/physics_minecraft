@@ -98,6 +98,19 @@ pub enum SimCommand {
         /// (请求是瞬态)。
         velocity: (Vec3, Vec3),
     },
+    /// 主体生成(REQ-012 §3,A01):`entity` 占一个 `EntityId`,`body` =
+    /// 身体定义的**内容哈希**(客户端只能按名字引用,由服务端解析成哈希,
+    /// 协议到 A03 才追加),`state` = 根连杆初态。
+    /// **本地受信通道专用**(driver commands / Session 直发),与
+    /// `SetAreaTicket` 同款:不进 C2S 白名单(`command_shard` 返回 `None` →
+    /// translate 拒绝;`validate_external_command` 同口径拒绝——A03 才开
+    /// 协议面)。**照常盖章入外部命令日志**(回放再生:与普通命令同一路径,
+    /// 经分片收件箱 → `apply_command`)。
+    SpawnAgent {
+        entity: EntityId,
+        body: types::BodyHash,
+        state: EntityState,
+    },
 }
 
 impl SimCommand {
@@ -115,6 +128,7 @@ impl SimCommand {
             Self::SetAreaTicket { .. } => 8,
             Self::RemoveAreaTicket { .. } => 9,
             Self::SpawnCompound { .. } => 10,
+            Self::SpawnAgent { .. } => 11,
         }
     }
 }
@@ -258,13 +272,37 @@ mod tests {
             SimCommand::SpawnCompound {
                 entity: EntityId::from_parts(1, 1),
                 origin: BlockPos::ZERO,
-                shape: two_cells,
+                shape: two_cells.clone(),
                 impulses: Vec::new(),
                 velocity: (Vec3::ZERO, Vec3::ZERO),
             }
             .ordinal(),
             10,
             "SpawnCompound = 追加序 10(枚举只许追加,REQ-010 §5.6 K02)"
+        );
+        // REQ-012 A01:SpawnAgent 追加在尾(ordinal = 11),旧 0–10 不变;
+        // 只追加枚举:反序列化旧字节不受影响。
+        assert_eq!(
+            SimCommand::SpawnAgent {
+                entity: EntityId::from_parts(1, 1),
+                body: types::BodyHash([0u8; 8]),
+                state: EntityState::default(),
+            }
+            .ordinal(),
+            11,
+            "SpawnAgent = 追加序 11(枚举只许追加,REQ-012 §3 A01)"
+        );
+        assert_eq!(
+            SimCommand::SpawnCompound {
+                entity: EntityId::from_parts(1, 1),
+                origin: BlockPos::ZERO,
+                shape: two_cells.clone(),
+                impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
+            }
+            .ordinal(),
+            10,
+            "旧 10 不变(SpawnAgent 追加在其后)"
         );
         // 旧编码可解:bincode 依赖不在本 crate(日志层 sim-api 覆盖);此处
         // 锚"只追加"的结构前提——新变体只追加在尾、ordinal 单调,旧字节解码

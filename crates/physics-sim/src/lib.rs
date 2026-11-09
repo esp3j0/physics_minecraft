@@ -10,6 +10,7 @@
 //! 图纸:[docs/design/codebase-layout.md §3 physics-sim](../../docs/design/codebase-layout.md)
 
 pub mod activation;
+pub mod agent;
 pub mod cohesion;
 pub mod collider_build;
 pub mod compound_flow;
@@ -26,6 +27,7 @@ mod conv;
 mod solidify;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
+pub use agent::{AgentRecord, AgentSpawnError, BodyRegistry, BodyRegistryError};
 pub use sim::{
     ActivationEvents, BlockWrite, BlockWriteKind, FlowEventInfo, FlowKind, ForcedLandingReason,
     LocomotionState, Outbox, ShardSim, ShardSimConfig, SolidifyConfig, TicketOp, TicketOpRecord,

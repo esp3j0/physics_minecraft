@@ -8,7 +8,6 @@ use voxel::BlockRegistry;
 use crate::log::{CommandLog, LogEntry};
 use crate::session::{Session, SessionConfig, SessionError};
 use crate::snapshot::{GlobalSnapshot, WorldSnapshot};
-
 /// 从全局快照 + 命令日志重建会话(AC8 执行侧;旧入口,保留给既有
 /// GlobalSnapshot 测试——回放规则与 [`replay_world`] 一致)。
 ///
@@ -61,12 +60,27 @@ pub fn replay_world(
     cfg: SessionConfig,
     new_registry: impl Fn() -> Box<dyn BlockRegistry>,
 ) -> Result<Session, SessionError> {
+    replay_world_with_bodies(world, log, cfg, new_registry, || {
+        physics_sim::BodyRegistry::new()
+    })
+}
+
+/// 同 [`replay_world`],另注入身体注册表(REQ-012 A01 第 1/4 节:BodyRegistry
+/// 不进快照,restore 重新注入;每分片 clone。快照中主体哈希缺失 = 类型化
+/// 错误,不 panic)。生产 resume(app bootstrap)走本入口。
+pub fn replay_world_with_bodies(
+    world: &WorldSnapshot,
+    log: &CommandLog,
+    cfg: SessionConfig,
+    new_registry: impl Fn() -> Box<dyn BlockRegistry>,
+    new_bodies: impl Fn() -> physics_sim::BodyRegistry,
+) -> Result<Session, SessionError> {
     let mut cfg = cfg;
     cfg.scheduler.start_tick = world.shards.tick;
 
     let mut session = Session::new(cfg);
     for bytes in world.shards.per_shard.values() {
-        session.register_snapshot(bytes, new_registry())?;
+        session.register_snapshot_with_bodies(bytes, new_registry(), new_bodies())?;
     }
     session.restore_scheduler_state(world.scheduler.clone());
     replay_log_entries(&mut session, world.shards.tick, log.entries())?;

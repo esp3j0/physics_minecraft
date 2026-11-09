@@ -1,0 +1,21 @@
+# REQ-012 A01:玩家默认身体(D1/`capsule` demo 定值)。
+# 真实单位(千克、米);生成时质量/惯量/PD 增益乘全局系数 k(默认 1/100,§4):
+# 胶囊进世界后质量 = 80 × 0.01 = 0.8。
+#
+# 胶囊 capsule_y(0.6, 0.3):总高 2·(0.6+0.3) = 1.8 m;锁定转动;
+# 摩擦 μ = 0.3(capsule demo:μ 只决定主体对方块的摩擦,接缝/地面钩子 A02);
+# 恢复系数 0(demo 放行取值)。
+
+name = "capsule"
+lock_rotations = true
+
+[[links]]
+name = "torso"
+mass = 80.0
+friction = 0.3
+restitution = 0.0
+
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.6
+radius = 0.3

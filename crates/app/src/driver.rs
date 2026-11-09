@@ -230,6 +230,11 @@ pub fn validate_external_command(
         // 复合体生成(K02 §5.6):调度器从模拟产出再注入的专用内部载荷,
         // 外部一律拒绝(无论来源;防御层与 net::command_shard 同口径)。
         messaging::SimCommand::SpawnCompound { .. } => Err("SpawnCompound 是调度器专用命令"),
+        // 主体生成(REQ-012 A01 第 2 节):本地受信通道专用(Session 直发,
+        // 与 SetAreaTicket 同款);不进 C2S 白名单(net::command_shard 返回
+        // None → translate 拒绝)——协议与附身面在 A03 开。经外部缝到达 =
+        // 拒绝丢弃。
+        messaging::SimCommand::SpawnAgent { .. } => Err("SpawnAgent 走本地受信通道(协议面 A03 开)"),
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
@@ -456,7 +461,12 @@ pub struct DriverOutcome {
 /// 转换标记(`BlockWrite::load_conversion`)——v6 及更早档解码必失败/版本
 /// 拒绝,必须清 `data_dir`;单元 03 在 v7 内追加形状,单元之间不保证 v7
 /// 检查点互通(§4.6 第 8 条)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 7;
+/// **v8**(REQ-012 A01,#25):分片快照追加主体附加记录
+/// (`ShardSimSnapshot.agents`:身体哈希 + 连杆句柄表,§3)与
+/// `ShardSimConfig.agent_mass_scale`(§4)——v7 及更早档解码必失败/版本
+/// 拒绝,必须清 `data_dir`(REQ-012 §3"检查点:格式版本 7 → 8,不做迁移,
+/// 沿用旧档显式拒绝")。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 8;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -1687,11 +1697,15 @@ pub fn bootstrap(
                     at.0, bundle.world.shards.tick
                 );
             }
-            let session = sim_api::replay::replay_world(
+            // 身体注册表(REQ-012 A01 第 1/4 节):启动时加载一次,restore
+            // 逐分片注入(不进快照,做法与 BlockRegistry 一致)。
+            let bodies = load_body_registry(&config.bodies_dir);
+            let session = sim_api::replay::replay_world_with_bodies(
                 &bundle.world,
                 &log,
                 config.session_config(),
                 new_registry,
+                move || bodies.clone(),
             )?;
             // spawn 高水位(#12):三输入取 max——bundle 字段(checkpoint
             // 前)、增量日志(checkpoint 后、崩溃前的窗口)、恢复后实体表
@@ -1714,6 +1728,31 @@ pub fn bootstrap(
 
     let store = storage::worker::StoreWorker::new(Box::new(chunks), Box::new(checkpoints));
     Ok((session, log, store, resume_from, spawn_next_seq))
+}
+
+/// 加载身体注册表(REQ-012 A01 第 1 节:启动时从目录加载 `*.body.toml`,
+/// 注入每个 `ShardSim`,做法与 BlockRegistry 一样——不进快照)。目录不存在
+/// = 空注册表(生成主体类型化拒绝);单个文件非法 = fail-stop(资产错误在
+/// 启动期显式暴露,不静默降级)。文件按文件名升序加载(确定性)。
+pub fn load_body_registry(dir: &std::path::Path) -> physics_sim::BodyRegistry {
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return bodies;
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("body.toml 读取失败 {:?}(fail-stop):{e}", path));
+        bodies
+            .insert_toml(&text)
+            .unwrap_or_else(|e| panic!("body.toml 非法 {:?}(fail-stop):{e}", path));
+    }
+    bodies
 }
 
 /// bootstrap 之外的第二步装配(REQ-002 §4.3/§4.4):按 world_kind 造生成器,
@@ -1739,8 +1778,15 @@ pub fn wire_provider_and_new_sim(
     };
     let provider = storage::provider::ChunkProvider::new(store, generator, config.world_seed);
     let new_registry = new_registry;
+    // 身体注册表(REQ-012 A01 第 1 节):启动时加载一次,每分片 clone 注入
+    // (BTreeMap 克隆,便宜;与 BlockRegistry 同款"不进快照、restore 重注入")。
+    let bodies = load_body_registry(&config.bodies_dir);
     let new_sim = Box::new(move |shard: types::ShardId| {
-        physics_sim::ShardSim::new(config.shard_sim_config(shard), new_registry())
+        physics_sim::ShardSim::new_with_bodies(
+            config.shard_sim_config(shard),
+            new_registry(),
+            bodies.clone(),
+        )
     });
     (provider, new_sim)
 }
@@ -2340,6 +2386,23 @@ mod tests {
             )
             .is_err(),
             "MarkActor 服务端专用"
+        );
+        // SpawnAgent 外部拒绝(REQ-012 A01 第 2 节:本地受信通道专用,协议
+        // 面 A03 开;net::command_shard 返回 None 同口径)。
+        let spawn_agent = messaging::SimCommand::SpawnAgent {
+            entity: e,
+            body: types::BodyHash([0u8; 8]),
+            state: EntityState::default(),
+        };
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(7)),
+                shard_id(0, 0),
+                &spawn_agent
+            )
+            .is_err(),
+            "SpawnAgent 走本地受信通道(协议面 A03 开)"
         );
         session.shutdown();
     }
@@ -2997,15 +3060,35 @@ mod tests {
             }
             other => panic!("v3 旧档必须版本拒绝,实为 {:?}", other.is_err()),
         }
+
+        // ⑥ v7(REQ-012 A01,#25 之前的格式):分片快照无 agents 记录与
+        //    agent_mass_scale(REQ-012 §3"格式版本 7 → 8,不做迁移")→
+        //    版本拒绝,必须清 data_dir。
+        let v7 = CheckpointBundle {
+            format_version: 7,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        match decode_checkpoint(&encode_checkpoint(&v7)) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 7"),
+                    "v7 必须明确报版本错误:{msg}"
+                );
+            }
+            other => panic!("v7 旧档必须版本拒绝,实为 {:?}", other.is_err()),
+        }
     }
 
     /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
-    /// 常量已升 7(REQ-010 单元 02;#17 D2 时曾为 5、REQ-009 单元 02 起 6);
-    /// v3 编码(bundle 形状同构、版本号 3)必须显式版本拒绝。与
-    /// `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,一个锚常量。
+    /// 常量已升 7(REQ-010 单元 02;#17 D2 时曾为 5、REQ-009 单元 02 起 6、
+    /// REQ-012 A01 起 8);v3 编码(bundle 形状同构、版本号 3)必须显式版本
+    /// 拒绝。与 `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,
+    /// 一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 7, "REQ-010 单元 02 起 = v7");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 8, "REQ-012 A01 起 = v8");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -3044,7 +3127,10 @@ mod tests {
         };
         let v6 = mk(CHECKPOINT_FORMAT_VERSION);
         let bytes = encode_checkpoint(&v6);
-        assert_eq!(bytes[0], 7, "前缀 = 未压缩 varint 版本(7 = 单字节)");
+        assert_eq!(
+            bytes[0], CHECKPOINT_FORMAT_VERSION as u8,
+            "前缀 = 未压缩 varint 版本(REQ-012 A01 起 8 = 单字节)"
+        );
         assert!(
             bytes.len() < 50_000,
             "1 MB 全零日志应被压缩,实为 {} 字节",

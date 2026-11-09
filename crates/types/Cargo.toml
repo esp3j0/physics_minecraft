@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 glam = { version = "0.33", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
+# REQ-012 A01:BodyDef 的 body.toml 解析(body.toml 错误的类型化上抛)。
+thiserror = "2"
+# REQ-012 A01:body.toml 文本解析(workspace 既有依赖,app/viewer/xtask 在用)。
+toml = "1"
 
 [lints]
 workspace = true

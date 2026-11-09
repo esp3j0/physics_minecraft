@@ -1606,11 +1606,13 @@ mod unit02 {
     }
 
     /// AC-C12:checkpoint 自本单元起为 v7(§4.6 第 8 条)。
+    /// REQ-012 A01(#25)升 v8:分片快照追加主体记录与 agent_mass_scale;
+    /// 版本断言按放行允许的例外改为 8(检查点版本断言 7 → 8)。
     ///
     /// 会变红的实现:信封、出站写入与待转换集合的格式变了却没升版本。
     #[test]
-    fn acc_c12_checkpoint_version_is_v7() {
-        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 7);
+    fn acc_c12_checkpoint_version_is_v8() {
+        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 8);
     }
 }
 

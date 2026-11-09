@@ -87,7 +87,20 @@ impl Session {
         bytes: &[u8],
         registry: Box<dyn BlockRegistry>,
     ) -> Result<ShardId, SessionError> {
-        let sim = ShardSim::restore(bytes, registry)?;
+        self.register_snapshot_with_bodies(bytes, registry, physics_sim::BodyRegistry::new())
+    }
+
+    /// 同 [`Session::register_snapshot`],另注入身体注册表(REQ-012 A01
+    /// 第 1/4 节:BodyRegistry 不进快照,restore 重新注入,做法与
+    /// BlockRegistry 一致)。快照中主体哈希缺失 → `Err(SessionError::Snapshot)`
+    /// (类型化 `SimSnapshotError::UnknownBody`)。
+    pub fn register_snapshot_with_bodies(
+        &mut self,
+        bytes: &[u8],
+        registry: Box<dyn BlockRegistry>,
+        bodies: physics_sim::BodyRegistry,
+    ) -> Result<ShardId, SessionError> {
+        let sim = ShardSim::restore_with_bodies(bytes, registry, bodies)?;
         let shard = sim.shard();
         self.scheduler.register(sim);
         Ok(shard)
@@ -508,6 +521,28 @@ impl Session {
             sequence,
             command: SimCommand::RemoveAreaTicket { id },
         })
+    }
+
+    /// 主体生成(REQ-012 §3,A01 第 2 节):本地受信通道正路——照常盖章
+    /// (`apply_at = tick_now()`、source = 会话、sequence 沿会话单调)入
+    /// **分片收件箱**与外部命令日志(回放再生)。不进 C2S 白名单
+    /// (`net::command_shard` 返回 None、`validate_external_command` 拒绝;
+    /// 协议与附身面在 A03 开)。分片未注册 → panic(调度器语义,同 `send`)。
+    pub fn spawn_agent(
+        &mut self,
+        shard: ShardId,
+        entity: types::EntityId,
+        body: types::BodyHash,
+        state: types::EntityState,
+    ) -> Result<LogEntry, SessionError> {
+        self.send(
+            shard,
+            SimCommand::SpawnAgent {
+                entity,
+                body,
+                state,
+            },
+        )
     }
 
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
