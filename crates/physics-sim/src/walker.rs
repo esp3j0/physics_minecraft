@@ -782,6 +782,12 @@ mod tests {
             }
             let cross = cross.expect("布景自检:240 拍内过缝 x=32").max(1);
             let mut speculative_seen = false;
+            // A02-14:两种顺序的覆盖断言——本轮至少见到一次 agent_is_1
+            // (顺序 1)或 !agent_is_1(顺序 2)。断言 1–3 对两侧都有断言力
+            // 才说明布景真的覆盖了 pair 的两种排列;若顺序 2 轮里主体始终
+            // 是 collider1(插入顺序没生效),该轮断言面就只剩单侧。
+            let mut agent_is_1_seen = false;
+            let mut agent_is_2_seen = false;
             let end = (cross + 5).min(239);
             for tick in cross - 1..=end {
                 let st = s.entity_state(a).expect("主体全程在");
@@ -795,6 +801,11 @@ mod tests {
                     .y;
                 for pair in s.phys.narrow_phase.contact_pairs_with(rec.collider) {
                     let agent_is_1 = pair.collider1 == rec.collider;
+                    if agent_is_1 {
+                        agent_is_1_seen = true;
+                    } else {
+                        agent_is_2_seen = true;
+                    }
                     let rapier3d::prelude::PairContacts::Rigid(rigid) = &pair.contacts else {
                         continue;
                     };
@@ -847,6 +858,19 @@ mod tests {
                 speculative_seen,
                 "布景自检:过缝窗口内必须出现被处理的推测接触(缝布景未触发)"
             );
+            // A02-14:覆盖断言——顺序 1(agent_first = true)轮至少见到一次
+            // agent_is_1,顺序 2 轮至少见到一次 !agent_is_1。
+            if agent_first {
+                assert!(
+                    agent_is_1_seen,
+                    "A02-14:顺序 1(先 spawn 主体)整轮没见到 agent_is_1 的接触对——插入顺序未生效,断言面只剩单侧"
+                );
+            } else {
+                assert!(
+                    agent_is_2_seen,
+                    "A02-14:顺序 2(先载地形)整轮没见到 !agent_is_1 的接触对——插入顺序未生效,断言面只剩单侧"
+                );
+            }
         }
     }
 }

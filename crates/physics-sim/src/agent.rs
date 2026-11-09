@@ -1617,4 +1617,364 @@ anchor = [0.0, 0.0, 0.0]
         let vy = jumped_vy.expect("接地起跳:竖直速度应达到起跳量级(> 1 m/s)");
         assert!(vy > 1.0, "起跳速度量级 sqrt(2·9.81·1.4) ≈ 5.24 m/s");
     }
+
+    // ---- REQ-012 A02b:判据 A02-9(确定性,内核检查点半边)----
+    //
+    // 时间线(全 900 拍,主体在 3×3 平板内往返):拍 0 spawn;拍 1 意图
+    // (5.6, 0)(行走);拍 121 = 检查点 1(行走中);拍 150 折返;拍 360
+    // 意图 (5.6, 0) + jump(移动中跳);空中拍 = 检查点 2;拍 440 意图清零
+    // 刹停;拍 441 起第一个"step_tick 奇数且保持力非零"的拍 = 检查点 3
+    // (布景断言这一点);拍 500 在主体当拍实际位置正上方生成砸块;拍 700
+    // 在主体旁 2.5 m 爆炸。砸块/爆心的坐标按**当拍实际位置**动态生成——
+    // 恢复线在检查点后与 golden 逐位相同,读到的位置一致 → 输入一致。
+    // 每条命令都是盖章输入(apply_prefix 消费 = 输入日志条目的内核形态);
+    // Session 层回放两次的另一半在 crates/app/tests/a02b_session_determinism.rs。
+
+    /// 时间线的第 tick 拍输入(sequence 全局单调;`probe` = 当拍主体位置,
+    /// 供砸块/爆心定位,golden 与恢复线各自读自己的状态,逐位一致)。
+    fn a02b9_inputs(
+        tick: u32,
+        hash: BodyHash,
+        probe: types::EntityState,
+    ) -> Vec<messaging::StampedInput> {
+        let mut inputs = Vec::new();
+        let a = types::EntityId::from_parts(1, 1);
+        if tick == 0 {
+            inputs.push(spawn_agent_input(a, hash, Vec3::new(24.0, 1.95, 24.0)));
+        }
+        if tick == 1 {
+            inputs.push(intent_input(a, 1, (5.6, 0.0), 0.0, false));
+        }
+        if tick == 150 {
+            inputs.push(intent_input(a, 2, (-5.6, 0.0), 0.0, false));
+        }
+        if tick == 360 {
+            inputs.push(intent_input(a, 3, (5.6, 0.0), 0.0, true));
+        }
+        if tick == 440 {
+            inputs.push(intent_input(a, 4, (0.0, 0.0), 0.0, false));
+        }
+        if tick == 500 {
+            // 砸块:主体正上方(top 2.8 + 0.5 + 3.0 = 6.3;ac_a6 同款)。
+            inputs.push(messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 5,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: types::EntityId::from_parts(1, 2),
+                    state: types::EntityState {
+                        translation: Vec3::new(probe.translation.x, 6.3, probe.translation.z),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            });
+        }
+        if tick == 700 {
+            // 爆炸:主体旁 2.5 m(ac_a6 同 power/radius,位置跟随主体)。
+            inputs.push(messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 6,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::Detonate {
+                    center: Vec3::new(probe.translation.x - 2.5, 1.0, probe.translation.z),
+                    power: 12.0,
+                    radius: 5.0,
+                }),
+            });
+        }
+        inputs
+    }
+
+    /// 检查点拍探测结果(跑 golden 线时顺路记录)。
+    #[derive(Debug, Clone, Copy)]
+    struct A02b9Checkpoints {
+        walking: u32,
+        airborne: Option<u32>,
+        between_controls: Option<u32>,
+        /// 检查点 3 拍的保持力(探测时记录;golden 跑完后 walker_holds 已是
+        /// 末态,不能回查历史拍)。
+        between_controls_hold: (f32, f32),
+    }
+
+    /// A02-9(内核半边):三检查点(行走中 / 空中 / 两个控制拍之间且保持力
+    /// 非零)的快照恢复续跑与不中断的 golden 线每拍主体状态逐位相同。
+    ///
+    /// 检查点 3 的布景前置在 golden 线上断言:该拍 `step_tick` 为奇数(下一
+    /// 拍非控制拍)、`walker_holds[a].held_force != (0, 0)`(保持的力非零
+    /// ——快照丢 `walker_holds` 的变异让本测试红:恢复线保持力清空 → 后续
+    /// 轨迹分叉)。
+    #[test]
+    fn a02_9_checkpoint_resume_bitwise_identical_at_three_positions() {
+        let hash = fresh_capsule_registry()
+            .hash_of("capsule")
+            .expect("capsule 已装");
+        let a = types::EntityId::from_parts(1, 1);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        const TOTAL: u32 = 900;
+
+        // ---- golden 线:完整跑一遍,顺路探测三个检查点拍 ----
+        let mut golden = ac_a6_sim();
+        let mut cps = A02b9Checkpoints {
+            walking: 121,
+            airborne: None,
+            between_controls: None,
+            between_controls_hold: (0.0, 0.0),
+        };
+        let mut golden_trace: Vec<types::EntityState> = Vec::with_capacity(TOTAL as usize);
+        let mut hit_seen = false;
+        for tick in 0..TOTAL {
+            let probe = golden
+                .entity_state(a)
+                .unwrap_or_else(|| types::EntityState {
+                    translation: Vec3::new(24.0, 1.95, 24.0),
+                    ..types::EntityState::default()
+                });
+            golden.apply_prefix(&a02b9_inputs(tick, hash, probe));
+            golden.apply_activation(&observers);
+            golden.step();
+            golden.run_transient_lifecycle();
+            let _ = golden.take_outbox();
+            let st = golden.entity_state(a).expect("golden 线主体全程在");
+            // 布景自检:砸块(实体 (1,2))与主体发生过接触。
+            if !hit_seen
+                && let (Some(r2), Some(ra)) = (
+                    golden.entities.get(&types::EntityId::from_parts(1, 2)),
+                    golden.entities.get(&a),
+                )
+            {
+                let ca = ra.collider;
+                hit_seen = golden
+                    .phys
+                    .narrow_phase
+                    .contact_pairs_with(r2.collider)
+                    .any(|pair| pair.collider1 == ca || pair.collider2 == ca);
+            }
+            // 检查点 2:空中(jump 后 vy > 1.5 的第一拍;此后不再改)。
+            if cps.airborne.is_none() && tick > 360 && st.linvel.y > 1.5 {
+                cps.airborne = Some(tick);
+            }
+            // 检查点 3:两个控制拍之间(step_tick 奇数 = 下一拍非控制拍)
+            // 且保持力非零(刹车段力非零;再显式断言)。
+            if cps.between_controls.is_none()
+                && (440..500).contains(&tick)
+                && golden.step_tick.0 % 2 == 1
+                && golden
+                    .walker_holds
+                    .get(&a)
+                    .is_some_and(|h| h.held_force != (0.0, 0.0))
+            {
+                cps.between_controls = Some(tick);
+                cps.between_controls_hold = golden
+                    .walker_holds
+                    .get(&a)
+                    .map(|h| h.held_force)
+                    .unwrap_or((0.0, 0.0));
+            }
+            golden_trace.push(st);
+        }
+        let airborne = cps
+            .airborne
+            .expect("布景自检:900 拍内出现空中拍(jump 后 vy > 1.5)");
+        let between = cps
+            .between_controls
+            .expect("布景自检:刹车段出现保持力非零的控制拍间隙");
+        assert!(
+            golden_trace[cps.walking as usize].linvel.x > 5.0,
+            "布景自检:检查点 1(拍 121)处于行走中(vx = {})",
+            golden_trace[cps.walking as usize].linvel.x
+        );
+        assert!(
+            golden_trace[airborne as usize].linvel.y > 1.5,
+            "布景自检:检查点 2(拍 {airborne})处于空中(vy = {})",
+            golden_trace[airborne as usize].linvel.y
+        );
+        // 布景断言(放行 A02-9 原文):检查点 3 落在两个控制拍之间,保持的
+        // 力非零。step_tick 奇数在探测条件里;保持力取探测拍记录值(golden
+        // 跑完后 walker_holds 已是末态)。
+        assert!(
+            cps.between_controls_hold != (0.0, 0.0),
+            "布景自检:检查点 3 拍 {between} 保持的力非零"
+        );
+        // 布景自检:砸块与主体发生过接触(方块自由落体 ~51 拍后砸中主体)。
+        assert!(hit_seen, "布景自检:砸块与主体发生接触(被砸半边真实发生)");
+
+        // ---- 三条恢复线:跑到检查点拍 step 完成后快照 → 恢复 → 续跑 ----
+        for (cp_tick, label) in [
+            (cps.walking, "行走中"),
+            (airborne, "空中"),
+            (between, "控制拍之间"),
+        ] {
+            let mut s = ac_a6_sim();
+            let mut resume = Vec::with_capacity(TOTAL as usize);
+            for tick in 0..TOTAL {
+                let probe = s.entity_state(a).unwrap_or_else(|| types::EntityState {
+                    translation: Vec3::new(24.0, 1.95, 24.0),
+                    ..types::EntityState::default()
+                });
+                s.apply_prefix(&a02b9_inputs(tick, hash, probe));
+                s.apply_activation(&observers);
+                s.step();
+                s.run_transient_lifecycle();
+                let _ = s.take_outbox();
+                if tick == cp_tick {
+                    let bytes = s.snapshot();
+                    s = crate::sim::ShardSim::restore_with_bodies(
+                        &bytes,
+                        Box::new(SimpleRegistry::builtin()),
+                        fresh_capsule_registry(),
+                    )
+                    .expect("检查点恢复");
+                }
+                resume.push(s.entity_state(a).expect("恢复线主体全程在"));
+            }
+            for (t, (x, y)) in golden_trace.iter().zip(resume.iter()).enumerate() {
+                assert_eq!(
+                    x, y,
+                    "检查点[{label}](拍 {cp_tick})恢复续跑:拍 {t} 主体状态逐位不同"
+                );
+            }
+        }
+    }
+
+    // ---- REQ-012 A02b:判据 A02-11(兜底冻结的主体豁免)----
+    //
+    // 主体在所有观察者的唤醒范围外持续行走,超过 actor_motion_max_ticks
+    // (默认 1200)拍:断言主体没被兜底冻结、仍是 Dynamic,并继续按意图
+    // 行走。变异自证(删 run_transient_lifecycle 兜底冻结里的主体豁免)
+    // 让本测试红。
+
+    /// A02-11 前半:主体持续行走出唤醒范围,常驻运动票记账触顶(默认
+    /// 1200 拍)后不被兜底冻结——分片内闭环:触顶 → capped_freeze_pending
+    /// → run_transient_lifecycle 的主体豁免跳过(冻结语义在 B03)。
+    /// 布景:8×2 chunk 平板(x 0..128, z 0..32;全在分片本体区内),观察者
+    /// (4,3,16),主体出生 (4.5,1.95,16) 意图 (4.3, 0) 沿 +x;~440 拍出
+    /// 唤醒 unload 半径(32 m)开始记账,再 1200 拍触顶 ≈ 拍 1640;总
+    /// 1680 拍(末态 x ≈ 125 < 128,远离分片边界——迁移 fail-stop 的
+    /// 布景纪律)。
+    #[test]
+    fn a02_11_agent_walking_past_actor_motion_cap_is_not_frozen() {
+        let (mut s, hash) = test_sim();
+        // 8×2 chunk 平板(层 64 全石)。
+        let stone = types::BlockId(1);
+        for cx in 0..8i32 {
+            for cz in 0..2i32 {
+                let mut chunk = voxel::Chunk::air();
+                for x in 0..voxel::CHUNK_X {
+                    for z in 0..voxel::CHUNK_Z {
+                        chunk.set(x, 64, z, stone);
+                    }
+                }
+                s.load_chunk(types::ChunkPos::new(cx, cz), chunk);
+            }
+        }
+        let a = types::EntityId::from_parts(1, 1);
+        s.apply_prefix(&[
+            spawn_agent_input(a, hash, Vec3::new(4.5, 1.95, 16.0)),
+            intent_input(a, 1, (4.3, 0.0), 0.0, false),
+        ]);
+        let observers = [Vec3::new(4.0, 3.0, 16.0)];
+        // 全程不冻结(每 10 拍抽查;触顶预期在 ~1640 拍,抽查覆盖到其后)。
+        let mut last_x_tick = 0u32;
+        for tick in 0..1680u32 {
+            production_tick(&mut s, &observers);
+            if tick % 10 == 9 {
+                // entity_state 的存在性自检:主体不被强制落地/虚空移除。
+                s.entity_state(a)
+                    .expect("主体全程在(不被强制落地/虚空移除)");
+                assert!(
+                    !s.is_frozen(a),
+                    "A02-11:拍 {tick} 主体被冻结(兜底冻结豁免缺失)——触顶预期拍 ~1640"
+                );
+                last_x_tick = tick;
+            }
+        }
+        // 继续按意图行走:末态净位移 ≈ 4.3 m/s × 28 s ≈ 120 m。
+        let st = s.entity_state(a).expect("主体全程在");
+        assert!(
+            st.translation.x - 4.5 > 90.0,
+            "A02-11:主体按意图持续行走(末态 x = {:.1},期望 > 94.5)",
+            st.translation.x
+        );
+        assert!(
+            last_x_tick >= 1650,
+            "布景自检:抽查覆盖到触顶之后的拍(最后抽查拍 {last_x_tick})"
+        );
+    }
+
+    /// A02-11 后半(冻结闭包):主体站在一个方块实体上,该方块被**滞回
+    /// 冻结**(观察者移远 → 出唤醒 unload 半径 → 静止常驻体决策冻结)。
+    /// 断言:主体没有被连带冻结(`freeze_with_closure` 的主体豁免;变异删
+    /// 该豁免让本测试红)、方块确实冻结了(证明布景走到了闭包)。
+    ///
+    /// 布景:3×3 平板,方块 SpawnDynamic (24,1.5,24)(贴地),主体出生其
+    /// 上 (24,2.9,24);观察者 (24,3,24) 安定 120 拍(主体落上方块、双方
+    /// 静止判据推进)→ 观察者移到 (500,0,500) → 下一拍 plan 决策:方块
+    /// outside+静止 → 冻结;主体 outside+静止 → 决策含主体但落实段豁免。
+    /// 跑 60 拍让决策落实。
+    #[test]
+    fn a02_11_agent_on_frozen_block_is_not_caught_by_closure() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        let block = types::EntityId::from_parts(1, 2);
+        s.apply_prefix(&[
+            spawn_agent_input(a, hash, Vec3::new(24.0, 2.9, 24.0)),
+            // 方块:半边 0.5、贴地(格中心 y = 1.5);MarkActor 常驻化——
+            // 瞬态体不进滞回冻结分支(`!actor && !carried` 冻结恒 false),
+            // 常驻体才走"出唤醒范围 + 静止 → 滞回冻结"(sim.rs 测试同款)。
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: block,
+                    state: types::EntityState {
+                        translation: Vec3::new(24.0, 1.5, 24.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 2,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::MarkActor {
+                    entity: block,
+                    actor: true,
+                }),
+            },
+        ]);
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        for _ in 0..120 {
+            production_tick(&mut s, &observers);
+        }
+        // 安定自检:主体站在方块上(双方醒着、主体接地)。
+        assert!(s.agent_is_grounded(a, 0.05), "布景自检:主体落在方块上接地");
+        assert!(!s.is_frozen(block), "布景自检:安定段方块未冻结(在唤醒范围)");
+        assert!(!s.is_frozen(a), "布景自检:安定段主体未冻结");
+
+        // 观察者移远 → 滞回决策(方块 outside + 静止 → 冻结;主体 outside
+        // + 静止 → 决策含主体,落实段豁免;闭包从方块递归时主体豁免)。
+        let far = [Vec3::new(500.0, 0.0, 500.0)];
+        for _ in 0..60 {
+            production_tick(&mut s, &far);
+        }
+        // 主体没有被连带冻结,仍是 Dynamic 并仍在表(未被凝固写块)。
+        assert!(
+            !s.is_frozen(a),
+            "A02-11:支撑方块被滞回冻结时主体被连带冻结(闭包主体豁免缺失)"
+        );
+        assert!(s.is_agent(a), "主体仍在 agents 表(未被写块)");
+        assert!(
+            s.entity_state(a).is_some(),
+            "主体实体仍在(闭包未把主体凝固/移除)"
+        );
+        // 方块确实冻结了(证明布景走到了滞回冻结 + 闭包递归路径)。
+        assert!(
+            s.is_frozen(block),
+            "布景自检:方块已被滞回冻结(闭包路径真实走到;否则布景无效)"
+        );
+    }
 }
