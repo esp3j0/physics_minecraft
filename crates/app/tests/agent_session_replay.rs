@@ -90,14 +90,9 @@ fn run_timeline(session: &mut Session, log: &mut CommandLog) -> Vec<EntityState>
                     )
                     .expect("收件箱未满");
                 log.append(entry);
-                // A02a:零意图(正路 Session::agent_intent 盖章入日志)。主体
-                // 有了行走控制器 + 摩擦清零钩子后,拍 1500 爆炸的冲量若无
-                // 控制器刹车会让主体一直滑出本体区(触发 A01 迁移 fail-stop,
-                // 布景约束被打破);零意图 = 控制律刹车,滑 ~3.4 m 停住。
-                let entry = session
-                    .agent_intent(shard, a, (0.0, 0.0), 0.0, false)
-                    .expect("收件箱未满");
-                log.append(entry);
+                // R1-P1:不再补零意图。无意图的主体按零意图走控制律刹车
+                // (钩子摩擦清零后无刹车会一直滑出本体区,触发 A01 迁移
+                // fail-stop;P1 修复后刹车内置,拍 1500 爆炸后 ~3.4 m 停住)。
             }
             500 => {
                 let entry = session

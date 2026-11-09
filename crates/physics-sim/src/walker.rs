@@ -306,38 +306,32 @@ impl ShardSim {
         if let Some(record) = self.agents.get_mut(&id) {
             record.intent_jump = false;
         }
-        let has_intent = self
-            .agents
-            .get(&id)
-            .is_some_and(|r| r.intent_move.is_some() || r.intent_yaw.is_some());
         let g = self.cfg.gravity.length();
         let mass = rb.mass();
         let pos = conv::rapier_to_vec3(rb.translation());
         let v = conv::rapier_to_vec3(rb.linvel());
         // ---- 接地判定(只在控制拍;球投射,§13 R1/CR2 定值)----
         let grounded = self.agent_ground_check(handle, collider, pos, walker.ground_eps);
-        let held = if has_intent {
-            // ---- 水平力:F = clamp(m(v_t − v_h)/τ, F_max);空中 × air ----
-            let target = Vector::new(mv.0, 0.0, mv.1);
-            let vh = Vector::new(v.x, 0.0, v.z);
-            let mut f = (target - vh) * (mass / walker.tau);
-            let fmax = walker.fmax_g * mass * g;
-            let fl = f.length();
-            if fl > fmax && fl > 0.0 {
-                f *= fmax / fl;
-            }
-            if !grounded {
-                f *= walker.air;
-            }
-            let f = if f.length() < FORCE_DEADZONE {
-                Vector::new(0.0, 0.0, 0.0)
-            } else {
-                f
-            };
-            (f.x, f.z)
-        } else {
-            // 无意图:力归零(不施加;主体自然入睡;A01 站立判据行为不变)。
+        // R1-P1:没有意图的主体一律按零意图处理(mv = (0,0),yaw 取 0——
+        // 从未收到过意图的主体 prev_yaw 也是 0,不触发朝向写入):照常走
+        // 控制律刹车。钩子已把主体对固定刚体的摩擦清零,无意图若保持零力,
+        // 被推一下的主体会一直滑出本体区(原 A02a 缺陷,ac_a6 布景曾补零
+        // 意图掩盖);零速时力 < 0.01 N 死区不施加,入睡不受影响。
+        let target = Vector::new(mv.0, 0.0, mv.1);
+        let vh = Vector::new(v.x, 0.0, v.z);
+        let mut f = (target - vh) * (mass / walker.tau);
+        let fmax = walker.fmax_g * mass * g;
+        let fl = f.length();
+        if fl > fmax && fl > 0.0 {
+            f *= fmax / fl;
+        }
+        if !grounded {
+            f *= walker.air;
+        }
+        let held = if f.length() < FORCE_DEADZONE {
             (0.0, 0.0)
+        } else {
+            (f.x, f.z)
         };
         // 写保持态(力 + 朝向去重记忆)。
         let prev_yaw = self
@@ -522,5 +516,337 @@ mod tests {
             -0.008,
             "原值 −8 mm 比间隙 −10 mm 浅:取原值(负得少 = max)"
         );
+    }
+    // ---- R1(P1/P2/P4/P5)回归与判据测试 ----
+
+    use types::glam::Vec3 as TestVec3;
+
+    /// 生产节奏的一拍(激活开启 + 观察者;判据布景同款)。
+    fn production_tick(sim: &mut crate::sim::ShardSim, observers: &[TestVec3]) {
+        sim.apply_activation(observers);
+        sim.step();
+        sim.run_transient_lifecycle();
+        let _ = sim.take_outbox();
+    }
+
+    /// R1-P1(行为缺陷回归):主体生成后**不发任何意图**,给一个水平冲量,
+    /// 主体必须在有限拍内停住(钩子把对地摩擦清零了,无意图若保持零力,
+    /// 被推一下的主体会一直匀速滑出本体区——原 A02a 缺陷)。
+    ///
+    /// 量级推演(m = 0.8 kg、τ = 0.2 s、冲量 1.0 N·s → v0 = 1.25 m/s):
+    /// 刹车 F = m·v/τ = 5 N(钳制内),dv/dt = −v/τ 指数衰减;死区 0.01 N
+    /// 对应 v ≈ 0.0025 m/s,ln(500) ≈ 6.2 个 τ ≈ 1.24 s ≈ 75 拍;刹车距离
+    /// ≈ v0·τ = 0.25 m。
+    ///
+    /// 变异自证:把 `walker_control_one` 恢复成"无意图 → 力恒零"(原
+    /// `has_intent` 分支),摩擦清零后主体匀速滑行不停,本测试红(实测:
+    /// 变异下 240 拍不停,本测试在 stop 断言红)。
+    #[test]
+    fn r1_p1_agent_without_intent_stops_after_impulse() {
+        let (mut s, hash) = crate::agent::tests::test_sim();
+        crate::agent::tests::load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.apply_prefix(&[crate::agent::tests::spawn_agent_input(
+            a,
+            hash,
+            TestVec3::new(24.0, 1.95, 24.0),
+        )]);
+        // 安定 60 拍(落地;不发任何意图;出生在 3×3 平板中心 (24,24),
+        // 刹车行程 0.25 m 远离任何 chunk 边缘)。
+        let observers = [TestVec3::new(24.0, 3.0, 24.0)];
+        for _ in 0..60 {
+            production_tick(&mut s, &observers);
+        }
+        // 水平冲量 1.0 N·s(沿 +x;m = 0.8 → v0 = 1.25 m/s)。
+        let rec = s.entities.get(&a).expect("主体在表");
+        let handle = rec.handle;
+        if let Some(rb) = s.phys.bodies.get_mut(handle) {
+            rb.apply_impulse(rapier3d::prelude::Vector::new(1.0, 0.0, 0.0), true);
+        }
+        let x0 = s.entity_state(a).expect("主体在").translation.x;
+        // 找停住拍:|v| < 0.01 m/s 连续 30 拍(指数衰减尾段不反弹)。
+        let mut stop_tick = None;
+        let mut stopped_run = 0u32;
+        let mut max_speed = 0.0f32;
+        for tick in 0..240u32 {
+            production_tick(&mut s, &observers);
+            let st = s.entity_state(a).expect("主体不出本体区(刹车有效)");
+            let v = (st.linvel.x * st.linvel.x + st.linvel.z * st.linvel.z).sqrt();
+            max_speed = max_speed.max(v);
+            if v < 0.01 {
+                stopped_run += 1;
+                if stopped_run >= 30 && stop_tick.is_none() {
+                    stop_tick = Some(tick - 29);
+                }
+            } else {
+                stopped_run = 0;
+            }
+        }
+        let stop = stop_tick.expect("无意图主体被推后必须在 240 拍内停住(刹车生效)");
+        let x1 = s.entity_state(a).expect("主体在").translation.x;
+        let dist = (x1 - x0).abs();
+        // 布景自检:冲量确实给了速度(v0 = 1.25 m/s 量级)。
+        assert!(
+            max_speed > 1.0,
+            "布景自检:冲量后最大水平速度 {max_speed:.3} 应 ≈ 1.25 m/s"
+        );
+        // 停住拍数写明:理论 ~75 拍(见函数头推演),给余量到 120。
+        assert!(stop <= 120, "无意图主体 {stop} 拍才停(> 120):刹车过慢");
+        // 刹车距离写明:理论 ≈ v0·τ = 0.25 m,给余量 0.4 m(变异下主体
+        // 匀速滑 1.25 m/s × 4 s = 5 m,该断言必红)。
+        assert!(
+            dist <= 0.4,
+            "无意图主体滑行 {dist:.3} m(> 0.4):钩子摩擦清零后无刹车"
+        );
+    }
+
+    /// R1-P4(变异 N3/N4 的宿主):控制器运行、意图为零,主体必须在有限
+    /// 拍内入睡(rapier `is_sleeping`),之后保持睡着到 3600 拍。
+    ///
+    /// 死区(FORCE_DEADZONE 0.01 N)与"朝向只在变化时写"共同保证零意图
+    /// 主体不施力、不被 set_rotation 打扰 → island 满足 rapier 睡眠条件
+    /// (默认:速度低于 0.05 m/s 持续 0.5 s = 30 拍)。放行第 3 节"主体
+    /// 才能入睡"的判据面。变异自证:N3(去掉死区,小力也施加)与 N4
+    /// (朝向每控制拍 set_rotation)都会让 island 的睡眠计时清零,主体
+    /// 180 拍内睡不着,本测试红。若变异下主体仍能入睡,如实报告,不放宽。
+    #[test]
+    fn r1_p4_zero_intent_agent_sleeps_and_stays_asleep() {
+        let (mut s, hash) = crate::agent::tests::test_sim();
+        crate::agent::tests::load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.apply_prefix(&[crate::agent::tests::spawn_agent_input(
+            a,
+            hash,
+            TestVec3::new(24.0, 1.95, 24.0),
+        )]);
+        let observers = [TestVec3::new(24.0, 3.0, 24.0)];
+        let handle = s.entities.get(&a).expect("主体在表").handle;
+        let is_sleeping =
+            |s: &crate::sim::ShardSim| s.phys.bodies.get(handle).expect("主体刚体在").is_sleeping();
+        // 找入睡拍(写明;默认睡眠参数 0.05 m/s 持续 0.5 s → 落地安定后
+        // ~60 拍内入睡,实测 36;给余量 180)。
+        let mut sleep_tick = None;
+        for tick in 0..180u32 {
+            production_tick(&mut s, &observers);
+            if is_sleeping(&s) {
+                sleep_tick = Some(tick);
+                break;
+            }
+        }
+        let at = sleep_tick.expect("零意图主体必须在 180 拍内入睡(死区+朝向不写)");
+        // 入睡后保持睡着直到 3600 拍(醒转 = 有力在施加或朝向在被写)。
+        for tick in at..3600u32 {
+            production_tick(&mut s, &observers);
+            assert!(
+                is_sleeping(&s),
+                "拍 {tick}:主体醒了(死区失效或朝向被反复写,N3/N4 特征)"
+            );
+        }
+    }
+
+    /// R1-P5:空中水平力系数 `air`(放行第 3 节,F = clamp(m(v_t−v_h)/τ)
+    /// 空中再乘 air)。原地起跳,到空中以后发水平意图,对离地期间的每个
+    /// 控制拍间隔断言测得水平加速度 ≈ air·(v_t − v)/τ(力按控制律算,含
+    /// F_max 钳制——本布景 v_t = 5.6 时 F_raw = m·5.6/τ = 22.4 N < F_max =
+    /// 8·m·g ≈ 62.8 N,不触钳)。
+    ///
+    /// 离散化:力在拍间保持,一拍内 v 更新 = O(dt),半解析误差 ~dt/(2τ)
+    /// ≈ 4%,实测最差 1.7%;取容差 15%。变异自证:N8(去掉 `air`)下
+    /// 加速度放大 1/0.2 = 5 倍,全部样本飞出容差,本测试红。
+    #[test]
+    fn r1_p5_airborne_horizontal_accel_scales_with_air() {
+        let (mut s, hash) = crate::agent::tests::test_sim();
+        crate::agent::tests::load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        // 安定(接地,零意图),然后 jump + 水平意图同拍发(jump 消费在
+        // 控制拍;意图是保持状态,空中全程有效)。
+        s.apply_prefix(&[
+            crate::agent::tests::spawn_agent_input(a, hash, TestVec3::new(24.0, 1.95, 24.0)),
+            crate::agent::tests::intent_input(a, 1, (0.0, 0.0), 0.0, false),
+        ]);
+        let observers = [TestVec3::new(24.0, 3.0, 24.0)];
+        for _ in 0..60 {
+            production_tick(&mut s, &observers);
+        }
+        assert!(s.agent_is_grounded(a, 0.05), "布景自检:起跳前接地");
+        // jump = true + 水平意图 5.6(下一个控制拍起跳,意图保持)。
+        s.apply_prefix(&[crate::agent::tests::intent_input(
+            a,
+            2,
+            (5.6, 0.0),
+            0.0,
+            true,
+        )]);
+        // 逐拍记录:grounded 状态 + vx;离地期间的拍间隔做样本。
+        let dt = 1.0f32 / 60.0;
+        let tau = 0.2f32;
+        let air = 0.2f32;
+        let vt = 5.6f32;
+        let mut prev_vx: Option<f32> = None;
+        let mut airborne_run = 0u32;
+        let mut samples = 0u32;
+        let mut worst_err = 0.0f32;
+        for _tick in 0..120u32 {
+            production_tick(&mut s, &observers);
+            let st = s.entity_state(a).expect("主体全程在");
+            let grounded = s.agent_is_grounded(a, 0.05);
+            airborne_run = if grounded { 0 } else { airborne_run + 1 };
+            if let Some(pv) = prev_vx
+                && airborne_run >= 3
+            {
+                // 离地期间一整拍(起跳拍及其后第一拍跳过:起跳拍控制判定
+                // 仍接地、力按满强度施加,是控制律的正确行为,不是空中
+                // 系数的样本)。
+                let a_meas = (st.linvel.x - pv) / dt;
+                let a_pred = air * (vt - pv) / tau;
+                worst_err = worst_err.max((a_meas - a_pred).abs() / a_pred);
+                samples += 1;
+            }
+            prev_vx = Some(st.linvel.x);
+        }
+        // 布景自检:空中样本足够多(起跳滞空 ~64 拍 → 空中拍间隔样本
+        // ~30)且确实产生了水平加速(vx 显著 > 0)。
+        assert!(
+            samples >= 20,
+            "布景自检:空中样本 {samples} 应 ≥ 20(滞空 ~64 拍)"
+        );
+        let vx_end = prev_vx.expect("有记录");
+        assert!(vx_end > 2.0, "布景自检:空中水平加速生效,vx={vx_end:.3}");
+        assert!(
+            worst_err <= 0.15,
+            "R1-P5:空中加速度最差相对误差 {worst_err:.3} > 15%(理论 a = air·(v_t−v)/τ)"
+        );
+    }
+
+    /// R1-P2(钩子本身,A02-4 第 2 半):真实施步里跨缝行走的**推测接触**
+    /// 被接缝修正处理。两种 collider 顺序(靠 spawn 与 load_chunk 的插入
+    /// 顺序交换 pair 两侧;rapier pair 按 handle 序排 collider1/2):
+    ///   - 顺序 1:先 spawn 主体 → 主体 = collider1;
+    ///   - 顺序 2:先载地形 → 主体 = collider2(法线符号相反的分支)。
+    ///   - 过缝拍窗口内断言:
+    ///     1) 主体全部接触流形的法线都精确竖直(被摆竖 or 本来竖直;若
+    ///        钩子没跑或 in_band 误判,推测接触保持斜法线,本断言红);
+    ///     2) 存在推测接触流形(间隙 dist > 1e-4)且 |vy| ≤ 0.2(布景
+    ///        自检:钩子真的处理了缝,且锚点重建在近静止拍才有效);
+    ///     3) 推测接触的 dist = 竖直间隙 = (质心 y + 主体侧锚点 y) −
+    ///        地形侧锚点 y(锚点系:fixed 体世界系、动态体质心局部系;
+    ///        钩子改 dist 后差值烘焙进锚点,故重建应相等)。
+    ///   - 变异自证(改生产代码):
+    ///     - N1(`dist = seam_corrected_dist(..) * sign`):顺序 2 sign = −1
+    ///       → dist 翻负,断言 3 红;
+    ///     - N2(锚点恒取 a1/a2 不按 agent1 分):顺序 2 实参传反 →
+    ///       in_band 失败 / 竖直间隙变负 → 断言 1(法线不摆竖)或 3 红。
+    #[test]
+    fn r1_p2_seam_hook_processes_real_contacts_both_orders() {
+        for agent_first in [true, false] {
+            let (mut s, hash) = crate::agent::tests::test_sim();
+            let a = types::EntityId::from_parts(1, 1);
+            // 布景:3×3 平板,主体出生在缝 x=16 上,沿 +x 走 4.3 m/s 过
+            // 第二条缝 x = 32(a02_3 同款几何,行程加倍)。
+            if agent_first {
+                s.apply_prefix(&[crate::agent::tests::spawn_agent_input(
+                    a,
+                    hash,
+                    TestVec3::new(16.0, 1.95, 24.0),
+                )]);
+                crate::agent::tests::load_flat_ground(&mut s);
+            } else {
+                crate::agent::tests::load_flat_ground(&mut s);
+                s.apply_prefix(&[crate::agent::tests::spawn_agent_input(
+                    a,
+                    hash,
+                    TestVec3::new(16.0, 1.95, 24.0),
+                )]);
+            }
+            s.apply_prefix(&[crate::agent::tests::intent_input(
+                a,
+                1,
+                (4.3, 0.0),
+                0.0,
+                false,
+            )]);
+            let observers = [
+                TestVec3::new(16.0, 3.0, 24.0),
+                TestVec3::new(32.0, 3.0, 24.0),
+            ];
+            // 找过缝拍(x 首次 > 32),窗口扫描到 +5 拍。
+            let mut cross = None;
+            let mut tick = 0u32;
+            while tick < 240 {
+                production_tick(&mut s, &observers);
+                if s.entity_state(a).expect("主体全程在").translation.x > 32.0 {
+                    cross = Some(tick);
+                    break;
+                }
+                tick += 1;
+            }
+            let cross = cross.expect("布景自检:240 拍内过缝 x=32").max(1);
+            let mut speculative_seen = false;
+            let end = (cross + 5).min(239);
+            for tick in cross - 1..=end {
+                let st = s.entity_state(a).expect("主体全程在");
+                let rec = s.entities.get(&a).expect("主体在表");
+                let com_y = s
+                    .phys
+                    .bodies
+                    .get(rec.handle)
+                    .expect("主体刚体在")
+                    .translation()
+                    .y;
+                for pair in s.phys.narrow_phase.contact_pairs_with(rec.collider) {
+                    let agent_is_1 = pair.collider1 == rec.collider;
+                    let rapier3d::prelude::PairContacts::Rigid(rigid) = &pair.contacts else {
+                        continue;
+                    };
+                    for m in &rigid.manifolds {
+                        let d = &m.data;
+                        // 断言 1:法线精确竖直(摆竖 = Vector::new(0, ±1, 0) 位级)。
+                        assert!(
+                            d.normal.x == 0.0 && d.normal.z == 0.0,
+                            "R1-P2 顺序(agent_first={agent_first})拍 {tick}:流形法线 ({}, {}, {}) 不竖直——接缝修正没处理该接触",
+                            d.normal.x,
+                            d.normal.y,
+                            d.normal.z
+                        );
+                        assert!(
+                            d.normal.y == 1.0 || d.normal.y == -1.0,
+                            "R1-P2 顺序(agent_first={agent_first})拍 {tick}:法线 y = {} 非 ±1",
+                            d.normal.y
+                        );
+                        for sc in &d.solver_contacts {
+                            if sc.dist <= 1e-4 {
+                                continue; // 真实接触(dist≈0),非缝的推测接触
+                            }
+                            // 断言 2 的前提:近静止拍锚点重建才无漂移。
+                            assert!(
+                                st.linvel.y.abs() <= 0.2,
+                                "布景自检:推测接触出现在 |vy| > 0.2 的拍(布景需调整)"
+                            );
+                            // 断言 3:dist = 竖直间隙(重建锚点世界高差)。
+                            let (agent_ay, terrain_ay) = if agent_is_1 {
+                                (sc.anchor1.y, sc.anchor2.y)
+                            } else {
+                                (sc.anchor2.y, sc.anchor1.y)
+                            };
+                            let gap = com_y + agent_ay - terrain_ay;
+                            assert!(
+                                (sc.dist - gap).abs() < 1e-4,
+                                "R1-P2 顺序(agent_first={agent_first})拍 {tick}:推测接触 dist {:.6} ≠ 竖直间隙 {:.6}(乘符号 / 锚点取反的特征)",
+                                sc.dist,
+                                gap
+                            );
+                            speculative_seen = true;
+                        }
+                    }
+                }
+                if tick < end {
+                    production_tick(&mut s, &observers);
+                }
+            }
+            assert!(
+                speculative_seen,
+                "布景自检:过缝窗口内必须出现被处理的推测接触(缝布景未触发)"
+            );
+        }
     }
 }

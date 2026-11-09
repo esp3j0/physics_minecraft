@@ -424,7 +424,7 @@ pub(crate) fn agent_half_size(def: &BodyDef) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use types::glam::Vec3;
     use types::{DimensionId, ShardPos, WorldId};
@@ -509,7 +509,7 @@ mod tests {
     /// SpawnAgent 的盖章输入(REQ-012 A01 R1-P3b:AC-A6/判据布景的主体生成
     /// 走**命令路径**(apply_prefix → apply_command → spawn_agent),不再直调;
     /// SCHEDULER 来源 = 服务端注入,与 SpawnDynamic 测试同款)。
-    fn spawn_agent_input(
+    pub(crate) fn spawn_agent_input(
         entity: types::EntityId,
         body: BodyHash,
         pos: Vec3,
@@ -1148,11 +1148,9 @@ anchor = [0.0, 0.0, 0.0]
     /// 砸中后弹落滚走、静止后凝固成方块(默认凝固配置;主体 actor 恒豁免);
     /// 爆炸 power 12 / radius 5,中心 (21.5, 1, 24)(距主体 2.5 m,斜向冲量
     /// 把主体沿 +x 推开;地面炸坑但 3×3 平板足够大)。
-    /// A02a:主体有了行走控制器与接触钩子(摩擦清零)——爆炸冲量推主体
-    /// 后地面不再有摩擦阻力,主体会一直滑出本体区(触发 A01 迁移 fail-stop,
-    /// 判据 A01-2 的"主体全程在"布景约束被打破)。布景补一条**零意图**:
-    /// 意图 = 零速时控制器按控制律刹车(F = clamp(m(0 − v)/τ)),主体被推
-    /// 出 ~3.4 m 后停住(探针实测),不出本体区。判据期望值不动。
+    /// A02a:主体有了行走控制器与接触钩子(摩擦清零)——R1-P1 起无意图的
+    /// 主体按零意图走控制律刹车(被推出 ~3.4 m 后停住,探针实测),不出
+    /// 本体区,判据期望值不动。
     fn ac_a6_inputs(tick: u32, hash: BodyHash) -> Vec<messaging::StampedInput> {
         let mut inputs = Vec::new();
         if tick == 0 {
@@ -1161,17 +1159,6 @@ anchor = [0.0, 0.0, 0.0]
                 hash,
                 Vec3::new(24.0, 1.95, 24.0),
             ));
-            inputs.push(messaging::StampedInput {
-                apply_at: types::Tick::ZERO,
-                source: messaging::InputSource::SCHEDULER,
-                sequence: 3,
-                payload: messaging::InputPayload::Command(messaging::SimCommand::AgentIntent {
-                    entity: types::EntityId::from_parts(1, 1),
-                    move_xz: (0.0, 0.0),
-                    yaw: 0.0,
-                    jump: false,
-                }),
-            });
         }
         if tick == 500 {
             inputs.push(messaging::StampedInput {
@@ -1344,7 +1331,7 @@ anchor = [0.0, 0.0, 0.0]
     // ---- REQ-012 A02a 第 2 节:AgentIntent 内核校验(A02-10 内核半边)----
 
     /// 盖章的 AgentIntent 输入(apply_prefix 直发;网络前置校验在 driver)。
-    fn intent_input(
+    pub(crate) fn intent_input(
         entity: types::EntityId,
         seq: u64,
         move_xz: (f32, f32),
