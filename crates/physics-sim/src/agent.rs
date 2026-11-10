@@ -318,8 +318,9 @@ impl ShardSim {
     /// **不施加力**——迁移那一拍的施力由本拍 `step` 内的控制器段照常进行
     /// (60 Hz 施力先 `reset_forces` 再施加保持力;§13 `migrate`:写回必须
     /// 在下一次步进之前,否则失力 1–2 拍)。单连杆预留字段非空 = 内部一致
-    /// 性违规 fail-stop(B01 才带关节状态)。`source` 不写回:生成路径恒
-    /// `None`(`SpawnAgent` 命令分支同口径),迁移不改 `EntityId`。
+    /// 性违规 fail-stop(B01 才带关节状态)。`source` 写回(R1-P8:A03 玩家
+    /// 生成主体后迁移不能丢来源;实体归属表的 `EntityOwner.source` 由调度器
+    /// 按 outbox 口径维护,此处对齐 EntityRecord)。
     #[allow(clippy::too_many_arguments)] // 信封字段逐项透传(B01 前恒空三项)
     pub(crate) fn migrate_agent_in(
         &mut self,
@@ -331,6 +332,7 @@ impl ShardSim {
         intent_jump: bool,
         held_force: (f32, f32),
         last_yaw: f32,
+        source: Option<messaging::InputSource>,
         actor_motion_ticks: Option<u64>,
         joint_q: &[f32],
         joint_qd: &[f32],
@@ -353,6 +355,7 @@ impl ShardSim {
         record.intent_jump = intent_jump;
         if let Some(rec) = self.entities.get_mut(&entity) {
             rec.actor_motion_ticks = actor_motion_ticks;
+            rec.source = source;
         }
         self.walker_holds.insert(
             entity,
@@ -2065,5 +2068,167 @@ anchor = [0.0, 0.0, 0.0]
             s.is_frozen(block),
             "布景自检:方块已被滞回冻结(闭包路径真实走到;否则布景无效)"
         );
+    }
+
+    // ---- A04 R1-P8:信封往返逐字段 ----
+
+    /// 发出方记录快照(P8 断言基准:`AgentRecord` 控制器三字段 +
+    /// `WalkerHold` 两字段 + `EntityRecord` 的 `source`/`actor_motion_ticks`)。
+    struct AgentSideSnapshot {
+        intent_move: Option<(f32, f32)>,
+        intent_yaw: Option<f32>,
+        intent_jump: bool,
+        held_force: (f32, f32),
+        last_yaw: f32,
+        source: Option<messaging::InputSource>,
+        actor_motion_ticks: Option<u64>,
+    }
+
+    fn agent_side_snapshot(s: &crate::sim::ShardSim, a: types::EntityId) -> AgentSideSnapshot {
+        let rec = s.agents.get(&a).expect("主体在表");
+        let hold = s.walker_hold_of(a).expect("保持态在表");
+        let entity_rec = s.entities.get(&a).expect("实体在表");
+        AgentSideSnapshot {
+            intent_move: rec.intent_move,
+            intent_yaw: rec.intent_yaw,
+            intent_jump: rec.intent_jump,
+            held_force: (hold.0, hold.1),
+            last_yaw: hold.2,
+            source: entity_rec.source,
+            actor_motion_ticks: entity_rec.actor_motion_ticks,
+        }
+    }
+
+    /// 信封往返(R1-P8):各字段非默认的主体(意图三项、保持力、
+    /// `last_yaw`、`actor_motion_ticks`、`source`,`intent_jump = true`)
+    /// 经 `MigrateAgent` 信封迁到**另一个 ShardSim**(同注册表、同地形),
+    /// 接收方的记录与保持态逐字段等于发出方。
+    ///
+    /// 布景:两个 sim(片 (0,0)/(1,0)),各装 3×3 平板;发出方 sim 直接对
+    /// 记录写字段(意图/保持态走内核写入口,`source`/`actor_motion_ticks`
+    /// 测试内直写 EntityRecord——P8 放行原文口径)。迁移触发:发出方 step
+    /// 把主体推出本体区(位置直写刚体)→ step 拍末产 `MigrateAgent`
+    /// Intent → 构造盖章信封投给接收方 apply_prefix。
+    #[test]
+    fn a04_p8_migrate_agent_envelope_roundtrip_fieldwise() {
+        let (mut src, hash) = test_sim();
+        load_flat_ground(&mut src);
+        // 接收方:同注册表哈希(共表口径)+ 同地形。
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+        let mut dst = crate::sim::ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_capsule_registry(),
+        );
+        load_flat_ground(&mut dst);
+        let a = types::EntityId::from_parts(1, 1);
+        src.apply_prefix(&[spawn_agent_input(a, hash, Vec3::new(24.0, 2.0, 24.0))]);
+        src.apply_prefix(&[intent_input(a, 0, (2.5, -1.5), 0.75, true)]);
+        // 跑一拍让意图生效(跳请求在控制拍被消费,`intent_jump` 回落 false;
+        // P8 要 `intent_jump = true` 随信封走,故消费后再置一次)。
+        src.step();
+        src.run_transient_lifecycle();
+        let _ = src.take_outbox();
+        src.apply_prefix(&[intent_input(a, 1, (2.5, -1.5), 0.75, true)]);
+        // 直写各字段到非默认值(P8 放行:source 在测试里直接写到记录上;
+        // actor_motion_ticks 同款;保持力/last_yaw 直写 walker_holds)。
+        let src_src = Some(messaging::InputSource(7));
+        let src_ticks = Some(321u64);
+        if let Some(rec) = src.entities.get_mut(&a) {
+            rec.source = src_src;
+            rec.actor_motion_ticks = src_ticks;
+        }
+        let hold_force = (1.25f32, -0.75f32);
+        let last_yaw = -1.25f32;
+        src.walker_holds.insert(
+            a,
+            crate::walker::WalkerHold {
+                held_force: hold_force,
+                last_yaw,
+            },
+        );
+        let before = agent_side_snapshot(&src, a);
+        assert_eq!(before.intent_move, Some((2.5, -1.5)), "布景自检:意图写入");
+        assert_eq!(before.intent_yaw, Some(0.75), "布景自检:朝向写入");
+        assert!(before.intent_jump, "布景自检:intent_jump = true");
+        assert_eq!(before.held_force, hold_force, "布景自检:保持力写入");
+        assert_eq!(before.last_yaw, last_yaw, "布景自检:last_yaw 写入");
+        assert_eq!(before.source, src_src, "布景自检:source 直写");
+        assert_eq!(
+            before.actor_motion_ticks, src_ticks,
+            "布景自检:actor_motion_ticks 直写"
+        );
+
+        // 迁移:拍末 step 检测到主体出本体区(位置直写刚体到 x > 本体区)。
+        // 本体区 128 m(core 8 chunk);直写 x = 130、y 站立高度。
+        {
+            let rec = src.entities.get(&a).expect("在场");
+            let handle = rec.handle;
+            let body = src.phys.bodies.get_mut(handle).expect("刚体在场");
+            body.set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(130.0, 1.9, 24.0)),
+                true,
+            );
+            body.set_linvel(crate::conv::vec3_to_rapier(Vec3::new(2.5, 0.0, -1.5)), true);
+        }
+        src.step();
+        src.run_transient_lifecycle();
+        let outbox = src.take_outbox();
+        assert!(
+            !src.agents.contains_key(&a),
+            "发出方:主体已原子移除(agents 不留残余)"
+        );
+        // 从 outbox.migrations 取 MigrateAgent Intent,盖章成信封投接收方。
+        let mut payload = None;
+        for intent in &outbox.migrations {
+            if let messaging::EnvelopePayload::MigrateAgent { entity, .. } = &intent.payload {
+                assert_eq!(*entity, a, "信封实体一致");
+                payload = Some(intent.payload.clone());
+            }
+        }
+        let payload = payload.expect("布景自检:拍末产出 MigrateAgent");
+        let env = messaging::Envelope::stamp(
+            shard_id(0, 0),
+            messaging::Intent {
+                destination: shard_id(1, 0),
+                payload,
+            },
+            types::Tick(0),
+            0,
+        );
+        dst.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick(1),
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            payload: messaging::InputPayload::Envelope(env),
+        }]);
+        let after = agent_side_snapshot(&dst, a);
+        assert_eq!(
+            after.intent_move, before.intent_move,
+            "P8:接收方 intent_move 逐字段等于发出方"
+        );
+        assert_eq!(
+            after.intent_yaw, before.intent_yaw,
+            "P8:接收方 intent_yaw 逐字段等于发出方"
+        );
+        assert_eq!(
+            after.intent_jump, before.intent_jump,
+            "P8:接收方 intent_jump 逐字段等于发出方(true 随信封走)"
+        );
+        assert_eq!(
+            after.held_force, before.held_force,
+            "P8:接收方保持力逐字段等于发出方"
+        );
+        assert_eq!(
+            after.last_yaw, before.last_yaw,
+            "P8:接收方 last_yaw 逐字段等于发出方"
+        );
+        assert_eq!(after.source, before.source, "P8:接收方写回 source(R1-P8)");
+        assert_eq!(
+            after.actor_motion_ticks, before.actor_motion_ticks,
+            "P8:接收方 actor_motion_ticks 逐字段等于发出方"
+        );
+        dst.run_transient_lifecycle();
+        let _ = dst.take_outbox();
     }
 }

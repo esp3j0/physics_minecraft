@@ -949,7 +949,7 @@ impl ShardSim {
                         body,
                         state,
                         actor: _,
-                        source: _,
+                        source,
                         actor_motion_ticks,
                         intent_move,
                         intent_yaw,
@@ -978,6 +978,7 @@ impl ShardSim {
                             *intent_jump,
                             *held_force,
                             *last_yaw,
+                            *source,
                             *actor_motion_ticks,
                             joint_q,
                             joint_qd,
@@ -1540,8 +1541,10 @@ impl ShardSim {
                     pos_chunk(state.translation).shard_of(),
                 );
                 if let Some(agent) = self.agents.remove(&id) {
-                    // 主体迁移:A01 只支持单连杆(多连杆在 B01)。
-                    debug_assert!(
+                    // 主体迁移:A01 只支持单连杆(多连杆在 B01)。assert 而非
+                    // debug_assert(A04 R1-P9):release 构建同样 fail-stop,
+                    // 与接收方 migrate_agent_in 的一致性 assert 对齐。
+                    assert!(
                         agent.links.len() == 1,
                         "A04 只支持单连杆主体迁移(多连杆在 B01)"
                     );
