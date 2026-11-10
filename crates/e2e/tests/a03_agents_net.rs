@@ -699,12 +699,9 @@ async fn a03_3_possess_rules_table() {
         None,
         "B 附身 A 身体被拒"
     );
-    // 行 2b:附身已被他人附身的主体 → 同上。
-    assert_eq!(
-        possess(&mut a, &mut rxa, eb, 30).await,
-        None,
-        "A 附身 B 已附身的身体被拒"
-    );
+    // 行 2b(A03 验收 P6)挪到下方服务端主体段:A 附身 B 的玩家身体会被
+    // source 检查先拒,`possessor_of` 检查走不到——改为 A 附身 B 已附身的
+    // **服务端主体**(source = None,只有"已被他人附身"检查能拒)。
     // 行 2c:不存在的实体 → 拒。
     let ghost = EntityId::from_parts(0, 9999);
     assert_eq!(
@@ -760,6 +757,14 @@ async fn a03_3_possess_rules_table() {
         possess(&mut a, &mut rxa, server_body, 200).await,
         Some(Some(server_body)),
         "附身没人附身的服务端主体成功"
+    );
+    // 行 2b(P6):A 已附身服务端主体,B 再附身它 → 拒,计数,附身表不变
+    // (B 仍附身 eb)。source 检查对服务端主体(source = None)放行,只有
+    // `possessor_of` 的"已被他人附身"检查能拒——变异"解除该检查"(M2)红。
+    assert_eq!(
+        possess(&mut b, &mut rxb, server_body, 30).await,
+        None,
+        "B 附身 A 已附身的服务端主体被拒(possessor_of 检查)"
     );
     // 现在附身自己的身体:旧的服务端主体自动解除(表一对一),回新回执。
     assert_eq!(
@@ -1561,4 +1566,106 @@ async fn a03_9_agent_states_semantics() {
         "无主体的世界不再发 AgentStates(帧序列与改动前逐位相同的锚)"
     );
     let _ = shutdown(h).await;
+}
+
+// ===========================================================================
+// A03-3 补充(P4):"玩家身体"判定用 is_agent,不用 actor 标记
+// ===========================================================================
+
+/// P4(验收返修):玩家 C2S::Spawn 一个方块、本地管理面 MarkActor 它,
+/// 然后这个玩家**仍能**生成身体(actor 误标不再挡一对一校验);断线后
+/// 方块**还在**(不随玩家身体被误删)。变异(恢复用 `actor` 判定)红:
+/// MarkActor 后一对一校验把方块当玩家身体 → 生成被拒;断线把方块删掉。
+#[tokio::test(start_paused = true)]
+async fn a03_4b_player_body_check_uses_is_agent_not_actor() {
+    let h = harness(base_config(), (2, 60)).await;
+    let (mut c, mut rx) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    let _p = join(&mut c, &mut rx, 4).await;
+    c.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, GROUND_TOP_Y + 2.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver");
+    advance_ticks(30).await;
+
+    // ① 玩家生成一个方块(C2S::Spawn → spawn_owned,source = 该玩家,
+    // actor 默认 false)。
+    c.send(&C2S::Spawn {
+        state: capsule_spawn(Vec3::new(16.0, GROUND_TOP_Y + 1.0, 16.0)),
+        desc: types::EntityDesc::default(),
+    })
+    .await
+    .expect("Spawn 方块");
+    let mut block = None;
+    for _ in 0..300 {
+        if let Some(S2C::Spawned { entity }) = next_frame(&mut rx).await {
+            block = Some(entity);
+            break;
+        }
+    }
+    let block = block.expect("方块生成回执");
+    advance_ticks(5).await;
+
+    // ② 本地管理面 MarkActor 它(本地受信通道;服务端策略命令,网络面
+    // 拒绝——此处走 DriverCommand::Send 正路)。
+    h.tx.send(DriverCommand::Send {
+        shard: ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(1, 1)),
+        command: messaging::SimCommand::MarkActor {
+            entity: block,
+            actor: true,
+        },
+    })
+    .await
+    .expect("commands 通道 Send");
+    advance_ticks(10).await;
+
+    // ③ 玩家仍能生成身体(P4 判据核心:actor 误标不挡一对一)。
+    // 返回值 = 玩家身体 ID(断线移除的主体;下方计数断言用)。
+    let _e = spawn_agent(
+        &mut c,
+        &mut rx,
+        "capsule",
+        Vec3::new(8.0, GROUND_TOP_Y + 1.2, 8.0),
+        0.0,
+        300,
+    )
+    .await
+    .expect("MarkActor 方块后玩家仍能生成身体(P4)");
+
+    // ④ 断线:玩家身体被移除;MarkActor 方块**还在**(不被误删)。
+    // 断线方自己的通道随连接关闭收不到 removed 帧——移除断言:观察连接
+    // 的 AgentStates(EntityStates 不含主体)中不再出现身体;方块在
+    // EntityStates 里仍在。
+    c.bye().await;
+    advance_ticks(30).await;
+    // 方块还在、身体没了:新观察连接看两个实体。
+    let (mut watcher, mut rxw) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    let _pw = join(&mut watcher, &mut rxw, 6).await;
+    watcher
+        .send(&C2S::MoveObserver {
+            position: Vec3::new(12.0, GROUND_TOP_Y + 2.0, 12.0),
+        })
+        .await
+        .expect("watcher MoveObserver");
+    advance_ticks(30).await;
+    let mut block_seen = false;
+    for _ in 0..300 {
+        if let Some(S2C::EntityStates { states, .. }) = next_frame(&mut rxw).await
+            && states.iter().any(|(id, _)| *id == block)
+        {
+            block_seen = true;
+            break;
+        }
+    }
+    assert!(
+        block_seen,
+        "断线后 MarkActor 方块还在(P4:不被当玩家身体误删)"
+    );
+    let outcome = shutdown(h).await;
+    assert_eq!(
+        outcome.agent.bodies_removed_on_disconnect, 1,
+        "断线只移除玩家身体(1),方块不算"
+    );
 }

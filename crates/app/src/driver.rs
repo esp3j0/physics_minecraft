@@ -963,8 +963,10 @@ impl ObserveOrchestrator {
     // = 拒绝计数不回包,hostile 输入不断链) ----
 
     /// 该连接名下是否还有存活的玩家身体(D1/D12:一个连接一个身体):
-    /// 扫全局归属表,`source == Some(player)` 的主体(任一连接的玩家身体
-    /// 唯一;断线即移除,不存在残留)。
+    /// 扫全局归属表,`source == Some(player)` 且**是主体**的实体(任一连接
+    /// 的玩家身体唯一;断线即移除,不存在残留)。主体判定用内核的
+    /// `is_agent`(agents 表),不用归属表的 `actor` 演员政策标记——本地
+    /// 管理面可以对玩家生成的方块 `MarkActor`,`actor` 会误标(P4)。
     fn player_body_of(
         &self,
         session: &sim_api::session::Session,
@@ -973,7 +975,7 @@ impl ObserveOrchestrator {
         session
             .entity_owners()
             .into_iter()
-            .find(|(_, source, is_agent)| *source == Some(player) && *is_agent)
+            .find(|(id, source, _)| *source == Some(player) && session.is_agent(*id))
             .map(|(id, _, _)| id)
     }
 
@@ -1183,7 +1185,16 @@ impl ObserveOrchestrator {
             return;
         }
         match session.send_agent_intent_to(player, entity, move_xz, yaw, jump) {
-            Ok(entry) => log.append(entry),
+            Ok(entry) => {
+                // 直接投递成功:若有本实体更旧的暂存条目(同拍更早投递失败后
+                // 落的),新意图已生效,旧条目必须清掉——否则随后 flush 会把
+                // 旧意图再投一遍,排在新的后面把"停下"盖回"走"(P1)。被清
+                // 的旧条目计入"被覆盖"。
+                if self.pending_intents.remove(&entity).is_some() {
+                    self.agent_counters.intent_overwritten += 1;
+                }
+                log.append(entry);
+            }
             Err(sim_api::session::SessionError::Rejected("实体不存在或迁移窗口")) => {
                 // 在途窗口:意图不能丢("停下"丢了主体就一直走)。暂存最后
                 // 一条;同窗口多条被覆盖的计数。
@@ -2149,7 +2160,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         let player_bodies: Vec<types::EntityId> = session
             .entity_owners()
             .into_iter()
-            .filter(|(_, source, is_agent)| source.is_some() && *is_agent)
+            .filter(|(id, source, _)| source.is_some() && session.is_agent(*id))
             .map(|(id, _, _)| id)
             .collect();
         for entity in player_bodies {
@@ -2701,45 +2712,24 @@ mod tests {
         session
     }
 
-    /// REQ-012 A03 判据 A03-5(路由与在途;驱动单测):迁移在途窗口(owner
-    /// 查不到)的意图暂存——同窗多条只留最后一条(被覆盖计数),owner 出现
-    /// 后下一拍 flush 投递(计数"延后"≥ 1)。真实网络栈下迁移在途拍(恰
-    /// 1 拍)不可从客户端构造(TCP 帧到达粒度 ~10 拍;e2e a03_5 走功能
-    /// 断言 + 如实报告),暂存/覆盖/flush 的时序行为在此直接构造。
+    /// REQ-012 A03 判据 A03-5(路由与在途;驱动单测,P2 重做):**真实迁移**
+    /// 的在途窗口意图语义。两分片 Session,玩家身体(source = Some)真实走过
+    /// 片 (0,0) 本体区边界(步进意图 + 越界拍位姿直写兜底,a04_1 同口径),
+    /// 逐拍检测 `in_transit_entities`(恰隔 1 拍:tick N 末产出信封、tick N+1
+    /// 前缀重建),调用顺序照 `run` 循环(reap → flush → follow;本用例无
+    /// 附身,reap/follow 空转,列出仅为顺序一致)。三种情形:
+    /// - (a) 在途发"停下" → 下一拍 flush 投递,intent_deferred +1,之后
+    ///   60 拍位移 < 2 cm;
+    /// - (b) 同窗两条(先"走"后"停下")→ 只有后一条生效,intent_overwritten +1;
+    /// - (c) P1 情形:在途发"走"(进暂存),下一拍(已落地)直接投"停下"
+    ///   成功 → flush 不得再把暂存的"走"投出去盖掉"停下"(P1 修法 = 直接
+    ///   投递成功清暂存;修前本情形主体继续走 = 红)。
     ///
-    /// 口径:owner 查不到 = 迁移在途窗口的驱动侧可见形态(与信封在途的
-    /// Session 层采样一致,A04 R1 实证的丢意图窗口)。附身权威(A03-4)与
-    /// 端到端行走(e2e a03_5)不进本用例。
+    /// 真实网络栈构造不出 1 拍窗口(TCP 帧粒度 ~10 拍,e2e a03_5 如实报告
+    /// 不硬断言);驱动级直接驱动 Session + 编排器,判定与生产同一实现。
     #[test]
     fn a03_inflight_intent_stash_overwrite_and_flush() {
-        let config = test_config(600);
-        let mut session = session_with_one_shard(&config);
-        let mut log = sim_api::log::CommandLog::new();
-        let mut orchestrator = ObserveOrchestrator::new(ObserveCadence::default(), 0);
-        let mut counters = AgentCounters::default();
-
-        let e = types::EntityId::from_parts(0, 7);
-        let player = messaging::InputSource(1);
-
-        // ① 主体不存在(owner 查不到 = 在途窗口形态):意图暂存。
-        orchestrator.send_intent(player, e, (0.0, 0.0), 0.0, false, &mut session, &mut log);
-        assert_eq!(orchestrator.pending_intents.len(), 1, "在途意图进暂存");
-        assert_eq!(
-            counters.intent_deferred + orchestrator.agent_counters.intent_deferred,
-            1
-        );
-        counters = counters + orchestrator.agent_counters_delta();
-        assert_eq!(counters.intent_deferred, 1, "延后计数 +1");
-
-        // ② 同窗再来两条:只留最后一条,被覆盖的两条计数。
-        orchestrator.send_intent(player, e, (1.0, 0.0), 0.0, false, &mut session, &mut log);
-        orchestrator.send_intent(player, e, (2.0, 0.0), 0.0, false, &mut session, &mut log);
-        counters = counters + orchestrator.agent_counters_delta();
-        assert_eq!(orchestrator.pending_intents.len(), 1, "同窗只留最后一条");
-        assert_eq!(counters.intent_overwritten, 2, "被覆盖的计数 +2");
-        assert_eq!(counters.intent_deferred, 3, "每条暂存都计延后");
-
-        // ③ 主体出现(生成 + tick 应用 claim ownership):flush 投递最后一条。
+        // 两分片、带 capsule 注册表(a04 agent_sim 同款:生产配置 + 注册表)。
         let bodies = {
             let mut b = physics_sim::BodyRegistry::new();
             b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
@@ -2747,60 +2737,327 @@ mod tests {
             b
         };
         let hash = bodies.hash_of("capsule").expect("capsule 已装");
-        // 生成主体:换带 capsule 注册表的分片(SpawnAgent 的内核校验查哈希
-        // 在注册表;sim() 的 SimpleRegistry 不含)——re-register 会顶掉旧分片
-        // (Session::register 对已注册分片 panic?看签名——用新 Session 最稳,
-        // 暂存表与 Session 无关,直接换)。
-        let mut session = sim_api::session::Session::new(config.session_config());
-        session.register(physics_sim::ShardSim::new_with_bodies(
-            {
-                let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
-                cfg.solidify.enabled = false;
-                cfg.cohesion.enabled = false;
-                cfg
-            },
-            Box::new(SimpleRegistry::builtin()),
-            bodies,
-        ));
-        session
-            .spawn_agent(
-                shard_id(0, 0),
-                e,
-                hash,
-                types::EntityState {
-                    translation: Vec3::new(24.0, 1.95, 24.0),
-                    ..types::EntityState::default()
+        let agent_sim = |x: i32, z: i32| {
+            physics_sim::ShardSim::new_with_bodies(
+                {
+                    let mut cfg = physics_sim::ShardSimConfig::new(shard_id(x, z));
+                    cfg.solidify.enabled = false;
+                    cfg.cohesion.enabled = false;
+                    cfg
                 },
+                Box::new(SimpleRegistry::builtin()),
+                bodies.clone(),
             )
-            .expect("生成");
-        session.tick();
-        let before = log.to_bytes().len();
-        orchestrator.flush_pending_intents(&mut session, &mut log);
-        counters = counters + orchestrator.agent_counters_delta();
-        assert!(orchestrator.pending_intents.is_empty(), "投递后暂存清空");
-        assert!(log.to_bytes().len() > before, "投递经日志(回放确定性)");
-        // 投的是最后一条(move_xz = (2.0, 0.0))。
-        let entries = sim_api::log::CommandLog::from_bytes(&log.to_bytes())
-            .expect("日志可解")
-            .take()
-            .into_iter()
-            .filter(|entry| {
-                matches!(
-                    entry.command,
-                    messaging::SimCommand::AgentIntent {
-                        move_xz: (2.0, 0.0),
-                        ..
+        };
+        let flat = || {
+            let mut chunk = voxel::Chunk::air();
+            let stone = types::BlockId(1);
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    chunk.set(x, 64, z, stone);
+                }
+            }
+            chunk
+        };
+        let mk_session = || {
+            let config = test_config(600);
+            let mut session = sim_api::session::Session::new(config.session_config());
+            session.register(agent_sim(0, 0));
+            session.register(agent_sim(1, 0));
+            for sx in 0..2i32 {
+                let shard = shard_id(sx, 0);
+                for cx in (8 * sx)..(8 * sx + 8) {
+                    for cz in 0..8 {
+                        session.apply_chunk_load(shard, types::ChunkPos::new(cx, cz), flat());
                     }
-                )
-            })
-            .count();
-        assert_eq!(entries, 1, "flush 投递的是同窗最后一条");
-        assert_eq!(counters.intent_deferred, 3, "flush 成功不再计延后");
+                }
+            }
+            session
+        };
+        let player = messaging::InputSource(1);
+        let e = types::EntityId::from_parts(0, 7);
 
-        // ④ 再 flush:无暂存,无新日志。
-        let before2 = log.to_bytes().len();
-        orchestrator.flush_pending_intents(&mut session, &mut log);
-        assert_eq!(log.to_bytes().len(), before2, "无暂存无投递");
+        /// 场景驱动器:生成玩家身体于 (0,0) 近边界,真实走过 x = 128;每拍
+        /// tick 后按 `run` 循环顺序跑 reap → flush(附身表空,reap/follow
+        /// 空转,列出仅为顺序一致)。命令投递在 flush 之前(生产 run 的命令
+        /// 分支先于 tick 末端编排)。
+        struct Run {
+            session: sim_api::session::Session,
+            log: sim_api::log::CommandLog,
+            orchestrator: ObserveOrchestrator,
+            /// 逐拍采到的迁移在途拍号(tick N 末信封在 Router)。
+            in_transit_ticks: Vec<u64>,
+            /// 在途窗口后的第一拍(落地拍)。
+            landed_tick: Option<u64>,
+            player: messaging::InputSource,
+            entity: types::EntityId,
+        }
+
+        impl Run {
+            fn walk_intent(&mut self, mv: (f32, f32)) {
+                // 在途窗口(恰 1 拍)直接投递必被拒(Rejected);意图是保持
+                // 状态,窗口拍跳过等价(保持的力由内核迁移载荷延续)。
+                if self.session.in_transit_entities().contains(&self.entity) {
+                    return;
+                }
+                let entry = self
+                    .session
+                    .send_agent_intent_to(self.player, self.entity, mv, 0.0, false)
+                    .expect("意图入日志");
+                self.log.append(entry);
+            }
+
+            /// 拍循环一次(生产 run 的一轮迭代):tick → 消费/编排(等价
+            /// 命令分支 `pre` → reap → flush → follow)→ 在途采样(tick N
+            /// 末产出的信封在 tick N+1 前可见;采样后进入下一拍)。`pre`
+            /// 对应生产里 select 命令分支的消费点。
+            fn tick_end(&mut self, pre: impl FnOnce(&mut Self)) {
+                self.session.tick();
+                let t = self.session.tick_now().0 - 1;
+                let in_transit = self.session.in_transit_entities().contains(&self.entity);
+                pre(self);
+                self.orchestrator
+                    .reap_removed_agents(&self.session, &OutboundHub::new());
+                self.orchestrator
+                    .flush_pending_intents(&mut self.session, &mut self.log);
+                if in_transit {
+                    self.in_transit_ticks.push(t);
+                } else if self.landed_tick.is_none() && !self.in_transit_ticks.is_empty() {
+                    self.landed_tick = Some(t);
+                }
+            }
+
+            /// 静置采样:推进 `ticks` 拍(无命令),返回前后主体位置。
+            fn settle(&mut self, ticks: u64) -> (types::glam::Vec3, types::glam::Vec3) {
+                let p0 = self
+                    .session
+                    .agent_root_position(self.entity)
+                    .expect("主体在场");
+                for _ in 0..ticks {
+                    self.tick_end(|_| {});
+                }
+                let p1 = self
+                    .session
+                    .agent_root_position(self.entity)
+                    .expect("主体在场");
+                (p0, p1)
+            }
+
+            fn counters(&mut self) -> AgentCounters {
+                self.orchestrator.agent_counters_delta()
+            }
+
+            fn in_flight(&self) -> bool {
+                !self.in_transit_ticks.is_empty()
+            }
+        }
+
+        let mk_run = || Run {
+            session: mk_session(),
+            log: sim_api::log::CommandLog::new(),
+            orchestrator: ObserveOrchestrator::new(ObserveCadence::default(), 0),
+            in_transit_ticks: Vec::new(),
+            landed_tick: None,
+            player,
+            entity: e,
+        };
+
+        // 生成玩家身体(Session 正路 spawn_agent_from 盖章入日志,source =
+        // Some(1) = 驱动网络路径 handle_spawn_agent 的同一内核入口);再走
+        // 意图到边界:意图是保持状态,持续施力,主体 5.6 m/s 走 8 m 到
+        // x > 126 约需 25+ 拍;越界拍 tick 末产出 MigrateAgent 信封。意图
+        // 一直发到检测到在途窗口为止(窗口出现 = 真实迁移已触发)。
+        let spawn_and_walk_to_transit = |r: &mut Run| {
+            let entry = r
+                .session
+                .spawn_agent_from(
+                    player,
+                    shard_id(0, 0),
+                    e,
+                    hash,
+                    types::EntityState {
+                        translation: Vec3::new(120.0, 1.95, 8.0),
+                        rotation: types::glam::Quat::from_rotation_y(0.0),
+                        ..types::EntityState::default()
+                    },
+                )
+                .expect("生成(source = Some(1))");
+            r.log.append(entry);
+            r.session.tick();
+            for _ in 0..200 {
+                if r.in_flight() {
+                    break;
+                }
+                r.walk_intent((5.6, 0.0));
+                r.tick_end(|_| {});
+            }
+            assert!(
+                r.in_flight(),
+                "布景自检:200 拍内必出现真实迁移在途窗口(出生 120 → 边界 128)"
+            );
+        };
+
+        // 计数器累计(delta = mem::take,每次取走即清;各情形独立累计)。
+        let mut total = AgentCounters::default();
+
+        // ---- 情形 (a):在途发"停下" → 下一拍投递,60 拍位移 < 2 cm ----
+        {
+            let mut r = mk_run();
+            spawn_and_walk_to_transit(&mut r);
+            // 在途拍发"停下"(send_intent 走暂存分支)。
+            let stop_tick = r.session.tick_now().0;
+            r.orchestrator.send_intent(
+                player,
+                e,
+                (0.0, 0.0),
+                0.0,
+                false,
+                &mut r.session,
+                &mut r.log,
+            );
+            total = total + r.counters();
+            assert_eq!(total.intent_deferred, 1, "(a) 暂存计延后 +1");
+            assert_eq!(r.orchestrator.pending_intents.len(), 1, "(a) 进暂存");
+            r.tick_end(|_| {});
+            total = total + r.counters();
+            assert!(r.orchestrator.pending_intents.is_empty(), "(a) flush 投出");
+            assert_eq!(total.intent_deferred, 1, "(a) flush 不再计延后");
+            // 投递拍 = 落地拍(stop_tick 拍间隙暂存,tick stop_tick 消费信封
+            // = 主体落地,同拍末端 flush 投出)。
+            assert_eq!(
+                r.landed_tick,
+                Some(stop_tick),
+                "(a) 在途发停下,下一拍(落地拍)投递"
+            );
+            // 日志里恰好一条零意图(暂存投出;行走意图 mv = (5.6, 0) 不混入)。
+            let stop_entries = sim_api::log::CommandLog::from_bytes(&r.log.to_bytes())
+                .expect("日志可解")
+                .take()
+                .into_iter()
+                .filter(|entry| {
+                    entry.command
+                        == messaging::SimCommand::AgentIntent {
+                            entity: e,
+                            move_xz: (0.0, 0.0),
+                            yaw: 0.0,
+                            jump: false,
+                        }
+                })
+                .count();
+            assert_eq!(stop_entries, 1, "(a) 只投了一条停下");
+            // 停下生效:先等刹车完成(5.6 m/s、τ 0.2 → 刹车行程 ≈ 1.12 m、
+            // ~75 拍收敛;给 120 拍),再取静置窗口两个 60 拍采样对比
+            // (e2e a03_5 同口径)。
+            r.settle(120);
+            let (p0, p1) = r.settle(60);
+            assert!(
+                p0.distance(p1) < 0.02,
+                "(a) 停下后 60 拍位移 {} ≥ 2 cm(停下未生效)",
+                p0.distance(p1)
+            );
+        }
+
+        // ---- 情形 (b):同窗两条(先"走"后"停下")→ 只有后一条生效 ----
+        {
+            let mut r = mk_run();
+            spawn_and_walk_to_transit(&mut r);
+            // 同窗两条:先"走"后"停下"——只留最后一条。
+            r.orchestrator.send_intent(
+                player,
+                e,
+                (5.6, 0.0),
+                0.0,
+                false,
+                &mut r.session,
+                &mut r.log,
+            );
+            r.orchestrator.send_intent(
+                player,
+                e,
+                (0.0, 0.0),
+                0.0,
+                false,
+                &mut r.session,
+                &mut r.log,
+            );
+            let c = r.counters();
+            assert_eq!(c.intent_overwritten, 1, "(b) 同窗覆盖计 +1");
+            assert_eq!(c.intent_deferred, 2, "(b) 每条暂存都计延后");
+            assert_eq!(r.orchestrator.pending_intents.len(), 1, "(b) 只留最后");
+            r.tick_end(|_| {});
+            assert!(
+                r.orchestrator.pending_intents.is_empty(),
+                "(b) flush 投出最后一条"
+            );
+            // 落地后停下生效(最后一条是零意图):等刹车完成后取静置窗口。
+            r.settle(120);
+            let (p0, p1) = r.settle(60);
+            assert!(
+                p0.distance(p1) < 0.02,
+                "(b) 同窗两条只有后一条生效:60 拍位移 {} ≥ 2 cm",
+                p0.distance(p1)
+            );
+        }
+
+        // ---- 情形 (c):P1 缺陷——在途发"走",下一拍直接投"停下" ----
+        // 修前:直接投递成功不清暂存,flush 把"走"再投一遍排在"停下"后面
+        // (内核取最后一条),主体继续走 = 红。修后:直接投递成功清暂存
+        // (计入被覆盖),只投"停下",主体停住。
+        {
+            let mut r = mk_run();
+            spawn_and_walk_to_transit(&mut r);
+            // 拍 N(在途):发"走"(进暂存;生产探针 mode1 的 t=96)。
+            r.orchestrator.send_intent(
+                player,
+                e,
+                (5.6, 0.0),
+                0.0,
+                false,
+                &mut r.session,
+                &mut r.log,
+            );
+            assert_eq!(r.orchestrator.pending_intents.len(), 1, "(c) 走进暂存");
+            // 拍 N+1(tick 消费信封 = 主体落地;本轮 pre 前主体已查得到
+            // owner):发"停下"直接投成功(t=97 的 next-tick stop)。
+            r.tick_end(|r2| {
+                assert!(
+                    !r2.session.in_transit_entities().contains(&e),
+                    "(c) 此刻已落地(owner 查得到)"
+                );
+                r2.orchestrator.send_intent(
+                    player,
+                    e,
+                    (0.0, 0.0),
+                    0.0,
+                    false,
+                    &mut r2.session,
+                    &mut r2.log,
+                );
+            });
+            let c = r.counters();
+            assert!(
+                r.orchestrator.pending_intents.is_empty(),
+                "(c) P1 修法:直接投递成功清掉暂存的旧意图"
+            );
+            assert_eq!(c.intent_overwritten, 1, "(c) 被清的旧条目计被覆盖 +1");
+            // flush:无暂存可投("停下"不会被盖掉)。
+            let before = r.log.to_bytes().len();
+            r.orchestrator
+                .flush_pending_intents(&mut r.session, &mut r.log);
+            assert_eq!(
+                r.log.to_bytes().len(),
+                before,
+                "(c) flush 无暂存无投递(停下不被盖)"
+            );
+            // 主体停住:等刹车完成后取静置窗口 60 拍位移 < 2 cm。
+            r.settle(120);
+            let (p0, p1) = r.settle(60);
+            assert!(
+                p0.distance(p1) < 0.02,
+                "(c) P1:直接投递后 60 拍位移 {} ≥ 2 cm(旧暂存盖掉了停下)",
+                p0.distance(p1)
+            );
+        }
     }
 
     /// REQ-012 A03 判据 A03-10(检查点恢复;驱动 run 级):恢复(bootstrap
