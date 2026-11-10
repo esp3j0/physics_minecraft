@@ -579,6 +579,18 @@ pub struct ShardSim {
     /// 摩擦清零不受本开关影响(对照的被测操作是接缝修正,不是摩擦方案,
     /// capsule demo fix0 同款口径)。
     pub(crate) seam_fix_enabled: bool,
+    /// 本拍的全局主体形状表(REQ-012 §6"暂缓写入",A05):调度器每拍开始
+    /// 下发的"上一拍末全部主体连杆位姿";重叠判定只查本表,不查 `agents`
+    /// (拥有格与持有副本判定一致)。**派生状态,不进快照**——恢复后由
+    /// 调度器重算;恢复线首拍前调度器必然已注入(空表 = 无主体,判定恒
+    /// false,与"无主体"世界行为一致)。
+    pub(crate) agent_shapes: crate::agent_shape::AgentShapeTable,
+    /// SetBlock 暂缓队列(REQ-012 §6,A05):与主体连杆重叠的外部实心写入
+    /// 不落体素,格 → 待写的实心方块(每格只留最后一条,替换旧条目;同格
+    /// 非实心写入作废条目)。每拍开始(形状表到位后、命令处理前)按
+    /// `BlockPos` 升序重试,不再重叠即按 SetBlock 同一条写入路径补写。
+    /// **随分片快照走**(检查点 v9)。
+    pub(crate) deferred_set_blocks: BTreeMap<BlockPos, BlockId>,
 }
 
 /// 撞击冲量流的按实体事件累计(F02a,§5.7.1;`evaluate_impacts` 采样)。
@@ -654,6 +666,8 @@ impl ShardSim {
             step_tick: Tick::ZERO,
             walker_holds: BTreeMap::new(),
             seam_fix_enabled: true,
+            agent_shapes: crate::agent_shape::AgentShapeTable::default(),
+            deferred_set_blocks: BTreeMap::new(),
         }
     }
 
@@ -687,6 +701,30 @@ impl ShardSim {
     /// 布景真的会碰接缝问题)。生产路径恒开(默认 true,不入快照)。
     pub fn set_seam_fix_for_test(&mut self, enabled: bool) {
         self.seam_fix_enabled = enabled;
+    }
+
+    /// 注入本拍的全局主体形状表(REQ-012 §6"暂缓写入",A05):调度器在
+    /// 每拍分片步进之前,按**上一拍末**全部主体的连杆碰撞体与世界位姿
+    /// (迁移在途取 Router 信封)汇总下发。派生状态,**不进快照**——恢复后
+    /// 由调度器从快照主体状态与在途信封重算。空表 = 无主体,所有重叠判定
+    /// 短路为 false(无主体时暂缓路径一次都不走,AC-A05-10)。
+    pub fn set_agent_shape_table(&mut self, table: crate::agent_shape::AgentShapeTable) {
+        self.agent_shapes = table;
+    }
+
+    /// 本拍形状表只读视图(测试/调度器汇总用)。
+    pub fn agent_shape_table(&self) -> &crate::agent_shape::AgentShapeTable {
+        &self.agent_shapes
+    }
+
+    /// SetBlock 暂缓队列只读视图(测试观测口):格 → 被暂缓的实心方块。
+    pub fn deferred_set_blocks(&self) -> &BTreeMap<BlockPos, BlockId> {
+        &self.deferred_set_blocks
+    }
+
+    /// 暂缓队列长度瞬时值(A05 遥测:调度器按分片求和下发)。
+    pub fn deferred_set_block_count(&self) -> usize {
+        self.deferred_set_blocks.len()
     }
 
     /// 体素世界只读视图(测试/导出用)。
@@ -1203,6 +1241,14 @@ impl ShardSim {
     /// 用的是更新后的速度,放行评论风险 1;05c:补偿紧接 `phys.step()`
     /// 之后——凝固桥会删实体、迁移检测会移出实体,先收集再处理,风险 1)。
     pub fn step(&mut self) {
+        // A05 暂缓补写(REQ-012 §6):形状表已由调度器在拍首注入,先于本拍
+        // 命令重试暂缓队列——按 `BlockPos` 升序,不再重叠即按 SetBlock 同一
+        // 条写入路径补写(`block_updates` 记 `External`、地形唤醒、坍塌/承载
+        // 触发照常);仍重叠的留下。补写计"补写"。注意补写发生在 step 内
+        // (调度器 tick 的 apply_prefix 与 step 同拍):owner 分片补写产出的
+        // `External` 条目由调度器发布,holder 分片的副本由广播命令同拍送达
+        // (同一表 ⇒ 同样暂缓/补写,判定一致)。
+        self.flush_deferred_set_blocks();
         self.prestep_contact_wake();
         // 撞击接近速度的基准(§5 修订 9):各醒着动态实体本步之前的线速度,
         // 供 `evaluate_impacts` 使用(解算后的速度已被冲量修改)。
@@ -1332,6 +1378,34 @@ impl ShardSim {
                 && (slow_ticks >= cfg.consecutive_ticks || is_sleeping)
             {
                 if let Some(shape) = desc.shape() {
+                    // A05(REQ-012 §6):任一目标格与本拍全局形状表重叠 ⇒
+                    // 整体本拍不转换(复合体只要有一格重叠,整体都不转),
+                    // 实体保持为实体,下一拍再试。不先删实体再排队写块
+                    // (不出现方块消失、总数不守恒的窗口);计"凝固暂缓"。
+                    // 表为空时短路(无主体世界零开销,AC-A05-10)。
+                    if !self.agent_shapes.is_empty() {
+                        let snap_cells: Vec<BlockPos> = shape
+                            .cells()
+                            .iter()
+                            .map(|c| {
+                                let r = state.rotation
+                                    * types::glam::Vec3::new(
+                                        c.offset[0] as f32,
+                                        c.offset[1] as f32,
+                                        c.offset[2] as f32,
+                                    );
+                                crate::settle::cell_of(
+                                    state.translation.x + r.x,
+                                    state.translation.y + r.y,
+                                    state.translation.z + r.z,
+                                )
+                            })
+                            .collect();
+                        if self.agent_shapes.overlaps_any(&snap_cells) {
+                            self.outbox.cohesion_stats.solidify_deferred += 1;
+                            continue;
+                        }
+                    }
                     // ---- 复合体:整块凝固(REQ-010 §8.1、§8.3 第 1、2 条)。
                     // "被占" = 目标格是地形实心,或与其他实体的碰撞体重叠——
                     // 实体的格集合 = 各格中心所在格(单格 = 中心格,复合体 =
@@ -1467,6 +1541,13 @@ impl ShardSim {
                     let ang_err = solidify::snap_angle_error(state.rotation, snapped);
                     let too_far =
                         disp > cfg.max_snap_blocks || ang_err > cfg.max_snap_angle_deg.to_radians();
+                    // A05(REQ-012 §6):凝固落点格与主体连杆重叠 ⇒ 本拍不
+                    // 转换,实体保持为实体,下一拍再试;计"凝固暂缓"。判定在
+                    // 判据(慢速/睡)之后——只有本会触发凝固的实体才查表。
+                    if !self.agent_shapes.is_empty() && self.agent_shapes.overlaps(cell) {
+                        self.outbox.cohesion_stats.solidify_deferred += 1;
+                        continue;
+                    }
                     // 凝固落点须有支撑邻接(REQ-010 终审返修 1,**仅在承载判定
                     // 开启时**):目标格 6 邻中至少一个实心格(未装载 chunk 与
                     // 世界底按有地基,同接地口径)。悬浮在坑/洞上的落点(正下方
@@ -2912,6 +2993,16 @@ impl ShardSim {
                         continue; // 前置不满足:推迟(留在 forced_pending,同单格柱缺)
                     }
                     crate::cohesion::CompoundLanding::Write { cells } => {
+                        // A05(REQ-012 §6):任一落点格与全局形状表重叠 ⇒
+                        // 整体本拍不落地,实体保持为实体,留在队列下一拍再试
+                        // (不许先删实体再排队写块);计"落地暂缓"。
+                        if !self.agent_shapes.is_empty() {
+                            let cells: Vec<BlockPos> = cells.iter().map(|(c, _)| *c).collect();
+                            if self.agent_shapes.overlaps_any(&cells) {
+                                self.outbox.cohesion_stats.forced_landing_deferred += 1;
+                                continue;
+                            }
+                        }
                         // 整块平移后的落点同拍写入(Emergent + 触发 + 唤醒)。
                         for (cell, block) in &cells {
                             let old_block = self.voxels.get_block(*cell);
@@ -2948,6 +3039,29 @@ impl ShardSim {
                         // §4.8 的单格规则落地;先落的格写入体素,对后落的格算
                         // 占用;柱下没有实心的格虚空消失(不写)。整块强制落地
                         // 退化一次计 1(§8.3 第 7 条)。
+                        // A05(REQ-012 §6):退化前先按形状各格当前所在格判
+                        // 重叠——任一格与主体重叠 ⇒ 整体本拍不落地(留队,
+                        // 计"落地暂缓"),不在逐格写入中途插暂缓(保证"总数
+                        // 守恒、无方块消失窗口"对退化路径同样成立)。
+                        if !self.agent_shapes.is_empty() {
+                            let start_cells: Vec<BlockPos> = shape
+                                .cells()
+                                .iter()
+                                .map(|c| {
+                                    let r = rot
+                                        * types::glam::Vec3::new(
+                                            c.offset[0] as f32,
+                                            c.offset[1] as f32,
+                                            c.offset[2] as f32,
+                                        );
+                                    crate::settle::cell_of(pos.x + r.x, pos.y + r.y, pos.z + r.z)
+                                })
+                                .collect();
+                            if self.agent_shapes.overlaps_any(&start_cells) {
+                                self.outbox.cohesion_stats.forced_landing_deferred += 1;
+                                continue;
+                            }
+                        }
                         for cell in shape.cells() {
                             let r = rot
                                 * types::glam::Vec3::new(
@@ -3043,6 +3157,10 @@ impl ShardSim {
             };
             // 借用收口:landing 计算的闭包借用 self.entities/VoxelWorld,块内
             // 结束后才能 &mut 移除实体。
+            // A05(REQ-012 §6):落点列与主体重叠 ⇒ 本拍不落地(留队下一拍,
+            // 计"落地暂缓")。判在 landing 计算之后——口径 = **要写的格**
+            // (landing)与形状表重叠才暂缓;landing 为 None(虚空移除)不涉
+            // 及写块,不暂缓。不重叠时行为逐位不变。
             let landing = {
                 let overlaps = |b: BlockPos| -> bool {
                     self.entities.iter().any(|(other, orec)| {
@@ -3079,6 +3197,12 @@ impl ShardSim {
                 self.activation_events.void_removals += 1;
                 continue;
             };
+            // A05(REQ-012 §6):要写的格与主体连杆重叠 ⇒ 本拍不落地,实体
+            // 保持为实体、留队下一拍再试(总数守恒,无消失窗口)。
+            if !self.agent_shapes.is_empty() && self.agent_shapes.overlaps(landing) {
+                self.outbox.cohesion_stats.forced_landing_deferred += 1;
+                continue;
+            }
             // 落点写块(Emergent)+ despawn(与凝固桥同产出;复用 REQ-005
             // 广播持久化)。
             let old_block = self.voxels.get_block(landing);
@@ -3186,6 +3310,44 @@ impl ShardSim {
             return;
         }
         self.pending_terrain_wakes.insert(cell);
+    }
+
+    /// SetBlock 暂缓队列重试(REQ-012 §6,A05):每拍开始(形状表到位后、
+    /// 命令处理前)按 `BlockPos` 升序重试;不再重叠的条目按 SetBlock 同一
+    /// 条写入路径落体素(计"补写"),仍重叠的留下。主体被移除 ⇒ 表里没有
+    /// 它 ⇒ 下一拍自然补写。
+    fn flush_deferred_set_blocks(&mut self) {
+        if self.deferred_set_blocks.is_empty() {
+            return;
+        }
+        let pending: Vec<BlockPos> = self.deferred_set_blocks.keys().copied().collect();
+        for pos in pending {
+            if self.agent_shapes.overlaps(pos) {
+                continue; // 仍重叠:留在队列,下一拍再试
+            }
+            let block = self
+                .deferred_set_blocks
+                .remove(&pos)
+                .expect("键取自本表(fail-stop)");
+            // 与 SetBlock 命令臂同一条写入路径(触发登记要写前的方块)。
+            let old_block = self.voxels.get_block(pos);
+            let edit = VoxelEdit::new().set(pos, block);
+            match edit.apply(&mut self.voxels) {
+                Ok(dirty) => {
+                    self.defer_chunk_collider_rebuild(dirty);
+                    self.outbox.block_updates.push(BlockWrite {
+                        pos,
+                        block,
+                        kind: BlockWriteKind::External,
+                        load_conversion: false,
+                    });
+                    self.register_terrain_write(pos);
+                    self.register_collapse_trigger(pos, old_block, block);
+                    self.outbox.cohesion_stats.set_block_deferred_flushed += 1;
+                }
+                Err(e) => panic!("SetBlock 暂缓补写越界(fail-stop):{e}"),
+            }
+        }
     }
 
     /// 坍塌/承载触发登记(REQ-009 §6.2.1、REQ-010 §4.6 第 2 条):写入前后
@@ -4292,6 +4454,24 @@ impl ShardSim {
     fn apply_command(&mut self, cmd: SimCommand, source: InputSource) {
         match cmd {
             SimCommand::SetBlock { pos, block } => {
+                // A05(REQ-012 §6"暂缓写入"):外部实心写入与主体连杆重叠
+                // → 不写体素,进暂缓队列(判定只查本拍形状表,不查 agents;
+                // owner 与 holder 收到同一命令 + 同一表 ⇒ 结论一致)。写空气
+                // 和非实心方块从不暂缓;同格已有暂缓条目时,实心替换(计
+                // "被替换")、非实心直接写入并作废(计"被作废")。
+                if self.registry.material(block).is_some() {
+                    if self.agent_shapes.overlaps(pos) {
+                        let stats = &mut self.outbox.cohesion_stats;
+                        if self.deferred_set_blocks.insert(pos, block).is_some() {
+                            stats.set_block_deferred_replaced += 1;
+                        } else {
+                            stats.set_block_deferred += 1;
+                        }
+                        return;
+                    }
+                } else if let Some(_stale) = self.deferred_set_blocks.remove(&pos) {
+                    self.outbox.cohesion_stats.set_block_deferred_invalidated += 1;
+                }
                 // 触发登记要写前的方块(实心性与方块比较都用它)。
                 let old_block = self.voxels.get_block(pos);
                 let edit = VoxelEdit::new().set(pos, block);
@@ -4721,15 +4901,33 @@ impl ShardSim {
                 continue;
             }
             let pos = conv::rapier_to_vec3(body.translation());
-            let Some(impulse) = crate::explosion::explosion_impulse(center, power, radius, pos)
-            else {
-                continue;
+            // A05(REQ-012 §6"爆炸:对每个连杆施加冲量"):主体按连杆遍历——
+            // 每个连杆取其**连杆中心**的 `explosion_impulse`(与普通实体同一
+            // 公式同一支点),施加到主体刚体。单连杆 = 旧路径逐位相同(唯一
+            // 连杆即根,中心 = 根位置,同一个 `apply_impulse` 调用)。多连杆
+            // (B01)时每连杆各自求冲量、施加到同一根刚体(单刚体多 collider
+            // 的合成;按连杆遍历、不写死根连杆)。非主体实体 = 旧路径逐位不变。
+            let link_centers: Vec<Vec3> = match self.agents.get(&id) {
+                None => vec![pos],
+                Some(record) => record
+                    .links
+                    .values()
+                    .filter_map(|&lh| {
+                        self.phys
+                            .bodies
+                            .get(lh)
+                            .map(|lb| conv::rapier_to_vec3(lb.translation()))
+                    })
+                    .collect(),
             };
-            self.phys
-                .bodies
-                .get_mut(rec.handle)
-                .expect("handle 有效")
-                .apply_impulse(conv::vec3_to_rapier(impulse), true);
+            let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
+            for center_of_link in link_centers {
+                if let Some(imp) =
+                    crate::explosion::explosion_impulse(center, power, radius, center_of_link)
+                {
+                    body.apply_impulse(conv::vec3_to_rapier(imp), true);
+                }
+            }
         }
         // 地形破坏(REQ-009 §4.1):D7 起默认开启;实体冲量仍按原半径
         // (REQ-001 §4.2 不变),地形求值在冲量之后。

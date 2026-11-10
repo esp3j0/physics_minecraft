@@ -151,6 +151,22 @@ pub struct CohesionStats {
     /// 复合体冲量流修正次数(G02,§5.8.4;施加给对方刚体或加到对方分块
     /// 请求都计)。
     pub compound_flow_corrections: u64,
+    /// SetBlock 暂缓数(REQ-012 §6"暂缓写入",A05):外部实心写入因与主体
+    /// 连杆重叠而未落体素、进暂缓队列的次数。
+    pub set_block_deferred: u64,
+    /// 暂缓条目被同格新实心写入替换的次数(A05)。
+    pub set_block_deferred_replaced: u64,
+    /// 暂缓条目被同格非实心写入作废的次数(A05)。
+    pub set_block_deferred_invalidated: u64,
+    /// 暂缓补写数(A05):暂缓条目在本拍重试中不再重叠、按 SetBlock 同一
+    /// 写入路径落体素的次数。
+    pub set_block_deferred_flushed: u64,
+    /// 凝固暂缓数(A05):单格或复合体凝固因目标格与主体重叠而本拍不转换
+    /// 的次数(复合体按整体计 1)。
+    pub solidify_deferred: u64,
+    /// 强制落地暂缓数(A05):单格或复合体强制落地因目标格与主体重叠而
+    /// 本拍不落地的次数(复合体按整体计 1)。
+    pub forced_landing_deferred: u64,
 }
 
 impl CohesionStats {
@@ -184,6 +200,12 @@ impl CohesionStats {
         self.compound_flow_breaks += other.compound_flow_breaks;
         self.compound_flow_detached_cells += other.compound_flow_detached_cells;
         self.compound_flow_corrections += other.compound_flow_corrections;
+        self.set_block_deferred += other.set_block_deferred;
+        self.set_block_deferred_replaced += other.set_block_deferred_replaced;
+        self.set_block_deferred_invalidated += other.set_block_deferred_invalidated;
+        self.set_block_deferred_flushed += other.set_block_deferred_flushed;
+        self.solidify_deferred += other.solidify_deferred;
+        self.forced_landing_deferred += other.forced_landing_deferred;
     }
 }
 
@@ -1298,6 +1320,12 @@ mod tests {
             compound_flow_breaks: 26 * k,
             compound_flow_detached_cells: 27 * k,
             compound_flow_corrections: 28 * k,
+            set_block_deferred: 29 * k,
+            set_block_deferred_replaced: 30 * k,
+            set_block_deferred_invalidated: 31 * k,
+            set_block_deferred_flushed: 32 * k,
+            solidify_deferred: 33 * k,
+            forced_landing_deferred: 34 * k,
         };
         let (a, b) = (mk(1), mk(100));
         let mut sum = a;

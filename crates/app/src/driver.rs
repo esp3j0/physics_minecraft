@@ -582,7 +582,12 @@ pub struct DriverOutcome {
 /// `ShardSimConfig.agent_mass_scale`(§4)——v7 及更早档解码必失败/版本
 /// 拒绝,必须清 `data_dir`(REQ-012 §3"检查点:格式版本 7 → 8,不做迁移,
 /// 沿用旧档显式拒绝")。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 8;
+/// **v9**(REQ-012 A05,#25):分片快照追加 SetBlock 暂缓队列
+/// (`ShardSimSnapshot.deferred_set_blocks`,§6"暂缓写入")——v8 及更早档
+/// 解码必失败/版本拒绝,必须清 `data_dir`(REQ-012 §3"检查点:A05 把暂缓
+/// 写入队列放进分片快照,版本再升到 9,旧档显式拒绝";全局主体形状表是
+/// 派生状态,不入快照)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 9;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -4506,16 +4511,35 @@ mod tests {
             }
             other => panic!("v7 旧档必须版本拒绝,实为 {:?}", other.is_err()),
         }
+
+        // ⑦ v8(REQ-012 A05,#25 本单元之前的格式):分片快照无暂缓队列
+        //    (REQ-012 §3"A05 把暂缓写入队列放进分片快照,版本再升到 9")→
+        //    版本拒绝,必须清 data_dir。
+        let v8 = CheckpointBundle {
+            format_version: 8,
+            world: mk_world(types::Tick(7)),
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        match decode_checkpoint(&encode_checkpoint(&v8)) {
+            Err(AppError::Decode(msg)) => {
+                assert!(
+                    msg.contains("unsupported checkpoint format version 8"),
+                    "v8 必须明确报版本错误:{msg}"
+                );
+            }
+            other => panic!("v8 旧档必须版本拒绝,实为 {:?}", other.is_err()),
+        }
     }
 
     /// 任务书测试 `checkpoint_v4_rejects_v3`(REQ-007 任务 01/B5):当前版本
     /// 常量已升 7(REQ-010 单元 02;#17 D2 时曾为 5、REQ-009 单元 02 起 6、
-    /// REQ-012 A01 起 8);v3 编码(bundle 形状同构、版本号 3)必须显式版本
-    /// 拒绝。与 `old_checkpoint_version_rejected` ⑤ 相互独立:一个锚行为,
-    /// 一个锚常量。
+    /// REQ-012 A01 起 8、A05 起 9);v3 编码(bundle 形状同构、版本号 3)
+    /// 必须显式版本拒绝。与 `old_checkpoint_version_rejected` ⑤ 相互独立:
+    /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 8, "REQ-012 A01 起 = v8");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 9, "REQ-012 A05 起 = v9");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -4556,7 +4580,7 @@ mod tests {
         let bytes = encode_checkpoint(&v6);
         assert_eq!(
             bytes[0], CHECKPOINT_FORMAT_VERSION as u8,
-            "前缀 = 未压缩 varint 版本(REQ-012 A01 起 8 = 单字节)"
+            "前缀 = 未压缩 varint 版本(REQ-012 A05 起 9 = 单字节)"
         );
         assert!(
             bytes.len() < 50_000,

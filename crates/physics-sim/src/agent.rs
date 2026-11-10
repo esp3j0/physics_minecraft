@@ -206,9 +206,49 @@ impl ShardSim {
         self.bodies.get(body).map(agent_half_size)
     }
 
+    /// 身体各连杆的形状定义引用(A05:调度器给迁移在途主体构造形状表
+    /// 条目用;哈希不在注册表 → None)。
+    pub fn agent_body_link_defs(&self, body: &BodyHash) -> Option<Vec<&[types::ShapeDef]>> {
+        self.bodies
+            .get(body)
+            .map(|def| def.links.iter().map(|l| l.shapes.as_slice()).collect())
+    }
+
     /// 主体数(测试观测口)。
     pub fn agent_count(&self) -> usize {
         self.agents.len()
+    }
+
+    /// 本分片主体的连杆形状表条目(REQ-012 §6"暂缓写入",A05):调度器在
+    /// 每拍步进前汇总全部分片的条目(∪ 在途信封)下发给每个分片。位姿 =
+    /// 连杆刚体的世界位姿;形状与生成层同一映射。EntityId 升序。
+    pub fn agent_shape_entries(&self) -> crate::agent_shape::AgentShapeTable {
+        let mut table = crate::agent_shape::AgentShapeTable::default();
+        for (&id, record) in &self.agents {
+            let def = self
+                .bodies
+                .get(&record.body_hash)
+                .expect("主体身体哈希必在注册表(restore 前置校验,fail-stop)");
+            let links = def
+                .links
+                .iter()
+                .filter_map(|link| {
+                    record.links.get(&link.name).and_then(|&handle| {
+                        self.phys
+                            .bodies
+                            .get(handle)
+                            .map(|rb| crate::agent_shape::AgentLinkEntry {
+                                pose: *rb.position(),
+                                shape: agent_link_shared_shape(&link.shapes),
+                                bound_radius: crate::agent_shape::link_bound_radius(&link.shapes),
+                                center: crate::conv::rapier_to_vec3(rb.translation()),
+                            })
+                    })
+                })
+                .collect();
+            table.links.insert(id, links);
+        }
+        table
     }
 
     /// 主体状态流(REQ-012 A03 §1;`S2C::AgentStates` 下发源,调度器逐分片
@@ -543,6 +583,57 @@ fn shape_collider(s: &types::ShapeDef, mass: f32) -> rapier3d::prelude::Collider
         }
     };
     builder.mass(mass)
+}
+
+/// 连杆形状的 parry 共享形状(A05 形状表用):与 [`agent_collider_builder`]
+/// / [`shape_collider`] 同一映射,只取形状部分、不带质量/材质——重叠判定
+/// 只关心几何。放在 agent_shape.rs 会反向依赖生成层细节,这里与生成层同源。
+/// 连杆形状的 parry 共享形状(A05 形状表用):与 [`agent_collider_builder`]
+/// / [`shape_collider`] 同一映射,只取形状部分、不带质量/材质——重叠判定
+/// 只关心几何。`pub` 供 agent_shape 的信封条目构造复用(同源保证)。
+pub fn agent_link_shared_shape_pub(shapes: &[types::ShapeDef]) -> rapier3d::prelude::SharedShape {
+    agent_link_shared_shape(shapes)
+}
+
+pub(crate) fn agent_link_shared_shape(
+    shapes: &[types::ShapeDef],
+) -> rapier3d::prelude::SharedShape {
+    use rapier3d::prelude::*;
+    if shapes.len() == 1 {
+        return match &shapes[0] {
+            types::ShapeDef::Box { half } => SharedShape::cuboid(half[0], half[1], half[2]),
+            types::ShapeDef::Sphere { radius } => SharedShape::ball(*radius),
+            types::ShapeDef::CapsuleY {
+                half_height,
+                radius,
+            } => SharedShape::capsule_y(*half_height, *radius),
+            types::ShapeDef::ConvexHull { points } => {
+                let pts: Vec<rapier3d::prelude::Vector> =
+                    points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+                SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
+            }
+        };
+    }
+    let parts: Vec<(Pose, SharedShape)> = shapes
+        .iter()
+        .map(|s| {
+            let shape = match s {
+                types::ShapeDef::Box { half } => SharedShape::cuboid(half[0], half[1], half[2]),
+                types::ShapeDef::Sphere { radius } => SharedShape::ball(*radius),
+                types::ShapeDef::CapsuleY {
+                    half_height,
+                    radius,
+                } => SharedShape::capsule_y(*half_height, *radius),
+                types::ShapeDef::ConvexHull { points } => {
+                    let pts: Vec<rapier3d::prelude::Vector> =
+                        points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+                    SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
+                }
+            };
+            (Pose::IDENTITY, shape)
+        })
+        .collect();
+    SharedShape::compound(parts)
 }
 
 /// 主体描述的 half_size:形状最大竖向半包络(足迹/唤醒几何的保守包络;

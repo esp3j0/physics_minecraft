@@ -11,6 +11,7 @@
 
 pub mod activation;
 pub mod agent;
+pub mod agent_shape;
 pub mod cohesion;
 pub mod collider_build;
 pub mod compound_flow;
@@ -29,6 +30,7 @@ mod walker;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
 pub use agent::{AgentRecord, AgentSpawnError, BodyRegistry, BodyRegistryError};
+pub use agent_shape::AgentShapeTable;
 pub use sim::{
     ActivationEvents, BlockWrite, BlockWriteKind, FlowEventInfo, FlowKind, ForcedLandingReason,
     LocomotionState, Outbox, ShardSim, ShardSimConfig, SolidifyConfig, TicketOp, TicketOpRecord,

@@ -828,6 +828,11 @@ impl Session {
         self.scheduler.agent_root_position(entity)
     }
 
+    /// SetBlock 暂缓队列长度按全部分片求和(A05 遥测;测试观测口)。
+    pub fn deferred_set_block_total(&self) -> usize {
+        self.scheduler.deferred_set_block_total()
+    }
+
     /// Router 待投递迁移信封(REQ-012 A03;驱动侧附身清理的"在途不算
     /// 移除"判定)。
     pub fn in_transit_migrations(&self) -> Vec<messaging::Envelope> {

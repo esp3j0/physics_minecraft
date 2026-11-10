@@ -112,6 +112,13 @@ struct ShardSimSnapshot {
     /// 力与朝向去重记忆。checkpoint 落在两个控制拍之间时保持的力非零,
     /// 恢复线必须继续施加(A02-9)。随快照走。
     walker_holds: BTreeMap<EntityId, crate::walker::WalkerHold>,
+    /// SetBlock 暂缓队列(REQ-012 §6"暂缓写入",**v9 追加**):与主体连杆
+    /// 重叠而被暂缓的外部实心写入,格 → 待写方块。checkpoint 落在暂缓与
+    /// 补写之间时恢复线不得丢(判据 A05-9)。随快照走。**布局变化**:v8 档
+    /// 解码失败——需清 data_dir(REQ-012 §3"检查点:A05 把暂缓写入队列放进
+    /// 分片快照,版本升到 9,旧档显式拒绝")。全局主体形状表是派生状态,
+    /// **不进快照**(恢复后调度器按快照主体状态与在途信封重算,§6)。
+    deferred_set_blocks: BTreeMap<types::BlockPos, types::BlockId>,
 }
 
 /// 快照用的世界克隆:状态字段逐域拷贝,三个 serde(skip) 工作区字段取新构造
@@ -203,6 +210,7 @@ impl ShardSim {
             agents: self.agents.clone(),
             step_tick: self.step_tick,
             walker_holds: self.walker_holds.clone(),
+            deferred_set_blocks: self.deferred_set_blocks.clone(),
         };
         bincode::serde::encode_to_vec(&snap, bincode::config::standard())
             .expect("快照编码不可能失败(全字段可序列化,fail-stop)")
@@ -273,6 +281,11 @@ impl ShardSim {
             // 保持的力继续施加)。
             step_tick: snap.step_tick,
             walker_holds: snap.walker_holds,
+            // SetBlock 暂缓队列随快照走(v9;恢复后调度器注入形状表,下一拍
+            // 开始按升序重试补写)。
+            deferred_set_blocks: snap.deferred_set_blocks,
+            // 全局主体形状表不入快照(派生状态;恢复线首拍前由调度器注入)。
+            agent_shapes: crate::agent_shape::AgentShapeTable::default(),
             // 接缝修正开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
             seam_fix_enabled: true,
             bodies,

@@ -27,8 +27,14 @@ use crate::ownership::OwnershipMap;
 use crate::router::{RouteError, Router, RouterConfig, RouterSnapshot};
 
 /// 一个 worker 本拍的批次任务:同 worker 分到的多个分片打包成一个消息
-/// (元素 = (分片, sim 所有权, 本拍输入前缀),ShardId 升序)。
-type WorkerJob = Vec<(ShardId, ShardSim, Vec<StampedInput>)>;
+/// (元素 = (分片, sim 所有权, 本拍输入前缀, 本拍全局主体形状表),
+/// ShardId 升序;形状表全分片同份,A05)。
+type WorkerJob = Vec<(
+    ShardId,
+    ShardSim,
+    Vec<StampedInput>,
+    physics_sim::agent_shape::AgentShapeTable,
+)>;
 
 /// worker 回传:sim 连同本拍产出与激活事件计数(06c 遥测;回传完成顺序不定,
 /// 屏障后进 BTreeMap 归一)。
@@ -42,7 +48,10 @@ fn worker_main(job_rx: Receiver<WorkerJob>, result_tx: SyncSender<WorkerResult>)
     while let Ok(job) = job_rx.recv() {
         let result: WorkerResult = job
             .into_iter()
-            .map(|(shard, mut sim, prefix)| {
+            .map(|(shard, mut sim, prefix, shapes)| {
+                // A05:本拍全局主体形状表注入(在 apply_prefix 之前——SetBlock
+                // 命令的暂缓判定、step 的暂缓重试/凝固/落地判定都查它)。
+                sim.set_agent_shape_table(shapes);
                 sim.apply_prefix(&prefix);
                 sim.step();
                 // H1(REQ-007 任务 03 返修):瞬态体生命周期段并入生产 tick——
@@ -157,6 +166,10 @@ pub struct ActivationTelemetry {
     /// `ActivationEvents::collider_rebuilds` 合计(含生命周期路径的立即重建
     /// 与批量写路径 flush 的统一重建)。
     pub collider_rebuilds: u64,
+    /// SetBlock 暂缓队列长度瞬时值(A05,REQ-012 §6"暂缓写入"遥测):
+    /// **拍末**全部分片的暂缓队列长度之和(分片求和;下一拍开始会按升序
+    /// 重试补写,该值反映"拍末还压着多少条")。
+    pub deferred_set_blocks: u64,
 }
 
 impl ActivationTelemetry {
@@ -1672,6 +1685,36 @@ impl Scheduler {
             }
         }
         self.pending_emergent_spawns = kept_spawns;
+        // 2.5(A05,REQ-012 §6"暂缓写入"):汇总**上一拍末**全部主体的连杆
+        // 形状与位姿,构造本拍的全局主体形状表,注入每个分片。迁移在途的
+        // 主体取 Router 信封里的位姿(信封即"上一拍末"语义:迁移拍步进后
+        // 盖章,apply_at = N+1;body 哈希的形状定义从任一分片注册表取——
+        // 全分片同源)。派生状态,每拍重建,不进快照;恢复线由快照里的
+        // 主体状态与在途信封重算(同一入口)。
+        let mut shape_table = physics_sim::agent_shape::AgentShapeTable::default();
+        for sim in self.sims.values() {
+            for (id, links) in sim.agent_shape_entries().links {
+                shape_table.links.insert(id, links);
+            }
+        }
+        for env in self.router.in_transit_migrations() {
+            if let messaging::EnvelopePayload::MigrateAgent {
+                entity,
+                body,
+                state,
+                ..
+            } = &env.payload
+            {
+                let body_links = self
+                    .sims
+                    .values()
+                    .find_map(|sim| sim.agent_body_link_defs(body));
+                if let Some(body_links) = body_links {
+                    shape_table.insert_from_envelope(*entity, *state, &body_links);
+                }
+            }
+        }
+        let table_for_step = shape_table.clone();
         let sims = std::mem::take(&mut self.sims);
         let stepped_shards = sims.len();
         let mut slots: Vec<WorkerJob> = (0..self.cfg.worker_count).map(|_| Vec::new()).collect();
@@ -1692,7 +1735,7 @@ impl Scheduler {
             if slots[slot].is_empty() {
                 dispatched.insert(slot);
             }
-            slots[slot].push((shard, sim, prefix));
+            slots[slot].push((shard, sim, prefix, table_for_step.clone()));
         }
 
         // 4. 经每 worker 的 capacity-one 通道发送(每 worker 本拍至多一条任务,
@@ -2278,6 +2321,8 @@ impl Scheduler {
         }
         for sim in self.sims.values() {
             telemetry.chunks_data += sim.voxel().chunk_count();
+            // A05 遥测:暂缓队列长度瞬时值按分片求和(拍末状态)。
+            telemetry.deferred_set_blocks += sim.deferred_set_block_count() as u64;
             telemetry.chunks_collider += sim.collider_chunk_count();
             for (id, _source, _actor) in sim.entity_owners() {
                 let awaiting = sim.is_awaiting_terrain(id);
@@ -2321,6 +2366,7 @@ impl Scheduler {
                 contact_wake_skipped_no_terrain: events.contact_wake_skipped_no_terrain,
                 actor_motion_capped: events.actor_motion_capped,
                 collider_rebuilds: events.collider_rebuilds,
+                deferred_set_blocks: telemetry.deferred_set_blocks,
             },
         }
     }
@@ -2503,6 +2549,14 @@ impl Scheduler {
     /// 已注册分片,ShardId 升序(BTreeMap 键序)。
     pub fn shard_ids(&self) -> Vec<ShardId> {
         self.sims.keys().copied().collect()
+    }
+
+    /// SetBlock 暂缓队列长度按全部分片求和(A05 遥测;测试观测口)。
+    pub fn deferred_set_block_total(&self) -> usize {
+        self.sims
+            .values()
+            .map(|s| s.deferred_set_block_count())
+            .sum()
     }
 
     pub fn shard_count(&self) -> usize {
