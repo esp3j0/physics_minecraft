@@ -290,7 +290,8 @@ fn run_scenario() -> Vec<Frame> {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     // 初始分片(0,0)预注册(对齐生产 bootstrap:首分片装配期注册,chunk
     // 仍只经激活请求 + provider.get 装载;后续分片由每拍 ensure 注册)。
     session.register(new_sim(shard_id(0, 0)));

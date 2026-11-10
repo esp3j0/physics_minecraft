@@ -110,7 +110,8 @@ async fn drive(
 ) -> app::driver::DriverOutcome {
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
         config,
         session,
@@ -206,7 +207,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),
         session,
@@ -244,7 +246,8 @@ async fn commands_after_resume_apply_to_restored_shards() {
     // —— 续跑后向同分片发 SetBlock,跑 1 拍(全局第 7 拍)生效 ——
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store2, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store2, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),
         session: session2,
@@ -362,7 +365,8 @@ async fn telemetry_wired_into_driver_outcome() {
     );
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
         config,
         session,
@@ -419,7 +423,8 @@ async fn spawn_high_water_survives_restart() {
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(app::driver::run(app::driver::DriverArgs {
         config: config.clone(),
         session,

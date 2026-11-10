@@ -222,7 +222,8 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         app::driver::bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None);
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),

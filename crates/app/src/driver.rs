@@ -526,6 +526,19 @@ pub enum AppError {
     Session(#[from] sim_api::session::SessionError),
     #[error("检查点解码失败:{0}")]
     Decode(String),
+    /// MARGIN 校验失败(REQ-012 A04 第 4 节;REQ-001 §4.2 推导):身体包络
+    /// 超过 `MARGIN ≥ vmax·dt + 最大实体尺寸 + ε` 的推导上限,迁移检测
+    /// 会漏检(实体一拍跳出扩张区),拒绝启动。
+    #[error(
+        "MARGIN 不足:margin {margin_m} m < 必需 {required_m} m \
+            (vmax·dt + 最大身体包络 {envelope_m} m + ε 0.05;vmax = {vmax} m/s)"
+    )]
+    Margin {
+        margin_m: f32,
+        required_m: f32,
+        envelope_m: f32,
+        vmax: f32,
+    },
 }
 
 /// bundle → checkpoint 字节(v5,#17 D2;唯一编码入口,e2e 与工具复用):
@@ -1732,7 +1745,8 @@ pub fn bootstrap(
             }
             // 身体注册表(REQ-012 A01 第 1/4 节):启动时加载一次,restore
             // 逐分片注入(不进快照,做法与 BlockRegistry 一致)。
-            let bodies = load_body_registry(&config.bodies_dir);
+            // A04 第 4 节:加载即校验 MARGIN(类型化拒绝)。
+            let bodies = load_body_registry(config)?;
             let session = sim_api::replay::replay_world_with_bodies(
                 &bundle.world,
                 &log,
@@ -1767,10 +1781,16 @@ pub fn bootstrap(
 /// 注入每个 `ShardSim`,做法与 BlockRegistry 一样——不进快照)。目录不存在
 /// = 空注册表(生成主体类型化拒绝);单个文件非法 = fail-stop(资产错误在
 /// 启动期显式暴露,不静默降级)。文件按文件名升序加载(确定性)。
-pub fn load_body_registry(dir: &std::path::Path) -> physics_sim::BodyRegistry {
+/// 加载后按 REQ-012 A04 第 4 节校验 MARGIN(REQ-001 §4.2:`MARGIN ≥
+/// vmax·dt + 最大实体尺寸 + ε`,身体包络半径计入"最大实体尺寸")——
+/// 不满足返回类型化 `AppError::Margin`,拒绝启动。vmax 取注册表内最大
+/// `[walker].max_speed`(无 walker 的身体不行走,不计);ε = 0.05(与接地
+/// 容差同量级的接触余量;默认 16 m 对胶囊绰绰有余)。
+pub fn load_body_registry(config: &Config) -> Result<physics_sim::BodyRegistry, AppError> {
+    let dir = &config.bodies_dir;
     let mut bodies = physics_sim::BodyRegistry::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return bodies;
+        return Ok(bodies);
     };
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())
@@ -1785,7 +1805,27 @@ pub fn load_body_registry(dir: &std::path::Path) -> physics_sim::BodyRegistry {
             .insert_toml(&text)
             .unwrap_or_else(|e| panic!("body.toml 非法 {:?}(fail-stop):{e}", path));
     }
-    bodies
+    // MARGIN 校验(REQ-012 A04 第 4 节;REQ-001 §4.2 推导)。
+    let margin = config.margin_meters as f32;
+    let envelope = bodies.max_envelope_radius();
+    let vmax = bodies
+        .hashes()
+        .iter()
+        .filter_map(|h| bodies.get(h).and_then(|d| d.walker))
+        .map(|w| w.max_speed)
+        .fold(0.0f32, f32::max);
+    let dt = config.dt;
+    const CONTACT_EPS: f32 = 0.05;
+    let required = vmax * dt + envelope + CONTACT_EPS;
+    if margin < required {
+        return Err(AppError::Margin {
+            margin_m: margin,
+            required_m: required,
+            envelope_m: envelope,
+            vmax,
+        });
+    }
+    Ok(bodies)
 }
 
 /// bootstrap 之外的第二步装配(REQ-002 §4.3/§4.4):按 world_kind 造生成器,
@@ -1797,14 +1837,16 @@ pub fn load_body_registry(dir: &std::path::Path) -> physics_sim::BodyRegistry {
 /// `world_kind`:
 /// - `Superflat` → `Superflat::classic()`;
 /// - `SeededScatter` → `SeededScatter::new(0.1)`(低密度散布,基底不变)。
+type WiredProvider = (
+    storage::provider::ChunkProvider,
+    Box<dyn FnMut(types::ShardId) -> physics_sim::ShardSim + Send>,
+);
+
 pub fn wire_provider_and_new_sim(
     config: Config,
     store: &storage::worker::StoreWorker,
     new_registry: impl Fn() -> Box<dyn voxel::BlockRegistry> + Send + 'static,
-) -> (
-    storage::provider::ChunkProvider,
-    Box<dyn FnMut(types::ShardId) -> physics_sim::ShardSim + Send>,
-) {
+) -> Result<WiredProvider, AppError> {
     let generator: Box<dyn voxel::WorldGenerator> = match config.world_kind {
         crate::config::WorldKind::Superflat => Box::new(voxel::Superflat::classic()),
         crate::config::WorldKind::SeededScatter => Box::new(voxel::SeededScatter::new(0.1)),
@@ -1813,7 +1855,8 @@ pub fn wire_provider_and_new_sim(
     let new_registry = new_registry;
     // 身体注册表(REQ-012 A01 第 1 节):启动时加载一次,每分片 clone 注入
     // (BTreeMap 克隆,便宜;与 BlockRegistry 同款"不进快照、restore 重注入")。
-    let bodies = load_body_registry(&config.bodies_dir);
+    // A04 第 4 节:加载即校验 MARGIN(类型化拒绝,拒绝启动)。
+    let bodies = load_body_registry(&config)?;
     let new_sim = Box::new(move |shard: types::ShardId| {
         physics_sim::ShardSim::new_with_bodies(
             config.shard_sim_config(shard),
@@ -1821,7 +1864,7 @@ pub fn wire_provider_and_new_sim(
             bodies.clone(),
         )
     });
-    (provider, new_sim)
+    Ok((provider, new_sim))
 }
 
 #[cfg(test)]
@@ -1935,7 +1978,8 @@ mod tests {
         let mut session = sim_api::session::Session::new(config.session_config());
         let (provider, mut new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         session.register(sim(0, 0));
 
         // —— 布景(生产 tick + 编排;Superflat 地表 y = -59.5)——
@@ -2605,7 +2649,8 @@ mod tests {
         );
         let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let args = DriverArgs {
             config,
             session,
@@ -3696,7 +3741,8 @@ mod tests {
         );
         let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -3776,7 +3822,8 @@ mod tests {
         );
         let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -4172,7 +4219,8 @@ mod tests {
         );
         let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -4407,7 +4455,8 @@ mod tests {
         // provider 仍由 wire 装配(数据源不变)。
         let (provider, _) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let sim_source = config.clone();
         let new_sim = Box::new(move |shard: types::ShardId| {
             let mut sim_cfg = sim_source.shard_sim_config(shard);

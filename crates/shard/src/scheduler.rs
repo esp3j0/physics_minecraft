@@ -402,14 +402,17 @@ impl Scheduler {
     /// 实体锚点(位置):存活 = 所在分片实体状态;迁移在途 = Router 待投递
     /// 信封的载荷状态(§4.3.3"迁移在途期间票据保持,锚点取在途载荷状态")。
     fn entity_anchor(&self, entity: EntityId) -> Option<Vec3> {
-        // 在途信封(任意 apply_at > 当前拍的 MigrateEntity 载荷)。
+        // 在途信封(任意 apply_at > 当前拍的迁移载荷;`MigrateAgent` 同语义,
+        // REQ-012 A04)。
         for env in self.router.in_transit_migrations() {
-            if let messaging::EnvelopePayload::MigrateEntity {
-                entity: e, state, ..
-            } = &env.payload
-                && *e == entity
-            {
-                return Some(state.translation);
+            match &env.payload {
+                messaging::EnvelopePayload::MigrateEntity {
+                    entity: e, state, ..
+                } if *e == entity => return Some(state.translation),
+                messaging::EnvelopePayload::MigrateAgent {
+                    entity: e, state, ..
+                } if *e == entity => return Some(state.translation),
+                _ => {}
             }
         }
         // 存活:扫分片(注册分片数小;每拍仅在票视图派生时发生)。
@@ -431,19 +434,37 @@ impl Scheduler {
     /// 根因)。
     fn entity_motion_of(&self, entity: EntityId) -> Option<(Vec3, Vec3, f32)> {
         for env in self.router.in_transit_migrations() {
-            if let messaging::EnvelopePayload::MigrateEntity {
-                entity: e,
-                state,
-                desc,
-                ..
-            } = &env.payload
-                && *e == entity
-            {
-                return Some((
-                    state.translation,
-                    state.linvel,
-                    physics_sim::settle::envelope_half(desc),
-                ));
+            match &env.payload {
+                messaging::EnvelopePayload::MigrateEntity {
+                    entity: e,
+                    state,
+                    desc,
+                    ..
+                } if *e == entity => {
+                    return Some((
+                        state.translation,
+                        state.linvel,
+                        physics_sim::settle::envelope_half(desc),
+                    ));
+                }
+                // 主体在途(REQ-012 A04):信封不带 desc,足迹按生成路径同款
+                // 的"竖向半包络"回退——half_size 来自身体定义(agent.rs
+                // `agent_half_size`,胶囊 = half_height + radius),经
+                // envelope_half 单格分支原样返回。
+                messaging::EnvelopePayload::MigrateAgent {
+                    entity: e,
+                    body,
+                    state,
+                    ..
+                } if *e == entity => {
+                    let half = self
+                        .sims
+                        .values()
+                        .find_map(|sim| sim.agent_half_size_of(body))
+                        .unwrap_or(0.5);
+                    return Some((state.translation, state.linvel, half));
+                }
+                _ => {}
             }
         }
         for shard in self.sims.keys() {
@@ -892,6 +913,15 @@ impl Scheduler {
         self.sims.values().any(|sim| sim.is_agent(entity))
     }
 
+    /// 主体所在分片的控制器保持态(REQ-012 A04 判据 A04-4/A04-5 观测口:
+    /// 用保持力的变化拍判断控制拍相位、迁移拍施力断言)。主体不在任何
+    /// 已注册分片 → None(BTreeMap 键序扫,确定性)。
+    pub fn walker_hold_of(&self, entity: EntityId) -> Option<(f32, f32, f32)> {
+        self.sims
+            .values()
+            .find_map(|sim| sim.walker_hold_of(entity))
+    }
+
     /// 覆盖判定(REQ-005 §4.3.1/任务书 03,签名固定):核心区(core AABB,
     /// 8×8 chunk × 128m 的水平立柱;y 不参与——分片是整高柱)或该分片持有的
     /// 任一 chunk(owner 本体副本或扩张缓存副本,查 `chunk_holders`——表内
@@ -1219,13 +1249,17 @@ impl Scheduler {
             }
         }
         // 在途:迁移信封载荷里的实体(ownership 在源片保留,已覆盖;显式再扫
-        // 防"claim 未落但信封已在"的窗口)。
+        // 防"claim 未落但信封已在"的窗口)。`MigrateAgent`(REQ-012 A04)
+        // 同款:主体恒 actor,不会进 transient,匹配仅为完整性。
         for env in self.router.in_transit_migrations() {
-            if let messaging::EnvelopePayload::MigrateEntity { entity, actor, .. } = &env.payload
-                && !*actor
-                && !transient.contains(entity)
-            {
-                transient.push(*entity);
+            match &env.payload {
+                messaging::EnvelopePayload::MigrateEntity { entity, actor, .. }
+                | messaging::EnvelopePayload::MigrateAgent { entity, actor, .. }
+                    if !*actor && !transient.contains(entity) =>
+                {
+                    transient.push(*entity);
+                }
+                _ => {}
             }
         }
         for id in transient {
@@ -1355,12 +1389,27 @@ impl Scheduler {
     /// 末尾重建 holder 表:预载 chunk 的 sim(回放恢复/测试手工装载/任务 02
     /// 的 restore)凭已加载 chunk 登记 holder——装配期允许先 holder 后 owner,
     /// owner 在位校验仍由 tick 开头的 fail-stop 承担(评审 Blocker 1)。
-    pub fn register(&mut self, sim: ShardSim) {
+    ///
+    /// REQ-012 A04 第 3 节:分片注册时 `step_tick` 设为当前全局 tick
+    /// (驱动在任意拍新建分片不再从 0 起算——奇数拍建的分片相位与老分片
+    /// 相反,主体跨过去控制周期错半拍)。此后控制拍恒等价于"全局 tick 为
+    /// 偶数"。快照恢复的分片沿用快照里的值,并在恢复时断言一致(见
+    /// `restore_state`)。
+    pub fn register(&mut self, mut sim: ShardSim) {
         let shard = sim.shard();
         if self.sims.contains_key(&shard) {
             panic!("重复注册分片 {shard:?}(所有权唯一,AC5 fail-stop)");
         }
         let at = self.coordinator.tick();
+        // REQ-012 A04 第 3 节:新分片 step_tick 从当前全局 tick 起算(照常
+        // 每拍 +1,控制拍恒 = 全局偶数拍);快照恢复的分片(step_tick 已非零
+        // = 快照里的值)原样沿用。与调度器 tick 的一致性断言在
+        // `restore_state`(那里 coordinator 已对齐快照拍;不经 restore_state
+        // 的裸分片注册——如 session::register_snapshot 直配默认调度器——
+        // 沿用快照值,行为与历史一致)。
+        if sim.step_tick() == Tick::ZERO {
+            sim.set_step_tick(at);
+        }
         self.ownership.claim(shard, at);
         self.lifecycles.insert(
             shard,
@@ -1876,11 +1925,13 @@ impl Scheduler {
             // 终结判定(REQ-007 §4.3.3/R7;任务 03):despawned ∧ ¬本拍迁移意图
             // ∧ ¬同拍重新 spawned(传送)→ End 全部实体票。凝固/强制落地/虚空
             // 移除/RemoveEntity 都走这里;迁移 despawn 保留票(键不变时钟继续)。
+            // `MigrateAgent`(REQ-012 A04)与 `MigrateEntity` 同款豁免。
             let migrated: BTreeSet<EntityId> = outbox
                 .migrations
                 .iter()
                 .filter_map(|i| match &i.payload {
-                    messaging::EnvelopePayload::MigrateEntity { entity, .. } => Some(*entity),
+                    messaging::EnvelopePayload::MigrateEntity { entity, .. }
+                    | messaging::EnvelopePayload::MigrateAgent { entity, .. } => Some(*entity),
                     _ => None,
                 })
                 .collect();
@@ -1901,6 +1952,7 @@ impl Scheduler {
                         matches!(
                             &env.payload,
                             messaging::EnvelopePayload::MigrateEntity { entity, .. }
+                                | messaging::EnvelopePayload::MigrateAgent { entity, .. }
                                 if entity == id
                         )
                     });
@@ -1920,11 +1972,16 @@ impl Scheduler {
                                     messaging::EnvelopePayload::MigrateEntity {
                                         entity: e,
                                         ..
+                                    }
+                                    | messaging::EnvelopePayload::MigrateAgent {
+                                        entity: e,
+                                        ..
                                     } if *e == *id
                                 )
                             })
                             .map(|env| match &env.payload {
-                                messaging::EnvelopePayload::MigrateEntity { actor, .. } => *actor,
+                                messaging::EnvelopePayload::MigrateEntity { actor, .. }
+                                | messaging::EnvelopePayload::MigrateAgent { actor, .. } => *actor,
                                 _ => false,
                             })
                             .or_else(|| {
@@ -2113,10 +2170,15 @@ impl Scheduler {
                 alive_or_in_transit.insert(*id, owner.actor);
             }
             for env in self.router.in_transit_migrations() {
-                if let messaging::EnvelopePayload::MigrateEntity { entity, actor, .. } =
-                    &env.payload
-                {
-                    alive_or_in_transit.insert(*entity, *actor);
+                match &env.payload {
+                    messaging::EnvelopePayload::MigrateEntity { entity, actor, .. } => {
+                        alive_or_in_transit.insert(*entity, *actor);
+                    }
+                    // 主体在途(REQ-012 A04):恒 actor(载荷字段),同款入表。
+                    messaging::EnvelopePayload::MigrateAgent { entity, actor, .. } => {
+                        alive_or_in_transit.insert(*entity, *actor);
+                    }
+                    _ => {}
                 }
             }
             let mut frozen_actors: BTreeSet<EntityId> = BTreeSet::new();
@@ -2381,6 +2443,18 @@ impl Scheduler {
             };
             self.lifecycles
                 .insert(shard, ShardLifecycle::restore(lc_snap, cfg));
+        }
+        // REQ-012 A04 第 3 节:快照恢复的分片沿用快照里的 step_tick,断言它
+        // 等于调度器的 tick(coordinator 此刻已对齐快照拍;不一致 = 分片快照
+        // 与调度器快照来自不同拍,恢复装配错误 fail-stop)。
+        for (shard, sim) in &self.sims {
+            assert!(
+                sim.step_tick() == now,
+                "快照分片 {shard:?} 的 step_tick {} ≠ 调度器 tick {}(控制相位\
+                 不一致,恢复装配错误,fail-stop)",
+                sim.step_tick().0,
+                now.0
+            );
         }
         // holder 表从各分片已加载 chunk 重建(表不入快照)。
         self.rebuild_holders();

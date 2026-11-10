@@ -93,6 +93,36 @@ impl BodyRegistry {
     pub fn hashes(&self) -> Vec<BodyHash> {
         self.by_hash.keys().copied().collect()
     }
+
+    /// 注册表内最大身体包络半径(REQ-012 A04 第 4 节:计入 REQ-001 §4.2
+    /// MARGIN 推导的"最大实体尺寸")。包络按形状最大外接半径取保守值:
+    /// 盒 = 半对角 √3、球/胶囊 = 半径(+半高)、凸包 = 最大顶点模长;多形状
+    /// /多连杆取最大。空注册表 → 0.0(无身体 = 无附加)。
+    pub fn max_envelope_radius(&self) -> f32 {
+        self.by_hash
+            .values()
+            .map(|def| {
+                def.links
+                    .iter()
+                    .flat_map(|l| l.shapes.iter())
+                    .map(|s| match s {
+                        types::ShapeDef::Box { half } => {
+                            (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt()
+                        }
+                        types::ShapeDef::Sphere { radius } => radius.abs(),
+                        types::ShapeDef::CapsuleY {
+                            half_height,
+                            radius,
+                        } => half_height.abs() + radius.abs(),
+                        types::ShapeDef::ConvexHull { points } => points
+                            .iter()
+                            .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+                            .fold(0.0f32, f32::max),
+                    })
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max)
+    }
 }
 
 /// 主体的分片侧附加记录(REQ-012 §3):`EntityRecord` 之外,连杆句柄表与
@@ -167,6 +197,13 @@ impl ShardSim {
     /// 主体的身体哈希;非主体/不存在 → None。
     pub fn agent_body_hash(&self, id: EntityId) -> Option<BodyHash> {
         self.agents.get(&id).map(|a| a.body_hash)
+    }
+
+    /// 身体定义的竖向半包络(REQ-012 A04:调度器在途主体迁移的足迹口径,
+    /// 与生成路径 `EntityDesc.half_size` 同源——`agent_half_size`)。
+    /// 哈希不在注册表 → None。
+    pub fn agent_half_size_of(&self, body: &BodyHash) -> Option<f32> {
+        self.bodies.get(body).map(agent_half_size)
     }
 
     /// 主体数(测试观测口)。
@@ -272,6 +309,58 @@ impl ShardSim {
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
         self.outbox.spawned.push(entity);
         Ok(())
+    }
+
+    /// 迁移重建入口(REQ-012 A04 放行第 2 节):按身体哈希走 `spawn_agent`
+    /// 同一条生成路径(碰撞体挂钩子标志、`actor = true`、登记进 `agents`、
+    /// `outbox.spawned` 照常),再写回控制器保持状态(意图 + `WalkerHold`)
+    /// 与常驻运动票触顶标记(04a 遗留返修同款:计数连续,不借迁移绕上限)。
+    /// **不施加力**——迁移那一拍的施力由本拍 `step` 内的控制器段照常进行
+    /// (60 Hz 施力先 `reset_forces` 再施加保持力;§13 `migrate`:写回必须
+    /// 在下一次步进之前,否则失力 1–2 拍)。单连杆预留字段非空 = 内部一致
+    /// 性违规 fail-stop(B01 才带关节状态)。`source` 不写回:生成路径恒
+    /// `None`(`SpawnAgent` 命令分支同口径),迁移不改 `EntityId`。
+    #[allow(clippy::too_many_arguments)] // 信封字段逐项透传(B01 前恒空三项)
+    pub(crate) fn migrate_agent_in(
+        &mut self,
+        entity: EntityId,
+        body: BodyHash,
+        state: types::EntityState,
+        intent_move: Option<(f32, f32)>,
+        intent_yaw: Option<f32>,
+        intent_jump: bool,
+        held_force: (f32, f32),
+        last_yaw: f32,
+        actor_motion_ticks: Option<u64>,
+        joint_q: &[f32],
+        joint_qd: &[f32],
+        last_targets: &[f32],
+    ) {
+        // B01 预留字段:单连杆一律为空;非空 = 内部一致性违规(B01 之前
+        // 不可能产出,信封来源只可能是同版本内核)。
+        assert!(
+            joint_q.is_empty() && joint_qd.is_empty() && last_targets.is_empty(),
+            "MigrateAgent 带多连杆关节状态(单连杆恒空,内部一致性违规,fail-stop)"
+        );
+        self.spawn_agent(entity, body, state)
+            .expect("MigrateAgent 的身体哈希必在注册表(接收方 fail-stop 前置已查)");
+        let record = self
+            .agents
+            .get_mut(&entity)
+            .expect("spawn_agent 刚登记(fail-stop)");
+        record.intent_move = intent_move;
+        record.intent_yaw = intent_yaw;
+        record.intent_jump = intent_jump;
+        if let Some(rec) = self.entities.get_mut(&entity) {
+            rec.actor_motion_ticks = actor_motion_ticks;
+        }
+        self.walker_holds.insert(
+            entity,
+            crate::walker::WalkerHold {
+                held_force,
+                last_yaw,
+            },
+        );
     }
 
     /// 移除主体(REQ-012 A01 第 3 节:刚体、碰撞体、`collider_to_entity`

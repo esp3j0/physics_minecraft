@@ -169,7 +169,8 @@ async fn harness() -> Harness {
         Box::new(MemCheckpointStore::new()),
     );
     let (provider, _) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
     let new_sim = Box::new(move |shard: ShardId| {
         let mut cfg = sim_source.shard_sim_config(shard);

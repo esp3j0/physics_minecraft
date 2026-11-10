@@ -240,6 +240,15 @@ fn capsule_geometry(sim: &ShardSim, collider: ColliderHandle) -> Option<(f32, f3
 }
 
 impl ShardSim {
+    /// 主体的控制器保持态只读访问(REQ-012 A04 判据 A04-4 观测口:用保持力
+    /// 的变化拍判断控制拍相位;A04-5 迁移拍施力断言也经它)。非主体/不存在
+    /// → None。返回 (Fx, Fz, last_yaw)(复制,不泄引用)。
+    pub fn walker_hold_of(&self, id: EntityId) -> Option<(f32, f32, f32)> {
+        self.walker_holds
+            .get(&id)
+            .map(|h| (h.held_force.0, h.held_force.1, h.last_yaw))
+    }
+
     /// 控制器段(A02a 第 3 节;`step()` 内物理步进之前调用):
     /// 控制拍(30 Hz)做接地判定 + 算保持力 + 朝向 + 跳跃;每拍(60 Hz)
     /// 先 `reset_forces` 再施加保持力(只对主体)。无主体时除 per-agent

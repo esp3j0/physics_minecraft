@@ -19,11 +19,12 @@ fn main() {
 
     // 世界数据源 + 分片构造闭包(REQ-002 §4.3/§4.4):provider = worker 通道 +
     // 生成器(按 config.world_kind)+ config.world_seed;new_sim = shard_sim_config
-    // 换算 + registry 工厂。
+    // 换算 + registry 工厂。A04:加载身体注册表即校验 MARGIN,失败拒绝启动。
     let (provider, new_sim) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
 
     // tokio runtime(网络装配与驱动同 runtime;REQ-003 决议 2 并发模型)。
     let runtime = tokio::runtime::Builder::new_current_thread()

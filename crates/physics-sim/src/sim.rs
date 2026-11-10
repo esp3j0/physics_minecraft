@@ -661,6 +661,28 @@ impl ShardSim {
         self.cfg.shard
     }
 
+    /// 分片步进计数(REQ-012 A04 第 3 节):分片注册进调度器时设为当前
+    /// **全局 tick**(此后照常每拍 +1)——新建分片不再从 0 起算,控制拍
+    /// 恒等价于"全局 tick 为偶数"。驱动(`new_sim` 闭包)在调度器注册前
+    /// 调用;快照恢复的分片沿用快照里的值(不走本入口)。**只许在首次
+    /// `step` 之前调用一次**(重复调用 = 装配错误;`set_step_tick` 已跑过
+    /// 的分片再对齐 = 控制相位被静默改写,fail-stop)。
+    pub fn set_step_tick(&mut self, tick: Tick) {
+        assert!(
+            self.step_tick == Tick::ZERO,
+            "set_step_tick 重复调用(step_tick 已 = {:?};分片注册对齐只许一次,\
+             装配错误 fail-stop)",
+            self.step_tick
+        );
+        self.step_tick = tick;
+    }
+
+    /// 分片步进计数(REQ-012 A04 第 3 节观测口):调度器 `restore_state`
+    /// 断言快照恢复的分片相位等于全局 tick 用。
+    pub fn step_tick(&self) -> Tick {
+        self.step_tick
+    }
+
     /// 接缝修正开关(**测试对照专用**,A02-3:关掉接缝修正的对照组证明
     /// 布景真的会碰接缝问题)。生产路径恒开(默认 true,不入快照)。
     pub fn set_seam_fix_for_test(&mut self, enabled: bool) {
@@ -915,6 +937,52 @@ impl ShardSim {
                         if let Some(rec) = self.entities.get_mut(entity) {
                             rec.actor_motion_ticks = *actor_motion_ticks;
                         }
+                    }
+                    // 主体迁移(REQ-012 A04 放行第 2 节):按身体哈希走
+                    // `SpawnAgent` 同一条生成路径(碰撞体挂钩子标志、
+                    // `actor = true`、登记进 `agents`),写回意图与
+                    // `WalkerHold`,再进入本拍 `step`——迁移那一拍照常施加
+                    // 保持的力(§13 `migrate`)。目的分片不认识该哈希 =
+                    // 内部一致性违规(所有分片共用同一份 `BodyRegistry`)。
+                    EnvelopePayload::MigrateAgent {
+                        entity,
+                        body,
+                        state,
+                        actor: _,
+                        source: _,
+                        actor_motion_ticks,
+                        intent_move,
+                        intent_yaw,
+                        intent_jump,
+                        held_force,
+                        last_yaw,
+                        joint_q,
+                        joint_qd,
+                        last_targets,
+                    } => {
+                        assert!(
+                            self.bodies.get(body).is_some(),
+                            "MigrateAgent 的身体哈希 {body:?} 不在本分片注册表\
+                             (所有分片共用同一份 BodyRegistry,内部一致性违规,fail-stop)"
+                        );
+                        assert!(
+                            !self.entities.contains_key(entity),
+                            "MigrateAgent 目标实体 {entity:?} 已存在(迁移原子性违规,fail-stop)"
+                        );
+                        self.migrate_agent_in(
+                            *entity,
+                            *body,
+                            *state,
+                            *intent_move,
+                            *intent_yaw,
+                            *intent_jump,
+                            *held_force,
+                            *last_yaw,
+                            *actor_motion_ticks,
+                            joint_q,
+                            joint_qd,
+                            last_targets,
+                        );
                     }
                     // 涌现事件(REQ-005 任务 03):共享参数本地求值,复用同一
                     // 纯函数;冻结体免疫语义不变(§9.12)。CrossEvent 未来变体
@@ -1460,18 +1528,48 @@ impl ShardSim {
             }
 
             // ---- 迁移检测(实体中心离开本体区,demo A)----
-            // REQ-012 A01(放行第 2 节):主体迁移在 A04 实现——主体走到
-            // 本路径 = fail-stop(测试布景让主体远离分片边界)。
+            // REQ-012 A04(放行第 2 节):主体走 `MigrateAgent` 真迁移——
+            // 判定以根连杆中心为准(单连杆 = 胶囊中心,与普通实体同点),
+            // 同一拍原子移除(agents/walker_holds/刚体/碰撞体都不留残余),
+            // 控制器保持状态(意图 + 保持的力)随载荷走(§13 `migrate`:
+            // 迁移那一拍照常施加保持的力)。
             if !self.core_contains(state.translation) {
-                assert!(
-                    !self.agents.contains_key(&id),
-                    "主体 {id:?} 走到迁移检测路径(REQ-012 A01:主体迁移在 A04 实现,fail-stop)"
-                );
                 let dest = ShardId::new(
                     self.cfg.shard.world,
                     self.cfg.shard.dimension,
                     pos_chunk(state.translation).shard_of(),
                 );
+                if let Some(agent) = self.agents.remove(&id) {
+                    // 主体迁移:A01 只支持单连杆(多连杆在 B01)。
+                    debug_assert!(
+                        agent.links.len() == 1,
+                        "A04 只支持单连杆主体迁移(多连杆在 B01)"
+                    );
+                    let hold = self.walker_holds.remove(&id).unwrap_or_default();
+                    self.entities.remove(&id).expect("存在");
+                    self.phys.remove_body(handle);
+                    self.outbox.despawned.push(id);
+                    self.outbox.migrations.push(Intent {
+                        destination: dest,
+                        payload: EnvelopePayload::MigrateAgent {
+                            entity: id,
+                            body: agent.body_hash,
+                            state,
+                            actor,
+                            source,
+                            actor_motion_ticks,
+                            intent_move: agent.intent_move,
+                            intent_yaw: agent.intent_yaw,
+                            intent_jump: agent.intent_jump,
+                            held_force: hold.held_force,
+                            last_yaw: hold.last_yaw,
+                            joint_q: Vec::new(),
+                            joint_qd: Vec::new(),
+                            last_targets: Vec::new(),
+                        },
+                    });
+                    continue;
+                }
                 // 04a 遗留返修:触顶标记随迁移载荷带走(与 actor/source 同款)
                 // ——否则触顶实体借迁移绕过上限,目的分片重新签发。
                 self.entities.remove(&id).expect("存在");

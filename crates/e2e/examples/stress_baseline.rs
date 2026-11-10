@@ -107,7 +107,8 @@ impl Rig {
         session.set_area_ticket_caps(max_r, max_c);
         let (provider, new_sim) = app::driver::wire_provider_and_new_sim(config, &store, || {
             Box::new(SimpleRegistry::builtin())
-        });
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         Self {
             session,
             store,

@@ -2385,7 +2385,8 @@ pub(crate) mod tests {
         let (provider, new_sim) =
             crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(SimpleRegistry::builtin())
-            });
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let (tx, rx) = tokio::sync::mpsc::channel::<crate::driver::DriverCommand>(16);
         let args = DriverArgs {
             config,
@@ -2584,7 +2585,8 @@ pub(crate) mod tests {
         let (provider, new_sim) =
             crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(voxel::SimpleRegistry::builtin())
-            });
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(crate::driver::run(crate::driver::DriverArgs {
             config,
             session,

@@ -158,6 +158,8 @@ impl Router {
 
     /// 在途迁移信封(REQ-007 任务 03/R2:实体票锚点在途取迁移载荷状态)。
     /// 桶序 = (destination, apply_at) 升序,桶内 canonical 序(确定性)。
+    /// `MigrateAgent`(REQ-012 A04)与 `MigrateEntity` 同语义:主体迁移
+    /// 在途时票据锚点同样取载荷状态。
     pub fn in_transit_migrations(&self) -> Vec<Envelope> {
         self.queue
             .snapshot()
@@ -166,6 +168,7 @@ impl Router {
                 matches!(
                     env.payload,
                     messaging::EnvelopePayload::MigrateEntity { .. }
+                        | messaging::EnvelopePayload::MigrateAgent { .. }
                 )
             })
             .collect()

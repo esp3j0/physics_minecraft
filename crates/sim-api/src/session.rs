@@ -747,6 +747,12 @@ impl Session {
         self.scheduler.is_agent(entity)
     }
 
+    /// 主体所在分片的控制器保持态(REQ-012 A04 判据观测口;透传调度器)。
+    /// 主体不在任何分片/迁移窗口 → None。
+    pub fn walker_hold_of(&self, entity: EntityId) -> Option<(f32, f32, f32)> {
+        self.scheduler.walker_hold_of(entity)
+    }
+
     /// 按实体 owner 投递命令(REQ-006 任务 01):不再由调用方猜分片。
     /// 未知实体/迁移窗口 → `Rejected`;成功与 `send_from` 同款入日志。
     pub fn send_to_entity(

@@ -69,7 +69,8 @@ async fn start_server(
     );
     let (provider, _) = app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
         Box::new(SimpleRegistry::builtin())
-    });
+    })
+    .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
     let new_sim = Box::new(move |shard: ShardId| {
         ShardSim::new(

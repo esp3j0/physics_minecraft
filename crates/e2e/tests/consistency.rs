@@ -1202,7 +1202,8 @@ async fn acc6_network_observer_replay() {
         Box::new(checkpoints.clone()),
     );
     let (provider, _) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
     let new_sim = Box::new(move |shard: ShardId| {
         let mut cfg = sim_source.shard_sim_config(shard);
@@ -1739,7 +1740,8 @@ async fn acc8_workspace_regression_and_viewer_smoke() {
         Box::new(MemCheckpointStore::new()),
     );
     let (provider, _) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
     let new_sim = Box::new(move |shard: ShardId| {
         let mut cfg = sim_source.shard_sim_config(shard);
@@ -2016,7 +2018,8 @@ async fn pending_blockwrite_cells_defer_window() {
         Box::new(checkpoints.clone()),
     );
     let (provider, new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
         config: config.clone(),
         session,

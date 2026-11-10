@@ -147,7 +147,8 @@ mod unit01 {
             let (provider, _new_sim) =
                 app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                     Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
-                });
+                })
+                .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
             for pos in [ChunkPos::new(0, 0), ChunkPos::new(-3, 7)] {
                 let chunk = provider.generate(pos);
                 for x in 0..16 {

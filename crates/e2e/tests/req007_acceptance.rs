@@ -68,7 +68,8 @@ impl Harness {
         let (provider, new_sim) =
             app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(voxel::SimpleRegistry::builtin())
-            });
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let mut cfg = config.shard_sim_config(origin());
         tweak_origin(&mut cfg);
         session.register(physics_sim::ShardSim::new(
@@ -1720,7 +1721,8 @@ fn restore_harness(snapshot: &sim_api::snapshot::WorldSnapshot) -> Harness {
     .expect("自有快照必可恢复");
     let (provider, new_sim) = app::driver::wire_provider_and_new_sim(config, &store, || {
         Box::new(voxel::SimpleRegistry::builtin())
-    });
+    })
+    .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     Harness {
         session,
         store,

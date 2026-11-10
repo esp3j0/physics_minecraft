@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use types::{BlockId, BlockPos, EntityDesc, EntityId, EntityState, ShardId, Tick};
+use types::{BlockId, BlockPos, BodyHash, EntityDesc, EntityId, EntityState, ShardId, Tick};
 
 use crate::event::CrossEvent;
 
@@ -41,6 +41,43 @@ pub enum EnvelopePayload {
         /// 承载转换标记(REQ-010 §9):接收方据此在本拍多求一次"转换前"的 F。
         load_conversion: bool,
     },
+    /// 主体迁移(REQ-012 §3 / A04 放行第 1 节):**整个主体同一拍原子迁移**,
+    /// 以根连杆中心判定归属。信封带身体内容哈希(接收方按它走 `SpawnAgent`
+    /// 同一条生成路径重建)+ 根状态 + 控制器保持状态(意图与保持的力——
+    /// §13 `migrate`:迁移那一拍照常施加保持的力,丢了会失力 1–2 拍)。
+    /// 控制者标识**不进内核信封**(A04 放行第 1 节):控制者在驱动层按
+    /// `EntityId` 记(D6),迁移不改 `EntityId`,驱动层映射不受影响。
+    MigrateAgent {
+        entity: EntityId,
+        /// 身体内容哈希(所有分片共用同一份 `BodyRegistry`;接收方查不到 =
+        /// 内部一致性违规 fail-stop)。
+        body: BodyHash,
+        /// 根连杆状态(tick N 末提取的四向量;单连杆 = 胶囊中心)。
+        state: EntityState,
+        /// 演员政策标记(主体恒 true,随载荷走与 `MigrateEntity` 同款)。
+        actor: bool,
+        /// 实体来源:外部 spawn = 玩家;服务端/内部 = None。
+        source: Option<crate::InputSource>,
+        /// 常驻运动票持票记账/触顶标记(与 `MigrateEntity` 同款:迁移带走,
+        /// 目的分片计数连续)。
+        actor_motion_ticks: Option<u64>,
+        /// 控制器保持状态:最近一条意图的水平分量(世界系 m/s)。
+        intent_move: Option<(f32, f32)>,
+        /// 最近一条意图的朝向(rad,内核规范化域)。
+        intent_yaw: Option<f32>,
+        /// 一次性跳请求(未消费时随迁移走;消费后恒 false)。
+        intent_jump: bool,
+        /// 保持的水平力 (Fx, Fz)(世界系 N;零 = 不施加入 rapier)。
+        held_force: (f32, f32),
+        /// 上一次 `set_rotation` 的朝向(去重记忆;迁移后不重复写朝向)。
+        last_yaw: f32,
+        /// B01 预留:关节坐标(单连杆恒空;非空 = 内部一致性违规 fail-stop)。
+        joint_q: Vec<f32>,
+        /// B01 预留:关节速度(单连杆恒空)。
+        joint_qd: Vec<f32>,
+        /// B01 预留:最后的目标(单连杆恒空)。
+        last_targets: Vec<f32>,
+    },
 }
 
 impl EnvelopePayload {
@@ -50,6 +87,7 @@ impl EnvelopePayload {
             Self::MigrateEntity { .. } => 0,
             Self::Event(_) => 1,
             Self::BlockWrite { .. } => 2,
+            Self::MigrateAgent { .. } => 3,
         }
     }
 }
@@ -299,6 +337,35 @@ mod tests {
         };
         assert!(migrate.ordinal() < event.ordinal());
         assert!(event.ordinal() < write.ordinal(), "声明序 = 序号升序");
+    }
+
+    /// REQ-012 A04(放行第 1 节):MigrateAgent 追加在尾(ordinal = 3),
+    /// 旧 0–2 不变;单连杆预留字段恒空。
+    #[test]
+    fn migrate_agent_ordinals_appended_in_declared_order() {
+        let agent = EnvelopePayload::MigrateAgent {
+            entity: EntityId::from_parts(1, 1),
+            body: types::BodyHash([0; 8]),
+            state: EntityState::default(),
+            actor: true,
+            source: None,
+            actor_motion_ticks: None,
+            intent_move: Some((1.0, 0.0)),
+            intent_yaw: Some(0.0),
+            intent_jump: false,
+            held_force: (0.0, 0.0),
+            last_yaw: 0.0,
+            joint_q: Vec::new(),
+            joint_qd: Vec::new(),
+            last_targets: Vec::new(),
+        };
+        assert_eq!(agent.ordinal(), 3, "MigrateAgent = 追加序 3(A04)");
+        let write = EnvelopePayload::BlockWrite {
+            pos: types::BlockPos::ZERO,
+            block: types::BlockId(1),
+            load_conversion: false,
+        };
+        assert!(write.ordinal() < agent.ordinal(), "旧 0–2 不变");
     }
 
     #[test]

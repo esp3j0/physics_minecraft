@@ -34,7 +34,8 @@ fn run_area_ticket_scenario() -> (usize, usize) {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
 
     let frozen_body = EntityId::from_parts(1, 1);
@@ -224,7 +225,8 @@ fn ac_t3_no_hanging_blue_blocks() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     let projectile = EntityId::from_parts(1, 1);
 
@@ -293,7 +295,8 @@ fn ac_t24_enable_backfill() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let transient = EntityId::from_parts(1, 1);
     // 未启用:注册 + spawn(手动装载等价既有路径;不签票)。
     session.register(new_sim(shard_id(0, 0)));
@@ -351,7 +354,8 @@ fn ac_t4_cross_shard_landing() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     // 区域票在起点(启用 + 地形);抛体高速向 +x(越分片界 128m)。
     session
@@ -410,7 +414,8 @@ fn ac_t5_awaiting_terrain_and_block_priority() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let _ = &provider;
     let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
     cfg.activation.collider_budget_per_tick = 0;
@@ -484,7 +489,8 @@ fn ac_t6_lookahead_not_awaiting() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     // 区域票盖住出发点(当前足迹就绪);高速东移 → 前视 chunk 跨出票覆盖
     // (未载)。实体出生在地面上方 1 格,水平 40 m/s。
@@ -537,7 +543,8 @@ fn ac_t7_deadline_and_void() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     let v = EntityId::from_parts(1, 1);
     // 区域票(启用),实体出生在深虚空(-100 < −64−16)。
@@ -703,7 +710,8 @@ fn ac_t20_lifecycle() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     use physics_sim::tickets::TicketHolder;
     // 区域票启用 + 瞬态体(落地即凝固 → 票 End)。
@@ -765,7 +773,8 @@ fn h2_carried_freeze_wake_via_plan_entity_tier() {
     );
     let mut session = Session::new(config.session_config());
     let (provider, mut new_sim) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry());
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
     // 观察者启用,盖住承载点(唤醒范围)。
     session
