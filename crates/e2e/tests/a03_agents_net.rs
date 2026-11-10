@@ -87,6 +87,19 @@ async fn next_frame(rx: &mut mpsc::UnboundedReceiver<S2C>) -> Option<S2C> {
     tokio::time::timeout(SOFT, rx.recv()).await.ok().flatten()
 }
 
+/// 软窗落空(None)后的真实墙钟让步(1 ms):暂停时钟下 tokio 定时器瞬时
+/// 兑现,一串软窗可以在墙钟微秒内烧完——空闲信道的请求-回执(服务端响应
+/// 要走真实 socket 往返)在高负载 CI 上会被整个预算饿死而本地快机险过
+/// (CI run 42825549615 的 a03_3 行 1b / a03_6 末尾 unpossess 实证;有帧流
+/// 量时虚拟时钟被就绪任务冻结,等待自然退化为实时收帧,故只有空闲信道
+/// 命中)。阻塞的是本测试的单线程运行时,各任务本就空闲;内核侧 loopback
+/// 回执在让步期间入队,下一次 park 的 IO 轮询即拾起、整条服务端链(读 →
+/// NetUp → 驱动 → 回执写)在同一 park 周期跑完。拒绝 = 静默的负断言走满
+/// 预算(200 × 1 ms = 200 ms),代价可接受。
+fn real_yield() {
+    std::thread::sleep(Duration::from_millis(1));
+}
+
 // ---------------------------------------------------------------------------
 // 内嵌迷你客户端(network.rs 同款;codec = sim-api::proto 公开对称接口)
 // ---------------------------------------------------------------------------
@@ -176,7 +189,7 @@ async fn spawn_agent(
         match next_frame(rx).await {
             Some(S2C::Spawned { entity }) => return Some(entity),
             Some(_) => continue,
-            None => break,
+            None => real_yield(),
         }
     }
     None
@@ -197,7 +210,7 @@ async fn possess(
         match next_frame(rx).await {
             Some(S2C::Possessed { entity }) => return Some(entity),
             Some(_) => continue,
-            None => break,
+            None => real_yield(),
         }
     }
     None
@@ -215,7 +228,7 @@ async fn unpossess(
         match next_frame(rx).await {
             Some(S2C::Possessed { entity }) => return Some(entity),
             Some(_) => continue,
-            None => break,
+            None => real_yield(),
         }
     }
     None
