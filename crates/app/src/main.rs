@@ -20,7 +20,8 @@ fn main() {
     // 世界数据源 + 分片构造闭包(REQ-002 §4.3/§4.4):provider = worker 通道 +
     // 生成器(按 config.world_kind)+ config.world_seed;new_sim = shard_sim_config
     // 换算 + registry 工厂。A04:加载身体注册表即校验 MARGIN,失败拒绝启动。
-    let (provider, new_sim) =
+    // A03 §2:同一份注册表交驱动(生成校验不再读目录)。
+    let (provider, new_sim, bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
         })
@@ -57,6 +58,7 @@ fn main() {
             new_sim,
             observe: Some(network.observe),
             spawn_next_seq,
+            bodies,
         }));
         handle.await.expect("驱动任务 panic(fail-stop)")
     });

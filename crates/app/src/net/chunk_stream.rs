@@ -193,7 +193,7 @@ impl Default for PumpConfig {
 /// 驱动关停 = 回执 `Err`(oneshot 发送端弃发)→ **连接终止**:泵停止(任务书:
 /// 回执失败 = 连接终止;连接侧的 Left 上报由其读循环对端关断路径收口)。
 pub(crate) async fn run_pump(
-    state: std::sync::Arc<tokio::sync::Mutex<ChunkStreamState>>,
+    state: std::sync::Arc<std::sync::Mutex<ChunkStreamState>>,
     cfg: PumpConfig,
     mut shutdown: tokio::sync::broadcast::Receiver<()>,
     up_tx: tokio::sync::mpsc::Sender<super::NetUp>,
@@ -222,7 +222,7 @@ pub(crate) async fn run_pump(
                 for _ in 0..cfg.max_catchup_rounds {
                     // 差分锁窗口:只做纯计算+集合维护,零 await(短临界区)。
                     let diff = {
-                        let mut guard = state.lock().await;
+                        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
                         guard.diff()
                     };
                     // 卸载侧(零等待):先清账再发 ChunkUnload 给客户端。
@@ -250,7 +250,7 @@ pub(crate) async fn run_pump(
                         // 的话下轮差分不再含这些 chunk——被记为已装载却从未
                         // 发出,永久丢失。回滚后下轮 diff 重算重发(卸载侧
                         // 已发 ChunkUnload 无需回滚:账已清 = 语义成立)。
-                        let mut guard = state.lock().await;
+                        let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
                         guard.rollback_load(&diff.to_load);
                         break;
                     }

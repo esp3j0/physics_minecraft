@@ -105,10 +105,11 @@ impl Rig {
         // 与 bootstrap 同:区域票上限注入。
         let (max_r, max_c) = config.area_ticket_caps();
         session.set_area_ticket_caps(max_r, max_c);
-        let (provider, new_sim) = app::driver::wire_provider_and_new_sim(config, &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, new_sim, _bodies) =
+            app::driver::wire_provider_and_new_sim(config, &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         Self {
             session,
             store,

@@ -211,6 +211,55 @@ impl ShardSim {
         self.agents.len()
     }
 
+    /// 主体状态流(REQ-012 A03 §1;`S2C::AgentStates` 下发源,调度器逐分片
+    /// 收集):`(EntityId, BodyHash, 连杆姿态列表)`;**只含主体**(驱动侧
+    /// 与 `entity_states` 分开发送,主体从不出现在方块流里——A01 已过滤)。
+    /// 连杆姿态按 `BodyDef.links` 的顺序排(A03 §1:多连杆姿态的顺序契约;
+    /// 单连杆 = 1 条)。本分片内 EntityId 升序由调用方合并排序。
+    pub fn agent_states(&self) -> Vec<(EntityId, BodyHash, Vec<types::EntityState>)> {
+        self.agents
+            .iter()
+            .map(|(&id, record)| {
+                let def = self
+                    .bodies
+                    .get(&record.body_hash)
+                    .expect("主体身体哈希必在注册表(restore 前置校验,fail-stop)");
+                let poses = def
+                    .links
+                    .iter()
+                    .filter_map(|link| {
+                        record.links.get(&link.name).and_then(|&handle| {
+                            self.phys.bodies.get(handle).map(|rb| types::EntityState {
+                                translation: crate::conv::rapier_to_vec3(rb.translation()),
+                                rotation: crate::conv::rapier_to_quat(rb.rotation()),
+                                linvel: crate::conv::rapier_to_vec3(rb.linvel()),
+                                angvel: crate::conv::rapier_to_vec3(rb.angvel()),
+                            })
+                        })
+                    })
+                    .collect();
+                (id, record.body_hash, poses)
+            })
+            .collect()
+    }
+
+    /// 主体根连杆的世界位置(REQ-012 A03 §5 观察者跟随):主体在本分片 →
+    /// `Some(根位置)`;不在 → None。根连杆 = `links` 表首条(单连杆即它;
+    /// B01 多连杆按 `BodyDef.links[0]` = 根的名字)。
+    pub fn agent_root_position(&self, entity: EntityId) -> Option<types::glam::Vec3> {
+        let record = self.agents.get(&entity)?;
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        let root = def.links.first()?;
+        let &handle = record.links.get(&root.name)?;
+        self.phys
+            .bodies
+            .get(handle)
+            .map(|rb| crate::conv::rapier_to_vec3(rb.translation()))
+    }
+
     /// 生成主体(REQ-012 §3;A01 第 3 节):
     /// - 未知哈希 → `Err(UnknownBody)` + 遥测(`agent_spawn_rejected`);
     /// - 多连杆 → `Err(MultiLink)` + 遥测(B01 实现);
@@ -218,12 +267,16 @@ impl ShardSim {
     /// - 生成位置与实心体素重叠 → 不检查(与 `SpawnDynamic` 同口径:物理
     ///   接触下一步自然解决);
     /// - 质量/惯量乘全局系数 k(`cfg.agent_mass_scale`,§4 默认 1/100);
-    /// - `actor` 恒为 true;`outbox.spawned` 照常(调度器 claim ownership)。
+    /// - `actor` 恒为 true;`outbox.spawned` 照常(调度器 claim ownership);
+    /// - `source` 写进实体记录(REQ-012 A03 §2:调度器注入/本地会话 = None,
+    ///   网络玩家 = `Some(player)`——`entity_owner(a).source` 指认玩家身体,
+    ///   迁移已随实体记录带走;migrate_agent_in 的写回口径与此一致)。
     pub fn spawn_agent(
         &mut self,
         entity: EntityId,
         body: BodyHash,
         state: types::EntityState,
+        source: Option<messaging::InputSource>,
     ) -> Result<(), AgentSpawnError> {
         let def = match self.bodies.get(&body) {
             Some(def) => def.clone(),
@@ -286,7 +339,7 @@ impl ShardSim {
                 desc,
                 slow_ticks: 0,
                 actor: true,
-                source: None,
+                source,
                 window: std::collections::VecDeque::new(),
                 carried: false,
                 at_rest: false,
@@ -344,7 +397,7 @@ impl ShardSim {
             joint_q.is_empty() && joint_qd.is_empty() && last_targets.is_empty(),
             "MigrateAgent 带多连杆关节状态(单连杆恒空,内部一致性违规,fail-stop)"
         );
-        self.spawn_agent(entity, body, state)
+        self.spawn_agent(entity, body, state, source)
             .expect("MigrateAgent 的身体哈希必在注册表(接收方 fail-stop 前置已查)");
         let record = self
             .agents
@@ -355,7 +408,6 @@ impl ShardSim {
         record.intent_jump = intent_jump;
         if let Some(rec) = self.entities.get_mut(&entity) {
             rec.actor_motion_ticks = actor_motion_ticks;
-            rec.source = source;
         }
         self.walker_holds.insert(
             entity,
@@ -726,6 +778,7 @@ pub(crate) mod tests {
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         assert!(s.is_agent(a));
@@ -876,6 +929,7 @@ pub(crate) mod tests {
                 translation: Vec3::new(31.0, 3.0, 8.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         s.spawn_entity_for_test(plain, Vec3::new(16.0, 3.0, 8.0));
@@ -996,6 +1050,7 @@ pub(crate) mod tests {
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         let baseline_solid = count_solid_blocks(&s);
@@ -1086,6 +1141,7 @@ pub(crate) mod tests {
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         s.spawn_entity_for_test(plain, Vec3::new(60.0, 3.0, 60.0));
@@ -1111,8 +1167,8 @@ pub(crate) mod tests {
             translation: Vec3::new(60.0, 3.0, 60.0),
             ..types::EntityState::default()
         };
-        s.spawn_agent(a, hash, st).expect("首次成功");
-        let _ = s.spawn_agent(a, hash, st);
+        s.spawn_agent(a, hash, st, None).expect("首次成功");
+        let _ = s.spawn_agent(a, hash, st, None);
     }
 
     /// 未知身体哈希:类型化拒绝 + 遥测(Outbox.agent_spawn_rejected)。
@@ -1125,6 +1181,7 @@ pub(crate) mod tests {
                 types::EntityId::from_parts(1, 1),
                 unknown,
                 types::EntityState::default(),
+                None,
             )
             .unwrap_err();
         assert_eq!(err, AgentSpawnError::UnknownBody(unknown), "类型化拒绝");
@@ -1168,6 +1225,7 @@ anchor = [0.0, 0.0, 0.0]
                 types::EntityId::from_parts(1, 1),
                 h,
                 types::EntityState::default(),
+                None,
             )
             .unwrap_err();
         assert!(matches!(err, AgentSpawnError::MultiLink(2)), "类型化拒绝");
@@ -1190,6 +1248,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         s.step();
@@ -1459,6 +1518,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         s.spawn_entity_for_test(plain, Vec3::new(60.0, 3.0, 60.0));
@@ -1503,6 +1563,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("无 walker 身体可生成");
         s.apply_prefix(&[intent_input(a, 0, (1.0, 0.0), 0.0, false)]);
@@ -1528,6 +1589,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         for (i, (mx, mz, y)) in [
@@ -1562,6 +1624,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         // (3, 4) 长 5 < 5.6:不钳。
@@ -1594,6 +1657,7 @@ anchor = [0.0, 0.0, 0.0]
                 translation: Vec3::new(24.0, 1.95, 24.0),
                 ..types::EntityState::default()
             },
+            None,
         )
         .expect("capsule 可生成");
         let pi = core::f32::consts::PI;

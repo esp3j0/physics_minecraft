@@ -1201,7 +1201,7 @@ async fn acc6_network_observer_replay() {
         Box::new(storage::mem::MemChunkStore::new()),
         Box::new(checkpoints.clone()),
     );
-    let (provider, _) =
+    let (provider, _, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
@@ -1228,6 +1228,7 @@ async fn acc6_network_observer_replay() {
             cadence,
         }),
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     // A 进区 (8,·,8),B 进区 (200,·,8);A 中途断开。
@@ -1739,7 +1740,7 @@ async fn acc8_workspace_regression_and_viewer_smoke() {
         Box::new(storage::mem::MemChunkStore::new()),
         Box::new(MemCheckpointStore::new()),
     );
-    let (provider, _) =
+    let (provider, _, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
@@ -1766,6 +1767,7 @@ async fn acc8_workspace_regression_and_viewer_smoke() {
             cadence,
         }),
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     let (events, _control) = ViewerClient::spawn(addr, 2).expect("spawn 连真服务器");
@@ -2017,7 +2019,7 @@ async fn pending_blockwrite_cells_defer_window() {
         Box::new(chunks_store.clone()),
         Box::new(checkpoints.clone()),
     );
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -2031,6 +2033,7 @@ async fn pending_blockwrite_cells_defer_window() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     // ① 观察者贴边界 (120,-58,8):(0,0) 本体 + (1,0) 邻片(8m < 32m)双 ensure,

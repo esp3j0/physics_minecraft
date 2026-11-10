@@ -1330,6 +1330,44 @@ impl Scheduler {
         self.entity_ownership.owner_of(entity)
     }
 
+    /// 全局归属表只读视图(REQ-012 A03 §2/§5:驱动侧"该连接名下的玩家身体"
+    /// 扫描与恢复清扫用):`(EntityId, source, actor)` 按 EntityId 升序
+    /// (BTreeMap 键序)。
+    pub fn entity_owners(&self) -> Vec<(EntityId, Option<InputSource>, bool)> {
+        self.entity_ownership
+            .iter()
+            .map(|(&id, owner)| (id, owner.source, owner.actor))
+            .collect()
+    }
+
+    /// 主体状态流(REQ-012 A03 §1;`S2C::AgentStates` 下发源):全部已注册
+    /// 分片的 `(EntityId, BodyHash, 连杆姿态列表)`,EntityId 升序;连杆姿态
+    /// 按 `BodyDef.links` 顺序(单连杆 = 1 条)。委托
+    /// [`ShardSim::agent_states`]。
+    pub fn agent_states(&self) -> Vec<(EntityId, types::BodyHash, Vec<types::EntityState>)> {
+        let mut out = Vec::new();
+        for sim in self.sims.values() {
+            out.extend(sim.agent_states());
+        }
+        out.sort_by_key(|(id, _, _)| *id);
+        out
+    }
+
+    /// 主体根连杆的世界位置(REQ-012 A03 §5 观察者跟随):任一已注册分片
+    /// 持有该主体 → `Some(根位置)`;迁移在途窗口/不存在 → None。BTreeMap
+    /// 键序扫,确定性。
+    pub fn agent_root_position(&self, entity: EntityId) -> Option<Vec3> {
+        self.sims
+            .values()
+            .find_map(|sim| sim.agent_root_position(entity))
+    }
+
+    /// Router 待投递迁移信封(REQ-012 A03;驱动侧附身清理的"在途不算
+    /// 移除"判定):委托 [`shard::router::Router::in_transit_migrations`]。
+    pub fn in_transit_migrations(&self) -> Vec<messaging::Envelope> {
+        self.router.in_transit_migrations()
+    }
+
     /// 常驻运动票签发(任务 04a;分片判定经 IssueActorMotion 触发,单点在
     /// 调度器):表中已有 → 无操作(D14,不重置时钟);limit =
     /// actor_motion_max_ticks(到期 = 撤票,非强制落地)。D17:未启用不签

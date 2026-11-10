@@ -109,7 +109,7 @@ async fn drive(
     ticks: u32,
 ) -> app::driver::DriverOutcome {
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -123,6 +123,7 @@ async fn drive(
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -206,7 +207,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
     assert_eq!(resume_from, None);
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -220,6 +221,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -245,7 +247,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
 
     // —— 续跑后向同分片发 SetBlock,跑 1 拍(全局第 7 拍)生效 ——
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store2, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -259,6 +261,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -364,7 +367,7 @@ async fn telemetry_wired_into_driver_outcome() {
         Box::new(MemCheckpointStore::new()),
     );
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -378,6 +381,7 @@ async fn telemetry_wired_into_driver_outcome() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -422,7 +426,7 @@ async fn spawn_high_water_survives_restart() {
     let mut session = session;
     session.register(ground_sim());
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(app::driver::run(app::driver::DriverArgs {
@@ -436,6 +440,7 @@ async fn spawn_high_water_survives_restart() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     let old = EntityId::from_parts(0, 77);
     tx.send(DriverCommand::Send {

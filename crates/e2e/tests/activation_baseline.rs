@@ -289,7 +289,7 @@ fn run_scenario() -> Vec<Frame> {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     // 初始分片(0,0)预注册(对齐生产 bootstrap:首分片装配期注册,chunk

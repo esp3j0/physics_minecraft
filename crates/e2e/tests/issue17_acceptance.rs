@@ -221,7 +221,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
     let (session, log, store, resume_from, _seq) =
         app::driver::bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None);
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
@@ -236,6 +236,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     tx.send(DriverCommand::MoveObserver {
         position: Vec3::new(8.0, types::WORLD_Y_MIN as f32 + 6.0, 8.0),

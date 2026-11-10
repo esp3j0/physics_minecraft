@@ -274,6 +274,7 @@ async fn acg3_observer_walk_builds_playable_world() {
         new_sim: new_sim_no_bridge(config.clone()),
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     // 观察者进分片 (1,0) 新区(x=200 → chunk 12 → 分片 (1,0));y 取地面顶面
@@ -388,7 +389,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         Box::new(checkpoints.clone()),
     );
     // provider/new_sim 走生产装配函数(seed/world_kind 来自 Config;Superflat)。
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let driver = tokio::spawn(run(DriverArgs {
@@ -402,6 +403,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     let shard = shard_id(1, 0);
@@ -888,7 +890,7 @@ async fn acg6_persisted_after_process_restart() {
     let (session, log, store, resume_from, _spawn_next_seq) =
         app::driver::bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "空目录全新会话");
-    let (provider, new_sim) =
+    let (provider, new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
@@ -903,6 +905,7 @@ async fn acg6_persisted_after_process_restart() {
         new_sim,
         observe: None,
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
 
     let shard = shard_id(1, 0);

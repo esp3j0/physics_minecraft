@@ -524,10 +524,16 @@ impl Session {
     }
 
     /// 主体生成(REQ-012 §3,A01 第 2 节):本地受信通道正路——照常盖章
-    /// (`apply_at = tick_now()`、source = 会话、sequence 沿会话单调)入
-    /// **分片收件箱**与外部命令日志(回放再生)。不进 C2S 白名单
-    /// (`net::command_shard` 返回 None、`validate_external_command` 拒绝;
-    /// 协议与附身面在 A03 开)。分片未注册 → panic(调度器语义,同 `send`)。
+    /// (`apply_at = tick_now()`、source = **会话**、sequence 沿会话单调)入
+    /// **分片收件箱**与外部命令日志(回放再生;日志 source = 会话的口径由
+    /// A02a agent_session_replay 钉住,不改)。内核换算侧(A03 §2):调度器
+    /// 注入 → None,**会话身份经 send 的 `Some(1)` 也会写进实体记录**——
+    /// 本地会话布景用主体与网络玩家 1 身份混叠;生产路径的服务端权威主体
+    /// 走 commands 通道(dispatch_external 的 SCHEDULER 盖章,owner.source
+    /// = None,"没人附身的服务端主体"可被附身),本入口仅测试/布景使用。
+    /// 网络玩家身体走 [`Session::spawn_agent_from`]。不进 C2S 白名单
+    /// (`net::command_shard` 返回 None、`validate_external_command` 拒绝)。
+    /// 分片未注册 → panic(调度器语义,同 `send`)。
     pub fn spawn_agent(
         &mut self,
         shard: ShardId,
@@ -536,6 +542,31 @@ impl Session {
         state: types::EntityState,
     ) -> Result<LogEntry, SessionError> {
         self.send(
+            shard,
+            SimCommand::SpawnAgent {
+                entity,
+                body,
+                state,
+            },
+        )
+    }
+
+    /// 带来源的主体生成(REQ-012 A03 §2;签名照 `spawn_owned`):与
+    /// [`Session::spawn_agent`] 同语义(盖章当前拍、沿会话单调、入分片收件
+    /// 箱与日志),但 `source` 用参数——网络玩家的主体 `source =
+    /// Some(player)`(内核写进实体记录,`entity_owner(a).source` 指认玩家
+    /// 身体;迁移随实体记录带走);`spawn_agent` 即会话来源(None 语义由
+    /// 调度器注入换算)。
+    pub fn spawn_agent_from(
+        &mut self,
+        source: InputSource,
+        shard: ShardId,
+        entity: EntityId,
+        body: types::BodyHash,
+        state: EntityState,
+    ) -> Result<LogEntry, SessionError> {
+        self.send_from(
+            source,
             shard,
             SimCommand::SpawnAgent {
                 entity,
@@ -561,6 +592,35 @@ impl Session {
     ) -> Result<LogEntry, SessionError> {
         self.send(
             shard,
+            SimCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            },
+        )
+    }
+
+    /// 按实体当前 owner 投递主体意图(REQ-012 A03 §4 路由;签名照
+    /// `send_to_entity`):**不按调用方上次记住的分片投**——A04 R1 实证迁移
+    /// 后发往原分片的意图会被丢掉。owner 查不到(迁移在途窗口/不存在)→
+    /// `Rejected("实体不存在或迁移窗口")`(调用方 = 驱动暂存到下一拍;
+    /// §4:意图是保持状态,在途窗口不能丢)。成功入日志(`send_from` 同款
+    /// 盖章,source = 玩家)。
+    pub fn send_agent_intent_to(
+        &mut self,
+        source: InputSource,
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    ) -> Result<LogEntry, SessionError> {
+        let owner = self
+            .entity_owner(entity)
+            .ok_or(SessionError::Rejected("实体不存在或迁移窗口"))?;
+        self.send_from(
+            source,
+            owner.shard,
             SimCommand::AgentIntent {
                 entity,
                 move_xz,
@@ -745,6 +805,47 @@ impl Session {
     /// 驱动侧前置校验用)。不存在/迁移窗口 → false。
     pub fn is_agent(&self, entity: EntityId) -> bool {
         self.scheduler.is_agent(entity)
+    }
+
+    /// 全局归属表只读视图(REQ-012 A03 §2/§5):`(EntityId, source, actor)`
+    /// 按 EntityId 升序(透传调度器)。驱动侧"该连接名下的玩家身体"扫描
+    /// 与恢复清扫用。
+    pub fn entity_owners(&self) -> Vec<(EntityId, Option<InputSource>, bool)> {
+        self.scheduler.entity_owners()
+    }
+
+    /// 主体状态流(REQ-012 A03 §1;`S2C::AgentStates` 下发源):全部已注册
+    /// 分片的 `(EntityId, BodyHash, 连杆姿态列表)`,EntityId 升序;连杆姿态
+    /// 按 `BodyDef.links` 顺序(单连杆 = 1 条)。只含主体(方块流
+    /// `entity_states` 已过滤主体,A01)。
+    pub fn agent_states(&self) -> Vec<(EntityId, types::BodyHash, Vec<EntityState>)> {
+        self.scheduler.agent_states()
+    }
+
+    /// 主体根连杆的世界位置(REQ-012 A03 §5 观察者跟随);迁移在途窗口/
+    /// 不存在 → None。
+    pub fn agent_root_position(&self, entity: EntityId) -> Option<Vec3> {
+        self.scheduler.agent_root_position(entity)
+    }
+
+    /// Router 待投递迁移信封(REQ-012 A03;驱动侧附身清理的"在途不算
+    /// 移除"判定)。
+    pub fn in_transit_migrations(&self) -> Vec<messaging::Envelope> {
+        self.scheduler.in_transit_migrations()
+    }
+
+    /// 在途迁移的实体集合(REQ-012 A03 §4:意图投递的早窗口判定——owner
+    /// 已指向目的分片但信封未落地,此刻投递会被内核静默拒绝,必须暂存)。
+    pub fn in_transit_entities(&self) -> std::collections::BTreeSet<EntityId> {
+        self.scheduler
+            .in_transit_migrations()
+            .into_iter()
+            .filter_map(|env| match env.payload {
+                messaging::EnvelopePayload::MigrateEntity { entity, .. }
+                | messaging::EnvelopePayload::MigrateAgent { entity, .. } => Some(entity),
+                _ => None,
+            })
+            .collect()
     }
 
     /// 主体所在分片的控制器保持态(REQ-012 A04 判据观测口;透传调度器)。

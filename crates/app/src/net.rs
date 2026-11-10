@@ -149,6 +149,9 @@ pub enum TranslateOutcome {
     /// 调试遥测订阅(REQ-011 §3.5.2;W03):幂等;该连接开始接收
     /// [`S2C::DebugStats`]。
     SubscribeDebug,
+    /// 主体协议面(REQ-012 A03):SpawnAgent/Possess/Unpossess/AgentIntent
+    /// 的 DriverCommand 载体(驱动侧校验与回执;校验不过 = 拒绝计数)。
+    Agent(DriverCommand),
     /// 非白名单命令等(协议违规 → 断连)。
     Reject(&'static str),
 }
@@ -173,6 +176,31 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
             None => TranslateOutcome::Reject("非白名单命令"),
         },
         C2S::Spawn { state, desc } => TranslateOutcome::Send(DriverCommand::Spawn { state, desc }),
+        // 主体协议面(REQ-012 A03;枚举只追加,既有分支不动):四个新变体
+        // 照 DriverCommand::Spawn 样式走 DriverCommand 载体上行,驱动侧
+        // 校验/路由/回执(校验不过 = 驱动侧拒绝计数,不回包)。
+        C2S::SpawnAgent {
+            body,
+            position,
+            yaw,
+        } => TranslateOutcome::Agent(DriverCommand::SpawnAgent {
+            body,
+            position,
+            yaw,
+        }),
+        C2S::Possess { entity } => TranslateOutcome::Agent(DriverCommand::Possess { entity }),
+        C2S::Unpossess => TranslateOutcome::Agent(DriverCommand::Unpossess),
+        C2S::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            jump,
+        } => TranslateOutcome::Agent(DriverCommand::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            jump,
+        }),
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
         C2S::SubscribeDebug => TranslateOutcome::SubscribeDebug,
@@ -429,6 +457,11 @@ impl WorldWriter {
 pub struct OutboundHub {
     /// 玩家 → 该连接的 World 队列写入端(BTreeMap:键序确定性)。
     writers: std::sync::Mutex<std::collections::BTreeMap<InputSource, WorldWriter>>,
+    /// 玩家 → 该连接的 chunk 流泵态(REQ-012 A03 §5 观察者跟随):服务端
+    /// 替玩家移观察者时同步泵中心(否则跟随不拉 chunk,沿途区域不下发)。
+    centers: std::sync::Mutex<
+        std::collections::BTreeMap<InputSource, std::sync::Arc<std::sync::Mutex<ChunkStreamState>>>,
+    >,
     /// World 满 → 丢最旧的累计次数(AC-N5 观测口径;单调;原子累计——
     /// 计数本体在每连接的 Outbound 上,hub 注册/注销只存各队列的计数句柄,
     /// 读侧对在场句柄求和 + 已注销队列的沉淀值)。
@@ -450,8 +483,35 @@ impl OutboundHub {
             .insert(player, writer);
     }
 
+    /// 注册玩家的 chunk 流泵态(A03 §5;Subscribe 建流时)。
+    fn register_center(
+        &self,
+        player: InputSource,
+        state: std::sync::Arc<std::sync::Mutex<ChunkStreamState>>,
+    ) {
+        self.centers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(player, state);
+    }
+
+    /// 服务端同步泵中心(A03 §5 观察者跟随):玩家不在表 = 幂等无操作。
+    pub fn set_stream_center(&self, player: InputSource, center: types::ChunkPos) {
+        let centers = self.centers.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = centers.get(&player) {
+            state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .set_center(center);
+        }
+    }
+
     /// 注销玩家出站(连接任务终止时;Drop 路径同步执行)。返回是否确有注册。
     fn unregister(&self, player: &InputSource) -> bool {
+        self.centers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(player);
         let removed = self
             .writers
             .lock()
@@ -630,7 +690,7 @@ enum SessionState {
 /// (泵择 `shutdown` 臂终止——断连即停,无孤儿任务)。
 pub(crate) struct StreamLink {
     /// 泵态(center 单槽合并 + 视距 + loaded;连接读路径与泵共享)。
-    pub state: std::sync::Arc<tokio::sync::Mutex<ChunkStreamState>>,
+    pub state: std::sync::Arc<std::sync::Mutex<ChunkStreamState>>,
     /// 连接侧关机发送端(连接任务 Drop 时触发;显式 abort 兜底)。
     pub shutdown: tokio::sync::broadcast::Sender<()>,
     /// 泵任务句柄(显式 abort 兜底用)。
@@ -643,7 +703,7 @@ impl StreamLink {
     /// `data_ready` 提醒冲刷);StreamChunks 请求经 `up_tx` 以
     /// `NetUp::DriverCommand` 上行(驱动侧路由后持有 oneshot 回执)。
     pub fn spawn(
-        state: std::sync::Arc<tokio::sync::Mutex<ChunkStreamState>>,
+        state: std::sync::Arc<std::sync::Mutex<ChunkStreamState>>,
         cfg: PumpConfig,
         up_tx: mpsc::Sender<NetUp>,
         outbound: WorldWriter,
@@ -883,7 +943,7 @@ async fn handle_frame(
                 // 距离过滤半径跟随)。
                 link.state
                     .lock()
-                    .await
+                    .unwrap_or_else(|p| p.into_inner())
                     .resubscribe(view_distance.min(VIEW_DISTANCE_MAX));
                 let _ = up_tx
                     .send(NetUp::Subscribed {
@@ -913,12 +973,12 @@ async fn handle_frame(
             // 泵经 WorldWriter 只写 World 队列(单 socket 写者 = 连接任务);
             // StreamChunks 请求仍经 up_tx 上行(驱动侧经 NetUp 路由后持有
             // oneshot 回执,REQ-003 §4.4)。
-            let stream_state = std::sync::Arc::new(tokio::sync::Mutex::new(ChunkStreamState::new(
+            let stream_state = std::sync::Arc::new(std::sync::Mutex::new(ChunkStreamState::new(
                 types::ChunkPos::new(0, 0),
                 view_distance,
             )));
             let link = StreamLink::spawn(
-                stream_state,
+                stream_state.clone(),
                 pump,
                 up_tx.clone(),
                 outbound.world_writer(),
@@ -928,6 +988,9 @@ async fn handle_frame(
             // 逐玩家填充 EntityStates/BlockUpdates;连接终止由注册守卫注销
             // (守卫经 `&mut Option` 从连接任务写入——handle_frame 不持 Arc)。
             hub.register(player, outbound.world_writer());
+            // chunk 流泵态注册(A03 §5 观察者跟随:服务端替玩家移观察者
+            // 时同步泵中心)。
+            hub.register_center(player, stream_state.clone());
             let hub_arc = run_hub.clone();
             *hub_guard = Some(DisconnectGuard {
                 player,
@@ -956,12 +1019,21 @@ async fn handle_frame(
                     (position.x / 16.0).floor() as i32,
                     (position.z / 16.0).floor() as i32,
                 );
-                link.state.lock().await.set_center(center);
+                link.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .set_center(center);
             }
             let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
             Flow::Continue
         }
         TranslateOutcome::Send(cmd) => {
+            let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
+            Flow::Continue
+        }
+        // 主体协议面(REQ-012 A03):照 Send 同款经 DriverCommand 载体上行
+        // (驱动侧校验;校验不过 = 拒绝计数,不回包)。
+        TranslateOutcome::Agent(cmd) => {
             let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
             Flow::Continue
         }
@@ -1457,6 +1529,102 @@ pub(crate) mod tests {
             None
         );
         assert_eq!(command_shard(&SimCommand::RemoveAreaTicket { id: 1 }), None);
+    }
+
+    // ---- REQ-012 A03 判据 A03-1(协议面):主体协议四变体照 Spawn 样式走
+    // DriverCommand 载体;C2S::Command(SimCommand::SpawnAgent/AgentIntent)
+    // 仍是 Reject(主体只走专用包,SimCommand 形态不开放给客户端)。 ----
+    #[test]
+    fn a03_translate_agent_variants_and_command_reject() {
+        let player = InputSource(1);
+        // 四个新 C2S 变体 → TranslateOutcome::Agent(对应 DriverCommand)。
+        assert_eq!(
+            translate(
+                player,
+                C2S::SpawnAgent {
+                    body: "capsule".to_string(),
+                    position: Vec3::new(8.0, -60.0, 8.0),
+                    yaw: 0.5,
+                }
+            ),
+            TranslateOutcome::Agent(DriverCommand::SpawnAgent {
+                body: "capsule".to_string(),
+                position: Vec3::new(8.0, -60.0, 8.0),
+                yaw: 0.5,
+            })
+        );
+        assert_eq!(
+            translate(
+                player,
+                C2S::Possess {
+                    entity: EntityId::from_parts(0, 7),
+                }
+            ),
+            TranslateOutcome::Agent(DriverCommand::Possess {
+                entity: EntityId::from_parts(0, 7),
+            })
+        );
+        assert_eq!(
+            translate(player, C2S::Unpossess),
+            TranslateOutcome::Agent(DriverCommand::Unpossess)
+        );
+        assert_eq!(
+            translate(
+                player,
+                C2S::AgentIntent {
+                    entity: EntityId::from_parts(0, 7),
+                    move_xz: (1.0, 0.0),
+                    yaw: 0.0,
+                    jump: false,
+                }
+            ),
+            TranslateOutcome::Agent(DriverCommand::AgentIntent {
+                entity: EntityId::from_parts(0, 7),
+                move_xz: (1.0, 0.0),
+                yaw: 0.0,
+                jump: false,
+            })
+        );
+        // C2S::Command 承载主体命令仍 Reject(协议层;A03 §1 最后一条)。
+        let spawn_agent_cmd = SimCommand::SpawnAgent {
+            entity: EntityId::from_parts(0, 1),
+            body: types::BodyHash([0u8; 8]),
+            state: types::EntityState::default(),
+        };
+        let outcome = translate(player, C2S::Command(spawn_agent_cmd));
+        assert!(
+            matches!(outcome, TranslateOutcome::Reject(why) if why.contains("非白名单")),
+            "C2S::Command(SpawnAgent) → Reject:{outcome:?}"
+        );
+        let intent_cmd = SimCommand::AgentIntent {
+            entity: EntityId::from_parts(0, 1),
+            move_xz: (1.0, 0.0),
+            yaw: 0.0,
+            jump: false,
+        };
+        let outcome = translate(player, C2S::Command(intent_cmd));
+        assert!(
+            matches!(outcome, TranslateOutcome::Reject(why) if why.contains("非白名单")),
+            "C2S::Command(AgentIntent) → Reject:{outcome:?}"
+        );
+        // command_shard 同口径 None(防御层;既有分支不动)。
+        assert_eq!(
+            command_shard(&SimCommand::SpawnAgent {
+                entity: EntityId::from_parts(0, 1),
+                body: types::BodyHash([0u8; 8]),
+                state: types::EntityState::default(),
+            }),
+            None
+        );
+        assert_eq!(
+            command_shard(&SimCommand::AgentIntent {
+                entity: EntityId::from_parts(0, 1),
+                move_xz: (1.0, 0.0),
+                yaw: 0.0,
+                jump: false,
+            }),
+            None
+        );
     }
 
     #[tokio::test]
@@ -2382,7 +2550,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&config.data_dir);
         let (session, log, store, _resume, _spawn_next_seq) =
             bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("装配");
-        let (provider, new_sim) =
+        let (provider, new_sim, _bodies) =
             crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(SimpleRegistry::builtin())
             })
@@ -2399,6 +2567,7 @@ pub(crate) mod tests {
             new_sim,
             observe: None,
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         };
         let driver = tokio::spawn(crate::driver::run(args));
 
@@ -2582,7 +2751,7 @@ pub(crate) mod tests {
             Box::new(storage::mem::MemChunkStore::new()),
             Box::new(storage::mem::MemCheckpointStore::new()),
         );
-        let (provider, new_sim) =
+        let (provider, new_sim, _bodies) =
             crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(voxel::SimpleRegistry::builtin())
             })
@@ -2598,6 +2767,7 @@ pub(crate) mod tests {
             new_sim,
             observe: Some(handle.observe),
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         }));
 
         // 外部客户端连入:Hello + Subscribe → 首帧 Welcome(ACV1 冒烟)。

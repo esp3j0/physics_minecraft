@@ -44,6 +44,34 @@ pub enum C2S {
     /// [`S2C::DebugStats`];重复发送幂等;断连即失效。未订阅连接的帧序列
     /// 与不订阅时逐位相同。
     SubscribeDebug,
+    /// 主体生成(REQ-012 A03 §2;追加在 `SubscribeDebug` 之后):客户端只按
+    /// 名字引用身体(§2.1;哈希是服务端权威换算,不信任客户端算术)。服务端
+    /// 校验(身体名在注册表、坐标/yaw 有限、出生 chunk 已加载、该连接无存活
+    /// 玩家身体——D1/D12 一连接一身体)全部通过才生成;成功复用
+    /// [`S2C::Spawned`] 回执;被拒不回包,只计数(驱动遥测)。
+    SpawnAgent {
+        body: String,
+        position: Vec3,
+        yaw: f32,
+    },
+    /// 附身(REQ-012 A03 §3):客户端请求附身一个主体(自己的身体,或一个
+    /// 没人附身的服务端主体 `source = None`)。结果经 [`S2C::Possessed`] 回执;
+    /// 被拒不回包,只计数。
+    Possess {
+        entity: EntityId,
+    },
+    /// 解除附身(REQ-012 A03 §3):给原主体发一条零意图(经日志投递,主体
+    /// 停下),回 [`S2C::Possessed{ entity: None }`]。
+    Unpossess,
+    /// 主体意图(REQ-012 A03 §4;AC-A7):带实体——服务端只有在发送方正
+    /// 附身这个实体时才投递,否则拒绝并计数;数值检查(有限值/钳制)仍由
+    /// 内核做(A02),驱动不重复。
+    AgentIntent {
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    },
 }
 
 /// 服务器 → 客户端(追加式)。
@@ -98,6 +126,29 @@ pub enum S2C {
         counters: DebugCounters,
         /// 最近 8 条非空冲量流事件(带拍号,旧 → 新)。
         recent: Vec<(Tick, FlowEventWire)>,
+    },
+    /// 主体状态流(REQ-012 A03 §1;追加在 `DebugStats` 之后):连杆姿态按
+    /// `BodyDef.links` 的顺序排(单连杆 = 1 条);增量、全量、距离过滤的
+    /// 语义与周期同 [`S2C::EntityStates`],**两者分开发送**。主体永远不出
+    /// 现在[`S2C::EntityStates`]里(内核 entity_states 已过滤,A01)。
+    ///
+    /// 与 `EntityStates` 的一处不同:全量包即使为空也照发是 `EntityStates`
+    /// 的拍号心跳语义;`AgentStates` 只在这个连接视距内有主体、或上一次发
+    /// 给它的主体表不为空时才发——世界里没有主体时,帧序列与改动前逐位
+    /// 相同(AC-A8)。
+    AgentStates {
+        tick: Tick,
+        /// `(EntityId, BodyHash, 连杆姿态列表)`;姿态按 `BodyDef.links` 顺序。
+        states: Vec<(EntityId, types::BodyHash, Vec<EntityState>)>,
+        /// 本周期消失的主体(迁移/移除;语义同 `EntityStates.removed`)。
+        removed: Vec<EntityId>,
+        /// 全量标记(语义同 `EntityStates.full`:以 states 重建主体表)。
+        full: bool,
+    },
+    /// 附身回执(REQ-012 A03 §3):`Some` = 附身成功;`None` = 解除附身
+    /// (客户端请求或主体被移除而被迫解除)。
+    Possessed {
+        entity: Option<EntityId>,
     },
 }
 
@@ -469,6 +520,106 @@ mod tests {
             decode_frame(&encode_frame(&empty)),
             Some(empty),
             "空 recent 往返"
+        );
+    }
+
+    /// REQ-012 A03 判据 A03-1:六个新变体编解码往返 + 判别值钉在声明序
+    /// (追加在末尾)——C2S:`SpawnAgent` = 8(Hello0/Subscribe1/MoveObserver2/
+    /// Command3/Ping4/Goodbye5/Spawn6/SubscribeDebug7)、`Possess` = 9、
+    /// `Unpossess` = 10、`AgentIntent` = 11;S2C:`AgentStates` = 10
+    /// (Welcome0/ChunkData1/ChunkUnload2/EntityStates3/BlockUpdates4/Pong5/
+    /// Bye6/Spawned7/EntityShapes8/DebugStats9)、`Possessed` = 11;既有变体
+    /// golden 不变由 [`Self::ace7_old_variant_golden_bytes`] 与
+    /// [`Self::w8_debug_variants_roundtrip_and_discriminants`] 钉住。
+    #[test]
+    fn a03_agent_variants_roundtrip_and_discriminants() {
+        // C2S::SpawnAgent 往返 + 判别值(载荷首字节 = varint 判别值)。
+        let spawn_agent = C2S::SpawnAgent {
+            body: "capsule".to_string(),
+            position: Vec3::new(8.0, -60.0, 8.0),
+            yaw: 1.25,
+        };
+        let frame = encode_c2s_frame(&spawn_agent);
+        assert_eq!(frame[4], 8, "SpawnAgent 判别值 = 8(声明序追加)");
+        assert_eq!(
+            decode_c2s_frame(&frame),
+            Some(spawn_agent),
+            "SpawnAgent 往返"
+        );
+
+        // C2S::Possess。
+        let possess = C2S::Possess {
+            entity: EntityId::from_parts(0, 7),
+        };
+        let frame = encode_c2s_frame(&possess);
+        assert_eq!(frame[4], 9, "Possess 判别值 = 9");
+        assert_eq!(decode_c2s_frame(&frame), Some(possess), "Possess 往返");
+
+        // C2S::Unpossess(无字段)。
+        let frame = encode_c2s_frame(&C2S::Unpossess);
+        assert_eq!(frame[4], 10, "Unpossess 判别值 = 10");
+        assert_eq!(
+            decode_c2s_frame(&frame),
+            Some(C2S::Unpossess),
+            "Unpossess 往返"
+        );
+
+        // C2S::AgentIntent。
+        let intent = C2S::AgentIntent {
+            entity: EntityId::from_parts(0, 7),
+            move_xz: (1.0, -0.5),
+            yaw: -2.5,
+            jump: true,
+        };
+        let frame = encode_c2s_frame(&intent);
+        assert_eq!(frame[4], 11, "AgentIntent 判别值 = 11");
+        assert_eq!(decode_c2s_frame(&frame), Some(intent), "AgentIntent 往返");
+
+        // S2C::AgentStates:增量与全量两条(带 BodyHash 与连杆姿态列表)。
+        let states = S2C::AgentStates {
+            tick: Tick(240),
+            states: vec![(
+                EntityId::from_parts(0, 7),
+                types::BodyHash::fnv1a(b"probe"),
+                vec![EntityState {
+                    translation: Vec3::new(8.0, -60.0, 8.0),
+                    ..EntityState::default()
+                }],
+            )],
+            removed: vec![EntityId::from_parts(0, 3)],
+            full: false,
+        };
+        let frame = encode_frame(&states);
+        assert_eq!(frame[4], 10, "AgentStates 判别值 = 10(声明序追加)");
+        assert_eq!(decode_frame(&frame), Some(states), "AgentStates 增量往返");
+        let full = S2C::AgentStates {
+            tick: Tick(300),
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: true,
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&full)),
+            Some(full),
+            "AgentStates 全量(空表)往返"
+        );
+
+        // S2C::Possessed:Some 与 None 两条。
+        let possessed_some = S2C::Possessed {
+            entity: Some(EntityId::from_parts(0, 7)),
+        };
+        let frame = encode_frame(&possessed_some);
+        assert_eq!(frame[4], 11, "Possessed 判别值 = 11");
+        assert_eq!(
+            decode_frame(&frame),
+            Some(possessed_some),
+            "Possessed(Some) 往返"
+        );
+        let possessed_none = S2C::Possessed { entity: None };
+        assert_eq!(
+            decode_frame(&encode_frame(&possessed_none)),
+            Some(possessed_none),
+            "Possessed(None) 往返"
         );
     }
 }

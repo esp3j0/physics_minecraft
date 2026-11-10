@@ -65,7 +65,7 @@ impl Harness {
         // 与 bootstrap 同:区域票上限经配置注入。
         let (max_r, max_c) = config.area_ticket_caps();
         session.set_area_ticket_caps(max_r, max_c);
-        let (provider, new_sim) =
+        let (provider, new_sim, _bodies) =
             app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                 Box::new(voxel::SimpleRegistry::builtin())
             })
@@ -1719,10 +1719,11 @@ fn restore_harness(snapshot: &sim_api::snapshot::WorldSnapshot) -> Harness {
         || Box::new(voxel::SimpleRegistry::builtin()),
     )
     .expect("自有快照必可恢复");
-    let (provider, new_sim) = app::driver::wire_provider_and_new_sim(config, &store, || {
-        Box::new(voxel::SimpleRegistry::builtin())
-    })
-    .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+    let (provider, new_sim, _bodies) =
+        app::driver::wire_provider_and_new_sim(config, &store, || {
+            Box::new(voxel::SimpleRegistry::builtin())
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     Harness {
         session,
         store,

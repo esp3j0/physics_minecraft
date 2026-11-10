@@ -144,7 +144,7 @@ mod unit01 {
                 Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
             })
             .expect("装配");
-            let (provider, _new_sim) =
+            let (provider, _new_sim, _bodies) =
                 app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                     Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
                 })

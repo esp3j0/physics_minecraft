@@ -168,7 +168,7 @@ async fn harness() -> Harness {
         Box::new(storage::mem::MemChunkStore::new()),
         Box::new(MemCheckpointStore::new()),
     );
-    let (provider, _) =
+    let (provider, _, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
@@ -195,6 +195,7 @@ async fn harness() -> Harness {
             cadence,
         }),
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     Harness { tx, driver, addr }
 }

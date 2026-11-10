@@ -67,10 +67,11 @@ async fn start_server(
         Box::new(storage::mem::MemChunkStore::new()),
         Box::new(MemCheckpointStore::new()),
     );
-    let (provider, _) = app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
-        Box::new(SimpleRegistry::builtin())
-    })
-    .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+    let (provider, _, _bodies) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
     let new_sim = Box::new(move |shard: ShardId| {
         ShardSim::new(
@@ -93,6 +94,7 @@ async fn start_server(
             cadence,
         }),
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     (tx, driver, addr)
 }

@@ -367,7 +367,7 @@ async fn harness(config: Config, pump: PumpConfig, observe: (u64, u64), zero_g: 
     );
     // provider 走生产装配(worker 通道 + 生成器按 world_kind + seed);
     // new_sim 自造(凝固桥关;zero_g 可选)。
-    let (provider, _) =
+    let (provider, _, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let sim_source = config.clone();
@@ -397,6 +397,7 @@ async fn harness(config: Config, pump: PumpConfig, observe: (u64, u64), zero_g: 
             cadence,
         }),
         spawn_next_seq: 0,
+        bodies: physics_sim::BodyRegistry::new(),
     }));
     Harness {
         tx,

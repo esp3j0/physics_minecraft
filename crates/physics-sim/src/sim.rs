@@ -4385,13 +4385,16 @@ impl ShardSim {
                 // 同口径拒绝)。类型化拒绝 → 遥测计数(Outbox.
                 // agent_spawn_rejected),不断链;重复 EntityId 与 SpawnDynamic
                 // 同口径(fail-stop assert,spawn_agent 内)。
-                // 来源换算与 SpawnDynamic 一致(调度器注入 = 服务端实体)。
-                let _owner_source = if source == InputSource::SCHEDULER {
+                // 来源换算与 SpawnDynamic 一致(调度器注入 = 服务端实体);
+                // REQ-012 A03 §2:写进实体记录——本地会话/调度器 → None,
+                // 网络玩家 → Some(player),`entity_owner(a).source` 指认玩家
+                // 身体(迁移随实体记录带走)。
+                let owner_source = if source == InputSource::SCHEDULER {
                     None
                 } else {
                     Some(source)
                 };
-                if let Err(_e) = self.spawn_agent(entity, body, state) {
+                if let Err(_e) = self.spawn_agent(entity, body, state, owner_source) {
                     // 遥测在 spawn_agent 内计数(类型化拒绝不断链)。
                 }
             }

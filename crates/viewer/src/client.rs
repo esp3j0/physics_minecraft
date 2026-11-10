@@ -219,6 +219,10 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
             counters,
             recent,
         }),
+        // 主体协议面(REQ-012 A03;枚举只追加):viewer 侧 A06 才接附身模式
+        // 与相机,先映射 None 让 viewer 编译过(主体流对渲染无意义即吞掉,
+        // 与 Pong 同款)。
+        S2C::AgentStates { .. } | S2C::Possessed { .. } => None,
     }
 }
 

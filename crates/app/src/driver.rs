@@ -62,6 +62,30 @@ pub enum DriverCommand {
     RemoveAreaTicket {
         id: u64,
     },
+    /// 主体生成(REQ-012 A03 §2;网络上行的 DriverCommand 载体):驱动侧
+    /// 校验(身体名/有限值/chunk 已加载/一连接一身体)通过后分配 ID、
+    /// 盖章投递 `SimCommand::SpawnAgent`、回执 `S2C::Spawned`。
+    SpawnAgent {
+        body: String,
+        position: types::glam::Vec3,
+        yaw: f32,
+    },
+    /// 附身请求(REQ-012 A03 §3):驱动侧附身表(连接 ↔ 主体,双向一对一,
+    /// 不进内核不进检查点 D6)校验后回执 `S2C::Possessed`。
+    Possess {
+        entity: types::EntityId,
+    },
+    /// 解除附身(REQ-012 A03 §3):给原主体发零意图(经日志),回
+    /// `S2C::Possessed{ entity: None }`。
+    Unpossess,
+    /// 主体意图(REQ-012 A03 §4;AC-A7):只在发送方正附身 `entity` 时投递
+    /// (按实体当前 owner 路由);迁移在途窗口暂存到下一拍。
+    AgentIntent {
+        entity: types::EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    },
 }
 
 impl PartialEq for DriverCommand {
@@ -101,6 +125,23 @@ impl PartialEq for DriverCommand {
                     desc: db,
                 },
             ) => sa == sb && da == db,
+            (
+                Self::SpawnAgent {
+                    body: ba,
+                    position: pa,
+                    yaw: ya,
+                },
+                Self::SpawnAgent {
+                    body: bb,
+                    position: pb,
+                    yaw: yb,
+                },
+            ) => ba == bb && pa == pb && ya == yb,
+            (Self::Possess { entity: ea }, Self::Possess { entity: eb })
+            | (Self::AgentIntent { entity: ea, .. }, Self::AgentIntent { entity: eb, .. }) => {
+                ea == eb
+            }
+            (Self::Unpossess, Self::Unpossess) => true,
             _ => false,
         }
     }
@@ -109,6 +150,21 @@ impl PartialEq for DriverCommand {
 /// 命令前置校验结果(REQ-003 评审修复①):`Ok(())` = 可发;`Err(reason)`
 /// = 必被模拟侧 fail-stop 拒绝(丢弃不投——hostile 输入不得触发 fail-stop)。
 type CommandGuard = Result<(), &'static str>;
+
+/// 实体命令的目标实体(A03 §5 计数口径):`RemoveEntity`/`TeleportEntity`
+/// 返回 `Some(entity)`,其余命令 None。
+/// 位置 → 所在 chunk(floor 语义;观察者跟随的泵中心换算,与
+/// `Session::observer_dest_of` 同口径)。
+fn root_to_chunk(p: Vec3) -> types::ChunkPos {
+    types::ChunkPos::new((p.x / 16.0).floor() as i32, (p.z / 16.0).floor() as i32)
+}
+fn entity_command_target(command: &messaging::SimCommand) -> Option<types::EntityId> {
+    match command {
+        messaging::SimCommand::RemoveEntity { entity }
+        | messaging::SimCommand::TeleportEntity { entity, .. } => Some(*entity),
+        _ => None,
+    }
+}
 
 /// 外部命令投递前的前置校验(REQ-003 §4.2「网络层永不直改模拟」+ README
 /// 决策 4 翻译层一处收口的投递侧补全):路由换算可由客户端任意参数构造,
@@ -173,6 +229,14 @@ pub fn validate_external_command(
                 && owner.source != Some(player)
             {
                 return Err("越权:实体不属于该玩家");
+            }
+            // REQ-012 A03 §5:网络来源不得对**主体**发实体命令——包括玩家
+            // 自己的身体(上面 owner.source 检查对自己的身体会放行)。内核
+            // 侧:主体 Teleport 是 fail-stop 断言,RemoveEntity 走 despawn
+            // (玩家自删身体绕过断线的 D12 口径)。本地受信通道(source =
+            // None)不受此限(断线移除/恢复清扫/管理面照常)。
+            if source.is_some() && session.is_agent(*entity) {
+                return Err("主体不受网络实体命令(断线/位姿变更走 D12 专用路径)");
             }
             return Ok(());
         }
@@ -345,6 +409,14 @@ fn dispatch_external(
         cmd @ messaging::SimCommand::SpawnDynamic { .. } => session
             .send_from(messaging::InputSource::SCHEDULER, shard, cmd)
             .map(|entry| log.append(entry)),
+        // 主体生成(REQ-012 A03 §2):服务端权威主体同 SpawnDynamic 口径
+        // ——SCHEDULER 盖章(内核换算 owner.source = None,"没人附身的
+        // 服务端主体"可被附身;会话身份 1 与网络玩家 1 同名,不能当主体
+        // 来源)。网络玩家的身体走 C2S::SpawnAgent + spawn_agent_from
+        // (玩家 source),不经过本臂。
+        cmd @ messaging::SimCommand::SpawnAgent { .. } => session
+            .send_from(messaging::InputSource::SCHEDULER, shard, cmd)
+            .map(|entry| log.append(entry)),
         _ => {
             // 单发路径照旧:先缝后日志,失败即不入日志(决策 5)。
             session
@@ -392,6 +464,10 @@ pub struct DriverArgs {
     /// ObserveOrchestrator 构造后注入(resume,取 max 防回退)。重启后新 ID
     /// 严格大于重启前分配过的所有 ID(含已 despawn)。
     pub spawn_next_seq: u32,
+    /// 身体注册表(REQ-012 A03 §2;生成校验"身体名在注册表里"用):生产
+    /// 装配 = `wire_provider_and_new_sim` 已加载的同一份(不再读目录);测试
+    /// 装配不涉主体时给空表(生成被拒即正确行为)。
+    pub bodies: physics_sim::BodyRegistry,
 }
 
 /// 观察输出缝(REQ-003 §4.4;任务书 03 装配件):网络层 `serve` 的 up 接收端
@@ -440,6 +516,10 @@ struct PlayerStream {
     view_distance_m: f32,
     /// 上次发给该玩家的实体表快照(差分基准;实体消失 = 上轮有本轮无)。
     last_sent: BTreeMap<types::EntityId, types::EntityState>,
+    /// 上次发给该玩家的主体表快照(REQ-012 A03 §1:`AgentStates` 差分基准;
+    /// `(EntityId, 身体哈希, 连杆姿态)`;是否发送的判据 = 本拍视距内有主体
+    /// 或本表非空——世界无主体时帧序列与改动前逐位相同,AC-A8)。
+    last_agents: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)>,
 }
 /// 驱动结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -460,6 +540,9 @@ pub struct DriverOutcome {
     pub chunks_loaded: u64,
     /// 卸载并入持久化批的 chunk 数(含 despawn 卸载)。
     pub chunks_unloaded: u64,
+    /// 主体协议面遥测(REQ-012 A03 §6;生成/附身/意图等计数,不改
+    /// DebugCounters——bincode 协议结构,加字段破坏兼容)。
+    pub agent: AgentCounters,
 }
 
 /// 检查点格式版本(REQ-005 D8;REQ-007 任务 01 升版,B5):预发布阶段不兼容
@@ -689,8 +772,80 @@ pub struct ObserveOrchestrator {
     ticks_since_debug: u64,
     /// 外部 spawn 的服务端 ID 序号(REQ-006 任务 02;origin=0 保留)。
     next_spawn_seq: u32,
+    /// 身体注册表(REQ-012 A03 §2;生成校验"身体名在注册表里"):
+    /// `wire_provider_and_new_sim` 加载的同一份,不进快照。
+    bodies: physics_sim::BodyRegistry,
+    // ---- 主体协议面状态(REQ-012 A03;全部驱动内存,不进内核不进检查点,
+    // D6/D12:回放只重放日志里的动作,附身表随断线/移除重建) ----
+    /// 附身表·正向(连接 → 主体):双向一对一,插入前反向表必须无该实体。
+    possessed_by: BTreeMap<messaging::InputSource, types::EntityId>,
+    /// 附身表·反向(主体 → 连接):与 `possessed_by` 严格互逆(判据 A03-3
+    /// 断言双向一对一)。
+    possessor_of: BTreeMap<types::EntityId, messaging::InputSource>,
+    /// 观察者跟随簿记(连接 → 上次服务端设定观察者的位置):每拍身体位移
+    /// 超 2 m 再移一次(§5;断线/解除附身即弃)。
+    observer_follow: BTreeMap<messaging::InputSource, Vec3>,
+    /// 迁移在途窗口的意图暂存(主体 → 最后一条):owner 查不到时存下,下一
+    /// 拍 owner 出现再投递;同窗口多条只留最后一条(§4;被覆盖的计数)。
+    pending_intents: PendingIntents,
+    /// 主体遥测计数(A03 §6;驱动内存,放 DriverOutcome,不改 DebugCounters
+    /// ——bincode 协议结构,加字段破坏兼容)。
+    agent_counters: AgentCounters,
     /// 节奏副本(输出点用)。
     _cadence: ObserveCadence,
+}
+
+/// 在途意图暂存表(REQ-012 A03 §4):主体 → (连接, move_xz, yaw, jump)。
+type PendingIntents = BTreeMap<types::EntityId, (messaging::InputSource, (f32, f32), f32, bool)>;
+/// 暂存表快照条目(flush 遍历用)。
+type PendingIntentEntry = (
+    types::EntityId,
+    (messaging::InputSource, (f32, f32), f32, bool),
+);
+
+/// 主体协议面遥测(A03 §6):驱动侧拒绝/延后/覆盖等计数。**不改
+/// [`sim_api::proto::DebugCounters`]**——它是 bincode 协议结构,加字段破坏
+/// 协议兼容;本结构只进 `DriverOutcome`。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AgentCounters {
+    /// 生成被拒(身体名未知/非有限值/chunk 未加载/一连接一身体)。
+    pub spawn_rejected: u64,
+    /// 附身被拒(别人身体/已被附身/不存在/非主体)。
+    pub possess_rejected: u64,
+    /// 意图被拒(未附身该实体或伪造他人主体)。
+    pub intent_rejected: u64,
+    /// 意图延后(迁移在途窗口暂存,下一拍投递)。
+    pub intent_deferred: u64,
+    /// 意图被覆盖(同一在途窗口多条,只留最后一条)。
+    pub intent_overwritten: u64,
+    /// 附身期间客户端 `MoveObserver` 被忽略。
+    pub move_observer_ignored: u64,
+    /// 网络实体命令(RemoveEntity/TeleportEntity)打到主体上被拒
+    /// (含玩家自己的身体)。
+    pub entity_command_rejected: u64,
+    /// 断线移除的玩家身体数。
+    pub bodies_removed_on_disconnect: u64,
+    /// 检查点恢复后第一拍移除的玩家身体数。
+    pub bodies_removed_on_recovery: u64,
+}
+
+impl std::ops::Add for AgentCounters {
+    type Output = AgentCounters;
+    fn add(self, rhs: AgentCounters) -> AgentCounters {
+        AgentCounters {
+            spawn_rejected: self.spawn_rejected + rhs.spawn_rejected,
+            possess_rejected: self.possess_rejected + rhs.possess_rejected,
+            intent_rejected: self.intent_rejected + rhs.intent_rejected,
+            intent_deferred: self.intent_deferred + rhs.intent_deferred,
+            intent_overwritten: self.intent_overwritten + rhs.intent_overwritten,
+            move_observer_ignored: self.move_observer_ignored + rhs.move_observer_ignored,
+            entity_command_rejected: self.entity_command_rejected + rhs.entity_command_rejected,
+            bodies_removed_on_disconnect: self.bodies_removed_on_disconnect
+                + rhs.bodies_removed_on_disconnect,
+            bodies_removed_on_recovery: self.bodies_removed_on_recovery
+                + rhs.bodies_removed_on_recovery,
+        }
+    }
 }
 
 /// 外部 spawn 请求(REQ-006 任务 02;降低 handler 参数)。
@@ -705,6 +860,15 @@ impl ObserveOrchestrator {
     /// checkpoint 恢复产出;全新会话传 0)。分配从这里开始,保证重启后
     /// 新 ID 严格大于重启前分配过的所有序号(含已 despawn)。
     pub fn new(cadence: ObserveCadence, spawn_next_seq: u32) -> Self {
+        Self::with_bodies(cadence, spawn_next_seq, physics_sim::BodyRegistry::new())
+    }
+
+    /// 带身体注册表的构造(A03 §2:生成校验用;与 `new` 同款,注册表另给)。
+    pub fn with_bodies(
+        cadence: ObserveCadence,
+        spawn_next_seq: u32,
+        bodies: physics_sim::BodyRegistry,
+    ) -> Self {
         Self {
             players: BTreeMap::new(),
             ticks_since_interval: 0,
@@ -716,6 +880,12 @@ impl ObserveOrchestrator {
             debug_recent: std::collections::VecDeque::new(),
             ticks_since_debug: 0,
             next_spawn_seq: spawn_next_seq,
+            bodies,
+            possessed_by: BTreeMap::new(),
+            possessor_of: BTreeMap::new(),
+            observer_follow: BTreeMap::new(),
+            pending_intents: BTreeMap::new(),
+            agent_counters: AgentCounters::default(),
             _cadence: cadence,
         }
     }
@@ -789,9 +959,434 @@ impl ObserveOrchestrator {
         }
     }
 
+    // ---- 主体协议面(REQ-012 A03 §2/§3/§4/§5;全部经日志投递,校验不过
+    // = 拒绝计数不回包,hostile 输入不断链) ----
+
+    /// 该连接名下是否还有存活的玩家身体(D1/D12:一个连接一个身体):
+    /// 扫全局归属表,`source == Some(player)` 的主体(任一连接的玩家身体
+    /// 唯一;断线即移除,不存在残留)。
+    fn player_body_of(
+        &self,
+        session: &sim_api::session::Session,
+        player: messaging::InputSource,
+    ) -> Option<types::EntityId> {
+        session
+            .entity_owners()
+            .into_iter()
+            .find(|(_, source, is_agent)| *source == Some(player) && *is_agent)
+            .map(|(id, _, _)| id)
+    }
+
+    /// 主体生成(C2S::SpawnAgent;A03 §2):四项校验——身体名在注册表、
+    /// 坐标与 yaw 有限、出生 chunk 已加载(分片已注册)、该连接无存活玩家
+    /// 身体——任一不满足拒绝并计数(不 panic,不回包);都满足时分配 ID、
+    /// 用连接身份盖章投递 `SimCommand::SpawnAgent`(内核写 `source =
+    /// Some(player)`)、回 `S2C::Spawned`。yaw 只查有限(朝向由内核消费,
+    /// 生成姿态的朝向即玩家所选)。
+    #[allow(clippy::too_many_arguments)] // 校验链 + 日志/回执缝逐项透传(A03)
+    fn handle_spawn_agent(
+        &mut self,
+        player: messaging::InputSource,
+        body_name: String,
+        position: Vec3,
+        yaw: f32,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        // ① 身体名在注册表里(客户端只按名字引用身体,§2.1)。
+        let Some(body_hash) = self.bodies.hash_of(&body_name) else {
+            self.agent_counters.spawn_rejected += 1;
+            return;
+        };
+        // ② 坐标与 yaw 都是有限值;出生 y 在世界内。
+        if !position.is_finite()
+            || !yaw.is_finite()
+            || !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&(position.y.floor() as i32))
+        {
+            self.agent_counters.spawn_rejected += 1;
+            return;
+        }
+        // ③ 出生点所在 chunk 已加载,分片已注册(不自动建片,与外部 spawn
+        // 同口径)。
+        let cell = types::BlockPos::new(
+            position.x.floor() as i32,
+            position.y.floor() as i32,
+            position.z.floor() as i32,
+        );
+        let chunk = cell.chunk_of();
+        let shard = types::ShardId::new(types::WorldId(0), types::DimensionId(0), chunk.shard_of());
+        if !session.shard_ids().contains(&shard) || !session.is_chunk_loaded(shard, chunk) {
+            self.agent_counters.spawn_rejected += 1;
+            return;
+        }
+        // ④ 这个连接名下还没有存活的玩家身体(D1/D12:一个连接一个身体)。
+        if self.player_body_of(session, player).is_some() {
+            self.agent_counters.spawn_rejected += 1;
+            return;
+        }
+        // 全过:分配 ID、盖章投递(网络玩家的 source → 内核写 Some(player))、
+        // 回执。生成状态:初速零、旋转 = 绕 y 轴 yaw(与 A02 意图朝向同口径)。
+        let entity = self.allocate_spawn_id(session);
+        let state = types::EntityState {
+            translation: position,
+            rotation: types::glam::Quat::from_rotation_y(yaw),
+            ..types::EntityState::default()
+        };
+        match session.spawn_agent_from(player, shard, entity, body_hash, state) {
+            Ok(entry) => {
+                log.append(entry);
+                hub.push_critical(player, S2C::Spawned { entity });
+            }
+            Err(sim_api::session::SessionError::Route(shard::router::RouteError::InboxFull {
+                ..
+            })) => self.agent_counters.spawn_rejected += 1,
+            Err(other) => {
+                eprintln!("[driver] 主体生成拒绝:{other:?}");
+                self.agent_counters.spawn_rejected += 1;
+            }
+        }
+    }
+
+    /// 附身(C2S::Possess;A03 §3 表):
+    /// - 自己的身体,或没人附身的服务端主体(`source = None`)→ 成功;
+    ///   此前附身着别的主体先按"解除附身"处理旧的(零意图 + Possessed(None)
+    ///   对旧连接的语义只在旧主体属于本连接时出现——一对一表下旧主体必属
+    ///   本连接)。
+    /// - 别的玩家的身体、已被他人附身的主体、不存在或不是主体的实体 →
+    ///   拒绝并计数,附身表不变。
+    ///
+    /// 成功后:移一次观察者到身体根位置(§5 观察者跟随),回 `Possessed(Some)`。
+    #[allow(clippy::too_many_arguments)] // 校验/投递/回执三缝逐项透传(A03)
+    fn handle_possess(
+        &mut self,
+        player: messaging::InputSource,
+        entity: types::EntityId,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        // 实体存在、是主体(迁移在途窗口 owner 查不到 = 不存在,拒绝)。
+        let Some(owner) = session.entity_owner(entity) else {
+            self.agent_counters.possess_rejected += 1;
+            return;
+        };
+        if !session.is_agent(entity) {
+            self.agent_counters.possess_rejected += 1;
+            return;
+        }
+        // 别的玩家的身体(source = Some(other) 且 other ≠ 本人)→ 拒绝。
+        if let Some(other) = owner.source
+            && other != player
+        {
+            self.agent_counters.possess_rejected += 1;
+            return;
+        }
+        // 已被他人附身 → 拒绝(附身自己的身体允许:possessor 已是本人)。
+        if let Some(&cur) = self.possessor_of.get(&entity)
+            && cur != player
+        {
+            self.agent_counters.possess_rejected += 1;
+            return;
+        }
+        // 一对一:本连接若已附身别的主体,先解除旧的(零意图 + 表清理;
+        // 不给旧主体回 Possessed(None)——同一连接的新回执覆盖语义)。
+        if let Some(prev) = self.possessed_by.get(&player).copied()
+            && prev != entity
+        {
+            self.unpossess_entity(player, prev, session, log);
+        }
+        // 登记(双向一对一;同实体重复附身幂等)。
+        self.possessed_by.insert(player, entity);
+        self.possessor_of.insert(entity, player);
+        // 观察者跟随:附身成功移一次到身体根位置(经日志投递)+ 同步该
+        // 连接的 chunk 流泵中心(否则跟随不拉 chunk)。
+        if let Some(root) = session.agent_root_position(entity) {
+            match session.move_observer_from(player, root) {
+                Ok(entry) => log.append(entry),
+                Err(other) => panic!("观察者移动失败(非预期):{other:?}"),
+            }
+            hub.set_stream_center(player, root_to_chunk(root));
+            self.observer_follow.insert(player, root);
+        }
+        hub.push_critical(
+            player,
+            S2C::Possessed {
+                entity: Some(entity),
+            },
+        );
+    }
+
+    /// 解除附身(C2S::Unpossess;A03 §3 表第 3 行):给原主体发一条零意图
+    /// (经日志投递,原主体停下),回 `Possessed(None)`,观察者控制权还给
+    /// 客户端(跟随簿记清掉)。没有附身关系 = 幂等无操作(不发回执,不计数
+    /// ——协议无"未附身"错误语义;A03 表只定义有附身时的行为)。
+    fn handle_unpossess(
+        &mut self,
+        player: messaging::InputSource,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        let Some(entity) = self.possessed_by.get(&player).copied() else {
+            return;
+        };
+        self.unpossess_entity(player, entity, session, log);
+        hub.push_critical(player, S2C::Possessed { entity: None });
+    }
+
+    /// 附身表摘除 + 零意图(经日志;`handle_unpossess` 与附身切换、断线、
+    /// 主体被移除共用;不发任何回执——回执由调用方按语义发)。
+    fn unpossess_entity(
+        &mut self,
+        player: messaging::InputSource,
+        entity: types::EntityId,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        self.possessed_by.remove(&player);
+        self.possessor_of.remove(&entity);
+        self.observer_follow.remove(&player);
+        self.pending_intents.remove(&entity);
+        // 零意图(主体停下):按实体当前 owner 投递(经日志)。
+        self.send_intent(player, entity, (0.0, 0.0), 0.0, false, session, log);
+    }
+
+    /// 意图投递(按实体当前 owner;owner 查不到 = 迁移在途 → 暂存到
+    /// `pending_intents`,下一拍 owner 出现再投,计数"延后";同窗口多条只留
+    /// 最后一条,被覆盖的计数;实际投递拍号由日志记,回放按日志来)。
+    /// 投递用 `session.send_agent_intent_to`(按 owner 路由的盖章入口)。
+    #[allow(clippy::too_many_arguments)] // 意图四元组 + 日志缝逐项透传(A03)
+    fn send_intent(
+        &mut self,
+        player: messaging::InputSource,
+        entity: types::EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        // 迁移在途的**早窗口**(§4):owner 表已指向目的分片、信封还没落地
+        // ——此刻投递会 Ok(目的分片收件箱)但内核应用拍实体尚未到达 =
+        // 静默拒绝(A04 R1 实证的丢意图窗口后段)。信封集合里有该实体 →
+        // 与 owner 查不到同型:暂存下一拍,不投。
+        if session.in_transit_entities().contains(&entity) {
+            if self
+                .pending_intents
+                .insert(entity, (player, move_xz, yaw, jump))
+                .is_some()
+            {
+                self.agent_counters.intent_overwritten += 1;
+            }
+            self.agent_counters.intent_deferred += 1;
+            return;
+        }
+        match session.send_agent_intent_to(player, entity, move_xz, yaw, jump) {
+            Ok(entry) => log.append(entry),
+            Err(sim_api::session::SessionError::Rejected("实体不存在或迁移窗口")) => {
+                // 在途窗口:意图不能丢("停下"丢了主体就一直走)。暂存最后
+                // 一条;同窗口多条被覆盖的计数。
+                if self
+                    .pending_intents
+                    .insert(entity, (player, move_xz, yaw, jump))
+                    .is_some()
+                {
+                    self.agent_counters.intent_overwritten += 1;
+                }
+                self.agent_counters.intent_deferred += 1;
+            }
+            Err(sim_api::session::SessionError::Route(shard::router::RouteError::InboxFull {
+                ..
+            })) => {
+                // 反压:意图是保持状态,丢弃会卡住主体——暂存重试(与在途
+                // 同型,计数归延后)。
+                if self
+                    .pending_intents
+                    .insert(entity, (player, move_xz, yaw, jump))
+                    .is_some()
+                {
+                    self.agent_counters.intent_overwritten += 1;
+                }
+                self.agent_counters.intent_deferred += 1;
+            }
+            Err(other) => panic!("意图投递失败(非反压/非拒绝):{other:?}"),
+        }
+    }
+
+    /// 主体意图(C2S::AgentIntent;A03 §4 权威,AC-A7):只有发送方正附身
+    /// `entity` 时才投递;数值检查仍由内核做(A02),驱动不重复。未附身/
+    /// 伪造 = 拒绝并计数。
+    #[allow(clippy::too_many_arguments)] // 意图四元组 + 日志缝逐项透传(A03)
+    fn handle_agent_intent(
+        &mut self,
+        player: messaging::InputSource,
+        entity: types::EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        if self.possessed_by.get(&player) != Some(&entity) {
+            self.agent_counters.intent_rejected += 1;
+            return;
+        }
+        self.send_intent(player, entity, move_xz, yaw, jump, session, log);
+    }
+
+    /// 当前拍末的跟随检查(§5 观察者跟随):每拍对每个附身连接,身体根位置
+    /// 离上次设定位置超 2 m → 服务端替它移观察者(经日志)。附身成功时移过
+    /// 第一次(`handle_possess`),此处是续随。
+    fn follow_observers(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        const FOLLOW_THRESHOLD_M: f32 = 2.0;
+        let pairs: Vec<(messaging::InputSource, types::EntityId)> =
+            self.possessed_by.iter().map(|(&p, &e)| (p, e)).collect();
+        for (player, entity) in pairs {
+            let Some(root) = session.agent_root_position(entity) else {
+                // 主体不可见(迁移在途):跳过,跟随簿记不动;主体回来后
+                // 按位移差续随。
+                continue;
+            };
+            let moved = match self.observer_follow.get(&player) {
+                Some(last) => last.distance(root) > FOLLOW_THRESHOLD_M,
+                None => true,
+            };
+            if moved {
+                match session.move_observer_from(player, root) {
+                    Ok(entry) => log.append(entry),
+                    Err(other) => panic!("观察者移动失败(非预期):{other:?}"),
+                }
+                hub.set_stream_center(player, root_to_chunk(root));
+                self.observer_follow.insert(player, root);
+            }
+        }
+    }
+
+    /// 在途意图的下一拍投递(§4:owner 出现时再投;owner 仍查不到 → 留存)。
+    /// 投递拍号由日志记(确定性不受影响);投完清空对应条目。
+    fn flush_pending_intents(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        if self.pending_intents.is_empty() {
+            return;
+        }
+        let entries: Vec<PendingIntentEntry> =
+            self.pending_intents.iter().map(|(k, v)| (*k, *v)).collect();
+        for (entity, (player, move_xz, yaw, jump)) in entries {
+            match session.send_agent_intent_to(player, entity, move_xz, yaw, jump) {
+                Ok(entry) => {
+                    log.append(entry);
+                    self.pending_intents.remove(&entity);
+                }
+                Err(sim_api::session::SessionError::Rejected("实体不存在或迁移窗口")) => {
+                    // 仍在途:留存,下一拍再试。
+                }
+                Err(sim_api::session::SessionError::Route(
+                    shard::router::RouteError::InboxFull { .. },
+                )) => {
+                    // 仍反压:留存,下一拍再试。
+                }
+                Err(other) => panic!("在途意图投递失败(非预期):{other:?}"),
+            }
+        }
+    }
+
+    /// 断线处理(§5,D12;`NetUp::Left` 分支调用):先解除附身;再移除该
+    /// 连接名下的玩家身体(经日志的 RemoveEntity,内核走 despawn_agent);
+    /// 被它附身的服务端主体保留,并收到一条零意图。
+    fn handle_left(
+        &mut self,
+        player: messaging::InputSource,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        _hub: &OutboundHub,
+    ) {
+        // ① 先解除附身:被附身的服务端主体保留 + 零意图(unpossess_entity
+        // 的零意图即此);自己的身体则随后被移除(零意图对已移除实体由内核
+        // 幂等拒,无害——但顺序上先解除附身再移除身体,零意图先于移除)。
+        if let Some(entity) = self.possessed_by.get(&player).copied() {
+            self.unpossess_entity(player, entity, session, log);
+        }
+        // ② 移除玩家身体(经日志;内核走 despawn_agent,不留残余)。
+        if let Some(body) = self.player_body_of(session, player) {
+            let cmd = messaging::SimCommand::RemoveEntity { entity: body };
+            // 玩家身体的 owner.source = 该玩家;经 send_to_entity 按当前
+            // owner 投(§4 路由口径)。
+            match session.send_to_entity(player, body, cmd) {
+                Ok(entry) => log.append(entry),
+                Err(other) => panic!("断线移除玩家身体失败(非预期):{other:?}"),
+            }
+            self.agent_counters.bodies_removed_on_disconnect += 1;
+        }
+        // ③ 观察者移除(既有语义:断连票撤,幂等)。
+        match session.remove_observer_from(player) {
+            Ok(entry) => log.append(entry),
+            Err(other) => panic!("观察者移除失败(非预期):{other:?}"),
+        }
+    }
+
     /// 当前 spawn 高水位(#12;checkpoint 写路径用)。
     pub fn spawn_next_seq(&self) -> u32 {
         self.next_spawn_seq
+    }
+
+    /// 取走本拍以来累计的主体遥测并清零(§6:run 每拍并入 outcome 累计值;
+    /// 与 `record_debug_telemetry` 的逐拍累加同型,计数只增不清)。
+    fn agent_counters_delta(&mut self) -> AgentCounters {
+        std::mem::take(&mut self.agent_counters)
+    }
+
+    /// 主体被移除后的附身清理(§3:被迫解除):逐条检查附身表,主体已不在
+    /// (断线移除/掉出世界/内核 despawn)→ 摘除双向条目并给附身它的连接回
+    /// `Possessed(None)`(不投零意图——主体已不存在;在途暂存一并清)。
+    /// 每拍末跑一次(附身表极小,BTreeMap 扫描)。
+    fn reap_removed_agents(&mut self, session: &sim_api::session::Session, hub: &OutboundHub) {
+        if self.possessor_of.is_empty() {
+            return;
+        }
+        // 迁移在途窗口(owner 查不到 = 信封未到;A04:恰隔 2 拍)不算移除
+        // ——在途主体集合由 Router 待投递信封给出(实体真移除的信封不存在
+        // 于 Router,despawn 走 outbox 不走信封)。
+        let in_transit: std::collections::BTreeSet<types::EntityId> = session
+            .in_transit_migrations()
+            .into_iter()
+            .filter_map(|env| match env.payload {
+                messaging::EnvelopePayload::MigrateEntity { entity, .. }
+                | messaging::EnvelopePayload::MigrateAgent { entity, .. } => Some(entity),
+                _ => None,
+            })
+            .collect();
+        let gone: Vec<(types::EntityId, messaging::InputSource)> = self
+            .possessor_of
+            .keys()
+            .filter(|&&entity| !session.is_agent(entity) && !in_transit.contains(&entity))
+            .map(|&entity| (entity, self.possessor_of[&entity]))
+            .collect();
+        for (entity, player) in gone {
+            self.possessor_of.remove(&entity);
+            self.possessed_by.remove(&player);
+            self.observer_follow.remove(&player);
+            self.pending_intents.remove(&entity);
+            hub.push_critical(player, S2C::Possessed { entity: None });
+        }
+    }
+
+    /// 附身表只读视图(判据 A03-3 断言双向一对一用):`(连接, 主体)` 升序。
+    pub fn possessions(&self) -> Vec<(messaging::InputSource, types::EntityId)> {
+        self.possessed_by.iter().map(|(&p, &e)| (p, e)).collect()
+    }
+
+    /// 附身表反向视图(主体 → 连接)。
+    pub fn possessor_of(&self, entity: types::EntityId) -> Option<messaging::InputSource> {
+        self.possessor_of.get(&entity).copied()
     }
 
     /// 网络上行事件消费(任务书 03 编排 ①②;REQ-005 D9 观察者命令入日志)。
@@ -829,6 +1424,7 @@ impl ObserveOrchestrator {
                 let stream = self.players.entry(player).or_insert_with(|| PlayerStream {
                     view_distance_m: 0.0,
                     last_sent: BTreeMap::new(),
+                    last_agents: BTreeMap::new(),
                 });
                 stream.view_distance_m = f32::from(view_distance) * 16.0;
             }
@@ -836,15 +1432,14 @@ impl ObserveOrchestrator {
                 // 断连即弃(细则 3):观察流状态清理 + 模拟侧观察者移除入日志
                 // (REQ-005 D9:remove_observer_from 盖章玩家 source + 会话
                 // 单调 sequence,log.append → 可回放;幂等——不在表无害)。
+                // REQ-012 A03 §5(D12):先解除附身、再移除该连接名下的玩家
+                // 身体(经日志);被它附身的服务端主体保留 + 零意图——都收口
+                // 在 handle_left(观察者移除也并入其中)。
                 self.players.remove(&player);
                 self.pending_welcome.remove(&player);
                 // 调试遥测订阅即失效(REQ-011 §3.5.2;不在集合 = 无害幂等)。
                 self.debug_subscribers.remove(&player);
-                match session.remove_observer_from(player) {
-                    Ok(entry) => log.append(entry),
-                    // 观察者收件箱 unbounded → 无失败路径;非预期错误 fail-stop。
-                    Err(other) => panic!("观察者移除失败(非预期):{other:?}"),
-                }
+                self.handle_left(player, session, log, hub);
             }
             NetUp::SubscribeDebug { player } => {
                 // 调试遥测订阅(REQ-011 §3.5.2;W03):登记进集合(幂等);
@@ -853,6 +1448,13 @@ impl ObserveOrchestrator {
             }
             NetUp::DriverCommand { player, cmd } => match cmd {
                 DriverCommand::MoveObserver { position } => {
+                    // REQ-012 A03 §5(AC-A7):附身期间该连接的 MoveObserver
+                    // 一律忽略并计数(防止客户端把视野和身体分开;服务端用
+                    // 跟随簿记替它移)。未附身 → 照旧入日志生效。
+                    if self.possessed_by.contains_key(&player) {
+                        self.agent_counters.move_observer_ignored += 1;
+                        return;
+                    }
                     // 观察者移动入日志(REQ-005 D9):盖章 source = 玩家、
                     // sequence 沿会话单调;返回 LogEntry 直接 append。
                     // 收件箱 unbounded(REQ-002 细则 1),无失败路径;
@@ -883,6 +1485,14 @@ impl ObserveOrchestrator {
                         validate_external_command(session, Some(player), shard, &command)
                     {
                         eprintln!("[driver] 网络命令丢弃(前置校验):{why} ({command:?})");
+                        // REQ-012 A03 §5:打到主体上的网络实体命令单独计数
+                        // (玩家身体有了 source 后,原"越权"检查会放行自己的
+                        // 身体;主体 Teleport 是内核 fail-stop,必须在这里挡)。
+                        if let Some(entity) = entity_command_target(&command)
+                            && session.is_agent(entity)
+                        {
+                            self.agent_counters.entity_command_rejected += 1;
+                        }
                         *commands_rejected += 1;
                         return;
                     }
@@ -890,6 +1500,27 @@ impl ObserveOrchestrator {
                     // 广播(每目标一条 LogEntry 全入日志),其余单发入日志;
                     // 反压/拒绝计数不断链。
                     dispatch_external(session, log, commands_rejected, player, shard, command);
+                }
+                DriverCommand::SpawnAgent {
+                    body,
+                    position,
+                    yaw,
+                } => {
+                    self.handle_spawn_agent(player, body, position, yaw, session, log, hub);
+                }
+                DriverCommand::Possess { entity } => {
+                    self.handle_possess(player, entity, session, log, hub);
+                }
+                DriverCommand::Unpossess => {
+                    self.handle_unpossess(player, session, log, hub);
+                }
+                DriverCommand::AgentIntent {
+                    entity,
+                    move_xz,
+                    yaw,
+                    jump,
+                } => {
+                    self.handle_agent_intent(player, entity, move_xz, yaw, jump, session, log);
                 }
                 DriverCommand::SetAreaTicket { .. } | DriverCommand::RemoveAreaTicket { .. } => {
                     // 区域票不经网络上行的 DriverCommand(translate 已拒绝
@@ -1059,6 +1690,76 @@ impl ObserveOrchestrator {
                 },
             );
         }
+
+        // 主体状态流(REQ-012 A03 §1):与 EntityStates 分开发送、同周期同
+        // 口径的距离过滤/差分/全量;**发送判据不同**——本拍该玩家视距内有
+        // 主体、或上次发给它的主体表非空才发(A03 §1:世界无主体时帧序列与
+        // 改动前逐位相同,AC-A8)。主体被移除 → 出现在增量包 removed(差分
+        // 三源同型:迁移/移除/消失)。主体从不在 EntityStates 里(内核已过滤)。
+        let agent_table = session.agent_states();
+        let agents_visible_any = !agent_table.is_empty();
+        for player in hub.subscribers() {
+            let Some(stream) = self.players.get_mut(&player) else {
+                continue;
+            };
+            let Some(&position) = observers.get(&player) else {
+                continue; // 未 MoveObserver:无过滤中心,静默等待(0 视距语义)
+            };
+            let full = full_due || stream.last_agents.is_empty();
+            let radius = stream.view_distance_m;
+            // 视距内主体(3D 距离,与 EntityStates 同式;中心 = 观察者位置)。
+            let mut visible: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)> =
+                BTreeMap::new();
+            for (id, hash, poses) in &agent_table {
+                if let Some(root) = poses.first()
+                    && position.distance(root.translation) <= radius
+                {
+                    visible.insert(*id, (*hash, poses.clone()));
+                }
+            }
+            let nothing_near = visible.is_empty();
+            // 发送判据(§1):视距内没有主体且上次发的表也为空 → 不发任何帧。
+            if nothing_near && stream.last_agents.is_empty() {
+                continue;
+            }
+            let mut states: Vec<(types::EntityId, types::BodyHash, Vec<types::EntityState>)> =
+                Vec::new();
+            let mut removed: Vec<types::EntityId> = Vec::new();
+            if full {
+                states = visible
+                    .iter()
+                    .map(|(k, v)| (*k, v.0, v.1.clone()))
+                    .collect();
+            } else {
+                for (id, (hash, poses)) in &visible {
+                    match stream.last_agents.get(id) {
+                        Some(prev) if prev.0 == *hash && prev.1 == *poses => {}
+                        _ => states.push((*id, *hash, poses.clone())),
+                    }
+                }
+                for id in stream.last_agents.keys() {
+                    if !visible.contains_key(id) {
+                        removed.push(*id);
+                    }
+                }
+            }
+            stream.last_agents = visible;
+            // 增量语义(与 EntityStates 同款):无变化不发包。全量包只在
+            // 视距内有主体或上次表非空时照发(上面的判据已挡住空世界)。
+            if !full && states.is_empty() && removed.is_empty() {
+                continue;
+            }
+            hub.push_world(
+                player,
+                S2C::AgentStates {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                },
+            );
+        }
+        let _ = agents_visible_any; // 判据已逐玩家内联(nothing_near + last_agents)
 
         // BlockUpdates:按格位视距覆盖广播(单包合并,README 决策 9;格位
         // 中心到玩家 ≤ 过滤半径)。未移动过的玩家(无中心)静默等待。
@@ -1388,6 +2089,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         mut new_sim,
         observe,
         spawn_next_seq,
+        bodies,
     } = args;
     // 会话 source(commands 通道本地权威命令的日志 source;网络路径用玩家,
     // REQ-005 D9)。
@@ -1404,6 +2106,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
 
     let mut ticks_run: u64 = 0;
     let mut commands_rejected: u64 = 0;
+    // 主体协议面遥测(A03 §6):编排器逐拍累加,退出并入 outcome。observe
+    // 关闭时(无网络面)恢复清扫仍要做(检查点恢复的玩家身体必须移除;A03
+    // §5)——计数走本地变量。
+    let mut agent_counters = AgentCounters::default();
     let mut checkpoints_written: Vec<types::Tick> = Vec::new();
     // 编排计数(REQ-002 §4.4:DriverOutcome 增计数字段)。
     let mut shards_spawned: u64 = 0;
@@ -1426,12 +2132,38 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
         (
-            ObserveOrchestrator::new(link.cadence, spawn_next_seq),
+            ObserveOrchestrator::with_bodies(link.cadence, spawn_next_seq, bodies),
             link.up,
             link.hub,
             link.cadence,
         )
     });
+
+    // 检查点恢复后的第一拍(REQ-012 A03 §5):bootstrap 恢复路径等同所有
+    // 玩家同时断线(D12)——run 启动时 session 里已有 `source = Some(_)` 的
+    // 主体 = 必然来自检查点(全新会话的网络生成最早发生在第一拍之后:命令
+    // 盖章 apply_at = tick_now,驱动 tick 末端消费上行,首拍 tick 前不可能
+    // 有玩家主体)——按日志移除并计数;服务端主体(source = None)照常留在
+    // 检查点里。observe 关闭也要做(无网络面的恢复测试同样断言清扫)。
+    {
+        let player_bodies: Vec<types::EntityId> = session
+            .entity_owners()
+            .into_iter()
+            .filter(|(_, source, is_agent)| source.is_some() && *is_agent)
+            .map(|(id, _, _)| id)
+            .collect();
+        for entity in player_bodies {
+            let cmd = messaging::SimCommand::RemoveEntity { entity };
+            // 本地受信通道(玩家已断线,身份不复存在;send_to_entity 按当前
+            // owner 投递,apply_at = 恢复拍 → 第一拍 tick 应用,§5"第一拍
+            // 移除"的语义)。
+            match session.send_to_entity(messaging::InputSource::SCHEDULER, entity, cmd) {
+                Ok(entry) => log.append(entry),
+                Err(other) => panic!("恢复移除玩家身体失败(非预期):{other:?}"),
+            }
+            agent_counters.bodies_removed_on_recovery += 1;
+        }
+    }
 
     // ctrl_c 关机源(仅当 listen_ctrl_c;测试关掉,否则暂停时间测试被信号干扰)。
     let shutdown_signal = async {
@@ -1514,11 +2246,20 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                         }
                     }
                     orchestrator.record_block_changes(&mut session);
+                    // 主体协议面的每拍收尾(REQ-012 A03 §4/§5):被移除主体的
+                    // 附身清理(被迫解除,回 Possessed(None))→ 在途意图的
+                    // 下一拍投递 → 观察者跟随检查。都在本拍 net_up 消费与输出
+                    // 之间,投递/移动经日志盖章本拍。
+                    orchestrator.reap_removed_agents(&session, hub);
+                    orchestrator.flush_pending_intents(&mut session, &mut log);
+                    orchestrator.follow_observers(&mut session, &mut log, hub);
                     orchestrator.emit_outputs(&session, hub, session.tick_now(), *cadence);
                     // 调试遥测(REQ-011 §3.5.2;W03):先累计(读本拍 TickSummary),
                     // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
                     orchestrator.record_debug_telemetry(&summary, session.tick_now());
                     orchestrator.maybe_emit_debug_stats(hub, session.tick_now());
+                    // 主体遥测并入累计(§6:退出时随 DriverOutcome 上报)。
+                    agent_counters = agent_counters + orchestrator.agent_counters_delta();
                 }
 
                 // checkpoint 节奏:整间隔倍数拍到期(fire-and-forget,决策 5)。
@@ -1548,6 +2289,18 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     Some(DriverCommand::Shutdown) | None => break,
                     Some(DriverCommand::Spawn { .. }) => {
                         panic!("commands 通道的 Spawn 变体仅网络上行使用;本地 spawn 用 Send/SpawnDynamic")
+                    }
+                    Some(
+                        DriverCommand::SpawnAgent { .. }
+                        | DriverCommand::Possess { .. }
+                        | DriverCommand::Unpossess
+                        | DriverCommand::AgentIntent { .. },
+                    ) => {
+                        // 主体协议面(REQ-012 A03)仅网络上行(translate 的
+                        // Agent 臂);本地受信通道生成/控制主体走 Session 正路
+                        // (spawn_agent/agent_intent,Session::agent_intent 直投
+                        // 或 submit_raw)。出现 = 编程错误 fail-stop。
+                        panic!("commands 通道的主体协议面变体仅网络上行使用(fail-stop)")
                     }
                     Some(DriverCommand::Send { shard, command }) => {
                         // 前置校验(评审修复①):预检不过 = 丢弃不投——hostile
@@ -1660,6 +2413,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         shards_despawned,
         chunks_loaded,
         chunks_unloaded,
+        agent: agent_counters,
     }
 }
 
@@ -1840,6 +2594,8 @@ pub fn load_body_registry(config: &Config) -> Result<physics_sim::BodyRegistry, 
 type WiredProvider = (
     storage::provider::ChunkProvider,
     Box<dyn FnMut(types::ShardId) -> physics_sim::ShardSim + Send>,
+    // 身体注册表(A03 §2:同一份交驱动,生成校验不再读目录)。
+    physics_sim::BodyRegistry,
 );
 
 pub fn wire_provider_and_new_sim(
@@ -1857,14 +2613,15 @@ pub fn wire_provider_and_new_sim(
     // (BTreeMap 克隆,便宜;与 BlockRegistry 同款"不进快照、restore 重注入")。
     // A04 第 4 节:加载即校验 MARGIN(类型化拒绝,拒绝启动)。
     let bodies = load_body_registry(&config)?;
+    let registry_for_sim = bodies.clone();
     let new_sim = Box::new(move |shard: types::ShardId| {
         physics_sim::ShardSim::new_with_bodies(
             config.shard_sim_config(shard),
             new_registry(),
-            bodies.clone(),
+            registry_for_sim.clone(),
         )
     });
-    Ok((provider, new_sim))
+    Ok((provider, new_sim, bodies))
 }
 
 #[cfg(test)]
@@ -1944,6 +2701,211 @@ mod tests {
         session
     }
 
+    /// REQ-012 A03 判据 A03-5(路由与在途;驱动单测):迁移在途窗口(owner
+    /// 查不到)的意图暂存——同窗多条只留最后一条(被覆盖计数),owner 出现
+    /// 后下一拍 flush 投递(计数"延后"≥ 1)。真实网络栈下迁移在途拍(恰
+    /// 1 拍)不可从客户端构造(TCP 帧到达粒度 ~10 拍;e2e a03_5 走功能
+    /// 断言 + 如实报告),暂存/覆盖/flush 的时序行为在此直接构造。
+    ///
+    /// 口径:owner 查不到 = 迁移在途窗口的驱动侧可见形态(与信封在途的
+    /// Session 层采样一致,A04 R1 实证的丢意图窗口)。附身权威(A03-4)与
+    /// 端到端行走(e2e a03_5)不进本用例。
+    #[test]
+    fn a03_inflight_intent_stash_overwrite_and_flush() {
+        let config = test_config(600);
+        let mut session = session_with_one_shard(&config);
+        let mut log = sim_api::log::CommandLog::new();
+        let mut orchestrator = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        let mut counters = AgentCounters::default();
+
+        let e = types::EntityId::from_parts(0, 7);
+        let player = messaging::InputSource(1);
+
+        // ① 主体不存在(owner 查不到 = 在途窗口形态):意图暂存。
+        orchestrator.send_intent(player, e, (0.0, 0.0), 0.0, false, &mut session, &mut log);
+        assert_eq!(orchestrator.pending_intents.len(), 1, "在途意图进暂存");
+        assert_eq!(
+            counters.intent_deferred + orchestrator.agent_counters.intent_deferred,
+            1
+        );
+        counters = counters + orchestrator.agent_counters_delta();
+        assert_eq!(counters.intent_deferred, 1, "延后计数 +1");
+
+        // ② 同窗再来两条:只留最后一条,被覆盖的两条计数。
+        orchestrator.send_intent(player, e, (1.0, 0.0), 0.0, false, &mut session, &mut log);
+        orchestrator.send_intent(player, e, (2.0, 0.0), 0.0, false, &mut session, &mut log);
+        counters = counters + orchestrator.agent_counters_delta();
+        assert_eq!(orchestrator.pending_intents.len(), 1, "同窗只留最后一条");
+        assert_eq!(counters.intent_overwritten, 2, "被覆盖的计数 +2");
+        assert_eq!(counters.intent_deferred, 3, "每条暂存都计延后");
+
+        // ③ 主体出现(生成 + tick 应用 claim ownership):flush 投递最后一条。
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let hash = bodies.hash_of("capsule").expect("capsule 已装");
+        // 生成主体:换带 capsule 注册表的分片(SpawnAgent 的内核校验查哈希
+        // 在注册表;sim() 的 SimpleRegistry 不含)——re-register 会顶掉旧分片
+        // (Session::register 对已注册分片 panic?看签名——用新 Session 最稳,
+        // 暂存表与 Session 无关,直接换)。
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            {
+                let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+                cfg.solidify.enabled = false;
+                cfg.cohesion.enabled = false;
+                cfg
+            },
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        ));
+        session
+            .spawn_agent(
+                shard_id(0, 0),
+                e,
+                hash,
+                types::EntityState {
+                    translation: Vec3::new(24.0, 1.95, 24.0),
+                    ..types::EntityState::default()
+                },
+            )
+            .expect("生成");
+        session.tick();
+        let before = log.to_bytes().len();
+        orchestrator.flush_pending_intents(&mut session, &mut log);
+        counters = counters + orchestrator.agent_counters_delta();
+        assert!(orchestrator.pending_intents.is_empty(), "投递后暂存清空");
+        assert!(log.to_bytes().len() > before, "投递经日志(回放确定性)");
+        // 投的是最后一条(move_xz = (2.0, 0.0))。
+        let entries = sim_api::log::CommandLog::from_bytes(&log.to_bytes())
+            .expect("日志可解")
+            .take()
+            .into_iter()
+            .filter(|entry| {
+                matches!(
+                    entry.command,
+                    messaging::SimCommand::AgentIntent {
+                        move_xz: (2.0, 0.0),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(entries, 1, "flush 投递的是同窗最后一条");
+        assert_eq!(counters.intent_deferred, 3, "flush 成功不再计延后");
+
+        // ④ 再 flush:无暂存,无新日志。
+        let before2 = log.to_bytes().len();
+        orchestrator.flush_pending_intents(&mut session, &mut log);
+        assert_eq!(log.to_bytes().len(), before2, "无暂存无投递");
+    }
+
+    /// REQ-012 A03 判据 A03-10(检查点恢复;驱动 run 级):恢复(bootstrap
+    /// 带 source = Some(_) 主体启动)等同所有玩家同时断线——run 启动的
+    /// 清扫第一拍移除玩家身体(计数)并经日志;服务端主体(source = None)
+    /// 照常留在世界里(D12)。
+    ///
+    /// 口径:run 启动时 session 已有玩家主体 = 必然来自检查点恢复(全新
+    /// 会话的网络生成最早发生在第一拍之后;判定见 run 内注释)。本测试
+    /// 直接构造该状态喂 `run`(observe 关闭——无网络面的恢复同样清扫)。
+    #[tokio::test(start_paused = true)]
+    async fn a03_recovery_sweep_removes_player_bodies() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let hash = bodies.hash_of("capsule").expect("capsule 已装");
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            {
+                let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+                cfg.solidify.enabled = false;
+                cfg.cohesion.enabled = false;
+                cfg
+            },
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        ));
+        // 玩家身体(source = Some(1);恢复带来)+ 服务端主体(None)。
+        let player_body = types::EntityId::from_parts(0, 1);
+        let server = types::EntityId::from_parts(0, 2);
+        session
+            .spawn_agent_from(
+                messaging::InputSource(1),
+                shard_id(0, 0),
+                player_body,
+                hash,
+                types::EntityState {
+                    translation: Vec3::new(12.0, 1.95, 12.0),
+                    ..types::EntityState::default()
+                },
+            )
+            .expect("玩家身体生成");
+        session
+            .spawn_agent_from(
+                messaging::InputSource::SCHEDULER,
+                shard_id(0, 0),
+                server,
+                hash,
+                types::EntityState {
+                    translation: Vec3::new(24.0, 1.95, 24.0),
+                    ..types::EntityState::default()
+                },
+            )
+            .expect("服务端主体生成");
+        // 盖章投递 → tick 一次让调度器 claim ownership(replay 恢复线由
+        // rebuild_entity_ownership 直接恢复,本测试手工等价这一步)。
+        session.tick();
+
+        // run(observe = None):启动清扫在第一拍 tick 应用。
+        let store = storage::worker::StoreWorker::new(
+            Box::new(storage::mem::MemChunkStore::new()),
+            Box::new(storage::mem::MemCheckpointStore::new()),
+        );
+        let (provider, new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (tx, rx) = tokio::sync::mpsc::channel::<DriverCommand>(16);
+        let driver = tokio::spawn(run(DriverArgs {
+            config,
+            session,
+            store,
+            log: sim_api::log::CommandLog::new(),
+            commands: rx,
+            listen_ctrl_c: false,
+            provider,
+            new_sim,
+            observe: None,
+            spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
+        }));
+        // 推进 30 拍(清扫在第一拍)。
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_secs_f32(1.0 / 60.0)).await;
+            tokio::task::yield_now().await;
+        }
+        tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert_eq!(
+            outcome.agent.bodies_removed_on_recovery, 1,
+            "恢复清扫移除玩家身体计数 +1"
+        );
+        // 服务端主体保留 + 玩家身体没了:经终末快照的会话外观察不可得;
+        // 驱动已关,断言走清扫计数 + 移除命令经日志(outcome 之外不可达)
+        // ——counters 是主断言;实体表状态由同路径的 Session 层恢复测试
+        // (a03_session_determinism)覆盖。此处再验服务端主体数:1。
+        let _ = server;
+        assert_eq!(outcome.agent.bodies_removed_on_disconnect, 0);
+    }
+
     /// 任务书测试 `app::snapshot_roundtrip_full_ticket_state`(REQ-007 06b;
     /// §4.14 全字段非默认值往返,AC-T21 前置)。生产路径(Session + 编排)构造
     /// 同时在场的状态:
@@ -1976,10 +2938,11 @@ mod tests {
             Box::new(storage::mem::MemCheckpointStore::new()),
         );
         let mut session = sim_api::session::Session::new(config.session_config());
-        let (provider, mut new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, mut new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         session.register(sim(0, 0));
 
         // —— 布景(生产 tick + 编排;Superflat 地表 y = -59.5)——
@@ -2647,10 +3610,11 @@ mod tests {
             Box::new(MemChunkStore::new()),
             Box::new(checkpoints.clone()),
         );
-        let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let args = DriverArgs {
             config,
             session,
@@ -2662,6 +3626,7 @@ mod tests {
             new_sim,
             observe: None,
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         };
         (args, tx, checkpoints)
     }
@@ -3739,10 +4704,11 @@ mod tests {
             Box::new(chunks.clone()),
             Box::new(checkpoints.clone()),
         );
-        let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -3754,6 +4720,7 @@ mod tests {
             new_sim,
             observe: None,
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         }));
 
         // 进区(分片 (1,0))→ 等装载 → 瞬移远走(分片 (50,0),超卸载半径)。
@@ -3820,10 +4787,11 @@ mod tests {
             Box::new(MemChunkStore::new()),
             Box::new(checkpoints.clone()),
         );
-        let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -3835,6 +4803,7 @@ mod tests {
             new_sim,
             observe: None,
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         }));
 
         advance_ticks(3).await;
@@ -4217,10 +5186,11 @@ mod tests {
             Box::new(chunks_shared.clone()),
             Box::new(SharedCheckpoints::default()),
         );
-        let (provider, new_sim) = wire_provider_and_new_sim(config.clone(), &store, || {
-            Box::new(SimpleRegistry::builtin())
-        })
-        .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
+        let (provider, new_sim, _bodies) =
+            wire_provider_and_new_sim(config.clone(), &store, || {
+                Box::new(SimpleRegistry::builtin())
+            })
+            .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
         let driver = tokio::spawn(run(DriverArgs {
             config,
             session,
@@ -4232,6 +5202,7 @@ mod tests {
             new_sim,
             observe: None,
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         }));
 
         // 编辑 chunk (8,0)(owner = 片 (1,0);两片各持一份 → 广播两片)。
@@ -4453,7 +5424,7 @@ mod tests {
         // ——测试场景确定化:实体出生即静止,20 拍内凝固(session.rs 测试
         // 清单 5 同款);无坠落(坠落会滑出视距球,观察断言不确定)。
         // provider 仍由 wire 装配(数据源不变)。
-        let (provider, _) = wire_provider_and_new_sim(config.clone(), &store, || {
+        let (provider, _, _bodies) = wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
         })
         .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
@@ -4479,6 +5450,7 @@ mod tests {
                 cadence,
             }),
             spawn_next_seq: 0,
+            bodies: physics_sim::BodyRegistry::new(),
         };
         (args, tx, hub, addr, checkpoints)
     }

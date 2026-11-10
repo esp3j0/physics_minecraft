@@ -33,7 +33,7 @@ fn run_area_ticket_scenario() -> (usize, usize) {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -224,7 +224,7 @@ fn ac_t3_no_hanging_blue_blocks() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -294,7 +294,7 @@ fn ac_t24_enable_backfill() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let transient = EntityId::from_parts(1, 1);
@@ -353,7 +353,7 @@ fn ac_t4_cross_shard_landing() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -413,7 +413,7 @@ fn ac_t5_awaiting_terrain_and_block_priority() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     let _ = &provider;
@@ -488,7 +488,7 @@ fn ac_t6_lookahead_not_awaiting() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -542,7 +542,7 @@ fn ac_t7_deadline_and_void() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -709,7 +709,7 @@ fn ac_t20_lifecycle() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
@@ -772,7 +772,7 @@ fn h2_carried_freeze_wake_via_plan_entity_tier() {
         Box::new(storage::mem::MemCheckpointStore::new()),
     );
     let mut session = Session::new(config.session_config());
-    let (provider, mut new_sim) =
+    let (provider, mut new_sim, _bodies) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
             .expect("装配失败(fail-stop;MARGIN 不足等类型化错误)");
     session.register(new_sim(shard_id(0, 0)));
