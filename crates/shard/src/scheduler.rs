@@ -40,7 +40,8 @@ type WorkerJob = Vec<(
 /// 屏障后进 BTreeMap 归一)。
 type WorkerResult = Vec<(ShardId, ShardSim, Outbox, physics_sim::ActivationEvents)>;
 
-/// worker 线程主体:循环收批;逐 job `apply_prefix → step → take_outbox` 后回传。
+/// worker 线程主体:循环收批;逐 job `set_agent_shape_table → 暂缓补写 →
+/// apply_prefix → step → take_outbox` 后回传。
 ///
 /// `recv` 返回 Err(发送端全部释放)= 正常退出;回传 send 失败 = 调度器已死,
 /// 一致性违规 → panic(fail-stop)。
@@ -52,6 +53,10 @@ fn worker_main(job_rx: Receiver<WorkerJob>, result_tx: SyncSender<WorkerResult>)
                 // A05:本拍全局主体形状表注入(在 apply_prefix 之前——SetBlock
                 // 命令的暂缓判定、step 的暂缓重试/凝固/落地判定都查它)。
                 sim.set_agent_shape_table(shapes);
+                // R1-P1:暂缓补写在形状表到位后、本拍命令之前(§6"每拍开始、
+                // 表到位之后、本拍命令之前";旧序在 step 开头补写,主体离开
+                // 那一拍同格新实心 SetBlock 直写后被旧条目盖回,最新写入丢失)。
+                sim.flush_agent_deferred_writes();
                 sim.apply_prefix(&prefix);
                 sim.step();
                 // H1(REQ-007 任务 03 返修):瞬态体生命周期段并入生产 tick——

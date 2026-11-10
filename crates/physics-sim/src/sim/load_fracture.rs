@@ -160,6 +160,19 @@ impl ShardSim {
         for pair in self.phys.narrow_phase.contact_pairs() {
             let key1 = pair.collider1.into_raw_parts();
             let key2 = pair.collider2.into_raw_parts();
+            // REQ-012 §6 第 2/3 条(R1-P2):任一侧是主体的接触对整对跳过
+            // (同复合体冲量流;`compound_flow = false` 的原 §7 路径同口径)。
+            {
+                let e1 = collider_to_entity.get(&key1);
+                let e2 = collider_to_entity.get(&key2);
+                let pair_touches_agent = [e1, e2]
+                    .into_iter()
+                    .flatten()
+                    .any(|e| self.agents.contains_key(e));
+                if pair_touches_agent {
+                    continue;
+                }
+            }
             // 碰撞体世界位姿(勘误 2:接触点世界坐标 = 位姿 × local_p;
             // 簇的 `local_p` 已折算到碰撞体坐标系,无需子形状位姿)。
             // **D4 采样只需要本体一侧的位姿**(地形一侧速度为 0,用不到;
@@ -449,11 +462,25 @@ impl ShardSim {
                 }
             }
         }
-        // 采样(局部系事件):按实体累计接触点与对方冲量。
+        // 采样(局部系事件):按实体累计接触点与对方冲量。REQ-012 §6 第
+        // 2/3 条(R1-P2):**任一侧是主体**的接触对整对跳过——主体作为撞击
+        // 源不触发地形破坏与冲量流;复合体撞主体按普通物理接触(rapier 照常
+        // 解算),不建事件、不拿对方修正。
         let mut samples: BTreeMap<EntityId, CompoundFlowSample> = BTreeMap::new();
         for pair in self.phys.narrow_phase.contact_pairs() {
             let key1 = pair.collider1.into_raw_parts();
             let key2 = pair.collider2.into_raw_parts();
+            {
+                let e1 = collider_to_entity.get(&key1);
+                let e2 = collider_to_entity.get(&key2);
+                let pair_touches_agent = [e1, e2]
+                    .into_iter()
+                    .flatten()
+                    .any(|e| self.agents.contains_key(e));
+                if pair_touches_agent {
+                    continue;
+                }
+            }
             let pos1 = self
                 .phys
                 .colliders

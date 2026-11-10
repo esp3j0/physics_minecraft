@@ -712,6 +712,17 @@ impl ShardSim {
         self.agent_shapes = table;
     }
 
+    /// SetBlock 暂缓补写(REQ-012 §6,R1-P1):拍首调用——形状表注入之后、
+    /// 本拍命令(`apply_prefix`)之前。按 `BlockPos` 升序,不再重叠即按
+    /// SetBlock 同一条写入路径补写(`block_updates` 记 `External`、地形唤醒、
+    /// 坍塌/承载触发照常);仍重叠的留下,补写计"补写"。同拍到达的实心
+    /// `SetBlock` 在补写之后判定:格已补写则不重叠、直接生效,同格以最后
+    /// 一条为准;补写产出的 `External` 条目 owner 分片由调度器发布,holder
+    /// 分片的副本由广播命令同拍送达(同一表 ⇒ 同样暂缓/补写,判定一致)。
+    pub fn flush_agent_deferred_writes(&mut self) {
+        self.flush_deferred_set_blocks();
+    }
+
     /// 本拍形状表只读视图(测试/调度器汇总用)。
     pub fn agent_shape_table(&self) -> &crate::agent_shape::AgentShapeTable {
         &self.agent_shapes
@@ -1241,14 +1252,6 @@ impl ShardSim {
     /// 用的是更新后的速度,放行评论风险 1;05c:补偿紧接 `phys.step()`
     /// 之后——凝固桥会删实体、迁移检测会移出实体,先收集再处理,风险 1)。
     pub fn step(&mut self) {
-        // A05 暂缓补写(REQ-012 §6):形状表已由调度器在拍首注入,先于本拍
-        // 命令重试暂缓队列——按 `BlockPos` 升序,不再重叠即按 SetBlock 同一
-        // 条写入路径补写(`block_updates` 记 `External`、地形唤醒、坍塌/承载
-        // 触发照常);仍重叠的留下。补写计"补写"。注意补写发生在 step 内
-        // (调度器 tick 的 apply_prefix 与 step 同拍):owner 分片补写产出的
-        // `External` 条目由调度器发布,holder 分片的副本由广播命令同拍送达
-        // (同一表 ⇒ 同样暂缓/补写,判定一致)。
-        self.flush_deferred_set_blocks();
         self.prestep_contact_wake();
         // 撞击接近速度的基准(§5 修订 9):各醒着动态实体本步之前的线速度,
         // 供 `evaluate_impacts` 使用(解算后的速度已被冲量修改)。
@@ -4903,28 +4906,29 @@ impl ShardSim {
             let pos = conv::rapier_to_vec3(body.translation());
             // A05(REQ-012 §6"爆炸:对每个连杆施加冲量"):主体按连杆遍历——
             // 每个连杆取其**连杆中心**的 `explosion_impulse`(与普通实体同一
-            // 公式同一支点),施加到主体刚体。单连杆 = 旧路径逐位相同(唯一
-            // 连杆即根,中心 = 根位置,同一个 `apply_impulse` 调用)。多连杆
-            // (B01)时每连杆各自求冲量、施加到同一根刚体(单刚体多 collider
-            // 的合成;按连杆遍历、不写死根连杆)。非主体实体 = 旧路径逐位不变。
-            let link_centers: Vec<Vec3> = match self.agents.get(&id) {
-                None => vec![pos],
-                Some(record) => record
-                    .links
-                    .values()
-                    .filter_map(|&lh| {
-                        self.phys
-                            .bodies
-                            .get(lh)
-                            .map(|lb| conv::rapier_to_vec3(lb.translation()))
-                    })
-                    .collect(),
-            };
-            let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
-            for center_of_link in link_centers {
+            // 公式同一支点),施加到**该连杆自己的刚体**(R1-P4:多连杆时
+            // 写死根刚体等于把全部冲量合并到根,与放行"按连杆遍历,不能写死
+            // 根连杆"不符;单连杆 `lh == rec.handle` 结果逐位不变)。非主体
+            // 实体 = 旧路径逐位不变。
+            let link_centers: Vec<(Vec3, rapier3d::prelude::RigidBodyHandle)> =
+                match self.agents.get(&id) {
+                    None => vec![(pos, rec.handle)],
+                    Some(record) => record
+                        .links
+                        .values()
+                        .filter_map(|&lh| {
+                            self.phys
+                                .bodies
+                                .get(lh)
+                                .map(|lb| (conv::rapier_to_vec3(lb.translation()), lh))
+                        })
+                        .collect(),
+                };
+            for (center_of_link, lh) in link_centers {
                 if let Some(imp) =
                     crate::explosion::explosion_impulse(center, power, radius, center_of_link)
                 {
+                    let body = self.phys.bodies.get_mut(lh).expect("连杆句柄有效");
                     body.apply_impulse(conv::vec3_to_rapier(imp), true);
                 }
             }

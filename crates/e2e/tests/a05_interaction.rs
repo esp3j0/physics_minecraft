@@ -32,7 +32,8 @@
 //!
 //! 布景:判据 A05-5/6 用单分片 ShardSim 直接驱动(形状表手工注入 = 生产
 //! 同源构造),判据 A05-7/8/9 用 2×2 分片 Session(调度器自动汇总下发)。
-//! 生产节奏 = apply_prefix → step → run_transient_lifecycle → take_outbox。
+//! 生产节奏 = 表注入 → 暂缓补写 → apply_prefix → step →
+//! run_transient_lifecycle → take_outbox(R1-P1:补写先于本拍命令)。
 
 use messaging::{InputPayload, InputSource, SimCommand, StampedInput};
 use physics_sim::agent_shape::{AgentLinkEntry, AgentShapeTable};
@@ -111,9 +112,12 @@ fn spawn_agent_cmd(a: EntityId, pos: Vec3) -> SimCommand {
 }
 
 /// 生产节奏的一拍(激活开启 = 带观察者;worker 同序)。返回本拍 outbox
-/// (调用方读遥测计数;take 走即清,不返回就丢)。
+/// (调用方读遥测计数;take 走即清,不返回就丢)。R1-P1:暂缓补写在表
+/// 同步之后、命令之前(worker:`set_agent_shape_table → 补写 → apply_prefix
+/// → step`;§6"每拍开始、表到位之后、本拍命令之前")。
 fn production_tick(sim: &mut ShardSim, observers: &[Vec3]) -> physics_sim::Outbox {
     sim.apply_activation(observers);
+    sim.flush_agent_deferred_writes();
     sim.step();
     sim.run_transient_lifecycle();
     sim.take_outbox()
@@ -275,7 +279,8 @@ fn settled_agent() -> (ShardSim, EntityId, Vec3) {
     (s, a, base)
 }
 
-/// 每拍形状表同步(单分片测试的调度器替身:按主体当前位姿重建表)。
+/// 每拍形状表同步(单分片测试的调度器替身:按主体当前位姿重建表;
+/// 补写随后的 production_tick 同步执行——worker 同序)。
 fn sync_shape_table(s: &mut ShardSim, a: EntityId) {
     let table = s.agent_shape_entries();
     let _ = a;
@@ -672,20 +677,16 @@ fn a05_2_pushed_by_block_and_compound_compound_not_broken() {
             "对照线必须断:同款复合体撞悬挑石梁(复合体流/撞击流/破坏计数全 0)"
         );
     }
-    // ---- 组 4:主体被当地形处理的采样口径(变异 13)----
-    // 复合体冲量流的接近速度按**相对速度**算(§5.8.1 勘误 2:v_other − v_self);
-    // 主体是动态对方 → v_other = 主体速度。变异 13(主体按撞到地形处理)
-    // 把主体从对方速度表剔掉 → v_other = 0 → 接近速度只用复合体自身速度。
-    // 布景分离两者:用**无 [walker] 段**主体(walker 刹车 ~7 拍时间常数,
-    // 追尾路上速度会衰减过门槛;nowalker 速度不被衰减),阶段 1 用 −20
-    // 复合体把主体推到高速;阶段 2 在主体前方 ~0.3 m 放**静止**复合体,
-    // 主体匀速追上:相对接近速度 = |v_agent| ≫ 1(事件建立);按地形口径
-    // = 0 < 1(全被筛掉,事件 = 0)。断言阶段 2 事件 > 0 = 钉住
-    // "主体速度进接近速度"。
-    {
-        let (mut s, a, _base) = settled_nowalker_agent();
-        let observers = [Vec3::new(24.0, 3.0, 24.0)];
-        let shape = CompoundShape::new(vec![
+    // ---- 组 4:复合体冲量流排除主体(R1-P2;§6 第 2/3 条)----
+    // 复合体冲量流的两条采样路径(资格表 + 对方速度表所在的两处)都排除
+    // "任一侧是主体"的接触对:主体与复合体之间只保留 rapier 物理接触,不建
+    // 事件、不拿对方修正。变异 13 = "复合体冲量流不排除主体接触对"(把
+    // R1-P2 的整对跳过删掉),(a)/(b) 的主体线会建事件 ⇒ 红。
+    // 标定:4 格石条 V=32 m/s 撞贴地石墙(整层满石、零重力布景见对照线 ②),
+    // 现场二分临界 ≈ 31.1766(31.1766 不断 / 31.1767 断),V = 32 取
+    // 1.02× 临界留余量。
+    let bar_shape = || {
+        CompoundShape::new(vec![
             ShapeCell {
                 offset: [0, 0, 0],
                 block: BlockId(1),
@@ -703,85 +704,252 @@ fn a05_2_pushed_by_block_and_compound_compound_not_broken() {
                 block: BlockId(1),
             },
         ])
-        .expect("4 格横条合法");
-        // 阶段 1:−6 复合体撞主体(同组 2 几何;从 27 起步——20 拍内到达,
-        // 不给"低速滑行 → 静置凝固"留窗口:−3 从 28 起步要 74 拍,滑到
-        // t30 已近零速,t50 凝固消失)。撞击后主体 ~2.5 m/s、每拍 0.04 m
-        // ——阶段 2 的接触是浅穿透,solver 正常解算(14.9 m/s = 0.25 m/拍
-        // 深穿透,rapier 当初始重叠蠕动推出,接触冲量近 0)。
+        .expect("4 格横条合法")
+    };
+    // (a) 主体撞静止复合体:事件 0。对照线:同质量、同速度的普通动态
+    // 方块撞同一复合体,事件 > 0(静态复合体被撞醒,以对方身份进事件)。
+    {
+        let (mut s, a, base) = settled_nowalker_agent();
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        // 主体起速:近距离爆炸(同 A05-3 布景,no-walker 不施力 → Δv 干净)。
+        let center = Vec3::new(base.x - 1.2, 1.0, base.z);
         s.apply_prefix(&[stamp(
             2,
-            SimCommand::SpawnCompound {
-                entity: EntityId::from_parts(1, 3),
-                origin: BlockPos::new(27, 1, 23),
-                shape: shape.clone(),
-                impulses: Vec::new(),
-                velocity: (Vec3::new(-6.0, 0.0, 0.0), Vec3::ZERO),
+            SimCommand::Detonate {
+                center,
+                power: 8.0,
+                radius: 5.0,
             },
         )]);
-        let mut agent_vx_peak = 0.0f32;
-        for _ in 0..60 {
-            sync_shape_table(&mut s, a);
-            let _ = production_tick(&mut s, &observers);
-            let st = s.entity_state(a).expect("主体在");
-            agent_vx_peak = agent_vx_peak.max(st.linvel.x.abs());
-        }
-        eprintln!("A05-2 组 4 阶段 1:主体速度峰值 {agent_vx_peak:.3} m/s");
-        assert!(
-            (1.0..8.0).contains(&agent_vx_peak),
-            "布景自检:阶段 1 须把主体推到 1~8 m/s(峰值 {agent_vx_peak:.3})"
-        );
-        // 阶段 2 直接开跑(nowalker 不衰减;窗口 20 拍内撞上,慢复合体
-        // 来不及凝固)。
-        let vx = s.entity_state(a).expect("主体在").linvel.x;
-        eprintln!("A05-2 组 4 阶段 2 前:主体 vx = {vx:.3} m/s");
-        assert!(vx.abs() > 1.0, "布景自检:主体须仍以高速运动(vx = {vx:.3})");
-        // 清场:阶段 1 的大复合体已远去/停驻,但它的残余接触会污染阶段 2
-        // 的事件口径(它也是动态对方)——直接移除,只留主体与慢复合体。
-        s.apply_prefix(&[stamp(
-            199,
-            SimCommand::RemoveEntity {
-                entity: EntityId::from_parts(1, 3),
-            },
-        )]);
-        for _ in 0..2 {
+        for _ in 0..3 {
             sync_shape_table(&mut s, a);
             let _ = production_tick(&mut s, &observers);
         }
-        // 静止复合体放在主体 −x 前方,间隙 ≈0.3 m(复合体右缘 = 主体左缘
-        // − 0.3):nowalker 不减速,~2 拍内撞上。复合体 4 格宽,spawn 原点
-        // 是左下角格——不能与主体胶囊重叠。
-        let agent_x = s.entity_state(a).expect("主体在").translation.x;
-        let vx_now = s.entity_state(a).expect("主体在").linvel.x;
-        eprintln!("清场后主体 x {agent_x:.2} vx {vx_now:.3}");
-        let gx = (agent_x - 0.3 - 0.3 - 4.0).ceil() as i32; // ceil:右缘 gap ≤ 0.3
+        let vx0 = s.entity_state(a).expect("主体在").linvel.x;
+        eprintln!("A05-2 组 4(a) 主体起速 vx = {vx0:.3} m/s");
+        assert!(vx0 > 4.0, "布景自检:主体须被炸出 +x 高速(vx = {vx0:.3})");
+        // 静止复合体放在主体前方(+x ~1 m 起步格):4 格宽,spawn 原点是
+        // 左下角格,不能与主体重叠。
+        let ax = s.entity_state(a).expect("主体在").translation.x;
+        let gx = (ax + 1.0).ceil() as i32;
         s.apply_prefix(&[stamp(
-            200,
+            3,
             SimCommand::SpawnCompound {
                 entity: EntityId::from_parts(1, 4),
-                origin: BlockPos::new(gx, 1, 23),
-                shape,
+                origin: BlockPos::new(gx, 1, base.z.floor() as i32),
+                shape: bar_shape(),
                 impulses: Vec::new(),
                 velocity: (Vec3::ZERO, Vec3::ZERO),
             },
         )]);
-        let mut events_phase2 = 0u64;
-        for i in 0..30 {
+        let mut events_agent = 0u64;
+        let mut breaks_agent = 0u64;
+        for _ in 0..60 {
             sync_shape_table(&mut s, a);
             let out = production_tick(&mut s, &observers);
-            events_phase2 += out.cohesion_stats.compound_flow_events;
-            if i % 3 == 0 {
-                let av = s.entity_state(a).map(|x| (x.translation.x, x.linvel.x));
-                let cv = s
-                    .entity_state(EntityId::from_parts(1, 4))
-                    .map(|x| (x.translation.x, x.linvel.x));
-                eprintln!("  阶段2 t{i}: agent={av:?} comp={cv:?}");
+            events_agent += out.cohesion_stats.compound_flow_events;
+            breaks_agent += out.cohesion_stats.compound_flow_breaks;
+        }
+        eprintln!("A05-2 组 4(a) 主体线:事件 {events_agent} 断开 {breaks_agent}");
+        assert_eq!(
+            events_agent, 0,
+            "主体撞复合体不建复合体冲量流事件(§6 第 3 条;变异 13 红)"
+        );
+        // 对照线:同质量、同速度的普通动态方块撞同一复合体。主体质量
+        // 0.8 kg,单格普通方块 0.729 kg(同档);速度 = 主体的实测起速
+        // vx0(同款爆炸 Δv 与质量成反比:0.729 kg 方块 Δv ≈ 5.6 × 0.8/0.729
+        // ——这里按主体速度直接给方块初速,免得再起一个爆炸布景)。
+        // 布景关重力关凝固(静止复合体贴地 36 拍会凝固消失,低速方块
+        // 走不到位;悬空复合体在零重力下不动)。
+        let cfg_ctrl = {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify.enabled = false;
+            cfg
+        };
+        let mut sw = ShardSim::new_with_bodies(
+            cfg_ctrl,
+            Box::new(SimpleRegistry::builtin()),
+            capsule_registry(),
+        );
+        // 平板地形(world y = 0 全石,顶面 y = 1)。
+        for cx in 0..3i32 {
+            for cz in 0..3i32 {
+                let mut ch = Chunk::air();
+                for x in 0..voxel::CHUNK_X {
+                    for z in 0..voxel::CHUNK_Z {
+                        ch.set(x, 64, z, BlockId(1));
+                    }
+                }
+                sw.load_chunk(ChunkPos::new(cx, cz), ch);
             }
         }
-        eprintln!("A05-2 组 4 阶段 2:主体追尾慢复合体,复合体流事件 {events_phase2}");
+        // 悬空静止复合体(y = 2 行;零重力不动);同质量(0.729 ≈ 主体 0.8)
+        // 普通动态方块以主体同一速度 vx0 从 2 m 外撞过去。
+        sw.apply_prefix(&[
+            stamp(
+                2,
+                SimCommand::SpawnCompound {
+                    entity: EntityId::from_parts(1, 4),
+                    origin: BlockPos::new(28, 2, 24),
+                    shape: bar_shape(),
+                    impulses: Vec::new(),
+                    velocity: (Vec3::ZERO, Vec3::ZERO),
+                },
+            ),
+            stamp(
+                3,
+                SimCommand::SpawnDynamic {
+                    entity: EntityId::from_parts(1, 5),
+                    state: EntityState {
+                        translation: Vec3::new(25.5, 2.5, 24.5),
+                        linvel: Vec3::new(vx0, 0.0, 0.0),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            ),
+        ]);
+        let mut events_ctrl = 0u64;
+        for _ in 0..200 {
+            let out = production_tick(&mut sw, &[]);
+            events_ctrl += out.cohesion_stats.compound_flow_events;
+        }
+        eprintln!("A05-2 组 4(a) 对照线:事件 {events_ctrl}");
         assert!(
-            events_phase2 > 0,
-            "相对接近速度口径:主体({vx:.3})追尾静止复合体 ⇒ 接近速度 = |v| > 1,事件必建;             主体被按撞到地形处理(v_other = 0)则口径 = 0 < 1 全筛 → 0(变异 13 即红)"
+            events_ctrl > 0,
+            "对照线必须建事件:同质量同速度的普通动态方块撞同一复合体 \
+             (静态复合体被撞醒后以对方身份进事件;全 0 = 对照布景坏)"
+        );
+    }
+    // (b) 复合体以速度 V 撞主体:事件 0、复合体不断。对照线:同一复合体、
+    // 同一速度 V 撞石墙,复合体本身断开(compound_flow_breaks > 0)。
+    {
+        let (mut s, a, base) = settled_nowalker_agent();
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        // 主体站复合体行进路径上(复合体 y=1 贴地行,顶面 y=2 与主体胶囊
+        // y 1.05..2.85 重叠);复合体从 x=14 起步 +x(32 m/s = 0.533 m/拍,
+        // ~10 拍到主体)。
+        let v = 32.0f32;
+        s.apply_prefix(&[stamp(
+            2,
+            SimCommand::SpawnCompound {
+                entity: EntityId::from_parts(1, 4),
+                origin: BlockPos::new(14, 1, base.z.floor() as i32),
+                shape: bar_shape(),
+                impulses: Vec::new(),
+                velocity: (Vec3::new(v, 0.0, 0.0), Vec3::ZERO),
+            },
+        )]);
+        let mut events_b = 0u64;
+        let mut breaks_b = 0u64;
+        let mut compound_alive = true;
+        // 撞主体接触窗口:复合体端格(x = origin+3 右缘)与主体中心 x 相交
+        // 的前后 2 拍。窗口外(撞飞后复合体翻滚再碰地形)的复合体↔地形事件
+        // 与本判据无关,不计入。
+        let mut in_contact_window = false;
+        let mut window_done = false;
+        for _ in 0..60 {
+            sync_shape_table(&mut s, a);
+            let comp = s.entity_state(EntityId::from_parts(1, 4));
+            let agent_x = s.entity_state(a).expect("主体在").translation.x;
+            if let (Some(cst), false) = (comp, window_done) {
+                // 复合体原点 = translation(原点格心);端格右缘 = x + 3.95。
+                let front_x = cst.translation.x + 3.95;
+                if !window_done && front_x >= agent_x - 1.0 {
+                    in_contact_window = true;
+                }
+                if in_contact_window && cst.translation.x > agent_x + 1.0 {
+                    window_done = true;
+                    in_contact_window = false;
+                }
+            }
+            let out = production_tick(&mut s, &observers);
+            if in_contact_window || !window_done {
+                events_b += out.cohesion_stats.compound_flow_events;
+                breaks_b += out.cohesion_stats.compound_flow_breaks;
+            }
+            if s.entity_state(EntityId::from_parts(1, 4)).is_none() {
+                compound_alive = false;
+            }
+        }
+        let comp_end = s.entity_state(EntityId::from_parts(1, 4));
+        eprintln!(
+            "A05-2 组 4(b) 主体线:事件 {events_b} 断开 {breaks_b} 复合体在 {compound_alive:?} 末 {comp_end:?}"
+        );
+        assert_eq!(
+            events_b, 0,
+            "复合体撞主体不建复合体冲量流事件(§6 第 3 条;变异 13 红)"
+        );
+        assert!(
+            compound_alive,
+            "复合体撞主体不断(V = {v} 远超断墙阈值,若建了事件必断;\
+             实体消失 = 走了不该走的路径)"
+        );
+        // 对照线 ②:同一复合体、同一速度 V 撞石墙(整层满石上立墙 = 贴地墙,
+        // 压向割 ∞ 不断地形;复合体本身断开)。零重力、无主体(同标定布景)。
+        let cfg = {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify.enabled = false;
+            cfg.cohesion.impact_flow = false;
+            cfg
+        };
+        let mut sw = {
+            let mut sim = ShardSim::new_with_bodies(
+                cfg,
+                Box::new(SimpleRegistry::builtin()),
+                capsule_registry(),
+            );
+            // 3×3 chunk 整层满石(world y = 0 全石,顶面 y = 1)。
+            for cx in 0..3i32 {
+                for cz in 0..3i32 {
+                    let mut ch = Chunk::air();
+                    for x in 0..voxel::CHUNK_X {
+                        for z in 0..voxel::CHUNK_Z {
+                            ch.set(x, 64, z, BlockId(1));
+                            for y in 0..64 {
+                                ch.set(x, y, z, BlockId(1));
+                            }
+                        }
+                    }
+                    sim.load_chunk(ChunkPos::new(cx, cz), ch);
+                }
+            }
+            sim
+        };
+        // 墙:x = 30..=31、y = 1..=6、z = 22..=26(标定布景同款)。
+        for x in 30..=31 {
+            for y in 1..=6 {
+                for z in 22..=26 {
+                    sw.write_voxel_for_test(BlockPos::new(x, y, z), BlockId(1));
+                }
+            }
+        }
+        sw.apply_prefix(&[stamp(
+            1,
+            SimCommand::SpawnCompound {
+                entity: EntityId::from_parts(1, 4),
+                origin: BlockPos::new(24, 2, 23),
+                shape: bar_shape(),
+                impulses: Vec::new(),
+                velocity: (Vec3::new(v, 0.0, 0.0), Vec3::ZERO),
+            },
+        )]);
+        let mut events_wall = 0u64;
+        let mut breaks_wall = 0u64;
+        for _ in 0..40 {
+            sw.step();
+            let out = sw.take_outbox();
+            events_wall += out.cohesion_stats.compound_flow_events;
+            breaks_wall += out.cohesion_stats.compound_flow_breaks;
+        }
+        eprintln!("A05-2 组 4(b) 对照线(V = {v} 撞石墙):事件 {events_wall} 断开 {breaks_wall}");
+        assert_eq!(events_wall, 1, "对照线布景自检:撞墙恰建 1 个事件");
+        assert!(
+            breaks_wall > 0,
+            "对照线必须断:同一复合体、同一速度 V 撞石墙,复合体本身断开 \
+             (compound_flow_breaks = {breaks_wall};标定临界 ≈ 31.177,V = {v})"
         );
     }
 }
@@ -840,78 +1008,174 @@ fn a05_3_explosion_launches_agent_by_per_link_impulse() {
 
 // ── A05-4:地形承载 ───────────────────────────────────────────────────────
 
-/// 石桥(bond = 8 = 8 格重;一格重 W0 = 0.729 kg?——承载单位是格重,
-/// 默认格质量 1.0/格(CELL_MASS),跨 3 格桥两端墩)。桥长取承载极限:
-/// 水平跨 4 格两端锚定,中央 2 格由两端的 bond 链传递;对照线 = 桥中央
-/// 加 1 格实心(第 5 格把跨中悬挑变成 5 格链)就塌。布景现场标定:
-/// 跨度从 3 格开始扫到判定"主体站桥不塌、加 1 格就塌"的档。
+/// "stone2":bond = 8、Connected,其余同 stone(承载模型里每格重量恒 1
+/// 格重、与材料无关;bond 相同 ⇒ 与 stone 同受力)。R1-P3 的"不改变桥
+/// 受力的写入"用它:桥面 stone 换 stone2 触发一次承载求值,结构受力不变。
+fn stone2_registry() -> voxel::SimpleRegistry {
+    let mut reg = voxel::SimpleRegistry::builtin();
+    reg.register_with_material(
+        "stone2",
+        voxel::Material {
+            resistance: 6.0,
+            impact_threshold: 18.0,
+            support: voxel::Support::Connected,
+            pulverize_factor: 2.0,
+            bond: 8,
+            impact_crush: 72.0,
+        },
+    )
+    .expect("stone2 注册合法");
+    reg
+}
+
+fn stone2_id() -> BlockId {
+    let reg = stone2_registry();
+    voxel::BlockRegistry::id_of(&reg, "stone2").expect("stone2 已装")
+}
+
+fn stone2_sim() -> ShardSim {
+    let cfg = ShardSimConfig::new(shard_id(0, 0));
+    ShardSim::new_with_bodies(cfg, Box::new(stone2_registry()), capsule_registry())
+}
+
+/// R1-P3:桥长取在承载极限(现场标定 N = 8)。单端锚定水平悬挑:
+/// 源 → 每格容量 1(格重),悬挑链水平 bond 8,末端 → 汇点 bond 8 ⇒
+/// 流 ≤ min(N, 8):N = 8 恰好扛住(流 = 割 = 8),N = 9 > 8 塌。
+/// 主体线 = 同一座 8 格桥 + 主体站桥 + 跳 10 次 + 一次同重量替换写入
+/// (stone → stone2,触发覆盖桥连通块的承载求值;受力不变):桥不塌、
+/// 转换 0、load_evaluations ≥ 1。对照线 = 桥面再加 1 格实心 → 9 格链
+/// 超限塌。拆墩组保留(拆锚柱顶格,桥塌主体随落)。
 #[test]
 fn a05_4_load_ignores_agent_weight_bridge_control() {
-    // 布景(承载判定语义现场标定):石 bond = 8 = 一条共面连接最多传 8 格重
-    // (格重 W0 = 0.729 kg/格)。**单端锚定的 12 格水平悬挑桥**:拆锚后
-    // 悬挑连通块 12 格,流 12 > 割 8 → 塌(对照线);站上主体不塌(主体
-    // 重量不计入承载判定,§6)。主体线与对照线同一座桥。
-    let build_bridge = |s: &mut ShardSim| {
-        // 桥面 y=3(与地面 y=1 隔两格空隙,不贴地),x ∈ [22, 33](12 格,
-        // z=24);锚柱 x=21(y=1..3,底 (21,1) 落在地面顶上接地)。
-        for x in 22..=33 {
+    let n_limit = 8usize; // 现场标定:见标定线两档
+    let build_bridge = |s: &mut ShardSim, n: usize| {
+        // 桥面 y=3(与地面 y=1 隔两格空隙,不贴地),x ∈ [22, 22+n),z=24;
+        // 锚柱 x=21(y=1..3)用 **bedrock**(Support::Anchor ⇒ 柱整根接地,
+        // 桥连通块与整层地面断开——stone 柱会把桥连通块经 y=0 整层接到
+        // 3072 格 > load_max_cells 2048,整块按预算判稳定,永不塌)。
+        for x in 22..22 + n as i32 {
             s.write_voxel_for_test(BlockPos::new(x, 3, 24), BlockId(1));
         }
-        s.write_voxel_for_test(BlockPos::new(21, 1, 24), BlockId(1));
-        s.write_voxel_for_test(BlockPos::new(21, 2, 24), BlockId(1));
-        s.write_voxel_for_test(BlockPos::new(21, 3, 24), BlockId(1));
+        s.write_voxel_for_test(BlockPos::new(21, 1, 24), BlockId(3));
+        s.write_voxel_for_test(BlockPos::new(21, 2, 24), BlockId(3));
+        s.write_voxel_for_test(BlockPos::new(21, 3, 24), BlockId(3));
     };
-    // ---- 对照线:挖锚柱顶格 → 12 格全悬挑 → 塌 ----
-    {
-        let mut s = walker_sim();
-        load_flat_ground(&mut s);
-        build_bridge(&mut s);
-        let seq = 10u64;
-        s.apply_prefix(&[stamp(
-            seq,
-            SimCommand::SetBlock {
-                pos: BlockPos::new(21, 1, 24),
-                block: BlockId::AIR,
-            },
-        )]);
-        let observers = [Vec3::new(28.0, 3.0, 24.0)];
-        let mut converted = 0u64;
-        let mut evals = 0u64;
-        let mut falling = 0u64;
-        for i in 0..30 {
-            let out = production_tick(&mut s, &observers);
-            converted += out.destruction_stats.cells_collapsed;
-            evals += out.cohesion_stats.load_evaluations;
-            falling += out.cohesion_stats.load_falling;
-            if i < 5 {
-                eprintln!(
-                    "t{i}: anchor={:?} evals={} falling={}",
-                    s.voxel().get_block(BlockPos::new(21, 1, 24)),
-                    out.cohesion_stats.load_evaluations,
-                    out.cohesion_stats.load_falling
-                );
-            }
-        }
-        let missing = (22..=33)
+    let bridge_missing = |s: &ShardSim, n: usize| -> usize {
+        (22..22 + n as i32)
             .map(|x| s.voxel().get_block(BlockPos::new(x, 3, 24)).is_air())
             .filter(|&air| air)
-            .count();
+            .count()
+    };
+    // ---- 标定线:N = 8 同重量替换写入 → 求值跑 → 不塌;N = 9 桥塌 ----
+    {
+        // N = 8:stone → stone2 替换(同重同 bond),承载求值触发,桥扛住。
+        let mut s = stone2_sim();
+        load_flat_ground(&mut s);
+        build_bridge(&mut s, n_limit);
+        let s2id = stone2_id();
+        s.apply_prefix(&[stamp(
+            10,
+            SimCommand::SetBlock {
+                pos: BlockPos::new(25, 3, 24),
+                block: s2id,
+            },
+        )]);
+        let observers = [Vec3::new(26.0, 3.0, 24.0)];
+        let mut evals = 0u64;
+        let mut converted = 0u64;
+        for _ in 0..30 {
+            let out = production_tick(&mut s, &observers);
+            evals += out.cohesion_stats.load_evaluations;
+            converted += out.destruction_stats.cells_collapsed;
+        }
         eprintln!(
-            "A05-4 对照线(12 格悬挑桥拆锚):坍塌转换 {converted},桥缺失格 {missing}/12,求值 {evals},falling {falling}"
+            "A05-4 标定线 N={n_limit}:stone2 替换格 = {:?},求值 {evals},转换 {converted}",
+            s.voxel().get_block(BlockPos::new(25, 3, 24))
+        );
+        assert!(
+            evals >= 1,
+            "布景自检:实心替换写入须触发承载求值(load_evaluations = {evals})"
+        );
+        assert_eq!(
+            bridge_missing(&s, n_limit),
+            0,
+            "标定线:N = 8 在承载极限上,同重量替换不塌"
+        );
+        assert_eq!(converted, 0, "标定线 N=8:承载转换 0");
+        // N = 9:同桥多 1 格 → 流 9 > 割 8 → 塌。
+        let mut s = stone2_sim();
+        load_flat_ground(&mut s);
+        build_bridge(&mut s, n_limit + 1);
+        // 写入用 stone→stone2 替换(同 ID 写入 old == new 不登记触发,
+        // 求值根本不跑)。
+        s.apply_prefix(&[stamp(
+            10,
+            SimCommand::SetBlock {
+                pos: BlockPos::new(25, 3, 24),
+                block: stone2_id(),
+            },
+        )]);
+        let observers = [Vec3::new(26.0, 3.0, 24.0)];
+        let mut converted = 0u64;
+        let mut evals9 = 0u64;
+        for _ in 0..30 {
+            let out = production_tick(&mut s, &observers);
+            converted += out.destruction_stats.cells_collapsed;
+            evals9 += out.cohesion_stats.load_evaluations;
+        }
+        eprintln!(
+            "A05-4 标定线 N={}:+1 格超限,桥缺失 {}/{},求值 {evals9}",
+            n_limit + 1,
+            bridge_missing(&s, n_limit + 1),
+            n_limit + 1
         );
         assert!(
             converted > 0,
-            "对照线必须塌:12 格悬挑(流 12 > 割 8)拆锚后 cells_collapsed = {converted}"
+            "标定线:N = 9(极限 + 1 格)必须塌(converted = {converted})"
         );
     }
-    // ---- 主体线:同一座桥 + 主体站桥上 600 拍 + 跳 10 次:不塌、转换 0 ----
+    // ---- 对照线:8 格桥面再加 1 格实心 → 塌 ----
     {
-        let mut s = walker_sim();
+        let mut s = stone2_sim();
         load_flat_ground(&mut s);
-        build_bridge(&mut s);
+        build_bridge(&mut s, n_limit);
+        let observers = [Vec3::new(26.0, 3.0, 24.0)];
+        s.apply_prefix(&[stamp(
+            10,
+            SimCommand::SetBlock {
+                pos: BlockPos::new(22 + n_limit as i32, 3, 24),
+                block: BlockId(1),
+            },
+        )]);
+        let mut converted = 0u64;
+        for _ in 0..30 {
+            let out = production_tick(&mut s, &observers);
+            converted += out.destruction_stats.cells_collapsed;
+        }
+        eprintln!(
+            "A05-4 对照线(桥面 +1 格 → {} 格链):坍塌转换 {converted},缺失 {}/{}",
+            n_limit + 1,
+            bridge_missing(&s, n_limit),
+            n_limit
+        );
+        assert!(
+            converted > 0,
+            "对照线必须塌:桥面加 1 格(流 {lim} > 割 8)→ cells_collapsed = {converted}",
+            lim = n_limit + 1
+        );
+    }
+    // ---- 主体线:同一座 8 格桥 + 主体站桥 + 跳 10 次(逐跳断言升高
+    //      > 0.3 m)+ 站桥期间一次同重量替换写入(触发求值):桥不塌、
+    //      转换 0、load_evaluations ≥ 1 ----
+    {
+        let mut s = stone2_sim();
+        load_flat_ground(&mut s);
+        build_bridge(&mut s, n_limit);
         let a = EntityId::from_parts(1, 1);
+        // 主体站桥面中部(x=26,y=3 格 → 站位 y ≈ 4.9?桥面顶 y=4;中心
+        // 4 + 0.95)。落稳后开跑。
         s.apply_prefix(&[
-            stamp(0, spawn_agent_cmd(a, Vec3::new(27.5, 4.5, 24.5))),
+            stamp(0, spawn_agent_cmd(a, Vec3::new(26.5, 5.5, 24.5))),
             stamp(
                 1,
                 SimCommand::AgentIntent {
@@ -922,13 +1186,27 @@ fn a05_4_load_ignores_agent_weight_bridge_control() {
                 },
             ),
         ]);
-        let observers = [Vec3::new(28.0, 3.0, 24.0)];
+        let observers = [Vec3::new(26.0, 3.0, 24.0)];
+        for _ in 0..60 {
+            sync_shape_table(&mut s, a);
+            let _ = production_tick(&mut s, &observers);
+        }
+        let rest_y = s.entity_state(a).expect("主体落稳").translation.y;
+        eprintln!("A05-4 主体线:落稳 y = {rest_y:.3}(桥面顶 y=4)");
+        assert!(
+            (3.5..5.5).contains(&rest_y),
+            "布景自检:主体须站在桥面附近(y = {rest_y:.3})"
+        );
         let mut seq = 2u64;
         let mut converted = 0u64;
-        let mut jumps = 0usize;
+        let mut evals = 0u64;
         let mut fell_below = false;
-        for i in 0..600 {
-            if i > 0 && i % 60 == 0 && jumps < 10 {
+        let mut jumps_done = 0usize;
+        let mut jump_rises = Vec::new();
+        // 每 55 拍一跳(600 拍 ≥ 10 跳:55×10 = 550);同重量替换写入在
+        // 第 200 拍(桥站期间,桥面 stone → stone2)。
+        for i in 0..600i32 {
+            if i > 0 && i % 55 == 0 && jumps_done < 10 {
                 s.apply_prefix(&[stamp(
                     seq,
                     SimCommand::AgentIntent {
@@ -939,35 +1217,74 @@ fn a05_4_load_ignores_agent_weight_bridge_control() {
                     },
                 )]);
                 seq += 1;
-                jumps += 1;
+                jumps_done += 1;
+                jump_rises.push((jumps_done, rest_y));
+            }
+            // 同重量替换写入在 i==30:落稳之后、第一跳(i=55)之前,主体
+            // 确定站在桥面上(跳跃空中主体格会漂到 y=6,不在桥连通块里)。
+            if i == 30 {
+                let s2id = stone2_id();
+                s.apply_prefix(&[stamp(
+                    seq,
+                    SimCommand::SetBlock {
+                        pos: BlockPos::new(25, 3, 24),
+                        block: s2id,
+                    },
+                )]);
+                seq += 1;
             }
             sync_shape_table(&mut s, a);
             let out = production_tick(&mut s, &observers);
             converted += out.destruction_stats.cells_collapsed;
-            let st = s.entity_state(a).expect("主体在");
-            if st.translation.y < 1.0 {
-                fell_below = true;
+            evals += out.cohesion_stats.load_evaluations;
+            if let Some(st) = s.entity_state(a) {
+                if st.translation.y < 1.0 {
+                    fell_below = true;
+                }
+                // 逐跳:跳后 20 拍内记录根位置升高。
+                if let Some(&(_k, _)) = jump_rises.last() {
+                    let rise = st.translation.y - rest_y;
+                    let last = jump_rises.len();
+                    if rise > jump_rises[last - 1].1 - rest_y {
+                        jump_rises[last - 1].1 = rest_y + rise.max(0.0);
+                    }
+                }
             }
         }
-        let missing = (22..=33)
-            .map(|x| s.voxel().get_block(BlockPos::new(x, 3, 24)).is_air())
-            .filter(|&air| air)
-            .count();
+        // 逐跳重新实测:每跳窗口内最大升高(简单法:重放不稳,直接用
+        // 记录值断言 > 0.3)。上面的记录器把"当前最高 y − rest_y"存进
+        // 第二元:逐跳取值。
+        let rises: Vec<f32> = jump_rises.iter().map(|(_, h)| h - rest_y).collect();
         eprintln!(
-            "A05-4 主体线:跳 {jumps} 次,桥缺失格 {missing}/12,承载转换 {converted},掉下 {fell_below}"
+            "A05-4 主体线:跳 {jumps_done} 次,逐跳升高(>0.3 须全过)= \
+             {rises:?};求值 {evals},转换 {converted},掉下 {fell_below}"
         );
+        assert_eq!(jumps_done, 10, "须跳满 10 次");
+        for (k, r) in rises.iter().enumerate() {
+            assert!(
+                *r > 0.3,
+                "第 {} 跳主体须离开桥面(升高 {} ≤ 0.3 m)",
+                k + 1,
+                r
+            );
+        }
+        assert!(
+            evals >= 1,
+            "主体站桥期间须触发至少一次承载求值(load_evaluations = {evals})"
+        );
+        let missing = bridge_missing(&s, n_limit);
         assert_eq!(missing, 0, "主体站桥不得压塌桥(§6:重量不计入承载)");
         assert_eq!(converted, 0, "承载转换计数须为 0");
         assert!(!fell_below, "主体全程不掉下(桥在)");
     }
-    // ---- 拆墩组:同桥 + 主体 → 挖锚 → 桥塌,主体随之落、不卡、不 NaN ----
+    // ---- 拆墩组:同桥 + 主体 → 挖锚柱顶格 → 桥塌,主体随之落、不卡、不 NaN ----
     {
-        let mut s = walker_sim();
+        let mut s = stone2_sim();
         load_flat_ground(&mut s);
-        build_bridge(&mut s);
+        build_bridge(&mut s, n_limit);
         let a = EntityId::from_parts(1, 1);
         s.apply_prefix(&[
-            stamp(0, spawn_agent_cmd(a, Vec3::new(27.5, 4.5, 24.5))),
+            stamp(0, spawn_agent_cmd(a, Vec3::new(26.5, 5.5, 24.5))),
             stamp(
                 1,
                 SimCommand::AgentIntent {
@@ -978,7 +1295,7 @@ fn a05_4_load_ignores_agent_weight_bridge_control() {
                 },
             ),
         ]);
-        let observers = [Vec3::new(28.0, 3.0, 24.0)];
+        let observers = [Vec3::new(26.0, 3.0, 24.0)];
         for _ in 0..60 {
             sync_shape_table(&mut s, a);
             let _ = production_tick(&mut s, &observers);
@@ -992,40 +1309,32 @@ fn a05_4_load_ignores_agent_weight_bridge_control() {
             },
         )]);
         let mut converted = 0u64;
-        let mut fell = false;
         let mut nan = false;
         for _ in 0..360 {
             sync_shape_table(&mut s, a);
             let out = production_tick(&mut s, &observers);
             converted += out.destruction_stats.cells_collapsed;
-            if let Some(st) = s.entity_state(a) {
-                if !st.translation.is_finite() {
-                    nan = true;
-                }
-                if st.translation.y < 0.5 {
-                    fell = true;
-                }
+            if let Some(st) = s.entity_state(a)
+                && !st.translation.is_finite()
+            {
+                nan = true;
             }
         }
-        let missing = (22..=33)
-            .map(|x| s.voxel().get_block(BlockPos::new(x, 3, 24)).is_air())
-            .filter(|&air| air)
-            .count();
+        let missing = bridge_missing(&s, n_limit);
         let end = s
             .entity_state(a)
             .map(|x| (x.translation.x, x.translation.y, x.translation.z));
         eprintln!(
-            "A05-4 拆墩组:桥缺失格 {missing}/12,转换 {converted},主体下落 {fell},NaN {nan},末位置 {end:?}"
+            "A05-4 拆墩组:桥缺失格 {missing}/{n_limit},转换 {converted},主体末位置 {end:?},NaN {nan}"
         );
-        assert!(missing >= 6, "布景自检:拆锚后桥须塌(缺失 {missing}/12)");
-        // 判据口径:"拆掉桥墩,桥塌,主体随之下落、落地、不卡、不 NaN":
-        // 主体高度必须显著低于桥面(y=3),且全程有限、实体仍在(被塌落
-        // 碎块接住也算"落地",判据不要求掉到地面 y=1)。
+        assert!(
+            missing >= 6,
+            "布景自检:拆锚后桥须塌(缺失 {missing}/{n_limit})"
+        );
         let y = s.entity_state(a).expect("主体在").translation.y;
         assert!(y < 2.0, "主体须随桥下落(末 y {y:.3},桥面 y=3)");
         assert!(!nan, "全程不 NaN");
         assert!(s.entity_state(a).is_some(), "主体不卡死(仍在模拟中)");
-        let _ = fell;
     }
 }
 
@@ -1132,7 +1441,9 @@ fn a05_5_setblock_deferred_replaced_invalidated_flushed() {
         "暂缓条目已作废"
     );
 
-    // ⑤ 重新写石暂缓;主体走开(走意图 3 m)⇒ 第一拍不再重叠时补写。
+    // ⑤ 重新写石暂缓;③' 同格换泥土(不同方块,R1-P7:替换必须断言内容
+    // ——队列只留后一条泥土,补写后该格 = 泥土;V10"只留第一条"会补写
+    // 石头,即红);主体走开 ⇒ 第一拍不再重叠时补写。
     sync_shape_table(&mut s, a);
     s.apply_prefix(&[stamp(
         seq,
@@ -1144,6 +1455,26 @@ fn a05_5_setblock_deferred_replaced_invalidated_flushed() {
     seq += 1;
     let _ = s.take_outbox();
     assert_eq!(s.deferred_set_blocks().get(&target), Some(&BlockId(1)));
+    // ③' 泥土(builtin dirt = BlockId(2),同一注册表的另一种实心)替换。
+    sync_shape_table(&mut s, a);
+    s.apply_prefix(&[stamp(
+        seq,
+        SimCommand::SetBlock {
+            pos: target,
+            block: BlockId(2),
+        },
+    )]);
+    seq += 1;
+    let out = s.take_outbox();
+    assert_eq!(
+        out.cohesion_stats.set_block_deferred_replaced, 1,
+        "石→泥土同格实心再写:被替换 +1"
+    );
+    assert_eq!(
+        s.deferred_set_blocks().get(&target),
+        Some(&BlockId(2)),
+        "只留后一条泥土(R1-P7:内容断言)"
+    );
 
     // 走开:+x 方向意图 2 m/s,几拍后不再重叠。
     s.apply_prefix(&[stamp(
@@ -1181,8 +1512,12 @@ fn a05_5_setblock_deferred_replaced_invalidated_flushed() {
         first_free + 1,
         "补写拍号 = 首个不重叠拍 + 1(first_free {first_free},flushed {flushed})"
     );
-    assert_eq!(s.voxel().get_block(target), BlockId(1), "补写落格");
-    // 总数守恒:初始 + 1(补写的石)。
+    assert_eq!(
+        s.voxel().get_block(target),
+        BlockId(2),
+        "补写落格 = 后一条泥土(R1-P7:V10 只留第一条会补写石头,即红)"
+    );
+    // 总数守恒:初始 + 1(补写的泥土)。
     assert_eq!(
         solid_count(&s),
         initial + 1,
@@ -1449,9 +1784,341 @@ fn a05_6_solidify_and_forced_landing_deferred() {
             "复合体凝固后总数守恒(2 格落格)"
         );
     }
+    // ---- 组 4:复合体强制落地暂缓(整块 Write 路径,R1-P6)----
+    // 预算压力触发:激活预算 1 格,主体(常驻,预算豁免)+ 2 格复合体(瞬态,
+    // 4 格 > 1)→ 下一拍 plan 超预算淘汰复合体 → 强制落地。复合体悬在主体
+    // 上方,整块落点与主体重叠 ⇒ 暂缓(+1)、实体保持;主体走开 ⇒ 整块
+    // 落地(Emergent)、实体消失、总数守恒。布景自检(对照组):同一布景
+    // 去掉主体,复合体就在该路径落地(不暂缓)。
+    {
+        let bar = || {
+            CompoundShape::new(vec![
+                ShapeCell {
+                    offset: [0, 0, 0],
+                    block: BlockId(1),
+                },
+                ShapeCell {
+                    offset: [1, 0, 0],
+                    block: BlockId(1),
+                },
+            ])
+            .expect("2 格横条合法")
+        };
+        // 主体线:复合体 2 格骑在主体头顶(下格 = 主体上格,重叠)。
+        let (mut s, a, base) = settled_agent();
+        // 预算压力路径在 ShardSim 层测试已覆盖(compound_forced_landing_
+        // lands_whole_on_budget_eviction);这里用与组 2 同款入口(强制落地
+        // 指令 = 调度器 7.5 同款),只判 A05 暂缓语义。
+        let victims = EntityId::from_parts(1, 3);
+        let gy = base.y.floor() as i32 + 1;
+        s.apply_prefix(&[stamp(
+            2,
+            SimCommand::SpawnCompound {
+                entity: victims,
+                origin: BlockPos::new(base.x.floor() as i32, gy, base.z.floor() as i32),
+                shape: bar(),
+                impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
+            },
+        )]);
+        sync_shape_table(&mut s, a);
+        let _ = production_tick(&mut s, &[Vec3::new(24.0, 3.0, 24.0)]);
+        // 等复合体低速(凝固判据外的强制落地只看队列;这里直接下指令)。
+        s.apply_forced_landing_directive(victims);
+        let observers_w = [Vec3::new(24.0, 3.0, 24.0)];
+        let mut deferred_w = 0u64;
+        let mut still_entity = true;
+        for _ in 0..120 {
+            sync_shape_table(&mut s, a);
+            let out = production_tick(&mut s, &observers_w);
+            deferred_w += out.cohesion_stats.forced_landing_deferred;
+            if s.entity_state(victims).is_none() {
+                still_entity = false;
+            }
+        }
+        eprintln!("A05-6 组 4(复合体整块落地暂缓):计数 {deferred_w},仍实体 {still_entity}");
+        assert!(deferred_w >= 1, "整块落点与主体重叠 ⇒ 落地暂缓 +1");
+        assert!(still_entity, "暂缓期间复合体保持为实体");
+        let total_before_w = solid_count(&s) + 2;
+        s.apply_prefix(&[stamp(
+            3,
+            SimCommand::AgentIntent {
+                entity: a,
+                move_xz: (2.0, 0.0),
+                yaw: 0.0,
+                jump: false,
+            },
+        )]);
+        let mut landed_w = false;
+        for _ in 0..600 {
+            sync_shape_table(&mut s, a);
+            production_tick(&mut s, &observers_w);
+            if s.entity_state(victims).is_none() {
+                landed_w = true;
+            }
+        }
+        let total_after_w = solid_count(&s);
+        eprintln!("A05-6 组 4(走开后):整块落地 {landed_w},总数 {total_before_w} → {total_after_w}");
+        assert!(landed_w, "主体走开后复合体整块落地");
+        assert_eq!(total_after_w, total_before_w, "全程总数守恒(2 格落格)");
+        // 布景自检(对照组):同一布景去掉主体 → 复合体直接整块落地。
+        let mut s2 = walker_sim();
+        load_flat_ground(&mut s2);
+        let v2 = EntityId::from_parts(1, 3);
+        s2.apply_prefix(&[stamp(
+            2,
+            SimCommand::SpawnCompound {
+                entity: v2,
+                origin: BlockPos::new(24, 2, 24),
+                shape: bar(),
+                impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
+            },
+        )]);
+        let _ = production_tick(&mut s2, &[Vec3::new(24.0, 3.0, 24.0)]);
+        s2.apply_forced_landing_directive(v2);
+        let mut landed_ctrl = false;
+        for _ in 0..120 {
+            let _ = production_tick(&mut s2, &[Vec3::new(24.0, 3.0, 24.0)]);
+            if s2.entity_state(v2).is_none() {
+                landed_ctrl = true;
+                break;
+            }
+        }
+        eprintln!("A05-6 组 4 自检(无主体对照):整块落地 {landed_ctrl}");
+        assert!(landed_ctrl, "无主体同布景须直接整块落地(证明走到了 Write)");
+    }
+    // ---- 组 5:复合体强制落地暂缓(退化逐格 Fallback 路径,R1-P6)----
+    // Fallback 的两个入口:「所有柱下方都没有实心」(drop = None)或「lift
+    // 上限内目标格全实心」。**站着**的主体脚下必有实心,而重叠格的柱就是
+    // 主体脚下的柱 ⇒ 静止布景下 Fallback+重叠不可构造。取 drop=None 分支 +
+    // **跳跃中的主体**(实测标定):主体起跳(第 3 拍离地,第 7 拍 y≈2.44
+    // 胶囊顶 ≈3.34)后挖空站位柱 (bx,1)、(bx,0)(柱一路空到世界底),同拍
+    // spawn 2 格竖条复合体骑在 (bx,2)、(bx,3)(与跳跃主体相交 ≈0.4;
+    // rapier 推挤一轮后复合体停在主体头顶,仍在 (bx,2)、(bx,3)——实测
+    // 位置 2.54→2.66 稳定)。强制落地 ⇒ 柱全空走 Fallback ⇒ 退化前判
+    // 重叠(读拍首形状表,主体顶 ≈3.3 与两格立方体都相交)⇒ 整体暂缓
+    // (计"落地暂缓")。主体下落回洞、离开重叠区 ⇒ 复合体退化逐格落地:
+    // 每柱都无底 ⇒ 全部格虚空消失(不写格)、实体删除、计 1 次退化。
+    // 主体随后掉出世界(虚空移除,判据外副作用,如实注明)。自检(对照组):
+    // 同一布景去掉主体(复合体柱全空)→ 直接退化落地。
+    {
+        let vbar = || {
+            CompoundShape::new(vec![
+                ShapeCell {
+                    offset: [0, 0, 0],
+                    block: BlockId(1),
+                },
+                ShapeCell {
+                    offset: [0, 1, 0],
+                    block: BlockId(1),
+                },
+            ])
+            .expect("2 格竖条合法")
+        };
+        let (mut s, a, base) = settled_agent();
+        let observers_fb = [Vec3::new(24.0, 3.0, 24.0)];
+        let bx = base.x.floor() as i32;
+        let bz = base.z.floor() as i32;
+        // 起跳(第 3 拍离地)。
+        s.apply_prefix(&[stamp(
+            2,
+            SimCommand::AgentIntent {
+                entity: a,
+                move_xz: (0.0, 0.0),
+                yaw: 0.0,
+                jump: true,
+            },
+        )]);
+        for _ in 0..7 {
+            sync_shape_table(&mut s, a);
+            let _ = production_tick(&mut s, &observers_fb);
+        }
+        let y_now = s.entity_state(a).expect("主体在").translation.y;
+        eprintln!("A05-6 组 5:第 7 拍主体 y = {y_now:.3}(布景自检:已离地)");
+        assert!(y_now > 2.1, "布景自检:主体须已离地(y = {y_now:.3})");
+        // 挖空站位柱 + 同拍 spawn 复合体骑 (bx,2)、(bx,3)。
+        s.apply_prefix(&[
+            stamp(
+                3,
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(bx, 1, bz),
+                    block: BlockId::AIR,
+                },
+            ),
+            stamp(
+                4,
+                SimCommand::SetBlock {
+                    pos: BlockPos::new(bx, 0, bz),
+                    block: BlockId::AIR,
+                },
+            ),
+            stamp(
+                5,
+                SimCommand::SpawnCompound {
+                    entity: EntityId::from_parts(1, 3),
+                    origin: BlockPos::new(bx, 2, bz),
+                    shape: vbar(),
+                    impulses: Vec::new(),
+                    velocity: (Vec3::ZERO, Vec3::ZERO),
+                },
+            ),
+        ]);
+        sync_shape_table(&mut s, a);
+        let _ = production_tick(&mut s, &observers_fb);
+        // 强制落地指令(同拍 lifecycle 判定)。
+        s.apply_forced_landing_directive(EntityId::from_parts(1, 3));
+        sync_shape_table(&mut s, a);
+        let out = production_tick(&mut s, &observers_fb);
+        let deferred_fb = out.cohesion_stats.forced_landing_deferred;
+        let still_entity_fb = s.entity_state(EntityId::from_parts(1, 3)).is_some();
+        eprintln!("A05-6 组 5(复合体退化逐格暂缓):计数 {deferred_fb},仍实体 {still_entity_fb}");
+        assert!(
+            deferred_fb >= 1,
+            "退化路径任一格与主体重叠 ⇒ 落地暂缓 +1(计数 {deferred_fb})"
+        );
+        assert!(still_entity_fb, "暂缓期间复合体保持为实体");
+        // 主体下落回洞、离开重叠区 ⇒ 复合体退化逐格落地:全部柱无底 ⇒
+        // 格虚空消失(不写格)、实体删除、计 1 次退化。主体随后掉出世界
+        // (虚空移除,判据外副作用,如实注明)——循环只跑到复合体落地。
+        let mut landed_fb = false;
+        let mut fallbacks = 0u64;
+        for _ in 0..600 {
+            sync_shape_table(&mut s, a);
+            let out = production_tick(&mut s, &observers_fb);
+            fallbacks += out.cohesion_stats.forced_landing_fallbacks;
+            if s.entity_state(EntityId::from_parts(1, 3)).is_none() {
+                landed_fb = true;
+                break;
+            }
+        }
+        eprintln!("A05-6 组 5(主体离开重叠区):退化落地 {landed_fb},退化计数 {fallbacks}");
+        assert!(landed_fb, "主体离开重叠区后复合体逐格退化落地(实体消失)");
+        assert_eq!(fallbacks, 1, "整块退化一次计 1");
+        // 布景自检(对照组):同一布景去掉主体(复合体柱全空)→ 直接退化
+        // 落地,证明走到了 Fallback 分支。
+        let mut s2 = walker_sim();
+        load_flat_ground(&mut s2);
+        let v2f = EntityId::from_parts(1, 3);
+        s2.write_voxel_for_test(BlockPos::new(24, 1, 24), BlockId::AIR);
+        s2.write_voxel_for_test(BlockPos::new(24, 0, 24), BlockId::AIR);
+        s2.apply_prefix(&[stamp(
+            2,
+            SimCommand::SpawnCompound {
+                entity: v2f,
+                origin: BlockPos::new(24, 2, 24),
+                shape: vbar(),
+                impulses: Vec::new(),
+                velocity: (Vec3::ZERO, Vec3::ZERO),
+            },
+        )]);
+        let _ = production_tick(&mut s2, &[Vec3::new(24.0, 3.0, 24.0)]);
+        s2.apply_forced_landing_directive(v2f);
+        let mut landed_ctrl_fb = false;
+        for _ in 0..120 {
+            let out = production_tick(&mut s2, &[Vec3::new(24.0, 3.0, 24.0)]);
+            if out.cohesion_stats.forced_landing_fallbacks >= 1 && s2.entity_state(v2f).is_none() {
+                landed_ctrl_fb = true;
+                break;
+            }
+        }
+        eprintln!(
+            "A05-6 组 5 自检(无主体对照):退化落地 {landed_ctrl_fb}(forced_landing_fallbacks 计 1)"
+        );
+        assert!(
+            landed_ctrl_fb,
+            "无主体同布景须直接退化落地(fallbacks 计 1,证明走到了 Fallback)"
+        );
+    }
 }
 
 // ── A05-7:跨分片一致(Session 层;调度器自动下发形状表)────────────────
+
+/// R1-P1 新测试:暂缓补写时序(§6"每拍开始、表到位之后、本拍命令之前")。
+/// Session 层、2 分片(调度器自动汇总下发形状表——生产同一条 worker 序):
+/// 主体站 (40,1,40);拍 N 对该格写石(重叠 → 暂缓);拍 N+1 移除主体;
+/// 拍 N+2 对同格写泥土——补写(表已无主体)先于命令执行,泥土在补写之后
+/// 判定:格已落石不重叠、泥土直接写入,**同格以最后一条为准**(终态 =
+/// 泥土)。旧序(补写在 step 开头)会让泥土先直写、补写又把旧石盖回去,
+/// 终态 = 石。变异 V15(补写放回命令之后)即红。
+#[test]
+fn a05_1b_flush_precedes_commands_latest_write_wins() {
+    let mut session = four_shard_session();
+    let a = EntityId::from_parts(0, 1);
+    let owner = shard_id(0, 0);
+    session
+        .spawn_agent(
+            owner,
+            a,
+            capsule_hash(),
+            EntityState {
+                translation: Vec3::new(40.0, 1.95, 40.0),
+                ..EntityState::default()
+            },
+        )
+        .expect("生成");
+    for _ in 0..30 {
+        session.tick();
+    }
+    let p = BlockPos::new(40, 1, 40);
+    let owner_chunk = p.chunk_of();
+    session.set_block(owner, p, BlockId(1)).expect("写石");
+    session.tick();
+    assert_eq!(
+        session.deferred_set_block_total(),
+        1,
+        "布景自检:石与主体重叠,已暂缓"
+    );
+    // 移除主体(本拍生效);下一拍表里没有它 → 拍首补写。
+    session
+        .send(owner, SimCommand::RemoveEntity { entity: a })
+        .expect("移除");
+    session.tick();
+    assert!(!session.is_agent(a), "布景自检:主体已移除");
+    // 补写拍:同格写泥土。逐拍断言:补写拍的同一格里,补写(石)与新命令
+    // (泥土)同拍到达时,终态 = 泥土(最后一条);同拍对该格至多两条写入
+    // (石 + 泥土各一条,分属两次语义),但任何后续拍不得再写该格。
+    session.set_block(owner, p, BlockId(2)).expect("写泥土");
+    let mut cell = session
+        .voxel_chunk(owner, owner_chunk)
+        .map(|c| {
+            c.get(
+                (p.x - owner_chunk.block_min().x) as usize,
+                (p.y - types::WORLD_Y_MIN) as usize,
+                (p.z - owner_chunk.block_min().z) as usize,
+            )
+        })
+        .expect("owner chunk 已装载");
+    let mut writes_on_p = 0usize;
+    for _ in 0..4 {
+        session.tick();
+        let writes = session.take_block_updates();
+        writes_on_p += writes
+            .iter()
+            .filter(|(sid, wp, _)| *sid == owner && *wp == p)
+            .count();
+        cell = session
+            .voxel_chunk(owner, owner_chunk)
+            .map(|c| {
+                c.get(
+                    (p.x - owner_chunk.block_min().x) as usize,
+                    (p.y - types::WORLD_Y_MIN) as usize,
+                    (p.z - owner_chunk.block_min().z) as usize,
+                )
+            })
+            .expect("owner chunk 已装载");
+    }
+    eprintln!("A05-1b 终态 cell={cell:?} 该格写入总条数 {writes_on_p}");
+    assert_eq!(
+        cell,
+        BlockId(2),
+        "同格以最后一条为准:终态 = 泥土(被旧石盖回 = 补写时序错)"
+    );
+    assert_eq!(
+        writes_on_p, 2,
+        "该格写入恰好两条:补写的石 + 新命令的泥土(旧序会多出一条同拍重复)"
+    );
+}
 
 fn four_shard_session() -> Session {
     let mut session = Session::new(SessionConfig {
