@@ -395,30 +395,39 @@ async fn a06_4_player_respawn_and_auto_possess() {
     }
     advance_ticks(10).await;
 
-    // 走进洞:逐拍发意图 (0, −4.3)(−z 方向),直到掉落(主体流里不见该
-    // 身体或 y 下降明显)。4.5 m ≈ 30 拍 + 落洞。
+    // 走进洞:逐拍发意图 (0, −4.3)(−z 方向),直到掉落(y 明显下降)。
+    // 4.5 m ≈ 30 拍 + 落洞。采样按 10 拍窗口(CI 高负载下逐拍收帧的
+    // drained 预算不稳:窗口内帧数 ≥ AgentStates cadence,排干必有所获;
+    // 逐拍口径本地过、CI 挂——见 REQ-012 A03 "在线帧 tick=状态拍+1" 同款
+    // 时序抖动)。意图逐拍发不受窗口影响(每拍一条照发)。
     let mut fell = false;
     let mut last_seen: Option<Vec3> = None;
-    for _ in 0..400 {
-        a.send(&C2S::AgentIntent {
-            entity: body,
-            move_xz: (0.0, -4.3),
-            yaw: 0.0,
-            jump: false,
-        })
-        .await
-        .expect("走向洞");
-        advance_ticks(1).await;
-        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
-            if p.y < last_seen.map_or(p.y, |q| q.y) - 0.05 {
-                // y 明显下降 = 落洞(洞深 4 m;顶面 −60,胶囊悬空下坠)。
-                fell = true;
-                break;
-            }
-            last_seen = Some(p);
+    for _ in 0..40 {
+        // 窗口 10 拍:逐拍发意图(在途窗口被拒 = 布景预期)。
+        for _ in 0..10 {
+            a.send(&C2S::AgentIntent {
+                entity: body,
+                move_xz: (0.0, -4.3),
+                yaw: 0.0,
+                jump: false,
+            })
+            .await
+            .expect("走向洞");
+            advance_ticks(1).await;
         }
-        // 主体流里消失(已掉出视距/移除;虚空移除要 ~100+ 拍才发生,洞深
-        // 4 m 的下落不该消失——继续等;400 拍预算足够判 fell)。
+        // 窗口末收帧:y 较上次采样明显下降 = 落洞(洞深 4 m;顶面 −60,
+        // 胶囊悬空下坠;10 拍自由落体 ≈ 0.9 m ≫ 0.05 阈)。
+        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
+            match last_seen {
+                None => last_seen = Some(p),
+                Some(q) => {
+                    if p.y < q.y - 0.05 {
+                        fell = true;
+                        break;
+                    }
+                }
+            }
+        }
     }
     if !fell {
         // 兜底:最后采样显著低于站立高度(−59.1)即视为落洞。
@@ -747,24 +756,31 @@ async fn a06_6_replay_includes_respawn_actions() {
         }
     }
     advance_ticks(10).await;
+    // 走洞采样同 a06_4:10 拍窗口(CI 逐拍收帧不稳)。
     let mut fell = false;
     let mut last_seen: Option<Vec3> = None;
-    for _ in 0..400 {
-        a.send(&C2S::AgentIntent {
-            entity: body,
-            move_xz: (0.0, -4.3),
-            yaw: 0.0,
-            jump: false,
-        })
-        .await
-        .expect("走向洞");
-        advance_ticks(1).await;
+    for _ in 0..40 {
+        for _ in 0..10 {
+            a.send(&C2S::AgentIntent {
+                entity: body,
+                move_xz: (0.0, -4.3),
+                yaw: 0.0,
+                jump: false,
+            })
+            .await
+            .expect("走向洞");
+            advance_ticks(1).await;
+        }
         if let Some(p) = agent_pose_drained(&mut rxa, body).await {
-            if p.y < last_seen.map_or(p.y, |q| q.y) - 0.05 {
-                fell = true;
-                break;
+            match last_seen {
+                None => last_seen = Some(p),
+                Some(q) => {
+                    if p.y < q.y - 0.05 {
+                        fell = true;
+                        break;
+                    }
+                }
             }
-            last_seen = Some(p);
         }
     }
     assert!(
