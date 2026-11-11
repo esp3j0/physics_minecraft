@@ -1048,13 +1048,11 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
     }
 
     // 身体**用意图走远**(附身中观察者被服务器跟随拉回身体旁,MoveObserver
-    // 会被覆写):+x 走 90 拍 × 4.3 m/s ≈ 90 拍 ≈ 6.4 m 不够——逐拍发意图
-    // 连走 300 拍 ≈ 21 m,足够走出默认 data_unload_radius(48 m)+ 出生点
-    // chunk(0,0) 之外?不够。改为**分批长走**:总共 700 拍 ≈ 50 m。
-    // (卸载圈以观察者锚 = 身体位置为圆心 48 m;出生点 (8.5,·,8.5) 距身体
-    // > 48 m 即出圈。)
-    let mut cur = Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5);
-    for _ in 0..900 {
+    // 会被覆写):逐拍发意图 +x,固定走 700 拍(虚拟时钟下 60 拍/s × 4.3
+    // m/s ≈ 50 m;**不依赖下行帧采样**——CI 帧投递时序不可判是 R1/R2/R3
+    // 的既证结论)。行走距离按拍数解析推算(末速见 eprintln 的本地标定):
+    // 出生点 (8.5,·,8.5) 距身体 > 48 m(默认 data_unload_radius)即出卸载圈。
+    for _ in 0..700 {
         a.send(&C2S::AgentIntent {
             entity: body,
             move_xz: (4.3, 0.0),
@@ -1064,18 +1062,9 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
         .await
         .expect("走远");
         advance_ticks(1).await;
-        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
-            cur = p;
-        }
-        // 走够 56 m(48 m 卸载圈 + 8 m 裕量)即停。
-        if cur.x > 8.5 + 56.0 {
-            break;
-        }
     }
-    // 再给卸载决策与冷却留拍数(数据预算逐拍装卸)。
-    advance_ticks(600).await;
-
-    // 先发零意图停住身体(残留意图会让它走过洞口)。
+    // 发零意图停住(刹车 ~120 拍,a03 系"先 settle 等刹车"同款),再给卸载
+    // 决策与冷却留拍数(数据预算逐拍装卸)。
     a.send(&C2S::AgentIntent {
         entity: body,
         move_xz: (0.0, 0.0),
@@ -1084,13 +1073,17 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
     })
     .await
     .expect("停住");
-    advance_ticks(20).await;
-    let cur = agent_pose_drained(&mut rxa, body)
-        .await
-        .expect("身体位置可采样");
-    // 挖穿身体脚下(x/z 各 2 格,同洞宽口径;以停稳位置为准)。
-    let bx = cur.x as i32;
-    let bz = cur.z as i32;
+    advance_ticks(120).await;
+    advance_ticks(600).await;
+
+    // 洞挖在**固定坐标**(身体解析行程 ≈ 700 × 4.3/60 ≈ 50 m → 停在
+    // x ≈ 58;挖 x=56..58、z=8..9 整列 AIR——身体停稳点落在洞上,零意图
+    // 后不再移动)。世界底全深挖穿,身体悬空掉虚空。
+    // 停稳位置解析推算:700 拍 × 4.3/60 ≈ 50.2 m + 刹车滑行 → x ≈ 59.6
+    // (本地实测 59.64;CI 同虚拟时钟,拍数即距离)。洞挖 x=58..60、
+    // z=8..9 整列 AIR,覆盖停稳格。
+    let bx = 58_i32;
+    let bz = 8_i32;
     let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
     for x in [bx, bx + 1] {
         for z in [bz, bz + 1] {
