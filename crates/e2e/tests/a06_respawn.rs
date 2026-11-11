@@ -61,7 +61,8 @@ async fn next_frame(rx: &mut mpsc::UnboundedReceiver<S2C>) -> Option<S2C> {
     tokio::time::timeout(SOFT, rx.recv()).await.ok().flatten()
 }
 
-fn real_yield() {
+async fn real_yield() {
+    tokio::task::yield_now().await;
     std::thread::sleep(Duration::from_millis(1));
 }
 
@@ -152,7 +153,7 @@ async fn spawn_agent_expect(
         match next_frame(rx).await {
             Some(S2C::Spawned { entity }) => return entity,
             Some(_) => continue,
-            None => real_yield(),
+            None => real_yield().await,
         }
     }
     panic!("生成回执未到")
@@ -172,7 +173,7 @@ async fn possess_expect(
         match next_frame(rx).await {
             Some(S2C::Possessed { entity: Some(x) }) if x == entity => return,
             Some(_) => continue,
-            None => real_yield(),
+            None => real_yield().await,
         }
     }
     panic!("附身回执未到")
@@ -191,6 +192,10 @@ async fn agent_pose_drained(rx: &mut mpsc::UnboundedReceiver<S2C>, id: EntityId)
     while rx.try_recv().is_ok() {}
     let mut last = None;
     for _ in 0..50 {
+        // start_paused 虚拟时钟的 timeout 不耗真实时间,服务器任务要在
+        // 真实 CPU 窗口里才能投帧(a03 系 real_yield 同款);无 real_yield
+        // 时 CI 单核 runner 上 50 次 timeout 瞬时烧完,一次帧都等不到。
+        real_yield().await;
         match next_frame(rx).await {
             Some(S2C::AgentStates { states, .. }) => {
                 if let Some((_, _, poses)) = states.iter().find(|(e, ..)| *e == id)
