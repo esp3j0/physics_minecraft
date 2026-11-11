@@ -615,26 +615,26 @@ fn forward_commands(commands: &[EngineCommand], control: &crate::client::Control
     control.command_batch(batch);
 }
 
-/// Spawned 回执摘流(A06 §4):`inflight` = 在途 SpawnAgent 请求数,**按
-/// 请求顺序**与回执一一对应——头部 `inflight` 条回执归主体,其余归普通
-/// 方块 Spawn。返回 (主体回执, 方块回执, 剩余在途)。方块先落地、主体
-/// 后生成的错序帧也逐条对齐(多退少不补)。
-fn split_agent_receipts(
-    all_spawned: &[EntityId],
-    inflight: usize,
-) -> (Vec<EntityId>, Vec<EntityId>, usize) {
-    let mut agent_spawned = Vec::new();
-    let mut plain_spawned = Vec::new();
-    let mut remaining = inflight;
-    for &id in all_spawned {
-        if remaining > 0 {
-            remaining -= 1;
-            agent_spawned.push(id);
-        } else {
-            plain_spawned.push(id);
+/// 附身状态机命令 → `control.*` 调用(R1 §3.2 统一出口:P/意图/on_agents
+/// 三处都经它转发)。`intent_target` = 意图的目标实体(状态机当前附身;
+/// Intent 只在 possessed 相位产出,调用方从状态机取)。
+fn forward_possess_command(
+    command: PossessCommand,
+    intent_target: Option<EntityId>,
+    control: &crate::client::ControlHandle,
+) {
+    match command {
+        PossessCommand::SpawnAgent { position, yaw } => {
+            control.spawn_agent("capsule".to_owned(), position, yaw);
+        }
+        PossessCommand::Possess(entity) => control.possess(entity),
+        PossessCommand::Unpossess => control.unpossess(),
+        PossessCommand::Intent { move_xz, yaw, jump } => {
+            if let Some(entity) = intent_target {
+                control.agent_intent(entity, move_xz, yaw, jump);
+            }
         }
     }
-    (agent_spawned, plain_spawned, remaining)
 }
 
 /// 脚本模式观察者上报:耦合开启时,相机较上次上报变化超过 1 m 立即上报,
@@ -693,11 +693,6 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
     let mut finished = false;
     let mut coupled = true;
     let mut last_sent: Option<(macroquad::math::Vec3, Instant)> = None;
-    // A06:脚本模式的主体回执跟踪——SpawnAgent 命令在途计数(发送层逐条
-    // 单发;回执按请求顺序从 spawned 总流摘出)。一场景最多一个 spawn_agent,
-    // 计数非零期间的 Spawned 回执即主体回执。
-    let mut agent_spawn_inflight: usize = 0;
-    let mut agent_spawned_receipts: Vec<EntityId> = Vec::new();
     // A06:身体形状表(启动时读 assets/bodies);未知哈希画占位盒。
     let mut body_table = BodyShapeTable::from_dir(std::path::Path::new("assets/bodies"));
 
@@ -726,29 +721,16 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
         // 推进引擎(结束后不再推进):输出相机/耦合/命令/截图请求/步骤记录。
         let mut frame_shot: Option<ScreenshotRequest> = None;
         if let (false, Some(e)) = (finished, engine.as_mut()) {
-            // A06:回执摘流——在途 SpawnAgent 请求期间到达的 Spawned 回执
-            // 归主体(agent_spawned),其余归普通 spawn。一场景最多一个
-            // spawn_agent(解析期限),摘流口径与请求顺序一致。
-            let all_spawned = world.state.take_spawned();
-            let (agent_spawned, spawned, inflight_left) =
-                split_agent_receipts(&all_spawned, agent_spawn_inflight);
-            agent_spawn_inflight = inflight_left;
-            agent_spawned_receipts.extend(agent_spawned);
+            // R1 §3.3:回执不再在渲染层摘流——引擎按自己记的请求顺序
+            // (spawn_requests 队列)消费全部 Spawned 回执。
+            let spawned = world.state.take_spawned();
             let input = FrameInput {
                 dt,
                 server_tick: world.state.tick(),
                 world: &world.state,
                 spawned: &spawned,
-                agent_spawned: &agent_spawned_receipts,
             };
             let output = e.frame(&input);
-            agent_spawned_receipts.clear();
-            // 在途计数在命令转发前刷新(本帧发的新请求,回执下一帧起摘)。
-            agent_spawn_inflight += output
-                .commands
-                .iter()
-                .filter(|c| matches!(c, EngineCommand::SpawnAgent { .. }))
-                .count();
             camera.set_from_pose(&output.camera);
             // A06 §4:possess follow = true 时切第三人称相机(follow = false
             // 相机不动,截图机位确定)。
@@ -817,14 +799,25 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
             world.draw_entity(*id, pose);
         }
         // 主体(A06 §1):脚本模式同样逐连杆画(直接取最新,不插值);未知
-        // 哈希占位盒 + 计数,与交互模式同一口径。
-        for (_id, (hash, poses)) in world.state.live_agents() {
+        // 哈希占位盒 + 计数,与交互模式同一口径。附身中的主体用高亮色
+        // (R1:脚本 possess 后引擎输出的 possessed ID 也上色——放行审图
+        // 发现"脚本模式附身胶囊仍品红、expect 写高亮色",两者对齐)。
+        for (id, (hash, poses)) in world.state.live_agents() {
             let known = body_table.get(&hash).is_some();
             if !known {
                 body_table.note_unknown();
             }
             let shapes = body_table.get(&hash);
-            draw_agent(shapes, poses, AGENT_COLOR);
+            let possessed_now = engine
+                .as_ref()
+                .map(|e| e.possessed_id() == Some(id))
+                .unwrap_or(false);
+            let color = if possessed_now {
+                POSSESSED_AGENT_COLOR
+            } else {
+                AGENT_COLOR
+            };
+            draw_agent(shapes, poses, color);
         }
         set_default_camera();
 
@@ -951,7 +944,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     full,
                 } => {
                     let ids: Vec<EntityId> = states.iter().map(|(id, ..)| *id).collect();
-                    possess_state.observe_agents(&ids, &removed);
+                    let intent_target = possess_state.possessed();
+                    for command in possess_state.on_agents(&ids, &removed) {
+                        forward_possess_command(command, intent_target, &control);
+                    }
                     world.apply(ViewEvent::Agents {
                         tick,
                         states,
@@ -962,22 +958,16 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                 ViewEvent::Possessed { entity } => {
                     possess_state.on_possessed(entity);
                 }
+                ViewEvent::Spawned { entity } => {
+                    // R1 §3.2:回执进去重窗口;归属判定在 on_agents(回执 +
+                    // 主体流两个证据凑齐)。
+                    possess_state.on_spawned(entity);
+                    world.apply(ViewEvent::Spawned { entity });
+                }
                 other => world.apply(other),
             }
         }
         world.sync();
-
-        // A06:Spawned 回执消费(与生成请求按序对应)。自动附身候选 =
-        // 主体表最新 ID(一连接一身体,D1——主体表唯一主体即自己的;
-        // try_auto_possess 有 pending 门闩,只在 P 生成后的窗口消费一次)。
-        let receipts = world.state.take_spawned().len();
-        for _ in 0..receipts {
-            possess_state.on_spawn_receipt();
-        }
-        let candidate = world.state.live_agents().last().map(|(id, _)| *id);
-        if let Some(id) = possess_state.try_auto_possess(candidate) {
-            control.possess(id);
-        }
 
         // W04:交互模式订阅调试遥测(连上即发一次;脚本模式不订阅)。
         if !subscribed {
@@ -1051,9 +1041,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             }
             // P 键(按下沿):状态机出命令(SpawnAgent/Possess/Unpossess)。
             if is_key_pressed(KeyCode::P) {
-                // 生成目标(未附身且没有身体时用):屏幕中心拾取的地面格
-                // 顶面上方 1 m(格顶面 + 0.9 胶囊半高 → 站立;拾取无命中
-                // → 不生成,提示)。
+                // 生成目标(NoBody 相位用):屏幕中心拾取的地面格顶面上方
+                // 1 m(格顶面 + 0.9 胶囊半高 → 站立;拾取无命中 → 不生成,
+                // 提示)。
                 let spawn_target = target.as_ref().map(|hit| {
                     let top = hit.block_pos;
                     let px = top.x as f32 + 0.5;
@@ -1061,25 +1051,14 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     let pz = top.z as f32 + 0.5;
                     (types::glam::Vec3::new(px, py, pz), camera.yaw.to_degrees())
                 });
-                // 未附身时的"我的身体":主体表唯一主体(一连接一身体,D1;
-                // 重生场景服务器自动附身,这里覆盖手动 P 附身)。
-                let self_agent = world.state.live_agents().last().map(|(id, _)| *id);
-                let commands = possess_state.frame(
-                    true,
-                    &Keys::default(),
-                    camera.yaw.to_degrees(),
-                    spawn_target,
-                    self_agent,
-                );
+                // R1 §3.2:自己的身体由状态机按"回执 + 主体流"归属,这里
+                // 不再喂"主体表 ID 最大的"。
+                #[allow(clippy::disallowed_methods)] // 墙钟(P 按下沿时刻;渲染侧授权)
+                let now = Instant::now();
+                let commands = possess_state.on_p_pressed(spawn_target, now);
+                let intent_target = possess_state.possessed();
                 for command in commands {
-                    match command {
-                        PossessCommand::SpawnAgent { position, yaw } => {
-                            control.spawn_agent("capsule".to_owned(), position, yaw);
-                        }
-                        PossessCommand::Possess(entity) => control.possess(entity),
-                        PossessCommand::Unpossess => control.unpossess(),
-                        PossessCommand::Intent { .. } => {}
-                    }
+                    forward_possess_command(command, intent_target, &control);
                 }
             }
             // 附身时的 WASD 意图(每帧喂状态机;节流/变化检测在状态机里)。
@@ -1092,16 +1071,18 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     shift: is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift),
                     jump_down: is_key_down(KeyCode::Space),
                 };
-                let commands =
-                    possess_state.frame(false, &keys, camera.yaw.to_degrees(), None, None);
-                for command in commands {
-                    if let PossessCommand::Intent { move_xz, yaw, jump } = command
-                        && let Some(entity) = possess_state.possessed()
-                    {
-                        control.agent_intent(entity, move_xz, yaw, jump);
-                    }
+                #[allow(clippy::disallowed_methods)] // 墙钟(意图节流;渲染侧授权)
+                let now = Instant::now();
+                let intent_target = possess_state.possessed();
+                for command in possess_state.on_keys(&keys, camera.yaw.to_degrees(), now) {
+                    forward_possess_command(command, intent_target, &control);
                 }
             }
+            // 请求等待超时(每帧推进;SpawnRequested/PossessRequested 2 s
+            // 无回应回退相位)。
+            #[allow(clippy::disallowed_methods)] // 墙钟(请求超时;渲染侧授权)
+            let now = Instant::now();
+            possess_state.tick(now);
         }
         // —— REQ-011 W01 工具按键(仅交互模式;鼠标释放(M)时左右键不
         //   触发,避免点 HUD 误拆;断连后不发命令)——
@@ -1277,8 +1258,13 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
 
         // —— 3D 场景 ——
         clear_background(SKYBLUE);
-        // A06:附身时用第三人称相机(看向身体根位置上方 0.6 m,后方当前
-        // 距离处,抬高按 pitch;主体 yaw = 相机水平朝向——意图已带)。
+        // A06/R1 §3.4:附身时每帧把第三人称位姿**写回 FlyCamera**——
+        // `possessed_camera_position`(纯函数,MUT15 测试锚)算出相机位置;
+        // `third_person_camera` 的视线方向就是 `FlyCamera::forward()`,所以
+        // `to_camera()` 画出来的画面与单独构造 `Camera3D` 一样;退出附身时
+        // 飞行相机自然从当前位置继续,拾取射线也从当前相机位置发出。
+        // 附身期间不调 `camera.update(dt)`(不让 WASD 平移相机),只用鼠标
+        // 改 yaw/pitch。
         let possessed_id = possess_state.possessed();
         let mut possessed_root: Option<types::glam::Vec3> = None;
         if let Some(id) = possessed_id
@@ -1288,24 +1274,15 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             possessed_root = Some(pose.translation);
         }
         if let Some(root) = possessed_root {
-            let (pos, look) = possess::third_person_camera(
+            let pos = possess::possessed_camera_position(
                 root,
                 camera.yaw.to_degrees(),
                 camera.pitch.to_degrees(),
                 possess_state.camera_dist(),
             );
-            let cam = Camera3D {
-                position: vec3(pos.x, pos.y, pos.z),
-                target: vec3(look.x, look.y, look.z),
-                up: macroquad::math::Vec3::Y,
-                fovy: 70.0_f32.to_radians(),
-                projection: Projection::Perspective,
-                ..Camera3D::default()
-            };
-            set_camera(&cam);
-        } else {
-            set_camera(&camera.to_camera());
+            camera.position = vec3(pos.x, pos.y, pos.z);
         }
+        set_camera(&camera.to_camera());
         for mesh in world.meshes.values() {
             draw_mesh(mesh);
         }
@@ -1388,8 +1365,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     )
                 }
                 _ => {
-                    let waiting = if possess_state.auto_possess_pending() {
+                    let waiting = if possess_state.phase() == possess::Phase::SpawnRequested {
                         " (waiting spawn...)"
+                    } else if possess_state.phase() == possess::Phase::PossessRequested {
+                        " (waiting possess...)"
                     } else {
                         ""
                     };
@@ -1715,32 +1694,5 @@ mod tests {
             "单格 desc 仍为默认(逐位不变)"
         );
         assert!(rx.try_recv().is_err(), "通道应已收干(恰好 4 条消息)");
-    }
-
-    /// Spawned 回执摘流(A06):头部 inflight 条归主体、其余归方块;错序帧
-    /// (方块回执先到)逐条对齐;在途耗尽后其余全部归方块。
-    ///
-    /// 会变红的实现:摘流不看在途计数(全部归主体——方块回执被吞,spawn
-    /// 等待超时);或按"最后一条归主体"(错序帧错位)。
-    #[test]
-    fn split_agent_receipts_splits_by_inflight_order() {
-        let a = EntityId::from_parts(0, 1);
-        let b = EntityId::from_parts(0, 2);
-        let c = EntityId::from_parts(0, 3);
-        // 主体请求 1 条在途;同帧回执 3 条(1 主体 + 2 方块)。
-        let (agent, plain, left) = split_agent_receipts(&[a, b, c], 1);
-        assert_eq!(agent, vec![a], "头部 1 条归主体");
-        assert_eq!(plain, vec![b, c], "其余归方块");
-        assert_eq!(left, 0, "在途耗尽");
-        // 在途 2 条、回执只有 1 条(主体回执下一帧才到):全部归主体,余 1。
-        let (agent, plain, left) = split_agent_receipts(&[b], 2);
-        assert_eq!(agent, vec![b]);
-        assert!(plain.is_empty());
-        assert_eq!(left, 1, "未摘满在途保留");
-        // 零在途:全部归方块。
-        let (agent, plain, left) = split_agent_receipts(&[a, c], 0);
-        assert!(agent.is_empty());
-        assert_eq!(plain, vec![a, c]);
-        assert_eq!(left, 0);
     }
 }

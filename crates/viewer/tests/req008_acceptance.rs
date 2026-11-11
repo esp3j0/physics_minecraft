@@ -80,7 +80,6 @@ fn frame(e: &mut Engine, dt: f32, tick: u64, world: &World, spawned: &[EntityId]
         server_tick: tick,
         world,
         spawned,
-        agent_spawned: &[],
     })
 }
 
@@ -1078,7 +1077,6 @@ mod unit02 {
             server_tick: 40,
             world,
             spawned: &[],
-            agent_spawned: &[],
         });
         for r in &out.finished {
             m.push(r, world);

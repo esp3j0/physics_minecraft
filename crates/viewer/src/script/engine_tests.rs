@@ -97,7 +97,6 @@ fn frame(
         server_tick: tick,
         world,
         spawned,
-        agent_spawned: &[],
     })
 }
 
@@ -736,7 +735,7 @@ spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
     assert!(out.finished.is_empty(), "回执未到不结束");
     // 帧 2:回执到达 → 登记 + 结束。
     let _ = frame(&mut e, 0.016, 1, &w, &[]);
-    // agent_spawned 走专门通道,这里通过 agent_receipts_frame 喂。
+    // 回执走统一 spawned 总流(引擎按请求队列归属)。
     let out = {
         let mut o = crate::script::FrameOutput {
             camera: start_pose(),
@@ -751,8 +750,7 @@ spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
             dt: 0.016,
             server_tick: 1,
             world: &w,
-            spawned: &[],
-            agent_spawned: &[eid(7)],
+            spawned: &[eid(7)],
         })
     };
     assert_eq!(out.finished.len(), 1, "回执到 → 当帧结束");
@@ -783,7 +781,6 @@ check = { agent_alive = { label = \"p\" }, agent_in = { label = \"p\", from = [5
         server_tick: 0,
         world: &w,
         spawned: &[],
-        agent_spawned: &[],
     });
     assert_eq!(out.commands.len(), 1);
     // 帧 2:回执 → spawn_agent 结束;possess/intent/mark_agent 等即时步骤
@@ -795,8 +792,7 @@ check = { agent_alive = { label = \"p\" }, agent_in = { label = \"p\", from = [5
         dt: 0.016,
         server_tick: 1,
         world: &w,
-        spawned: &[],
-        agent_spawned: &[eid(7)],
+        spawned: &[eid(7)],
     });
     let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
     assert!(actions.contains(&"spawn_agent"), "{actions:?}");
@@ -858,7 +854,6 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 10 }",
         server_tick: 0,
         world: &w0,
         spawned: &[],
-        agent_spawned: &[],
     });
     // 帧 1:回执 → spawn_agent 结束;即时步骤(possess/mark_agent/check/
     // wait_until)同帧连推。世界带主体,mark 位置 (8.0,-57,24)。
@@ -868,8 +863,7 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 10 }",
         dt: 0.016,
         server_tick: 1,
         world: &w,
-        spawned: &[],
-        agent_spawned: &[eid(7)],
+        spawned: &[eid(7)],
     });
     let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
     assert!(
@@ -913,7 +907,6 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 5 }",
         server_tick: 0,
         world: &w,
         spawned: &[],
-        agent_spawned: &[],
     });
     // 帧 1:回执登记;世界带主体(possess 的可见判据成立,当帧发命令),
     // 但 wait_until 的 agent_alive 查的是"当前场景末步"……主体在 → 成立?
@@ -926,8 +919,7 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 5 }",
         dt: 0.016,
         server_tick: 1,
         world: &w,
-        spawned: &[],
-        agent_spawned: &[eid(7)],
+        spawned: &[eid(7)],
     });
     let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
     assert!(actions.contains(&"spawn_agent"), "{actions:?}");
@@ -946,7 +938,6 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 5 }",
             server_tick: tick,
             world: &w,
             spawned: &[],
-            agent_spawned: &[],
         });
         assert!(out.finished.is_empty(), "拍 {tick} 仍应等待");
         tick += 1;
@@ -958,7 +949,6 @@ wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 5 }",
         server_tick: 6,
         world: &w3,
         spawned: &[],
-        agent_spawned: &[],
     });
     let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
     assert!(
@@ -987,7 +977,6 @@ unpossess = {}",
         server_tick: 0,
         world: &w,
         spawned: &[],
-        agent_spawned: &[],
     });
     // 帧 1:回执 → spawn_agent + possess + unpossess 全部即时推进
     // (possess 输出先 Some 后被 unpossess 清成 None——同帧终态)。
@@ -995,8 +984,7 @@ unpossess = {}",
         dt: 0.016,
         server_tick: 1,
         world: &w,
-        spawned: &[],
-        agent_spawned: &[eid(3)],
+        spawned: &[eid(3)],
     });
     let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
     assert!(
@@ -1020,14 +1008,182 @@ possess = { label = \"p\", follow = true }",
         server_tick: 0,
         world: &w2,
         spawned: &[],
-        agent_spawned: &[],
     });
     let out = e2.frame(&FrameInput {
         dt: 0.016,
         server_tick: 1,
         world: &w2,
-        spawned: &[],
-        agent_spawned: &[eid(3)],
+        spawned: &[eid(3)],
     });
     assert_eq!(out.possess, Some((eid(3), true)), "follow = true 透传");
+}
+
+// ---------------------------------------------------------------------------
+// T7(R1 §3.3):引擎 spawn_requests 请求队列——回执按**发出顺序**归属,
+// spawn(count) 与 spawn_agent 混排不归错。
+// ---------------------------------------------------------------------------
+
+/// spawn(count = 2) → spawn_agent → spawn(count = 1):回执 4 条按序到达,
+/// 三个标签各自拿到正确的 ID。
+#[test]
+fn t7_receipts_follow_request_order() {
+    let mut e = engine(
+        "[[step]]
+spawn = { at = [0.0, -50.0, 0.0], count = 2, label = \"a\" }
+[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+spawn = { at = [20.0, -50.0, 0.0], count = 1, label = \"b\" }",
+    );
+    let w = FlatWorld::default();
+    // 帧 1:第一步 spawn(count = 2)与 spawn_agent 发命令(spawn 是等待步,
+    // 第二个 spawn 步要等回执才推进)。
+    let out = frame(&mut e, 0.016, 0, &w, &[]);
+    let spawns = out
+        .commands
+        .iter()
+        .filter(|c| matches!(c, crate::script::EngineCommand::Spawn { .. }))
+        .count();
+    let agents = out
+        .commands
+        .iter()
+        .filter(|c| matches!(c, crate::script::EngineCommand::SpawnAgent { .. }))
+        .count();
+    assert_eq!(spawns, 2, "第一步 spawn count = 2 当帧发出");
+    assert_eq!(agents, 0, "spawn_agent 要等 spawn 步结束(等待步串行)");
+    // 帧 2:方块回执 2 条按序到 → 第一个 spawn 步结束;spawn_agent 发命令
+    // (入队 Agent 槽位)。世界带主体。
+    let mut w2 = FlatWorld::with_entities(&[]);
+    w2.agent = Some((eid(9), Vec3::new(8.0, -57.0, 24.0)));
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w2,
+        spawned: &[eid(1), eid(2)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(
+        actions.iter().filter(|a| **a == "spawn").count() >= 1,
+        "第一个 spawn 步结束: {actions:?}"
+    );
+    assert_eq!(
+        out.commands
+            .iter()
+            .filter(|c| matches!(c, crate::script::EngineCommand::SpawnAgent { .. }))
+            .count(),
+        1,
+        "spawn_agent 在 spawn 结束后同帧发出"
+    );
+    // 帧 3:主体回执(9)→ spawn_agent 结束,第三个 spawn(count = 1)发命令。
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 2,
+        world: &w2,
+        spawned: &[eid(9)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(actions.contains(&"spawn_agent"), "{actions:?}");
+    assert_eq!(
+        out.commands
+            .iter()
+            .filter(|c| matches!(c, crate::script::EngineCommand::Spawn { .. }))
+            .count(),
+        1,
+        "第二个 spawn(count = 1)当帧发出"
+    );
+    // 帧 4:最后一条回执(方块 3)→ 第二个 spawn 步结束;possess 同帧连推。
+    // 主体标签归属用 possess 钉住:标签 p 的 ID 必须是 eid(9),不是方块。
+    let mut e2 = engine(
+        "[[step]]
+spawn = { at = [0.0, -50.0, 0.0], count = 2, label = \"a\" }
+[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+spawn = { at = [20.0, -50.0, 0.0], count = 1, label = \"b\" }
+[[step]]
+possess = { label = \"p\" }",
+    );
+    let _ = frame(&mut e2, 0.016, 0, &w, &[]);
+    let _ = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w2,
+        spawned: &[eid(1), eid(2)],
+    });
+    let _ = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 2,
+        world: &w2,
+        spawned: &[eid(9)],
+    });
+    let out = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 3,
+        world: &w2,
+        spawned: &[eid(3)],
+    });
+    assert_eq!(
+        out.possess,
+        Some((eid(9), false)),
+        "标签 p = eid(9)(队列 Agent 槽位),不是方块 eid(1/3)"
+    );
+}
+
+/// 顺序换成 spawn_agent 在前再测一组:**同帧两条回执一起到达,队列里
+/// 既有 Block 又有 Agent**——按队列归属(Agent 吃 9、Block 吃 1);
+/// "主体优先"变异(回执不按队列,第一条无条件归主体)会把先到的方块
+/// 吞给主体(possess 到 eid(1))。
+#[test]
+fn t7_receipts_agent_first_order() {
+    let mut e2 = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+spawn = { at = [0.0, -50.0, 0.0], count = 1, label = \"a\" }
+[[step]]
+possess = { label = \"p\" }",
+    );
+    let w = FlatWorld::default();
+    // 帧 1:spawn_agent 命令(队列:[Agent])。
+    let out = frame(&mut e2, 0.016, 0, &w, &[]);
+    assert_eq!(
+        out.commands
+            .iter()
+            .filter(|c| matches!(c, crate::script::EngineCommand::SpawnAgent { .. }))
+            .count(),
+        1,
+        "帧 1:spawn_agent 发命令"
+    );
+    // 帧 2:主体回执(9)→ Agent 出队、spawn_agent 结束;block spawn 发命令
+    // (队列:[Block count=1])。
+    let mut w2 = FlatWorld::with_entities(&[]);
+    w2.agent = Some((eid(9), Vec3::new(8.0, -57.0, 24.0)));
+    let out = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w2,
+        spawned: &[eid(9)],
+    });
+    assert_eq!(
+        out.commands
+            .iter()
+            .filter(|c| matches!(c, crate::script::EngineCommand::Spawn { .. }))
+            .count(),
+        1,
+        "方块 spawn 在 spawn_agent 结束后同帧发出"
+    );
+    // 帧 3:回执两条**一起**到达 [方块 1, 主体 2]。队列头 = Block →
+    // 1 归 Block;2 无槽位(一场景一 agent)忽略。possess(标签 p)= eid(9)
+    // (spawn 步本帧结束,possess 同帧连推,输出在本帧)。
+    let out = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 2,
+        world: &w2,
+        spawned: &[eid(1), eid(2)],
+    });
+    assert_eq!(
+        out.possess,
+        Some((eid(9), false)),
+        "possess 附身的是队列里 Agent 槽位的 eid(9),不是先到的方块 eid(1)"
+    );
 }

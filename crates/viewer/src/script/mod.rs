@@ -278,12 +278,10 @@ pub struct FrameInput<'a> {
     /// viewer 收到的最新服务器拍号。
     pub server_tick: u64,
     pub world: &'a dyn WorldQuery,
-    /// 自上一帧以来收到的 `Spawned` 回执(按到达顺序)。
+    /// 自上一帧以来收到的 `Spawned` 回执(按到达顺序)。引擎按**自己记的
+    /// 请求顺序**消费(R1 §3.3:`spawn_requests` 队列)——方块 `spawn` 与
+    /// `spawn_agent` 都会收到回执,归属由引擎入队顺序决定。
     pub spawned: &'a [EntityId],
-    /// 自上一帧以来收到的、属于 `spawn_agent` 请求的 `Spawned` 回执
-    /// (A06 §4;渲染层按请求顺序从总回执里摘出——SendAgentAgent 逐条
-    /// 不混批,一条 spawn_agent 恰一条回执;空 = 无主体回执)。
-    pub agent_spawned: &'a [EntityId],
 }
 
 /// 引擎要求渲染层发给服务器的命令。
@@ -430,6 +428,12 @@ impl Engine {
 
     pub fn status(&self) -> &EngineStatus {
         &self.status
+    }
+
+    /// 当前附身的主体 ID(渲染层上色用;R1:脚本 possess 后胶囊画高亮色,
+    /// 与交互模式同一口径——审图 expect 写"高亮色"就必须真的画高亮色)。
+    pub fn possessed_id(&self) -> Option<EntityId> {
+        self.inner.possessed_id()
     }
 
     /// 结束后的退出码(REQ-008 §4):0 = 全部完成且检查成立;1 = 有检查失败;

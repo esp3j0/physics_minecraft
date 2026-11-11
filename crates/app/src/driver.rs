@@ -790,23 +790,13 @@ pub struct ObserveOrchestrator {
     /// 观察者跟随簿记(连接 → 上次服务端设定观察者的位置):每拍身体位移
     /// 超 2 m 再移一次(§5;断线/解除附身即弃)。
     observer_follow: BTreeMap<messaging::InputSource, Vec3>,
-    /// 玩家出生点表(A06 §6"玩家回出生点"):连接 → 最近一次被接受的
-    /// `SpawnAgent` 的(位置, yaw, 身体名)。`handle_spawn_agent` 成功即覆盖
-    /// 写入;断线清掉。不进快照——重生动作走与网络请求同一条校验/日志路径,
-    /// 回放线由日志里的 SpawnAgent/Possess 自再生(D6 同款口径)。
-    agent_spawn_points: BTreeMap<messaging::InputSource, (Vec3, f32, String)>,
-    /// 玩家身体归属表(A06;主体 ID → 拥有连接):`handle_spawn_agent` 成功
-    /// 即插入;断线移除/虚空移除重生时清掉。虚空移除发生时内核已清 agents
-    /// 表、归属表也同步 release——靠本表反查"这是哪个连接的身体"。不进
-    /// 快照(回放线生成动作入日志,重新插表)。
-    player_bodies: BTreeMap<types::EntityId, messaging::InputSource>,
-    /// 重生待附身表(A06):连接 → 刚重生分配的实体 ID。生成命令下一拍
-    /// 才在内核生效(apply_at = 拍号,分片收件箱),同拍归属表扫不到——
-    /// 待下一拍该实体出现在归属表再走 `handle_possess`(成功计
-    /// `player_respawned`;失败计 `player_respawn_failed`)。
-    pending_respawn_possess: BTreeMap<messaging::InputSource, types::EntityId>,
-    /// 待附身等待拍数(宽限 3 拍;A06 内部簿记)。
-    respawn_possess_wait: u32,
+    /// 玩家回出生点簿记(A06 R1):出生点表(连接 → 最近一次被接受的
+    /// `SpawnAgent`)、玩家身体归属表、重生待附身表三张表收进一个纯逻辑
+    /// 模块([`crate::respawn::RespawnBook`])。`handle_spawn_agent` 成功即
+    /// 覆盖写出生点;断线清整条连接。不进快照——重生动作走与网络请求同一
+    /// 条校验/日志路径,回放线由日志里的 SpawnAgent/Possess 自再生(D6 同
+    /// 款口径)。
+    respawn: crate::respawn::RespawnBook,
     /// 迁移在途窗口的意图暂存(主体 → 最后一条):owner 查不到时存下,下一
     /// 拍 owner 出现再投递;同窗口多条只留最后一条(§4;被覆盖的计数)。
     pending_intents: PendingIntents,
@@ -913,10 +903,7 @@ impl ObserveOrchestrator {
             possessed_by: BTreeMap::new(),
             possessor_of: BTreeMap::new(),
             observer_follow: BTreeMap::new(),
-            agent_spawn_points: BTreeMap::new(),
-            player_bodies: BTreeMap::new(),
-            pending_respawn_possess: BTreeMap::new(),
-            respawn_possess_wait: 0,
+            respawn: crate::respawn::RespawnBook::default(),
             pending_intents: BTreeMap::new(),
             agent_counters: AgentCounters::default(),
             _cadence: cadence,
@@ -1073,12 +1060,17 @@ impl ObserveOrchestrator {
             Ok(entry) => {
                 log.append(entry);
                 // A06 §6"玩家回出生点":最近一次被接受的 SpawnAgent 即出生点
-                // A06 §6"玩家回出生点":最近一次被接受的 SpawnAgent 即出生点
                 // (位置 + yaw + 身体名,重生用);驱动内存,断线清、不进快照
                 // (重生动作经日志,回放自再生)。归属表反查虚空移除用。
-                self.agent_spawn_points
-                    .insert(player, (position, yaw, body_name));
-                self.player_bodies.insert(entity, player);
+                self.respawn.on_spawn_accepted(
+                    player,
+                    entity,
+                    crate::respawn::SpawnPoint {
+                        position,
+                        yaw,
+                        body: body_name,
+                    },
+                );
                 hub.push_critical(player, S2C::Spawned { entity });
                 return Some(entity);
             }
@@ -1382,8 +1374,7 @@ impl ObserveOrchestrator {
         }
         // ②.5 出生点与身体归属清掉(A06 §6:断线连接的出生点不再有效;
         // 重连是新连接、新身体,由新 SpawnAgent 重建)。
-        self.agent_spawn_points.remove(&player);
-        self.player_bodies.retain(|_, owner| *owner != player);
+        self.respawn.on_disconnect(player);
         // ③ 观察者移除(既有语义:断连票撤,幂等)。
         match session.remove_observer_from(player) {
             Ok(entry) => log.append(entry),
@@ -1466,11 +1457,7 @@ impl ObserveOrchestrator {
             // 附身表(possessor_of)覆盖"服务端主体被玩家附身"的情形,不
             // 能当玩家身体判据(附身服务端主体掉出世界 = AI 主体移除,
             // §6 表:玩家身体回出生点,AI 主体移除)。
-            let Some(player) = self.player_bodies.remove(&entity) else {
-                continue;
-            };
-            // 出生点没有(不可能:插表与插出生点同处;防御性跳过)。
-            let Some((position, yaw, body)) = self.agent_spawn_points.get(&player).cloned() else {
+            let Some((player, point)) = self.respawn.on_void_removed(entity) else {
                 continue;
             };
             // 生成走与网络请求同一条校验/日志路径;被拒(出生点 chunk 未
@@ -1482,65 +1469,68 @@ impl ObserveOrchestrator {
                 // 不重生不计数,保持现状。
                 continue;
             }
-            let spawned_entity =
-                self.handle_spawn_agent(player, body.clone(), position, yaw, session, log, hub);
-            let rejected = spawned_entity.is_none();
-            if rejected {
+            let spawned_entity = self.handle_spawn_agent(
+                player,
+                point.body.clone(),
+                point.position,
+                point.yaw,
+                session,
+                log,
+                hub,
+            );
+            let Some(new_entity) = spawned_entity else {
                 // 出生点不可用:失败计数;连接已收 Possessed(None)(reap)。
                 self.agent_counters.player_respawn_failed += 1;
                 continue;
-            }
+            };
             // 生成成功:自动附身**跨拍**——生成命令 apply_at = 下一拍(分片
-            // 收件箱),同拍归属表还没有新身体。登记待附身表,下一拍实体
-            // 在归属表出现后再走 `handle_possess`(与网络请求同一条路径;
-            // Spawned 回执已在 handle_spawn_agent 内按顺序发出)。
-            self.pending_respawn_possess
-                .insert(player, spawned_entity.expect("rejected 已排除"));
+            // 收件箱),同拍归属表还没有新身体。登记待附身表(期限按条目算,
+            // issued_at = 本拍),实体在内核出现后再走 `handle_possess`(与
+            // 网络请求同一条路径;Spawned 回执已在 handle_spawn_agent 内按
+            // 顺序发出)。
+            self.respawn
+                .begin_possess_wait(player, new_entity, session.tick_now());
         }
     }
 
     /// 重生待附身的续随(每拍末,`respawn_void_removed_players` 之后):
-    /// 待附身表的实体已出现在归属表(内核已生成)→ 走 `handle_possess`
-    /// (与网络请求同一条路径),成功计 `player_respawned`。等 3 拍还不
-    /// 出现 → 计失败、清表(生成命令被内核拒绝的情形)。
+    /// 待附身条目逐条 `poll_possess`——实体已出现在内核 → 走
+    /// `handle_possess`(与网络请求同一条路径),成功计 `player_respawned`;
+    /// 超过按条目记的宽限(3 拍)仍不出现 → 计失败 + 补发
+    /// `Possessed(None)`(生成命令被内核拒绝的情形)。
     fn flush_pending_respawn_possess(
         &mut self,
         session: &mut sim_api::session::Session,
         log: &mut sim_api::log::CommandLog,
         hub: &OutboundHub,
     ) {
-        if self.pending_respawn_possess.is_empty() {
+        let now = session.tick_now();
+        let polls = self
+            .respawn
+            .poll_possess(now, |entity| session.entity_owner(entity).is_some());
+        if polls.is_empty() {
             return;
         }
-        let entries: Vec<(messaging::InputSource, types::EntityId)> = self
-            .pending_respawn_possess
-            .iter()
-            .map(|(&p, &e)| (p, e))
-            .collect();
-        let mut waited: Vec<messaging::InputSource> = Vec::new();
-        for (player, entity) in entries {
-            if session.entity_owner(entity).is_some() && session.is_agent(entity) {
-                self.pending_respawn_possess.remove(&player);
-                let before = self.agent_counters.possess_rejected;
-                self.handle_possess(player, entity, session, log, hub);
-                if self.agent_counters.possess_rejected > before {
-                    self.agent_counters.player_respawn_failed += 1;
-                } else {
-                    self.agent_counters.player_respawned += 1;
+        for poll in polls {
+            match poll {
+                crate::respawn::PossessPoll::Ready(player, entity) => {
+                    // Ready 只说明 owner 已登记;仍走 handle_possess 的完整
+                    // 校验(是主体、未被他人附身),被拒同样计失败。
+                    let before = self.agent_counters.possess_rejected;
+                    self.handle_possess(player, entity, session, log, hub);
+                    if self.agent_counters.possess_rejected > before {
+                        self.agent_counters.player_respawn_failed += 1;
+                    } else {
+                        self.agent_counters.player_respawned += 1;
+                    }
                 }
-            } else {
-                waited.push(player);
-            }
-        }
-        // 未出现的按拍计数,超过宽限(3 拍)计失败清掉。
-        self.respawn_possess_wait += 1;
-        if self.respawn_possess_wait >= 3 {
-            for player in waited {
-                if self.pending_respawn_possess.remove(&player).is_some() {
+                crate::respawn::PossessPoll::TimedOut(player, _) => {
+                    // 超过宽限:失败计数,并补发 Possessed(None)——reap 的
+                    // 被迫解除只在附身表里有条目时发,重生等待期不在表。
                     self.agent_counters.player_respawn_failed += 1;
+                    hub.push_critical(player, S2C::Possessed { entity: None });
                 }
             }
-            self.respawn_possess_wait = 0;
         }
     }
 
@@ -7141,7 +7131,7 @@ mod tests {
         );
         assert!(first.is_some(), "A 点生成被接受");
         assert_eq!(
-            o.agent_spawn_points.get(&player).map(|(p, ..)| *p),
+            o.respawn.spawn_point(player).map(|sp| sp.position),
             Some(pos_a)
         );
         // 第二次生成(B 点):出生点覆盖为 B(最近一次被接受)。
@@ -7157,12 +7147,12 @@ mod tests {
         );
         assert!(second.is_some(), "B 点生成被接受");
         assert_eq!(
-            o.agent_spawn_points.get(&player).map(|(p, ..)| *p),
+            o.respawn.spawn_point(player).map(|sp| sp.position),
             Some(pos_b),
             "出生点 = 最近一次被接受的 SpawnAgent(B)"
         );
         assert_eq!(
-            o.agent_spawn_points.get(&player).map(|(_, yaw, _)| *yaw),
+            o.respawn.spawn_point(player).map(|sp| sp.yaw),
             Some(90.0_f32)
         );
     }

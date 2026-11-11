@@ -25,6 +25,10 @@ pub enum LinkShape {
 /// 一连杆渲染条目:形状列表(每连杆 ≤ 8)。
 pub type LinkShapes = Vec<LinkShape>;
 
+/// 内置 `capsule` 身体(R1 §3.5):随二进制编入,`from_dir` 总是先放它,
+/// 目录读到的同名定义覆盖(`from_defs` 的 BTreeMap 后写者胜)。
+const BUILTIN_CAPSULE: &str = include_str!("../../../assets/bodies/capsule.body.toml");
+
 /// 哈希 → 形状表(缺省空;`from_defs`/`from_dir` 构建)。
 #[derive(Debug, Default, Clone)]
 pub struct BodyShapeTable {
@@ -74,10 +78,16 @@ impl BodyShapeTable {
         table
     }
 
-    /// 从目录读 `*.body.toml` 建表(路径不存在 = 空表,不报错——viewer 不
-    /// 因缺资产 fail-stop;解析失败同样跳过该文件并计数,渲染走占位)。
+    /// 从目录读 `*.body.toml` 建表(路径不存在 = 只有内置身体,不报错——
+    /// viewer 不因缺资产 fail-stop;解析失败同样跳过该文件并计数,渲染走
+    /// 占位)。R1 §3.5:内置 `capsule`(`include_str!` 随二进制),目录读到
+    /// 的定义覆盖或补充——不在仓库根目录启动 viewer 时胶囊也能正常画出来。
     pub fn from_dir(dir: &std::path::Path) -> Self {
-        let defs = load_defs(dir);
+        let mut defs = load_defs(dir);
+        if let Ok(builtin) = BodyDef::from_toml_str(BUILTIN_CAPSULE) {
+            // 内置在前、目录在后:from_defs 的 BTreeMap 后写者胜 = 同名覆盖。
+            defs.insert(0, builtin);
+        }
         Self::from_defs(&defs)
     }
 
@@ -171,14 +181,22 @@ mod tests {
         assert_eq!(table.take_unknown_draws(), 0, "取走即清");
     }
 
-    /// 目录加载:存在资产目录 → 建表;不存在 → 空表不报错。
+    /// 目录加载(R1 §3.5):目录不存在也至少有内置 capsule(不报错);
+    /// 真目录(工作区根的 assets/bodies;测试 cwd = crates/viewer)读到的
+    /// 同名定义覆盖内置(表内仍是 1 条——同名哈希覆盖,不重复)。
     #[test]
-    fn from_dir_missing_is_empty() {
+    fn from_dir_missing_has_builtin_capsule() {
         let table = BodyShapeTable::from_dir(std::path::Path::new("no/such/dir"));
-        assert!(table.is_empty());
-        // 真目录(工作区根的 assets/bodies;测试 cwd = crates/viewer)。
+        assert_eq!(table.len(), 1, "目录缺失也有内置 capsule");
+        let def = BodyDef::from_toml_str(CAPSULE_TOML).expect("capsule 合法");
+        assert!(
+            table.get(&def.hash()).is_some(),
+            "内置 capsule 的哈希可查(不在仓库根启动也能画)"
+        );
+        // 真目录:同名 capsule 覆盖内置,表内仍 1 条。
         let real = BodyShapeTable::from_dir(std::path::Path::new("../../assets/bodies"));
-        assert_eq!(real.len(), 1, "资产目录里的 capsule");
+        assert_eq!(real.len(), 1, "资产目录里的 capsule 覆盖内置(同名)");
+        assert!(real.get(&def.hash()).is_some());
     }
 
     /// 多连杆身体:连杆顺序保持 BodyDef.links 顺序(渲染按 AgentStates

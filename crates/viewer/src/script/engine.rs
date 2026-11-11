@@ -63,6 +63,20 @@ pub(crate) fn fill_cells(from: BlockPos, to: BlockPos) -> Vec<BlockPos> {
     cells
 }
 
+/// 在途 spawn 请求(R1 §3.3):引擎按**自己记的发出顺序**把回执归属到
+/// 标签——`Spawned` 回执只带实体 ID,方块 `spawn` 与 `spawn_agent` 都会
+/// 收到,顺序由引擎入队决定,不依赖回执与请求的到达顺序。
+#[derive(Debug, Clone, PartialEq)]
+enum SpawnKind {
+    /// 方块 `spawn`:记到该标签,`remaining` 减到 0 出队。
+    Block {
+        label: Option<String>,
+        remaining: usize,
+    },
+    /// `spawn_agent`:登记主体标签,一条回执出队。
+    Agent { label: String },
+}
+
 /// 等待步骤的跨帧状态(与当前步骤一一对应;即时步骤不进入等待状态)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum WaitState {
@@ -127,6 +141,9 @@ pub(super) struct EngineInner {
     fill: Option<FillProgress>,
     /// 当前 spawn 步骤已收到的回执(细则 6:按到达顺序消费)。
     spawn_received: Vec<EntityId>,
+    /// 在途 spawn 请求队列(R1 §3.3):发出 `spawn`/`spawn_agent` 命令时
+    /// 按发出顺序入队;消费 `input.spawned` 回执时逐个 ID 从队首归属。
+    spawn_requests: std::collections::VecDeque<SpawnKind>,
     /// 场景墙钟累计,秒(细则 10:含当前帧;与服务器拍号无关)。
     elapsed_secs: f32,
     /// A06 §4:spawn_agent 的标签 → 实体 ID(收到 Spawned 回执后登记;
@@ -184,6 +201,7 @@ impl EngineInner {
             wait: None,
             fill: None,
             spawn_received: Vec::new(),
+            spawn_requests: std::collections::VecDeque::new(),
             elapsed_secs: 0.0,
             agent_labels: BTreeMap::new(),
             agent_marks: BTreeMap::new(),
@@ -191,6 +209,11 @@ impl EngineInner {
             possess_pending: None,
             scenario,
         }
+    }
+
+    /// 当前附身的主体 ID(渲染层上色用;R1:脚本 possess 后胶囊画高亮色)。
+    pub(super) fn possessed_id(&self) -> Option<EntityId> {
+        self.possessed
     }
 
     /// 推进一帧,返回输出与结束后的引擎状态。
@@ -225,6 +248,31 @@ impl EngineInner {
         // 细则 9:拍号变化时先采样,再执行本帧步骤。
         self.sample(input);
         let tick = input.server_tick;
+
+        // R1 §3.3:回执消费在步骤推进之前——逐个 ID 从请求队列队首归属。
+        // 队首 Block:记到该标签(有标签才记)并减 remaining,减到 0 出队;
+        // 队首 Agent:登记主体标签并出队。队列空 = 非本引擎发出的回执
+        // (忽略,不 panic)。spawn/spawn_agent 步骤分支随后看自己的记账
+        // (spawn_received / agent_labels)判定结束。
+        for id in input.spawned {
+            match self.spawn_requests.front_mut() {
+                Some(SpawnKind::Block { label, remaining }) => {
+                    if let Some(name) = label {
+                        self.labels.entry(name.clone()).or_default().push(*id);
+                    }
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        self.spawn_requests.pop_front();
+                    }
+                    self.spawn_received.push(*id);
+                }
+                Some(SpawnKind::Agent { label }) => {
+                    self.agent_labels.insert(label.clone(), *id);
+                    self.spawn_requests.pop_front();
+                }
+                None => {}
+            }
+        }
 
         while let Some(step) = self.scenario.steps.get(self.step) {
             let step_no = self.step + 1; // 步骤序号从 1 开始(细则 1)
@@ -554,20 +602,21 @@ impl EngineInner {
                                 desc,
                             });
                         }
+                        // R1 §3.3:请求按发出顺序入队(一条 spawn = count 条
+                        // 回执),回执归属由本队列决定。
+                        self.spawn_requests.push_back(SpawnKind::Block {
+                            label: spawn_label.clone(),
+                            remaining: count as usize,
+                        });
                         self.wait = Some(WaitState::Spawn {
                             start_tick,
                             emitted: true,
                         });
                     }
-                    // 按到达顺序消费回执;超出 count 的不属于本步骤,丢弃。
+                    // 回执已在 frame 开头的消费段按请求队列归属(队首 Block
+                    // 计入 spawn_received);这里看记账判定结束。超出 count
+                    // 的回执属于后续请求,不在本段(队首已出队)。
                     let want = count as usize;
-                    let take = want.saturating_sub(self.spawn_received.len());
-                    for id in input.spawned.iter().take(take) {
-                        self.spawn_received.push(*id);
-                        if let Some(name) = &spawn_label {
-                            self.labels.entry(name.clone()).or_default().push(*id);
-                        }
-                    }
                     if self.spawn_received.len() >= want {
                         self.finish_step(
                             &mut out,
@@ -604,8 +653,9 @@ impl EngineInner {
                     }
                 }
                 // ---- A06 §4 主体动作 ----
-                // spawn_agent:发 SpawnAgent 命令,等 agent_spawned 回执登记
-                // 标签(超时 = 场景失败;一场景最多一个,解析期已限)。
+                // spawn_agent:发 SpawnAgent 命令,等回执登记标签(超时 = 场景
+                // 失败;一场景最多一个,解析期已限)。回执归属走 spawn_requests
+                // 队列(R1 §3.3):队首 Agent 即本步骤的主体回执。
                 Action::SpawnAgent { at, yaw, label } => {
                     let start_tick = match self.wait {
                         Some(WaitState::Spawn { start_tick, .. }) => start_tick,
@@ -621,13 +671,19 @@ impl EngineInner {
                     if !emitted {
                         out.commands
                             .push(EngineCommand::SpawnAgent { position: at, yaw });
+                        self.spawn_requests.push_back(SpawnKind::Agent {
+                            label: label.clone(),
+                        });
                         self.wait = Some(WaitState::Spawn {
                             start_tick,
                             emitted: true,
                         });
                     }
-                    if let Some(id) = input.agent_spawned.first() {
-                        self.agent_labels.insert(label.clone(), *id);
+                    // 队首是 Agent 且回执已到(input.spawned 含它)→ 标签已
+                    // 在消费段登记(见下);本步骤看 agent_labels 是否有条目
+                    // 决定结束。消费段与步骤段在 frame 内先后执行,同一帧内
+                    // 回执先归属、步骤后判定。
+                    if self.agent_labels.contains_key(&label) {
                         self.finish_step(
                             &mut out,
                             step_no,

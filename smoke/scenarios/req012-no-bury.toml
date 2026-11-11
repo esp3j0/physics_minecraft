@@ -1,13 +1,10 @@
 name = "req012-no-bury"
 req = "REQ-012"
-description = "方块实体落在胶囊身上:目标格与胶囊重叠时暂缓凝固(不把胶囊埋进体素);胶囊走开后暂缓写入生效(§11 第 4 行;§6 暂缓写入)"
+description = "方块实体落在胶囊身上:目标格与胶囊重叠时暂缓凝固(不把胶囊埋进体素);胶囊走开后暂缓写入生效(§11 第 4 行;§6 暂缓写入)。默认配置(无任何开关覆写);对照线 = 同布景不放胶囊时凝固所需拍数(现场标定实测,见检查注释)"
 timeout_secs = 240
 
 [server]
 world_seed = 11
-
-[server.destruction]
-enabled = false
 
 [[step]]
 camera = { pos = [10.0, -50.0, 24.0], yaw = -90.0, pitch = -25.0 }
@@ -41,9 +38,9 @@ spawn = { at = [8.5, -58.5, 14.5], count = 1, label = "lid" }
 [[step]]
 wait_until = { live_entities = { ge = 1 }, timeout_ticks = 120 }
 
-# 暂缓判定:方块压在胶囊身上(lid 压着 hero)——正常凝固用时(对照线,
-# 现场标定 ~40 拍;放行要求 hold_ticks 长于对照)内不凝固 = 实体 ≥ 1 持续。
-# hold = 90 拍(对照约 40,长于它 = 覆盖暂缓窗口)。
+# 暂缓判定:方块压在胶囊身上——正常凝固用时(对照线,现场标定:同布景
+# 不放胶囊时,实体出现拍 30 → 凝固消失拍 80,凝固用时实测 50 拍)内不
+# 凝固。hold = 90 拍,长于对照实测 50 拍 = 覆盖暂缓窗口。
 [[step]]
 label = "重叠格不凝固(暂缓)"
 wait_until = { live_entities = { ge = 1 }, timeout_ticks = 140, hold_ticks = 90 }
@@ -67,11 +64,11 @@ intent = { move = [0.0, 0.0], yaw = 90.0, jump = false }
 label = "走开后凝固"
 wait_until = { live_entities = { eq = 0 }, timeout_ticks = 300, hold_ticks = 30 }
 
-# 方块守恒:目标区域(含暂缓写入格 + 凝固落点)方块总数 = 1(lid 一格;
-# 脚本 spawn 单格用默认 desc = stone)。
+# 方块守恒:目标区域(含暂缓写入格 + 凝固落点)stone 方块总数**恰好 1**
+# (lid 一格;脚本 spawn 单格用默认 desc = stone)。
 [[step]]
-label = "方块守恒"
-check = { count = { from = [6, -60, 12], to = [12, -57, 17], is = "stone", ge = 1 } }
+label = "方块守恒(eq 1)"
+check = { count = { from = [6, -60, 12], to = [12, -57, 17], is = "stone", eq = 1 } }
 
 [[step]]
 camera = { pos = [10.0, -52.0, 22.0], yaw = -90.0, pitch = -25.0 }

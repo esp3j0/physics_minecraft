@@ -13,4 +13,5 @@
 pub mod config;
 pub mod driver;
 pub mod net;
+pub mod respawn;
 pub mod telemetry;

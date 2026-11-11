@@ -1,15 +1,10 @@
 name = "req012-bridge-fall"
 req = "REQ-012"
-description = "胶囊站在石桥上:拆桥墩,桥塌,胶囊随桥面下落到地面(§11 第 3 行;§6 表'脚下的桥塌了→主体正常下落')"
+description = "胶囊站在石桥上:拆桥墩,桥塌,胶囊随桥面下落到地面(§11 第 3 行;§6 表'脚下的桥塌了→主体正常下落')。默认配置(承载判定开启):7 格桥面每侧悬臂 3 格 < 石悬臂 8 格上界,建桥不塌;塌由拆两墩触发"
 timeout_secs = 240
 
 [server]
 world_seed = 7
-
-# 9 格桥面 > 8 格悬臂上限:承载判定会立即拆桥——本场景的"塌"由拆墩触发
-# (断柱 → 桥面实体化下落),关闭承载判定(同 req009-bridge-collapse 先例)。
-[server.cohesion]
-enabled = false
 
 [[step]]
 camera = { pos = [9.0, -48.0, 26.0], yaw = -90.0, pitch = -25.0 }
@@ -20,10 +15,9 @@ look_at = { target = [9.0, -56.0, 14.0] }
 [[step]]
 wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
 
-# 两墩一桥面(跨 z=14;x 6..12)。墩高 3(−60..−58),桥面在 −57。
-# 承载:9 格桥面 > 8 上限会塌——本场景先关承载凝固桥?不需要:桥建成
-# 后 fill 写入静态,承载判定只在写入/实体扰动时跑;9 格悬臂桥按 REQ-009
-# 会立即塌——参照 req009-bridge-collapse 关闭 cohesion 的先例。
+# 两墩一桥面(跨 z=14;x 6..12 共 7 格)。墩高 3(−60..−58),桥面在 −57。
+# 默认配置:7 格桥面(每侧悬臂 3 格)≤ stone 悬臂 8 格上界 → 建桥不塌;
+# 拆两墩 → 桥面悬空 → 承载判定拆桥 → 整块实体化下落。
 [[step]]
 label = "左墩"
 fill = { from = [6, -60, 14], to = [6, -58, 14], block = "stone" }
@@ -39,6 +33,7 @@ fill = { from = [6, -57, 14], to = [12, -57, 14], block = "stone" }
 [[step]]
 wait_until = { block = { pos = [12, -57, 14], is = "stone" }, timeout_ticks = 600 }
 
+# 建桥后桥面保持静态(承载判定下不塌——桥面 7 格仍写在地形)。
 [[step]]
 wait_ticks = { n = 20 }
 

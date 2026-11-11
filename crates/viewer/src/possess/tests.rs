@@ -1,4 +1,6 @@
-//! 附身状态机与意图映射单测(判据 A06-1、A06-2)。
+//! 附身状态机与意图映射单测(判据 A06-1 → T6 状态机逐行覆盖、A06-2 意图映射)。
+//!
+//! 时间全部显式推(`t(ms)` 辅助),状态机不读墙钟。
 
 use super::*;
 use types::EntityId;
@@ -12,6 +14,21 @@ fn keys(w: bool, a: bool, s: bool, d: bool, shift: bool) -> Keys {
         shift,
         jump_down: false,
     }
+}
+
+/// 显式时间轴:第 n 毫秒。
+fn t(ms: u64) -> std::time::Instant {
+    // Instant 只能取 now ± duration;用减法构造过去时刻,单调即可。
+    // (墙钟仅在测试时间轴构造点用一次;clippy.toml 对 viewer 测试的
+    // disallowed_methods 在此放行——同 render.rs 渲染节流的局部授权口径。)
+    #[allow(clippy::disallowed_methods)]
+    {
+        std::time::Instant::now() - std::time::Duration::from_millis(100_000 - ms)
+    }
+}
+
+fn agent_id(n: u32) -> EntityId {
+    EntityId::from_parts(0, n)
 }
 
 // ---------------------------------------------------------------------------
@@ -106,274 +123,305 @@ fn intent_shift_and_zero() {
 }
 
 // ---------------------------------------------------------------------------
-// A06-1 回执与附身状态机
+// T6:状态机逐行覆盖(R1 §3.2 转移表)
 // ---------------------------------------------------------------------------
 
-fn agent_id(n: u32) -> EntityId {
-    EntityId::from_parts(0, n)
-}
-
-/// 假服务器时序:P(无身体)→ SpawnAgent 命令 → Spawned 回执 + 主体流可见
-/// → 自动 Possess → Possessed(Some) 登记。中间插一条**方块 Spawn** 的
-/// Spawned 回执:序号错开,不会被附身(方块请求占序号,且自动附身只对
-/// 主体流里可见的 ID 发 Possess)。
+/// (a) 视野里先有一个 ID 更大的**别人的**主体,按 P 仍然发 SpawnAgent,
+/// 之后只附身自己的(不是 ID 最大的那个)。变红实现:归属改回"取视野里
+/// ID 最大的主体"(放行变异 1)。
 #[test]
-fn possess_flow_spawn_then_auto_possess() {
+fn t6a_p_with_bigger_foreign_agent_spawns_and_possesses_own() {
     let mut st = PossessState::new();
-    // P 按下(无身体;拾取目标 = 地面格顶面上方)。
-    let cmds = st.frame(
-        true,
-        &keys(false, false, false, false, false),
-        0.0,
-        Some((Vec3::new(8.0, -57.0, 24.0), 45.0)),
-        None,
-    );
+    // 视野里已有别人的主体 ID 42(AI 主体)。
+    st.on_agents(&[agent_id(42)], &[]);
+    assert_eq!(st.phase(), Phase::NoBody);
+    // 按 P:发 SpawnAgent(不是 Possess(42))。
+    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 45.0)), t(0));
     assert_eq!(
         cmds,
         vec![PossessCommand::SpawnAgent {
             position: Vec3::new(8.0, -57.0, 24.0),
             yaw: 45.0,
         }],
-        "P → SpawnAgent 命令"
+        "视野里有别人的主体,按 P 仍发 SpawnAgent"
     );
-    // 一条方块 Spawn 的回执先到(viewer 之前放过一个方块):序号被方块占。
-    st.on_spawn_receipt(); // 方块的
-    // 主体的 Spawned 回执到达。
-    st.on_spawn_receipt(); // 主体的
-    // 主体流可见(服务器 AgentStates 全量)。
-    st.observe_agents(&[agent_id(1)], &[]);
-    // 渲染层调用 try_auto_possess(候选 = 刚 Spawned 且主体流可见的 ID)。
-    let got = st.try_auto_possess(Some(agent_id(1)));
+    assert_eq!(st.phase(), Phase::SpawnRequested);
+    // 自己的身体回执到达,ID 更小(比如 7)。
+    st.on_spawned(agent_id(7));
+    // 主体流同时含 42 与 7:只附身 7。
+    let cmds = st.on_agents(&[agent_id(42), agent_id(7)], &[]);
     assert_eq!(
-        got,
-        Some(agent_id(1)),
-        "Spawned + 主体流可见 → 自动附身候选"
+        cmds,
+        vec![PossessCommand::Possess(agent_id(7))],
+        "自动附身只发自己的身体(回执+主体流),不是 ID 最大的"
     );
-    // Possessed(Some) 到达:登记附身。
-    st.on_possessed(Some(agent_id(1)));
-    assert_eq!(st.possessed(), Some(agent_id(1)));
-    // 附身后 pending 已消费:再次调用不重复发。
-    assert_eq!(
-        st.try_auto_possess(Some(agent_id(1))),
-        None,
-        "自动附身只发一次"
-    );
+    // Possessed(Some(7)) 确认。
+    st.on_possessed(Some(agent_id(7)));
+    assert_eq!(st.possessed(), Some(agent_id(7)));
+    assert_eq!(st.my_body(), Some(agent_id(7)));
 }
 
-/// 中间插方块 Spawned 不会把方块 ID 附身:自动附身候选必须是主体流可见的
-/// ID;渲染层传方块 ID(不在 agent_seen)→ try_auto_possess 不发。
+/// (b) 先收到一条**方块**回执、再收到身体回执:只附身身体,方块 ID 不进
+/// my_body(方块永不进主体流,自然不命中)。变红实现:回执不按队列、
+/// 主体优先(T7 同款)。
 #[test]
-fn block_spawn_id_never_possessed() {
+fn t6b_block_receipt_first_then_body_receipt() {
     let mut st = PossessState::new();
-    let _ = st.frame(true, &Keys::default(), 0.0, Some((Vec3::ZERO, 0.0)), None);
-    st.on_spawn_receipt(); // 主体的 Spawned
-    // 主体流(AgentStates)只含主体——方块实体走 EntityStates,永不进
-    // agent_seen。候选传一个从没见过的 ID(比如把方块 ID 当主体):不附身。
-    assert_eq!(
-        st.try_auto_possess(Some(EntityId::from_parts(0, 999))),
-        None
-    );
-    // 传主体流里的正确 ID → 附身。
-    st.observe_agents(&[agent_id(1)], &[]);
-    assert_eq!(st.try_auto_possess(Some(agent_id(1))), Some(agent_id(1)));
-}
-
-/// Possessed(None) → 回飞行相机(possessed 清空;意图状态清掉)。
-#[test]
-fn possessed_none_returns_to_fly_camera() {
-    let mut st = PossessState::new();
-    st.on_possessed(Some(agent_id(2)));
-    assert_eq!(st.possessed(), Some(agent_id(2)));
-    st.on_possessed(None);
-    assert_eq!(st.possessed(), None, "Possessed(None) → 飞行相机");
-    // 解除后无方向键 + P:重新走生成路径(不再发意图)。
-    let cmds = st.frame(
-        false,
-        &keys(true, false, false, false, false),
-        0.0,
-        None,
-        Some(agent_id(2)),
-    );
-    assert!(cmds.is_empty(), "未附身且无 P:不发任何命令(意图停发)");
-}
-
-/// 已附身时按 P → Unpossess(附带一条零意图让主体停下,放行 §2 表:
-/// Unpossess 语义 = 解除 + 主体停;两条命令同帧发出,顺序 Unpossess 在前)。
-/// 解除附身后再附身:意图节流状态必须已清——重附身第一帧同方向意图要
-/// 立即发出(否则残留的 last_intent 判"无变化"吞掉首帧,主体失控一拍)。
-#[test]
-fn repossess_after_unpossess_resends_intent_immediately() {
-    let mut st = PossessState::new();
-    st.on_possessed(Some(agent_id(5)));
-    // 附身中向东走(登记 last_intent = 东)。
-    let cmds = st.frame(
-        false,
-        &keys(true, false, false, false, false),
-        0.0,
-        None,
-        None,
-    );
-    assert!(
-        cmds.iter()
-            .any(|c| matches!(c, PossessCommand::Intent { .. })),
-        "布景:行走中发意图"
-    );
-    // 跨过 50 ms 节流窗(只验"变化才发"语义,不与节流耦合)。
-    std::thread::sleep(super::INTENT_INTERVAL);
-    // 服务器强制解除(被撞出世界等)→ Possessed(None)。
-    st.on_possessed(None);
-    // 重新附身同一主体。
-    st.on_possessed(Some(agent_id(5)));
-    // 第一帧同方向意图:必须立即发出(last_intent 已随解除清空)。
-    let cmds = st.frame(
-        false,
-        &keys(true, false, false, false, false),
-        0.0,
-        None,
-        None,
-    );
-    assert!(
-        cmds.iter()
-            .any(|c| matches!(c, PossessCommand::Intent { .. })),
-        "重附身首帧同方向意图必须发出(残留 last_intent 会吞掉它)"
-    );
-}
-
-#[test]
-fn p_toggles_unpossess_and_possess_existing_body() {
-    let mut st = PossessState::new();
-    st.on_possessed(Some(agent_id(3)));
-    let cmds = st.frame(true, &Keys::default(), 0.0, None, None);
-    assert_eq!(
-        cmds.first(),
-        Some(&PossessCommand::Unpossess),
-        "已附身按 P → Unpossess(首条)"
-    );
-    assert!(
-        !cmds.is_empty(),
-        "解除帧可附带停机意图(渲染层只透传 Unpossess 本体,零意图由服务器发)"
-    );
-    st.on_possessed(None);
-    // 未附身 + 有身体(agent_seen 可见):P 附身它(不是再生成)。
-    st.observe_agents(&[agent_id(3)], &[]);
-    let cmds = st.frame(true, &Keys::default(), 0.0, None, Some(agent_id(3)));
+    // P 生成(请求在途)。
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    // 先到一条方块 Spawned 回执(此前 viewer 放过方块)。
+    st.on_spawned(EntityId::from_parts(0, 999));
+    // 再到身体的 Spawned 回执。
+    st.on_spawned(agent_id(3));
+    // 主体流只有 3(方块 999 永不进 AgentStates)。
+    let cmds = st.on_agents(&[agent_id(3)], &[]);
     assert_eq!(
         cmds,
         vec![PossessCommand::Possess(agent_id(3))],
-        "有身体未附身按 P → Possess"
+        "只附身身体;方块 ID 不在主体流,永不归属"
     );
+    assert_eq!(st.my_body(), Some(agent_id(3)));
+    assert_ne!(st.my_body(), Some(EntityId::from_parts(0, 999)));
 }
 
-// ---------------------------------------------------------------------------
-// 意图节流与跳跃(A06-2 后半)
-// ---------------------------------------------------------------------------
-
-/// 意图有变化才发;50 ms 节流(墙钟);松开所有键发一次零速度;跳跃按下沿
-/// 只发一次(按住不连发)。
+/// (c) `SpawnRequested` 2 s 无回应 → 回 `NoBody`(请求被拒),清
+/// auto_possess;再按 P 可以重新生成。
 #[test]
-fn intent_throttle_change_and_zero_on_release() {
+fn t6c_spawn_requested_times_out_to_no_body() {
     let mut st = PossessState::new();
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    assert_eq!(st.phase(), Phase::SpawnRequested);
+    // 1.9 s:还没超时。
+    st.tick(t(1_900));
+    assert_eq!(st.phase(), Phase::SpawnRequested);
+    // 2.0 s:超时 → NoBody。
+    st.tick(t(2_000));
+    assert_eq!(
+        st.phase(),
+        Phase::NoBody,
+        "SpawnRequested 2 s 无回应 → NoBody"
+    );
+    // 超时后身体回执迟到:不再自动附身(auto_possess 已清)。
+    st.on_spawned(agent_id(1));
+    let cmds = st.on_agents(&[agent_id(1)], &[]);
+    assert!(cmds.is_empty(), "被拒后的迟到回执不自动附身");
+    assert_eq!(st.phase(), Phase::HasBody);
+    // 再按 P:有身体未附身 → Possess(走 HasBody 分支,不是再生成)。
+    let cmds = st.on_p_pressed(None, t(2_100));
+    assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(1))]);
+}
+
+/// (c') `PossessRequested` 2 s 无回应 → 回 `HasBody`。
+#[test]
+fn t6c2_possess_requested_times_out_to_has_body() {
+    let mut st = PossessState::new();
+    // 布景:已有身体(回执 + 主体流)。
+    st.on_spawned(agent_id(2));
+    let _ = st.on_agents(&[agent_id(2)], &[]);
+    assert_eq!(st.phase(), Phase::HasBody);
+    // P → PossessRequested。
+    let _ = st.on_p_pressed(None, t(0));
+    assert_eq!(st.phase(), Phase::PossessRequested);
+    // 2 s 无 Possessed 回执 → HasBody。
+    st.tick(t(2_000));
+    assert_eq!(
+        st.phase(),
+        Phase::HasBody,
+        "PossessRequested 超时 → HasBody"
+    );
+    assert_eq!(st.my_body(), Some(agent_id(2)), "身体归属不丢");
+}
+
+/// (d) 服务器主动重生:未请求的 Spawned(id) + AgentStates 含 id +
+/// Possessed(Some(id)) → my_body = id、Possessed。
+#[test]
+fn t6d_server_initiated_respawn_becomes_my_body() {
+    let mut st = PossessState::new();
+    // 未发任何请求:回执直接到(服务器主动生成)。
+    st.on_spawned(agent_id(9));
+    // Possessed(Some(9)) 先到(驱动重生路径:Spawned → Possessed 连发)。
+    st.on_possessed(Some(agent_id(9)));
+    assert_eq!(st.possessed(), Some(agent_id(9)));
+    assert_eq!(st.my_body(), Some(agent_id(9)));
+    // 主体流随后含 9:归属已确认,保持 Possessed(不被回退)。
+    let cmds = st.on_agents(&[agent_id(9)], &[]);
+    assert!(cmds.is_empty(), "已确认的归属不重复发 Possess");
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.my_body(), Some(agent_id(9)));
+}
+
+/// (e) removed 含 my_body → NoBody;Possessed(None) 收尾后按 P 走生成。
+#[test]
+fn t6e_removed_my_body_goes_no_body() {
+    let mut st = PossessState::new();
+    // 布景:已附身 3。
+    st.on_spawned(agent_id(3));
+    let _ = st.on_agents(&[agent_id(3)], &[]);
+    let _ = st.on_p_pressed(None, t(0));
+    st.on_possessed(Some(agent_id(3)));
+    assert_eq!(st.phase(), Phase::Possessed);
+    // 掉出世界:removed 含 3 → NoBody(等 Possessed(None) 收尾)。
+    let cmds = st.on_agents(&[], &[agent_id(3)]);
+    assert!(cmds.is_empty());
+    assert_eq!(st.phase(), Phase::NoBody);
+    assert_eq!(st.my_body(), None);
+    // Possessed(None) 到达:仍 NoBody(my_body 已空)。
+    st.on_possessed(None);
+    assert_eq!(st.phase(), Phase::NoBody);
+    // 再按 P(有拾取目标):重新生成。
+    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), t(10));
+    assert!(matches!(
+        cmds.as_slice(),
+        [PossessCommand::SpawnAgent { .. }]
+    ));
+}
+
+/// (f) `Possessed(None)`:
+/// - my_body 还在(主动 Unpossess)→ HasBody;
+/// - my_body 没了 → NoBody。意图状态都清零(重附身首帧意图立即发)。
+#[test]
+fn t6f_possessed_none_branches_on_body_presence() {
+    // 分支 1:主动解除(身体还在)。
+    let mut st = PossessState::new();
+    st.on_spawned(agent_id(4));
+    let _ = st.on_agents(&[agent_id(4)], &[]);
+    let _ = st.on_p_pressed(None, t(0));
     st.on_possessed(Some(agent_id(4)));
-    // 第一帧:W 按下(未发过 → 立即发)。
-    let cmds = st.frame(
-        false,
-        &keys(true, false, false, false, false),
-        0.0,
-        None,
-        None,
+    st.on_possessed(None);
+    assert_eq!(st.phase(), Phase::HasBody, "身体还在 → HasBody");
+    assert_eq!(st.my_body(), Some(agent_id(4)));
+    // 分支 2:服务器强制解除 + 身体已移除(removed 先行 → NoBody,再收
+    // Possessed(None) 收尾仍 NoBody)。
+    let mut st2 = PossessState::new();
+    st2.on_possessed(Some(agent_id(5)));
+    let _ = st2.on_agents(&[], &[agent_id(5)]);
+    assert_eq!(st2.phase(), Phase::NoBody, "身体被移除 → NoBody");
+    st2.on_possessed(None);
+    assert_eq!(st2.phase(), Phase::NoBody);
+    // 意图状态清零:重附身首帧同方向意图立即发。
+    st.on_possessed(Some(agent_id(4)));
+    let cmds = st.on_keys(&keys(true, false, false, false, false), 0.0, t(10));
+    assert!(
+        matches!(cmds.as_slice(), [PossessCommand::Intent { .. }]),
+        "重附身首帧意图立即发"
     );
-    assert_eq!(cmds.len(), 1, "首条意图立即发");
-    assert!(matches!(cmds[0], PossessCommand::Intent { .. }));
-    // 第二帧(50 ms 内):状态未变不发;状态变化(换键 W→D)也被节流窗拦下。
-    let cmds = st.frame(
-        false,
-        &keys(true, false, false, false, false),
-        0.0,
-        None,
-        None,
-    );
-    assert!(cmds.is_empty(), "无变化不重发(节流窗内)");
-    let cmds = st.frame(
-        false,
-        &keys(false, true, false, false, false),
-        0.0,
-        None,
-        None,
-    );
-    assert!(cmds.is_empty(), "窗内有变化也节流(≤50 ms 一条)");
-    // 状态变化(松开 W → 零速度):即使节流窗内也……按放行口径"松开所有
-    // 方向键要发一次零速度"+"每 50 ms 最多一条"——零速度是变化,须等节流。
-    // 本测试等 50 ms 后发。
-    std::thread::sleep(INTENT_INTERVAL);
-    let cmds = st.frame(
-        false,
-        &keys(false, false, false, false, false),
-        0.0,
-        None,
-        None,
-    );
-    assert_eq!(cmds.len(), 1, "松键 → 零速度意图");
-    match &cmds[0] {
-        PossessCommand::Intent { move_xz, jump, .. } => {
-            assert_eq!(*move_xz, (0.0, 0.0), "零速度");
-            assert!(!jump, "松键不发跳跃");
-        }
-        other => panic!("应为 Intent,实为 {other:?}"),
-    }
 }
 
-/// 跳跃按下沿:即使方向/朝向没变、节流窗未到,也立即发一条(带 jump);
-/// 按住不放(第二帧 jump_down 仍 = true)不连发。
+/// (g) 已附身按 P → Unpossess;状态保持 Possessed 等 Possessed(None)。
+/// 中途插 Spawned 回执不影响。
 #[test]
-fn jump_edge_sends_once() {
+fn t6g_p_while_possessed_sends_unpossess() {
     let mut st = PossessState::new();
-    st.on_possessed(Some(agent_id(5)));
-    // 静止 + 跳按下沿。
-    let mut k = keys(false, false, false, false, false);
-    k.jump_down = true;
-    let cmds = st.frame(false, &k, 0.0, None, None);
-    assert_eq!(cmds.len(), 1, "跳跃按下沿立即发");
+    st.on_possessed(Some(agent_id(6)));
+    let cmds = st.on_p_pressed(None, t(0));
+    assert_eq!(cmds, vec![PossessCommand::Unpossess]);
+    assert_eq!(st.phase(), Phase::Possessed, "Unpossess 发出后等服务器确认");
+    // 服务器确认解除。
+    st.on_possessed(None);
+    assert_eq!(st.phase(), Phase::HasBody);
+}
+
+/// (h) 请求等待期(SpawnRequested/PossessRequested)按 P 被忽略(转移表
+/// "其他 → 忽略")。
+#[test]
+fn t6h_p_ignored_while_request_pending() {
+    let mut st = PossessState::new();
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), t(100));
+    assert!(cmds.is_empty(), "SpawnRequested 期间按 P 忽略(不重复生成)");
+    assert_eq!(st.phase(), Phase::SpawnRequested);
+}
+
+/// (i) 节流语义(传入 now):首条立即发;50 ms 窗内变化被节流;窗外变化
+/// 发出;松键发零速度;跳跃按下沿即使窗内也立即发,按住不连发。
+#[test]
+fn t6i_intent_throttle_with_injected_now() {
+    let mut st = PossessState::new();
+    st.on_possessed(Some(agent_id(8)));
+    // 首条(W):立即发。
+    let cmds = st.on_keys(&keys(true, false, false, false, false), 0.0, t(0));
+    assert_eq!(cmds.len(), 1, "首条意图立即发");
+    // 窗内(30 ms)无变化:不发。
+    let cmds = st.on_keys(&keys(true, false, false, false, false), 0.0, t(30));
+    assert!(cmds.is_empty(), "50 ms 窗内无变化不发");
+    // 窗内(45 ms)变化(W→D):被节流。
+    let cmds = st.on_keys(&keys(false, false, false, true, false), 0.0, t(45));
+    assert!(cmds.is_empty(), "窗内有变化也节流");
+    // 窗外(60 ms,距上次发送 t(0) 已 60 ms):变化发出(D)。
+    let cmds = st.on_keys(&keys(false, false, false, true, false), 0.0, t(60));
+    assert_eq!(cmds.len(), 1, "窗外变化发出");
+    // 窗内(70 ms)松键:零速度被节流。
+    let cmds = st.on_keys(&keys(false, false, false, false, false), 0.0, t(70));
+    assert!(cmds.is_empty(), "窗内零速度也节流");
+    // 窗外(110 ms,距 t(60) 已 50 ms):零速度(松键)发出。
+    let cmds = st.on_keys(&keys(false, false, false, false, false), 0.0, t(110));
+    assert_eq!(cmds.len(), 1, "窗外零速度发出");
     match &cmds[0] {
         PossessCommand::Intent { move_xz, jump, .. } => {
             assert_eq!(*move_xz, (0.0, 0.0));
-            assert!(*jump, "jump = true");
+            assert!(!jump);
         }
         other => panic!("应为 Intent,实为 {other:?}"),
     }
-    // 按住 Space 但松开沿已过(渲染层的 is_key_pressed 只在按下沿为真,
-    // 这里模拟下一帧按住未松(jump_down = true)——沿检测在状态机:零变化
-    // + 非沿 → 不发。
-    let mut held = keys(false, false, false, false, false);
-    held.jump_down = true;
-    let cmds = st.frame(false, &held, 0.0, None, None);
-    assert!(cmds.is_empty(), "按住不连发(状态机 diff 出按下沿)");
+    // 跳跃按下沿(窗内):立即发一条带 jump 的意图。
+    let mut k = keys(false, false, false, false, false);
+    k.jump_down = true;
+    let cmds = st.on_keys(&k, 0.0, t(120));
+    assert_eq!(cmds.len(), 1, "跳跃按下沿立即发(无视节流窗)");
+    assert!(matches!(
+        &cmds[0],
+        PossessCommand::Intent { jump: true, .. }
+    ));
+    // 按住(下一帧仍 true):沿已过,不连发。
+    let cmds = st.on_keys(&k, 0.0, t(200));
+    assert!(cmds.is_empty(), "按住不连发");
+    // 未附身:on_keys 空。
+    let mut st2 = PossessState::new();
+    let cmds = st2.on_keys(&k, 0.0, t(0));
+    assert!(cmds.is_empty(), "未附身不发意图");
 }
 
-/// 跳跃时方向变化:跳与意图合并成一条(jump = true 的新意图)。
+/// 回执去重:同一 ID 出现在 present 多帧,只有第一帧归属(receipts 删除)。
 #[test]
-fn jump_with_direction_change_single_intent() {
+fn t6j_receipt_consumed_once() {
     let mut st = PossessState::new();
-    st.on_possessed(Some(agent_id(6)));
-    let mut k = keys(true, false, false, false, false);
-    k.jump_down = true;
-    let cmds = st.frame(false, &k, 0.0, None, None);
-    assert_eq!(cmds.len(), 1, "跳与意图合一帧一条");
-    match &cmds[0] {
-        PossessCommand::Intent { move_xz, jump, .. } => {
-            assert!(*jump);
-            assert!(
-                (move_xz.0 - WALK_SPEED).abs() <= 1e-5,
-                "W 前向 x 分量 = +4.3, 实得 {}",
-                move_xz.0
-            );
-            assert!(
-                move_xz.1.abs() <= 1e-5,
-                "W 前向 z 分量 = 0, 实得 {}",
-                move_xz.1
-            );
-        }
-        other => panic!("应为 Intent,实为 {other:?}"),
+    // 手动路径(P 有身体未附身)布景:回执 + 主体流 → HasBody;再按 P 发 Possess。
+    st.on_spawned(agent_id(11));
+    let _ = st.on_agents(&[agent_id(11)], &[]);
+    assert_eq!(st.phase(), Phase::HasBody);
+    assert_eq!(st.my_body(), Some(agent_id(11)));
+    // 下一帧 11 还在 present:回执已消费,不再归属(不重复触发转移)。
+    let cmds = st.on_agents(&[agent_id(11)], &[]);
+    assert!(cmds.is_empty(), "回执已消费,不重复");
+    assert_eq!(st.phase(), Phase::HasBody);
+    // 自动路径:回执窗口内同 ID 第二次出现在 present,不再发 Possess。
+    let mut st2 = PossessState::new();
+    let _ = st2.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    st2.on_spawned(agent_id(12));
+    let cmds = st2.on_agents(&[agent_id(12)], &[]);
+    assert_eq!(
+        cmds,
+        vec![PossessCommand::Possess(agent_id(12))],
+        "首帧归属发 Possess"
+    );
+    let cmds = st2.on_agents(&[agent_id(12)], &[]);
+    assert!(cmds.is_empty(), "第二帧不再发");
+}
+
+/// 回执窗口容量 64:挤掉最旧(不无限增长)。
+#[test]
+fn t6k_receipts_capped() {
+    let mut st = PossessState::new();
+    for n in 0..70_u32 {
+        st.on_spawned(agent_id(n));
     }
+    // 最早 6 条(0..6)已被挤掉:主体流出现 0 不再归属(无 auto_possess,
+    // 归属也不发命令——用 my_body 判)。
+    let _ = st.on_agents(&[agent_id(0)], &[]);
+    assert_eq!(st.my_body(), None, "最旧回执已被挤出窗口,不归属");
+    // 窗口内的 69 仍可归属。
+    let _ = st.on_agents(&[agent_id(69)], &[]);
+    assert_eq!(st.my_body(), Some(agent_id(69)), "窗口内回执仍有效");
 }
 
 // ---------------------------------------------------------------------------
@@ -381,9 +429,9 @@ fn jump_with_direction_change_single_intent() {
 // ---------------------------------------------------------------------------
 
 /// 第三人称相机:看向根位置上方 0.6 m,位于其后方 dist 处(yaw/pitch 同
-/// 飞行相机约定)。pitch 用 +90 表示向上看时相机在后下?——本约定:pitch
-/// 是**相机的俯仰**(抬头为正,同飞行相机);相机在前向的反方向,故
-/// pitch = +90(抬头)→ 相机在正下方。俯视身体(pitch = −90)相机在头顶。
+/// 飞行相机约定)。pitch 是**相机的俯仰**(抬头为正,同飞行相机);相机
+/// 在前向的反方向,故 pitch = +90(抬头)→ 相机在正下方。俯视身体
+/// (pitch = −90)相机在头顶。
 #[test]
 fn third_person_camera_positions() {
     let root = Vec3::new(10.0, -58.0, 20.0);
@@ -427,30 +475,55 @@ fn wheel_distance_clamped() {
 }
 
 // ---------------------------------------------------------------------------
-// 主体流账本(observe_agents):removed 立即清(agent_seen 收缩)。
+// T8(R1 §3.4):相机写回——third_person_camera 的 pos→look 方向与
+// FlyCamera::forward() 同式(误差 ≤ 1e-5),写回后 to_camera() 画面不变。
+// viewer 侧 forward = (cos yaw·cos pitch, sin pitch, sin yaw·cos pitch)。
 // ---------------------------------------------------------------------------
 
-#[test]
-fn removed_agents_retract_from_seen() {
-    let mut st = PossessState::new();
-    st.observe_agents(&[agent_id(1), agent_id(2)], &[]);
-    st.observe_agents(&[], &[agent_id(1)]);
-    // agent_id(1) 已被移除:自动附身不再接受它。
-    assert_eq!(st.try_auto_possess(Some(agent_id(1))), None);
-    st.observe_agents(&[], &[agent_id(2)]);
-    assert_eq!(st.try_auto_possess(Some(agent_id(2))), None);
+fn fly_forward_deg(yaw_deg: f32, pitch_deg: f32) -> Vec3 {
+    let yaw = yaw_deg.to_radians();
+    let pitch = pitch_deg.to_radians();
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    Vec3::new(cy * cp, sp, sy * cp)
 }
 
-/// 未知哈希/占位路径在这里测不了(渲染层职责);本文件的占位计数走
-/// render 侧 body table 测试(render.rs 单测)。
 #[test]
-fn spawn_request_receipts_fifo_order() {
-    let mut st = PossessState::new();
-    let _ = st.frame(true, &Keys::default(), 0.0, Some((Vec3::ZERO, 0.0)), None);
-    // 三条回执(方块、主体、多余):队列只有一条(主体的),方块先到。
-    st.on_spawn_receipt(); // 方块
-    assert_eq!(st.try_auto_possess(None), None, "主体回执未到,不自动附身");
-    st.on_spawn_receipt(); // 主体
-    // 多余回执:队列空,忽略(不 panic)。
-    st.on_spawn_receipt();
+fn t8_third_person_look_dir_matches_fly_forward() {
+    let root = Vec3::new(37.5, -57.0, -12.5);
+    for (yaw_deg, pitch_deg) in [
+        (0.0_f32, 0.0_f32),
+        (90.0, -30.0),
+        (180.0, 45.0),
+        (-45.0, -89.0),
+    ] {
+        let (pos, look) = third_person_camera(root, yaw_deg, pitch_deg, 4.0);
+        let dir = (look - pos).normalize();
+        let expect = fly_forward_deg(yaw_deg, pitch_deg);
+        assert!(
+            (dir - expect).length() <= 1e-5,
+            "yaw {yaw_deg}° pitch {pitch_deg}°:pos→look 实得 {dir:?},期望 forward {expect:?}"
+        );
+    }
+}
+
+/// MUT15 锚(R1 §3.4):附身帧写回 FlyCamera 的位置 = third_person_camera
+/// 的 pos(每帧写回;变异"不写回"= 渲染循环丢了这一步,该纯函数与写回点
+/// 同源,本测试钉住函数本体;写回点经 render 循环接线)。
+#[test]
+fn mut15_possessed_camera_position_matches_third_person() {
+    let root = Vec3::new(24.5, -58.1, 14.5);
+    for (yaw_deg, pitch_deg, dist) in [
+        (0.0_f32, 0.0_f32, 4.0_f32),
+        (90.0, -25.0, 2.0),
+        (-45.0, 60.0, 10.0),
+        (180.0, 0.0, 7.5),
+    ] {
+        let got = possessed_camera_position(root, yaw_deg, pitch_deg, dist);
+        let expect = third_person_camera(root, yaw_deg, pitch_deg, dist).0;
+        assert!(
+            (got - expect).length() <= 1e-5,
+            "yaw {yaw_deg} pitch {pitch_deg} dist {dist}:实得 {got:?},期望 {expect:?}"
+        );
+    }
 }

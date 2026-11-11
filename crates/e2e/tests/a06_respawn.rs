@@ -1,18 +1,24 @@
-//! REQ-012 A06(#25):玩家回出生点的场景判据(放行判据 A06-4/5/6)。
+//! REQ-012 A06 R1(#25):玩家回出生点的场景判据(放行判据 A06-4/5/6)。
 //!
 //! 口径:所有场景走**真实网络栈**(TCP 客户端 + 驱动 + Session,a03_agents_net
 //! 同款装配)。挖穿 = 对地面格发 `SetBlock AIR`(经网络命令,与玩家挖除同
 //! 路径);主体掉到虚空移除深度(y < WORLD_Y_MIN − 16)内核移除,驱动在
 //! 出生点重生并自动附身。
 //!
-//! - **A06-4**:玩家身体走进洞掉虚空 → 出生点新身体 + 自动附身
-//!   (Spawned + Possessed(Some));`player_respawned` = 1;新身体的意图
-//!   能驱动它走。对照:AI 主体(source = None)掉虚空只移除不重生。
-//! - **A06-5**:断线移除、出生点不可用,不重生(断线计数 0;出生点不可用
-//!   计 `player_respawn_failed`,连接收 `Possessed(None)`);恢复清扫同款
-//!   不重生(A03-10b 已覆盖清扫本体,这里锚定"清扫后不重生")。
-//! - **A06-6**:含一次重生的会话,命令日志回放逐位相同;重生拍的
-//!   `SpawnAgent`、`Possess` 都在日志里(与网络请求同一条路径)。
+//! - **A06-4(=T2)**:同一连接连续掉 3 次,每次都重生并收到
+//!   `Possessed(Some(新 ID))`;`player_respawned` = 3、`player_respawn_failed`
+//!   = 0;新身体的意图能驱动它走。对照:AI 主体(source = None)掉虚空只
+//!   移除不重生。
+//! - **A06-5(=T3/T4)**:恢复清扫**真的重启**(带玩家身体写检查点 → 关停 →
+//!   同一存储起新驱动 → 第一拍清扫移除 → 再跑 60 拍),`player_respawned`
+//!   = 0、`bodies_removed_on_recovery` ≥ 1;出生点不可用(驱动层单测,
+//!   a06_5_spawn_point_unavailable)计 `player_respawn_failed` = 1、
+//!   `player_respawned` = 0、连接收 `Possessed(None)`;断线移除不重生。
+//! - **A06-6(=T5)**:含一次重生的会话,拼接日志**从头回放两次**,逐拍
+//!   比较全部主体状态逐位相同;并与在线会话末态逐位相同。
+//!
+//! **等待循环一律有界**(R1 §4):收帧按条数封顶,超限 `panic!` 并写明
+//! 在等什么;任何回执不来都在 60 s 内变红。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -28,6 +34,7 @@ use sim_api::log::CommandLog;
 use sim_api::proto::{C2S, S2C, decode_frame, encode_c2s_frame};
 use sim_api::session::Session;
 use storage::mem::MemCheckpointStore;
+use storage::traits::CheckpointStore as _;
 use storage::worker::StoreWorker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -40,6 +47,9 @@ use voxel::{BlockRegistry, SimpleRegistry};
 const GROUND_TOP_Y: f32 = types::WORLD_Y_MIN as f32 + 4.0;
 /// 软窗(a03 同款)。
 const SOFT: Duration = Duration::from_millis(50);
+/// 收帧上限(条):一轮"等重生"窗口最多消费的下帧数。超限 panic(写明
+/// 在等什么)——挂死不算红(R1 §4)。
+const FRAME_BUDGET: usize = 4000;
 
 fn capsule_registry() -> BodyRegistry {
     let mut bodies = BodyRegistry::new();
@@ -64,6 +74,49 @@ async fn next_frame(rx: &mut mpsc::UnboundedReceiver<S2C>) -> Option<S2C> {
 async fn real_yield() {
     tokio::task::yield_now().await;
     std::thread::sleep(Duration::from_millis(1));
+}
+
+/// 逐帧推拍并消费"非 Possessed(新)"的杂帧,直到收到 `Possessed(Some(x))`
+/// 且 x ≠ old(重生+自动附身完成)或预算烧完(panic 写明在等什么)。
+/// 返回 (新身体, 期间记录的 removed 实体, 期间记录的 Spawned 实体)。
+/// `expect_removed` = 是否要求途中看到 old 出现在 removed(掉洞线)。
+async fn wait_respawn_possessed(
+    a: &mut TestClient,
+    rx: &mut mpsc::UnboundedReceiver<S2C>,
+    old: EntityId,
+) -> (EntityId, bool, Vec<EntityId>) {
+    let mut removed_seen = false;
+    let mut spawned: Vec<EntityId> = Vec::new();
+    let mut frames = 0usize;
+    loop {
+        if frames >= FRAME_BUDGET {
+            panic!(
+                "等重生自动附身超预算:{FRAME_BUDGET} 帧内未见 Possessed(Some(≠{old:?}));\
+                 removed_seen={removed_seen} spawned={spawned:?}(在等:虚空移除→重生→附身回执)"
+            );
+        }
+        frames += 1;
+        advance_ticks(1).await;
+        // 收干本拍可用帧(有界:每次 advance 后最多再收 32 条;收不到就回
+        // 主循环推下一拍——推进拍数本身就是时间上限)。
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(rx).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    if removed.contains(&old) {
+                        removed_seen = true;
+                    }
+                }
+                Some(S2C::Spawned { entity }) => spawned.push(entity),
+                Some(S2C::Possessed { entity: Some(x) }) if x != old => {
+                    return (x, removed_seen, spawned);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        let _ = a; // 保留参数形状(未来需要补发意图时用)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,54 +412,24 @@ fn respawn_failed(outcome: &DriverOutcome) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// A06-4:玩家身体掉虚空 → 出生点重生 + 自动附身;AI 主体对照只移除
+// A06-4(=T2):同一连接连续掉 3 次,每次都重生并自动附身;AI 主体对照只移除
 // ---------------------------------------------------------------------------
 
-/// 场景:玩家在 (24.5, 顶面 + 1.2, 8.5) 生成、附身;把脚下 4 格全挖成 AIR
-/// (bedrock 底 y = WORLD_Y_MIN 也挖)→ 玩家掉落 → 虚空移除(下落 ~20 m +
-/// 移除深度 16 m ≈ 100+ 拍)→ 出生点新身体 + 自动附身;发意图能走。
-#[tokio::test(start_paused = true)]
-async fn a06_4_player_respawn_and_auto_possess() {
-    let h = harness(base_config()).await;
-    let (mut a, mut rxa) = client(h.addr).await;
-    tokio::task::yield_now().await;
-    join(&mut a, &mut rxa, 4).await;
-    a.send(&C2S::MoveObserver {
-        position: Vec3::new(24.0, GROUND_TOP_Y + 2.0, 8.0),
-    })
-    .await
-    .expect("MoveObserver");
-    advance_ticks(30).await;
-
-    // 出生点 (24.5, 顶面 + 1.2, 12.5);洞挖在 z=8 柱(出生点旁,附身后
-    // 用意图走进洞——判据原文"走进打穿到世界底的洞")。
-    let spawn_pos = Vec3::new(24.5, GROUND_TOP_Y + 1.2, 12.5);
-    let body = spawn_agent_expect(&mut a, &mut rxa, spawn_pos, 0.0).await;
-    advance_ticks(30).await;
-    possess_expect(&mut a, &mut rxa, body).await;
-    // 落稳。
-    for _ in 0..60 {
-        advance_ticks(1).await;
-        let _ = agent_pose_drained(&mut rxa, body).await;
-    }
-
-    // 挖穿:柱 x=24,z=8,y 从顶面格到底(bedrock)全 AIR(与出生点隔 4 格,
-    // 塌落/掉落的证据不与出生点重叠)。
+/// 挖穿柱(x=24,z∈{8,9},y 全深 AIR;与出生点隔开,塌落证据不与出生点重叠)。
+async fn dig_shaft(a: &mut TestClient) {
     let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
-    // 2 格宽(z = 8、9 两列;1 格洞太窄,行走动量会擦边滑过)。
     for z in [8, 9] {
         for y in (types::WORLD_Y_MIN..=top_cell).rev() {
-            set_block(&mut a, BlockPos::new(24, y, z), types::BlockId::AIR).await;
+            set_block(a, BlockPos::new(24, y, z), types::BlockId::AIR).await;
         }
     }
-    advance_ticks(10).await;
+}
 
-    // 走进洞:逐拍发意图 (0, −4.3)(−z 方向)。4.5 m ≈ 30 拍 + 落洞;
-    // 固定走 50 拍(足够走出边沿并悬空下坠)。**在线帧采样不做判定依据**
-    // ——CI 受限 runner 上服务器任务的下行帧投递时序与本地不可比(R1/R2
-    // 两轮 CI 实证:逐拍与窗口采样都可能出现"相邻采样对永不满足"或整段
-    // 收不到帧);"是否掉洞"由下方统一收帧循环的结构判据承担(旧身体的
-    // removed 帧 = 虚空移除发生 = 必然走完洞+掉出世界)。
+/// 走进洞:逐拍发意图 (0, −4.3) 共 50 拍(足够走出边沿并悬空下坠)。
+/// "是否掉洞"由 [`wait_respawn_possessed`] 的结构判据承担(旧身体的
+/// removed 帧 = 虚空移除发生;在线帧采样不做判定依据——CI 受限 runner 上
+/// 帧投递时序与本地不可比,R1/R2 两轮 CI 实证)。
+async fn walk_into_shaft(a: &mut TestClient, body: EntityId) {
     for _ in 0..50 {
         a.send(&C2S::AgentIntent {
             entity: body,
@@ -418,74 +441,67 @@ async fn a06_4_player_respawn_and_auto_possess() {
         .expect("走向洞");
         advance_ticks(1).await;
     }
-    // 等待掉落 + 虚空移除 + 重生 + 自动附身(统一收帧循环,不丢帧:挖洞
-    // 会触发洞顶 dirt 柱的承载塌落,塌落生成的 Spawned 与重生 Spawned 同
-    // 通道——用 Possessed(Some(非旧身体)) 作为"重生+自动附身完成"的
-    // 终点判据;removed 帧与 Spawned(新身体) 逐帧记录,收尾断言)。
-    let mut removed_seen = false;
-    let mut new_body: Option<EntityId> = None;
-    let mut possessed_new = false;
-    let mut spawned_other: Vec<EntityId> = Vec::new();
-    for _ in 0..1200 {
-        advance_ticks(1).await;
-        loop {
-            real_yield().await;
-            match next_frame(&mut rxa).await {
-                Some(S2C::AgentStates { removed, .. }) => {
-                    if removed.contains(&body) {
-                        removed_seen = true;
-                    }
-                    continue;
-                }
-                Some(S2C::Spawned { entity }) => {
-                    spawned_other.push(entity);
-                    continue;
-                }
-                Some(S2C::Possessed { entity: Some(x) }) if x != body => {
-                    new_body = Some(x);
-                    possessed_new = true;
-                    break;
-                }
-                Some(_) => continue,
-                None => break,
-            }
-        }
-        if possessed_new {
-            break;
-        }
-    }
-    let new_body = new_body.expect("重生应产生新身体并自动附身(Possessed(Some))");
-    assert_ne!(new_body, body, "实体 ID 会变(§6)");
-    assert!(removed_seen, "旧身体应出现在 AgentStates.removed(虚空移除)");
-    assert!(
-        spawned_other.contains(&new_body),
-        "重生 Spawned 回执按顺序到达(实得 {spawned_other:?};塌落生成的实体也在)"
-    );
+}
 
-    // 新身体意图能驱动它走(在出生点附近沿 +x 走;意图连续发送——A03 同
-    // 款逐拍发,等位移超过 1 m 才算"能走")。
-    let mut walked = None;
-    for _ in 0..180 {
-        a.send(&C2S::AgentIntent {
-            entity: new_body,
-            move_xz: (4.3, 0.0),
-            yaw: 0.0,
-            jump: false,
-        })
-        .await
-        .expect("新身体意图");
+/// 场景(T2,R1 §4):同一连接**连续掉 3 次**——第一次在出生点生成附身,
+/// 走进洞掉虚空 → 重生 + 自动附身;新身体再次走进洞(洞已在出生点旁,
+/// 第二、三次生成后直接发意图走洞)→ 再重生;第三次同款。每次都收到
+/// `Possessed(Some(新 ID))`;关停计数 `player_respawned` = 3、
+/// `player_respawn_failed` = 0。变红实现:P1 的全局计数器(第二次重生
+/// 第一拍计数到 3 直接判失败)、虚空移除不重生、重生后不自动附身。
+#[tokio::test(start_paused = true)]
+async fn a06_4_respawn_three_times_same_connection() {
+    let h = harness(base_config()).await;
+    let (mut a, mut rxa) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    join(&mut a, &mut rxa, 4).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(24.0, GROUND_TOP_Y + 2.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver");
+    advance_ticks(30).await;
+
+    // 洞先挖好(出生点 (24.5, ·, 12.5) 旁 z=8/9 柱;重生点完好)。
+    dig_shaft(&mut a).await;
+    advance_ticks(10).await;
+
+    let spawn_pos = Vec3::new(24.5, GROUND_TOP_Y + 1.2, 12.5);
+    let mut body = spawn_agent_expect(&mut a, &mut rxa, spawn_pos, 0.0).await;
+    advance_ticks(30).await;
+    possess_expect(&mut a, &mut rxa, body).await;
+    // 落稳。
+    for _ in 0..60 {
         advance_ticks(1).await;
-        if let Some(p) = agent_pose_drained(&mut rxa, new_body).await
-            && p.x > spawn_pos.x + 1.0
-        {
-            walked = Some(p);
-            break;
+        let _ = agent_pose_drained(&mut rxa, body).await;
+    }
+
+    let mut removed_first = false;
+    for round in 1..=3 {
+        // 走进洞 + 掉落 + 重生 + 自动附身(有界等待;第二轮起身体就出生在
+        // 出生点,直接发意图走洞)。
+        walk_into_shaft(&mut a, body).await;
+        let (new_body, removed_seen, spawned) =
+            wait_respawn_possessed(&mut a, &mut rxa, body).await;
+        assert_ne!(new_body, body, "第 {round} 次:实体 ID 会变(§6)");
+        if round == 1 {
+            removed_first = removed_seen;
+            assert!(
+                spawned.contains(&new_body),
+                "重生 Spawned 回执按顺序到达(实得 {spawned:?})"
+            );
+        }
+        eprintln!("A06-4 T2 第 {round} 次重生:{body:?} → {new_body:?}");
+        body = new_body;
+        // 落稳后再进下一轮。
+        for _ in 0..30 {
+            advance_ticks(1).await;
+            let _ = agent_pose_drained(&mut rxa, body).await;
         }
     }
-    let p = walked.expect("新身体的意图能驱动它走(位移 > 1 m)");
-    eprintln!(
-        "A06-4 新身体意图行走:末位置 x = {:.3}(出生 {})",
-        p.x, spawn_pos.x
+    assert!(
+        removed_first,
+        "第 1 次掉洞:旧身体应出现在 AgentStates.removed"
     );
 
     // 关停取计数。
@@ -493,11 +509,16 @@ async fn a06_4_player_respawn_and_auto_possess() {
     let outcome = shutdown(h).await;
     assert_eq!(
         respawned(&outcome),
-        1,
-        "player_respawned = 1(实得 {})",
+        3,
+        "player_respawned = 3(实得 {})",
         outcome.agent.player_respawned
     );
-    assert_eq!(respawn_failed(&outcome), 0, "无失败重生");
+    assert_eq!(
+        respawn_failed(&outcome),
+        0,
+        "player_respawn_failed = 0(实得 {})",
+        outcome.agent.player_respawn_failed
+    );
 }
 
 /// 对照线:AI 主体(source = None)掉虚空只移除,不重生(§6 表)。
@@ -646,63 +667,172 @@ async fn a06_5_disconnect_no_respawn() {
     );
 }
 
-/// 出生点不可用:玩家身体在 A 点生成、附身;A 点所在分片被 despawn 不可行
-/// (有观察者在就 ensure)。改为:出生点记在 A;把身体**走到远处** B 再掉
-/// 洞——重生仍回 A(A 可见)。出生点不可用的可构造路径 = 出生点 chunk 未
-/// 装载:观察者离场导致卸载。做法:玩家 1 在出生点 (8.5, ·, 8.5) 生成;
-/// 玩家 2 观察着别处;把玩家 1 的观察者移走(走远)不改变 chunk 装载
-/// (身体所在分片仍有身体票)。
-/// —— 可构造口径改为驱动层单测(driver.rs 内 build:直接构造
-/// ObserveOrchestrator 调 respawn_void_removed_players,出生点 chunk 未
-/// 装载 → player_respawn_failed + Possessed(None))。本 e2e 只锚定
-/// 网络路径不重生+重生的计数,驱动层单测补失败分支。
+/// T3(R1 §4):恢复清扫**真的重启**——带玩家身体写检查点 → 关停 → 用
+/// 同一存储起新驱动 → 第一拍清扫移除 → 再跑 60 拍,`player_respawned` = 0、
+/// `bodies_removed_on_recovery` ≥ 1。变红实现:断线移除也重生(A06-5,
+/// 放行变异 8——清扫路径等同"玩家断线后的身体",若清扫调重生这条先红)。
+///
+/// 装配(a03_10b 恢复线同款):Session 层造"玩家身体活着"的快照落检查点,
+/// 新驱动 `run()` 从快照恢复(bootstrap 语义 = 所有玩家同时断线)。
 #[tokio::test(start_paused = true)]
 async fn a06_5_recovery_sweep_no_respawn() {
-    // 恢复清扫:检查点含玩家身体 → 重启后第一拍移除(A03 已证);
-    // 本测试锚定"清扫移除不重生":重启后 player_respawned = 0。
-    let mut config = base_config();
-    config.checkpoint_interval_ticks = 30;
-    let h = harness(config.clone()).await;
-    let (mut a, mut rxa) = client(h.addr).await;
-    tokio::task::yield_now().await;
-    join(&mut a, &mut rxa, 4).await;
-    a.send(&C2S::MoveObserver {
-        position: Vec3::new(8.0, GROUND_TOP_Y + 2.0, 8.0),
-    })
-    .await
-    .expect("MoveObserver");
-    advance_ticks(30).await;
-    let _body = spawn_agent_expect(
-        &mut a,
-        &mut rxa,
-        Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5),
-        0.0,
-    )
-    .await;
+    use shard::SchedulerConfig;
+    use sim_api::session::SessionConfig;
+    use types::{ShardId, ShardPos, WorldId};
+
+    let bodies = capsule_registry();
+    let hash = bodies.hash_of("capsule").expect("capsule 已装");
+    let shard = ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(0, 0));
+
+    // —— 第一段:造"玩家身体活着"的会话,写检查点进 RecordingCheckpointStore
+    //    (write_checkpoint 同款 bundle 编码;玩家身体 source = Some(1))——
+    let checkpoints_store = RecordingCheckpointStore::default();
+    let player_body = EntityId::from_parts(0, 1);
+    let snap_tick;
+    {
+        let mut session = Session::new(SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        });
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            physics_sim::ShardSimConfig::new(shard),
+            Box::new(SimpleRegistry::builtin()),
+            bodies.clone(),
+        ));
+        // 出生点 chunk(0,0)装载(平板一格地面;GROUND_TOP_Y 不适用——
+        // 这是手工平板,y=64 顶面,即 GROUND_TOP_Y 与手工世界无关,直接用
+        // 已知顶面)。
+        let mut chunk = voxel::Chunk::air();
+        let stone = types::BlockId(1);
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                chunk.set(x, 64, z, stone);
+            }
+        }
+        session.apply_chunk_load(shard, types::ChunkPos::new(0, 0), chunk);
+        let entry = session
+            .spawn_agent_from(
+                InputSource(1),
+                shard,
+                player_body,
+                hash,
+                types::EntityState {
+                    translation: Vec3::new(12.0, 65.2, 12.0),
+                    ..types::EntityState::default()
+                },
+            )
+            .expect("玩家身体生成");
+        let mut log = CommandLog::new();
+        log.append(entry);
+        session.tick();
+        // 快照 + bundle 编码(写检查点;spawn 高水位 = 已用 2)。
+        let world = session.world_snapshot();
+        snap_tick = world.shards.tick;
+        let bundle = app::driver::CheckpointBundle {
+            format_version: app::driver::CHECKPOINT_FORMAT_VERSION,
+            world,
+            log_bytes: log.to_bytes(),
+            spawn_next_seq: 2,
+        };
+        let mut store = checkpoints_store.clone();
+        storage::traits::CheckpointStore::append(
+            &mut store,
+            snap_tick,
+            &app::driver::encode_checkpoint(&bundle),
+        )
+        .expect("检查点写入");
+    }
+
+    // —— 第二段:同一存储起新驱动(replay 恢复 + run;observe 关闭 = 无
+    //    网络面,清扫照做)——
+    let resumed = {
+        let latest = checkpoints_store
+            .read_latest()
+            .expect("读回")
+            .expect("有检查点");
+        let bundle = app::driver::decode_checkpoint(&latest.1).expect("checkpoint 可解");
+        sim_api::replay::replay_world_with_bodies(
+            &bundle.world,
+            &CommandLog::new(),
+            SessionConfig {
+                scheduler: SchedulerConfig {
+                    worker_count: 2,
+                    start_tick: snap_tick,
+                    ..SchedulerConfig::default()
+                },
+                ..SessionConfig::default()
+            },
+            || Box::new(SimpleRegistry::builtin()),
+            || bodies.clone(),
+        )
+        .expect("恢复")
+    };
+    let config = Config {
+        worker_count: 2,
+        checkpoint_interval_ticks: 6000,
+        ..Config::default()
+    };
+    let store = StoreWorker::new(
+        Box::new(storage::mem::MemChunkStore::new()),
+        Box::new(checkpoints_store.clone()),
+    );
+    let (provider, new_sim, bodies2) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store, new_registry())
+            .expect("装配失败");
+    let (tx, rx) = mpsc::channel::<DriverCommand>(16);
+    let driver = tokio::spawn(run(DriverArgs {
+        config,
+        session: resumed,
+        store,
+        log: CommandLog::new(),
+        commands: rx,
+        listen_ctrl_c: false,
+        provider,
+        new_sim,
+        observe: None,
+        spawn_next_seq: 2,
+        bodies: bodies2,
+    }));
+    // 再跑 60 拍(清扫在第一拍)。
     advance_ticks(60).await;
-    // 直接关停(checkpoint 已写);重启 = 新驱动 + 同 store(A03-10b 同款,
-    // 这里不重启,只关停取计数——清扫线由 a03_10b 已证,本测试锚定
-    // "关停线内无重生")。
-    drop(a);
-    let outcome = shutdown(h).await;
-    assert_eq!(respawned(&outcome), 0, "无虚空移除 → 无重生(0)");
+    tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+    let outcome = driver.await.expect("驱动不 panic");
+    assert_eq!(
+        outcome.agent.bodies_removed_on_recovery, 1,
+        "第一拍清扫移除玩家身体(实得 {})",
+        outcome.agent.bodies_removed_on_recovery
+    );
+    assert_eq!(
+        respawned(&outcome),
+        0,
+        "恢复清扫不重生(player_respawned = 0,实得 {})",
+        outcome.agent.player_respawned
+    );
+    assert_eq!(respawn_failed(&outcome), 0);
 }
 
 // ---------------------------------------------------------------------------
-// A06-6:确定性(含一次重生的会话回放)
+// A06-6(=T5):确定性(含一次重生的会话,日志回放两次逐位同)
 // ---------------------------------------------------------------------------
 
-/// 含一次虚空移除 + 重生的会话:拼接日志回放,断言:
+/// 含一次虚空移除 + 重生的会话(T5,R1 §4):
 /// ① 重生动作在日志里——日志含**两条** `SimCommand::SpawnAgent`(原始
-///    生成 + 重生,与网络请求同一条路径,放行 §3"生成和附身都走与网络
-///    请求同一条校验、日志路径");
-/// ② 附身的可回放证据——重生后自动附身走的 `handle_possess` 会经日志
-///    给新身体发零意图、移观察者(`LogEntry`),日志里出现**两次**
-///    `SetObserverPosition` 类条目(原始附身 + 重生附身);本断言用
-///    日志总条目数与 SpawnAgent 计数(路径同构性),逐位回放比较归
-///    a03_10a 的机制覆盖(A06 的增量 = 两条 SpawnAgent 同路径)。
+///    生成 + 重生,与网络请求同一条路径),重生那条的实体 = 回执的新身体;
+/// ② **日志回放两次,逐拍比较全部主体状态,逐位相同**(放行 A06-6 原文);
+/// ③ 回放末态与**在线会话末态**(终末 checkpoint 的世界快照)逐位相同。
+///    变红实现:重生不写日志(放行变异 11——回放线没有重生动作,末态少
+///    一次重生,与在线末态不一致)。
+///
+/// 回放口径:取**第一个检查点**的世界快照 + **拼接日志**(窗内 `>=` 回放),
+/// tick 到在线末拍(关停时的 ticks_run),逐拍记录 `agent_states()`。
 #[tokio::test(start_paused = true)]
-async fn a06_6_replay_includes_respawn_actions() {
+async fn a06_6_replay_twice_bitwise_identical() {
+    use shard::SchedulerConfig;
+    use sim_api::session::SessionConfig;
+
     let mut config = base_config();
     config.checkpoint_interval_ticks = 30;
     let h = harness(config.clone()).await;
@@ -723,80 +853,38 @@ async fn a06_6_replay_includes_respawn_actions() {
         advance_ticks(1).await;
         let _ = agent_pose_drained(&mut rxa, body).await;
     }
-    // 挖穿旁柱 + 走进洞 + 掉落 + 重生(A06-4 同款;出生点不在挖的柱上,
+    // 挖穿旁柱 + 走进洞 + 掉落 + 重生(T2 同款;出生点不在挖的柱上,
     // 重生点完好 → 恰一次重生)。
-    let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
-    // 2 格宽(z = 8、9;同 A06-4:1 格洞行走动量会擦边滑过)。
-    for z in [8, 9] {
-        for y in (types::WORLD_Y_MIN..=top_cell).rev() {
-            set_block(&mut a, BlockPos::new(24, y, z), types::BlockId::AIR).await;
-        }
-    }
+    dig_shaft(&mut a).await;
     advance_ticks(10).await;
-    // 走进洞:固定走 50 拍(同 a06_4 R3;"是否掉洞"由统一收帧循环的
-    // Possessed(Some(非旧身体)) 结构判据承担,在线帧采样不判定——CI
-    // 受限 runner 上帧投递时序与本地不可比,R1/R2 两轮 CI 实证)。
-    for _ in 0..50 {
-        a.send(&C2S::AgentIntent {
-            entity: body,
-            move_xz: (0.0, -4.3),
-            yaw: 0.0,
-            jump: false,
-        })
-        .await
-        .expect("走向洞");
-        advance_ticks(1).await;
-    }
-    // 等虚空移除 + 重生(统一收帧;塌落生成的 Spawned 同通道,以
-    // Possessed(Some(非旧身体)) 为终点)。
-    let mut new_body = None;
-    for _ in 0..1200 {
-        advance_ticks(1).await;
-        loop {
-            real_yield().await;
-            match next_frame(&mut rxa).await {
-                Some(S2C::Possessed { entity: Some(x) }) if x != body => {
-                    new_body = Some(x);
-                    break;
-                }
-                Some(_) => continue,
-                None => break,
-            }
-        }
-        if new_body.is_some() {
-            break;
-        }
-    }
-    let new_body = new_body.expect("重生应产生新身体并自动附身");
+    walk_into_shaft(&mut a, body).await;
+    // 等虚空移除 + 重生(有界;Possessed(Some(非旧身体)) 为终点)。
+    let (new_body, _, _) = wait_respawn_possessed(&mut a, &mut rxa, body).await;
     advance_ticks(60).await;
     drop(a);
     let Harness {
         tx,
         driver,
-        addr,
         checkpoints,
+        ..
     } = h;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
     let outcome = driver.await.expect("驱动不 panic");
     assert_eq!(respawned(&outcome), 1, "重生恰好一次");
-    let _ = addr;
+    let online_ticks = outcome.ticks_run;
 
-    // 拼接日志(检查点窗拼接;a03_10 同法)。
+    // 拼接日志(检查点窗拼接;a03_10 同法)+ 结构断言(①)。
     let checkpoints = checkpoints.read_all();
     assert!(!checkpoints.is_empty(), "checkpoint 已写");
     let log = stitched_log(&checkpoints);
     let mut spawn_agent_count = 0usize;
     let mut respawn_spawn_seen = false;
-    let mut intent_count = 0usize;
     for entry in log.entries() {
         if let messaging::SimCommand::SpawnAgent { entity, .. } = entry.command {
             spawn_agent_count += 1;
             if entity == new_body {
                 respawn_spawn_seen = true;
             }
-        }
-        if matches!(entry.command, messaging::SimCommand::AgentIntent { .. }) {
-            intent_count += 1;
         }
     }
     assert_eq!(
@@ -807,20 +895,104 @@ async fn a06_6_replay_includes_respawn_actions() {
         respawn_spawn_seen,
         "重生那条 SpawnAgent 的实体 = 回执的新身体 {new_body:?}"
     );
-    // 重生后驱动自动附身走 handle_possess:对旧身体发零意图(unpossess
-    // 路径,旧身体已死会被内核幂等拒)、移观察者、对重生附身登记——
-    // 观察者移动条目(SetObserverPosition)在日志 ≥ 2 次(原始附身 +
-    // 重生附身)。
-    let observer_moves = log
-        .entries()
-        .iter()
-        .filter(|e| matches!(e.command, messaging::SimCommand::SetObserverPosition { .. }))
-        .count();
-    assert!(
-        observer_moves >= 2,
-        "附身路径的观察者移动条目 ≥ 2(原始 + 重生),实为 {observer_moves}"
+
+    // —— ② 回放两次,逐拍比较全部主体状态(逐位)——
+    // 第一个检查点的世界快照(起点)+ 拼接日志(`>=` 窗口回放)。
+    let (_, first_blob) = &checkpoints[0];
+    let first_bundle = app::driver::decode_checkpoint(first_blob).expect("checkpoint 可解");
+    let bodies = capsule_registry();
+    let mk_replay = || -> Session {
+        sim_api::replay::replay_world_with_bodies(
+            &first_bundle.world,
+            &log,
+            SessionConfig {
+                scheduler: SchedulerConfig {
+                    worker_count: 2,
+                    start_tick: first_bundle.world.shards.tick,
+                    ..SchedulerConfig::default()
+                },
+                ..SessionConfig::default()
+            },
+            || Box::new(SimpleRegistry::builtin()),
+            || bodies.clone(),
+        )
+        .expect("回放会话重建")
+    };
+    let end_tick = snap_tick_of(&checkpoints, online_ticks);
+    let sample = |session: &mut Session| -> Vec<u8> {
+        // 逐拍主体状态序列化(EntityId 升序 + BodyHash + 全连杆 EntityState
+        // 的 bincode;EntityState 含位姿/速度全部字段 = 逐位比较)。
+        let mut buf = Vec::new();
+        for (id, hash, poses) in session.agent_states() {
+            buf.extend_from_slice(&id.to_bits().to_le_bytes());
+            buf.extend_from_slice(&hash.0);
+            for pose in &poses {
+                let bytes = bincode::serde::encode_to_vec(pose, bincode::config::standard())
+                    .expect("EntityState 序列化");
+                buf.extend_from_slice(&bytes);
+            }
+        }
+        buf
+    };
+    let mut replay_samples = Vec::new();
+    for _rep in 0..2 {
+        let mut session = mk_replay();
+        let mut reps = Vec::new();
+        while session.tick_now().0 < end_tick.0 {
+            session.tick();
+            reps.push(sample(&mut session));
+        }
+        replay_samples.push(reps);
+        session.shutdown();
+    }
+    assert_eq!(
+        replay_samples[0], replay_samples[1],
+        "回放两次:逐拍全部主体状态逐位相同"
     );
-    let _ = intent_count;
+
+    // —— ③ 回放末态与在线会话末态逐位相同——
+    // 在线末态 = 终末 checkpoint 的世界快照,恢复出会话采样主体状态。
+    let (_, last_blob) = checkpoints.last().expect("终末 checkpoint");
+    let last_bundle = app::driver::decode_checkpoint(last_blob).expect("终末可解");
+    let mut online = sim_api::replay::replay_world_with_bodies(
+        &last_bundle.world,
+        &CommandLog::new(),
+        SessionConfig {
+            scheduler: SchedulerConfig {
+                worker_count: 2,
+                start_tick: last_bundle.world.shards.tick,
+                ..SchedulerConfig::default()
+            },
+            ..SessionConfig::default()
+        },
+        || Box::new(SimpleRegistry::builtin()),
+        || bodies.clone(),
+    )
+    .expect("在线末态恢复");
+    let online_final = sample(&mut online);
+    let replay_final = {
+        let mut session = mk_replay();
+        while session.tick_now().0 < end_tick.0 {
+            session.tick();
+        }
+        let s = sample(&mut session);
+        session.shutdown();
+        s
+    };
+    online.shutdown();
+    assert_eq!(
+        replay_final, online_final,
+        "回放末态与在线末态逐位相同(重生动作经日志自再生)"
+    );
+    assert!(!replay_final.is_empty(), "末态有主体(重生的新身体活着)");
+}
+
+/// 在线会话关停时的末拍(终末 checkpoint 的 tick;ticks_run 是相对值,
+/// 终末 bundle 的 tick = 下一待执行拍 = 回放终点)。
+fn snap_tick_of(checkpoints: &[(types::Tick, Vec<u8>)], _online_ticks: u64) -> types::Tick {
+    let (_, blob) = checkpoints.last().expect("终末 checkpoint");
+    let bundle = app::driver::decode_checkpoint(blob).expect("终末可解");
+    bundle.world.shards.tick
 }
 
 /// 日志窗拼接(a03_session_determinism 同法)。
@@ -834,4 +1006,147 @@ fn stitched_log(checkpoints: &[(types::Tick, Vec<u8>)]) -> CommandLog {
         }
     }
     log
+}
+
+// ---------------------------------------------------------------------------
+// A06-5(=T4,R1):出生点不可用 → player_respawn_failed = 1 + Possessed(None)
+// ---------------------------------------------------------------------------
+
+/// T4:出生点 chunk 卸载后身体被虚空移除 → 不重生,计
+/// `player_respawn_failed` = 1、`player_respawned` = 0,连接收到
+/// `Possessed(None)`。
+///
+/// 构造:玩家在 A=(8.5, ·, 8.5) 生成(view 4);观察者移到远处 B(≈140 m,
+/// 出观察票"出"区域)→ A 区 chunk 由激活决策卸载(无票、冷却后);挖穿
+/// 身体脚下(B 区)→ 身体掉虚空 → 驱动重生回 A → `handle_spawn_agent`
+/// 校验"出生 chunk 已装载"拒绝 → 失败计数;连接收 `Possessed(None)`
+/// (reap 在移除拍已发一次;TimedOut 分支不再重发——本判据等 reap 那条)。
+#[tokio::test(start_paused = true)]
+async fn a06_5_spawn_point_unavailable_respawn_failed() {
+    let h = harness(base_config()).await;
+    let (mut a, mut rxa) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    join(&mut a, &mut rxa, 4).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, GROUND_TOP_Y + 2.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver");
+    advance_ticks(30).await;
+    let body = spawn_agent_expect(
+        &mut a,
+        &mut rxa,
+        Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5),
+        0.0,
+    )
+    .await;
+    advance_ticks(30).await;
+    possess_expect(&mut a, &mut rxa, body).await;
+    for _ in 0..60 {
+        advance_ticks(1).await;
+        let _ = agent_pose_drained(&mut rxa, body).await;
+    }
+
+    // 身体**用意图走远**(附身中观察者被服务器跟随拉回身体旁,MoveObserver
+    // 会被覆写):+x 走 90 拍 × 4.3 m/s ≈ 90 拍 ≈ 6.4 m 不够——逐拍发意图
+    // 连走 300 拍 ≈ 21 m,足够走出默认 data_unload_radius(48 m)+ 出生点
+    // chunk(0,0) 之外?不够。改为**分批长走**:总共 700 拍 ≈ 50 m。
+    // (卸载圈以观察者锚 = 身体位置为圆心 48 m;出生点 (8.5,·,8.5) 距身体
+    // > 48 m 即出圈。)
+    let mut cur = Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5);
+    for _ in 0..900 {
+        a.send(&C2S::AgentIntent {
+            entity: body,
+            move_xz: (4.3, 0.0),
+            yaw: 0.0,
+            jump: false,
+        })
+        .await
+        .expect("走远");
+        advance_ticks(1).await;
+        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
+            cur = p;
+        }
+        // 走够 56 m(48 m 卸载圈 + 8 m 裕量)即停。
+        if cur.x > 8.5 + 56.0 {
+            break;
+        }
+    }
+    // 再给卸载决策与冷却留拍数(数据预算逐拍装卸)。
+    advance_ticks(600).await;
+
+    // 先发零意图停住身体(残留意图会让它走过洞口)。
+    a.send(&C2S::AgentIntent {
+        entity: body,
+        move_xz: (0.0, 0.0),
+        yaw: 0.0,
+        jump: false,
+    })
+    .await
+    .expect("停住");
+    advance_ticks(20).await;
+    let cur = agent_pose_drained(&mut rxa, body)
+        .await
+        .expect("身体位置可采样");
+    // 挖穿身体脚下(x/z 各 2 格,同洞宽口径;以停稳位置为准)。
+    let bx = cur.x as i32;
+    let bz = cur.z as i32;
+    let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
+    for x in [bx, bx + 1] {
+        for z in [bz, bz + 1] {
+            for y in (types::WORLD_Y_MIN..=top_cell).rev() {
+                set_block(&mut a, BlockPos::new(x, y, z), types::BlockId::AIR).await;
+            }
+        }
+    }
+    // 等虚空移除 + 重生尝试(失败)。终点判据 = 旧身体 removed(虚空移除)+
+    // Possessed(None) 到达,**两条独立置位**(reap 的 Possessed(None) 与
+    // removed 帧同拍不同通道,先后顺序不可依赖——CI 时序不可判是 R1/R2/R3
+    // 的既证结论)。
+    let mut removed_seen = false;
+    let mut possessed_none = false;
+    let mut frames = 0usize;
+    loop {
+        if frames >= FRAME_BUDGET {
+            panic!(
+                "等出生点不可用的失败重生超预算:{FRAME_BUDGET} 帧;removed_seen={removed_seen} \
+                 possessed_none={possessed_none}(在等:虚空移除 → 重生失败 → Possessed(None))"
+            );
+        }
+        frames += 1;
+        advance_ticks(1).await;
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(&mut rxa).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    if removed.contains(&body) {
+                        removed_seen = true;
+                    }
+                }
+                Some(S2C::Possessed { entity: None }) => {
+                    possessed_none = true;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if removed_seen && possessed_none {
+            break;
+        }
+    }
+
+    drop(a);
+    let outcome = shutdown(h).await;
+    assert_eq!(
+        respawn_failed(&outcome),
+        1,
+        "出生点不可用:player_respawn_failed = 1(实得 {})",
+        outcome.agent.player_respawn_failed
+    );
+    assert_eq!(
+        respawned(&outcome),
+        0,
+        "player_respawned = 0(实得 {})",
+        outcome.agent.player_respawned
+    );
 }
