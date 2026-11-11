@@ -182,6 +182,10 @@ fn staging_executes_expanded_set_and_fill_in_batches() {
             StageOut::Command(EngineCommand::SetBlock { .. }) => set_count += 1,
             StageOut::Command(EngineCommand::Spawn { .. }) => panic!("布景段不发 spawn"),
             StageOut::Command(EngineCommand::Detonate { .. }) => panic!("布景段不发 detonate"),
+            StageOut::Command(EngineCommand::SpawnAgent { .. }) => panic!("布景段不发 spawn_agent"),
+            StageOut::Command(EngineCommand::Possess { .. }) => panic!("布景段不发 possess"),
+            StageOut::Command(EngineCommand::Unpossess) => panic!("布景段不发 unpossess"),
+            StageOut::Command(EngineCommand::AgentIntent { .. }) => panic!("布景段不发 intent"),
             StageOut::Remove(_) => panic!("布景段不应发 RemoveEntity"),
         }
     }

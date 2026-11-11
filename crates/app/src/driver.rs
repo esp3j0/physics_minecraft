@@ -790,6 +790,23 @@ pub struct ObserveOrchestrator {
     /// 观察者跟随簿记(连接 → 上次服务端设定观察者的位置):每拍身体位移
     /// 超 2 m 再移一次(§5;断线/解除附身即弃)。
     observer_follow: BTreeMap<messaging::InputSource, Vec3>,
+    /// 玩家出生点表(A06 §6"玩家回出生点"):连接 → 最近一次被接受的
+    /// `SpawnAgent` 的(位置, yaw, 身体名)。`handle_spawn_agent` 成功即覆盖
+    /// 写入;断线清掉。不进快照——重生动作走与网络请求同一条校验/日志路径,
+    /// 回放线由日志里的 SpawnAgent/Possess 自再生(D6 同款口径)。
+    agent_spawn_points: BTreeMap<messaging::InputSource, (Vec3, f32, String)>,
+    /// 玩家身体归属表(A06;主体 ID → 拥有连接):`handle_spawn_agent` 成功
+    /// 即插入;断线移除/虚空移除重生时清掉。虚空移除发生时内核已清 agents
+    /// 表、归属表也同步 release——靠本表反查"这是哪个连接的身体"。不进
+    /// 快照(回放线生成动作入日志,重新插表)。
+    player_bodies: BTreeMap<types::EntityId, messaging::InputSource>,
+    /// 重生待附身表(A06):连接 → 刚重生分配的实体 ID。生成命令下一拍
+    /// 才在内核生效(apply_at = 拍号,分片收件箱),同拍归属表扫不到——
+    /// 待下一拍该实体出现在归属表再走 `handle_possess`(成功计
+    /// `player_respawned`;失败计 `player_respawn_failed`)。
+    pending_respawn_possess: BTreeMap<messaging::InputSource, types::EntityId>,
+    /// 待附身等待拍数(宽限 3 拍;A06 内部簿记)。
+    respawn_possess_wait: u32,
     /// 迁移在途窗口的意图暂存(主体 → 最后一条):owner 查不到时存下,下一
     /// 拍 owner 出现再投递;同窗口多条只留最后一条(§4;被覆盖的计数)。
     pending_intents: PendingIntents,
@@ -832,6 +849,11 @@ pub struct AgentCounters {
     pub bodies_removed_on_disconnect: u64,
     /// 检查点恢复后第一拍移除的玩家身体数。
     pub bodies_removed_on_recovery: u64,
+    /// 玩家身体被虚空移除后在出生点重生并自动附身的次数(A06 §6)。
+    pub player_respawned: u64,
+    /// 重生失败次数(A06 §6:出生点 chunk 未装载/分片未注册;连接收到
+    /// `Possessed(None)` 回观察者状态)。
+    pub player_respawn_failed: u64,
 }
 
 impl std::ops::Add for AgentCounters {
@@ -849,6 +871,8 @@ impl std::ops::Add for AgentCounters {
                 + rhs.bodies_removed_on_disconnect,
             bodies_removed_on_recovery: self.bodies_removed_on_recovery
                 + rhs.bodies_removed_on_recovery,
+            player_respawned: self.player_respawned + rhs.player_respawned,
+            player_respawn_failed: self.player_respawn_failed + rhs.player_respawn_failed,
         }
     }
 }
@@ -889,6 +913,10 @@ impl ObserveOrchestrator {
             possessed_by: BTreeMap::new(),
             possessor_of: BTreeMap::new(),
             observer_follow: BTreeMap::new(),
+            agent_spawn_points: BTreeMap::new(),
+            player_bodies: BTreeMap::new(),
+            pending_respawn_possess: BTreeMap::new(),
+            respawn_possess_wait: 0,
             pending_intents: BTreeMap::new(),
             agent_counters: AgentCounters::default(),
             _cadence: cadence,
@@ -991,6 +1019,7 @@ impl ObserveOrchestrator {
     /// Some(player)`)、回 `S2C::Spawned`。yaw 只查有限(朝向由内核消费,
     /// 生成姿态的朝向即玩家所选)。
     #[allow(clippy::too_many_arguments)] // 校验链 + 日志/回执缝逐项透传(A03)
+    /// 返回 `Some(实体)` = 生成命令已投递(回执已发;内核下一拍生效)。
     fn handle_spawn_agent(
         &mut self,
         player: messaging::InputSource,
@@ -1000,11 +1029,11 @@ impl ObserveOrchestrator {
         session: &mut sim_api::session::Session,
         log: &mut sim_api::log::CommandLog,
         hub: &OutboundHub,
-    ) {
+    ) -> Option<types::EntityId> {
         // ① 身体名在注册表里(客户端只按名字引用身体,§2.1)。
         let Some(body_hash) = self.bodies.hash_of(&body_name) else {
             self.agent_counters.spawn_rejected += 1;
-            return;
+            return None;
         };
         // ② 坐标与 yaw 都是有限值;出生 y 在世界内。
         if !position.is_finite()
@@ -1012,7 +1041,7 @@ impl ObserveOrchestrator {
             || !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&(position.y.floor() as i32))
         {
             self.agent_counters.spawn_rejected += 1;
-            return;
+            return None;
         }
         // ③ 出生点所在 chunk 已加载,分片已注册(不自动建片,与外部 spawn
         // 同口径)。
@@ -1025,12 +1054,12 @@ impl ObserveOrchestrator {
         let shard = types::ShardId::new(types::WorldId(0), types::DimensionId(0), chunk.shard_of());
         if !session.shard_ids().contains(&shard) || !session.is_chunk_loaded(shard, chunk) {
             self.agent_counters.spawn_rejected += 1;
-            return;
+            return None;
         }
         // ④ 这个连接名下还没有存活的玩家身体(D1/D12:一个连接一个身体)。
         if self.player_body_of(session, player).is_some() {
             self.agent_counters.spawn_rejected += 1;
-            return;
+            return None;
         }
         // 全过:分配 ID、盖章投递(网络玩家的 source → 内核写 Some(player))、
         // 回执。生成状态:初速零、旋转 = 绕 y 轴 yaw(与 A02 意图朝向同口径)。
@@ -1043,7 +1072,15 @@ impl ObserveOrchestrator {
         match session.spawn_agent_from(player, shard, entity, body_hash, state) {
             Ok(entry) => {
                 log.append(entry);
+                // A06 §6"玩家回出生点":最近一次被接受的 SpawnAgent 即出生点
+                // A06 §6"玩家回出生点":最近一次被接受的 SpawnAgent 即出生点
+                // (位置 + yaw + 身体名,重生用);驱动内存,断线清、不进快照
+                // (重生动作经日志,回放自再生)。归属表反查虚空移除用。
+                self.agent_spawn_points
+                    .insert(player, (position, yaw, body_name));
+                self.player_bodies.insert(entity, player);
                 hub.push_critical(player, S2C::Spawned { entity });
+                return Some(entity);
             }
             Err(sim_api::session::SessionError::Route(shard::router::RouteError::InboxFull {
                 ..
@@ -1053,6 +1090,7 @@ impl ObserveOrchestrator {
                 self.agent_counters.spawn_rejected += 1;
             }
         }
+        None
     }
 
     /// 附身(C2S::Possess;A03 §3 表):
@@ -1342,6 +1380,10 @@ impl ObserveOrchestrator {
             }
             self.agent_counters.bodies_removed_on_disconnect += 1;
         }
+        // ②.5 出生点与身体归属清掉(A06 §6:断线连接的出生点不再有效;
+        // 重连是新连接、新身体,由新 SpawnAgent 重建)。
+        self.agent_spawn_points.remove(&player);
+        self.player_bodies.retain(|_, owner| *owner != player);
         // ③ 观察者移除(既有语义:断连票撤,幂等)。
         match session.remove_observer_from(player) {
             Ok(entry) => log.append(entry),
@@ -1392,6 +1434,113 @@ impl ObserveOrchestrator {
             self.observer_follow.remove(&player);
             self.pending_intents.remove(&entity);
             hub.push_critical(player, S2C::Possessed { entity: None });
+        }
+    }
+
+    /// 玩家回出生点(A06,§6"玩家回出生点"):每拍末调用,取走本拍被虚空
+    /// 移除的主体列表;逐个查归属表(哪条连接的玩家身体):
+    /// - 玩家身体 → 在该连接的出生点重生 + 自动附身。**生成与附身都走与
+    ///   网络请求同一条校验/日志路径**(`handle_spawn_agent`/
+    ///   `handle_possess`,经日志 → 回放再生,判据 A06-6);出生点不可用
+    ///   (chunk 未装载、分片未注册等,`handle_spawn_agent` 校验拒绝)→
+    ///   计 `player_respawn_failed`,连接保持观察者状态(`reap_removed_
+    ///   agents` 已发过 `Possessed(None)`;此处不重发、不计数重生成功)。
+    ///   成功 → 计 `player_respawned`。
+    /// - AI 主体(source = None)/服务端主体 → 只移除,不重生(§6 掉出
+    ///   世界行;A06-4 对照线)。
+    /// - 归属表查不到(断线移除、恢复清扫、本地受信通道的 RemoveEntity
+    ///   等其他移除)→ 不重生。本函数只消费虚空移除列表;其他移除根本
+    ///   不进来,断线/清扫路径连"虚空移除"事件都没有。
+    fn respawn_void_removed_players(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        let removed = session.take_void_removed_agents();
+        if removed.is_empty() {
+            return;
+        }
+        for entity in removed {
+            // 只重生玩家身体(归属表里有条目的);AI 主体不在表 → 跳过。
+            // 附身表(possessor_of)覆盖"服务端主体被玩家附身"的情形,不
+            // 能当玩家身体判据(附身服务端主体掉出世界 = AI 主体移除,
+            // §6 表:玩家身体回出生点,AI 主体移除)。
+            let Some(player) = self.player_bodies.remove(&entity) else {
+                continue;
+            };
+            // 出生点没有(不可能:插表与插出生点同处;防御性跳过)。
+            let Some((position, yaw, body)) = self.agent_spawn_points.get(&player).cloned() else {
+                continue;
+            };
+            // 生成走与网络请求同一条校验/日志路径;被拒(出生点 chunk 未
+            // 装载、分片未注册等)→ 失败计数,连接保持 reap 已发的
+            // Possessed(None)(回观察者状态)。
+            let had_body = self.player_body_of(session, player).is_some();
+            if had_body {
+                // 防御:连接已有身体(不该发生——虚空移除的正是它的身体);
+                // 不重生不计数,保持现状。
+                continue;
+            }
+            let spawned_entity =
+                self.handle_spawn_agent(player, body.clone(), position, yaw, session, log, hub);
+            let rejected = spawned_entity.is_none();
+            if rejected {
+                // 出生点不可用:失败计数;连接已收 Possessed(None)(reap)。
+                self.agent_counters.player_respawn_failed += 1;
+                continue;
+            }
+            // 生成成功:自动附身**跨拍**——生成命令 apply_at = 下一拍(分片
+            // 收件箱),同拍归属表还没有新身体。登记待附身表,下一拍实体
+            // 在归属表出现后再走 `handle_possess`(与网络请求同一条路径;
+            // Spawned 回执已在 handle_spawn_agent 内按顺序发出)。
+            self.pending_respawn_possess
+                .insert(player, spawned_entity.expect("rejected 已排除"));
+        }
+    }
+
+    /// 重生待附身的续随(每拍末,`respawn_void_removed_players` 之后):
+    /// 待附身表的实体已出现在归属表(内核已生成)→ 走 `handle_possess`
+    /// (与网络请求同一条路径),成功计 `player_respawned`。等 3 拍还不
+    /// 出现 → 计失败、清表(生成命令被内核拒绝的情形)。
+    fn flush_pending_respawn_possess(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        if self.pending_respawn_possess.is_empty() {
+            return;
+        }
+        let entries: Vec<(messaging::InputSource, types::EntityId)> = self
+            .pending_respawn_possess
+            .iter()
+            .map(|(&p, &e)| (p, e))
+            .collect();
+        let mut waited: Vec<messaging::InputSource> = Vec::new();
+        for (player, entity) in entries {
+            if session.entity_owner(entity).is_some() && session.is_agent(entity) {
+                self.pending_respawn_possess.remove(&player);
+                let before = self.agent_counters.possess_rejected;
+                self.handle_possess(player, entity, session, log, hub);
+                if self.agent_counters.possess_rejected > before {
+                    self.agent_counters.player_respawn_failed += 1;
+                } else {
+                    self.agent_counters.player_respawned += 1;
+                }
+            } else {
+                waited.push(player);
+            }
+        }
+        // 未出现的按拍计数,超过宽限(3 拍)计失败清掉。
+        self.respawn_possess_wait += 1;
+        if self.respawn_possess_wait >= 3 {
+            for player in waited {
+                if self.pending_respawn_possess.remove(&player).is_some() {
+                    self.agent_counters.player_respawn_failed += 1;
+                }
+            }
+            self.respawn_possess_wait = 0;
         }
     }
 
@@ -2267,6 +2416,11 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     // 下一拍投递 → 观察者跟随检查。都在本拍 net_up 消费与输出
                     // 之间,投递/移动经日志盖章本拍。
                     orchestrator.reap_removed_agents(&session, hub);
+                    // 玩家回出生点(A06 §6):虚空移除的玩家身体在出生点重生
+                    // 并自动附身(与网络请求同一条校验/日志路径);AI 主体只
+                    // 移除。在 reap 之后(被迫解除先落地,重生回执随后)。
+                    orchestrator.respawn_void_removed_players(&mut session, &mut log, hub);
+                    orchestrator.flush_pending_respawn_possess(&mut session, &mut log, hub);
                     orchestrator.flush_pending_intents(&mut session, &mut log);
                     orchestrator.follow_observers(&mut session, &mut log, hub);
                     orchestrator.emit_outputs(&session, hub, session.tick_now(), *cadence);
@@ -6942,6 +7096,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             (4..12).map(|v| v as f32).collect::<Vec<_>>(),
             "最旧 4 条被弹,首条 = 第 5 次(supply = 4)"
+        );
+    }
+
+    /// A06 §6"玩家回出生点 = **最近一次**被接受的 SpawnAgent":同一连接
+    /// 先后在 A、B 两点生成,出生点表必须是 B。会变红的实现:`or_insert`
+    /// 只记第一次(重生回 A,玩家穿越了行程)。
+    #[test]
+    fn a06_spawn_point_overwrites_latest_accepted() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        // 生成点所在 chunk 必须已装载(A 点 → chunk (0,0),B 点 → (2,0))。
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(2, 0),
+            voxel::Chunk::air(),
+        );
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let hub = OutboundHub::new();
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::with_bodies(ObserveCadence::default(), 0, bodies);
+        let player = messaging::InputSource(1);
+        // 第一次生成(A 点):成功,出生点 = A。
+        let pos_a = types::glam::Vec3::new(8.5, -58.0, 8.5);
+        let first = o.handle_spawn_agent(
+            player,
+            "capsule".to_owned(),
+            pos_a,
+            0.0,
+            &mut session,
+            &mut log,
+            &hub,
+        );
+        assert!(first.is_some(), "A 点生成被接受");
+        assert_eq!(
+            o.agent_spawn_points.get(&player).map(|(p, ..)| *p),
+            Some(pos_a)
+        );
+        // 第二次生成(B 点):出生点覆盖为 B(最近一次被接受)。
+        let pos_b = types::glam::Vec3::new(40.5, -58.0, 12.5);
+        let second = o.handle_spawn_agent(
+            player,
+            "capsule".to_owned(),
+            pos_b,
+            90.0,
+            &mut session,
+            &mut log,
+            &hub,
+        );
+        assert!(second.is_some(), "B 点生成被接受");
+        assert_eq!(
+            o.agent_spawn_points.get(&player).map(|(p, ..)| *p),
+            Some(pos_b),
+            "出生点 = 最近一次被接受的 SpawnAgent(B)"
+        );
+        assert_eq!(
+            o.agent_spawn_points.get(&player).map(|(_, yaw, _)| *yaw),
+            Some(90.0_f32)
         );
     }
 }

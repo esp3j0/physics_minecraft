@@ -111,6 +111,33 @@ pub enum Action {
         expect: String,
         hud: bool,
     },
+    /// 主体生成(A06 §4):发 `SpawnAgent`(body 固定 capsule 资产——viewer
+    /// 冒烟统一用玩家胶囊;`at` = 出生位置),收到 `Spawned` 后登记标签。
+    /// 一个场景最多一个身体(放行 §4;第二条 spawn_agent = 解析错误)。
+    SpawnAgent {
+        at: Vec3,
+        yaw: f32,
+        label: String,
+    },
+    /// 附身(A06 §4):`follow` 缺省 false(相机不动,冒烟截图机位确定);
+    /// true 时切第三人称跟随。
+    Possess {
+        label: String,
+        follow: bool,
+    },
+    /// 解除附身(A06 §4)。
+    Unpossess,
+    /// 主体意图(A06 §4):持续生效,直到下一条 `intent`;`move` = 世界系
+    /// 水平速度 (vx, vz),`yaw` 度,`jump` 一次性。
+    Intent {
+        mv: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    },
+    /// 记下当前主体根位置(A06 §4;供 `agent_moved` 用)。
+    MarkAgent {
+        label: String,
+    },
 }
 
 /// 生成位置:绝对坐标,或相机前方 `ahead` 米再抬高 `lift` 米。
@@ -162,6 +189,23 @@ pub enum Check {
     NoFloating {
         height: f32,
         still_ticks: u64,
+    },
+    /// 主体根位置在闭区间盒内(A06 §4;`from`/`to` 各分量不要求有序)。
+    AgentIn {
+        label: String,
+        from: Vec3,
+        to: Vec3,
+    },
+    /// 主体相对 `mark_agent` 记录点的位移满足比较(A06 §4;米,`ge`/`le`
+    /// 恰一个——None 侧 = 无该向约束;两个都 None = 解析错误)。
+    AgentMoved {
+        label: String,
+        ge: Option<f32>,
+        le: Option<f32>,
+    },
+    /// 主体存活(A06 §4;标签对应的主体在主体表中)。
+    AgentAlive {
+        label: String,
     },
 }
 
@@ -220,6 +264,11 @@ pub trait WorldQuery {
     fn entity_shape(&self, _id: EntityId) -> Option<&CompoundShape> {
         None
     }
+    /// 当前唯一主体及其根位置(A06 §4;一场景一身体。无主体 → None)。
+    /// 假世界可不实现(默认 None)。
+    fn live_agent(&self) -> Option<(EntityId, Vec3)> {
+        None
+    }
 }
 
 /// 一帧的输入。
@@ -231,6 +280,10 @@ pub struct FrameInput<'a> {
     pub world: &'a dyn WorldQuery,
     /// 自上一帧以来收到的 `Spawned` 回执(按到达顺序)。
     pub spawned: &'a [EntityId],
+    /// 自上一帧以来收到的、属于 `spawn_agent` 请求的 `Spawned` 回执
+    /// (A06 §4;渲染层按请求顺序从总回执里摘出——SendAgentAgent 逐条
+    /// 不混批,一条 spawn_agent 恰一条回执;空 = 无主体回执)。
+    pub agent_spawned: &'a [EntityId],
 }
 
 /// 引擎要求渲染层发给服务器的命令。
@@ -250,6 +303,24 @@ pub enum EngineCommand {
     SetBlock {
         pos: BlockPos,
         block: BlockId,
+    },
+    /// 主体生成(A06 §4;发送层转 `C2S::SpawnAgent`,逐条不混批)。
+    SpawnAgent {
+        position: Vec3,
+        yaw: f32,
+    },
+    /// 附身(A06 §4;发送层转 `C2S::Possess`)。
+    Possess {
+        entity: EntityId,
+    },
+    /// 解除附身(A06 §4;发送层转 `C2S::Unpossess`)。
+    Unpossess,
+    /// 主体意图(A06 §4;发送层转 `C2S::AgentIntent`;move_xz 世界系)。
+    AgentIntent {
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
     },
 }
 
@@ -319,6 +390,9 @@ pub struct FrameOutput {
     pub screenshot: Option<ScreenshotRequest>,
     /// 本帧内结束的步骤(按序)。
     pub finished: Vec<StepRecord>,
+    /// A06 §4:脚本附身状态(Some = 已附身主体;follow 是否切第三人称)。
+    /// 渲染层据此决定相机模式(follow = false 时相机保持 fly 位姿)。
+    pub possess: Option<(EntityId, bool)>,
 }
 
 /// 引擎状态。

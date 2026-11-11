@@ -5,10 +5,14 @@
 //! 窗口编排。bin 入口在 main.rs(双 target 各自编译,窗口行为不测试,
 //! ACV4 手动清单)。
 
+/// REQ-012 A06:哈希 → 形状表(纯逻辑,零 macroquad)。
+pub mod bodies;
 /// REQ-008:命令行参数(交互 / 脚本模式)。
 pub mod cli;
 pub mod client;
 pub mod mesh;
+/// REQ-012 A06:附身状态机与意图映射(纯逻辑,零 macroquad)。
+pub mod possess;
 pub mod render;
 /// REQ-008:场景脚本(纯逻辑,零 macroquad)。
 pub mod script;

@@ -282,6 +282,9 @@ pub struct Scheduler {
     /// 本拍方块写入的 owner 发布集(REQ-005 D11:tick 内收集,两拍之间经
     /// `take_block_updates` 取走;恰一次语义)。
     block_updates: Vec<(ShardId, BlockPos, BlockId)>,
+    /// 本拍被虚空移除的主体 ID(A06 §6"玩家回出生点";tick 屏障阶段收集,
+    /// `take_void_removed_agents` 取走即清;不入快照——见方法文档)。
+    void_removed_agents: Vec<EntityId>,
     /// despawn 候选(tick 步骤 7 记录;只记录不清,两拍之间可重复取)。
     despawn_requests: BTreeSet<ShardId>,
     /// 下一个涌现实体序号(REQ-009 §7;从 1 起,单调、不复用,入调度器快照)。
@@ -345,6 +348,7 @@ impl Scheduler {
             activation_requests: BTreeMap::new(),
             solidified: Vec::new(),
             block_updates: Vec::new(),
+            void_removed_agents: Vec::new(),
             despawn_requests: BTreeSet::new(),
             next_emergent_seq: 1,
             pending_emergent_spawns: Vec::new(),
@@ -840,6 +844,16 @@ impl Scheduler {
     /// 可见,owner 持久化前差一拍——任务书语义已接受)。
     pub fn take_block_updates(&mut self) -> Vec<(ShardId, BlockPos, BlockId)> {
         std::mem::take(&mut self.block_updates)
+    }
+
+    /// 本拍被虚空移除的**主体** ID 列表(REQ-012 A06 §6"玩家回出生点"):
+    /// tick 屏障阶段从各分片 `Outbox::void_removed` 过滤出主体(`ShardSim::
+    /// is_agent`——注意此时该实体的 agents 记录已被内核清除,过滤用调度器
+    /// 拍前主体账本 [`Self::agent_void_watch`]),取走即清(恰一次)。普通
+    /// 实体的虚空移除不在列。**不入快照**(驱动内存,与附身表同款;回放线
+    /// 重生动作在日志里,本列表只服务在线驱动的"下一拍重生"判定)。
+    pub fn take_void_removed_agents(&mut self) -> Vec<EntityId> {
+        std::mem::take(&mut self.void_removed_agents)
     }
 
     /// 分片全实体表(REQ-003 §4.4 观察输出源①;任务书 00 签名固定):
@@ -1720,6 +1734,12 @@ impl Scheduler {
             }
         }
         let table_for_step = shape_table.clone();
+        // A06 §6"玩家回出生点"的主体账本:分片移出前的主体 ID 集(本拍
+        // 开始前的状态)。虚空移除发生在 worker 内(内核清 agents 表后才
+        // push outbox.void_removed),屏障后无法再用 is_agent 判定——本集
+        // 即"哪些 void_removed 实体是主体"的唯一依据。每拍重建,不进快照。
+        let agents_before_step: std::collections::BTreeSet<EntityId> =
+            self.sims.values().flat_map(|sim| sim.agent_ids()).collect();
         let sims = std::mem::take(&mut self.sims);
         let stepped_shards = sims.len();
         let mut slots: Vec<WorkerJob> = (0..self.cfg.worker_count).map(|_| Vec::new()).collect();
@@ -1785,7 +1805,16 @@ impl Scheduler {
         self.solidified.clear();
         // 方块写入收集(REQ-005 D11):同款恰一次;owner 过滤逐条判定。
         self.block_updates.clear();
+        // A06 §6"玩家回出生点":本拍被虚空移除的主体收集(取走即清)。
+        self.void_removed_agents.clear();
         for (shard, (sim, mut outbox, shard_events)) in results {
+            // 虚空移除的主体(§6):outbox.void_removed ∩ 拍前主体账本。
+            // 普通实体的虚空移除不入列(驱动只重生玩家身体)。
+            for id in &outbox.void_removed {
+                if agents_before_step.contains(id) {
+                    self.void_removed_agents.push(*id);
+                }
+            }
             // 地形破坏遥测(REQ-009 §8):本分片本拍计数并入合计(加法可交换)。
             destruction.add(&outbox.destruction_stats);
             // 粘结与整块塌落遥测(REQ-010 §11):同款并入合计。

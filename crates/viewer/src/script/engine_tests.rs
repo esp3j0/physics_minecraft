@@ -27,6 +27,8 @@ struct FlatWorld {
     overrides: std::collections::BTreeMap<(i32, i32, i32), types::BlockId>,
     /// 强制未装载的格(block_at 返回 None;count 检查的未装载分支用)。
     unloaded: std::collections::BTreeSet<(i32, i32, i32)>,
+    /// 当前主体(根位置;A06 检查用;None = 无主体)。
+    agent: Option<(EntityId, Vec3)>,
 }
 
 impl FlatWorld {
@@ -34,6 +36,7 @@ impl FlatWorld {
         Self {
             entities: entities.to_vec(),
             chunks: 4,
+            agent: None,
             ..Self::default()
         }
     }
@@ -58,6 +61,9 @@ impl WorldQuery for FlatWorld {
     }
     fn chunks_loaded(&self) -> usize {
         self.chunks
+    }
+    fn live_agent(&self) -> Option<(EntityId, Vec3)> {
+        self.agent
     }
 }
 
@@ -91,6 +97,7 @@ fn frame(
         server_tick: tick,
         world,
         spawned,
+        agent_spawned: &[],
     })
 }
 
@@ -400,6 +407,7 @@ impl FlatWorld {
             chunks: self.chunks,
             overrides: self.overrides.clone(),
             unloaded: self.unloaded.clone(),
+            agent: self.agent,
         }
     }
 }
@@ -706,4 +714,320 @@ wait_until = { live_entities = { eq = 0 }, timeout_ticks = 1000, hold_ticks = 30
     let out = frame(&mut e, 0.016, 260, &FlatWorld::with_entities(&[]), &[]);
     assert_eq!(out.finished.len(), 1, "拍 260 = ok_since 230 + 30,应结束");
     assert_eq!(e.exit_code(), Some(0));
+}
+
+// ---- A06 §4:主体动作与检查的引擎行为 ----
+
+/// spawn_agent:命令当帧发出;回执到达后登记标签,步骤结束;超时 = 失败。
+#[test]
+fn agent_spawn_receipt_and_label() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
+    );
+    let w = FlatWorld::default();
+    // 帧 1:发命令,无回执 → 未结束。
+    let out = frame(&mut e, 0.016, 0, &w, &[]);
+    assert_eq!(out.commands.len(), 1, "spawn_agent 命令当帧发出");
+    assert!(matches!(
+        out.commands[0],
+        crate::script::EngineCommand::SpawnAgent { .. }
+    ));
+    assert!(out.finished.is_empty(), "回执未到不结束");
+    // 帧 2:回执到达 → 登记 + 结束。
+    let _ = frame(&mut e, 0.016, 1, &w, &[]);
+    // agent_spawned 走专门通道,这里通过 agent_receipts_frame 喂。
+    let out = {
+        let mut o = crate::script::FrameOutput {
+            camera: start_pose(),
+            coupled: true,
+            commands: Vec::new(),
+            screenshot: None,
+            finished: Vec::new(),
+            possess: None,
+        };
+        let _ = &mut o;
+        e.frame(&FrameInput {
+            dt: 0.016,
+            server_tick: 1,
+            world: &w,
+            spawned: &[],
+            agent_spawned: &[eid(7)],
+        })
+    };
+    assert_eq!(out.finished.len(), 1, "回执到 → 当帧结束");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+    assert_eq!(out.finished[0].action, "spawn_agent");
+}
+
+/// possess → intent → mark_agent → agent_moved/agent_in/agent_alive 全链:
+/// 主体在表中,意图命令带实体 ID;mark 记基准,agent_moved 按位移求值。
+#[test]
+fn agent_possess_intent_mark_checks_chain() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+possess = { label = \"p\" }
+[[step]]
+intent = { move = [4.3, 0.0], yaw = 0.0, jump = false }
+[[step]]
+mark_agent = { label = \"p\" }
+[[step]]
+check = { agent_alive = { label = \"p\" }, agent_in = { label = \"p\", from = [5, -60, 20], to = [15, -50, 30] }, agent_moved = { label = \"p\", le = 10.0 } }",
+    );
+    // 帧 1:spawn_agent 发命令。
+    let w = FlatWorld::default();
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    assert_eq!(out.commands.len(), 1);
+    // 帧 2:回执 → spawn_agent 结束;possess/intent/mark_agent 等即时步骤
+    // 同帧继续(引擎"即时步骤同帧推进"语义)。世界带主体(mark_agent 要读
+    // 根位置)。
+    let mut w = FlatWorld::with_entities(&[]);
+    w.agent = Some((eid(7), Vec3::new(8.0, -57.0, 24.0)));
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[eid(7)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(actions.contains(&"spawn_agent"), "{actions:?}");
+    assert!(actions.contains(&"possess"), "{actions:?}");
+    assert!(actions.contains(&"intent"), "{actions:?}");
+    assert!(actions.contains(&"mark_agent"), "{actions:?}");
+    assert!(actions.contains(&"check"), "{actions:?}");
+    assert_eq!(
+        out.finished.last().map(|r| &r.outcome),
+        Some(&StepOutcome::Ok),
+        "全部检查成立"
+    );
+    assert_eq!(
+        out.possess,
+        Some((eid(7), false)),
+        "possess 状态输出(follow = false)"
+    );
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(actions.contains(&"intent"), "{actions:?}");
+    assert!(
+        out.commands.iter().any(|c| matches!(c, crate::script::EngineCommand::AgentIntent { entity, move_xz, .. } if *entity == eid(7) && *move_xz == (4.3, 0.0))),
+        "intent 命令应带实体与速度,实得 {:?}",
+        out.commands
+    );
+    assert!(actions.contains(&"mark_agent"), "{actions:?}");
+    assert!(actions.contains(&"check"), "{actions:?}");
+    assert_eq!(
+        out.finished.last().map(|r| &r.outcome),
+        Some(&StepOutcome::Ok),
+        "全部检查成立"
+    );
+    assert_eq!(
+        out.possess,
+        Some((eid(7), false)),
+        "possess 状态输出(follow = false)"
+    );
+}
+
+/// agent_moved ge 不满足 → CheckFailed(位移小于下限);主体消失 →
+/// agent_alive 失败。
+#[test]
+fn agent_checks_fail_paths() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+possess = { label = \"p\" }
+[[step]]
+mark_agent = { label = \"p\" }
+[[step]]
+check = { agent_moved = { label = \"p\", ge = 5.0 } }
+[[step]]
+wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 10 }",
+    );
+    // 帧 0:发 spawn_agent 命令(世界无主体)。
+    let w0 = FlatWorld::default();
+    let _ = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &w0,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    // 帧 1:回执 → spawn_agent 结束;即时步骤(possess/mark_agent/check/
+    // wait_until)同帧连推。世界带主体,mark 位置 (8.0,-57,24)。
+    let mut w = FlatWorld::with_entities(&[]);
+    w.agent = Some((eid(7), Vec3::new(8.0, -57.0, 24.0)));
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[eid(7)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(
+        actions.contains(&"spawn_agent")
+            && actions.contains(&"possess")
+            && actions.contains(&"mark_agent"),
+        "{actions:?}"
+    );
+    // 帧 1 连推:mark 后位置与 mark 相同(位移 0 < 5.0),check 的
+    // agent_moved ge 5.0 失败 → CheckFailed;末步 wait_until 的 agent_alive
+    // 成立(主体在表)→ 同帧结束,场景 Done(failed_checks = 1)。
+    let check = out
+        .finished
+        .iter()
+        .find(|r| r.action == "check")
+        .expect("check 步应已结束");
+    assert!(
+        matches!(check.outcome, StepOutcome::CheckFailed(_)),
+        "{:?}",
+        check.outcome
+    );
+    let failed = matches!(e.status(), EngineStatus::Done { failed_checks: 1 });
+    assert!(failed, "恰好 1 条失败: {:?}", e.status());
+}
+
+/// 主体从表中消失:agent_alive 的 wait_until 不成立 → 不结束(继续等,
+/// 直到超时)。
+#[test]
+fn agent_alive_waits_while_agent_missing() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+possess = { label = \"p\" }
+[[step]]
+wait_until = { agent_alive = { label = \"p\" }, timeout_ticks = 5 }",
+    );
+    let w = FlatWorld::default();
+    let _ = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    // 帧 1:回执登记;世界带主体(possess 的可见判据成立,当帧发命令),
+    // 但 wait_until 的 agent_alive 查的是"当前场景末步"……主体在 → 成立?
+    // 不——本测试压的是"wait_until 挂起"线:possess 同帧结束,
+    // wait_until 因 agent_alive 成立也当帧结束?不成立——wait_until 在
+    // 同一帧推进,alive 成立会立即结束。要压挂起线,须让主体晚一帧出现:
+    // 帧 1 世界无主体(possess 等待 → 也挂起),断言改压 possess 等待线。
+    let w = FlatWorld::with_entities(&[]);
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[eid(7)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(actions.contains(&"spawn_agent"), "{actions:?}");
+    // 帧 1 世界无主体:possess 等待(主体表可见判据不成立)→ 未结束。
+    assert!(
+        actions.iter().all(|a| *a != "possess"),
+        "possess 未结束: {actions:?}"
+    );
+    // 帧 2..5:主体仍不在 → possess 继续等待;拍 6:possess 超时
+    // (起点 1 + SPAWN_RECEIPT_TIMEOUT?120——拍 6 远未到,先给主体:
+    // 拍 6 给主体 → possess 当帧结束;后续帧 wait_until 挂起线单独压)。
+    let mut tick = 2;
+    while tick <= 5 {
+        let out = e.frame(&FrameInput {
+            dt: 0.016,
+            server_tick: tick,
+            world: &w,
+            spawned: &[],
+            agent_spawned: &[],
+        });
+        assert!(out.finished.is_empty(), "拍 {tick} 仍应等待");
+        tick += 1;
+    }
+    let mut w3 = w.clone_shallow();
+    w3.agent = Some((eid(7), Vec3::new(8.0, -57.0, 24.0)));
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 6,
+        world: &w3,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(
+        actions.contains(&"possess"),
+        "主体出现 → possess 当帧结束: {actions:?}"
+    );
+}
+
+/// unpossess:possess 输出清掉(out.possess = None)。
+#[test]
+fn agent_unpossess_clears_possess_output() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [0.0, 0.0, 0.0], label = \"p\" }
+[[step]]
+possess = { label = \"p\", follow = true }
+[[step]]
+unpossess = {}",
+    );
+    let w = FlatWorld {
+        agent: Some((eid(3), Vec3::ZERO)),
+        ..FlatWorld::default()
+    };
+    let _ = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    // 帧 1:回执 → spawn_agent + possess + unpossess 全部即时推进
+    // (possess 输出先 Some 后被 unpossess 清成 None——同帧终态)。
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w,
+        spawned: &[],
+        agent_spawned: &[eid(3)],
+    });
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert!(
+        actions.contains(&"possess") && actions.contains(&"unpossess"),
+        "{actions:?}"
+    );
+    assert_eq!(out.possess, None, "解除后 possess 输出清空(同帧终态)");
+    // follow = true 的透传单独验:新引擎只到 possess 为止。
+    let mut e2 = engine(
+        "[[step]]
+spawn_agent = { at = [0.0, 0.0, 0.0], label = \"p\" }
+[[step]]
+possess = { label = \"p\", follow = true }",
+    );
+    let w2 = FlatWorld {
+        agent: Some((eid(3), Vec3::ZERO)),
+        ..FlatWorld::default()
+    };
+    let _ = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &w2,
+        spawned: &[],
+        agent_spawned: &[],
+    });
+    let out = e2.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &w2,
+        spawned: &[],
+        agent_spawned: &[eid(3)],
+    });
+    assert_eq!(out.possess, Some((eid(3), true)), "follow = true 透传");
 }

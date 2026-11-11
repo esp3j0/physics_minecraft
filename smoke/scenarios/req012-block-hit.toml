@@ -1,0 +1,70 @@
+name = "req012-block-hit"
+req = "REQ-012"
+description = "土方块平抛斜砸站着的胶囊:胶囊被打出横向位移(实测 1.166 m,下限 0.3),落点周围地面区域 dirt 格数砸前砸后相等(地形不变,§11 第 2 行)"
+timeout_secs = 240
+
+[server]
+world_seed = 5
+
+[[step]]
+camera = { pos = [10.0, -50.0, 24.0], yaw = -90.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [10.0, -58.5, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+# 胶囊站立在 (8.5, 顶面 + 0.95, 14.5)。
+[[step]]
+label = "生成胶囊"
+spawn_agent = { at = [8.5, -59.05, 14.5], yaw = 0.0, label = "hero" }
+
+[[step]]
+possess = { label = "hero" }
+
+[[step]]
+wait_until = { agent_alive = { label = "hero" }, timeout_ticks = 120 }
+
+# 站稳(落定 40 拍)后记基准点。
+[[step]]
+wait_ticks = { n = 40 }
+
+[[step]]
+mark_agent = { label = "hero" }
+
+# 落点周围地面区域(6×1×6,含砸点)砸前 dirt 计数。
+[[step]]
+label = "砸前地面计数"
+check = { count = { from = [5, -61, 11], to = [12, -61, 18], is = "dirt", ge = 30 } }
+
+# 土方块斜砸(现场标定:正砸位移 0.000(A02b 已知,法向冲量竖直传地);
+# 平抛命中头顶:从 y=−57.7 落到头顶 −58.2 需 ~19 拍,横速 5 m/s 同期位移
+# 1.6 m,spawn x = 8.5−1.6 = 6.9,命中瞬间锤块在胶囊头顶偏西)。
+[[step]]
+label = "土方块斜砸"
+spawn = { at = [6.9, -57.7, 14.5], count = 1, velocity = [5.0, 0.0, 0.0], label = "hammer" }
+
+# 等砸中(锤块变成活实体后 ~55 拍落地;再等凝固)。
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 90 }
+
+[[step]]
+screenshot = { name = "after-hit", expect = "画面中有一个灰色立方体(锤块已凝固)落在一截粉色竖直胶囊的旁边,两者相邻;地面没有大范围缺失(地形没有被砸破)" }
+
+# 胶囊位移下限(现场标定:正砸位移 0.000(A02b 已知);改平抛斜砸后实测
+# 位移 1.166 m,下限 0.3 m ≈ 实测的 1/4,余量防跑偏)。
+[[step]]
+label = "位移下限(标定)"
+check = { agent_moved = { label = "hero", ge = 0.3 } }
+
+[[step]]
+label = "砸后地面计数(不变)"
+check = { count = { from = [5, -61, 11], to = [12, -61, 18], is = "dirt", ge = 30 } }
+
+[[step]]
+label = "主体仍存活"
+check = { agent_alive = { label = "hero" } }

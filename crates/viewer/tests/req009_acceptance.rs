@@ -46,6 +46,7 @@ fn frame(e: &mut Engine, tick: u64) -> FrameOutput {
         server_tick: tick,
         world: &World,
         spawned: &[],
+        agent_spawned: &[],
     })
 }
 

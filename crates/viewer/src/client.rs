@@ -60,6 +60,17 @@ pub enum ViewEvent {
     },
     /// 断连(对端 Bye/EOF/IO 失败;reason = 尽力还原的说明)。
     Disconnected { reason: String },
+    /// 主体状态流(REQ-012 A06):`(EntityId, BodyHash, 连杆姿态列表)`;
+    /// 增量/全量/removed 语义与 [`ViewEvent::Entities`] 同款。
+    Agents {
+        tick: Tick,
+        states: Vec<(EntityId, types::BodyHash, Vec<EntityState>)>,
+        removed: Vec<EntityId>,
+        full: bool,
+    },
+    /// 附身回执(REQ-012 A06):`Some` = 附身的主体;`None` = 回到飞行相机
+    /// (主动解除或被服务器被迫解除)。
+    Possessed { entity: Option<EntityId> },
 }
 
 /// 控制端(主循环 → 连接循环):观察者移动与主动离场。
@@ -87,6 +98,26 @@ pub(crate) enum Control {
     /// 调试遥测订阅(REQ-011 §3.5.2;W04:连接循环发 `C2S::SubscribeDebug`,
     /// 服务端开始按 10 拍下发 [`S2C::DebugStats`];重复发送幂等)。
     SubscribeDebug,
+    /// 主体生成(A06 §2:连接循环发 `C2S::SpawnAgent`;回执复用
+    /// [`ViewEvent::Spawned`]——与方块 Spawn 按请求顺序对应,见
+    /// [`PossessState`] 的请求队列)。
+    SpawnAgent {
+        body: String,
+        position: Vec3,
+        yaw: f32,
+    },
+    /// 附身(A06 §2;连接循环发 `C2S::Possess`)。
+    Possess { entity: EntityId },
+    /// 解除附身(A06 §2;连接循环发 `C2S::Unpossess`)。
+    Unpossess,
+    /// 主体意图(A06 §2;连接循环发 `C2S::AgentIntent`;move_xz 为**世界系**
+    /// 水平速度)。
+    AgentIntent {
+        entity: EntityId,
+        move_xz: (f32, f32),
+        yaw: f32,
+        jump: bool,
+    },
     /// 主动离场(`C2S::Goodbye`)。
     Goodbye,
 }
@@ -128,6 +159,35 @@ impl ControlHandle {
     /// 每 10 拍回 [`S2C::DebugStats`] → [`ViewEvent::DebugStats`])。
     pub fn subscribe_debug(&self) {
         let _ = self.tx.try_send(Control::SubscribeDebug);
+    }
+
+    /// 发主体生成请求(A06 §2;服务端校验分配 ID,回执 `Spawned`)。
+    pub fn spawn_agent(&self, body: String, position: Vec3, yaw: f32) {
+        let _ = self.tx.try_send(Control::SpawnAgent {
+            body,
+            position,
+            yaw,
+        });
+    }
+
+    /// 发附身请求(A06 §2;回执 `Possessed`)。
+    pub fn possess(&self, entity: EntityId) {
+        let _ = self.tx.try_send(Control::Possess { entity });
+    }
+
+    /// 发解除附身(A06 §2;回执 `Possessed(None)`)。
+    pub fn unpossess(&self) {
+        let _ = self.tx.try_send(Control::Unpossess);
+    }
+
+    /// 发主体意图(A06 §2;保持状态——服务端直到下一条意图;move_xz 世界系)。
+    pub fn agent_intent(&self, entity: EntityId, move_xz: (f32, f32), yaw: f32, jump: bool) {
+        let _ = self.tx.try_send(Control::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            jump,
+        });
     }
 
     /// 主动离场(尽力而为;连接亡故时静默)。
@@ -219,10 +279,21 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
             counters,
             recent,
         }),
-        // 主体协议面(REQ-012 A03;枚举只追加):viewer 侧 A06 才接附身模式
-        // 与相机,先映射 None 让 viewer 编译过(主体流对渲染无意义即吞掉,
-        // 与 Pong 同款)。
-        S2C::AgentStates { .. } | S2C::Possessed { .. } => None,
+        // 主体协议面(REQ-012 A03):A06 接附身模式与主体渲染——
+        // AgentStates/Possessed 一比一映射成事件(与 Pong 不同:渲染/附身
+        // 状态机要消费)。
+        S2C::AgentStates {
+            tick,
+            states,
+            removed,
+            full,
+        } => Some(ViewEvent::Agents {
+            tick,
+            states,
+            removed,
+            full,
+        }),
+        S2C::Possessed { entity } => Some(ViewEvent::Possessed { entity }),
     }
 }
 
@@ -399,6 +470,40 @@ async fn run_connection(
                         break 'read;
                     }
                 }
+                Some(Control::SpawnAgent { body, position, yaw }) => {
+                    let frame = encode_c2s_frame(&C2S::SpawnAgent { body, position, yaw });
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
+                Some(Control::Possess { entity }) => {
+                    let frame = encode_c2s_frame(&C2S::Possess { entity });
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
+                Some(Control::Unpossess) => {
+                    let frame = encode_c2s_frame(&C2S::Unpossess);
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
+                Some(Control::AgentIntent {
+                    entity,
+                    move_xz,
+                    yaw,
+                    jump,
+                }) => {
+                    let frame = encode_c2s_frame(&C2S::AgentIntent {
+                        entity,
+                        move_xz,
+                        yaw,
+                        jump,
+                    });
+                    if write_all(&mut stream, &frame).await.is_err() {
+                        break 'read;
+                    }
+                }
                 Some(Control::Goodbye) => {
                     let frame = encode_c2s_frame(&C2S::Goodbye);
                     let _ = write_all(&mut stream, &frame).await; // 尽力;随后读 EOF
@@ -556,6 +661,30 @@ mod tests {
                     },
                 )],
             },
+            // A06:主体流(增量 + 全量空包)与附身回执(Some/None)。
+            S2C::AgentStates {
+                tick: Tick(50),
+                states: vec![(
+                    EntityId::from_parts(0, 7),
+                    types::BodyHash::fnv1a(b"capsule"),
+                    vec![EntityState {
+                        translation: Vec3::new(1.0, 2.0, 3.0),
+                        ..EntityState::default()
+                    }],
+                )],
+                removed: vec![EntityId::from_parts(0, 8)],
+                full: false,
+            },
+            S2C::AgentStates {
+                tick: Tick(51),
+                states: vec![],
+                removed: vec![],
+                full: true,
+            },
+            S2C::Possessed {
+                entity: Some(EntityId::from_parts(0, 7)),
+            },
+            S2C::Possessed { entity: None },
         ];
 
         for case in cases {
@@ -629,6 +758,29 @@ mod tests {
                     }),
                 ) => {
                     assert_eq!((t, c, r), (tick, counters, recent), "DebugStats 字段一致");
+                }
+                (
+                    S2C::AgentStates {
+                        tick,
+                        states,
+                        removed,
+                        full,
+                    },
+                    Some(ViewEvent::Agents {
+                        tick: t,
+                        states: s,
+                        removed: r,
+                        full: f,
+                    }),
+                ) => {
+                    assert_eq!(
+                        (t, s, r, f),
+                        (tick, states, removed, full),
+                        "AgentStates 一致"
+                    );
+                }
+                (S2C::Possessed { entity }, Some(ViewEvent::Possessed { entity: e })) => {
+                    assert_eq!(e, entity, "Possessed 字段一致");
                 }
                 (S2C::Pong, None) => {}
                 (original, event) => panic!("变体 {original:?} 映射不符: {event:?}"),

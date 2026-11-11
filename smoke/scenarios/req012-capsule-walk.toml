@@ -1,0 +1,88 @@
+name = "req012-capsule-walk"
+req = "REQ-012"
+description = "胶囊在平地上走一段(x 4 → 12),到 1 格石台阶前起跳,站上台阶顶面(REQ-011 §11 第 1 行;AC-A2 的图形面)"
+timeout_secs = 240
+
+[server]
+world_seed = 3
+
+[[step]]
+label = "相机就位(俯视走位带)"
+camera = { pos = [10.0, -50.0, 26.0], yaw = -90.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [10.0, -58.5, 14.0] }
+
+# 装载就绪(左端 x 4 所在 chunk 已下发)。
+[[step]]
+wait_until = { block = { pos = [4, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+# 1 格台阶(x=12 一格 stone,顶面 = −59 = 地面顶面 + 1)。
+[[step]]
+label = "1 格台阶"
+set_block = { pos = [12, -60, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [12, -60, 14], is = "stone" }, timeout_ticks = 600 }
+
+# 胶囊出生在平地西端(x 4.5,顶面 + 0.95)。
+[[step]]
+label = "生成胶囊"
+spawn_agent = { at = [4.5, -59.05, 14.5], yaw = 90.0, label = "hero" }
+
+[[step]]
+possess = { label = "hero" }
+
+[[step]]
+wait_until = { agent_alive = { label = "hero" }, timeout_ticks = 120 }
+
+# 东行(+x,yaw 90°)4.3 m/s;加速 τ 0.2 s(≈12 拍),4.5 → 11.5 约 7 m
+# ≈ 100 拍(现场标定 97 拍到位,留 3 拍余量)。
+[[step]]
+label = "东行"
+intent = { move = [4.3, 0.0], yaw = 90.0, jump = false }
+
+# 中途截图(走过平地段,x 约 8;28 拍 ≈ 加速 + 1.9 m)。
+[[step]]
+wait_ticks = { n = 28 }
+
+[[step]]
+screenshot = { name = "walk-mid", expect = "画面中有一个直立的高亮色圆柱体(附身的胶囊)站在棕色平地上,正在向东(画面右)移动;地面上有一个灰色石台阶" }
+
+# 续走余程(到台阶前 x≈11.5;余 70 拍)。
+[[step]]
+wait_ticks = { n = 70 }
+
+# 跳跃(按下沿一次;接地上台阶)。
+[[step]]
+label = "跳上台阶"
+intent = { move = [4.3, 0.0], yaw = 90.0, jump = true }
+
+[[step]]
+wait_ticks = { n = 12 }
+
+# 停(零意图;站在台阶顶面/其后)。
+[[step]]
+intent = { move = [0.0, 0.0], yaw = 90.0, jump = false }
+
+[[step]]
+wait_ticks = { n = 30 }
+
+# 终点截图。
+[[step]]
+camera = { pos = [16.0, -54.0, 22.0], yaw = -135.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [12.0, -58.5, 14.0] }
+
+[[step]]
+screenshot = { name = "walk-top", expect = "画面中高亮色圆柱体站在灰色石台阶上或其紧东侧,脚下比周围棕色地面高出一格;没有穿模或悬浮" }
+
+# 终点盒:台阶顶面(x 11..14,y 台阶顶 −59..−57.5,z 14 格带)。
+[[step]]
+label = "终点在台阶顶面高度"
+check = { agent_in = { label = "hero", from = [10.5, -58.5, 13.5], to = [15.5, -57.0, 15.5] } }
+
+[[step]]
+label = "确已上台阶(走过 x=12)"
+check = { agent_in = { label = "hero", from = [12.5, -59.5, 13.5], to = [16.5, -57.0, 15.5] } }

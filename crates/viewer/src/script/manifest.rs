@@ -221,6 +221,7 @@ mod tests {
             server_tick: 41,
             world: &world,
             spawned: &[],
+            agent_spawned: &[],
         });
         assert_eq!(out.finished.len(), 2, "两个即时步骤同帧结束");
         for r in &out.finished {
@@ -271,6 +272,7 @@ mod tests {
             server_tick: 5,
             world: &world,
             spawned: &[],
+            agent_spawned: &[],
         });
         let record = out.finished.first().expect("截图步当帧结束");
         let request = record.screenshot.as_ref().expect("记录带截图请求");
@@ -303,6 +305,7 @@ mod tests {
             server_tick: 1,
             world: &world,
             spawned: &[],
+            agent_spawned: &[],
         });
         for r in &out.finished {
             m.push(r, &world);
@@ -359,6 +362,7 @@ mod tests {
             server_tick: 2,
             world: &world,
             spawned: &[],
+            agent_spawned: &[],
         });
         for r in &out.finished {
             m.push(r, &world);

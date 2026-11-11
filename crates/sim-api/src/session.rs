@@ -839,6 +839,14 @@ impl Session {
         self.scheduler.in_transit_migrations()
     }
 
+    /// 本拍被虚空移除的主体 ID 列表(REQ-012 A06 §6"玩家回出生点";取走
+    /// 即清,恰一次):调度器拍前主体账本过滤 [`physics_sim::Outbox::
+    /// void_removed`] 的产物。驱动据此在出生点重生玩家身体;**不入快照**
+    /// (重生动作在命令日志里,回放线自再生)。普通实体的虚空移除不在列。
+    pub fn take_void_removed_agents(&mut self) -> Vec<EntityId> {
+        self.scheduler.take_void_removed_agents()
+    }
+
     /// 在途迁移的实体集合(REQ-012 A03 §4:意图投递的早窗口判定——owner
     /// 已指向目的分片但信封未落地,此刻投递会被内核静默拒绝,必须暂存)。
     pub fn in_transit_entities(&self) -> std::collections::BTreeSet<EntityId> {

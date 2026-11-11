@@ -1,0 +1,83 @@
+name = "req012-no-bury"
+req = "REQ-012"
+description = "方块实体落在胶囊身上:目标格与胶囊重叠时暂缓凝固(不把胶囊埋进体素);胶囊走开后暂缓写入生效(§11 第 4 行;§6 暂缓写入)"
+timeout_secs = 240
+
+[server]
+world_seed = 11
+
+[server.destruction]
+enabled = false
+
+[[step]]
+camera = { pos = [10.0, -50.0, 24.0], yaw = -90.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [10.0, -58.5, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+# 胶囊站立 (8.5, 顶面 + 0.95, 14.5)。
+[[step]]
+label = "生成胶囊"
+spawn_agent = { at = [8.5, -59.05, 14.5], yaw = 0.0, label = "hero" }
+
+[[step]]
+possess = { label = "hero" }
+
+[[step]]
+wait_until = { agent_alive = { label = "hero" }, timeout_ticks = 120 }
+
+[[step]]
+wait_ticks = { n = 40 }
+
+# 一格土方块零速生成在胶囊身位格心(上格 y=−59,格心 −58.5;凝固落点
+# = 该格,与胶囊精确相交 → 暂缓。布景同 A05-6 组 1 的生产同构路径)。
+[[step]]
+label = "方块落在胶囊身上"
+spawn = { at = [8.5, -58.5, 14.5], count = 1, label = "lid" }
+
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 120 }
+
+# 暂缓判定:方块压在胶囊身上(lid 压着 hero)——正常凝固用时(对照线,
+# 现场标定 ~40 拍;放行要求 hold_ticks 长于对照)内不凝固 = 实体 ≥ 1 持续。
+# hold = 90 拍(对照约 40,长于它 = 覆盖暂缓窗口)。
+[[step]]
+label = "重叠格不凝固(暂缓)"
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 140, hold_ticks = 90 }
+
+[[step]]
+screenshot = { name = "deferred", expect = "画面中央有一个蓝色立方体(未凝固的活实体),它与品红/粉色胶囊的上截重叠遮挡,胶囊的下截从蓝色立方体下方露出于地面之上;胶囊没有被完全埋进地形,蓝色方块没有消失凝固成灰色" }
+
+# 胶囊走开(西行 3 m,离开身位格)。
+[[step]]
+label = "走开"
+intent = { move = [-4.3, 0.0], yaw = 90.0, jump = false }
+
+[[step]]
+wait_ticks = { n = 40 }
+
+[[step]]
+intent = { move = [0.0, 0.0], yaw = 90.0, jump = false }
+
+# 走开后暂缓写入生效:方块凝固(live_entities → 0)。
+[[step]]
+label = "走开后凝固"
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 300, hold_ticks = 30 }
+
+# 方块守恒:目标区域(含暂缓写入格 + 凝固落点)方块总数 = 1(lid 一格;
+# 脚本 spawn 单格用默认 desc = stone)。
+[[step]]
+label = "方块守恒"
+check = { count = { from = [6, -60, 12], to = [12, -57, 17], is = "stone", ge = 1 } }
+
+[[step]]
+camera = { pos = [10.0, -52.0, 22.0], yaw = -90.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [9.0, -58.5, 14.0] }
+
+[[step]]
+screenshot = { name = "after-leave", expect = "画面中胶囊已向西(画面左)离开原位;原位置上方或附近有一个灰色方块已凝固在地形里;空中没有蓝色下落体" }

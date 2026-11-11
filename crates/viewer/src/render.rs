@@ -15,7 +15,7 @@ use macroquad::input::{
     mouse_delta_position, mouse_wheel, set_cursor_grab, show_mouse,
 };
 use macroquad::math::vec3;
-use macroquad::models::{Mesh, draw_cube, draw_cube_wires, draw_mesh};
+use macroquad::models::{Mesh, draw_cube, draw_cube_wires, draw_cylinder, draw_mesh, draw_sphere};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
 use macroquad::window::{clear_background, next_frame, screen_height, screen_width};
@@ -25,9 +25,11 @@ use types::{BlockPos, ChunkPos, EntityDesc, EntityId, EntityState};
 // 注:macroquad 0.4 内嵌 glam 0.27,types 用 glam 0.33——两版 Vec3 不互认,
 // 一切跨界处按字段换算(下文 vec3(t.x, t.y, t.z) / types::glam::Vec3::new)。
 
+use crate::bodies::{BodyShapeTable, LinkShape};
 use crate::cli::{ViewerArgs, ViewerMode};
 use crate::client::{ViewEvent, ViewerClient};
 use crate::mesh::chunk_mesh;
+use crate::possess::{self, Keys, PossessCommand, PossessState};
 use crate::script::WorldQuery;
 use crate::script::manifest::Manifest;
 use crate::script::{
@@ -369,6 +371,95 @@ fn mq_quat(q: types::glam::Quat) -> macroquad::math::Quat {
     macroquad::math::Quat::from_xyzw(q.x, q.y, q.z, q.w)
 }
 
+/// 主体专用颜色(§11:要能区分主体和方块——方块/复合体是 BLUE;主体取
+/// 品红系)。
+const AGENT_COLOR: macroquad::color::Color = macroquad::color::Color::from_rgba(228, 92, 240, 255);
+/// 自己附身的主体高亮色(青绿;与普通主体的品红区分)。
+const POSSESSED_AGENT_COLOR: macroquad::color::Color =
+    macroquad::color::Color::from_rgba(92, 240, 178, 255);
+
+/// 画一个连杆(A06 §1):按 [`LinkShape`] 画胶囊(等高圆柱)/盒/球;
+/// 未知形状退化画 0.9 m 立方体。`pos` = 连杆姿态 translation(types 系)。
+fn draw_link(shape: &LinkShape, pos: types::glam::Vec3, color: macroquad::color::Color) {
+    let center = vec3(pos.x, pos.y, pos.z);
+    match shape {
+        LinkShape::CapsuleY {
+            half_height,
+            radius,
+        } => {
+            // 等高圆柱:总高 2·(half_height + radius),直径 2·radius。
+            // macroquad draw_cylinder 的 position = **底面中心**(顶点 y 从 0
+            // 长到 height),连杆位姿是胶囊中心 → 下移半高对齐。
+            let height = 2.0 * (half_height + radius);
+            let base = vec3(pos.x, pos.y - half_height - radius, pos.z);
+            draw_cylinder(base, *radius, *radius, height, None, color);
+        }
+        LinkShape::Box(half) => {
+            draw_cube(
+                center,
+                vec3(half[0] * 2.0, half[1] * 2.0, half[2] * 2.0),
+                None,
+                color,
+            );
+        }
+        LinkShape::Sphere(radius) => {
+            draw_sphere(center, *radius, None, color);
+        }
+        LinkShape::ConvexHull(points) => {
+            // 凸包画包围盒(§5.1:viewer 只画碰撞形状;凸包的盒包围足够
+            // 辨识,不做网格化)。
+            let mut min = [f32::MAX; 3];
+            let mut max = [f32::MIN; 3];
+            for p in points {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(p[axis]);
+                    max[axis] = max[axis].max(p[axis]);
+                }
+            }
+            let size = vec3(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+            let mid = vec3(
+                center.x + (min[0] + max[0]) * 0.5,
+                center.y + (min[1] + max[1]) * 0.5,
+                center.z + (min[2] + max[2]) * 0.5,
+            );
+            draw_cube(mid, size, None, color);
+        }
+    }
+}
+
+/// 画一个主体(A06 §1):按形状表逐连杆画;`shapes = None`(未知哈希)
+/// → 占位盒(1×2×1)。`poses` = AgentStates 的连杆姿态(types 系;
+/// **直接取最新**,不插值——口径见 possess.rs 模块文档)。占位计数由
+/// 调用侧对未知哈希调 [`BodyShapeTable::note_unknown`](借用分离)。
+fn draw_agent(
+    shapes: Option<&[Vec<LinkShape>]>,
+    poses: &[EntityState],
+    color: macroquad::color::Color,
+) {
+    match shapes {
+        Some(link_shapes) => {
+            for (i, pose) in poses.iter().enumerate() {
+                let Some(ls) = link_shapes.get(i) else {
+                    continue;
+                };
+                for shape in ls {
+                    draw_link(shape, pose.translation, color);
+                }
+            }
+        }
+        None => {
+            if let Some(pose) = poses.first() {
+                draw_cube(
+                    vec3(pose.translation.x, pose.translation.y, pose.translation.z),
+                    vec3(0.9, 1.8, 0.9),
+                    None,
+                    color,
+                );
+            }
+        }
+    }
+}
+
 /// 主循环入口(main 调用):按模式分发。服务器地址优先级:
 /// `--addr` > 环境变量 `VIEWER_ADDR` > `127.0.0.1:25565`;视距 = `VIEWER_VIEW`
 /// 环境变量(缺省 4,REQ-004A §2)或场景 `[viewer] view_distance`。
@@ -463,6 +554,8 @@ fn save_screenshot(request: &ScreenshotRequest, out: &Path) {
 /// 把引擎命令转发给服务器:同帧命令打成**一条 Batch 消息**(REQ-010 终审
 /// 返修 1——一次 fill 的逐格 SetBlock 是一次原子编辑,单条消息入队、单次
 /// TCP 写发出;Spawn 逐条不混批,服务端分配 ID 的回执语义按条对应)。
+/// A06:主体命令(SpawnAgent/Possess/Unpossess/AgentIntent)逐条不混批
+/// ——与 Spawn 同口径:服务端按请求顺序回执,批内无回执语义。
 fn forward_commands(commands: &[EngineCommand], control: &crate::client::ControlHandle) {
     let mut batch: Vec<SimCommand> = Vec::new();
     for command in commands {
@@ -473,6 +566,36 @@ fn forward_commands(commands: &[EngineCommand], control: &crate::client::Control
                     control.command_batch(std::mem::take(&mut batch));
                 }
                 control.spawn(*state, desc.clone());
+            }
+            EngineCommand::SpawnAgent { position, yaw } => {
+                // 批先发出(保序),SpawnAgent 单发(回执按请求顺序)。
+                if !batch.is_empty() {
+                    control.command_batch(std::mem::take(&mut batch));
+                }
+                control.spawn_agent("capsule".to_owned(), *position, *yaw);
+            }
+            EngineCommand::Possess { entity } => {
+                if !batch.is_empty() {
+                    control.command_batch(std::mem::take(&mut batch));
+                }
+                control.possess(*entity);
+            }
+            EngineCommand::Unpossess => {
+                if !batch.is_empty() {
+                    control.command_batch(std::mem::take(&mut batch));
+                }
+                control.unpossess();
+            }
+            EngineCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            } => {
+                if !batch.is_empty() {
+                    control.command_batch(std::mem::take(&mut batch));
+                }
+                control.agent_intent(*entity, *move_xz, *yaw, *jump);
             }
             EngineCommand::Detonate {
                 center,
@@ -490,6 +613,28 @@ fn forward_commands(commands: &[EngineCommand], control: &crate::client::Control
         }
     }
     control.command_batch(batch);
+}
+
+/// Spawned 回执摘流(A06 §4):`inflight` = 在途 SpawnAgent 请求数,**按
+/// 请求顺序**与回执一一对应——头部 `inflight` 条回执归主体,其余归普通
+/// 方块 Spawn。返回 (主体回执, 方块回执, 剩余在途)。方块先落地、主体
+/// 后生成的错序帧也逐条对齐(多退少不补)。
+fn split_agent_receipts(
+    all_spawned: &[EntityId],
+    inflight: usize,
+) -> (Vec<EntityId>, Vec<EntityId>, usize) {
+    let mut agent_spawned = Vec::new();
+    let mut plain_spawned = Vec::new();
+    let mut remaining = inflight;
+    for &id in all_spawned {
+        if remaining > 0 {
+            remaining -= 1;
+            agent_spawned.push(id);
+        } else {
+            plain_spawned.push(id);
+        }
+    }
+    (agent_spawned, plain_spawned, remaining)
 }
 
 /// 脚本模式观察者上报:耦合开启时,相机较上次上报变化超过 1 m 立即上报,
@@ -548,6 +693,13 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
     let mut finished = false;
     let mut coupled = true;
     let mut last_sent: Option<(macroquad::math::Vec3, Instant)> = None;
+    // A06:脚本模式的主体回执跟踪——SpawnAgent 命令在途计数(发送层逐条
+    // 单发;回执按请求顺序从 spawned 总流摘出)。一场景最多一个 spawn_agent,
+    // 计数非零期间的 Spawned 回执即主体回执。
+    let mut agent_spawn_inflight: usize = 0;
+    let mut agent_spawned_receipts: Vec<EntityId> = Vec::new();
+    // A06:身体形状表(启动时读 assets/bodies);未知哈希画占位盒。
+    let mut body_table = BodyShapeTable::from_dir(std::path::Path::new("assets/bodies"));
 
     loop {
         let dt = get_frame_time();
@@ -574,15 +726,42 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
         // 推进引擎(结束后不再推进):输出相机/耦合/命令/截图请求/步骤记录。
         let mut frame_shot: Option<ScreenshotRequest> = None;
         if let (false, Some(e)) = (finished, engine.as_mut()) {
-            let spawned = world.state.take_spawned();
+            // A06:回执摘流——在途 SpawnAgent 请求期间到达的 Spawned 回执
+            // 归主体(agent_spawned),其余归普通 spawn。一场景最多一个
+            // spawn_agent(解析期限),摘流口径与请求顺序一致。
+            let all_spawned = world.state.take_spawned();
+            let (agent_spawned, spawned, inflight_left) =
+                split_agent_receipts(&all_spawned, agent_spawn_inflight);
+            agent_spawn_inflight = inflight_left;
+            agent_spawned_receipts.extend(agent_spawned);
             let input = FrameInput {
                 dt,
                 server_tick: world.state.tick(),
                 world: &world.state,
                 spawned: &spawned,
+                agent_spawned: &agent_spawned_receipts,
             };
             let output = e.frame(&input);
+            agent_spawned_receipts.clear();
+            // 在途计数在命令转发前刷新(本帧发的新请求,回执下一帧起摘)。
+            agent_spawn_inflight += output
+                .commands
+                .iter()
+                .filter(|c| matches!(c, EngineCommand::SpawnAgent { .. }))
+                .count();
             camera.set_from_pose(&output.camera);
+            // A06 §4:possess follow = true 时切第三人称相机(follow = false
+            // 相机不动,截图机位确定)。
+            if let Some((id, follow)) = output.possess
+                && follow
+                && let Some((_, poses)) = world.state.agent(id)
+                && let Some(pose) = poses.first()
+            {
+                let root = pose.translation;
+                let look = types::glam::Vec3::new(root.x, root.y + 0.6, root.z);
+                camera.position = vec3(look.x, look.y + 4.0, look.z + 4.0);
+                camera.pitch = -45.0_f32.to_radians();
+            }
             coupled = output.coupled;
             forward_commands(&output.commands, &control);
             report_observer_if_due(
@@ -636,6 +815,16 @@ async fn run_script(addr: SocketAddr, env_view: Option<u8>, script: &Path, out: 
         }
         for (id, pose) in world.entities.iter() {
             world.draw_entity(*id, pose);
+        }
+        // 主体(A06 §1):脚本模式同样逐连杆画(直接取最新,不插值);未知
+        // 哈希占位盒 + 计数,与交互模式同一口径。
+        for (_id, (hash, poses)) in world.state.live_agents() {
+            let known = body_table.get(&hash).is_some();
+            if !known {
+                body_table.note_unknown();
+            }
+            let shapes = body_table.get(&hash);
+            draw_agent(shapes, poses, AGENT_COLOR);
         }
         set_default_camera();
 
@@ -729,10 +918,18 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
     // R 重建、K 播放动作段)。
     let mut stage_driver: Option<StageDriver> =
         stage.map(|path| StageDriver::new(prepare_stage(path), camera.to_pose()));
+    // REQ-012 A06:附身状态机 + 身体形状表(启动时读 assets/bodies)。
+    let mut possess_state = PossessState::new();
+    let mut body_table = BodyShapeTable::from_dir(std::path::Path::new("assets/bodies"));
 
     loop {
         let dt = get_frame_time();
-        camera.update(dt);
+        // A06:附身模式下相机由第三人称逻辑接管(下方),飞行 update 跳过;
+        // 鼠标视角仍走(delta 驱动 possess 相机的 yaw/pitch)。
+        let possessed_now = possess_state.possessed().is_some();
+        if !possessed_now {
+            camera.update(dt);
+        }
         tools.tick(dt); // 拒绝提示计时(逐帧 dt;工具行为不进模拟)
 
         // 事件排空(主循环 try_recv 排空,README 决策 3)。
@@ -746,10 +943,41 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                     counters,
                     recent,
                 } => panel.receive(tick, counters, recent),
+                // A06:主体流与附身回执(状态机消费;世界镜像也记主体表)。
+                ViewEvent::Agents {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                } => {
+                    let ids: Vec<EntityId> = states.iter().map(|(id, ..)| *id).collect();
+                    possess_state.observe_agents(&ids, &removed);
+                    world.apply(ViewEvent::Agents {
+                        tick,
+                        states,
+                        removed,
+                        full,
+                    });
+                }
+                ViewEvent::Possessed { entity } => {
+                    possess_state.on_possessed(entity);
+                }
                 other => world.apply(other),
             }
         }
         world.sync();
+
+        // A06:Spawned 回执消费(与生成请求按序对应)。自动附身候选 =
+        // 主体表最新 ID(一连接一身体,D1——主体表唯一主体即自己的;
+        // try_auto_possess 有 pending 门闩,只在 P 生成后的窗口消费一次)。
+        let receipts = world.state.take_spawned().len();
+        for _ in 0..receipts {
+            possess_state.on_spawn_receipt();
+        }
+        let candidate = world.state.live_agents().last().map(|(id, _)| *id);
+        if let Some(id) = possess_state.try_auto_possess(candidate) {
+            control.possess(id);
+        }
 
         // W04:交互模式订阅调试遥测(连上即发一次;脚本模式不订阅)。
         if !subscribed {
@@ -804,6 +1032,76 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             mouse_grabbed = !mouse_grabbed;
             set_cursor_grab(mouse_grabbed);
             show_mouse(!mouse_grabbed);
+        }
+        // —— REQ-012 A06:P 附身切换 / 滚轮相机距离 / WASD 意图(仅交互
+        //    模式;断连不发)——
+        if disconnected.is_none() {
+            // 附身模式下的鼠标视角:delta 驱动 possess 相机 yaw/pitch(鼠标
+            // 锁定时才生效——与飞行相机同口径)。
+            if mouse_grabbed && possess_state.possessed().is_some() {
+                let delta = mouse_delta_position();
+                camera.yaw -= delta.x * LOOK_SENSITIVITY;
+                camera.pitch = (camera.pitch + delta.y * LOOK_SENSITIVITY)
+                    .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
+            }
+            // 滚轮:附身时调相机距离;未附身走 W02 预设速度(原逻辑)。
+            if mouse_grabbed && possess_state.possessed().is_some() {
+                let (_, wheel_y) = mouse_wheel();
+                possess_state.adjust_camera_dist(wheel_y);
+            }
+            // P 键(按下沿):状态机出命令(SpawnAgent/Possess/Unpossess)。
+            if is_key_pressed(KeyCode::P) {
+                // 生成目标(未附身且没有身体时用):屏幕中心拾取的地面格
+                // 顶面上方 1 m(格顶面 + 0.9 胶囊半高 → 站立;拾取无命中
+                // → 不生成,提示)。
+                let spawn_target = target.as_ref().map(|hit| {
+                    let top = hit.block_pos;
+                    let px = top.x as f32 + 0.5;
+                    let py = top.y as f32 + 1.0 + 0.9;
+                    let pz = top.z as f32 + 0.5;
+                    (types::glam::Vec3::new(px, py, pz), camera.yaw.to_degrees())
+                });
+                // 未附身时的"我的身体":主体表唯一主体(一连接一身体,D1;
+                // 重生场景服务器自动附身,这里覆盖手动 P 附身)。
+                let self_agent = world.state.live_agents().last().map(|(id, _)| *id);
+                let commands = possess_state.frame(
+                    true,
+                    &Keys::default(),
+                    camera.yaw.to_degrees(),
+                    spawn_target,
+                    self_agent,
+                );
+                for command in commands {
+                    match command {
+                        PossessCommand::SpawnAgent { position, yaw } => {
+                            control.spawn_agent("capsule".to_owned(), position, yaw);
+                        }
+                        PossessCommand::Possess(entity) => control.possess(entity),
+                        PossessCommand::Unpossess => control.unpossess(),
+                        PossessCommand::Intent { .. } => {}
+                    }
+                }
+            }
+            // 附身时的 WASD 意图(每帧喂状态机;节流/变化检测在状态机里)。
+            if possess_state.possessed().is_some() {
+                let keys = Keys {
+                    w: is_key_down(KeyCode::W),
+                    a: is_key_down(KeyCode::A),
+                    s: is_key_down(KeyCode::S),
+                    d: is_key_down(KeyCode::D),
+                    shift: is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift),
+                    jump_down: is_key_down(KeyCode::Space),
+                };
+                let commands =
+                    possess_state.frame(false, &keys, camera.yaw.to_degrees(), None, None);
+                for command in commands {
+                    if let PossessCommand::Intent { move_xz, yaw, jump } = command
+                        && let Some(entity) = possess_state.possessed()
+                    {
+                        control.agent_intent(entity, move_xz, yaw, jump);
+                    }
+                }
+            }
         }
         // —— REQ-011 W01 工具按键(仅交互模式;鼠标释放(M)时左右键不
         //   触发,避免点 HUD 误拆;断连后不发命令)——
@@ -962,8 +1260,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                 radius: BLAST_RADIUS,
             });
         }
-        // 耦合时:相机位姿节流上报(≥100ms 一次;仅未断连时)。
-        if coupled && disconnected.is_none() {
+        // 耦合时:相机位姿节流上报(≥100ms 一次;仅未断连时)。A06:附身
+        // 期间不发 MoveObserver(服务器会忽略它,也会自己跟随观察者)。
+        if coupled && disconnected.is_none() && possess_state.possessed().is_none() {
             #[allow(clippy::disallowed_methods)] // 墙钟节流(同上,边缘授权)
             let due = last_send.elapsed() >= OBSERVER_SEND_INTERVAL;
             if due {
@@ -978,7 +1277,35 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
 
         // —— 3D 场景 ——
         clear_background(SKYBLUE);
-        set_camera(&camera.to_camera());
+        // A06:附身时用第三人称相机(看向身体根位置上方 0.6 m,后方当前
+        // 距离处,抬高按 pitch;主体 yaw = 相机水平朝向——意图已带)。
+        let possessed_id = possess_state.possessed();
+        let mut possessed_root: Option<types::glam::Vec3> = None;
+        if let Some(id) = possessed_id
+            && let Some((_, poses)) = world.state.agent(id)
+            && let Some(pose) = poses.first()
+        {
+            possessed_root = Some(pose.translation);
+        }
+        if let Some(root) = possessed_root {
+            let (pos, look) = possess::third_person_camera(
+                root,
+                camera.yaw.to_degrees(),
+                camera.pitch.to_degrees(),
+                possess_state.camera_dist(),
+            );
+            let cam = Camera3D {
+                position: vec3(pos.x, pos.y, pos.z),
+                target: vec3(look.x, look.y, look.z),
+                up: macroquad::math::Vec3::Y,
+                fovy: 70.0_f32.to_radians(),
+                projection: Projection::Perspective,
+                ..Camera3D::default()
+            };
+            set_camera(&cam);
+        } else {
+            set_camera(&camera.to_camera());
+        }
         for mesh in world.meshes.values() {
             draw_mesh(mesh);
         }
@@ -991,8 +1318,21 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
         for (id, pose) in world.entities.iter() {
             world.draw_entity(*id, pose);
         }
-        // —— REQ-011 W01:拾取线框 + 预制轮廓(3D 相机下画;线框颜色区分
-        //   基岩:普通格白、基岩橙)——
+        // 主体(A06 §1):逐连杆画(直接取最新,不插值);附身的用高亮色。
+        // 未知哈希:占位盒 + 计数(不 panic)。
+        for (id, (hash, poses)) in world.state.live_agents() {
+            let color = if Some(id) == possessed_id {
+                POSSESSED_AGENT_COLOR
+            } else {
+                AGENT_COLOR
+            };
+            let known = body_table.get(&hash).is_some();
+            if !known {
+                body_table.note_unknown();
+            }
+            let shapes = body_table.get(&hash);
+            draw_agent(shapes, poses, color);
+        }
         if let Some(hit) = &target {
             let color = if hit.block == voxel::builtin::BEDROCK {
                 ORANGE
@@ -1034,6 +1374,30 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             16.0,
             YELLOW,
         );
+        // A06 HUD:附身状态、实体 ID、身体水平速度、根位置。
+        {
+            let line = match possessed_id
+                .and_then(|id| world.state.agent(id).map(|(_, p)| (id, p.first().copied())))
+            {
+                Some((id, Some(pose))) => {
+                    let v = (pose.linvel.x, pose.linvel.z);
+                    let speed = (v.0 * v.0 + v.1 * v.1).sqrt();
+                    format!(
+                        "possess: id={:?} speed={:.2} m/s at ({:.1}, {:.1}, {:.1})",
+                        id, speed, pose.translation.x, pose.translation.y, pose.translation.z
+                    )
+                }
+                _ => {
+                    let waiting = if possess_state.auto_possess_pending() {
+                        " (waiting spawn...)"
+                    } else {
+                        ""
+                    };
+                    format!("possess: none{}", waiting)
+                }
+            };
+            draw_text(&line, 12.0, 88.0, 16.0, YELLOW);
+        }
         // REQ-011 W04:调试面板(F3 切换,交互默认显示)画在四行 HUD + 耦合
         // 行下方;面板显示时第 1 段(工具)取代 W01 的临时工具行,不重复画;
         // 面板隐藏时工具行与提示行照旧(W01 行为)。W05:布景状态行画在面板
@@ -1092,6 +1456,14 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             "WASD+mouse fly Shift/Ctrl up/down | B spawn cube X blast | M grab/release mouse",
             12.0,
             screen_height() - 12.0,
+            16.0,
+            DARKGRAY,
+        );
+        // A06 帮助行(放行 §2 表;第二行)。
+        draw_text(
+            "P possess/spawn body | WASD walk Shift run Space jump (possessed) | wheel camera dist",
+            12.0,
+            screen_height() - 30.0,
             16.0,
             DARKGRAY,
         );
@@ -1343,5 +1715,32 @@ mod tests {
             "单格 desc 仍为默认(逐位不变)"
         );
         assert!(rx.try_recv().is_err(), "通道应已收干(恰好 4 条消息)");
+    }
+
+    /// Spawned 回执摘流(A06):头部 inflight 条归主体、其余归方块;错序帧
+    /// (方块回执先到)逐条对齐;在途耗尽后其余全部归方块。
+    ///
+    /// 会变红的实现:摘流不看在途计数(全部归主体——方块回执被吞,spawn
+    /// 等待超时);或按"最后一条归主体"(错序帧错位)。
+    #[test]
+    fn split_agent_receipts_splits_by_inflight_order() {
+        let a = EntityId::from_parts(0, 1);
+        let b = EntityId::from_parts(0, 2);
+        let c = EntityId::from_parts(0, 3);
+        // 主体请求 1 条在途;同帧回执 3 条(1 主体 + 2 方块)。
+        let (agent, plain, left) = split_agent_receipts(&[a, b, c], 1);
+        assert_eq!(agent, vec![a], "头部 1 条归主体");
+        assert_eq!(plain, vec![b, c], "其余归方块");
+        assert_eq!(left, 0, "在途耗尽");
+        // 在途 2 条、回执只有 1 条(主体回执下一帧才到):全部归主体,余 1。
+        let (agent, plain, left) = split_agent_receipts(&[b], 2);
+        assert_eq!(agent, vec![b]);
+        assert!(plain.is_empty());
+        assert_eq!(left, 1, "未摘满在途保留");
+        // 零在途:全部归方块。
+        let (agent, plain, left) = split_agent_receipts(&[a, c], 0);
+        assert!(agent.is_empty());
+        assert_eq!(plain, vec![a, c]);
+        assert_eq!(left, 0);
     }
 }

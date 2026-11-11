@@ -24,8 +24,8 @@ const TOP_KEYS: [&str; 7] = [
 ];
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
-/// 全部动作键(与 [`Action`] 一一对应)。
-const ACTION_KEYS: [&str; 12] = [
+/// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作)。
+const ACTION_KEYS: [&str; 17] = [
     "camera",
     "look_at",
     "fly",
@@ -38,6 +38,11 @@ const ACTION_KEYS: [&str; 12] = [
     "wait_until",
     "check",
     "screenshot",
+    "spawn_agent",
+    "possess",
+    "unpossess",
+    "intent",
+    "mark_agent",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -308,6 +313,9 @@ fn parse_action(
             "count",
             "chunks_loaded",
             "no_floating",
+            "agent_in",
+            "agent_moved",
+            "agent_alive",
             "timeout_ticks",
             "hold_ticks",
         ],
@@ -318,8 +326,17 @@ fn parse_action(
             "count",
             "chunks_loaded",
             "no_floating",
+            "agent_in",
+            "agent_moved",
+            "agent_alive",
         ],
         "screenshot" => &["name", "expect", "hud"],
+        // A06 §4 主体动作。
+        "spawn_agent" => &["at", "yaw", "label"],
+        "possess" => &["label", "follow"],
+        "unpossess" => &[],
+        "intent" => &["move", "yaw", "jump"],
+        "mark_agent" => &["label"],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -541,6 +558,82 @@ fn parse_action(
                 hud,
             })
         }
+        // A06 §4 主体动作(spawn_agent/possess/unpossess/intent/mark_agent)。
+        "spawn_agent" => {
+            let at = t
+                .get("at")
+                .ok_or_else(|| e("动作 spawn_agent 缺必填参数 at".into()))?;
+            let label = t
+                .get("label")
+                .ok_or_else(|| e("动作 spawn_agent 缺必填参数 label".into()))?;
+            let yaw = match t.get("yaw") {
+                Some(v) => f32_of(v, "spawn_agent.yaw").map_err(e)?,
+                None => 0.0,
+            };
+            Ok(Action::SpawnAgent {
+                at: vec3(at, "spawn_agent.at").map_err(e)?,
+                yaw,
+                label: str_of(label, "spawn_agent.label").map_err(e)?,
+            })
+        }
+        "possess" => {
+            let label = t
+                .get("label")
+                .ok_or_else(|| e("动作 possess 缺必填参数 label".into()))?;
+            let follow = match t.get("follow") {
+                Some(v) => bool_of(v, "possess.follow").map_err(e)?,
+                None => false,
+            };
+            Ok(Action::Possess {
+                label: str_of(label, "possess.label").map_err(e)?,
+                follow,
+            })
+        }
+        "unpossess" => Ok(Action::Unpossess),
+        "intent" => {
+            let mv = t
+                .get("move")
+                .ok_or_else(|| e("动作 intent 缺必填参数 move".into()))?;
+            let yaw = match t.get("yaw") {
+                Some(v) => f32_of(v, "intent.yaw").map_err(e)?,
+                None => 0.0,
+            };
+            let jump = match t.get("jump") {
+                Some(v) => bool_of(v, "intent.jump").map_err(e)?,
+                None => false,
+            };
+            // move = [vx, vz](2 个数)。
+            let arr = mv
+                .as_array()
+                .ok_or_else(|| e("intent.move 应为 [vx, vz] 数组".to_string()))?;
+            if arr.len() != 2 {
+                return Err(e(format!(
+                    "intent.move 应恰好 2 个数,实为 {} 个",
+                    arr.len()
+                )));
+            }
+            let mut v = [0.0_f32; 2];
+            for (i, item) in arr.iter().enumerate() {
+                v[i] = item
+                    .as_float()
+                    .or_else(|| item.as_integer().map(|n| n as f64))
+                    .map(|f| f as f32)
+                    .ok_or_else(|| e(format!("intent.move 第 {} 项应为数", i + 1)))?;
+            }
+            Ok(Action::Intent {
+                mv: (v[0], v[1]),
+                yaw,
+                jump,
+            })
+        }
+        "mark_agent" => {
+            let label = t
+                .get("label")
+                .ok_or_else(|| e("动作 mark_agent 缺必填参数 label".into()))?;
+            Ok(Action::MarkAgent {
+                label: str_of(label, "mark_agent.label").map_err(e)?,
+            })
+        }
         // reject_unknown + 上面的 match 已穷尽 ACTION_KEYS。
         other => Err(e(format!("未知动作 \"{other}\""))),
     }
@@ -641,6 +734,84 @@ fn parse_checks(
                     height,
                     still_ticks,
                 });
+            }
+            // A06 §4 主体检查(agent_in/agent_moved/agent_alive)。
+            "agent_in" => {
+                let at = value.as_table().ok_or_else(|| {
+                    "agent_in 应为 { label = \"..\", from = [..], to = [..] } 形式的表".to_owned()
+                })?;
+                reject_unknown(at, &["label", "from", "to"], "agent_in")?;
+                let label = at
+                    .get("label")
+                    .ok_or_else(|| "agent_in 缺 label".to_owned())
+                    .and_then(|v| str_of(v, "agent_in.label"))?;
+                let from = at
+                    .get("from")
+                    .ok_or_else(|| "agent_in 缺 from".to_owned())
+                    .and_then(|v| vec3(v, "agent_in.from"))?;
+                let to = at
+                    .get("to")
+                    .ok_or_else(|| "agent_in 缺 to".to_owned())
+                    .and_then(|v| vec3(v, "agent_in.to"))?;
+                // 闭区间盒:from/to 各分量不要求有序,统一规整为 min/max
+                // (同 fill/count 口径)。
+                let lo = Vec3::new(from.x.min(to.x), from.y.min(to.y), from.z.min(to.z));
+                let hi = Vec3::new(from.x.max(to.x), from.y.max(to.y), from.z.max(to.z));
+                checks.push(Check::AgentIn {
+                    label,
+                    from: lo,
+                    to: hi,
+                });
+            }
+            "agent_moved" => {
+                let mt = value.as_table().ok_or_else(|| {
+                    "agent_moved 应为 { label = \"..\", ge = 米 } 或 { label = \"..\", le = 米 } 形式的表"
+                        .to_owned()
+                })?;
+                reject_unknown(mt, &["label", "ge", "le"], "agent_moved")?;
+                let label = mt
+                    .get("label")
+                    .ok_or_else(|| "agent_moved 缺 label".to_owned())
+                    .and_then(|v| str_of(v, "agent_moved.label"))?;
+                // ge/le 恰一个,值为数(米;与 count 的整数不同——位移是
+                // 连续量,解析为 f32)。
+                let mut ge: Option<f32> = None;
+                let mut le: Option<f32> = None;
+                for (key, which) in [("ge", 0), ("le", 1)] {
+                    if let Some(v) = mt.get(key) {
+                        if ge.is_some() || le.is_some() {
+                            return Err("agent_moved 应恰好给出 ge/le 之一".to_owned());
+                        }
+                        let m = v
+                            .as_float()
+                            .or_else(|| v.as_integer().map(|n| n as f64))
+                            .map(|f| f as f32)
+                            .ok_or_else(|| format!("agent_moved 的 {key} 应为数(米)"))?;
+                        if !m.is_finite() || m < 0.0 {
+                            return Err(format!("agent_moved 的 {key} 应为非负数(米)"));
+                        }
+                        if which == 0 {
+                            ge = Some(m);
+                        } else {
+                            le = Some(m);
+                        }
+                    }
+                }
+                if ge.is_none() && le.is_none() {
+                    return Err("agent_moved 缺比较项(ge/le 之一)".to_owned());
+                }
+                checks.push(Check::AgentMoved { label, ge, le });
+            }
+            "agent_alive" => {
+                let at = value
+                    .as_table()
+                    .ok_or_else(|| "agent_alive 应为 { label = \"..\" } 形式的表".to_owned())?;
+                reject_unknown(at, &["label"], "agent_alive")?;
+                let label = at
+                    .get("label")
+                    .ok_or_else(|| "agent_alive 缺 label".to_owned())
+                    .and_then(|v| str_of(v, "agent_alive.label"))?;
+                checks.push(Check::AgentAlive { label });
             }
             // timeout_ticks / hold_ticks 只属于 wait_until 本身,不是检查项。
             "timeout_ticks" | "hold_ticks" if what == "wait_until" => {}
@@ -757,6 +928,133 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
         }
         let action = parse_action(key, &t[key], step, &registry)?;
         steps.push(Step { label, action });
+    }
+
+    // A06 §4 校验(解析期,跨步骤):错误各指名步骤(从 1 起)。
+    // ① 主体动作的引用链:possess 的 label 必须先有 spawn_agent 登记(同
+    //    标签);agent_moved 的 label 必须先有同标签的 mark_agent;
+    //    agent_in/agent_alive 的 label 必须已由 spawn_agent 定义。
+    // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4)。
+    // ③ intent/unpossess/mark_agent 前必须有 possess(没有身体可操作 =
+    //    解析错误)。
+    {
+        let mut spawned: Option<(usize, String)> = None; // (步骤, 标签)
+        let mut possessed: Option<usize> = None; // 步骤
+        let mut marks: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for (i, step) in steps.iter().enumerate() {
+            let step_no = i + 1;
+            let refer = |label: &str, what: &str| -> Result<(), ScriptError> {
+                match &spawned {
+                    Some((_, name)) if name == label => Ok(()),
+                    Some((_, name)) => Err(step_err(
+                        step_no,
+                        format!(
+                            "{what} 引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\"(一场景一身体)"
+                        ),
+                    )),
+                    None => Err(step_err(
+                        step_no,
+                        format!("{what} 引用标签 \"{label}\",但此前没有 spawn_agent"),
+                    )),
+                }
+            };
+            match &step.action {
+                Action::SpawnAgent { label, .. } => {
+                    if spawned.is_some() {
+                        return Err(step_err(
+                            step_no,
+                            format!(
+                                "一场景最多一个身体:第二次 spawn_agent(第一次在第 {} 步)",
+                                spawned.as_ref().map(|(s, _)| *s).unwrap_or(0)
+                            ),
+                        ));
+                    }
+                    spawned = Some((step_no, label.clone()));
+                }
+                Action::Possess { label, .. } => {
+                    refer(label, "possess")?;
+                    possessed = Some(step_no);
+                }
+                Action::Unpossess => {
+                    if possessed.is_none() {
+                        return Err(step_err(step_no, "unpossess 前没有 possess"));
+                    }
+                    possessed = None;
+                }
+                Action::Intent { .. } => {
+                    if possessed.is_none() {
+                        return Err(step_err(step_no, "intent 前没有 possess"));
+                    }
+                }
+                Action::MarkAgent { label } => {
+                    if possessed.is_none() {
+                        return Err(step_err(step_no, "mark_agent 前没有 possess"));
+                    }
+                    refer(label, "mark_agent")?;
+                    marks.insert(label.clone(), step_no);
+                }
+                _ => {}
+            }
+        }
+        // 检查项的引用校验(独立遍历:check/wait_until 里出现的)。
+        for (i, step) in steps.iter().enumerate() {
+            let step_no = i + 1;
+            let checks: &[Check] = match &step.action {
+                Action::Check { checks } => checks,
+                Action::WaitUntil { checks, .. } => checks,
+                _ => continue,
+            };
+            for check in checks {
+                match check {
+                    Check::AgentIn { label, .. } | Check::AgentAlive { label } => match &spawned {
+                        Some((_, name)) if name == label => {}
+                        Some((_, name)) => {
+                            return Err(step_err(
+                                step_no,
+                                format!(
+                                    "主体检查引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\""
+                                ),
+                            ));
+                        }
+                        None => {
+                            return Err(step_err(
+                                step_no,
+                                format!("主体检查引用标签 \"{label}\",但场景没有 spawn_agent"),
+                            ));
+                        }
+                    },
+                    Check::AgentMoved { label, .. } => {
+                        match &spawned {
+                            Some((_, name)) if name == label => {}
+                            Some((_, name)) => {
+                                return Err(step_err(
+                                    step_no,
+                                    format!(
+                                        "agent_moved 引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\""
+                                    ),
+                                ));
+                            }
+                            None => {
+                                return Err(step_err(
+                                    step_no,
+                                    format!(
+                                        "agent_moved 引用标签 \"{label}\",但场景没有 spawn_agent"
+                                    ),
+                                ));
+                            }
+                        }
+                        if !marks.contains_key(label) {
+                            return Err(step_err(
+                                step_no,
+                                format!("agent_moved 前没有同标签的 mark_agent(\"{label}\")"),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     Ok(Scenario {

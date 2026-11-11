@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 
 use types::glam::Vec3;
-use types::{BlockId, BlockPos, ChunkPos, CompoundShape, EntityId};
+use types::{BlockId, BlockPos, ChunkPos, CompoundShape, EntityId, EntityState};
 
 use crate::client::ViewEvent;
 
@@ -60,6 +60,9 @@ pub struct WorldState {
     dirty: std::collections::BTreeSet<ChunkPos>,
     /// 自上次 `take_spawned` 以来收到的 Spawned 回执(到达顺序)。
     spawned: Vec<EntityId>,
+    /// 主体表(A06 §1):`(EntityId, BodyHash, 连杆姿态列表)`;增量
+    /// latest-wins、removed 删除、full 重建(语义与实体表同款)。
+    agents: BTreeMap<EntityId, (types::BodyHash, Vec<EntityState>)>,
 }
 
 impl WorldState {
@@ -130,6 +133,27 @@ impl WorldState {
                 }
             }
             ViewEvent::Spawned { entity } => self.spawned.push(entity),
+            // 主体流(A06 §1):增量 latest-wins、removed 删除、full 以
+            // states 重建(协议 full 同语义;与实体表对账一致)。
+            ViewEvent::Agents {
+                states,
+                removed,
+                full,
+                ..
+            } => {
+                if full {
+                    self.agents.clear();
+                }
+                for (id, hash, poses) in states {
+                    self.agents.insert(id, (hash, poses));
+                }
+                for id in removed {
+                    self.agents.remove(&id);
+                }
+            }
+            // 附身回执(A06 §2):不进世界镜像——附身状态机在渲染层
+            // (`PossessState`,按事件驱动)。这里无害吞掉(apply 的穷尽性)。
+            ViewEvent::Possessed { .. } => {}
             // 形状按 ID 记(覆盖旧值;§10 修订 4 第 3 条)。
             ViewEvent::Shapes { shapes } => {
                 for (id, shape) in shapes {
@@ -191,11 +215,35 @@ impl WorldState {
     pub fn take_spawned(&mut self) -> Vec<EntityId> {
         std::mem::take(&mut self.spawned)
     }
+
+    /// 主体表只读视图(A06 §1):`(EntityId, (BodyHash, 连杆姿态))`,
+    /// EntityId 升序(BTreeMap 键序)。渲染层按此画主体。
+    pub fn live_agents(&self) -> Vec<(EntityId, (types::BodyHash, &[EntityState]))> {
+        self.agents
+            .iter()
+            .map(|(id, (hash, poses))| (*id, (*hash, poses.as_slice())))
+            .collect()
+    }
+
+    /// 某主体的连杆姿态与哈希(A06 §1);不存在 → None。
+    pub fn agent(&self, id: EntityId) -> Option<(types::BodyHash, &[EntityState])> {
+        self.agents.get(&id).map(|(h, p)| (*h, p.as_slice()))
+    }
 }
 
 impl WorldQuery for WorldState {
     fn live_entities(&self) -> Vec<(EntityId, Vec3)> {
         self.entities.iter().map(|(id, p)| (*id, *p)).collect()
+    }
+
+    fn live_agent(&self) -> Option<(EntityId, Vec3)> {
+        self.agents.iter().next().map(|(id, (_, poses))| {
+            let pos = poses
+                .first()
+                .map(|p| p.translation)
+                .unwrap_or(types::glam::Vec3::ZERO);
+            (*id, pos)
+        })
     }
 
     fn block_at(&self, pos: BlockPos) -> Option<BlockId> {

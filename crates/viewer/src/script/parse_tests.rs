@@ -420,3 +420,137 @@ fn spawn_shape_rejects_malformed() {
         assert_eq!(e.step, Some(1), "{why}:错误要带步骤序号");
     }
 }
+
+// ---- A06 §4:主体动作与检查(解析 + 跨步骤校验)----
+
+/// 新动作解析形状(spawn_agent/possess/unpossess/intent/mark_agent)。
+#[test]
+fn agent_actions_parse() {
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nintent = {{ move = [4.3, 0.0], yaw = 0.0, jump = false }}\n[[step]]\nmark_agent = {{ label = \"p\" }}\n[[step]]\nunpossess = {{}}\n"
+    ))
+    .expect("主体动作场景可解析");
+    assert_eq!(s.steps.len(), 5);
+    assert_eq!(
+        s.steps[0].action,
+        Action::SpawnAgent {
+            at: Vec3::new(8.0, -57.0, 24.0),
+            yaw: 90.0,
+            label: "p".to_owned()
+        }
+    );
+    assert_eq!(
+        s.steps[1].action,
+        Action::Possess {
+            label: "p".to_owned(),
+            follow: false
+        },
+        "follow 缺省 false"
+    );
+    assert_eq!(
+        s.steps[2].action,
+        Action::Intent {
+            mv: (4.3, 0.0),
+            yaw: 0.0,
+            jump: false
+        }
+    );
+    assert_eq!(s.steps[4].action, Action::Unpossess);
+}
+
+/// 错误路径(放行 §4 校验):① possess 前没有 spawn_agent;② agent_moved
+/// 前没有 mark_agent;③ 未定义标签;④ 一场景两条 spawn_agent;⑤ intent/
+/// unpossess/mark_agent 前没有 possess;⑥ 引用了别的标签。
+#[test]
+fn agent_actions_validation_errors() {
+    // ① possess 前没有 spawn_agent。
+    let e = err(&one_step("possess = { label = \"p\" }"));
+    assert!(
+        e.message.contains("spawn_agent"),
+        "possess 无 spawn_agent:{}",
+        e.message
+    );
+    // ② agent_moved 前没有 mark_agent(spawn_agent 有,mark 没有)。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\ncheck = {{ agent_moved = {{ label = \"p\", ge = 1.0 }} }}\n"
+    ));
+    assert!(
+        e.message.contains("mark_agent"),
+        "agent_moved 无 mark:{}",
+        e.message
+    );
+    // ③ 未定义标签(agent_in 引用没登记过的)。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\ncheck = {{ agent_in = {{ label = \"q\", from = [0,0,0], to = [1,1,1] }} }}\n"
+    ));
+    assert!(e.message.contains("q"), "未定义标签:{}", e.message);
+    // ④ 一场景两条 spawn_agent。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\nspawn_agent = {{ at = [1.0, 0.0, 0.0], label = \"r\" }}\n"
+    ));
+    assert!(
+        e.message.contains("最多一个身体"),
+        "两条 spawn_agent:{}",
+        e.message
+    );
+    // ⑤ intent 前没有 possess。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\nintent = {{ move = [1.0, 0.0] }}\n"
+    ));
+    assert!(
+        e.message.contains("possess"),
+        "intent 无 possess:{}",
+        e.message
+    );
+    // ⑥ mark_agent 引用别的标签。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"q\" }}\n"
+    ));
+    assert!(e.message.contains("q"), "mark_agent 错标签:{}", e.message);
+}
+
+/// 主体检查的参数错误:agent_moved 的 ge/le 都不给、给两个、负值、非数。
+#[test]
+fn agent_moved_cmp_errors() {
+    let cases = [
+        "check = { agent_moved = { label = \"p\" } }",
+        "check = { agent_moved = { label = \"p\", ge = 1.0, le = 2.0 } }",
+        "check = { agent_moved = { label = \"p\", ge = -1.0 } }",
+        "check = { agent_moved = { label = \"p\", ge = \"x\" } }",
+    ];
+    for case in cases {
+        let e = err(&format!(
+            "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\" }}\n[[step]]\n{case}\n"
+        ));
+        assert_eq!(e.step, Some(3), "{case}:应报步骤 3");
+    }
+}
+
+/// 合法路径:agent_moved le、agent_alive、wait_until 里用 agent_in。
+#[test]
+fn agent_checks_ok_forms() {
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\" }}\n[[step]]\nwait_until = {{ agent_alive = {{ label = \"p\" }}, agent_moved = {{ label = \"p\", le = 2.5 }}, timeout_ticks = 100 }}\n"
+    ))
+    .expect("合法主体检查场景");
+    match &s.steps[3].action {
+        Action::WaitUntil { checks, .. } => {
+            assert_eq!(checks.len(), 2);
+            assert!(matches!(checks[0], Check::AgentAlive { .. }));
+            match &checks[1] {
+                Check::AgentMoved { ge, le, .. } => {
+                    assert_eq!(*ge, None);
+                    assert_eq!(*le, Some(2.5));
+                }
+                other => panic!("应为 AgentMoved,实为 {other:?}"),
+            }
+        }
+        other => panic!("应为 WaitUntil,实为 {other:?}"),
+    }
+    // wait_until 里用 agent_in 也合法(标签已定义)。
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0.0, 0.0, 0.0], label = \"p\" }}\n[[step]]\nwait_until = {{ agent_in = {{ label = \"p\", from = [0,0,0], to = [1,1,1] }}, timeout_ticks = 10 }}\n"
+    ))
+    .expect("agent_in 在 wait_until 里合法");
+    assert_eq!(s.steps.len(), 2);
+}

@@ -178,6 +178,12 @@ impl ShardSim {
         self.agents.contains_key(&id)
     }
 
+    /// 全部主体 ID(A06 §6"玩家回出生点";调度器拍前主体账本用):agents
+    /// 键序升序。只读观测口,不进快照。
+    pub fn agent_ids(&self) -> Vec<EntityId> {
+        self.agents.keys().copied().collect()
+    }
+
     /// 主体是否接地(A02a 第 3 节的接地判定;判据布景的接地自检观测口)。
     /// 主体不存在/无碰撞体/几何非胶囊 → false。
     pub fn agent_is_grounded(&self, id: EntityId, ground_eps: f32) -> bool {

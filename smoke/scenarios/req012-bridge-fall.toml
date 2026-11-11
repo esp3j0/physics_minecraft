@@ -1,0 +1,98 @@
+name = "req012-bridge-fall"
+req = "REQ-012"
+description = "胶囊站在石桥上:拆桥墩,桥塌,胶囊随桥面下落到地面(§11 第 3 行;§6 表'脚下的桥塌了→主体正常下落')"
+timeout_secs = 240
+
+[server]
+world_seed = 7
+
+# 9 格桥面 > 8 格悬臂上限:承载判定会立即拆桥——本场景的"塌"由拆墩触发
+# (断柱 → 桥面实体化下落),关闭承载判定(同 req009-bridge-collapse 先例)。
+[server.cohesion]
+enabled = false
+
+[[step]]
+camera = { pos = [9.0, -48.0, 26.0], yaw = -90.0, pitch = -25.0 }
+
+[[step]]
+look_at = { target = [9.0, -56.0, 14.0] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+# 两墩一桥面(跨 z=14;x 6..12)。墩高 3(−60..−58),桥面在 −57。
+# 承载:9 格桥面 > 8 上限会塌——本场景先关承载凝固桥?不需要:桥建成
+# 后 fill 写入静态,承载判定只在写入/实体扰动时跑;9 格悬臂桥按 REQ-009
+# 会立即塌——参照 req009-bridge-collapse 关闭 cohesion 的先例。
+[[step]]
+label = "左墩"
+fill = { from = [6, -60, 14], to = [6, -58, 14], block = "stone" }
+
+[[step]]
+label = "右墩"
+fill = { from = [12, -60, 14], to = [12, -58, 14], block = "stone" }
+
+[[step]]
+label = "桥面"
+fill = { from = [6, -57, 14], to = [12, -57, 14], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [12, -57, 14], is = "stone" }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 20 }
+
+# 胶囊生成在桥面中部上方(桥面顶 = −56,胶囊半高 0.9 → −55.05)。
+[[step]]
+label = "生成胶囊在桥上"
+spawn_agent = { at = [9.5, -55.05, 14.5], yaw = 0.0, label = "hero" }
+
+[[step]]
+possess = { label = "hero" }
+
+# 桥面高度盒(落稳在桥上)。
+[[step]]
+wait_until = { agent_in = { label = "hero", from = [7.5, -56.5, 13.5], to = [11.5, -55.0, 15.5] }, timeout_ticks = 300 }
+
+[[step]]
+screenshot = { name = "on-bridge", expect = "画面中高亮色圆柱体站在灰色石桥的桥面上,桥由两根石柱支撑悬在棕色地面上方" }
+
+# 拆两墩(整列 AIR)。
+[[step]]
+label = "拆左墩"
+fill = { from = [6, -60, 14], to = [6, -58, 14], block = "air" }
+
+[[step]]
+label = "拆右墩"
+fill = { from = [12, -60, 14], to = [12, -58, 14], block = "air" }
+
+# 桥面实体化 + 塌落 + 胶囊随之下落(~120 拍裕量)。
+[[step]]
+wait_ticks = { n = 30 }
+
+# 落到地面高度盒(y −60..−58;地面顶面 −60)。
+[[step]]
+label = "胶囊落到地面高度"
+wait_until = { agent_in = { label = "hero", from = [4.5, -60.5, 11.5], to = [14.5, -57.8, 17.5] }, timeout_ticks = 600 }
+
+[[step]]
+wait_ticks = { n = 60 }
+
+[[step]]
+camera = { pos = [9.0, -52.0, 22.0], yaw = -90.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [9.0, -58.5, 14.0] }
+
+[[step]]
+screenshot = { name = "after-fall", expect = "画面中桥已不再悬空:桥面方块贴着地面(凝固的灰条或蓝色下落体),高亮色圆柱体在地面上(或桥面方块旁);没有悬空的桥" }
+
+# 桥面原高度区域实心 = 0(桥塌干净)。
+[[step]]
+label = "桥面原高度无实心"
+check = { count = { from = [6, -57, 14], to = [12, -57, 14], is = "stone", eq = 0 } }
+
+# 胶囊活着(随桥下落没有消失)。
+[[step]]
+label = "胶囊存活"
+check = { agent_alive = { label = "hero" } }

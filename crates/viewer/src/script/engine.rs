@@ -69,6 +69,12 @@ enum WaitState {
     Fly {
         start_tick: u64,
     },
+    /// possess 等待主体表可见(A06 §4;回执后下一拍才内核生效)。
+    Possess {
+        start_tick: u64,
+        entity: EntityId,
+        follow: bool,
+    },
     WaitTicks {
         start_tick: u64,
     },
@@ -88,7 +94,9 @@ enum WaitState {
 impl WaitState {
     fn start_tick(self) -> u64 {
         match self {
-            WaitState::Fly { start_tick } | WaitState::WaitTicks { start_tick } => start_tick,
+            WaitState::Fly { start_tick }
+            | WaitState::WaitTicks { start_tick }
+            | WaitState::Possess { start_tick, .. } => start_tick,
             WaitState::WaitUntil { start_tick, .. } => start_tick,
             WaitState::Spawn { start_tick, .. } => start_tick,
         }
@@ -121,6 +129,29 @@ pub(super) struct EngineInner {
     spawn_received: Vec<EntityId>,
     /// 场景墙钟累计,秒(细则 10:含当前帧;与服务器拍号无关)。
     elapsed_secs: f32,
+    /// A06 §4:spawn_agent 的标签 → 实体 ID(收到 Spawned 回执后登记;
+    /// 一场景最多一个身体,解析期已限一条 spawn_agent)。
+    agent_labels: BTreeMap<String, EntityId>,
+    /// A06 §4:mark_agent 的标签 → 记录时的根位置(agent_moved 的基准)。
+    agent_marks: BTreeMap<String, Vec3>,
+    /// A06 §4:当前附身的主体(spawn_agent 生成的;possess 成功即登记,
+    /// unpossess 清掉;intent/mark_agent 的操作对象)。
+    possessed: Option<EntityId>,
+    /// A06 §4:possess 步骤的跨帧状态(已发 Possess 命令,等回执与主体流
+    /// 可见;`follow` 缺省 false——相机不动)。
+    possess_pending: Option<PossessPending>,
+}
+
+/// possess 步骤的跨帧状态(A06 §4):等待 Spawned 回执 → 发 Possess →
+/// 等主体表出现该 ID(视为附身成功;协议 Possessed 回执不进脚本引擎——
+/// 引擎按"主体表可见即 possession 生效"判定,与渲染层 PossessState 的
+/// 回执流解耦)。
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PossessPending {
+    label: String,
+    follow: bool,
+    /// possess 步骤开始的拍号(超时判定)。
+    start_tick: u64,
 }
 
 impl EngineInner {
@@ -154,6 +185,10 @@ impl EngineInner {
             fill: None,
             spawn_received: Vec::new(),
             elapsed_secs: 0.0,
+            agent_labels: BTreeMap::new(),
+            agent_marks: BTreeMap::new(),
+            possessed: None,
+            possess_pending: None,
             scenario,
         }
     }
@@ -166,6 +201,7 @@ impl EngineInner {
             commands: Vec::new(),
             screenshot: None,
             finished: Vec::new(),
+            possess: None,
         };
         if !matches!(self.status, EngineStatus::Running { .. }) {
             return (out, self.status.clone()); // 细则 11:结束后不再推进
@@ -567,6 +603,213 @@ impl EngineInner {
                         break;
                     }
                 }
+                // ---- A06 §4 主体动作 ----
+                // spawn_agent:发 SpawnAgent 命令,等 agent_spawned 回执登记
+                // 标签(超时 = 场景失败;一场景最多一个,解析期已限)。
+                Action::SpawnAgent { at, yaw, label } => {
+                    let start_tick = match self.wait {
+                        Some(WaitState::Spawn { start_tick, .. }) => start_tick,
+                        _ => {
+                            self.wait = Some(WaitState::Spawn {
+                                start_tick: tick,
+                                emitted: false,
+                            });
+                            tick
+                        }
+                    };
+                    let emitted = matches!(self.wait, Some(WaitState::Spawn { emitted: true, .. }));
+                    if !emitted {
+                        out.commands
+                            .push(EngineCommand::SpawnAgent { position: at, yaw });
+                        self.wait = Some(WaitState::Spawn {
+                            start_tick,
+                            emitted: true,
+                        });
+                    }
+                    if let Some(id) = input.agent_spawned.first() {
+                        self.agent_labels.insert(label.clone(), *id);
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            Some(label.clone()),
+                            "spawn_agent",
+                            StepOutcome::Ok,
+                            None,
+                            start_tick,
+                            tick,
+                        );
+                    } else if tick >= start_tick.saturating_add(SPAWN_RECEIPT_TIMEOUT_TICKS) {
+                        let reason = format!(
+                            "spawn_agent 回执超时:{SPAWN_RECEIPT_TIMEOUT_TICKS} 拍内未收到"
+                        );
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            Some(label),
+                            "spawn_agent",
+                            StepOutcome::Error(reason.clone()),
+                            None,
+                            start_tick,
+                            tick,
+                        );
+                        self.status = EngineStatus::Failed {
+                            step: step_no,
+                            reason,
+                        };
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                // possess:内核生成在回执后下一拍才生效(Spawned 回执 = 命令
+                // 投递时发),立即发 Possess 会被驱动以"实体不存在"拒绝——
+                // 等主体表出现该 ID 再发(与渲染层 try_auto_possess 同口径)。
+                // follow 只影响渲染层相机,不改引擎状态。
+                Action::Possess { label, follow } => {
+                    let Some(id) = self.agent_labels.get(&label).copied() else {
+                        let reason = format!("possess:标签 \"{label}\" 还没有回执");
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            None,
+                            "possess",
+                            StepOutcome::Error(reason.clone()),
+                            None,
+                            tick,
+                            tick,
+                        );
+                        self.status = EngineStatus::Failed {
+                            step: step_no,
+                            reason,
+                        };
+                        break;
+                    };
+                    let start_tick = self.enter_wait(
+                        |t| WaitState::Possess {
+                            start_tick: t,
+                            entity: id,
+                            follow,
+                        },
+                        tick,
+                    );
+                    if input.world.live_agent().is_some_and(|(lid, _)| lid == id) {
+                        out.commands.push(EngineCommand::Possess { entity: id });
+                        self.possessed = Some(id);
+                        self.possess_pending = Some(PossessPending {
+                            label: label.clone(),
+                            follow,
+                            start_tick,
+                        });
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            Some(label.clone()),
+                            "possess",
+                            StepOutcome::Ok,
+                            None,
+                            start_tick,
+                            tick,
+                        );
+                    } else if tick >= start_tick.saturating_add(SPAWN_RECEIPT_TIMEOUT_TICKS) {
+                        let reason =
+                            format!("possess 超时:{SPAWN_RECEIPT_TIMEOUT_TICKS} 拍内主体不可见");
+                        self.finish_step(
+                            &mut out,
+                            step_no,
+                            Some(label.clone()),
+                            "possess",
+                            StepOutcome::Error(reason.clone()),
+                            None,
+                            start_tick,
+                            tick,
+                        );
+                        self.status = EngineStatus::Failed {
+                            step: step_no,
+                            reason,
+                        };
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                Action::Unpossess => {
+                    self.possessed = None;
+                    self.possess_pending = None;
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "unpossess",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
+                // intent:持续生效直到下一条——登记保持意图,每帧若主体
+                // 存活重发(连接断开/主体移除即停;发一条即可,保持状态在
+                // 服务端)。jump 一次性:只在本帧命令带 true。
+                Action::Intent { mv, yaw, jump } => {
+                    if let Some(entity) = self.possessed {
+                        out.commands.push(EngineCommand::AgentIntent {
+                            entity,
+                            move_xz: mv,
+                            yaw,
+                            jump,
+                        });
+                    }
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "intent",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
+                // mark_agent:记下当前根位置(主体表无该主体 = 失败)。
+                Action::MarkAgent { label } => {
+                    let pos = self
+                        .possessed
+                        .and_then(|_| input.world.live_agent())
+                        .filter(|(id, _)| Some(*id) == self.possessed)
+                        .map(|(_, p)| p);
+                    match pos {
+                        Some(p) => {
+                            self.agent_marks.insert(label.clone(), p);
+                            self.finish_step(
+                                &mut out,
+                                step_no,
+                                None,
+                                "mark_agent",
+                                StepOutcome::Ok,
+                                None,
+                                tick,
+                                tick,
+                            );
+                        }
+                        None => {
+                            let reason = "mark_agent:主体不在主体表(未生成或已移除)".to_owned();
+                            self.finish_step(
+                                &mut out,
+                                step_no,
+                                None,
+                                "mark_agent",
+                                StepOutcome::Error(reason.clone()),
+                                None,
+                                tick,
+                                tick,
+                            );
+                            self.status = EngineStatus::Failed {
+                                step: step_no,
+                                reason,
+                            };
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -579,6 +822,18 @@ impl EngineInner {
         }
         out.camera = self.camera;
         out.coupled = self.coupled;
+        // A06 §4:脚本附身状态(follow 从 possess_pending 取;已解除 = None)。
+        out.possess = match self.possessed {
+            Some(id) => {
+                let follow = self
+                    .possess_pending
+                    .as_ref()
+                    .map(|p| p.follow)
+                    .unwrap_or(false);
+                Some((id, follow))
+            }
+            None => None,
+        };
         (out, self.status.clone())
     }
 
@@ -754,6 +1009,75 @@ impl EngineInner {
                         msgs.push(format!(
                             "存在悬空且静止的活实体:底面高出所在柱实心顶面 {height} m 以上,且 {still_ticks} 拍内位移 ≤ {STILL_DRIFT_MAX} m"
                         ));
+                    }
+                }
+                // A06 §4 主体检查:label 经 spawn_agent 登记;位置取主体表
+                // 的当前根位置(主体不在表 = 检查不成立,如实报失败)。
+                Check::AgentIn { label, from, to } => {
+                    let Some(id) = self.agent_labels.get(label) else {
+                        msgs.push(format!(
+                            "agent_in:标签 \"{label}\" 未登记(spawn_agent 回执未到)"
+                        ));
+                        continue;
+                    };
+                    match input.world.live_agent().filter(|(lid, _)| lid == id) {
+                        Some((_, p)) => {
+                            let inside = p.x >= from.x
+                                && p.x <= to.x
+                                && p.y >= from.y
+                                && p.y <= to.y
+                                && p.z >= from.z
+                                && p.z <= to.z;
+                            if !inside {
+                                msgs.push(format!(
+                                    "agent_in:主体根位置 ({:.2}, {:.2}, {:.2}) 不在盒 {from:?}..{to:?} 内",
+                                    p.x, p.y, p.z
+                                ));
+                            }
+                        }
+                        None => msgs.push(format!(
+                            "agent_in:主体(标签 \"{label}\")不在主体表(未生成或已移除)"
+                        )),
+                    }
+                }
+                Check::AgentMoved { label, ge, le } => {
+                    let Some(id) = self.agent_labels.get(label) else {
+                        msgs.push(format!(
+                            "agent_moved:标签 \"{label}\" 未登记(spawn_agent 回执未到)"
+                        ));
+                        continue;
+                    };
+                    let Some(mark) = self.agent_marks.get(label) else {
+                        msgs.push(format!(
+                            "agent_moved:标签 \"{label}\" 没有 mark_agent 基准点(解析期应已拦截;运行期标记步骤失败)"
+                        ));
+                        continue;
+                    };
+                    match input.world.live_agent().filter(|(lid, _)| lid == id) {
+                        Some((_, p)) => {
+                            let dist = (p - *mark).length();
+                            if let Some(ge_m) = ge
+                                && dist < *ge_m
+                            {
+                                msgs.push(format!("agent_moved:位移 {dist:.3} m < 下限 {ge_m} m"));
+                            }
+                            if let Some(le_m) = le
+                                && dist > *le_m
+                            {
+                                msgs.push(format!("agent_moved:位移 {dist:.3} m > 上限 {le_m} m"));
+                            }
+                        }
+                        None => msgs.push(format!(
+                            "agent_moved:主体(标签 \"{label}\")不在主体表(未生成或已移除)"
+                        )),
+                    }
+                }
+                Check::AgentAlive { label } => {
+                    let alive = self.agent_labels.get(label).is_some_and(|id| {
+                        input.world.live_agent().is_some_and(|(lid, _)| lid == *id)
+                    });
+                    if !alive {
+                        msgs.push(format!("agent_alive:标签 \"{label}\" 的主体不在主体表"));
                     }
                 }
             }
