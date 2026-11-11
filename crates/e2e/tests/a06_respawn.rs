@@ -191,10 +191,11 @@ async fn set_block(c: &mut TestClient, pos: BlockPos, block: types::BlockId) {
 async fn agent_pose_drained(rx: &mut mpsc::UnboundedReceiver<S2C>, id: EntityId) -> Option<Vec3> {
     while rx.try_recv().is_ok() {}
     let mut last = None;
-    for _ in 0..50 {
+    for _ in 0..200 {
         // start_paused 虚拟时钟的 timeout 不耗真实时间,服务器任务要在
         // 真实 CPU 窗口里才能投帧(a03 系 real_yield 同款);无 real_yield
-        // 时 CI 单核 runner 上 50 次 timeout 瞬时烧完,一次帧都等不到。
+        // 时 CI 受限 runner 上等待窗口瞬时烧完,一次帧都等不到。200 帧 ×
+        // 1 ms 真实 sleep = 单次 drained 至少 200 ms 真实让出窗。
         real_yield().await;
         match next_frame(rx).await {
             Some(S2C::AgentStates { states, .. }) => {
@@ -400,53 +401,23 @@ async fn a06_4_player_respawn_and_auto_possess() {
     }
     advance_ticks(10).await;
 
-    // 走进洞:逐拍发意图 (0, −4.3)(−z 方向),直到掉落(y 明显下降)。
-    // 4.5 m ≈ 30 拍 + 落洞。采样按 10 拍窗口(CI 高负载下逐拍收帧的
-    // drained 预算不稳:窗口内帧数 ≥ AgentStates cadence,排干必有所获;
-    // 逐拍口径本地过、CI 挂——见 REQ-012 A03 "在线帧 tick=状态拍+1" 同款
-    // 时序抖动)。意图逐拍发不受窗口影响(每拍一条照发)。
-    let mut fell = false;
-    let mut last_seen: Option<Vec3> = None;
-    for _ in 0..40 {
-        // 窗口 10 拍:逐拍发意图(在途窗口被拒 = 布景预期)。
-        for _ in 0..10 {
-            a.send(&C2S::AgentIntent {
-                entity: body,
-                move_xz: (0.0, -4.3),
-                yaw: 0.0,
-                jump: false,
-            })
-            .await
-            .expect("走向洞");
-            advance_ticks(1).await;
-        }
-        // 窗口末收帧:y 较上次采样明显下降 = 落洞(洞深 4 m;顶面 −60,
-        // 胶囊悬空下坠;10 拍自由落体 ≈ 0.9 m ≫ 0.05 阈)。
-        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
-            match last_seen {
-                None => last_seen = Some(p),
-                Some(q) => {
-                    if p.y < q.y - 0.05 {
-                        fell = true;
-                        break;
-                    }
-                }
-            }
-        }
+    // 走进洞:逐拍发意图 (0, −4.3)(−z 方向)。4.5 m ≈ 30 拍 + 落洞;
+    // 固定走 50 拍(足够走出边沿并悬空下坠)。**在线帧采样不做判定依据**
+    // ——CI 受限 runner 上服务器任务的下行帧投递时序与本地不可比(R1/R2
+    // 两轮 CI 实证:逐拍与窗口采样都可能出现"相邻采样对永不满足"或整段
+    // 收不到帧);"是否掉洞"由下方统一收帧循环的结构判据承担(旧身体的
+    // removed 帧 = 虚空移除发生 = 必然走完洞+掉出世界)。
+    for _ in 0..50 {
+        a.send(&C2S::AgentIntent {
+            entity: body,
+            move_xz: (0.0, -4.3),
+            yaw: 0.0,
+            jump: false,
+        })
+        .await
+        .expect("走向洞");
+        advance_ticks(1).await;
     }
-    if !fell {
-        // 兜底:最后采样显著低于站立高度(−59.1)即视为落洞。
-        if let Some(p) = last_seen
-            && p.y < GROUND_TOP_Y - 0.5
-        {
-            fell = true;
-        }
-    }
-    assert!(
-        fell,
-        "布景自检:玩家身体应走进洞并开始下落(末采样 {last_seen:?})"
-    );
-
     // 等待掉落 + 虚空移除 + 重生 + 自动附身(统一收帧循环,不丢帧:挖洞
     // 会触发洞顶 dirt 柱的承载塌落,塌落生成的 Spawned 与重生 Spawned 同
     // 通道——用 Possessed(Some(非旧身体)) 作为"重生+自动附身完成"的
@@ -458,6 +429,7 @@ async fn a06_4_player_respawn_and_auto_possess() {
     for _ in 0..1200 {
         advance_ticks(1).await;
         loop {
+            real_yield().await;
             match next_frame(&mut rxa).await {
                 Some(S2C::AgentStates { removed, .. }) => {
                     if removed.contains(&body) {
@@ -761,43 +733,27 @@ async fn a06_6_replay_includes_respawn_actions() {
         }
     }
     advance_ticks(10).await;
-    // 走洞采样同 a06_4:10 拍窗口(CI 逐拍收帧不稳)。
-    let mut fell = false;
-    let mut last_seen: Option<Vec3> = None;
-    for _ in 0..40 {
-        for _ in 0..10 {
-            a.send(&C2S::AgentIntent {
-                entity: body,
-                move_xz: (0.0, -4.3),
-                yaw: 0.0,
-                jump: false,
-            })
-            .await
-            .expect("走向洞");
-            advance_ticks(1).await;
-        }
-        if let Some(p) = agent_pose_drained(&mut rxa, body).await {
-            match last_seen {
-                None => last_seen = Some(p),
-                Some(q) => {
-                    if p.y < q.y - 0.05 {
-                        fell = true;
-                        break;
-                    }
-                }
-            }
-        }
+    // 走进洞:固定走 50 拍(同 a06_4 R3;"是否掉洞"由统一收帧循环的
+    // Possessed(Some(非旧身体)) 结构判据承担,在线帧采样不判定——CI
+    // 受限 runner 上帧投递时序与本地不可比,R1/R2 两轮 CI 实证)。
+    for _ in 0..50 {
+        a.send(&C2S::AgentIntent {
+            entity: body,
+            move_xz: (0.0, -4.3),
+            yaw: 0.0,
+            jump: false,
+        })
+        .await
+        .expect("走向洞");
+        advance_ticks(1).await;
     }
-    assert!(
-        fell,
-        "布景自检:玩家身体应走进洞并开始下落(末采样 {last_seen:?})"
-    );
     // 等虚空移除 + 重生(统一收帧;塌落生成的 Spawned 同通道,以
     // Possessed(Some(非旧身体)) 为终点)。
     let mut new_body = None;
     for _ in 0..1200 {
         advance_ticks(1).await;
         loop {
+            real_yield().await;
             match next_frame(&mut rxa).await {
                 Some(S2C::Possessed { entity: Some(x) }) if x != body => {
                     new_body = Some(x);
