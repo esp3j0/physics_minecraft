@@ -1515,11 +1515,13 @@ impl ObserveOrchestrator {
             match poll {
                 crate::respawn::PossessPoll::Ready(player, entity) => {
                     // Ready 只说明 owner 已登记;仍走 handle_possess 的完整
-                    // 校验(是主体、未被他人附身),被拒同样计失败。
+                    // 校验(是主体、未被他人附身),被拒同样计失败 + 补发
+                    // Possessed(None)(R2-4:此前只计数,连接收不到任何
+                    // 回执,客户端会停在等附身状态)。
                     let before = self.agent_counters.possess_rejected;
                     self.handle_possess(player, entity, session, log, hub);
                     if self.agent_counters.possess_rejected > before {
-                        self.agent_counters.player_respawn_failed += 1;
+                        self.fail_respawn_possess(player, hub);
                     } else {
                         self.agent_counters.player_respawned += 1;
                     }
@@ -1527,11 +1529,19 @@ impl ObserveOrchestrator {
                 crate::respawn::PossessPoll::TimedOut(player, _) => {
                     // 超过宽限:失败计数,并补发 Possessed(None)——reap 的
                     // 被迫解除只在附身表里有条目时发,重生等待期不在表。
-                    self.agent_counters.player_respawn_failed += 1;
-                    hub.push_critical(player, S2C::Possessed { entity: None });
+                    self.fail_respawn_possess(player, hub);
                 }
             }
         }
+    }
+
+    /// 重生后附身失败(Ready 被拒 / 等待超时)的统一收口(R2-4):计
+    /// `player_respawn_failed` + 补发 `Possessed(None)`——连接两侧状态
+    /// 一起回观察者(reap 的被迫解除只在附身表有条目时发,重生等待期
+    /// 不在表,这条是连接收到的唯一回执)。
+    fn fail_respawn_possess(&mut self, player: messaging::InputSource, hub: &OutboundHub) {
+        self.agent_counters.player_respawn_failed += 1;
+        hub.push_critical(player, S2C::Possessed { entity: None });
     }
 
     /// 附身表只读视图(判据 A03-3 断言双向一对一用):`(连接, 主体)` 升序。
@@ -7155,5 +7165,112 @@ mod tests {
             o.respawn.spawn_point(player).map(|sp| sp.yaw),
             Some(90.0_f32)
         );
+    }
+
+    /// R2-4(#25):重生待附身超时的失败收口——`begin_possess_wait` 登记
+    /// 一个**不存在的实体**(生成被内核拒绝的等价情形),推过宽限期
+    /// (`POSSESS_GRACE_TICKS`)后 `flush_pending_respawn_possess`:
+    /// `player_respawn_failed` = 1,且该连接的出站队列里有
+    /// `Possessed(None)`(连接侧要靠它回观察者状态)。变红实现:
+    /// `fail_respawn_possess` 不补发回执(只计数)。
+    #[test]
+    fn r2_4_respawn_possess_timeout_notifies_connection() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        let hub = OutboundHub::new();
+        // 本地队列接住 push_critical(hub.register 是 crate 内缝,测试直注)。
+        let mut outbound = crate::net::Outbound::new();
+        let player = messaging::InputSource(1);
+        hub.register(player, outbound.world_writer());
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        // 待附身条目:实体不存在(生成被拒的等价情形),发起拍 = 当前拍。
+        let ghost = EntityId::from_parts(0, 9_999_999);
+        let now = session.tick_now();
+        o.respawn.begin_possess_wait(player, ghost, now);
+        // 推过宽限期(逐拍 flush,与生产循环同节奏;宽限内不出判定)。
+        for _ in 0..=crate::respawn::POSSESS_GRACE_TICKS {
+            session.tick();
+            o.flush_pending_respawn_possess(&mut session, &mut log, &hub);
+        }
+        // 失败计数 = 1。
+        assert_eq!(
+            o.agent_counters.player_respawn_failed, 1,
+            "超时计 player_respawn_failed = 1(实得 {})",
+            o.agent_counters.player_respawn_failed
+        );
+        // 连接出站队列里有 Possessed(None)(fail_respawn_possess 补发)。
+        let got_possessed_none = std::iter::from_fn(|| outbound.try_pop())
+            .any(|msg| msg == S2C::Possessed { entity: None });
+        assert!(
+            got_possessed_none,
+            "出站队列应含 Possessed(None)(连接侧回观察者状态的唯一回执)"
+        );
+    }
+
+    /// R2-4(#25)变异 5 锚:**Ready 后被拒**也走 `fail_respawn_possess`
+    /// (计数 + 补发回执)。构造:待附身条目指向一个**已存在的非主体实体**
+    /// (普通 dynamic:`entity_owner` 有值 → poll Ready;`is_agent` false →
+    /// `handle_possess` 拒绝)。变红实现:Ready 被拒时只计数、不补发
+    /// `Possessed(None)`(或干脆不调 `fail_respawn_possess`)。
+    #[test]
+    fn r2_4_ready_but_rejected_also_notifies_connection() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        // 出生点 chunk(0,0)装载。
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        // 造一个**非主体**实体(普通 dynamic;source = SCHEDULER)。
+        let plain = EntityId::from_parts(0, 5_000_001);
+        let shard = shard_id(0, 0);
+        session
+            .spawn_owned(
+                shard,
+                plain,
+                types::EntityState {
+                    translation: types::glam::Vec3::new(8.5, -58.0, 8.5),
+                    ..types::EntityState::default()
+                },
+                types::EntityDesc::default(),
+                messaging::InputSource::SCHEDULER,
+            )
+            .expect("普通实体生成投递");
+        session.tick();
+        assert!(
+            session.entity_owner(plain).is_some() && !session.is_agent(plain),
+            "布景:plain 已在内核且不是主体"
+        );
+        let hub = OutboundHub::new();
+        let mut outbound = crate::net::Outbound::new();
+        let player = messaging::InputSource(1);
+        hub.register(player, outbound.world_writer());
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        // 待附身条目指向 plain:下一拍 poll 即 Ready,但 handle_possess 以
+        // "不是主体"拒绝。
+        o.respawn
+            .begin_possess_wait(player, plain, session.tick_now());
+        session.tick();
+        o.flush_pending_respawn_possess(&mut session, &mut log, &hub);
+        // 失败计数 = 1(handle_possess 被拒 → fail_respawn_possess)。
+        assert_eq!(
+            o.agent_counters.player_respawn_failed, 1,
+            "Ready 被拒计 player_respawn_failed = 1(实得 {})",
+            o.agent_counters.player_respawn_failed
+        );
+        assert!(
+            o.agent_counters.possess_rejected >= 1,
+            "handle_possess 确实拒绝(possess_rejected ≥ 1,实得 {})",
+            o.agent_counters.possess_rejected
+        );
+        // 连接收到 Possessed(None)(变异 5 的红点:不补发即红)。
+        let got_possessed_none = std::iter::from_fn(|| outbound.try_pop())
+            .any(|msg| msg == S2C::Possessed { entity: None });
+        assert!(got_possessed_none, "Ready 被拒也必须补发 Possessed(None)");
     }
 }

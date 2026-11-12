@@ -920,7 +920,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
         // A06:附身模式下相机由第三人称逻辑接管(下方),飞行 update 跳过;
         // 鼠标视角仍走(delta 驱动 possess 相机的 yaw/pitch)。
         let possessed_now = possess_state.possessed().is_some();
-        if !possessed_now {
+        // R2-3 输入路由:附身时空格/滚轮/WASD 都归附身功能,不再同时驱动
+        // 通用交互(切耦合 / 调发射速度 / 平移飞行相机)。每帧取一次。
+        let routing = possess::input_routing(possessed_now);
+        if routing.wasd_moves_camera {
             camera.update(dt);
         }
         tools.tick(dt); // 拒绝提示计时(逐帧 dt;工具行为不进模拟)
@@ -1013,8 +1016,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
         // 拾取(REQ-011 §3.3):客户端已收到的 chunk 数据,最远 48 m。
         target = pick_at_camera(&camera, &world.state);
 
-        // 空格切换耦合(边沿触发,不连发)。
-        if is_key_pressed(KeyCode::Space) {
+        // 空格切换耦合(边沿触发,不连发)。R2-3:附身时空格 = 跳跃意图,
+        // 不切耦合(附身期间与退出附身都不改变 coupled 的值)。
+        if routing.space_toggles_coupling && is_key_pressed(KeyCode::Space) {
             coupled = !coupled;
         }
         // M 切换鼠标锁定(释放后可正常使用指针;再按 M 重新锁定转视角)。
@@ -1149,7 +1153,9 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             tools.launch_shape = tools.launch_shape.next();
         }
         // 滚轮:预设速度 ±5,一帧最多一档;鼠标释放(M)时不生效(§3.1)。
-        if mouse_grabbed {
+        // R2-3:附身时滚轮 = 第三人称相机距离(上方 possess 分支已消费),
+        // 不再调发射预设速度。
+        if mouse_grabbed && routing.wheel_sets_launch_speed {
             let (_, wheel_y) = mouse_wheel();
             if wheel_y != 0.0 {
                 tools.preset_speed = adjust_preset_speed(tools.preset_speed, wheel_y);
@@ -1341,10 +1347,13 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
             draw_text(line, 12.0, 20.0 + i as f32 * 20.0, 18.0, WHITE);
         }
         draw_text(
-            if coupled {
-                "coupled: ON (Space to toggle)"
-            } else {
-                "coupled: OFF (Space to toggle)"
+            // R2-3:附身时空格是跳跃,提示不再说 "Space to toggle"(耦合值
+            // 在附身期间与退出附身时都不变)。
+            match (coupled, possessed_id.is_some()) {
+                (true, false) => "coupled: ON (Space to toggle)",
+                (false, false) => "coupled: OFF (Space to toggle)",
+                (true, true) => "coupled: ON (locked while possessed)",
+                (false, true) => "coupled: OFF (locked while possessed)",
             },
             12.0,
             104.0,

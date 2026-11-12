@@ -50,6 +50,35 @@ const SOFT: Duration = Duration::from_millis(50);
 /// 收帧上限(条):一轮"等重生"窗口最多消费的下帧数。超限 panic(写明
 /// 在等什么)——挂死不算红(R1 §4)。
 const FRAME_BUDGET: usize = 4000;
+/// 等待墙钟上限(R2-1):单个等待循环从建 `Deadline` 起最多 60 s 真实
+/// 时间。帧数预算在 CI 受限 runner 上换算成墙钟不可控(每帧内层
+/// real_yield 的真实 sleep 被调度放大,T4 按 4000 帧实测 344 s)——墙钟
+/// 上限保证"回执不来 60 s 内变红"。
+const WAIT_WALL_SECS: u64 = 60;
+
+/// 单个等待循环的墙钟上限(R2-1 设计):循环开头 `new`,每轮迭代 `check`;
+/// 过期 panic 带上在等什么。
+struct Deadline {
+    at: std::time::Instant,
+    what: &'static str,
+}
+
+impl Deadline {
+    fn new(what: &'static str) -> Self {
+        Self {
+            #[allow(clippy::disallowed_methods)] // e2e 测试墙钟上限(R2-1 授权)
+            at: std::time::Instant::now() + Duration::from_secs(WAIT_WALL_SECS),
+            what,
+        }
+    }
+
+    fn check(&self) {
+        #[allow(clippy::disallowed_methods)] // 同上
+        if std::time::Instant::now() >= self.at {
+            panic!("等待墙钟超限({WAIT_WALL_SECS} s):{}", self.what);
+        }
+    }
+}
 
 fn capsule_registry() -> BodyRegistry {
     let mut bodies = BodyRegistry::new();
@@ -88,7 +117,9 @@ async fn wait_respawn_possessed(
     let mut removed_seen = false;
     let mut spawned: Vec<EntityId> = Vec::new();
     let mut frames = 0usize;
+    let deadline = Deadline::new("虚空移除→重生→附身回执(Possessed(Some(≠旧身体)))");
     loop {
+        deadline.check();
         if frames >= FRAME_BUDGET {
             panic!(
                 "等重生自动附身超预算:{FRAME_BUDGET} 帧内未见 Possessed(Some(≠{old:?}));\
@@ -323,9 +354,25 @@ impl storage::traits::CheckpointStore for RecordingCheckpointStore {
 
 struct Harness {
     tx: mpsc::Sender<DriverCommand>,
-    driver: tokio::task::JoinHandle<DriverOutcome>,
+    /// Some = 待 join;显式 shutdown 时 take(Drop 类型禁止 move 字段,
+    /// take 走 Option::replace 语义合法)。
+    driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
     checkpoints: RecordingCheckpointStore,
+}
+
+/// 兜底关停(R2-1,a06_6 挂死根因):测试 body panic(等待判据红)时,
+/// 测试任务 unwind,**没人发 Shutdown**——驱动任务在 start_paused 下
+/// `ticker.tick()` auto-advance 全速空转,每 `checkpoint_interval_ticks`
+/// 拍写一次 checkpoint(bincode + lz4 压缩,栈证据:
+/// `write_checkpoint → encode_checkpoint → lz4_flex compress`),测试
+/// 进程永不退出(实测 25 min 不结束,CPU 满核)。Drop 先 try_send 关停,
+/// 驱动收尾(终末 checkpoint + flush + shutdown)照常走完;JoinHandle
+/// 留在原地被 drop(detach)不阻塞 unwind。
+impl Drop for Harness {
+    fn drop(&mut self) {
+        let _ = self.tx.try_send(DriverCommand::Shutdown);
+    }
 }
 
 fn base_config() -> Config {
@@ -385,7 +432,7 @@ async fn harness(config: Config) -> Harness {
     }));
     Harness {
         tx,
-        driver,
+        driver: Some(driver),
         addr,
         checkpoints,
     }
@@ -395,11 +442,12 @@ fn new_registry() -> impl Fn() -> Box<dyn BlockRegistry> + Send + 'static {
     || Box::new(SimpleRegistry::builtin())
 }
 
-async fn shutdown(h: Harness) -> DriverOutcome {
+async fn shutdown(mut h: Harness) -> DriverOutcome {
     h.tx.send(DriverCommand::Shutdown)
         .await
         .expect("驱动仍存活");
-    h.driver.await.expect("驱动不 panic")
+    let driver = h.driver.take().expect("驱动句柄只在 shutdown 取走一次");
+    driver.await.expect("驱动不 panic")
 }
 
 /// DriverOutcome 的 player_respawned 计数(测试断言用)。
@@ -835,7 +883,7 @@ async fn a06_6_replay_twice_bitwise_identical() {
 
     let mut config = base_config();
     config.checkpoint_interval_ticks = 30;
-    let h = harness(config.clone()).await;
+    let mut h = harness(config.clone()).await;
     let (mut a, mut rxa) = client(h.addr).await;
     tokio::task::yield_now().await;
     join(&mut a, &mut rxa, 4).await;
@@ -862,13 +910,12 @@ async fn a06_6_replay_twice_bitwise_identical() {
     let (new_body, _, _) = wait_respawn_possessed(&mut a, &mut rxa, body).await;
     advance_ticks(60).await;
     drop(a);
-    let Harness {
-        tx,
-        driver,
-        checkpoints,
-        ..
-    } = h;
-    tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+    // 不解构 Harness(其 Drop 是 panic 路径的兜底关停);显式关停取计数。
+    let checkpoints = h.checkpoints.clone();
+    h.tx.send(DriverCommand::Shutdown)
+        .await
+        .expect("驱动仍存活");
+    let driver = h.driver.take().expect("驱动句柄只在 shutdown 取走一次");
     let outcome = driver.await.expect("驱动不 panic");
     assert_eq!(respawned(&outcome), 1, "重生恰好一次");
     let online_ticks = outcome.ticks_run;
@@ -1099,7 +1146,9 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
     let mut removed_seen = false;
     let mut possessed_none = false;
     let mut frames = 0usize;
+    let deadline = Deadline::new("虚空移除 → 重生失败 → Possessed(None)");
     loop {
+        deadline.check();
         if frames >= FRAME_BUDGET {
             panic!(
                 "等出生点不可用的失败重生超预算:{FRAME_BUDGET} 帧;removed_seen={removed_seen} \

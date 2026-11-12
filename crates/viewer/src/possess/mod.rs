@@ -348,8 +348,15 @@ impl PossessState {
 
     /// 每帧推进(R1 §3.2 转移表 tick 行):请求等待超过 2 s 视为被拒——
     /// `SpawnRequested` → `NoBody`(清 auto_possess);`PossessRequested`
-    /// → `HasBody`。
+    /// → `HasBody`。R2-5:自动附身发出的 Possess(`on_agents` 路径,那里
+    /// 拿不到 `now`)`requested_at` 为 None——在这里补起算(从这一帧开始
+    /// 计时),否则服务器不回时永远停在 `PossessRequested`,`P` 键失效。
     pub fn tick(&mut self, now: std::time::Instant) {
+        if self.requested_at.is_none()
+            && matches!(self.phase, Phase::SpawnRequested | Phase::PossessRequested)
+        {
+            self.requested_at = Some(now);
+        }
         let Some(at) = self.requested_at else {
             return;
         };
@@ -390,6 +397,31 @@ pub fn third_person_camera(root: Vec3, yaw_deg: f32, pitch_deg: f32, dist: f32) 
 /// 锚:渲染循环每帧用它写 `camera.position`,变异"不写回"在这里红)。
 pub fn possessed_camera_position(root: Vec3, yaw_deg: f32, pitch_deg: f32, dist: f32) -> Vec3 {
     third_person_camera(root, yaw_deg, pitch_deg, dist).0
+}
+
+/// 输入路由表(R2-3):附身/非附身两态下,通用交互键各自是否仍生效。
+/// 附身时全 false——空格是跳跃、滚轮是相机距离、WASD 是行走意图,原有
+/// 的"空格切换耦合 / 滚轮调发射预设速度 / WASD 平移相机"必须让路(R1
+/// 验收:附身时跳一下,退出后飞行相机不上报位置的根因就是空格把 `coupled`
+/// 翻成了 false)。非附身时全 true(既有行为不变)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputRouting {
+    /// 空格是否切换相机 ↔ 观察者耦合(附身时空格 = 跳跃,不切)。
+    pub space_toggles_coupling: bool,
+    /// 滚轮是否调发射预设速度(附身时滚轮 = 第三人称相机距离,不调)。
+    pub wheel_sets_launch_speed: bool,
+    /// WASD 是否平移飞行相机(附身时 WASD = 行走意图,不平移)。
+    pub wasd_moves_camera: bool,
+}
+
+/// 按是否附身取输入路由:附身三项全 false,否则全 true。
+pub fn input_routing(possessed: bool) -> InputRouting {
+    let free = !possessed;
+    InputRouting {
+        space_toggles_coupling: free,
+        wheel_sets_launch_speed: free,
+        wasd_moves_camera: free,
+    }
 }
 
 #[cfg(test)]

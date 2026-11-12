@@ -424,6 +424,46 @@ fn t6k_receipts_capped() {
     assert_eq!(st.my_body(), Some(agent_id(69)), "窗口内回执仍有效");
 }
 
+/// (R2-5)自动附身的 Possess 无计时起点 → tick 补起算:按 P → 回执 →
+/// on_agents 自动发 Possess(requested_at 为 None,该路径拿不到 now)→
+/// 不给 Possessed 回执,推 2 s 多 → 状态回 HasBody,再按 P 能重发 Possess。
+/// 变红实现:tick 不给 requested_at 补计时(服务器不回时永远停在
+/// PossessRequested,P 键失效)。
+#[test]
+fn r2_5_tick_arms_timeout_for_auto_possess_request() {
+    let mut st = PossessState::new();
+    // 按 P 生成 → SpawnRequested(此刻有计时起点,走 on_agents 时被清)。
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    assert_eq!(st.phase(), Phase::SpawnRequested);
+    st.on_spawned(agent_id(20));
+    let cmds = st.on_agents(&[agent_id(20)], &[]);
+    assert_eq!(
+        cmds,
+        vec![PossessCommand::Possess(agent_id(20))],
+        "自动附身发 Possess"
+    );
+    assert_eq!(st.phase(), Phase::PossessRequested);
+    // 服务器不回 Possessed:推 2.1 s(超过 REQUEST_TIMEOUT)→ HasBody。
+    // 计时起点由第一帧 tick(t(0))补上——从这一帧起算 2 s。
+    st.tick(t(0));
+    st.tick(t(1_900));
+    assert_eq!(st.phase(), Phase::PossessRequested, "1.9 s 还没超时");
+    st.tick(t(2_100));
+    assert_eq!(
+        st.phase(),
+        Phase::HasBody,
+        "自动附身请求 2 s 无回应 → HasBody(超时兜底生效)"
+    );
+    // P 键恢复有效:再按 P 重发 Possess。
+    let cmds = st.on_p_pressed(None, t(2_200));
+    assert_eq!(
+        cmds,
+        vec![PossessCommand::Possess(agent_id(20))],
+        "超时回退后 P 键能重新发 Possess"
+    );
+    assert_eq!(st.phase(), Phase::PossessRequested);
+}
+
 // ---------------------------------------------------------------------------
 // 第三人称相机与滚轮
 // ---------------------------------------------------------------------------
@@ -526,4 +566,27 @@ fn mut15_possessed_camera_position_matches_third_person() {
             "yaw {yaw_deg} pitch {pitch_deg} dist {dist}:实得 {got:?},期望 {expect:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// R2-3(#25):输入路由——附身时空格/滚轮/WASD 不再驱动通用交互
+// ---------------------------------------------------------------------------
+
+/// 非附身:三项全 true(既有行为不变);附身:三项全 false。
+/// 变红实现:`input_routing(true)` 仍返回全 true(附身时空格既跳又切
+/// 耦合——R1 验收的串键根因)。
+#[test]
+fn r2_3_input_routing_by_possession() {
+    let free = input_routing(false);
+    assert!(
+        free.space_toggles_coupling && free.wheel_sets_launch_speed && free.wasd_moves_camera,
+        "非附身:三项全 true(既有行为),实得 {free:?}"
+    );
+    let possessed = input_routing(true);
+    assert!(
+        !possessed.space_toggles_coupling
+            && !possessed.wheel_sets_launch_speed
+            && !possessed.wasd_moves_camera,
+        "附身:三项全 false(空格=跳跃/滚轮=相机距离/WASD=行走意图),实得 {possessed:?}"
+    );
 }

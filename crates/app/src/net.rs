@@ -475,8 +475,9 @@ impl OutboundHub {
     }
 
     /// 注册玩家出站(连接 Subscribe 成功时;同玩家重复注册 = 替换——
-    /// 身份单调递增不循环,理论不可达,防御式覆盖)。
-    fn register(&self, player: InputSource, writer: WorldWriter) {
+    /// 身份单调递增不循环,理论不可达,防御式覆盖)。crate 内可见:
+    /// driver 测试注入本地队列断言出站内容(R2-4)用。
+    pub(crate) fn register(&self, player: InputSource, writer: WorldWriter) {
         self.writers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
