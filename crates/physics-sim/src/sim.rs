@@ -325,6 +325,10 @@ pub struct Outbox {
     pub forced_landings: Vec<(EntityId, BlockPos)>,
     /// 虚空移除(§4.8):y < WORLD_Y_MIN − 深度 的实体(无 BlockWrite)。
     pub void_removed: Vec<EntityId>,
+    /// 本拍因失控被移除的主体数(REQ-012 §6,B01b):步进后防护把超速/
+    /// 非有限的主体按"掉出世界"移除,每移除一只 +1。纯计数(随 Outbox
+    /// 走,不影响确定性)。
+    pub agent_runaway_removed: u64,
 }
 
 /// 强制落地的原因(06c 遥测;§4.16"截止、预算分计")。
@@ -597,6 +601,12 @@ pub struct ShardSim {
     /// `BlockPos` 升序重试,不再重叠即按 SetBlock 同一条写入路径补写。
     /// **随分片快照走**(检查点 v9)。
     pub(crate) deferred_set_blocks: BTreeMap<BlockPos, BlockId>,
+    /// 失控防护开关(**测试对照专用**,B01b X3):关掉后步进不再执行
+    /// `agent_runaway_guard`——X3 用 `catch_unwind` 抓 rapier 在失控状态
+    /// 下的 panic,证明防护的必要性。生产恒 true,不入快照(对照布景
+    /// 不进检查点,同 `seam_fix_enabled` 口径)。
+    #[cfg(test)]
+    pub(crate) agent_runaway_guard_enabled: bool,
 }
 
 /// 撞击冲量流的按实体事件累计(F02a,§5.7.1;`evaluate_impacts` 采样)。
@@ -674,6 +684,8 @@ impl ShardSim {
             seam_fix_enabled: true,
             agent_shapes: crate::agent_shape::AgentShapeTable::default(),
             deferred_set_blocks: BTreeMap::new(),
+            #[cfg(test)]
+            agent_runaway_guard_enabled: true,
         }
     }
 
@@ -1309,6 +1321,17 @@ impl ShardSim {
         self.walker_control_tick();
         let hooks = crate::walker::AgentContactInput::sample(self);
         self.phys.step_with_events(&hooks, &());
+        // 失控防护(REQ-012 §6,B01b):步进后立刻查全部主体,超速/非有限
+        // 的按"掉出世界"移除——下一拍之前处理(demo `mass` §13:panic 前一
+        // 拍状态还有限、速度 ≥ 2204 m/s,来得及)。被移除的主体 ID 不进本拍
+        // 余下各段(采样表按 `entities` 查,见各段守卫)。开关 = X3 对照
+        // (测试专用;生产恒 true)。
+        #[cfg(test)]
+        if self.agent_runaway_guard_enabled {
+            self.agent_runaway_guard();
+        }
+        #[cfg(not(test))]
+        self.agent_runaway_guard();
         self.collect_contact_wake_compensation();
         // §5.7 修正扣除表(G02,§5.8.1):拍内有效,每拍清空(上一拍的修正
         // 不扣到本拍事件上)。
@@ -2967,20 +2990,10 @@ impl ShardSim {
                     // 不再走循环外那行(旧代码根被移除两次——rapier 对无效
                     // 句柄静默 no-op,行为未变,但账目不对)。单连杆路径:
                     // 循环移除唯一连杆 = 原行为,逐句等价。
-                    if let Some(agent) = self.agents.remove(&id) {
-                        for handle in agent.links.values().copied().collect::<Vec<_>>() {
-                            self.phys.remove_body(handle);
-                        }
-                        self.walker_holds.remove(&id);
-                        self.entities.remove(&id).expect("存在");
-                        self.locomotion.remove(&id);
-                        self.forced_pending.remove(&id);
-                        self.forced_reasons.remove(&id);
-                        self.outbox.despawned.push(id);
-                        self.outbox.void_removed.push(id);
-                        // 06c 遥测:虚空移除只计 void_removals(§4.16:落地失败
-                        // 转虚空移除的、虚空线以下生成的,都不算强制落地)。
-                        self.activation_events.void_removals += 1;
+                    // B01b:主体分支原样提出为 `remove_agent_as_void`(虚空
+                    // 移除与失控共用;逐句等价,行为不变)。
+                    if self.agents.contains_key(&id) {
+                        self.remove_agent_as_void(id);
                         continue;
                     }
                     self.entities.remove(&id).expect("存在");

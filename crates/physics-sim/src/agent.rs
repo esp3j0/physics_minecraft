@@ -185,6 +185,22 @@ pub(crate) enum AgentIntentError {
     NonFinite,
 }
 
+/// 失控速度阈值(REQ-012 §6,m/s):任一连杆线速度的模超过它 → 按"掉出
+/// 世界"处理。demo `mass` 的结论(REQ-012 §13):panic 的前一拍状态都还
+/// 有限、线速度都不低于 2204 m/s,200 m/s 防得住且无误杀(质量 8 峰值
+/// 126 m/s、单格方块峰值 68.3 m/s)。常量,不进配置。
+pub const AGENT_V_GUARD: f32 = 200.0;
+
+/// 失控原因(B01b 第 3.1 节;`agent_runaway_reason` 的返回)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RunawayReason {
+    /// 任一连杆位置/朝向/线速度/角速度,或 multibody 的关节坐标/广义速度
+    /// 任一分量非有限(NaN/±inf)。
+    NonFinite,
+    /// 任一连杆线速度的模 > `AGENT_V_GUARD`。
+    OverSpeed,
+}
+
 /// 关节目标命令的内核侧拒绝原因(B01a 第 3.4 节;类型化,计数在
 /// apply_command 的 `agent_joint_targets_rejected`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1052,6 +1068,111 @@ impl ShardSim {
             }
         }
         None
+    }
+
+    /// 失控判定(B01b 第 3.2 节;纯读)。检查顺序:
+    /// 1. 每个**连杆**(按 `BodyDef.links` 的顺序;单连杆胶囊 = 1 条)的
+    ///    位置、朝向、线速度、角速度,任一分量非有限 → `NonFinite`;
+    /// 2. 多连杆:multibody 的关节坐标、广义速度任一非有限 → `NonFinite`;
+    /// 3. 任一连杆线速度的模 > `AGENT_V_GUARD` → `OverSpeed`。
+    ///
+    /// 命中即返回;全部通过 → `None`。主体不存在 → `None`(防护段在
+    /// agents 表上迭代,不会以不存在的 ID 调用)。
+    pub(crate) fn agent_runaway_reason(&self, id: EntityId) -> Option<RunawayReason> {
+        let record = self.agents.get(&id)?;
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        // 1. 逐连杆刚体状态(links 按名字序存句柄,按 BodyDef.links 的顺序查)。
+        for link in &def.links {
+            let &handle = record
+                .links
+                .get(&link.name)
+                .expect("连杆句柄在登记表(fail-stop)");
+            let rb = self.phys.bodies.get(handle).expect("连杆刚体存在");
+            let p = crate::conv::rapier_to_vec3(rb.translation());
+            let r = rb.rotation();
+            let v = crate::conv::rapier_to_vec3(rb.linvel());
+            let av = crate::conv::rapier_to_vec3(rb.angvel());
+            if ![
+                p.x, p.y, p.z, r.x, r.y, r.z, r.w, v.x, v.y, v.z, av.x, av.y, av.z,
+            ]
+            .iter()
+            .all(|c| c.is_finite())
+            {
+                return Some(RunawayReason::NonFinite);
+            }
+            // 3. 超速(在非有限之后:NaN 比较恒 false,顺序保证 NonFinite 优先)。
+            if v.length() > AGENT_V_GUARD {
+                return Some(RunawayReason::OverSpeed);
+            }
+        }
+        // 2. multibody 关节坐标与广义速度(单连杆无 multibody,跳过)。
+        if def.dof_count() > 0 {
+            let mb_index = self
+                .agent_multibody_index(record)
+                .expect("多连杆主体必有 multibody(fail-stop)");
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            for link in mb.links() {
+                if link.joint.coords().iter().any(|c| !c.is_finite()) {
+                    return Some(RunawayReason::NonFinite);
+                }
+            }
+            if mb.generalized_velocity().iter().any(|v| !v.is_finite()) {
+                return Some(RunawayReason::NonFinite);
+            }
+        }
+        None
+    }
+
+    /// 虚空移除与失控共用的主体移除路径(B01b 第 3.2 节):拆全部连杆刚体
+    /// (关节随刚体移除一并拆)、清 `agents`/`entities`/`walker_holds`/
+    /// `locomotion`/`forced_pending`/`forced_reasons`,推 `outbox.despawned`
+    /// 与 `outbox.void_removed`,`activation_events.void_removals += 1`。
+    /// 语义与 `run_transient_lifecycle` 虚空段的主体分支逐句一致(B01b 第
+    /// 1 步原样提出,行为不变)。主体不存在 → panic(fail-stop;调用方
+    /// 在 agents 表上迭代)。
+    pub(crate) fn remove_agent_as_void(&mut self, id: EntityId) {
+        if let Some(agent) = self.agents.remove(&id) {
+            for handle in agent.links.values().copied().collect::<Vec<_>>() {
+                self.phys.remove_body(handle);
+            }
+            self.walker_holds.remove(&id);
+            self.entities.remove(&id).expect("存在");
+            self.locomotion.remove(&id);
+            self.forced_pending.remove(&id);
+            self.forced_reasons.remove(&id);
+            self.outbox.despawned.push(id);
+            self.outbox.void_removed.push(id);
+            // 06c 遥测:虚空移除只计 void_removals(§4.16)。
+            self.activation_events.void_removals += 1;
+        } else {
+            panic!("remove_agent_as_void:主体不存在(fail-stop):{id:?}");
+        }
+    }
+
+    /// 步进后的失控防护(B01b 第 3.2/3.3 节):每个主体过一遍
+    /// [`ShardSim::agent_runaway_reason`],命中即按"掉出世界"移除
+    /// ( [`ShardSim::remove_agent_as_void`] + `outbox.agent_runaway_removed`
+    /// 计数)。无主体时立即返回。调用点 = `step()` 内 `phys.step_with_events`
+    /// 之后、`collect_contact_wake_compensation()` 之前——失控主体在被移除
+    /// 后不再进入本拍余下各段(撞击采样等)。
+    pub(crate) fn agent_runaway_guard(&mut self) {
+        if self.agents.is_empty() {
+            return;
+        }
+        let ids: Vec<EntityId> = self.agents.keys().copied().collect();
+        for id in ids {
+            if self.agent_runaway_reason(id).is_some() {
+                self.remove_agent_as_void(id);
+                self.outbox.agent_runaway_removed += 1;
+            }
+        }
     }
 }
 
@@ -4011,5 +4132,1503 @@ anchor = [0.0, 0.0, 0.0]
             "thigh 连杆局部 AABB 最低 {thigh_min},期望 −(0.1065+0.02) = {}",
             -(0.1065 + 0.02)
         );
+    }
+
+    // ---- B01b:失控防护(§6;任务书第 4 节 G1–G6)----
+
+    /// 站立四足布景(站稳 = 入睡或 300 拍;B01a-R1 同款地面与出生点)。
+    /// 返回 (sim, body hash, agent id);观察者已注册。
+    fn stand_quad() -> (crate::sim::ShardSim, BodyHash, types::EntityId) {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for tick in 0..300usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            let asleep = s
+                .phys
+                .bodies
+                .get(s.entities.get(&a).expect("在场").handle)
+                .expect("根刚体")
+                .is_sleeping();
+            if asleep {
+                break;
+            }
+            let _ = tick;
+        }
+        (s, hash, a)
+    }
+
+    /// 超速注入 helper(G2/G2b/G4 共用):把四足 multibody 根连杆的广义
+    /// 速度(前 3 项 = 根线速度 x/y/z)直写为 `v` m/s 朝上。multibody 非根
+    /// 连杆的刚体线速度每步由 forward_kinematics 从广义速度重算覆盖,直接
+    /// `set_linvel` 会被丢弃——注入必须落在广义速度这一层(与防护的检查
+    /// 对象一致:步进后 FK 把根速度写回刚体,防护连杆循环读根 = 读到注入值)。
+    /// 布景四足已站立(可能已入睡),注入前先唤醒。
+    fn inject_root_overspeed(s: &mut crate::sim::ShardSim, a: types::EntityId, v: f32) {
+        let record = s.agents.get(&a).expect("主体登记").clone();
+        let root_handle = s.entities.get(&a).expect("在场").handle;
+        s.phys
+            .bodies
+            .get_mut(root_handle)
+            .expect("根刚体")
+            .wake_up(true);
+        let link_id = s
+            .phys
+            .multibody_joints
+            .rigid_body_link(root_handle)
+            .expect("根连杆在 multibody");
+        let mb = s
+            .phys
+            .multibody_joints
+            .get_multibody_mut(link_id.multibody)
+            .expect("multibody 存在");
+        let mut gv = mb.generalized_velocity_mut();
+        gv[0] = 0.0;
+        gv[1] = v;
+        gv[2] = 0.0;
+        let _ = &record;
+    }
+
+    /// G1:`agent_runaway_reason` 的纯判定(任务书第 4 节表)。站稳的四足 →
+    /// None;非根连杆线速度 NaN → NonFinite;位置 NaN → NonFinite;线速度
+    /// 250 → OverSpeed;线速度 150 → None(对照)。
+    #[test]
+    fn g1_runaway_reason_pure_judgement() {
+        let (mut s, _hash, a) = stand_quad();
+        assert_eq!(s.agent_runaway_reason(a), None, "站稳 → None");
+
+        // 布景自检:13 连杆、12 自由度(非根连杆存在)。
+        let record = s.agents.get(&a).expect("主体登记");
+        assert_eq!(record.links.len(), 13);
+        // 取一个非根连杆的句柄(links 按名字序;根 = BodyDef.links[0] 的名字)。
+        let def = s.bodies.get(&record.body_hash).expect("def").clone();
+        let root_name = def.links[0].name.clone();
+        let non_root = def
+            .links
+            .iter()
+            .find(|l| l.name != root_name)
+            .expect("非根连杆存在")
+            .name
+            .clone();
+        let &h = record.links.get(&non_root).expect("句柄在表");
+
+        // 直接在原 sim 上逐案改刚体状态(每案改完恢复,案间不互相污染)。
+        // 案 1:非根连杆线速度 NaN。
+        s.phys.bodies.get_mut(h).expect("连杆刚体").set_linvel(
+            crate::conv::vec3_to_rapier(Vec3::new(f32::NAN, 0.0, 0.0)),
+            true,
+        );
+        assert_eq!(
+            s.agent_runaway_reason(a),
+            Some(RunawayReason::NonFinite),
+            "非根连杆线速度 NaN → NonFinite"
+        );
+
+        // 案 1 收尾:速度恢复有限(案间不互相污染;检查顺序按任务书)。
+        let &h1r = s
+            .agents
+            .get(&a)
+            .expect("主体")
+            .links
+            .get(&non_root)
+            .unwrap();
+        s.phys
+            .bodies
+            .get_mut(h1r)
+            .expect("连杆刚体")
+            .set_linvel(crate::conv::vec3_to_rapier(Vec3::ZERO), true);
+
+        // 案 2:非根连杆位置 NaN。
+        let &h2 = s
+            .agents
+            .get(&a)
+            .expect("主体")
+            .links
+            .get(&non_root)
+            .unwrap();
+        s.phys
+            .bodies
+            .get_mut(h2)
+            .expect("连杆刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(f32::NAN, 1.0, 24.0)),
+                true,
+            );
+        assert_eq!(
+            s.agent_runaway_reason(a),
+            Some(RunawayReason::NonFinite),
+            "连杆位置 NaN → NonFinite"
+        );
+
+        // 案 2 收尾:位置恢复有限。
+        let &h2r = s
+            .agents
+            .get(&a)
+            .expect("主体")
+            .links
+            .get(&non_root)
+            .unwrap();
+        s.phys
+            .bodies
+            .get_mut(h2r)
+            .expect("连杆刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 1.5, 24.0)),
+                true,
+            );
+
+        // 案 3:线速度 250 → OverSpeed。
+        let &h3 = s
+            .agents
+            .get(&a)
+            .expect("主体")
+            .links
+            .get(&non_root)
+            .unwrap();
+        s.phys.bodies.get_mut(h3).expect("连杆刚体").set_linvel(
+            crate::conv::vec3_to_rapier(Vec3::new(250.0, 0.0, 0.0)),
+            true,
+        );
+        assert_eq!(
+            s.agent_runaway_reason(a),
+            Some(RunawayReason::OverSpeed),
+            "连杆线速度 250 m/s → OverSpeed"
+        );
+
+        // 案 4(对照):线速度 150 → None(150 < 200 阈值;NaN 已被覆盖为有限值)。
+        let &h4 = s
+            .agents
+            .get(&a)
+            .expect("主体")
+            .links
+            .get(&non_root)
+            .unwrap();
+        s.phys.bodies.get_mut(h4).expect("连杆刚体").set_linvel(
+            crate::conv::vec3_to_rapier(Vec3::new(150.0, 0.0, 0.0)),
+            true,
+        );
+        assert_eq!(
+            s.agent_runaway_reason(a),
+            None,
+            "连杆线速度 150 m/s(阈值下)→ None(对照)"
+        );
+    }
+
+    /// G2:经 `step()` 触发。注入方式:把非根连杆线速度直写为 300 m/s
+    /// (先经对照线证明:防护关掉时步进后确实读得到 > 200——见
+    /// `g2b_guard_off_reads_over_speed`)。断言:这一拍结束时刚体数、碰撞
+    /// 体数、multibody 数回到生成前;`void_removed`、`despawned` 各有它;
+    /// `agent_runaway_removed == 1`。
+    #[test]
+    fn g2_step_guard_removes_overspeed_quad() {
+        let (mut s, _hash, a) = stand_quad();
+        let bodies_before = {
+            let (mut s0, _h) = quad_sim_with(0.01);
+            load_flat_ground(&mut s0);
+            s0.phys.bodies.len()
+        };
+        let colliders_before = {
+            let (mut s0, _h) = quad_sim_with(0.01);
+            load_flat_ground(&mut s0);
+            s0.phys.colliders.len()
+        };
+        let mb_before = {
+            let (mut s0, _h) = quad_sim_with(0.01);
+            load_flat_ground(&mut s0);
+            s0.phys.multibody_joints.iter().count()
+        };
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        s.apply_activation(&observers);
+        // 注入:根连杆广义速度 300 m/s 朝上(> 200 阈值;helper,见其文档)。
+        inject_root_overspeed(&mut s, a, 300.0);
+        s.step();
+        // 同拍内已被移除:agents/entities 无它,三项计数回到生成前。
+        assert!(!s.agents.contains_key(&a), "失控主体同拍移除(agents)");
+        assert!(!s.entities.contains_key(&a), "失控主体同拍移除(entities)");
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体数回到生成前");
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before,
+            "碰撞体数回到生成前"
+        );
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            mb_before,
+            "multibody 数回到生成前"
+        );
+        let out = s.take_outbox();
+        assert!(out.void_removed.contains(&a), "void_removed 有失控主体一条");
+        assert!(out.despawned.contains(&a), "despawned 有失控主体一条");
+        assert_eq!(out.agent_runaway_removed, 1, "agent_runaway_removed == 1");
+    }
+
+    /// G2 的对照线(任务书:先确认不加防护时步进后确实读得到 > 200):关掉
+    /// 防护开关,同注入后步进,主体仍在场且连杆速度 > 200(物理解算没有把
+    /// 它拉回阈值内)。
+    #[test]
+    fn g2b_guard_off_reads_over_speed() {
+        let (mut s, _hash, a) = stand_quad();
+        s.agent_runaway_guard_enabled = false;
+        inject_root_overspeed(&mut s, a, 300.0);
+        s.step();
+        // 读根连杆(注入落在根;防护连杆循环先查根)。
+        let root_h = s.entities.get(&a).expect("主体在场(无防护)").handle;
+        let v = crate::conv::rapier_to_vec3(s.phys.bodies.get(root_h).expect("根刚体").linvel())
+            .length();
+        assert!(
+            v > crate::agent::AGENT_V_GUARD,
+            "无防护时步进后连杆速度 {v} 应 > 200(在等超速读数)"
+        );
+    }
+
+    /// G3:单连杆胶囊同样被防护(同 G2 口径)。
+    #[test]
+    fn g3_capsule_also_guarded() {
+        let (mut s, caphash) = test_sim();
+        load_flat_ground(&mut s);
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            caphash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 1.95, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("capsule 生成");
+        let observers = [Vec3::new(24.0, 3.0, 24.0)];
+        s.apply_activation(&observers);
+        let _ = s.take_outbox();
+        // 注入:根(唯一)连杆线速度 300 m/s。
+        let h = s.entities.get(&a).expect("在场").handle;
+        s.phys.bodies.get_mut(h).expect("胶囊刚体").set_linvel(
+            crate::conv::vec3_to_rapier(Vec3::new(300.0, 0.0, 0.0)),
+            true,
+        );
+        s.step();
+        assert!(!s.agents.contains_key(&a), "胶囊失控同拍移除");
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体数回到生成前");
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before,
+            "碰撞体数回到生成前"
+        );
+        let out = s.take_outbox();
+        assert!(out.void_removed.contains(&a));
+        assert_eq!(out.agent_runaway_removed, 1);
+    }
+
+    /// G4:其他实体继续运行。同一分片:第一只四足失控被移除后,另一只四足
+    /// 与一个动态方块继续。再跑 600 拍:无 panic,第二只仍站着(站高
+    /// ∈ [0.27, 0.29]),`agent_runaway_removed` 累计 1。
+    #[test]
+    fn g4_other_entities_keep_running() {
+        let (mut s, hash, a) = stand_quad();
+        // 第二只四足(不同 EntityId;间隔 8 m 避免碰撞)与一个动态方块。
+        let b = types::EntityId::from_parts(1, 2);
+        s.spawn_agent(b, hash, quad_spawn_state(quad_origin(32.0, 24.0)), None)
+            .expect("第二只四足生成");
+        assert_quad_above_ground(&s, b);
+        let block = types::EntityId::from_parts(1, 3);
+        s.spawn_entity_for_test(block, Vec3::new(32.0 + 4.0, GROUND_TOP_Y + 2.0, 24.0));
+        let observers = [Vec3::new(28.0, 3.45, 24.0)];
+        s.apply_activation(&observers);
+        let _ = s.take_outbox();
+        // 第一只失控(helper:根广义速度 300 m/s 朝上)。
+        inject_root_overspeed(&mut s, a, 300.0);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.agent_runaway_removed, 1, "第一只被移除一次");
+        assert!(!s.agents.contains_key(&a), "第一只已移除");
+        assert!(s.agents.contains_key(&b), "第二只仍在");
+        assert!(s.entities.contains_key(&block), "方块仍在");
+        // 再跑 600 拍(生产节奏)。
+        let mut runaway_total = out.agent_runaway_removed;
+        for _ in 0..600usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let o = s.take_outbox();
+            runaway_total += o.agent_runaway_removed;
+        }
+        assert_eq!(runaway_total, 1, "600 拍内不再有失控移除(总数恒 1)");
+        // 第二只仍站着:取 100 拍窗口的机身平均高度 − 地面顶面 ∈ [0.27, 0.29]。
+        let mut heights = Vec::new();
+        for _ in 0..100usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            let p = s.agent_root_position(b).expect("第二只在场");
+            heights.push(p.y);
+        }
+        let mean = heights.iter().sum::<f32>() / heights.len() as f32;
+        let stand_height = mean - GROUND_TOP_Y;
+        assert!(
+            (0.27..=0.29).contains(&stand_height),
+            "第二只站高 {stand_height} m,须在 [0.27, 0.29]"
+        );
+    }
+
+    /// G5:确定性。G4 的布景跑两遍,快照逐位相同;移除那一拍取快照、恢复、
+    /// 续跑到底,与不中断的逐位相同。
+    #[test]
+    fn g5_determinism_with_runaway_removal() {
+        let observers = [Vec3::new(28.0, 3.45, 24.0)];
+        let setup = || {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            let b = types::EntityId::from_parts(1, 2);
+            s.spawn_agent(b, hash, quad_spawn_state(quad_origin(32.0, 24.0)), None)
+                .expect("第二只四足生成");
+            let block = types::EntityId::from_parts(1, 3);
+            s.spawn_entity_for_test(block, Vec3::new(32.0 + 4.0, GROUND_TOP_Y + 2.0, 24.0));
+            (s, a)
+        };
+        // 稳站(与 stand_quad 同口径:入睡或 300 拍;两只同时稳站)。
+        let run = || {
+            let (mut s, a) = setup();
+            for _ in 0..300usize {
+                s.apply_activation(&observers);
+                s.step();
+                s.run_transient_lifecycle();
+                let _ = s.take_outbox();
+                let asleep = s
+                    .phys
+                    .bodies
+                    .get(s.entities.get(&a).expect("在场").handle)
+                    .expect("根刚体")
+                    .is_sleeping();
+                if asleep {
+                    break;
+                }
+            }
+            (s, a)
+        };
+        let (mut golden, a) = run();
+        // 注入并步进:失控拍(helper:根广义速度,与 G2 同注入层)。
+        inject_root_overspeed(&mut golden, a, 300.0);
+        golden.apply_activation(&observers);
+        golden.step();
+        let out = golden.take_outbox();
+        assert_eq!(out.agent_runaway_removed, 1, "布景自检:移除发生在本拍");
+        golden.run_transient_lifecycle();
+        let _ = golden.take_outbox();
+        // 上面的恢复注入写得绕,直接换成对齐 K13 的做法:整段推倒,
+        // 用"与不中断逐位相同"的直写对照(见下)。真正的断言在 continue_run。
+        let (mut interrupted, a2) = run();
+        let _ = a2;
+        // 重放到移除拍(取快照在 run_transient_lifecycle 之后,恢复线从
+        // "移除拍完全收尾"的状态续跑)。
+        inject_root_overspeed(&mut interrupted, a2, 300.0);
+        interrupted.apply_activation(&observers);
+        interrupted.step();
+        let o = interrupted.take_outbox();
+        assert_eq!(o.agent_runaway_removed, 1);
+        interrupted.run_transient_lifecycle();
+        let _ = interrupted.take_outbox();
+        let bytes = interrupted.snapshot();
+        // 恢复注册表 = quad + capsule(与布景同源;quad_registry() 每次
+        // 构造新实例,哈希由内容决定,逐位一致)。
+        let mut resumed = crate::sim::ShardSim::restore_with_bodies(
+            &bytes,
+            Box::new(SimpleRegistry::builtin()),
+            {
+                let (bodies, _hash) = quad_registry();
+                let mut bodies = bodies;
+                let _ = bodies.insert_toml(capsule_toml()).expect("capsule 合法");
+                bodies
+            },
+        )
+        .expect("恢复成功(注册表含 quad 与 capsule)");
+        // 续跑 200 拍,与不中断线逐拍快照对比。
+        let mut interrupted_snapshots = Vec::new();
+        for _ in 0..200usize {
+            resumed.apply_activation(&observers);
+            resumed.step();
+            resumed.run_transient_lifecycle();
+            let _ = resumed.take_outbox();
+            interrupted_snapshots.push(resumed.snapshot());
+        }
+        let mut golden_snapshots = Vec::new();
+        for _ in 0..200usize {
+            golden.apply_activation(&observers);
+            golden.step();
+            golden.run_transient_lifecycle();
+            let _ = golden.take_outbox();
+            golden_snapshots.push(golden.snapshot());
+        }
+        for (i, (a_snap, g_snap)) in interrupted_snapshots
+            .iter()
+            .zip(golden_snapshots.iter())
+            .enumerate()
+        {
+            assert_eq!(a_snap, g_snap, "续跑第 {i} 拍快照与不中断线逐位相同");
+        }
+    }
+
+    /// G6:低于阈值不误杀。四足从 3 m 自由落下着地,全程
+    /// `agent_runaway_removed == 0`,打印全程连杆速度峰值。
+    #[test]
+    fn g6_below_threshold_no_false_kill() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        // 3 m 自由落下:出生在地面顶面上方 3 m(足底 ~2.55 m 间隙)。
+        let origin = Vec3::new(24.0, GROUND_TOP_Y + 3.0 + 0.45, 24.0);
+        s.spawn_agent(a, hash, quad_spawn_state(origin), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let mut runaway_total = 0u64;
+        let mut peak = 0.0f32;
+        for _ in 0..600usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let o = s.take_outbox();
+            runaway_total += o.agent_runaway_removed;
+            // 全程连杆速度峰值(每拍扫一遍;主体被移除即退出循环)。
+            if let Some(record) = s.agents.get(&a) {
+                for &h in record.links.values() {
+                    if let Some(rb) = s.phys.bodies.get(h) {
+                        let v = crate::conv::rapier_to_vec3(rb.linvel()).length();
+                        peak = peak.max(v);
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+        assert_eq!(runaway_total, 0, "3 m 落体全程不触发防护(0 移除)");
+        println!(
+            "G6 全程连杆速度峰值 {peak:.1} m/s(阈值 {})",
+            crate::agent::AGENT_V_GUARD
+        );
+        assert!(s.agents.contains_key(&a), "四足全程在场(不被误杀)");
+    }
+
+    // ---- B01b:极端接触(AC-B8;任务书第 4 节 X1/X2/X3)----
+
+    /// X 系列单组判据统计。
+    #[derive(Debug, Default)]
+    struct XStats {
+        /// 连杆速度全程峰值。
+        peak_link_v: f32,
+        /// 机身(根连杆)速度全程峰值。
+        peak_body_v: f32,
+        /// 任一连杆速度超 max(20, 2v) 的最长连续拍数。
+        max_overrun_ticks: usize,
+        /// 全程状态是否一直有限(无 NaN/inf)。
+        all_finite: bool,
+        /// 触发失控移除的次数(0/1)。
+        runaway_removed: u64,
+        /// 末 60 拍机身速度最大值(末态不再发散的判据)。
+        tail_body_v_max: f32,
+    }
+
+    /// 末态分类(任务书 X1 打印项):站回 / 倒地 / 蹲低。口径(demo mass
+    /// §13 同源):机身 up·y ≥ 0.85 → 站回;≤ 0.35 → 蹲低;其余 → 倒地。
+    fn end_state_class(s: &crate::sim::ShardSim, a: types::EntityId) -> Option<&'static str> {
+        let record = s.agents.get(&a)?;
+        let root = record.links.values().next().copied()?;
+        let rb = s.phys.bodies.get(root)?;
+        let up = rb.rotation() * crate::conv::vec3_to_rapier(Vec3::Y);
+        Some(if up.y >= 0.85 {
+            "站回"
+        } else if up.y <= 0.35 {
+            "蹲低"
+        } else {
+            "倒地"
+        })
+    }
+
+    /// X 系列落块描述(生产默认密度 1.0 → 质量 = 8·h³)。
+    struct XDrop {
+        /// 落点(世界系 x/z;四足在 (24, 24))。
+        dx: f32,
+        dz: f32,
+        /// 起始高度(落点底面离地;X1 = 5/10,X2 = 5)。
+        height: f32,
+        /// 半边长(单格 0.5 → 质量 1;X2 = 1/2/4 → 质量 8/64/512)。
+        half_size: f32,
+    }
+
+    /// 单组跑法(X1/X2/X3 共用):四足先站到入睡或 300 拍 → SpawnDynamic
+    /// 生产路径(apply_prefix)生成落块(初速零,自由落 h)→ 600 拍
+    /// (+ extra_tail_ticks 尾段,每拍全生产节奏)。逐拍统计判据窗口;
+    /// 主体被移除后世界继续跑完剩余拍(G4 语义),统计停止。
+    fn run_x_group(
+        drop: &XDrop,
+        jitter: f32,
+        guard_on: bool,
+        extra_tail_ticks: usize,
+    ) -> (crate::sim::ShardSim, types::EntityId, XStats) {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..300usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            let asleep = s
+                .phys
+                .bodies
+                .get(s.entities.get(&a).expect("在场").handle)
+                .expect("根刚体")
+                .is_sleeping();
+            if asleep {
+                break;
+            }
+        }
+        // 生成落块:SpawnDynamic 生产路径(apply_prefix → apply_command →
+        // spawn_entity,生产默认密度 1.0 → 质量 = 8·h³)。落块底面从
+        // `height + jitter` 落到机身顶面(~0.28 + half_size)。
+        let start_y = GROUND_TOP_Y + drop.height + jitter + drop.half_size;
+        let id = types::EntityId::from_parts(2, 1);
+        let state = types::EntityState {
+            translation: Vec3::new(drop.dx, start_y, drop.dz),
+            ..types::EntityState::default()
+        };
+        let desc = types::EntityDesc {
+            half_size: drop.half_size,
+            ..types::EntityDesc::default()
+        };
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 0,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity: id,
+                state,
+                desc,
+            }),
+        }]);
+        if !guard_on {
+            s.agent_runaway_guard_enabled = false;
+        }
+        // 读回质量(生产默认密度校验;任务书 X1/X2"读回质量并打印")。
+        let mass = s.entity_mass(id).expect("落块在场");
+        let expected = 8.0 * drop.half_size * drop.half_size * drop.half_size;
+        assert!(
+            (mass - expected).abs() < 1e-3,
+            "落块质量读回 {mass},期望密度 1.0 × 体积 = {expected}"
+        );
+        // 撞击速度 = √(2g·h_eff):底面从 height 落到机身顶面 0.28。
+        let impact_v = (2.0f32 * 9.81 * drop.height.max(0.0)).sqrt();
+        let cap = (20.0f32).max(2.0 * impact_v);
+        let mut st = XStats {
+            all_finite: true,
+            ..XStats::default()
+        };
+        let total = 600usize + extra_tail_ticks;
+        let mut overrun_run = 0usize;
+        for tick in 0..total {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let out = s.take_outbox();
+            st.runaway_removed += out.agent_runaway_removed;
+            let Some(record) = s.agents.get(&a) else {
+                // 主体已移除:世界继续跑完剩余拍(不早退),统计终止。
+                for _ in tick + 1..total {
+                    s.apply_activation(&observers);
+                    s.step();
+                    s.run_transient_lifecycle();
+                    let _ = s.take_outbox();
+                }
+                break;
+            };
+            let mut link_peak = 0.0f32;
+            for &h in record.links.values() {
+                let rb = s.phys.bodies.get(h).expect("连杆在场");
+                let v3 = crate::conv::rapier_to_vec3(rb.linvel());
+                let p3 = crate::conv::rapier_to_vec3(rb.translation());
+                let r = rb.rotation();
+                let av = crate::conv::rapier_to_vec3(rb.angvel());
+                if ![
+                    v3.x, v3.y, v3.z, av.x, av.y, av.z, p3.x, p3.y, p3.z, r.w, r.x, r.y, r.z,
+                ]
+                .iter()
+                .all(|c| c.is_finite())
+                {
+                    st.all_finite = false;
+                }
+                link_peak = link_peak.max(v3.length());
+            }
+            st.peak_link_v = st.peak_link_v.max(link_peak);
+            let body_v = crate::conv::rapier_to_vec3(
+                s.phys
+                    .bodies
+                    .get(s.entities.get(&a).expect("在场").handle)
+                    .expect("根刚体")
+                    .linvel(),
+            )
+            .length();
+            st.peak_body_v = st.peak_body_v.max(body_v);
+            if link_peak > cap {
+                overrun_run += 1;
+                st.max_overrun_ticks = st.max_overrun_ticks.max(overrun_run);
+            } else {
+                overrun_run = 0;
+            }
+            if tick + 60 >= total {
+                st.tail_body_v_max = st.tail_body_v_max.max(body_v);
+            }
+        }
+        (s, a, st)
+    }
+
+    /// X1 机身 + 四条腿的 5×5 落点网格(demo mass 同口径;覆盖 ±0.5 m,
+    /// 步长 0.25 m:机身 ±0.15 与四腿 ±0.35 都在网格内)。
+    fn x1_grid() -> Vec<(f32, f32)> {
+        let mut g = Vec::new();
+        for i in -2i32..=2 {
+            for j in -2i32..=2 {
+                g.push((0.25 * i as f32, 0.25 * j as f32));
+            }
+        }
+        g
+    }
+
+    /// X1 切片 Runner:高度 h × 落点行 row(0..4,即 dx = 0.25·(row−2))
+    /// × 微扰档 j,共 5 组。三个(高度 × 行 × 微扰)= 250 组全矩阵由 50 个
+    /// #[test] 各跑一片;单片 ≈ 5 × 21 s ≈ 105 s(debug 档,任务书 5 分钟限)。
+    fn run_x1_slice(h: f32, row: usize, j: f32) {
+        let grid = x1_grid();
+        let cap = (20.0f32).max(2.0 * (2.0 * 9.81 * h).sqrt());
+        let mut groups = 0usize;
+        let mut panic_groups = 0usize;
+        let mut peak_link = 0.0f32;
+        let mut worst_overrun = 0usize;
+        let mut worst_body_v = 0.0f32;
+        let mut worst_tail_v = 0.0f32;
+        let mut finite_fail = Vec::new();
+        let mut overrun_fail = Vec::new();
+        let mut body_v_fail = Vec::new();
+        let mut tail_fail = Vec::new();
+        let mut runaway_fail = Vec::new();
+        let mut classes = std::collections::BTreeMap::<&'static str, usize>::new();
+        // 该行 5 个落点(row 0..4 → i = row−2;j 全扫)。
+        for &(dx, dz) in grid.iter().skip(row * 5).take(5) {
+            if (dx.abs() - 0.5 * (row as f32 - 2.0).abs()).abs() > 1e-6 {
+                // 只取该行(x 偏移 = 0.25·(row−2));x1_grid 是 5×5 按行排。
+            }
+            for j_this in [j] {
+                let drop = XDrop {
+                    dx: 24.0 + dx,
+                    dz: 24.0 + dz,
+                    height: h,
+                    half_size: 0.5,
+                };
+                let tag = format!("d({dx:+.2},{dz:+.2}) j{j_this:.3}");
+                groups += 1;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_x_group(&drop, j_this, true, 0)
+                }));
+                let Ok((s, a, st)) = result else {
+                    panic_groups += 1;
+                    continue;
+                };
+                peak_link = peak_link.max(st.peak_link_v);
+                worst_overrun = worst_overrun.max(st.max_overrun_ticks);
+                worst_body_v = worst_body_v.max(st.peak_body_v);
+                worst_tail_v = worst_tail_v.max(st.tail_body_v_max);
+                if !st.all_finite {
+                    finite_fail.push(tag.clone());
+                }
+                if st.max_overrun_ticks > 5 {
+                    overrun_fail.push(tag.clone());
+                }
+                if st.peak_body_v > cap {
+                    body_v_fail.push(tag.clone());
+                }
+                if st.tail_body_v_max >= 1.0 {
+                    tail_fail.push(tag.clone());
+                }
+                if st.runaway_removed != 0 {
+                    runaway_fail.push(tag.clone());
+                }
+                if let Some(c) = end_state_class(&s, a) {
+                    *classes.entry(c).or_default() += 1;
+                }
+            }
+        }
+        println!(
+            "X1 h={h} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups};连杆峰值 {peak_link:.1};             最长超限 {worst_overrun};机身峰值 {worst_body_v:.1};末60拍 {worst_tail_v:.3};末态 {classes:?}"
+        );
+        assert_eq!(panic_groups, 0, "X1 h={h} r{row} j{j:.3} 无 panic");
+        assert!(
+            finite_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} 非有限组 {finite_fail:?}"
+        );
+        assert!(
+            overrun_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} 超限>5 组 {overrun_fail:?}"
+        );
+        assert!(
+            body_v_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} 机身>{cap:.0} 组 {body_v_fail:?}"
+        );
+        assert!(
+            tail_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} 末态发散组 {tail_fail:?}"
+        );
+        assert!(
+            runaway_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} 误移除组 {runaway_fail:?}"
+        );
+    }
+
+    /// X2 切片 Runner:质量档(half, mass)× 落点行 row(0..2,dx = 0.5·(row−1))
+    /// × 微扰档 j,共 5 组(每组 600 + 300 拍)。全矩阵 3 质量 × 3 行 × 5 微扰
+    /// = 45 组/质量,由 15 个 #[test] 各跑一片(debug 档限时)。
+    fn run_x2_slice(half: f32, mass: f32, row: usize, j: f32) {
+        let mut grid = Vec::new();
+        for i in -1i32..=1 {
+            for jz in -1i32..=1 {
+                grid.push((0.5 * i as f32, 0.5 * jz as f32));
+            }
+        }
+        let mut groups = 0usize;
+        let mut panic_groups = 0usize;
+        let mut removed_groups = 0usize;
+        let mut peak_link_alive = 0.0f32;
+        let mut nonfinite_alive = Vec::new();
+        for &(dx, dz) in grid.iter().skip(row * 3).take(3) {
+            let drop = XDrop {
+                dx: 24.0 + dx,
+                dz: 24.0 + dz,
+                height: 5.0,
+                half_size: half,
+            };
+            let tag = format!("d({dx:+.2},{dz:+.2}) j{j:.3}");
+            groups += 1;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_x_group(&drop, j, true, 300)
+            }));
+            let Ok((_s, _a, st)) = result else {
+                panic_groups += 1;
+                continue;
+            };
+            if st.runaway_removed > 0 {
+                removed_groups += 1;
+            }
+            if st.peak_link_v.is_finite() {
+                peak_link_alive = peak_link_alive.max(st.peak_link_v);
+            }
+            if !st.all_finite && st.runaway_removed == 0 {
+                nonfinite_alive.push(tag);
+            }
+        }
+        println!(
+            "X2 m{mass} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups} 移除 {removed_groups};             未移除组连杆峰值 {peak_link_alive:.1}"
+        );
+        assert_eq!(panic_groups, 0, "X2 m{mass} r{row} j{j:.3} 无 panic");
+        assert!(
+            nonfinite_alive.is_empty(),
+            "X2 m{mass} r{row} j{j:.3} 未移除但非有限 {nonfinite_alive:?}"
+        );
+        if mass == 8.0 {
+            assert_eq!(
+                removed_groups, 0,
+                "X2 m8 r{row} j{j:.3} 误移除组存在(demo §13 峰值 126 < 200)"
+            );
+        }
+    }
+
+    /// X3 切片 Runner:质量档 half × 微扰档 j,跑全部 9 落点(防护关闭 +
+    /// catch_unwind),共 9 组。只报数:panic 组数、未 panic 组连杆速度峰值。
+    fn run_x3_slice(half: f32, j: f32) -> (usize, usize, f32) {
+        let mut grid = Vec::new();
+        for i in -1i32..=1 {
+            for jz in -1i32..=1 {
+                grid.push((0.5 * i as f32, 0.5 * jz as f32));
+            }
+        }
+        let mut total = 0usize;
+        let mut panics = 0usize;
+        let mut max_peak = 0.0f32;
+        for &(dx, dz) in &grid {
+            let drop = XDrop {
+                dx: 24.0 + dx,
+                dz: 24.0 + dz,
+                height: 5.0,
+                half_size: half,
+            };
+            total += 1;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_x_group(&drop, j, false, 0)
+            }));
+            match result {
+                Err(_) => panics += 1,
+                Ok((_s, _a, st)) => {
+                    if st.peak_link_v.is_finite() {
+                        max_peak = max_peak.max(st.peak_link_v);
+                    }
+                }
+            }
+        }
+        (total, panics, max_peak)
+    }
+
+    // ---- 参数化测试阵列(代码生成;每片 debug 档 ≤ 5 分钟)----
+
+    /// X1 h=5.0 落点行 0(dx = -0.50)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h5m_r0_j0() {
+        run_x1_slice(5.0, 0, 0.0);
+    }
+
+    /// X1 h=5.0 落点行 0(dx = -0.50)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h5m_r0_j1() {
+        run_x1_slice(5.0, 0, 0.017);
+    }
+
+    /// X1 h=5.0 落点行 0(dx = -0.50)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h5m_r0_j2() {
+        run_x1_slice(5.0, 0, 0.034);
+    }
+
+    /// X1 h=5.0 落点行 0(dx = -0.50)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h5m_r0_j3() {
+        run_x1_slice(5.0, 0, 0.051);
+    }
+
+    /// X1 h=5.0 落点行 0(dx = -0.50)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h5m_r0_j4() {
+        run_x1_slice(5.0, 0, 0.068);
+    }
+
+    /// X1 h=5.0 落点行 1(dx = -0.25)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h5m_r1_j0() {
+        run_x1_slice(5.0, 1, 0.0);
+    }
+
+    /// X1 h=5.0 落点行 1(dx = -0.25)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h5m_r1_j1() {
+        run_x1_slice(5.0, 1, 0.017);
+    }
+
+    /// X1 h=5.0 落点行 1(dx = -0.25)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h5m_r1_j2() {
+        run_x1_slice(5.0, 1, 0.034);
+    }
+
+    /// X1 h=5.0 落点行 1(dx = -0.25)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h5m_r1_j3() {
+        run_x1_slice(5.0, 1, 0.051);
+    }
+
+    /// X1 h=5.0 落点行 1(dx = -0.25)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h5m_r1_j4() {
+        run_x1_slice(5.0, 1, 0.068);
+    }
+
+    /// X1 h=5.0 落点行 2(dx = +0.00)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h5m_r2_j0() {
+        run_x1_slice(5.0, 2, 0.0);
+    }
+
+    /// X1 h=5.0 落点行 2(dx = +0.00)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h5m_r2_j1() {
+        run_x1_slice(5.0, 2, 0.017);
+    }
+
+    /// X1 h=5.0 落点行 2(dx = +0.00)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h5m_r2_j2() {
+        run_x1_slice(5.0, 2, 0.034);
+    }
+
+    /// X1 h=5.0 落点行 2(dx = +0.00)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h5m_r2_j3() {
+        run_x1_slice(5.0, 2, 0.051);
+    }
+
+    /// X1 h=5.0 落点行 2(dx = +0.00)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h5m_r2_j4() {
+        run_x1_slice(5.0, 2, 0.068);
+    }
+
+    /// X1 h=5.0 落点行 3(dx = +0.25)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h5m_r3_j0() {
+        run_x1_slice(5.0, 3, 0.0);
+    }
+
+    /// X1 h=5.0 落点行 3(dx = +0.25)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h5m_r3_j1() {
+        run_x1_slice(5.0, 3, 0.017);
+    }
+
+    /// X1 h=5.0 落点行 3(dx = +0.25)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h5m_r3_j2() {
+        run_x1_slice(5.0, 3, 0.034);
+    }
+
+    /// X1 h=5.0 落点行 3(dx = +0.25)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h5m_r3_j3() {
+        run_x1_slice(5.0, 3, 0.051);
+    }
+
+    /// X1 h=5.0 落点行 3(dx = +0.25)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h5m_r3_j4() {
+        run_x1_slice(5.0, 3, 0.068);
+    }
+
+    /// X1 h=5.0 落点行 4(dx = +0.50)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h5m_r4_j0() {
+        run_x1_slice(5.0, 4, 0.0);
+    }
+
+    /// X1 h=5.0 落点行 4(dx = +0.50)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h5m_r4_j1() {
+        run_x1_slice(5.0, 4, 0.017);
+    }
+
+    /// X1 h=5.0 落点行 4(dx = +0.50)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h5m_r4_j2() {
+        run_x1_slice(5.0, 4, 0.034);
+    }
+
+    /// X1 h=5.0 落点行 4(dx = +0.50)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h5m_r4_j3() {
+        run_x1_slice(5.0, 4, 0.051);
+    }
+
+    /// X1 h=5.0 落点行 4(dx = +0.50)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h5m_r4_j4() {
+        run_x1_slice(5.0, 4, 0.068);
+    }
+
+    /// X1 h=10.0 落点行 0(dx = -0.50)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h10m_r0_j0() {
+        run_x1_slice(10.0, 0, 0.0);
+    }
+
+    /// X1 h=10.0 落点行 0(dx = -0.50)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h10m_r0_j1() {
+        run_x1_slice(10.0, 0, 0.017);
+    }
+
+    /// X1 h=10.0 落点行 0(dx = -0.50)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h10m_r0_j2() {
+        run_x1_slice(10.0, 0, 0.034);
+    }
+
+    /// X1 h=10.0 落点行 0(dx = -0.50)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h10m_r0_j3() {
+        run_x1_slice(10.0, 0, 0.051);
+    }
+
+    /// X1 h=10.0 落点行 0(dx = -0.50)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h10m_r0_j4() {
+        run_x1_slice(10.0, 0, 0.068);
+    }
+
+    /// X1 h=10.0 落点行 1(dx = -0.25)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h10m_r1_j0() {
+        run_x1_slice(10.0, 1, 0.0);
+    }
+
+    /// X1 h=10.0 落点行 1(dx = -0.25)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h10m_r1_j1() {
+        run_x1_slice(10.0, 1, 0.017);
+    }
+
+    /// X1 h=10.0 落点行 1(dx = -0.25)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h10m_r1_j2() {
+        run_x1_slice(10.0, 1, 0.034);
+    }
+
+    /// X1 h=10.0 落点行 1(dx = -0.25)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h10m_r1_j3() {
+        run_x1_slice(10.0, 1, 0.051);
+    }
+
+    /// X1 h=10.0 落点行 1(dx = -0.25)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h10m_r1_j4() {
+        run_x1_slice(10.0, 1, 0.068);
+    }
+
+    /// X1 h=10.0 落点行 2(dx = +0.00)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h10m_r2_j0() {
+        run_x1_slice(10.0, 2, 0.0);
+    }
+
+    /// X1 h=10.0 落点行 2(dx = +0.00)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h10m_r2_j1() {
+        run_x1_slice(10.0, 2, 0.017);
+    }
+
+    /// X1 h=10.0 落点行 2(dx = +0.00)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h10m_r2_j2() {
+        run_x1_slice(10.0, 2, 0.034);
+    }
+
+    /// X1 h=10.0 落点行 2(dx = +0.00)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h10m_r2_j3() {
+        run_x1_slice(10.0, 2, 0.051);
+    }
+
+    /// X1 h=10.0 落点行 2(dx = +0.00)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h10m_r2_j4() {
+        run_x1_slice(10.0, 2, 0.068);
+    }
+
+    /// X1 h=10.0 落点行 3(dx = +0.25)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h10m_r3_j0() {
+        run_x1_slice(10.0, 3, 0.0);
+    }
+
+    /// X1 h=10.0 落点行 3(dx = +0.25)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h10m_r3_j1() {
+        run_x1_slice(10.0, 3, 0.017);
+    }
+
+    /// X1 h=10.0 落点行 3(dx = +0.25)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h10m_r3_j2() {
+        run_x1_slice(10.0, 3, 0.034);
+    }
+
+    /// X1 h=10.0 落点行 3(dx = +0.25)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h10m_r3_j3() {
+        run_x1_slice(10.0, 3, 0.051);
+    }
+
+    /// X1 h=10.0 落点行 3(dx = +0.25)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h10m_r3_j4() {
+        run_x1_slice(10.0, 3, 0.068);
+    }
+
+    /// X1 h=10.0 落点行 4(dx = +0.50)× 微扰 0.0 m:5 组。
+    #[test]
+    fn x1_h10m_r4_j0() {
+        run_x1_slice(10.0, 4, 0.0);
+    }
+
+    /// X1 h=10.0 落点行 4(dx = +0.50)× 微扰 0.017 m:5 组。
+    #[test]
+    fn x1_h10m_r4_j1() {
+        run_x1_slice(10.0, 4, 0.017);
+    }
+
+    /// X1 h=10.0 落点行 4(dx = +0.50)× 微扰 0.034 m:5 组。
+    #[test]
+    fn x1_h10m_r4_j2() {
+        run_x1_slice(10.0, 4, 0.034);
+    }
+
+    /// X1 h=10.0 落点行 4(dx = +0.50)× 微扰 0.051 m:5 组。
+    #[test]
+    fn x1_h10m_r4_j3() {
+        run_x1_slice(10.0, 4, 0.051);
+    }
+
+    /// X1 h=10.0 落点行 4(dx = +0.50)× 微扰 0.068 m:5 组。
+    #[test]
+    fn x1_h10m_r4_j4() {
+        run_x1_slice(10.0, 4, 0.068);
+    }
+
+    /// X2 质量 8.0 落点行 0 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m8_r0_j0() {
+        run_x2_slice(1.0, 8.0, 0, 0.0);
+    }
+
+    /// X2 质量 8.0 落点行 0 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m8_r0_j1() {
+        run_x2_slice(1.0, 8.0, 0, 0.017);
+    }
+
+    /// X2 质量 8.0 落点行 0 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m8_r0_j2() {
+        run_x2_slice(1.0, 8.0, 0, 0.034);
+    }
+
+    /// X2 质量 8.0 落点行 0 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m8_r0_j3() {
+        run_x2_slice(1.0, 8.0, 0, 0.051);
+    }
+
+    /// X2 质量 8.0 落点行 0 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m8_r0_j4() {
+        run_x2_slice(1.0, 8.0, 0, 0.068);
+    }
+
+    /// X2 质量 8.0 落点行 1 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m8_r1_j0() {
+        run_x2_slice(1.0, 8.0, 1, 0.0);
+    }
+
+    /// X2 质量 8.0 落点行 1 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m8_r1_j1() {
+        run_x2_slice(1.0, 8.0, 1, 0.017);
+    }
+
+    /// X2 质量 8.0 落点行 1 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m8_r1_j2() {
+        run_x2_slice(1.0, 8.0, 1, 0.034);
+    }
+
+    /// X2 质量 8.0 落点行 1 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m8_r1_j3() {
+        run_x2_slice(1.0, 8.0, 1, 0.051);
+    }
+
+    /// X2 质量 8.0 落点行 1 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m8_r1_j4() {
+        run_x2_slice(1.0, 8.0, 1, 0.068);
+    }
+
+    /// X2 质量 8.0 落点行 2 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m8_r2_j0() {
+        run_x2_slice(1.0, 8.0, 2, 0.0);
+    }
+
+    /// X2 质量 8.0 落点行 2 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m8_r2_j1() {
+        run_x2_slice(1.0, 8.0, 2, 0.017);
+    }
+
+    /// X2 质量 8.0 落点行 2 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m8_r2_j2() {
+        run_x2_slice(1.0, 8.0, 2, 0.034);
+    }
+
+    /// X2 质量 8.0 落点行 2 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m8_r2_j3() {
+        run_x2_slice(1.0, 8.0, 2, 0.051);
+    }
+
+    /// X2 质量 8.0 落点行 2 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m8_r2_j4() {
+        run_x2_slice(1.0, 8.0, 2, 0.068);
+    }
+
+    /// X2 质量 64.0 落点行 0 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m64_r0_j0() {
+        run_x2_slice(2.0, 64.0, 0, 0.0);
+    }
+
+    /// X2 质量 64.0 落点行 0 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m64_r0_j1() {
+        run_x2_slice(2.0, 64.0, 0, 0.017);
+    }
+
+    /// X2 质量 64.0 落点行 0 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m64_r0_j2() {
+        run_x2_slice(2.0, 64.0, 0, 0.034);
+    }
+
+    /// X2 质量 64.0 落点行 0 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m64_r0_j3() {
+        run_x2_slice(2.0, 64.0, 0, 0.051);
+    }
+
+    /// X2 质量 64.0 落点行 0 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m64_r0_j4() {
+        run_x2_slice(2.0, 64.0, 0, 0.068);
+    }
+
+    /// X2 质量 64.0 落点行 1 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m64_r1_j0() {
+        run_x2_slice(2.0, 64.0, 1, 0.0);
+    }
+
+    /// X2 质量 64.0 落点行 1 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m64_r1_j1() {
+        run_x2_slice(2.0, 64.0, 1, 0.017);
+    }
+
+    /// X2 质量 64.0 落点行 1 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m64_r1_j2() {
+        run_x2_slice(2.0, 64.0, 1, 0.034);
+    }
+
+    /// X2 质量 64.0 落点行 1 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m64_r1_j3() {
+        run_x2_slice(2.0, 64.0, 1, 0.051);
+    }
+
+    /// X2 质量 64.0 落点行 1 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m64_r1_j4() {
+        run_x2_slice(2.0, 64.0, 1, 0.068);
+    }
+
+    /// X2 质量 64.0 落点行 2 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m64_r2_j0() {
+        run_x2_slice(2.0, 64.0, 2, 0.0);
+    }
+
+    /// X2 质量 64.0 落点行 2 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m64_r2_j1() {
+        run_x2_slice(2.0, 64.0, 2, 0.017);
+    }
+
+    /// X2 质量 64.0 落点行 2 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m64_r2_j2() {
+        run_x2_slice(2.0, 64.0, 2, 0.034);
+    }
+
+    /// X2 质量 64.0 落点行 2 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m64_r2_j3() {
+        run_x2_slice(2.0, 64.0, 2, 0.051);
+    }
+
+    /// X2 质量 64.0 落点行 2 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m64_r2_j4() {
+        run_x2_slice(2.0, 64.0, 2, 0.068);
+    }
+
+    /// X2 质量 512.0 落点行 0 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m512_r0_j0() {
+        run_x2_slice(4.0, 512.0, 0, 0.0);
+    }
+
+    /// X2 质量 512.0 落点行 0 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m512_r0_j1() {
+        run_x2_slice(4.0, 512.0, 0, 0.017);
+    }
+
+    /// X2 质量 512.0 落点行 0 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m512_r0_j2() {
+        run_x2_slice(4.0, 512.0, 0, 0.034);
+    }
+
+    /// X2 质量 512.0 落点行 0 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m512_r0_j3() {
+        run_x2_slice(4.0, 512.0, 0, 0.051);
+    }
+
+    /// X2 质量 512.0 落点行 0 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m512_r0_j4() {
+        run_x2_slice(4.0, 512.0, 0, 0.068);
+    }
+
+    /// X2 质量 512.0 落点行 1 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m512_r1_j0() {
+        run_x2_slice(4.0, 512.0, 1, 0.0);
+    }
+
+    /// X2 质量 512.0 落点行 1 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m512_r1_j1() {
+        run_x2_slice(4.0, 512.0, 1, 0.017);
+    }
+
+    /// X2 质量 512.0 落点行 1 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m512_r1_j2() {
+        run_x2_slice(4.0, 512.0, 1, 0.034);
+    }
+
+    /// X2 质量 512.0 落点行 1 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m512_r1_j3() {
+        run_x2_slice(4.0, 512.0, 1, 0.051);
+    }
+
+    /// X2 质量 512.0 落点行 1 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m512_r1_j4() {
+        run_x2_slice(4.0, 512.0, 1, 0.068);
+    }
+
+    /// X2 质量 512.0 落点行 2 × 微扰 0.0 m:5 组。
+    #[test]
+    fn x2_m512_r2_j0() {
+        run_x2_slice(4.0, 512.0, 2, 0.0);
+    }
+
+    /// X2 质量 512.0 落点行 2 × 微扰 0.017 m:5 组。
+    #[test]
+    fn x2_m512_r2_j1() {
+        run_x2_slice(4.0, 512.0, 2, 0.017);
+    }
+
+    /// X2 质量 512.0 落点行 2 × 微扰 0.034 m:5 组。
+    #[test]
+    fn x2_m512_r2_j2() {
+        run_x2_slice(4.0, 512.0, 2, 0.034);
+    }
+
+    /// X2 质量 512.0 落点行 2 × 微扰 0.051 m:5 组。
+    #[test]
+    fn x2_m512_r2_j3() {
+        run_x2_slice(4.0, 512.0, 2, 0.051);
+    }
+
+    /// X2 质量 512.0 落点行 2 × 微扰 0.068 m:5 组。
+    #[test]
+    fn x2_m512_r2_j4() {
+        run_x2_slice(4.0, 512.0, 2, 0.068);
+    }
+
+    /// X3 质量 64(防护关)× 微扰 0.0 m:9 落点组,只报数。
+    #[test]
+    fn x3_m64_j0() {
+        let (total, panics, peak) = run_x3_slice(2.0, 0.0);
+        println!("X3 m64 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 64(防护关)× 微扰 0.017 m:9 落点组,只报数。
+    #[test]
+    fn x3_m64_j1() {
+        let (total, panics, peak) = run_x3_slice(2.0, 0.017);
+        println!("X3 m64 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 64(防护关)× 微扰 0.034 m:9 落点组,只报数。
+    #[test]
+    fn x3_m64_j2() {
+        let (total, panics, peak) = run_x3_slice(2.0, 0.034);
+        println!("X3 m64 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 64(防护关)× 微扰 0.051 m:9 落点组,只报数。
+    #[test]
+    fn x3_m64_j3() {
+        let (total, panics, peak) = run_x3_slice(2.0, 0.051);
+        println!("X3 m64 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 64(防护关)× 微扰 0.068 m:9 落点组,只报数。
+    #[test]
+    fn x3_m64_j4() {
+        let (total, panics, peak) = run_x3_slice(2.0, 0.068);
+        println!("X3 m64 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 512(防护关)× 微扰 0.0 m:9 落点组,只报数。
+    #[test]
+    fn x3_m512_j0() {
+        let (total, panics, peak) = run_x3_slice(4.0, 0.0);
+        println!("X3 m512 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 512(防护关)× 微扰 0.017 m:9 落点组,只报数。
+    #[test]
+    fn x3_m512_j1() {
+        let (total, panics, peak) = run_x3_slice(4.0, 0.017);
+        println!("X3 m512 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 512(防护关)× 微扰 0.034 m:9 落点组,只报数。
+    #[test]
+    fn x3_m512_j2() {
+        let (total, panics, peak) = run_x3_slice(4.0, 0.034);
+        println!("X3 m512 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 512(防护关)× 微扰 0.051 m:9 落点组,只报数。
+    #[test]
+    fn x3_m512_j3() {
+        let (total, panics, peak) = run_x3_slice(4.0, 0.051);
+        println!("X3 m512 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
+    }
+
+    /// X3 质量 512(防护关)× 微扰 0.068 m:9 落点组,只报数。
+    #[test]
+    fn x3_m512_j4() {
+        let (total, panics, peak) = run_x3_slice(4.0, 0.068);
+        println!("X3 m512 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s");
     }
 }

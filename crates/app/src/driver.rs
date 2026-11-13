@@ -610,7 +610,11 @@ pub struct DriverOutcome {
 /// **v10**(REQ-012 B01a,#25):`AgentRecord` 布局追加 `joint_targets`(关节
 /// 目标保持状态随快照走)——v9 及更早档解码失败/版本拒绝,必须清
 /// `data_dir`(不做迁移,放行第 3.5 节)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 10;
+///
+/// **v11**(REQ-012 B01b,#25):`Outbox` 布局追加 `agent_runaway_removed`
+/// (失控移除计数随快照走,任务书 B01b 第 3.1 节)——v10 及更早档解码
+/// 失败/版本拒绝,必须清 `data_dir`(不做迁移)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 11;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -4815,7 +4819,7 @@ mod tests {
     /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 10, "REQ-012 B01a 起 = v10");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 11, "REQ-012 B01b 起 = v11");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -7342,13 +7346,14 @@ mod tests {
         assert_eq!(o.agent_counters.spawn_rejected, 1, "对照成功不计数");
     }
 
-    /// D2(B01a 放行第 3.5/3.7 节):检查点版本 10;版本 9 的档被显式拒绝
-    /// (AgentRecord 布局追加 joint_targets,v9 档解码不兼容;不做迁移)。
+    /// D2(B01a 放行第 3.5/3.7 节,继承):检查点版本 11(B01b 起,Outbox
+    /// 追加 agent_runaway_removed);版本 10 的档被显式拒绝(v10 档解码
+    /// 不兼容;不做迁移)。
     #[test]
-    fn d2_checkpoint_version_10_rejects_v9() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 10, "B01a 起 = v10");
+    fn d2_checkpoint_version_11_rejects_v10() {
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 11, "B01b 起 = v11");
         let bundle = CheckpointBundle {
-            format_version: 9,
+            format_version: 10,
             world: sim_api::snapshot::WorldSnapshot {
                 shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(7)),
                 scheduler: empty_scheduler_snapshot(types::Tick(7)),
@@ -7360,9 +7365,9 @@ mod tests {
         let msg = match decode_checkpoint(&bytes) {
             Err(AppError::Decode(msg)) => msg,
             Err(other) => panic!("期望 Decode 错误,实为 {other:?}"),
-            Ok(_) => panic!("v9 档必须被拒绝"),
+            Ok(_) => panic!("v10 档必须被拒绝"),
         };
-        assert!(msg.contains("9"), "错误信息指认旧版本: {msg}");
+        assert!(msg.contains("10"), "错误信息指认旧版本: {msg}");
     }
 
     /// D3(B01a-R1 P3):`validate_external_command` 的 `AgentJointTargets`

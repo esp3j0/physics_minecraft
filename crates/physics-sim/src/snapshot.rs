@@ -288,6 +288,9 @@ impl ShardSim {
             agent_shapes: crate::agent_shape::AgentShapeTable::default(),
             // 接缝修正开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
             seam_fix_enabled: true,
+            // 失控防护开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
+            #[cfg(test)]
+            agent_runaway_guard_enabled: true,
             bodies,
             chunk_bodies: snap.chunk_bodies,
             built_colliders: snap.built_colliders,
