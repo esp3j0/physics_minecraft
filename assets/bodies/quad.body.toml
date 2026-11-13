@@ -1,0 +1,325 @@
+# REQ-012 B01a:手写四足(quad demo §13 定值,`demos/agents/quad/src/lib.rs`)。
+# 真实单位(千克、米、牛·米);生成时质量/惯量/PD 增益/阻尼乘全局系数 k
+# (默认 1/100,§4)。
+#
+# 尺寸/质量/关节限位/力矩上限取自 quad demo 常量:机身半长 0.19(盒)、
+# Go2 真实几何 L = 0.213、髋距 HIP_X = 0.1934 / HIP_Z = 0.0465、大腿偏移
+# THIGH_OFF = 0.0955;13 连杆 = 机身 + 4 腿 × (hip 球 + thigh 胶囊 + shank
+# 胶囊),脚球 = shank 上带偏移的第二个形状(挂在小腿末端 (0, −L/2, 0))。
+# PD:kp 100 / kd 3;力矩上限 23.7 N·m;脚摩擦 0.6;恢复系数 0。
+# 腿序同 leg_signs():FL、FR、RL、RR(fx = 前/后,fz = 右/左)。
+#
+# default_angle = stand_targets(default_gait()) 的站立角(足端目标 (0, −0.28),
+# 逆解 ik):lat = 0、hip pitch = −0.853596389、knee = 1.70719278(rad)。
+
+name = "quad"
+
+[[links]]
+name = "body"
+mass = 6.921
+friction = 0.6
+restitution = 0.0
+
+[[links.shapes]]
+kind = "box"
+half = [0.19, 0.057, 0.047]
+
+# ---- 每条腿 3 连杆:hip 球 / thigh 胶囊 / shank 胶囊 + 脚球 ----
+
+# leg0 = FL(fx = +1,fz = −1)
+[[links]]
+name = "leg0_front_left_hip"
+mass = 0.678
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.035
+
+[[links]]
+name = "leg0_front_left_thigh"
+mass = 1.152
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.02
+
+[[links]]
+name = "leg0_front_left_shank"
+mass = 0.194
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.012
+[[links.shapes]]
+kind = "sphere"
+radius = 0.022
+offset = [0.0, -0.1065, 0.0]
+
+# leg1 = FR(fx = +1,fz = +1)
+[[links]]
+name = "leg1_front_right_hip"
+mass = 0.678
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.035
+
+[[links]]
+name = "leg1_front_right_thigh"
+mass = 1.152
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.02
+
+[[links]]
+name = "leg1_front_right_shank"
+mass = 0.194
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.012
+[[links.shapes]]
+kind = "sphere"
+radius = 0.022
+offset = [0.0, -0.1065, 0.0]
+
+# leg2 = RL(fx = −1,fz = −1)
+[[links]]
+name = "leg2_rear_left_hip"
+mass = 0.678
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.035
+
+[[links]]
+name = "leg2_rear_left_thigh"
+mass = 1.152
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.02
+
+[[links]]
+name = "leg2_rear_left_shank"
+mass = 0.194
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.012
+[[links.shapes]]
+kind = "sphere"
+radius = 0.022
+offset = [0.0, -0.1065, 0.0]
+
+# leg3 = RR(fx = −1,fz = +1)
+[[links]]
+name = "leg3_rear_right_hip"
+mass = 0.678
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.035
+
+[[links]]
+name = "leg3_rear_right_thigh"
+mass = 1.152
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.02
+
+[[links]]
+name = "leg3_rear_right_shank"
+mass = 0.194
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1065
+radius = 0.012
+[[links.shapes]]
+kind = "sphere"
+radius = 0.022
+offset = [0.0, -0.1065, 0.0]
+
+# ---- 关节(dof 顺序 = 本表顺序;每腿 lat / hip pitch / knee)----
+
+# leg0 FL:髋锚 (fx·0.1934, 0, fz·0.0465) = (0.1934, 0, −0.0465)
+[[joints]]
+parent = "body"
+child = "leg0_front_left_hip"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.1934, 0.0, -0.0465]
+child_anchor = [0.0, 0.0, 0.04775]
+limits = { lower = -0.8, upper = 0.8 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 0.0
+
+[[joints]]
+parent = "leg0_front_left_hip"
+child = "leg0_front_left_thigh"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, 0.0, -0.04775]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = -1.6, upper = 1.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = -0.853596389
+
+[[joints]]
+parent = "leg0_front_left_thigh"
+child = "leg0_front_left_shank"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, -0.1065, 0.0]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = 0.0, upper = 2.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 1.70719278
+
+# leg1 FR:髋锚 (0.1934, 0, 0.0465)
+[[joints]]
+parent = "body"
+child = "leg1_front_right_hip"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.1934, 0.0, 0.0465]
+child_anchor = [0.0, 0.0, -0.04775]
+limits = { lower = -0.8, upper = 0.8 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 0.0
+
+[[joints]]
+parent = "leg1_front_right_hip"
+child = "leg1_front_right_thigh"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, 0.0, 0.04775]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = -1.6, upper = 1.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = -0.853596389
+
+[[joints]]
+parent = "leg1_front_right_thigh"
+child = "leg1_front_right_shank"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, -0.1065, 0.0]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = 0.0, upper = 2.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 1.70719278
+
+# leg2 RL:髋锚 (−0.1934, 0, −0.0465)
+[[joints]]
+parent = "body"
+child = "leg2_rear_left_hip"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [-0.1934, 0.0, -0.0465]
+child_anchor = [0.0, 0.0, 0.04775]
+limits = { lower = -0.8, upper = 0.8 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 0.0
+
+[[joints]]
+parent = "leg2_rear_left_hip"
+child = "leg2_rear_left_thigh"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, 0.0, -0.04775]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = -1.6, upper = 1.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = -0.853596389
+
+[[joints]]
+parent = "leg2_rear_left_thigh"
+child = "leg2_rear_left_shank"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, -0.1065, 0.0]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = 0.0, upper = 2.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 1.70719278
+
+# leg3 RR:髋锚 (−0.1934, 0, 0.0465)
+[[joints]]
+parent = "body"
+child = "leg3_rear_right_hip"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [-0.1934, 0.0, 0.0465]
+child_anchor = [0.0, 0.0, -0.04775]
+limits = { lower = -0.8, upper = 0.8 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 0.0
+
+[[joints]]
+parent = "leg3_rear_right_hip"
+child = "leg3_rear_right_thigh"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, 0.0, 0.04775]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = -1.6, upper = 1.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = -0.853596389
+
+[[joints]]
+parent = "leg3_rear_right_thigh"
+child = "leg3_rear_right_shank"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.0, -0.1065, 0.0]
+child_anchor = [0.0, 0.1065, 0.0]
+limits = { lower = 0.0, upper = 2.6 }
+max_torque = 23.7
+kp = 100.0
+kd = 3.0
+default_angle = 1.70719278

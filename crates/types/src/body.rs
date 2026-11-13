@@ -12,6 +12,16 @@
 //!   跨平台稳定;自实现零新增依赖。
 //!
 //! 本模块不含 IO(目录加载在 app 装配层)。
+//!
+//! B01a(REQ-012 阶段 B,多连杆内核)补全的几何约定:
+//! - `ShapeDef` 每个变体带 `offset`(连杆局部系里的平移,缺省零)——脚球挂
+//!   在小腿末端这类"一个连杆多个形状"的表达;
+//! - `JointParams.child_anchor` = 关节原点在**子连杆**局部系的位置(缺省
+//!   零 = 子连杆原点就在关节上);`anchor` = 关节原点在**父连杆**局部系的
+//!   位置;`axis` 在关节系里给出。关节角为 0 时父子连杆朝向相同;
+//! - **根连杆必须是 `links[0]`**(`validate` 检查,单连杆自然满足);连杆
+//!   顺序 = `links` 的顺序;自由度顺序 = `joints` 里非 `fixed` 关节的顺序
+//!   (`dof_count` / `dof_joints`)。
 
 use serde::{Deserialize, Serialize};
 
@@ -45,17 +55,36 @@ impl std::fmt::Display for BodyHash {
 
 /// 碰撞形状定义(REQ-012 §2.1:盒、球、胶囊、凸包)。
 /// serde 内部 tag(`kind`):未知类别在解析层拒绝;每连杆形状数上限 8(校验层)。
+/// B01a:每个变体带 `offset` = 形状在**连杆局部系**里的平移(缺省零;
+/// 脚球挂在小腿末端 = shank 上带偏移的第二个形状,quad demo)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ShapeDef {
     /// 轴对齐盒(半边长)。
-    Box { half: [f32; 3] },
+    Box {
+        half: [f32; 3],
+        #[serde(default)]
+        offset: [f32; 3],
+    },
     /// 球。
-    Sphere { radius: f32 },
+    Sphere {
+        radius: f32,
+        #[serde(default)]
+        offset: [f32; 3],
+    },
     /// y 向胶囊(总高 = 2·(half_height + radius))。
-    CapsuleY { half_height: f32, radius: f32 },
+    CapsuleY {
+        half_height: f32,
+        radius: f32,
+        #[serde(default)]
+        offset: [f32; 3],
+    },
     /// 凸包(顶点集;导入工具生成)。
-    ConvexHull { points: Vec<[f32; 3]> },
+    ConvexHull {
+        points: Vec<[f32; 3]>,
+        #[serde(default)]
+        offset: [f32; 3],
+    },
 }
 
 /// 关节类型(REQ-012 §2.1;未知类型在 serde 层拒绝)。
@@ -79,6 +108,10 @@ pub struct JointLimits {
 pub struct JointParams {
     pub axis: [f32; 3],
     pub anchor: [f32; 3],
+    /// 关节原点在**子连杆**局部系里的位置(缺省零 = 子连杆原点就在关节上;
+    /// B01a)。`anchor` 是父侧、本字段是子侧,关节角为 0 时父子连杆朝向相同。
+    #[serde(default)]
+    pub child_anchor: [f32; 3],
     /// 上限 < 下限 → `BodyDefError::BadLimits`(校验层)。
     pub limits: Option<JointLimits>,
     /// 力矩上限(N·m;真实单位)。
@@ -260,9 +293,30 @@ pub enum BodyDefError {
     },
     #[error("至少要有一个连杆")]
     EmptyLinks,
+    /// 根连杆必须是 `links[0]`(B01a:生成层按 `links` 顺序建树,父须排在
+    /// 子之前;单连杆自然满足)。
+    #[error("根连杆必须是 links[0]:{0}")]
+    RootNotFirst(String),
+    /// 按连杆对开启自碰撞:B01a 不支持(生成层只做全 multibody 关闭)。
+    #[error("自碰撞按对开启暂不支持(B01a 只支持全关闭);{0:?}")]
+    SelfCollisionUnsupported(Vec<[String; 2]>),
 }
 
 impl BodyDef {
+    /// 自由度数 = `joints` 里非 `fixed` 关节的顺序数(B01a:关节目标命令的
+    /// 长度契约)。
+    pub fn dof_count(&self) -> usize {
+        self.dof_joints().count()
+    }
+
+    /// 自由度顺序的关节迭代器:`joints` 里非 `fixed` 关节,按 `joints` 顺序
+    /// (与内核的关节目标下标一一对应)。
+    pub fn dof_joints(&self) -> impl Iterator<Item = &JointDef> {
+        self.joints
+            .iter()
+            .filter(|j| j.kind.joint_type() != JointType::Fixed)
+    }
+
     /// 从 toml 文本解析 + 校验(解析即规范:哈希基于解析后的结构)。
     pub fn from_toml_str(text: &str) -> Result<Self, BodyDefError> {
         let def: BodyDef = toml::from_str(text).map_err(|e| BodyDefError::Parse(e.to_string()))?;
@@ -275,6 +329,12 @@ impl BodyDef {
     pub fn validate(&self) -> Result<(), BodyDefError> {
         if self.links.is_empty() {
             return Err(BodyDefError::EmptyLinks);
+        }
+        // ---- 自碰撞按对开启:B01a 不支持(生成层只做全 multibody 关闭)----
+        if !self.self_collision.extra_pairs.is_empty() {
+            return Err(BodyDefError::SelfCollisionUnsupported(
+                self.self_collision.extra_pairs.clone(),
+            ));
         }
         // ---- 行走段(A02a 第 1 节):只对单连杆身体有效;多连杆带段 =
         // 类型化错误;字段有限且 > 0(air 可 = 0)----
@@ -323,27 +383,40 @@ impl BodyDef {
             for (i, s) in l.shapes.iter().enumerate() {
                 let field = |name: &str| format!("{}.shapes[{i}].{name}", l.name);
                 match s {
-                    ShapeDef::Box { half } => {
+                    ShapeDef::Box { half, offset } => {
                         if half.iter().any(|v| !v.is_finite()) {
                             return Err(BodyDefError::NonFinite(field("half")));
                         }
+                        if offset.iter().any(|v| !v.is_finite()) {
+                            return Err(BodyDefError::NonFinite(field("offset")));
+                        }
                     }
-                    ShapeDef::Sphere { radius } => {
+                    ShapeDef::Sphere { radius, offset } => {
                         if !radius.is_finite() {
                             return Err(BodyDefError::NonFinite(field("radius")));
+                        }
+                        if offset.iter().any(|v| !v.is_finite()) {
+                            return Err(BodyDefError::NonFinite(field("offset")));
                         }
                     }
                     ShapeDef::CapsuleY {
                         half_height,
                         radius,
+                        offset,
                     } => {
                         if !half_height.is_finite() || !radius.is_finite() {
                             return Err(BodyDefError::NonFinite(field("capsule_y")));
                         }
+                        if offset.iter().any(|v| !v.is_finite()) {
+                            return Err(BodyDefError::NonFinite(field("offset")));
+                        }
                     }
-                    ShapeDef::ConvexHull { points } => {
+                    ShapeDef::ConvexHull { points, offset } => {
                         if points.iter().any(|p| p.iter().any(|v| !v.is_finite())) {
                             return Err(BodyDefError::NonFinite(field("points")));
+                        }
+                        if offset.iter().any(|v| !v.is_finite()) {
+                            return Err(BodyDefError::NonFinite(field("offset")));
                         }
                     }
                 }
@@ -370,9 +443,12 @@ impl BodyDef {
                 });
             }
             let p = j.kind.params();
-            if p.axis.iter().any(|v| !v.is_finite()) || p.anchor.iter().any(|v| !v.is_finite()) {
+            if p.axis.iter().any(|v| !v.is_finite())
+                || p.anchor.iter().any(|v| !v.is_finite())
+                || p.child_anchor.iter().any(|v| !v.is_finite())
+            {
                 return Err(BodyDefError::NonFinite(format!(
-                    "{}->{}.axis/anchor",
+                    "{}->{}.axis/anchor/child_anchor",
                     j.parent, j.child
                 )));
             }
@@ -448,6 +524,12 @@ impl BodyDef {
                 if !detached.is_empty() {
                     return Err(BodyDefError::Detached(detached));
                 }
+                // ---- 根必须在首位(B01a:生成按 links 顺序建树,父须先于
+                // 子;单连杆自然满足)——树形合法之后才判,环/多根仍报各自
+                // 的错误 ----
+                if self.links[0].name != *root {
+                    return Err(BodyDefError::RootNotFirst(self.links[0].name.clone()));
+                }
             }
             [..] => {
                 return Err(BodyDefError::MultipleRoots(
@@ -493,7 +575,9 @@ impl BodyDef {
     /// 哨兵字节防字段集变化后跨版本撞哈希。
     fn canonical_bytes(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        b.push(1);
+        // v2(B01a):形状 offset 与关节 child_anchor 进规范形式——胶囊/quad
+        // 的内容哈希因此变化(放行第 3.1 节授权;旧哈希测试按新值更新)。
+        b.push(2);
         put_str(&mut b, &self.name);
         b.push(u8::from(self.lock_rotations));
         put_len(&mut b, self.links.len());
@@ -513,28 +597,33 @@ impl BodyDef {
             put_len(&mut b, l.shapes.len());
             for s in &l.shapes {
                 match s {
-                    ShapeDef::Box { half } => {
+                    ShapeDef::Box { half, offset } => {
                         b.push(1);
                         put_f32s(&mut b, half);
+                        put_f32s(&mut b, offset);
                     }
-                    ShapeDef::Sphere { radius } => {
+                    ShapeDef::Sphere { radius, offset } => {
                         b.push(2);
                         put_f32(&mut b, *radius);
+                        put_f32s(&mut b, offset);
                     }
                     ShapeDef::CapsuleY {
                         half_height,
                         radius,
+                        offset,
                     } => {
                         b.push(3);
                         put_f32(&mut b, *half_height);
                         put_f32(&mut b, *radius);
+                        put_f32s(&mut b, offset);
                     }
-                    ShapeDef::ConvexHull { points } => {
+                    ShapeDef::ConvexHull { points, offset } => {
                         b.push(4);
                         put_len(&mut b, points.len());
                         for p in points {
                             put_f32s(&mut b, p);
                         }
+                        put_f32s(&mut b, offset);
                     }
                 }
             }
@@ -551,6 +640,7 @@ impl BodyDef {
             let p = j.kind.params();
             put_f32s(&mut b, &p.axis);
             put_f32s(&mut b, &p.anchor);
+            put_f32s(&mut b, &p.child_anchor);
             match p.limits {
                 None => b.push(0),
                 Some(l) => {
@@ -650,6 +740,7 @@ radius = 0.3
             vec![ShapeDef::CapsuleY {
                 half_height: 0.6,
                 radius: 0.3,
+                offset: [0.0; 3],
             }]
         );
         // hash 可复现(同文本两次解析)。
@@ -732,7 +823,10 @@ half_height = 0.6
                     inertia: None,
                     friction: 0.6,
                     restitution: 0.0,
-                    shapes: vec![ShapeDef::Sphere { radius: 0.1 }],
+                    shapes: vec![ShapeDef::Sphere {
+                        radius: 0.1,
+                        offset: [0.0; 3],
+                    }],
                 })
                 .collect::<Vec<_>>()
         };
@@ -742,6 +836,7 @@ half_height = 0.6
             kind: JointKind::Revolute(JointParams {
                 axis: [1.0, 0.0, 0.0],
                 anchor: [0.0; 3],
+                child_anchor: [0.0; 3],
                 limits: None,
                 max_torque: None,
                 max_velocity: None,
@@ -812,7 +907,13 @@ half_height = 0.6
             inertia: None,
             friction: 0.6,
             restitution: 0.0,
-            shapes: vec![ShapeDef::Sphere { radius: 0.1 }; count],
+            shapes: vec![
+                ShapeDef::Sphere {
+                    radius: 0.1,
+                    offset: [0.0; 3],
+                };
+                count
+            ],
         };
         let mk = |count: usize| BodyDef {
             name: "t".to_owned(),
@@ -935,13 +1036,15 @@ max_velocity = 10.0
 kp = 100.0
 kd = 3.0
 default_angle = 0.0
-[self_collision]
-extra_pairs = [["base", "arm"]]
 "#;
         let def = BodyDef::from_toml_str(ok).expect("两连杆合法");
         assert_eq!(def.joints.len(), 1);
         assert_eq!(def.joints[0].kind.joint_type(), JointType::Revolute);
-        assert_eq!(def.self_collision.extra_pairs.len(), 1);
+        // B01a:`extra_pairs` 非空 = SelfCollisionUnsupported(T4);本布景
+        // 不带 `[self_collision]` 段(原布景带一对,该字段在 B01a 起校验层
+        // 拒绝,布景随之去掉;拒绝语义由 self_collision_extra_pairs_rejected
+        // 覆盖)。
+        assert!(def.self_collision.extra_pairs.is_empty());
         // 多连杆哈希可复现。
         assert_eq!(def.hash(), BodyDef::from_toml_str(ok).unwrap().hash());
 
@@ -1100,5 +1203,244 @@ anchor = [0.0, 0.0, 0.0]
             ),
             "缺 fmax_g/air/jump_h/ground_eps/max_speed = 解析层拒绝"
         );
+    }
+
+    // ---- REQ-012 B01a:身体格式补全(T2–T5)----
+
+    /// assets/bodies/quad.body.toml 的 include(与 physics-sim 测试同一份资产)。
+    pub(crate) fn quad_toml() -> &'static str {
+        include_str!("../../../assets/bodies/quad.body.toml")
+    }
+
+    /// T2:形状 `offset` 与关节 `child_anchor` 的解析与缺省值(缺省零)。
+    #[test]
+    fn shape_offset_and_child_anchor_parse_and_default() {
+        // 缺省:不带 offset/child_anchor 的定义,解析后均为 [0;3]。
+        let def = BodyDef::from_toml_str(&capsule_toml()).expect("合法");
+        match &def.links[0].shapes[0] {
+            ShapeDef::CapsuleY { offset, .. } => {
+                assert_eq!(*offset, [0.0; 3], "形状 offset 缺省零");
+            }
+            other => panic!("期望 CapsuleY,实为 {other:?}"),
+        }
+        assert_eq!(
+            def.joints.len(),
+            0,
+            "单连杆无关节;child_anchor 缺省在关节用例验证"
+        );
+        // 显式:带 offset 的球 + 带 child_anchor 的关节。
+        let toml = r#"
+name = "two"
+[[links]]
+name = "base"
+mass = 10.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links.shapes]]
+kind = "sphere"
+radius = 0.05
+offset = [0.0, -0.25, 0.0]
+[[links]]
+name = "arm"
+mass = 1.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.25
+radius = 0.05
+[[joints]]
+parent = "base"
+child = "arm"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.1, 0.0]
+child_anchor = [0.0, 0.25, 0.0]
+"#;
+        let def = BodyDef::from_toml_str(toml).expect("合法");
+        assert_eq!(
+            def.links[0].shapes[1],
+            ShapeDef::Sphere {
+                radius: 0.05,
+                offset: [0.0, -0.25, 0.0],
+            },
+            "显式 offset 解析"
+        );
+        assert_eq!(
+            def.links[1].shapes[0],
+            ShapeDef::CapsuleY {
+                half_height: 0.25,
+                radius: 0.05,
+                offset: [0.0; 3],
+            },
+            "同文件另一个形状不带 offset = 缺省零"
+        );
+        assert_eq!(
+            def.joints[0].kind.params().child_anchor,
+            [0.0, 0.25, 0.0],
+            "显式 child_anchor 解析"
+        );
+    }
+
+    /// T3:根不在首位 → `RootNotFirst`(两连杆但 links 顺序颠倒)。
+    #[test]
+    fn root_not_first_rejected() {
+        // arm 是父、base 是子,但 links[0] = base(base 有父关节)→ 拒。
+        let toml = r#"
+name = "flipped"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[links]]
+name = "arm"
+mass = 1.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[joints]]
+parent = "arm"
+child = "base"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+"#;
+        assert_eq!(
+            BodyDef::from_toml_str(toml),
+            Err(BodyDefError::RootNotFirst("base".to_owned())),
+            "根(arm)不在 links[0] → RootNotFirst"
+        );
+    }
+
+    /// T4:`extra_pairs` 非空 → `SelfCollisionUnsupported`(B01a 不支持按对
+    /// 开启自碰撞)。
+    #[test]
+    fn self_collision_extra_pairs_rejected() {
+        let toml = r#"
+name = "two"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[links]]
+name = "arm"
+mass = 1.0
+[[links.shapes]]
+kind = "sphere"
+radius = 0.1
+[[joints]]
+parent = "base"
+child = "arm"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+[self_collision]
+extra_pairs = [["base", "arm"]]
+"#;
+        match BodyDef::from_toml_str(toml) {
+            Err(BodyDefError::SelfCollisionUnsupported(pairs)) => {
+                assert_eq!(pairs, vec![["base".to_owned(), "arm".to_owned()]]);
+            }
+            other => panic!("期望 SelfCollisionUnsupported,实为 {other:?}"),
+        }
+    }
+
+    /// T5:任一新字段改值 → 哈希变(形状 offset、child_anchor、规范哨兵)。
+    #[test]
+    fn new_fields_change_hash() {
+        let base = r#"
+name = "two"
+[[links]]
+name = "base"
+mass = 10.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links.shapes]]
+kind = "sphere"
+radius = 0.05
+offset = [0.0, -0.25, 0.0]
+[[links]]
+name = "arm"
+mass = 1.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.25
+radius = 0.05
+[[joints]]
+parent = "base"
+child = "arm"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.1, 0.0]
+child_anchor = [0.0, 0.25, 0.0]
+"#;
+        let a = BodyDef::from_toml_str(base).expect("合法");
+        // 形状 offset 变 → 哈希变。
+        let b = BodyDef::from_toml_str(
+            &base.replace("offset = [0.0, -0.25, 0.0]", "offset = [0.0, -0.26, 0.0]"),
+        )
+        .expect("合法");
+        assert_ne!(a.hash(), b.hash(), "形状 offset 变化必改哈希");
+        // child_anchor 变 → 哈希变。
+        let c = BodyDef::from_toml_str(&base.replace(
+            "child_anchor = [0.0, 0.25, 0.0]",
+            "child_anchor = [0.0, 0.24, 0.0]",
+        ))
+        .expect("合法");
+        assert_ne!(a.hash(), c.hash(), "child_anchor 变化必改哈希");
+        // 同一定义两次解析哈希一致(可复现)。
+        assert_eq!(a.hash(), BodyDef::from_toml_str(base).unwrap().hash());
+    }
+
+    /// T1:quad.body.toml 能解析、过校验;13 连杆、12 个 revolute、
+    /// `dof_count == 12`;根 = links[0];全部关节有限位与增益。
+    #[test]
+    fn quad_body_toml_parses_and_validates() {
+        let def = BodyDef::from_toml_str(quad_toml()).expect("quad.body.toml 合法");
+        assert_eq!(def.name, "quad");
+        assert_eq!(def.links.len(), 13, "机身 + 4 腿 × 3 连杆");
+        assert_eq!(def.links[0].name, "body", "根连杆 = links[0]");
+        assert_eq!(def.joints.len(), 12, "每腿 lat/thigh/shank 3 关节");
+        assert_eq!(def.dof_count(), 12, "12 个 revolute 全是非 fixed");
+        assert_eq!(def.dof_joints().count(), 12);
+        assert!(
+            def.joints
+                .iter()
+                .all(|j| j.kind.joint_type() == JointType::Revolute)
+        );
+        // 腿的顺序同 leg_signs()(FL, FR, RL, RR;fx, fz)。
+        let signs = [(1.0, -1.0), (1.0, 1.0), (-1.0, -1.0), (-1.0, 1.0)];
+        for (leg, (fx, fz)) in signs.iter().enumerate() {
+            let lat = &def.links[1 + leg * 3];
+            let thigh = &def.links[2 + leg * 3];
+            let shank = &def.links[3 + leg * 3];
+            let side = if *fx > 0.0 { "front" } else { "rear" };
+            let flank = if *fz > 0.0 { "right" } else { "left" };
+            assert_eq!(lat.name, format!("leg{leg}_{side}_{flank}_hip"));
+            assert_eq!(thigh.name, format!("leg{leg}_{side}_{flank}_thigh"));
+            assert_eq!(shank.name, format!("leg{leg}_{side}_{flank}_shank"));
+            // shank 第二个形状 = 脚球(带偏移挂在小腿末端,quad demo 的
+            // `(0, −L/2, 0)` = −0.1065)。
+            match &shank.shapes[1] {
+                ShapeDef::Sphere { radius, offset } => {
+                    assert_eq!(*radius, 0.022, "FOOT_R");
+                    assert_eq!(*offset, [0.0, -0.1065, 0.0], "脚球挂在小腿末端");
+                }
+                other => panic!("期望脚球 Sphere,实为 {other:?}"),
+            }
+        }
+        // 全部关节:限位、力矩上限、kp/kd 齐全。
+        for j in def.dof_joints() {
+            let p = j.kind.params();
+            assert!(p.limits.is_some(), "{} 有限位", j.child);
+            assert_eq!(p.max_torque, Some(23.7), "{} 力矩上限", j.child);
+            assert_eq!(p.kp, Some(100.0), "{} kp", j.child);
+            assert_eq!(p.kd, Some(3.0), "{} kd", j.child);
+            assert!(p.default_angle.is_some(), "{} 有 default_angle", j.child);
+        }
     }
 }

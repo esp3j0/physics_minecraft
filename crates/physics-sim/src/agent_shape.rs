@@ -45,19 +45,27 @@ pub struct AgentShapeTable {
 pub fn link_bound_radius(shapes: &[types::ShapeDef]) -> f32 {
     shapes
         .iter()
-        .map(|s| match s {
-            types::ShapeDef::Box { half } => {
-                (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt()
-            }
-            types::ShapeDef::Sphere { radius } => *radius,
-            types::ShapeDef::CapsuleY {
-                half_height,
-                radius,
-            } => half_height + radius,
-            types::ShapeDef::ConvexHull { points } => points
-                .iter()
-                .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
-                .fold(0.5f32, f32::max),
+        .map(|s| {
+            let (bound, offset): (f32, [f32; 3]) = match s {
+                types::ShapeDef::Box { half, offset } => (
+                    (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt(),
+                    *offset,
+                ),
+                types::ShapeDef::Sphere { radius, offset } => (*radius, *offset),
+                types::ShapeDef::CapsuleY {
+                    half_height,
+                    radius,
+                    offset,
+                } => (half_height + radius, *offset),
+                types::ShapeDef::ConvexHull { points, offset } => (
+                    points
+                        .iter()
+                        .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+                        .fold(0.5f32, f32::max),
+                    *offset,
+                ),
+            };
+            bound + (offset[0] * offset[0] + offset[1] * offset[1] + offset[2] * offset[2]).sqrt()
         })
         .fold(0.5f32, f32::max)
 }
@@ -65,20 +73,25 @@ pub fn link_bound_radius(shapes: &[types::ShapeDef]) -> f32 {
 /// 从形状定义构造局部形状与包围球半径(与 agent.rs 生成层同一映射;
 /// 本模块不依赖 agent 私有函数,形状构造在这里复制一份最小实现)。
 pub fn link_shape(shape: &types::ShapeDef) -> (SharedShape, f32) {
-    match shape {
-        types::ShapeDef::Box { half } => (
+    let (base, offset, bound): (SharedShape, [f32; 3], f32) = match shape {
+        types::ShapeDef::Box { half, offset } => (
             SharedShape::cuboid(half[0], half[1], half[2]),
+            *offset,
             (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt(),
         ),
-        types::ShapeDef::Sphere { radius } => (SharedShape::ball(*radius), *radius),
+        types::ShapeDef::Sphere { radius, offset } => {
+            (SharedShape::ball(*radius), *offset, *radius)
+        }
         types::ShapeDef::CapsuleY {
             half_height,
             radius,
+            offset,
         } => (
             SharedShape::capsule_y(*half_height, *radius),
+            *offset,
             half_height + radius,
         ),
-        types::ShapeDef::ConvexHull { points } => {
+        types::ShapeDef::ConvexHull { points, offset } => {
             let pts: Vec<rapier3d::parry::math::Vector> =
                 points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
             let hull = SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)");
@@ -86,9 +99,21 @@ pub fn link_shape(shape: &types::ShapeDef) -> (SharedShape, f32) {
             let half = (aabb.maxs - aabb.mins) * 0.5;
             (
                 hull,
+                *offset,
                 (half.x * half.x + half.y * half.y + half.z * half.z).sqrt(),
             )
         }
+    };
+    // B01a:形状 offset 非零 → 包一层 compound 把偏移带进几何(与生成层
+    // `agent_collider_builder` 同源;零偏移保持裸形状,旧实体路径逐位不变)。
+    if offset == [0.0; 3] {
+        (base, bound)
+    } else {
+        let pose = Pose {
+            translation: Vec3::from_array(offset),
+            ..Pose::IDENTITY
+        };
+        (SharedShape::compound(vec![(pose, base)]), bound)
     }
 }
 

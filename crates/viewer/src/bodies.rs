@@ -8,18 +8,24 @@ use std::collections::BTreeMap;
 
 use types::{BodyDef, BodyHash, ShapeDef};
 
-/// 一个连杆的渲染形状(世界系,连杆局部系;格 = 米)。
+/// 一个连杆的渲染形状(世界系,连杆局部系;格 = 米)。B01a:每个变体带
+/// `offset`(形状在连杆局部系里的平移,缺省零——quad 脚球挂在小腿末端)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkShape {
-    /// 轴对齐盒(半边长)。
-    Box([f32; 3]),
-    /// 球。
-    Sphere(f32),
-    /// y 向胶囊(半高、半径)——viewer 画等高的圆柱(放行 §1:胶囊画胶囊
-    /// 或等高的圆柱,二选一;macroquad 无胶囊原语,取圆柱:总高一致)。
-    CapsuleY { half_height: f32, radius: f32 },
-    /// 凸包(顶点集;viewer 画包围盒)。
-    ConvexHull(Vec<[f32; 3]>),
+    /// 轴对齐盒(半边长、连杆局部系平移)。
+    Box([f32; 3], [f32; 3]),
+    /// 球(半径、连杆局部系平移)。
+    Sphere(f32, [f32; 3]),
+    /// y 向胶囊(半高、半径、连杆局部系平移)——viewer 画等高的圆柱(放行
+    /// §1:胶囊画胶囊或等高的圆柱,二选一;macroquad 无胶囊原语,取圆柱:
+    /// 总高一致)。
+    CapsuleY {
+        half_height: f32,
+        radius: f32,
+        offset: [f32; 3],
+    },
+    /// 凸包(顶点集、连杆局部系平移;viewer 画包围盒)。
+    ConvexHull(Vec<[f32; 3]>, [f32; 3]),
 }
 
 /// 一连杆渲染条目:形状列表(每连杆 ≤ 8)。
@@ -57,17 +63,21 @@ impl BodyShapeTable {
                     link.shapes
                         .iter()
                         .map(|shape| match shape {
-                            ShapeDef::Box { half } => LinkShape::Box(*half),
-                            ShapeDef::Sphere { radius } => LinkShape::Sphere(*radius),
+                            ShapeDef::Box { half, offset } => LinkShape::Box(*half, *offset),
+                            ShapeDef::Sphere { radius, offset } => {
+                                LinkShape::Sphere(*radius, *offset)
+                            }
                             ShapeDef::CapsuleY {
                                 half_height,
                                 radius,
+                                offset,
                             } => LinkShape::CapsuleY {
                                 half_height: *half_height,
                                 radius: *radius,
+                                offset: *offset,
                             },
-                            ShapeDef::ConvexHull { points } => {
-                                LinkShape::ConvexHull(points.clone())
+                            ShapeDef::ConvexHull { points, offset } => {
+                                LinkShape::ConvexHull(points.clone(), *offset)
                             }
                         })
                         .collect()
@@ -161,6 +171,7 @@ mod tests {
             vec![LinkShape::CapsuleY {
                 half_height: 0.6,
                 radius: 0.3,
+                offset: [0.0; 3],
             }],
             "torso = y 向胶囊(0.6, 0.3)"
         );
@@ -193,9 +204,14 @@ mod tests {
             table.get(&def.hash()).is_some(),
             "内置 capsule 的哈希可查(不在仓库根启动也能画)"
         );
-        // 真目录:同名 capsule 覆盖内置,表内仍 1 条。
+        // 真目录:同名 capsule 覆盖内置(B01a 起目录还有 quad.body.toml,
+        // 表内 = 目录里的文件数;这里的"1 条"断言改成对数量不敏感的
+        // "目录读取增加了条目",覆盖语义由 from_defs 的 BTreeMap 保证)。
         let real = BodyShapeTable::from_dir(std::path::Path::new("../../assets/bodies"));
-        assert_eq!(real.len(), 1, "资产目录里的 capsule 覆盖内置(同名)");
+        assert!(
+            !real.is_empty(),
+            "资产目录至少有内置 capsule(同名覆盖;B01a 起含 quad)"
+        );
         assert!(real.get(&def.hash()).is_some());
     }
 
@@ -228,7 +244,7 @@ anchor = [0, 0, 0]
         let table = BodyShapeTable::from_defs([&def]);
         let links = table.get(&def.hash()).expect("可查");
         assert_eq!(links.len(), 2);
-        assert_eq!(links[0], vec![LinkShape::Box([0.1, 0.1, 0.1])]);
-        assert_eq!(links[1], vec![LinkShape::Sphere(0.2)]);
+        assert_eq!(links[0], vec![LinkShape::Box([0.1, 0.1, 0.1], [0.0; 3])]);
+        assert_eq!(links[1], vec![LinkShape::Sphere(0.2, [0.0; 3])]);
     }
 }

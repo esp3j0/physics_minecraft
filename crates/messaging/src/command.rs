@@ -124,6 +124,16 @@ pub enum SimCommand {
         yaw: f32,
         jump: bool,
     },
+    /// 关节目标(REQ-012 B01a,§2.2 意图/关节两层级的关节层):`targets`
+    /// = 目标角度,长度 = 非固定关节数(dof 顺序 = joints 里非 fixed 的
+    /// 顺序)。**本地受信通道专用**(与 `AgentIntent` 同款:不进 C2S 白名单,
+    /// 协议面 B02 再开),照常盖章入外部命令日志(回放再生)。内核不信任它
+    /// (可能来自日志回放):非主体 / dof = 0 / 长度不符 / 非有限值 = 类型化
+    /// 拒绝 + 遥测,不 panic;超限目标在内核钳到限位(遥测钳制计数)。
+    AgentJointTargets {
+        entity: EntityId,
+        targets: Vec<f32>,
+    },
 }
 
 impl SimCommand {
@@ -143,6 +153,7 @@ impl SimCommand {
             Self::SpawnCompound { .. } => 10,
             Self::SpawnAgent { .. } => 11,
             Self::AgentIntent { .. } => 12,
+            Self::AgentJointTargets { .. } => 13,
         }
     }
 }

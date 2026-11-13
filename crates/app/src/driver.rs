@@ -332,6 +332,25 @@ pub fn validate_external_command(
             }
             Ok(())
         }
+        // 关节目标(REQ-012 B01a 第 3.4 节):本地受信通道(commands,source
+        // = None)接受,进内核前拒绝——非有限值、不存在的实体、不是主体的
+        // 实体(被拒的不进日志)。网络来源拒绝(协议面 B02 开)。长度/超限
+        // 的检查在内核(dof 数与限位来自身体定义,驱动不复制这份知识)。
+        messaging::SimCommand::AgentJointTargets { entity, targets } => {
+            if source.is_some() {
+                return Err("AgentJointTargets 网络来源拒绝(本地受信通道专用;协议面 B02 开)");
+            }
+            if targets.iter().any(|t| !t.is_finite()) {
+                return Err("AgentJointTargets 参数非法(需有限 targets)");
+            }
+            if session.entity_owner(*entity).is_none() {
+                return Err("AgentJointTargets 实体不存在或迁移窗口");
+            }
+            if !session.is_agent(*entity) {
+                return Err("AgentJointTargets 目标不是主体");
+            }
+            Ok(())
+        }
         // Detonate 已在函数顶部先于分片注册检查处理(参数校验后直接 Ok/
         // Err 返回);此臂不可达,match 穷举仍需覆盖。
         messaging::SimCommand::Detonate { .. } => Ok(()),
@@ -587,7 +606,11 @@ pub struct DriverOutcome {
 /// 解码必失败/版本拒绝,必须清 `data_dir`(REQ-012 §3"检查点:A05 把暂缓
 /// 写入队列放进分片快照,版本再升到 9,旧档显式拒绝";全局主体形状表是
 /// 派生状态,不入快照)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 9;
+///
+/// **v10**(REQ-012 B01a,#25):`AgentRecord` 布局追加 `joint_targets`(关节
+/// 目标保持状态随快照走)——v9 及更早档解码失败/版本拒绝,必须清
+/// `data_dir`(不做迁移,放行第 3.5 节)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 10;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -1026,6 +1049,17 @@ impl ObserveOrchestrator {
             self.agent_counters.spawn_rejected += 1;
             return None;
         };
+        // ①-b 多连杆身体拒绝(B01a 放行第 3.7 节):B03 做完迁移之前,网络
+        // 不能生成多连杆身体(否则把它推到分片边界就能让服务器停机——迁移
+        // 路径对多连杆 fail-stop)。对照:capsule(单连杆)不受影响。
+        if self
+            .bodies
+            .get(&body_hash)
+            .is_some_and(|def| def.links.len() > 1)
+        {
+            self.agent_counters.spawn_rejected += 1;
+            return None;
+        }
         // ② 坐标与 yaw 都是有限值;出生 y 在世界内。
         if !position.is_finite()
             || !yaw.is_finite()
@@ -4781,7 +4815,7 @@ mod tests {
     /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 9, "REQ-012 A05 起 = v9");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 10, "REQ-012 B01a 起 = v10");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -7253,6 +7287,82 @@ mod tests {
             o.respawn.spawn_point(player).map(|sp| sp.yaw),
             Some(90.0_f32)
         );
+    }
+
+    /// D1(B01a 放行第 3.7 节):网络 `C2S::SpawnAgent` 请求 `quad`(多连杆)
+    /// → 拒绝并计 `spawn_rejected`;对照 `capsule`(单连杆)成功。
+    /// B03 做完迁移之前,网络不能生成多连杆身体(把它推到分片边界就能让
+    /// 服务器停机)。
+    #[test]
+    fn d1_network_spawn_agent_multi_link_rejected() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        // 出生点 chunk 必须已装载(③ 校验)。
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+                .expect("quad 合法");
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let hub = OutboundHub::new();
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::with_bodies(ObserveCadence::default(), 0, bodies);
+        let player = messaging::InputSource(1);
+        // quad(13 连杆)→ 拒绝 + 计数。
+        let quad = o.handle_spawn_agent(
+            player,
+            "quad".to_owned(),
+            types::glam::Vec3::new(8.5, -58.0, 8.5),
+            0.0,
+            &mut session,
+            &mut log,
+            &hub,
+        );
+        assert!(quad.is_none(), "多连杆身体必须拒绝(B03 前网络不生成)");
+        assert_eq!(o.agent_counters.spawn_rejected, 1, "spawn_rejected +1");
+        // 对照:capsule 同布景成功,计数不变。
+        let cap = o.handle_spawn_agent(
+            player,
+            "capsule".to_owned(),
+            types::glam::Vec3::new(8.5, -58.0, 8.5),
+            0.0,
+            &mut session,
+            &mut log,
+            &hub,
+        );
+        assert!(cap.is_some(), "单连杆 capsule 不受影响(对照)");
+        assert_eq!(o.agent_counters.spawn_rejected, 1, "对照成功不计数");
+    }
+
+    /// D2(B01a 放行第 3.5/3.7 节):检查点版本 10;版本 9 的档被显式拒绝
+    /// (AgentRecord 布局追加 joint_targets,v9 档解码不兼容;不做迁移)。
+    #[test]
+    fn d2_checkpoint_version_10_rejects_v9() {
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 10, "B01a 起 = v10");
+        let bundle = CheckpointBundle {
+            format_version: 9,
+            world: sim_api::snapshot::WorldSnapshot {
+                shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(7)),
+                scheduler: empty_scheduler_snapshot(types::Tick(7)),
+            },
+            log_bytes: Vec::new(),
+            spawn_next_seq: 0,
+        };
+        let bytes = encode_checkpoint(&bundle);
+        let msg = match decode_checkpoint(&bytes) {
+            Err(AppError::Decode(msg)) => msg,
+            Err(other) => panic!("期望 Decode 错误,实为 {other:?}"),
+            Ok(_) => panic!("v9 档必须被拒绝"),
+        };
+        assert!(msg.contains("9"), "错误信息指认旧版本: {msg}");
     }
 
     /// R2-4(#25):重生待附身超时的失败收口——`begin_possess_wait` 登记

@@ -381,20 +381,29 @@ const POSSESSED_AGENT_COLOR: macroquad::color::Color =
 /// 画一个连杆(A06 §1):按 [`LinkShape`] 画胶囊(等高圆柱)/盒/球;
 /// 未知形状退化画 0.9 m 立方体。`pos` = 连杆姿态 translation(types 系)。
 fn draw_link(shape: &LinkShape, pos: types::glam::Vec3, color: macroquad::color::Color) {
-    let center = vec3(pos.x, pos.y, pos.z);
+    // B01a:形状在连杆局部系里的平移(offset)加到连杆位姿上;零偏移时
+    // 与改前逐位一致(加零不改变浮点值)。
+    let [ox, oy, oz] = match shape {
+        LinkShape::Box(_, offset)
+        | LinkShape::Sphere(_, offset)
+        | LinkShape::CapsuleY { offset, .. }
+        | LinkShape::ConvexHull(_, offset) => *offset,
+    };
+    let center = vec3(pos.x + ox, pos.y + oy, pos.z + oz);
     match shape {
         LinkShape::CapsuleY {
             half_height,
             radius,
+            ..
         } => {
             // 等高圆柱:总高 2·(half_height + radius),直径 2·radius。
             // macroquad draw_cylinder 的 position = **底面中心**(顶点 y 从 0
             // 长到 height),连杆位姿是胶囊中心 → 下移半高对齐。
             let height = 2.0 * (half_height + radius);
-            let base = vec3(pos.x, pos.y - half_height - radius, pos.z);
+            let base = vec3(center.x, center.y - half_height - radius, center.z);
             draw_cylinder(base, *radius, *radius, height, None, color);
         }
-        LinkShape::Box(half) => {
+        LinkShape::Box(half, _) => {
             draw_cube(
                 center,
                 vec3(half[0] * 2.0, half[1] * 2.0, half[2] * 2.0),
@@ -402,10 +411,10 @@ fn draw_link(shape: &LinkShape, pos: types::glam::Vec3, color: macroquad::color:
                 color,
             );
         }
-        LinkShape::Sphere(radius) => {
+        LinkShape::Sphere(radius, _) => {
             draw_sphere(center, *radius, None, color);
         }
-        LinkShape::ConvexHull(points) => {
+        LinkShape::ConvexHull(points, _) => {
             // 凸包画包围盒(§5.1:viewer 只画碰撞形状;凸包的盒包围足够
             // 辨识,不做网格化)。
             let mut min = [f32::MAX; 3];

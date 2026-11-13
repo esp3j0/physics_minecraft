@@ -239,6 +239,9 @@ pub fn command_shard(command: &SimCommand) -> Option<types::ShardId> {
         // 同款(不走分片前缀——意图经 Session 入口盖章入日志与分片收件箱;
         // C2S 白名单 A03 开)。
         SimCommand::AgentIntent { .. } => return None,
+        // 关节目标(REQ-012 B01a 第 3.4 节):本地受信通道专用,与 AgentIntent
+        // 同款(经 Session 盖章入日志与分片收件箱;协议面 B02 开)。
+        SimCommand::AgentJointTargets { .. } => return None,
         // 观察者移除(REQ-005 D9):观察者收件箱专用命令,不走分片前缀——
         // 无上行映射(客户端白名单拒绝;driver::validate_external_command
         // 同口径防御层)。

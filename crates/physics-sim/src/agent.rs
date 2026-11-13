@@ -96,8 +96,9 @@ impl BodyRegistry {
 
     /// 注册表内最大身体包络半径(REQ-012 A04 第 4 节:计入 REQ-001 §4.2
     /// MARGIN 推导的"最大实体尺寸")。包络按形状最大外接半径取保守值:
-    /// 盒 = 半对角 √3、球/胶囊 = 半径(+半高)、凸包 = 最大顶点模长;多形状
-    /// /多连杆取最大。空注册表 → 0.0(无身体 = 无附加)。
+    /// 盒 = 半对角 √3、球/胶囊 = 半径(+半高)、凸包 = 最大顶点模长,再加
+    /// 形状 `offset` 的模长(B01a:脚球挂在小腿末端);多形状/多连杆取最大。
+    /// 空注册表 → 0.0(无身体 = 无附加)。
     pub fn max_envelope_radius(&self) -> f32 {
         self.by_hash
             .values()
@@ -105,19 +106,31 @@ impl BodyRegistry {
                 def.links
                     .iter()
                     .flat_map(|l| l.shapes.iter())
-                    .map(|s| match s {
-                        types::ShapeDef::Box { half } => {
-                            (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt()
-                        }
-                        types::ShapeDef::Sphere { radius } => radius.abs(),
-                        types::ShapeDef::CapsuleY {
-                            half_height,
-                            radius,
-                        } => half_height.abs() + radius.abs(),
-                        types::ShapeDef::ConvexHull { points } => points
-                            .iter()
-                            .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
-                            .fold(0.0f32, f32::max),
+                    .map(|s| {
+                        let (bound, offset): (f32, [f32; 3]) = match s {
+                            types::ShapeDef::Box { half, offset } => (
+                                (half[0] * half[0] + half[1] * half[1] + half[2] * half[2]).sqrt(),
+                                *offset,
+                            ),
+                            types::ShapeDef::Sphere { radius, offset } => (radius.abs(), *offset),
+                            types::ShapeDef::CapsuleY {
+                                half_height,
+                                radius,
+                                offset,
+                            } => (half_height.abs() + radius.abs(), *offset),
+                            types::ShapeDef::ConvexHull { points, offset } => (
+                                points
+                                    .iter()
+                                    .map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt())
+                                    .fold(0.0f32, f32::max),
+                                *offset,
+                            ),
+                        };
+                        bound
+                            + (offset[0] * offset[0]
+                                + offset[1] * offset[1]
+                                + offset[2] * offset[2])
+                                .sqrt()
                     })
                     .fold(0.0f32, f32::max)
             })
@@ -145,6 +158,9 @@ pub struct AgentRecord {
     /// 接没接地;没接地就丢掉,不缓存。随快照走(检查点落在置位与消费之间
     /// 时,恢复线同样消费)。
     pub intent_jump: bool,
+    /// 当前关节目标(长度 = `dof_count`;单连杆为空)。保持状态,直到下一条
+    /// 命令;随快照走(B01a:恢复后必须与电机里的目标一致,K10)。
+    pub joint_targets: Vec<f32>,
 }
 
 /// 主体生成失败原因(类型化拒绝;不 panic)。
@@ -153,9 +169,6 @@ pub enum AgentSpawnError {
     /// 哈希不在注册表(REQ-012 A01 第 3 节:类型化拒绝 + 遥测)。
     #[error("未知身体哈希:{0}")]
     UnknownBody(BodyHash),
-    /// 多连杆身体:内核 B01 才支持(A01 只生成单连杆)。
-    #[error("多连杆身体({0} 连杆)在 B01 实现;A01 只生成单连杆")]
-    MultiLink(usize),
     /// 定义校验失败(注册表加载时已校验;防御)。
     #[error("身体定义非法:{0}")]
     InvalidBody(String),
@@ -169,6 +182,20 @@ pub(crate) enum AgentIntentError {
     /// 身体没有 `[walker]` 段(多连杆身体或未配行走的单连杆)。
     NoWalker,
     /// move_xz/yaw 非有限(NaN/inf)。
+    NonFinite,
+}
+
+/// 关节目标命令的内核侧拒绝原因(B01a 第 3.4 节;类型化,计数在
+/// apply_command 的 `agent_joint_targets_rejected`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentJointTargetsError {
+    /// 实体不存在或不是主体。
+    NotAgent,
+    /// 身体自由度为 0(单连杆胶囊;关节命令只对多连杆身体有意义)。
+    NoJoints,
+    /// 长度 ≠ `dof_count`。
+    LengthMismatch,
+    /// 任一项非有限(NaN/inf)。
     NonFinite,
 }
 
@@ -306,9 +333,11 @@ impl ShardSim {
             .map(|rb| crate::conv::rapier_to_vec3(rb.translation()))
     }
 
-    /// 生成主体(REQ-012 §3;A01 第 3 节):
+    /// 生成主体(REQ-012 §3;A01 第 3 节 / B01a):
     /// - 未知哈希 → `Err(UnknownBody)` + 遥测(`agent_spawn_rejected`);
-    /// - 多连杆 → `Err(MultiLink)` + 遥测(B01 实现);
+    /// - 单连杆 = 玩家胶囊路径(`spawn_agent_single`,一行不改地搬);
+    /// - 多连杆 = `spawn_agent_multi`(B01a:正运动学摆位、碰撞体、关节
+    ///   电机、阻尼缩放、自碰撞关闭);
     /// - 重复 `EntityId` → fail-stop(与 `SpawnDynamic` 同口径 assert);
     /// - 生成位置与实心体素重叠 → 不检查(与 `SpawnDynamic` 同口径:物理
     ///   接触下一步自然解决);
@@ -331,10 +360,22 @@ impl ShardSim {
                 return Err(AgentSpawnError::UnknownBody(body));
             }
         };
-        if def.links.len() != 1 {
-            self.outbox.agent_spawn_rejected += 1;
-            return Err(AgentSpawnError::MultiLink(def.links.len()));
+        if def.links.len() == 1 {
+            self.spawn_agent_single(entity, &def, body, state, source)
+        } else {
+            self.spawn_agent_multi(entity, &def, body, state, source)
         }
+    }
+
+    /// 单连杆生成(A01 原路径原样;`links.len() == 1` 已由调用方保证)。
+    fn spawn_agent_single(
+        &mut self,
+        entity: EntityId,
+        def: &BodyDef,
+        body: BodyHash,
+        state: types::EntityState,
+        source: Option<messaging::InputSource>,
+    ) -> Result<(), AgentSpawnError> {
         if let Err(e) = def.validate() {
             self.outbox.agent_spawn_rejected += 1;
             return Err(AgentSpawnError::InvalidBody(e.to_string()));
@@ -373,7 +414,7 @@ impl ShardSim {
         // 主体描述:凝固路径按 actor 豁免永不使用 `desc.block`;`half_size`
         // 取形状包络半高(唤醒/预算几何的足迹外扩用,保守取胶囊总半高)。
         let desc = types::EntityDesc {
-            half_size: agent_half_size(&def),
+            half_size: agent_half_size(def),
             block: types::BlockId(1),
             shape: None,
         };
@@ -403,9 +444,271 @@ impl ShardSim {
                 intent_move: None,
                 intent_yaw: None,
                 intent_jump: false,
+                joint_targets: Vec::new(),
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
+        self.outbox.spawned.push(entity);
+        Ok(())
+    }
+
+    /// 多连杆生成(B01a,放行第 3.3 节步骤 1–6):
+    /// 1. 正运动学摆位(全部关节角取 0):根位姿 = `state`;子连杆朝向 =
+    ///    父朝向,位置 = 父位置 + 父朝向 × `anchor` − 子朝向 × `child_anchor`。
+    ///    按 `links` 顺序建刚体,父连杆必须排在子之前(否则 `InvalidBody`)。
+    ///    根的线速度/角速度取 `state`,其余连杆速度为零。
+    /// 2. 碰撞体:每连杆一个(`agent_collider_builder` 支持形状偏移);
+    ///    质量 = `link.mass × k`;**不挂** `MODIFY_SOLVER_CONTACTS` 钩子
+    ///    (那是行走控制器用的)。
+    /// 3. 关节:按 `joints` 顺序 `insert_multibody_joint`;revolute 电机恒在
+    ///    `AngX` 槽(§13 quad demo)、prismatic 用 `LinX`;电机 ForceBased,
+    ///    初始目标 = `default_angle`(缺省 0),`max_force = max_torque × k`
+    ///    (没给就不设上限)。
+    /// 4. 阻尼:`damping_mut()` 每项 × k(§4 硬要求,gait demo R1-5)。
+    /// 5. 自碰撞:multibody 级 `set_self_contacts_enabled(false)`;相邻连杆
+    ///    由 `contacts_enabled(false)` 关闭。
+    /// 6. 登记:同单连杆(EntityRecord/AgentRecord/outbox.spawned)。
+    fn spawn_agent_multi(
+        &mut self,
+        entity: EntityId,
+        def: &BodyDef,
+        body: BodyHash,
+        state: types::EntityState,
+        source: Option<messaging::InputSource>,
+    ) -> Result<(), AgentSpawnError> {
+        use rapier3d::prelude::*;
+        if let Err(e) = def.validate() {
+            self.outbox.agent_spawn_rejected += 1;
+            return Err(AgentSpawnError::InvalidBody(e.to_string()));
+        }
+        assert!(
+            !self.entities.contains_key(&entity) && !self.agents.contains_key(&entity),
+            "主体重复 spawn(fail-stop):{entity:?}"
+        );
+        let k = self.cfg.agent_mass_scale;
+        // 名字 → (生成序, 欲填的 handle 槽)。父先于子在 validate/这里强制。
+        let mut order: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+        for (i, link) in def.links.iter().enumerate() {
+            order.insert(link.name.as_str(), i);
+        }
+        let mut handles: Vec<Option<RigidBodyHandle>> = vec![None; def.links.len()];
+        let mut colliders: Vec<ColliderHandle> = Vec::new();
+
+        // ---- 步骤 1:按 links 顺序建刚体(父在子之前)----
+        for (i, link) in def.links.iter().enumerate() {
+            // 正运动学摆位:关节角全 0。子连杆朝向 = 父朝向;位置 = 父位置
+            // + 父朝向 × anchor − 子朝向 × child_anchor。i = 0(根)时位姿 =
+            // state 本身。
+            let (pose, linvel, angvel) = if i == 0 {
+                (
+                    crate::conv::pose_to_rapier(state.translation, state.rotation),
+                    crate::conv::vec3_to_rapier(state.linvel),
+                    crate::conv::vec3_to_rapier(state.angvel),
+                )
+            } else {
+                // 找把本连杆当 child 的关节(树形:恰一条)。
+                let j = def
+                    .joints
+                    .iter()
+                    .find(|j| j.child == link.name)
+                    .expect("非根连杆必为某关节的 child(validate 保证)");
+                let parent_i = order[j.parent.as_str()];
+                let parent_handle = handles[parent_i].expect("父连杆在 links 里排在子之前");
+                let parent_rb = self.phys.bodies.get(parent_handle).expect("父连杆刚体已建");
+                let parent_pos = parent_rb.translation();
+                let parent_rot = parent_rb.rotation();
+                let p = j.kind.params();
+                let anchor = crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(p.anchor));
+                let child_anchor =
+                    crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(p.child_anchor));
+                // 朝向 = 父朝向(关节角 0 时父子同向)。
+                let pos = parent_pos + parent_rot * anchor - parent_rot * child_anchor;
+                (
+                    Pose {
+                        translation: pos,
+                        rotation: *parent_rot,
+                        ..Pose::IDENTITY
+                    },
+                    Vector::ZERO,
+                    Vector::ZERO,
+                )
+            };
+            let mut body_builder = RigidBodyBuilder::dynamic()
+                .pose(pose)
+                .linvel(linvel)
+                .angvel(angvel);
+            if def.lock_rotations {
+                body_builder = body_builder.lock_rotations();
+            }
+            let handle = self.phys.insert_body(body_builder);
+            handles[i] = Some(handle);
+            // ---- 步骤 2:碰撞体(每连杆一个;质量 × k;不挂钩子)----
+            let mass = link.mass * k;
+            let mut collider_builder = agent_collider_builder(&link.shapes, mass);
+            collider_builder = collider_builder
+                .friction(link.friction)
+                .restitution(link.restitution);
+            let collider = self.phys.colliders.insert_with_parent(
+                collider_builder,
+                handle,
+                &mut self.phys.bodies,
+            );
+            colliders.push(collider);
+        }
+        let root_handle = handles[0].expect("根连杆已建");
+
+        // ---- 步骤 3:关节与电机 ----
+        // dof 顺序 = joints 里非 fixed 的顺序;关节目标表按该顺序建。
+        let mut joint_targets: Vec<f32> = Vec::new();
+        for j in &def.joints {
+            let parent_i = order[j.parent.as_str()];
+            let child_i = order[j.child.as_str()];
+            let (parent_handle, child_handle) = (
+                handles[parent_i].expect("父已建(顺序保证)"),
+                handles[child_i].expect("子已建"),
+            );
+            let p = j.kind.params();
+            // 三种 builder 类型不同,各自 build 成 GenericJoint 后统一走电机
+            // 段与 insert(demo 口径:RevoluteJointBuilder / FixedJointBuilder)。
+            let built: GenericJoint = match j.kind {
+                types::JointKind::Revolute(_) => {
+                    let mut b = RevoluteJointBuilder::new(crate::conv::vec3_to_rapier(
+                        types::glam::Vec3::from_array(p.axis),
+                    ))
+                    .local_anchor1(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.anchor,
+                    )))
+                    .local_anchor2(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.child_anchor,
+                    )))
+                    .contacts_enabled(false);
+                    if let Some(lim) = p.limits {
+                        b = b.limits([lim.lower, lim.upper]);
+                    }
+                    b.build().into()
+                }
+                types::JointKind::Prismatic(_) => {
+                    let mut b = PrismaticJointBuilder::new(crate::conv::vec3_to_rapier(
+                        types::glam::Vec3::from_array(p.axis),
+                    ))
+                    .local_anchor1(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.anchor,
+                    )))
+                    .local_anchor2(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.child_anchor,
+                    )))
+                    .contacts_enabled(false);
+                    if let Some(lim) = p.limits {
+                        b = b.limits([lim.lower, lim.upper]);
+                    }
+                    b.build().into()
+                }
+                types::JointKind::Fixed(_) => FixedJointBuilder::new()
+                    .local_anchor1(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.anchor,
+                    )))
+                    .local_anchor2(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+                        p.child_anchor,
+                    )))
+                    .contacts_enabled(false)
+                    .build()
+                    .into(),
+            };
+            // 电机:目标 = default_angle(缺省 0)、stiffness = kp × k、
+            // damping = kd × k;ForceBased;max_force = max_torque × k
+            // (没给就不设上限)。revolute 电机恒在 AngX 槽(§13 探针证据),
+            // prismatic 用 LinX;fixed 无自由度、不设电机。
+            let axis = match j.kind.joint_type() {
+                types::JointType::Revolute => JointAxis::AngX,
+                types::JointType::Prismatic => JointAxis::LinX,
+                types::JointType::Fixed => JointAxis::AngX, // 无自由度,不消费
+            };
+            let default_target = p.default_angle.unwrap_or(0.0);
+            let mut built = built;
+            if j.kind.joint_type() != types::JointType::Fixed {
+                built.set_motor(
+                    axis,
+                    default_target,
+                    0.0,
+                    p.kp.unwrap_or(0.0) * k,
+                    p.kd.unwrap_or(0.0) * k,
+                );
+                built.set_motor_model(axis, MotorModel::ForceBased);
+                if let Some(tau) = p.max_torque {
+                    built.motors[axis as usize].max_force = tau * k;
+                }
+                joint_targets.push(default_target);
+            }
+            let inserted = self
+                .phys
+                .insert_multibody_joint(parent_handle, child_handle, built);
+            assert!(
+                inserted.is_some(),
+                "insert_multibody_joint 失败(fail-stop):{} -> {}",
+                j.parent,
+                j.child
+            );
+        }
+
+        // ---- 步骤 4:阻尼 × k(§4 硬要求)----
+        // 全部关节插完后,3 根腿的关节并进同一 multibody(12 个关节)。取
+        // 根连杆所属 multibody(gait demo R1-5 同款)。
+        let link_id = self
+            .phys
+            .multibody_joints
+            .rigid_body_link(root_handle)
+            .expect("根连杆已在 multibody 中(fail-stop)");
+        let mb_index = link_id.multibody;
+        {
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody_mut(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            for d in mb.damping_mut().iter_mut() {
+                *d *= k;
+            }
+            // ---- 步骤 5:自碰撞全关(B01a 不支持按对开启,validate 已拒)----
+            mb.set_self_contacts_enabled(false);
+        }
+
+        // ---- 步骤 6:登记(同单连杆)----
+        let desc = types::EntityDesc {
+            half_size: agent_half_size(def),
+            block: types::BlockId(1),
+            shape: None,
+        };
+        let mut links = std::collections::BTreeMap::new();
+        for (i, link) in def.links.iter().enumerate() {
+            links.insert(link.name.clone(), handles[i].expect("全部连杆已建"));
+        }
+        self.entities.insert(
+            entity,
+            crate::sim::EntityRecord {
+                handle: root_handle,
+                collider: colliders[0],
+                desc,
+                slow_ticks: 0,
+                actor: true,
+                source,
+                window: std::collections::VecDeque::new(),
+                carried: false,
+                at_rest: false,
+                actor_motion_ticks: None,
+            },
+        );
+        self.agents.insert(
+            entity,
+            AgentRecord {
+                body_hash: body,
+                links,
+                colliders,
+                intent_move: None,
+                intent_yaw: None,
+                intent_jump: false,
+                joint_targets,
+            },
+        );
         self.outbox.spawned.push(entity);
         Ok(())
     }
@@ -466,15 +769,18 @@ impl ShardSim {
 
     /// 移除主体(REQ-012 A01 第 3 节:刚体、碰撞体、`collider_to_entity`
     /// (拍内重建表,无需清理)、`agents` 全部回到生成前状态)。
+    /// B01a:移除**全部连杆**刚体(multibody 关节随刚体移除一并拆),
+    /// 移除后刚体数、碰撞体数、multibody 数回到生成前(K2)。
     /// 主体不存在 → panic(fail-stop;调用方先判 `is_agent`)。
     pub fn despawn_agent(&mut self, id: EntityId) {
         let record = self.agents.remove(&id).expect("主体存在(fail-stop)");
-        debug_assert!(
-            record.links.len() == 1,
-            "A01 只支持单连杆主体(多连杆在 B01)"
-        );
-        let rec = self.entities.remove(&id).expect("实体记录存在(fail-stop)");
-        self.phys.remove_body(rec.handle);
+        self.entities.remove(&id).expect("实体记录存在(fail-stop)");
+        // 全部连杆逐个 remove_body(挂它的碰撞体与关节随之拆除;根连杆也走
+        // 同一路径)。links 表按名字序,与生成序无关——拆刚体之间没有顺序
+        // 依赖(rapier remove_body 自动处理悬挂关节引用)。
+        for handle in record.links.values().copied().collect::<Vec<_>>() {
+            self.phys.remove_body(handle);
+        }
         // A02a:控制器保持态随主体增删(移除后不残留)。
         self.walker_holds.remove(&id);
         // 调度器据此 release 全局 ownership(REQ-006 任务 00)。
@@ -539,56 +845,300 @@ impl ShardSim {
         record.intent_jump = jump;
         Ok(())
     }
+
+    /// 关节目标命令的内核侧接受(B01a,放行第 3.4 节):命令可能来自日志
+    /// 回放,内核**不信任它、不 panic**。检查(任一失败即 `Err`,世界不变):
+    /// - 实体不存在 / 不是主体(`NotAgent`);
+    /// - `dof_count == 0`(单连杆胶囊,`NoJoints`);
+    /// - 长度 ≠ `dof_count`(`LengthMismatch`);
+    /// - 任一项非有限(`NonFinite`)。
+    ///
+    /// 通过后:有 `limits` 的关节目标夹到 `[lower, upper]`(每夹一个返回
+    /// 计数 +1,遥测 `agent_joint_targets_clamped` 由 apply_command 段加);
+    /// 写进 `record.joint_targets`,逐关节更新电机目标(增益与上限不变);
+    /// 任一目标与原值差 > 1e-6 时唤醒整只主体的全部连杆(§13:睡着后 island
+    /// 不解电机约束,目标变化必须唤醒)。返回值 = 被钳制的个数。
+    pub(crate) fn apply_agent_joint_targets(
+        &mut self,
+        entity: EntityId,
+        targets: &[f32],
+    ) -> Result<u32, AgentJointTargetsError> {
+        let body_hash = match self.agents.get(&entity) {
+            Some(record) => record.body_hash,
+            None => return Err(AgentJointTargetsError::NotAgent),
+        };
+        let def = self
+            .bodies
+            .get(&body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        let dof = def.dof_count();
+        if dof == 0 {
+            return Err(AgentJointTargetsError::NoJoints);
+        }
+        if targets.len() != dof {
+            return Err(AgentJointTargetsError::LengthMismatch);
+        }
+        if targets.iter().any(|t| !t.is_finite()) {
+            return Err(AgentJointTargetsError::NonFinite);
+        }
+        // 钳制:有 limits 的关节把目标夹进 [lower, upper]。计被钳个数。
+        let mut clamped = 0u32;
+        let mut clamped_targets: Vec<f32> = Vec::with_capacity(dof);
+        for (j, &t) in def.dof_joints().zip(targets) {
+            match j.kind.params().limits {
+                Some(lim) if t < lim.lower => {
+                    clamped_targets.push(lim.lower);
+                    clamped += 1;
+                }
+                Some(lim) if t > lim.upper => {
+                    clamped_targets.push(lim.upper);
+                    clamped += 1;
+                }
+                _ => clamped_targets.push(t),
+            }
+        }
+        // 唤醒判定:任一目标与原值差 > 1e-6(与 quad demo `set_target` 同阈值)。
+        let record = self.agents.get_mut(&entity).expect("前面已查存在");
+        let changed = record.joint_targets.len() != dof
+            || record
+                .joint_targets
+                .iter()
+                .zip(&clamped_targets)
+                .any(|(a, b)| (a - b).abs() > 1e-6);
+        record.joint_targets = clamped_targets;
+        // 逐关节写电机目标(**只动 target_pos**,增益与上限不变)。先按
+        // dof 顺序收齐各关节 child 刚体在 multibody 里的 link 下标(不可变
+        // 查询),再可变借 multibody 写;两个查询段不重叠。
+        let child_link_ids: Vec<Option<usize>> = def
+            .dof_joints()
+            .map(|j| {
+                record
+                    .links
+                    .get(&j.child)
+                    .and_then(|&h| self.phys.multibody_joints.rigid_body_link(h))
+                    .map(|lid| lid.id)
+            })
+            .collect();
+        let mb_index = record
+            .links
+            .values()
+            .find_map(|&h| self.phys.multibody_joints.rigid_body_link(h))
+            .map(|lid| lid.multibody);
+        if let Some(mb_index) = mb_index {
+            let root_handle = self
+                .entities
+                .get(&entity)
+                .map(|rec| rec.handle)
+                .expect("主体 EntityRecord 存在(fail-stop)");
+            let targets = record.joint_targets.clone();
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody_mut(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            for (dof_i, j) in def.dof_joints().enumerate() {
+                let Some(link_id) = child_link_ids[dof_i] else {
+                    continue;
+                };
+                let Some(link) = mb.link_mut(link_id) else {
+                    continue;
+                };
+                let axis = match j.kind.joint_type() {
+                    types::JointType::Revolute => rapier3d::prelude::JointAxis::AngX,
+                    types::JointType::Prismatic => rapier3d::prelude::JointAxis::LinX,
+                    types::JointType::Fixed => continue,
+                };
+                link.joint.data.motors[axis as usize].target_pos = targets[dof_i];
+            }
+            // 唤醒:目标变化 → 整只主体全部连杆醒来(§13:电机约束只在
+            // island 解算时生效;借用已还,查表改用收集好的句柄)。
+            if changed {
+                let handles: Vec<rapier3d::prelude::RigidBodyHandle> = mb
+                    .links()
+                    .map(|l| l.rigid_body_handle())
+                    .chain(std::iter::once(root_handle))
+                    .collect();
+                for h in handles {
+                    if let Some(rb) = self.phys.bodies.get_mut(h) {
+                        rb.wake_up(true);
+                    }
+                }
+            }
+        }
+        Ok(clamped)
+    }
+
+    /// 主体关节位置(自由度顺序;B01a 只读观测口)。非主体 / 无关节 → None。
+    pub fn agent_joint_positions(&self, id: EntityId) -> Option<Vec<f32>> {
+        let record = self.agents.get(&id)?;
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        if def.dof_count() == 0 {
+            return None;
+        }
+        let mb_index = self.agent_multibody_index(record)?;
+        let mb = self
+            .phys
+            .multibody_joints
+            .get_multibody(mb_index)
+            .expect("multibody 存在(fail-stop)");
+        Some(
+            def.dof_joints()
+                .filter_map(|j| {
+                    let &handle = record.links.get(&j.child)?;
+                    let link_id = self.phys.multibody_joints.rigid_body_link(handle)?;
+                    let link = mb.link(link_id.id)?;
+                    let axis = match j.kind.joint_type() {
+                        types::JointType::Revolute => rapier3d::prelude::JointAxis::AngX,
+                        types::JointType::Prismatic => rapier3d::prelude::JointAxis::LinX,
+                        types::JointType::Fixed => return None,
+                    };
+                    Some(link.joint.coords()[axis as usize])
+                })
+                .collect(),
+        )
+    }
+
+    /// 主体关节速度(自由度顺序;rad/s 或 m/s)。非主体 / 无关节 → None。
+    pub fn agent_joint_velocities(&self, id: EntityId) -> Option<Vec<f32>> {
+        let record = self.agents.get(&id)?;
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        if def.dof_count() == 0 {
+            return None;
+        }
+        let mb_index = self.agent_multibody_index(record)?;
+        let mb = self
+            .phys
+            .multibody_joints
+            .get_multibody(mb_index)
+            .expect("multibody 存在(fail-stop)");
+        Some(
+            def.dof_joints()
+                .filter_map(|j| {
+                    let &handle = record.links.get(&j.child)?;
+                    let link_id = self.phys.multibody_joints.rigid_body_link(handle)?;
+                    let link = mb.link(link_id.id)?;
+                    let axis = match j.kind.joint_type() {
+                        types::JointType::Revolute => rapier3d::prelude::JointAxis::AngX,
+                        types::JointType::Prismatic => rapier3d::prelude::JointAxis::LinX,
+                        types::JointType::Fixed => return None,
+                    };
+                    let _ = axis; // 单自由度关节:速度向量的第 0 项即该轴(demo §13 同款)
+                    Some(mb.joint_velocity(link)[0])
+                })
+                .collect(),
+        )
+    }
+
+    /// 主体当前关节目标(自由度顺序;命令保持状态)。非主体 → None。
+    pub fn agent_joint_targets(&self, id: EntityId) -> Option<&[f32]> {
+        self.agents.get(&id).map(|r| r.joint_targets.as_slice())
+    }
+
+    /// 主体的 multibody 索引(按 links 表反查任意连杆;都不在 multibody 里
+    /// → None;单连杆胶囊恒 None)。
+    fn agent_multibody_index(
+        &self,
+        record: &AgentRecord,
+    ) -> Option<rapier3d::prelude::MultibodyIndex> {
+        for handle in record.links.values() {
+            if let Some(lid) = self.phys.multibody_joints.rigid_body_link(*handle) {
+                return Some(lid.multibody);
+            }
+        }
+        None
+    }
 }
 
 /// 按形状定义构造 collider(REQ-012 §2.1:盒、球、胶囊、凸包;多形状 =
-/// compound)。质量显式给定(真实单位 × k)。
+/// compound)。质量显式给定(真实单位 × k)。B01a:每个形状带 `offset`
+/// (连杆局部系平移;单形状时同样生效——quad 脚球 = shank 第二形状带偏移,
+/// thigh 等无偏移形状的 builder 路径不变)。
 pub(crate) fn agent_collider_builder(
     shapes: &[types::ShapeDef],
     mass: f32,
 ) -> rapier3d::prelude::ColliderBuilder {
     use rapier3d::prelude::*;
     if shapes.len() == 1 {
-        return shape_collider(&shapes[0], mass);
+        let (builder, offset) = shape_collider(&shapes[0], mass);
+        return builder.translation(crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(
+            offset,
+        )));
     }
     let parts: Vec<(Pose, SharedShape)> = shapes
         .iter()
         .map(|s| {
-            let shape = match s {
-                types::ShapeDef::Box { half } => SharedShape::cuboid(half[0], half[1], half[2]),
-                types::ShapeDef::Sphere { radius } => SharedShape::ball(*radius),
-                types::ShapeDef::CapsuleY {
-                    half_height,
-                    radius,
-                } => SharedShape::capsule_y(*half_height, *radius),
-                types::ShapeDef::ConvexHull { points } => {
-                    let pts: Vec<rapier3d::prelude::Vector> =
-                        points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-                    SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
-                }
-            };
-            (Pose::IDENTITY, shape)
+            let (shape, offset) = shape_shared(s);
+            (shape_offset_pose(offset), shape)
         })
         .collect();
     ColliderBuilder::compound(parts).mass(mass)
 }
 
-fn shape_collider(s: &types::ShapeDef, mass: f32) -> rapier3d::prelude::ColliderBuilder {
+/// 形状偏移 `[f32;3]` → parry `Pose`(纯平移;形状 offset 挂在连杆局部系)。
+fn shape_offset_pose(offset: [f32; 3]) -> rapier3d::prelude::Pose {
+    rapier3d::prelude::Pose {
+        rotation: rapier3d::prelude::Rotation::IDENTITY,
+        translation: crate::conv::vec3_to_rapier(types::glam::Vec3::from_array(offset)),
+        ..rapier3d::prelude::Pose::IDENTITY
+    }
+}
+
+/// 形状定义 → (共享形状, 连杆局部系偏移)。与 [`agent_collider_builder`]
+/// 同源;单一出口保证生成与形状表(A05)几何一致。
+fn shape_shared(s: &types::ShapeDef) -> (rapier3d::prelude::SharedShape, [f32; 3]) {
     use rapier3d::prelude::*;
-    let builder = match s {
-        types::ShapeDef::Box { half } => ColliderBuilder::cuboid(half[0], half[1], half[2]),
-        types::ShapeDef::Sphere { radius } => ColliderBuilder::ball(*radius),
+    match s {
+        types::ShapeDef::Box { half, offset } => {
+            (SharedShape::cuboid(half[0], half[1], half[2]), *offset)
+        }
+        types::ShapeDef::Sphere { radius, offset } => (SharedShape::ball(*radius), *offset),
         types::ShapeDef::CapsuleY {
             half_height,
             radius,
-        } => ColliderBuilder::capsule_y(*half_height, *radius),
-        types::ShapeDef::ConvexHull { points } => {
+            offset,
+        } => (SharedShape::capsule_y(*half_height, *radius), *offset),
+        types::ShapeDef::ConvexHull { points, offset } => {
             let pts: Vec<rapier3d::prelude::Vector> =
                 points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-            ColliderBuilder::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
+            (
+                SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)"),
+                *offset,
+            )
+        }
+    }
+}
+
+fn shape_collider(
+    s: &types::ShapeDef,
+    mass: f32,
+) -> (rapier3d::prelude::ColliderBuilder, [f32; 3]) {
+    use rapier3d::prelude::*;
+    let (offset, builder) = match s {
+        types::ShapeDef::Box { half, offset } => {
+            (*offset, ColliderBuilder::cuboid(half[0], half[1], half[2]))
+        }
+        types::ShapeDef::Sphere { radius, offset } => (*offset, ColliderBuilder::ball(*radius)),
+        types::ShapeDef::CapsuleY {
+            half_height,
+            radius,
+            offset,
+        } => (*offset, ColliderBuilder::capsule_y(*half_height, *radius)),
+        types::ShapeDef::ConvexHull { points, offset } => {
+            let pts: Vec<rapier3d::prelude::Vector> =
+                points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
+            (
+                *offset,
+                ColliderBuilder::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)"),
+            )
         }
     };
-    builder.mass(mass)
+    (builder.mass(mass), offset)
 }
 
 /// 连杆形状的 parry 共享形状(A05 形状表用):与 [`agent_collider_builder`]
@@ -606,37 +1156,17 @@ pub(crate) fn agent_link_shared_shape(
 ) -> rapier3d::prelude::SharedShape {
     use rapier3d::prelude::*;
     if shapes.len() == 1 {
-        return match &shapes[0] {
-            types::ShapeDef::Box { half } => SharedShape::cuboid(half[0], half[1], half[2]),
-            types::ShapeDef::Sphere { radius } => SharedShape::ball(*radius),
-            types::ShapeDef::CapsuleY {
-                half_height,
-                radius,
-            } => SharedShape::capsule_y(*half_height, *radius),
-            types::ShapeDef::ConvexHull { points } => {
-                let pts: Vec<rapier3d::prelude::Vector> =
-                    points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-                SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
-            }
-        };
+        let (shape, offset) = shape_shared(&shapes[0]);
+        if offset == [0.0; 3] {
+            return shape;
+        }
+        return SharedShape::compound(vec![(shape_offset_pose(offset), shape)]);
     }
     let parts: Vec<(Pose, SharedShape)> = shapes
         .iter()
         .map(|s| {
-            let shape = match s {
-                types::ShapeDef::Box { half } => SharedShape::cuboid(half[0], half[1], half[2]),
-                types::ShapeDef::Sphere { radius } => SharedShape::ball(*radius),
-                types::ShapeDef::CapsuleY {
-                    half_height,
-                    radius,
-                } => SharedShape::capsule_y(*half_height, *radius),
-                types::ShapeDef::ConvexHull { points } => {
-                    let pts: Vec<rapier3d::prelude::Vector> =
-                        points.iter().map(|p| Vec3::new(p[0], p[1], p[2])).collect();
-                    SharedShape::convex_hull(&pts).expect("凸包顶点合法(校验保证非退化)")
-                }
-            };
-            (Pose::IDENTITY, shape)
+            let (shape, offset) = shape_shared(s);
+            (shape_offset_pose(offset), shape)
         })
         .collect();
     SharedShape::compound(parts)
@@ -644,22 +1174,33 @@ pub(crate) fn agent_link_shared_shape(
 
 /// 主体描述的 half_size:形状最大竖向半包络(足迹/唤醒几何的保守包络;
 /// `envelope_radius = half·√3` ≥ 半高即可)。胶囊 = half_height + radius;
-/// 盒/球/凸包取最大轴或半径。
+/// 盒/球/凸包取最大轴或半径,加形状 `offset` 的模(B01a:连杆相对根的
+/// 偏移由生成位姿承载,这里只加形状在连杆内的偏移,quad 脚球 +0.1065)。
 pub(crate) fn agent_half_size(def: &BodyDef) -> f32 {
     def.links
         .iter()
         .flat_map(|l| l.shapes.iter())
-        .map(|s| match s {
-            types::ShapeDef::Box { half } => (half[0].abs().max(half[1].abs())).max(half[2].abs()),
-            types::ShapeDef::Sphere { radius } => radius.abs(),
-            types::ShapeDef::CapsuleY {
-                half_height,
-                radius,
-            } => half_height.abs() + radius.abs(),
-            types::ShapeDef::ConvexHull { points } => points
-                .iter()
-                .map(|p| p.iter().fold(0.0f32, |m, v| m.max(v.abs())))
-                .fold(0.5f32, f32::max),
+        .map(|s| {
+            let (bound, offset): (f32, [f32; 3]) = match s {
+                types::ShapeDef::Box { half, offset } => (
+                    (half[0].abs().max(half[1].abs())).max(half[2].abs()),
+                    *offset,
+                ),
+                types::ShapeDef::Sphere { radius, offset } => (radius.abs(), *offset),
+                types::ShapeDef::CapsuleY {
+                    half_height,
+                    radius,
+                    offset,
+                } => (half_height.abs() + radius.abs(), *offset),
+                types::ShapeDef::ConvexHull { points, offset } => (
+                    points
+                        .iter()
+                        .map(|p| p.iter().fold(0.0f32, |m, v| m.max(v.abs())))
+                        .fold(0.0f32, f32::max),
+                    *offset,
+                ),
+            };
+            bound + offset.iter().fold(0.0f32, |m, v| m.max(v.abs()))
         })
         .fold(0.5f32, f32::max)
 }
@@ -1286,9 +1827,11 @@ pub(crate) mod tests {
         assert_eq!(s.agent_count(), 0);
     }
 
-    /// 多连杆身体:A01 类型化拒绝 + 遥测(B01 实现)。
+    /// 两连杆身体(B01a 起**可以生成**):本测试改为验证多连杆最小布景的
+    /// 生成成功与遥测零拒绝(A01 时的类型化拒绝已随 B01a 放行撤除;两连杆
+    /// 也同时核对 joint_targets 表随 dof 建立)。
     #[test]
-    fn spawn_agent_multi_link_rejected_with_telemetry() {
+    fn spawn_agent_two_link_accepted_with_telemetry() {
         let two_link = r#"
 name = "two"
 [[links]]
@@ -1317,16 +1860,21 @@ anchor = [0.0, 0.0, 0.0]
         cfg.solidify.enabled = false;
         let mut s2 =
             crate::sim::ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies);
-        let err = s2
-            .spawn_agent(
-                types::EntityId::from_parts(1, 1),
-                h,
-                types::EntityState::default(),
-                None,
-            )
-            .unwrap_err();
-        assert!(matches!(err, AgentSpawnError::MultiLink(2)), "类型化拒绝");
-        assert_eq!(s2.outbox.agent_spawn_rejected, 1, "遥测计数");
+        s2.spawn_agent(
+            types::EntityId::from_parts(1, 1),
+            h,
+            types::EntityState::default(),
+            None,
+        )
+        .expect("两连杆生成成功(B01a)");
+        assert_eq!(s2.outbox.agent_spawn_rejected, 0, "遥测零拒绝");
+        assert_eq!(s2.agent_count(), 1);
+        assert_eq!(
+            s2.agent_joint_targets(types::EntityId::from_parts(1, 1))
+                .expect("主体在"),
+            &[0.0],
+            "dof = 1,初始目标 = default_angle 缺省 0"
+        );
     }
 
     // ---- 判据 A01-4:检查点 v8 快照往返 + UnknownBody ----
@@ -2391,5 +2939,955 @@ anchor = [0.0, 0.0, 0.0]
         );
         dst.run_transient_lifecycle();
         let _ = dst.take_outbox();
+    }
+
+    // ---- REQ-012 B01a:多连杆内核(K1–K12;放行第 4 节)----
+
+    /// quad.body.toml 文本(与 types 测试同一份资产)。
+    pub(crate) fn quad_toml() -> &'static str {
+        include_str!("../../../assets/bodies/quad.body.toml")
+    }
+
+    /// quad.body.toml 的注册表(单装 quad;测试多用 quad+capsule 混装)。
+    fn quad_registry() -> (BodyRegistry, BodyHash) {
+        let mut bodies = BodyRegistry::new();
+        let hash = bodies
+            .insert_toml(quad_toml())
+            .expect("quad.body.toml 合法");
+        (bodies, hash)
+    }
+
+    /// quad + capsule 注册表 + 配置(质量比例可调;凝固默认开,需要关的
+    /// 自行覆写)。
+    fn quad_sim_with(k: f32) -> (crate::sim::ShardSim, BodyHash) {
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
+        let mut cfg = cfg;
+        cfg.agent_mass_scale = k;
+        let (mut bodies, hash) = quad_registry();
+        let _ = bodies.insert_toml(capsule_toml()).expect("capsule 合法");
+        let sim =
+            crate::sim::ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies);
+        (sim, hash)
+    }
+
+    /// 生成一只四足的出生 state(关节角全 0 的竖直链,足端在 origin 下方
+    /// 0.34 m;测试把它放在平板上方一点,由电机拉到站立姿态)。
+    fn quad_spawn_state(origin: Vec3) -> types::EntityState {
+        types::EntityState {
+            translation: origin,
+            rotation: types::glam::Quat::IDENTITY,
+            ..types::EntityState::default()
+        }
+    }
+
+    /// K1:生成四足 = 13 刚体、12 自由度;全部连杆碰撞体映射到同一实体;
+    /// multibody 阻尼各项 = rapier 默认 × k;自碰撞关闭;关节接触关闭。
+    #[test]
+    fn k1_spawn_quad_structure() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let record = s.agents.get(&a).expect("主体登记");
+        // 13 刚体登记(links 表 = 13 条;实体记录 handle = 根连杆)。
+        assert_eq!(record.links.len(), 13, "13 连杆");
+        // 12 个自由度;目标 = default_angle(站立角);读取口齐全。
+        assert_eq!(record.joint_targets.len(), 12);
+        assert_eq!(s.agent_joint_positions(a).expect("关节位").len(), 12);
+        assert_eq!(s.agent_joint_velocities(a).expect("关节速").len(), 12);
+        // 全部连杆碰撞体映射到同一实体(13 碰撞体;脚球是 shank 第二形状,
+        // 同一刚体的 collider,不单算连杆)。
+        assert_eq!(record.colliders.len(), 13, "13 碰撞体");
+        let table = s.collider_to_entity_of();
+        for &ch in &record.colliders {
+            let key = ch.into_raw_parts();
+            assert_eq!(
+                table.get(&(key.0, key.1)),
+                Some(&a),
+                "连杆碰撞体 {ch:?} 归属同一实体"
+            );
+        }
+        // multibody:13 link;阻尼各项 = rapier 默认 × k;自碰撞关闭。
+        let mb_index = s.agent_multibody_index(record).expect("四足在 multibody");
+        let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+        assert_eq!(mb.num_links(), 13, "multibody 13 个 link");
+        for (i, d) in mb.damping().iter().enumerate() {
+            let expected = match i {
+                // rapier 默认:根平动 0;根转动与每个关节 0.1。
+                0..=2 => 0.0,
+                _ => 0.1,
+            };
+            assert!(
+                (*d - expected * 0.01).abs() < 1e-6,
+                "阻尼[{i}] = {d},期望 {}(默认 {expected} × k)",
+                expected * 0.01
+            );
+        }
+        assert!(!mb.self_contacts_enabled(), "自碰撞关闭");
+        // 全部关节 contacts_enabled(false)(相邻连杆接触一律关闭)。
+        for link in mb.links() {
+            if link.link_id() != 0 {
+                assert!(
+                    !link.joint.data.contacts_enabled(),
+                    "关节 contacts_enabled 必为 false(link {})",
+                    link.link_id()
+                );
+            }
+        }
+        // 根速度取 state(默认零 = 数值核对),其余连杆速度为零。
+        let root_rb = s
+            .phys
+            .bodies
+            .get(s.entities.get(&a).unwrap().handle)
+            .expect("根刚体");
+        assert!(
+            crate::conv::rapier_to_vec3(root_rb.linvel()).length() < 1e-6,
+            "根线速度取 state(默认零)"
+        );
+    }
+
+    /// K2:移除四足后刚体数、碰撞体数、multibody 数回到生成前。
+    #[test]
+    fn k2_despawn_quad_removes_all_bodies() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let mb_before = s.phys.multibody_joints.iter().count();
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        assert_eq!(s.phys.bodies.len(), bodies_before + 13);
+        assert_eq!(s.phys.colliders.len(), colliders_before + 13);
+        assert_eq!(s.phys.multibody_joints.iter().count(), mb_before + 12);
+        s.despawn_agent(a);
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体回到生成前");
+        assert_eq!(s.phys.colliders.len(), colliders_before, "碰撞体回到生成前");
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            mb_before,
+            "multibody 数回到生成前"
+        );
+        assert!(!s.is_agent(a));
+    }
+
+    /// K6:电机上限读回 = max_torque × k,增益读回 = kp × k、kd × k。
+    #[test]
+    fn k6_motor_params_scaled_by_k() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let record = s.agents.get(&a).expect("主体登记");
+        let mb_index = s.agent_multibody_index(record).expect("mb");
+        let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+        // dof 顺序:每关节 target 与增益。quad 全部关节 kp 100 / kd 3 /
+        // tau 23.7;k = 0.01 → 1.0 / 0.03 / 0.237。电机恒在 AngX 槽。
+        let def = s.bodies.get(&record.body_hash).expect("身体定义");
+        for (dof_i, j) in def.dof_joints().enumerate() {
+            let &handle = record.links.get(&j.child).expect("child 连杆");
+            let lid = s
+                .phys
+                .multibody_joints
+                .rigid_body_link(handle)
+                .expect("link");
+            let link = mb.link(lid.id).expect("link 槽");
+            let motor = &link.joint.data.motors[3]; // AngX = 3
+            assert!((motor.target_pos - record.joint_targets[dof_i]).abs() < 1e-6);
+            assert!(
+                (motor.stiffness - 100.0 * 0.01).abs() < 1e-5,
+                "kp 读回 = {} 期望 1.0",
+                motor.stiffness
+            );
+            assert!(
+                (motor.damping - 3.0 * 0.01).abs() < 1e-5,
+                "kd 读回 = {} 期望 0.03",
+                motor.damping
+            );
+            assert!(
+                (motor.max_force - 23.7 * 0.01).abs() < 1e-5,
+                "max_force 读回 = {} 期望 0.237",
+                motor.max_force
+            );
+            assert_eq!(
+                motor.model,
+                rapier3d::prelude::MotorModel::ForceBased,
+                "ForceBased"
+            );
+        }
+    }
+
+    /// 站立探针:跑 n 拍,返回每拍(机身 up·y、机身高度、关节 RMS 误差、
+    /// 水平速度模)。默认目标 = default_angle(生成即写进电机)。
+    fn stand_probe(
+        s: &mut crate::sim::ShardSim,
+        hash: BodyHash,
+        origin: Vec3,
+        n: usize,
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(origin), None)
+            .expect("四足生成");
+        let observers = [origin + Vec3::new(0.0, 2.0, 0.0)];
+        let targets = s.agent_joint_targets(a).expect("目标表").to_vec();
+        let mut trace = Vec::with_capacity(n);
+        for _ in 0..n {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+            let rec = s.entities.get(&a).expect("root in");
+            let rb = s.phys.bodies.get(rec.handle).expect("root rb");
+            let up = *rb.rotation() * types::glam::Vec3::Y;
+            let height = rb.translation().y;
+            let lin = rb.linvel();
+            let hspeed = (lin.x * lin.x + lin.z * lin.z).sqrt();
+            let q = s.agent_joint_positions(a).expect("q");
+            let rms = (q
+                .iter()
+                .zip(&targets)
+                .map(|(x, t)| (x - t) * (x - t))
+                .sum::<f32>()
+                / q.len() as f32)
+                .sqrt();
+            trace.push((up.y, height, rms, hspeed));
+        }
+        trace
+    }
+
+    /// K3(AC-B1):平地、默认目标、3600 拍。全程无 NaN;第 120 拍以后
+    /// 机身 up·y ≥ 0.95;第 600 拍以后高度标准差 ≤ 1 cm;第 600 拍以后
+    /// 关节 RMS ≤ 0.15 rad。允许自然睡眠(睡眠判据 = 根刚体 is_sleeping,
+    /// 睡着期间逐拍位移恒 0)。另跑一组强制醒着,只报水平滑移速度。
+    #[test]
+    fn k3_stand_3600_ticks() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let observers = [Vec3::new(24.0, 2.34, 24.0)];
+        let targets = s.agent_joint_targets(a).expect("目标表").to_vec();
+        let mut min_up = f32::INFINITY;
+        let mut max_rms = 0.0f32;
+        // 睡眠统计:睡着的拍数与睡着期间的最大逐拍位移。
+        let mut slept_ticks = 0usize;
+        let mut max_sleep_shift = 0.0f32;
+        let mut prev_sleeping_pos: Option<rapier3d::prelude::Vector> = None;
+        let mut heights_tail: Vec<f32> = Vec::new();
+        // 单只四足每拍耗时粗测(不设门槛,B04 再定)。Instant::now 在本 crate
+        // 被 clippy.toml 禁用(确定性纪律:测试代码也不许引入墙钟),测量段
+        // 单独豁免——计时不进任何判据与断言。
+        #[allow(clippy::disallowed_methods)]
+        let timing = std::time::Instant::now;
+        let mut tick_nanos: Vec<u32> = Vec::new();
+        for tick in 0..3600usize {
+            let t0 = timing();
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+            tick_nanos.push(t0.elapsed().as_nanos() as u32);
+            let rec = s.entities.get(&a).expect("root");
+            let rb = s.phys.bodies.get(rec.handle).expect("root rb");
+            let up = *rb.rotation() * types::glam::Vec3::Y;
+            let height = rb.translation().y;
+            let pos = rb.translation();
+            let sleeping = rb.is_sleeping();
+            if sleeping {
+                slept_ticks += 1;
+                if let Some(prev) = prev_sleeping_pos {
+                    let d = (pos - prev).length();
+                    max_sleep_shift = max_sleep_shift.max(d);
+                }
+                prev_sleeping_pos = Some(pos);
+            } else {
+                prev_sleeping_pos = None;
+            }
+            if tick >= 120 {
+                min_up = min_up.min(up.y);
+                assert!(up.is_finite() && height.is_finite(), "拍 {tick}:状态非有限");
+            }
+            if tick % 600 == 0 {
+                println!(
+                    "probe tick {tick}: sleeping={} hspeed={:.5}",
+                    rb.is_sleeping(),
+                    rb.linvel().length()
+                );
+            }
+            if tick >= 600 {
+                let q = s.agent_joint_positions(a).expect("q");
+                let rms = (q
+                    .iter()
+                    .zip(&targets)
+                    .map(|(x, t)| (x - t) * (x - t))
+                    .sum::<f32>()
+                    / q.len() as f32)
+                    .sqrt();
+                max_rms = max_rms.max(rms);
+                heights_tail.push(height);
+            }
+        }
+        assert!(
+            min_up >= 0.95,
+            "第 120 拍以后机身 up·y 最小 {min_up},须 ≥ 0.95"
+        );
+        let mean = heights_tail.iter().sum::<f32>() / heights_tail.len() as f32;
+        let var = heights_tail
+            .iter()
+            .map(|h| (h - mean) * (h - mean))
+            .sum::<f32>()
+            / heights_tail.len() as f32;
+        let std = var.sqrt();
+        assert!(std <= 0.01, "第 600 拍以后高度标准差 {std} m,须 ≤ 0.01");
+        assert!(max_rms <= 0.15, "第 600 拍以后关节 RMS {max_rms},须 ≤ 0.15");
+        // 睡着期间逐拍位移恒 0。
+        assert!(
+            max_sleep_shift == 0.0,
+            "睡着期间逐拍位移 {max_sleep_shift},恒为 0"
+        );
+        let sleep_ratio = slept_ticks as f32 / 3600.0;
+        println!(
+            "K3 实测:up·y 最小 {min_up};高度标准差 {std};关节 RMS 最大 {max_rms};睡眠占比 {sleep_ratio}"
+        );
+        // 单只四足每拍耗时粗测(不设门槛,B04 再定):站立段(600..)的均值
+        // 与 P95(含 apply_activation/step/outbox 全生产路径,debug 口径见
+        // 本测试的构建档)。
+        {
+            let mut tail = tick_nanos[600..].to_vec();
+            tail.sort_unstable();
+            let mean: f64 = tail.iter().map(|&v| v as f64).sum::<f64>() / tail.len() as f64;
+            let p95 = tail[(tail.len() as f32 * 0.95) as usize] as f64;
+            println!("K3 每拍耗时(含激活+step+outbox):mean {mean:.0} ns,P95 {p95:.0} ns");
+        }
+        // ---- 对照线(判据同段要求):强制醒着,只报水平滑移速度 ----
+        let (mut s2, hash2) = quad_sim_with(0.01);
+        load_flat_ground(&mut s2);
+        let a2 = types::EntityId::from_parts(1, 1);
+        s2.spawn_agent(
+            a2,
+            hash2,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成(醒着组)");
+        let observers2 = [Vec3::new(24.0, 2.34, 24.0)];
+        let mut hsum = 0.0f32;
+        let mut hn = 0usize;
+        for tick in 0..3600usize {
+            // 每 2 拍一条微小目标扰动(±1e-4,保证电机一直解算、主体不睡)。
+            if tick % 2 == 0 {
+                let mut targets2 = s2.agent_joint_targets(a2).expect("targets").to_vec();
+                for (i, t) in targets2.iter_mut().enumerate() {
+                    *t += ((tick as f32 * 0.01 + i as f32).sin()) * 1e-4;
+                }
+                s2.apply_agent_joint_targets(a2, &targets2)
+                    .expect("合法目标");
+            }
+            s2.apply_activation(&observers2);
+            s2.step();
+            let _ = s2.take_outbox();
+            if tick >= 600 {
+                let rec = s2.entities.get(&a2).expect("root");
+                let rb = s2.phys.bodies.get(rec.handle).expect("rb");
+                let lin = rb.linvel();
+                hsum += (lin.x * lin.x + lin.z * lin.z).sqrt();
+                hn += 1;
+            }
+        }
+        let drift = hsum / hn as f32;
+        println!("K3 强制醒着:水平滑移速度平均 {drift} m/s(已知现象 ~0.08,只报数)");
+    }
+
+    /// K4:k = 1/100 与 k = 1 两组站立,第 600 拍机身高度相差 ≤ 2 mm。
+    #[test]
+    fn k4_mass_scale_height_parity() {
+        let mut heights = [0.0f32; 2];
+        for (i, k) in [0.01f32, 1.0].into_iter().enumerate() {
+            let (mut s, hash) = quad_sim_with(k);
+            load_flat_ground(&mut s);
+            let trace = stand_probe(&mut s, hash, Vec3::new(24.0, 0.448, 24.0), 1200);
+            heights[i] = trace[600..].iter().map(|t| t.1).sum::<f32>() / 600.0;
+            println!("K4 k = {k}:第 600 拍后平均机身高度 {}", heights[i]);
+        }
+        let diff = (heights[0] - heights[1]).abs();
+        assert!(diff <= 0.002, "两组高度差 {diff} m,须 ≤ 0.002");
+    }
+
+    /// K5:四足睡着后改目标 → 下一拍醒来,关节朝新目标动。
+    #[test]
+    fn k5_new_target_wakes_sleeping_quad() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let observers = [Vec3::new(24.0, 2.34, 24.0)];
+        for _ in 0..900 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 平地站立不自然入睡(§13:站立滑移 ~0.1 m/s → drift 门永不满足;
+        // K3 实测睡眠占比 0)。sleeping 前置用 rapier 的手动 sleep 构造
+        // (mass demo M5 的睡眠判据同 API);判据要验证的是"目标变化唤醒"。
+        let rec = s.entities.get(&a).expect("root");
+        let root_handle = rec.handle;
+        let record0 = s.agents.get(&a).expect("record");
+        let mb0 = s.agent_multibody_index(record0).expect("mb");
+        let handles0: Vec<_> = {
+            let mb = s.phys.multibody_joints.get_multibody(mb0).expect("mb");
+            mb.links()
+                .map(|l| l.rigid_body_handle())
+                .chain(std::iter::once(root_handle))
+                .collect()
+        };
+        for h in &handles0 {
+            if let Some(rb) = s.phys.bodies.get_mut(*h) {
+                rb.sleep();
+            }
+        }
+        let asleep_before = s
+            .phys
+            .bodies
+            .get(root_handle)
+            .map(|rb| rb.is_sleeping())
+            .unwrap_or(false);
+        let q_before = s.agent_joint_positions(a).expect("q");
+        // 改 hip 列目标(−0.85 → −0.6,限位内;其余不动)。
+        let mut targets = s.agent_joint_targets(a).expect("targets").to_vec();
+        for t in targets.iter_mut().skip(1).step_by(3) {
+            *t = -0.6;
+        }
+        s.apply_agent_joint_targets(a, &targets).expect("合法目标");
+        s.apply_activation(&observers);
+        s.step();
+        let _ = s.take_outbox();
+        let awake = s
+            .phys
+            .bodies
+            .get(root_handle)
+            .map(|rb| rb.is_sleeping())
+            .unwrap_or(false);
+        assert!(
+            asleep_before,
+            "前置:站立 900 拍后应已自然睡眠(实测未睡——布景或参数问题)"
+        );
+        assert!(!awake, "改目标后下一拍必须醒来");
+        // 关节朝新目标动:hip 关节角向 −0.6(= 旧目标 −0.8536 → −0.6 方向,
+        // 即关节角增大)单拍内可见移动(电机醒来即出力)。
+        let q_after = s.agent_joint_positions(a).expect("q");
+        let new_target = -0.6_f32;
+        let moved = q_after[1] - q_before[1];
+        assert!(
+            moved.abs() > 1e-4
+                && (q_after[1] - new_target).abs() < (q_before[1] - new_target).abs(),
+            "hip 应朝新目标 {new_target} 动(前 {} 后 {})",
+            q_before[1],
+            q_after[1]
+        );
+    }
+
+    /// capsule 的哈希(从注册表查名字)。
+    fn capsule_hash_of(s: &crate::sim::ShardSim) -> BodyHash {
+        s.bodies.hash_of("capsule").expect("capsule 已装")
+    }
+
+    /// 拷贝当前注册表(restore_with_bodies 需要同源身体)。
+    fn fresh_registry_clone(s: &crate::sim::ShardSim) -> BodyRegistry {
+        let mut r = BodyRegistry::new();
+        for h in s.bodies.hashes() {
+            let def = s.bodies.get(&h).expect("def").clone();
+            r.insert_checked(def).expect("同哈希幂等");
+        }
+        r
+    }
+
+    /// K9/K10 共用:tick 拍的正弦目标序列(限位内的中幅摆动;dof 顺序 =
+    /// 每腿 [lat, hip, knee],限位循环取三档)。
+    fn current_sine_targets(tick: usize) -> Vec<f32> {
+        let mut targets = Vec::with_capacity(12);
+        for i in 0..12 {
+            let lim = [(-0.8, 0.8), (-1.6, 1.6), (0.0, 2.6)][i % 3];
+            let mid = (lim.0 + lim.1) / 2.0;
+            let amp = (lim.1 - lim.0) / 2.0 * 0.5;
+            let phase = (tick as f32 * 0.02 + i as f32 * 0.7).sin();
+            targets.push(mid + amp * phase);
+        }
+        targets
+    }
+
+    /// K7(AC-B5):长度不符、NaN、inf、对非主体、对胶囊(dof 0)各发一条,
+    /// 每条都类型化拒绝(世界不变),拒绝计数 5。
+    /// 世界不变性用"非法命令前后各取一次快照逐位相同"直接证。
+    #[test]
+    fn k7_rejected_targets_leave_world_untouched() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let observers = [Vec3::new(24.0, 2.34, 24.0)];
+        for _ in 0..30 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 五条非法全部走命令路径(apply_command 段计数;与 AgentIntent
+        // 的拒绝口径同层)。一条 apply_prefix 同拍带 5 条命令。
+        let mk_cmd =
+            |seq: u64, entity: types::EntityId, targets: Vec<f32>| messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: seq,
+                payload: messaging::InputPayload::Command(
+                    messaging::SimCommand::AgentJointTargets { entity, targets },
+                ),
+            };
+        // ① 长度不符(11 项)。
+        // ② NaN。③ inf。④ 非主体(普通实体,同拍先生成)。⑤ 胶囊(dof 0,
+        // 同拍先生成)。
+        let plain = types::EntityId::from_parts(1, 2);
+        let cap = types::EntityId::from_parts(1, 3);
+        s.apply_prefix(&[
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 7,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: plain,
+                    state: types::EntityState {
+                        translation: Vec3::new(20.0, 3.0, 20.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 8,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnAgent {
+                    entity: cap,
+                    body: capsule_hash_of(&s),
+                    state: types::EntityState {
+                        translation: Vec3::new(28.0, 1.95, 28.0),
+                        ..types::EntityState::default()
+                    },
+                }),
+            },
+            mk_cmd(11, a, vec![0.0; 11]),
+            mk_cmd(12, a, {
+                let mut v = vec![0.0; 12];
+                v[3] = f32::NAN;
+                v
+            }),
+            mk_cmd(13, a, {
+                let mut v = vec![0.0; 12];
+                v[4] = f32::INFINITY;
+                v
+            }),
+            mk_cmd(14, plain, vec![0.0; 12]),
+            mk_cmd(15, cap, vec![0.0; 1]),
+        ]);
+        s.step();
+        let out = s.take_outbox();
+        assert_eq!(out.agent_joint_targets_rejected, 5, "五条非法各 +1");
+        // 内核侧的错误类型逐一核对(世界不变性下面用快照对照证)。
+        assert_eq!(
+            s.apply_agent_joint_targets(a, &[0.0; 11]),
+            Err(crate::agent::AgentJointTargetsError::LengthMismatch)
+        );
+        assert_eq!(
+            s.apply_agent_joint_targets(
+                a,
+                &[
+                    0.0,
+                    0.0,
+                    0.0,
+                    f32::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                ]
+            ),
+            Err(crate::agent::AgentJointTargetsError::NonFinite)
+        );
+        assert_eq!(
+            s.apply_agent_joint_targets(
+                a,
+                &[
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    f32::INFINITY,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                ]
+            ),
+            Err(crate::agent::AgentJointTargetsError::NonFinite)
+        );
+        assert_eq!(
+            s.apply_agent_joint_targets(plain, &[0.0; 12]),
+            Err(crate::agent::AgentJointTargetsError::NotAgent)
+        );
+        assert_eq!(
+            s.apply_agent_joint_targets(cap, &[0.0; 1]),
+            Err(crate::agent::AgentJointTargetsError::NoJoints)
+        );
+        // 计数只在命令路径(apply_command 段;内核函数只报类型——
+        // 放行第 3.4 节"计数在 apply_command 分支统一 +1")。
+        // ---- 世界不变性(AC-B5):同样的布景 + 两条 spawn,对照组不发
+        // 非法命令。两线各自 step 一拍并 take_outbox(把拒绝计数取走——
+        // 快照含 Outbox 计数,计数是遥测不是世界状态;取走后两线快照必须
+        // 逐位相同)。世界不变性由内核函数保证:apply_agent_joint_targets
+        // 的全部拒绝分支在任何写状态之前早退(长度/有限检查在钳制与写
+        // record 之前)。----
+        let snap1 = {
+            let _ = s.take_outbox();
+            s.snapshot()
+        };
+        let (mut s2, hash2) = quad_sim_with(0.01);
+        load_flat_ground(&mut s2);
+        s2.spawn_agent(
+            a,
+            hash2,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成(对照)");
+        for _ in 0..30 {
+            s2.apply_activation(&observers);
+            s2.step();
+            let _ = s2.take_outbox();
+        }
+        // 对照线:同样两条 spawn,不发非法命令。
+        s2.apply_prefix(&[
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 7,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: plain,
+                    state: types::EntityState {
+                        translation: Vec3::new(20.0, 3.0, 20.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 8,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnAgent {
+                    entity: cap,
+                    body: capsule_hash_of(&s2),
+                    state: types::EntityState {
+                        translation: Vec3::new(28.0, 1.95, 28.0),
+                        ..types::EntityState::default()
+                    },
+                }),
+            },
+        ]);
+        s2.step();
+        let _ = s2.take_outbox();
+        let snap_ctrl = s2.snapshot();
+        assert_eq!(snap1, snap_ctrl, "非法命令后世界与不发命令的对照组逐位相同");
+    }
+
+    /// K8:超限目标 → 记录里的目标 = 限位值,钳制计数 = 超限个数;
+    /// 对照:限位内目标不计数。
+    #[test]
+    fn k8_clamp_targets_to_limits() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        let out0 = s.take_outbox();
+        assert_eq!(out0.agent_joint_targets_clamped, 0);
+        // 全部超上限(+100):quad 12 关节全有限位 → 全部被钳。走命令路径
+        // (钳制计数在 apply_command 段)。
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 21,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::AgentJointTargets {
+                entity: a,
+                targets: vec![100.0; 12],
+            }),
+        }]);
+        s.step();
+        let targets = s.agent_joint_targets(a).expect("targets").to_vec();
+        let def = BodyDef::from_toml_str(quad_toml()).expect("def");
+        for (i, j) in def.dof_joints().enumerate() {
+            assert_eq!(
+                targets[i],
+                j.kind.params().limits.expect("quad 全关节有限位").upper,
+                "目标 = 限位上限(dof {} = {})",
+                i,
+                j.child
+            );
+        }
+        let out = s.take_outbox();
+        assert_eq!(out.agent_joint_targets_clamped, 12, "钳制计数 = 超限个数");
+        // 对照:限位内目标(全 0)不计数。
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 22,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::AgentJointTargets {
+                entity: a,
+                targets: vec![0.0; 12],
+            }),
+        }]);
+        s.step();
+        let _ = s.take_outbox();
+        let out2 = s.take_outbox();
+        assert_eq!(out2.agent_joint_targets_clamped, 0, "限位内不计数");
+    }
+
+    /// K9(AC-B6):固定目标序列(各关节正弦,每 2 拍一条,600 拍)跑两遍,
+    /// 状态哈希(快照字节)逐位相同。
+    #[test]
+    fn k9_joint_target_sequence_deterministic() {
+        let run = || {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(
+                a,
+                hash,
+                quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+                None,
+            )
+            .expect("四足生成");
+            let observers = [Vec3::new(24.0, 2.34, 24.0)];
+            for tick in 0..600usize {
+                if tick % 2 == 0 {
+                    s.apply_agent_joint_targets(a, &current_sine_targets(tick))
+                        .expect("合法");
+                }
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+            }
+            s.snapshot()
+        };
+        let snap_a = run();
+        let snap_b = run();
+        assert_eq!(snap_a, snap_b, "同输入两遍逐位相同(AC-B6)");
+    }
+
+    /// K10(AC-B6):第 300 拍取快照 → 恢复 → 续跑到 600 拍,与不中断的
+    /// 哈希逐位相同;恢复后 joint_targets 与电机目标一致。
+    #[test]
+    fn k10_snapshot_restore_continuation() {
+        let build = |interrupt: bool| {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(
+                a,
+                hash,
+                quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
+                None,
+            )
+            .expect("四足生成");
+            let observers = [Vec3::new(24.0, 2.34, 24.0)];
+            let mut restored: Option<crate::sim::ShardSim> = None;
+            for tick in 0..600usize {
+                if tick % 2 == 0 {
+                    let sim = restored.as_mut().unwrap_or(&mut s);
+                    sim.apply_agent_joint_targets(a, &current_sine_targets(tick))
+                        .expect("合法");
+                }
+                let sim = restored.as_mut().unwrap_or(&mut s);
+                sim.apply_activation(&observers);
+                sim.step();
+                let _ = sim.take_outbox();
+                if tick == 300 && interrupt {
+                    let bytes = sim.snapshot();
+                    let bodies = fresh_registry_clone(sim);
+                    let r = crate::sim::ShardSim::restore_with_bodies(
+                        &bytes,
+                        Box::new(SimpleRegistry::builtin()),
+                        bodies,
+                    )
+                    .expect("restore");
+                    // 恢复后 joint_targets 与电机目标一致。
+                    let record = r.agents.get(&a).expect("主体登记");
+                    let targets = record.joint_targets.clone();
+                    let mb_index = r.agent_multibody_index(record).expect("mb");
+                    let mb = r.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+                    let def = r.bodies.get(&record.body_hash).expect("def");
+                    for (dof_i, j) in def.dof_joints().enumerate() {
+                        let &handle = record.links.get(&j.child).expect("child");
+                        let lid = r
+                            .phys
+                            .multibody_joints
+                            .rigid_body_link(handle)
+                            .expect("link");
+                        let link = mb.link(lid.id).expect("link");
+                        assert!(
+                            (link.joint.data.motors[3].target_pos - targets[dof_i]).abs() < 1e-6,
+                            "恢复后电机目标 = joint_targets(dof {dof_i})"
+                        );
+                    }
+                    restored = Some(r);
+                }
+            }
+            restored.unwrap_or(s).snapshot()
+        };
+        let uninterrupted = build(false);
+        let interrupted = build(true);
+        assert_eq!(uninterrupted, interrupted, "快照恢复续跑与不中断逐位相同");
+    }
+
+    /// K11:多连杆主体被推过分片边界 → fail-stop,信息含 "B03"。
+    /// (`should_panic`)布景:四足生成到相邻分片的 chunk 中,step 的迁移
+    /// 检测(核心区外)即触发。
+    #[test]
+    #[should_panic(expected = "B03")]
+    fn k11_multi_link_migration_fail_stop() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        // 分片 = 8×8 chunk(0..128);四足放在 x = 132(相邻分片 (1,0))→
+        // 不在本分片核心区。生成路径不查归属(§3 与 SpawnDynamic 同口径),
+        // 迁移检测在 step 内触发。
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            quad_spawn_state(Vec3::new(132.0, 0.448, 24.0)),
+            None,
+        )
+        .expect("四足生成");
+        s.apply_activation(&[Vec3::new(132.0, 2.34, 24.0)]);
+        s.step();
+    }
+
+    /// K12:一格方块放进四足某条腿占的格 → 暂缓写入(A05 的规则对非根
+    /// 连杆也成立);主体移除后补写生效。布景:机身绕 z 转 90° 横躺、中心
+    /// 放在格 24 的右缘(24.9)——腿链水平伸向 +x,shank 中心格 (25,·,·)
+    /// 与机身格 (24,·,·) 分离(站立姿态下所有连杆共享同一竖直格,判据
+    /// 区分不出"非根连杆在表里")。生成后不步进:暂缓判定只依赖形状表
+    /// 里的连杆位姿,FK 摆位已把连杆放好。
+    #[test]
+    fn k12_deferred_set_block_on_leg_cell() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.9, 2.0, 24.5),
+                rotation: types::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("四足生成");
+        // 非根连杆(shank,links[3] = leg0)的中心格。
+        let record = s.agents.get(&a).expect("主体登记");
+        let shank_name = s.bodies.get(&record.body_hash).expect("def").links[3]
+            .name
+            .clone();
+        let &shank_handle = record.links.get(&shank_name).expect("shank");
+        let rb = s.phys.bodies.get(shank_handle).expect("shank rb");
+        let p = crate::conv::rapier_to_vec3(rb.translation());
+        let shank_cell =
+            types::BlockPos::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+        // 布景自检:shank 格与机身格不同(判据的区分前提)。
+        let root_rb = s
+            .phys
+            .bodies
+            .get(s.entities.get(&a).unwrap().handle)
+            .expect("root rb");
+        let rp = crate::conv::rapier_to_vec3(root_rb.translation());
+        let root_cell = types::BlockPos::new(
+            rp.x.floor() as i32,
+            rp.y.floor() as i32,
+            rp.z.floor() as i32,
+        );
+        assert_ne!(
+            shank_cell, root_cell,
+            "布景自检:shank 格必须与机身格分离(shank 在 {p:?},root 在 {rp:?})"
+        );
+        // SetBlock 写进 shank 格 → 走暂缓写入路径。形状表 = 调度器口径
+        // (拍首注入上一拍末的主体连杆表)。
+        s.set_agent_shape_table(s.agent_shape_entries());
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 9,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SetBlock {
+                pos: shank_cell,
+                block: types::BlockId(1),
+            }),
+        }]);
+        s.step();
+        let _ = s.take_outbox();
+        assert!(
+            s.deferred_set_blocks.contains_key(&shank_cell),
+            "腿占的格的 SetBlock 被暂缓(非根连杆同规则)"
+        );
+        // 移除主体后,暂缓写入生效(A05 的规则)。调度器口径:移除后注入
+        // 空表 → 拍首 flush 补写。
+        s.despawn_agent(a);
+        s.set_agent_shape_table(crate::agent_shape::AgentShapeTable::default());
+        s.flush_agent_deferred_writes();
+        assert_eq!(
+            s.voxel().get_block(shank_cell),
+            types::BlockId(1),
+            "主体移除后暂缓写入生效"
+        );
     }
 }

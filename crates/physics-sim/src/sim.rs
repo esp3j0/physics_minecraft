@@ -310,6 +310,12 @@ pub struct Outbox {
     /// 本拍主体意图被钳制的次数(A02a 第 2 节:`move_xz` 长度超过
     /// `[walker].max_speed` 按比例钳到 max_speed)。纯计数(随 Outbox 走)。
     pub agent_intent_clamped: u64,
+    /// 本拍关节目标命令的内核侧拒绝数(REQ-012 B01a 第 3.4 节:非主体 /
+    /// dof = 0 / 长度不符 / 非有限值;世界不变)。纯计数(随 Outbox 走)。
+    pub agent_joint_targets_rejected: u64,
+    /// 本拍关节目标被钳到限位的个数(B01a 第 3.4 节:有 `limits` 的关节,
+    /// 每夹一个 +1)。纯计数(随 Outbox 走)。
+    pub agent_joint_targets_clamped: u64,
     /// 实体票状态操作(REQ-007 任务 03;S5:分片只产出状态依赖操作,签发
     /// 单点在调度器 claim/补签)。调度器按 TicketKey 序应用,N 拍产生 N+1 生效
     /// (§14-6);幂等由 TicketTable 保证。
@@ -1636,12 +1642,14 @@ impl ShardSim {
                     pos_chunk(state.translation).shard_of(),
                 );
                 if let Some(agent) = self.agents.remove(&id) {
-                    // 主体迁移:A01 只支持单连杆(多连杆在 B01)。assert 而非
-                    // debug_assert(A04 R1-P9):release 构建同样 fail-stop,
-                    // 与接收方 migrate_agent_in 的一致性 assert 对齐。
+                    // 主体迁移:多连杆在 B03 实现。assert 而非 debug_assert
+                    // (A04 R1-P9):release 构建同样 fail-stop,与接收方
+                    // migrate_agent_in 的一致性 assert 对齐。
                     assert!(
                         agent.links.len() == 1,
-                        "A04 只支持单连杆主体迁移(多连杆在 B01)"
+                        "多连杆主体迁移在 B03 实现(B01a fail-stop:{:?} 带 {} 个连杆)",
+                        id,
+                        agent.links.len()
                     );
                     let hold = self.walker_holds.remove(&id).unwrap_or_default();
                     self.entities.remove(&id).expect("存在");
@@ -2952,7 +2960,15 @@ impl ShardSim {
                 if y < threshold {
                     // REQ-012 A01(§6"掉出世界"):主体按"AI 主体移除"走同
                     // 一路径(清 agents 表;玩家回出生点在 A06 接线)。
-                    self.agents.remove(&id);
+                    // B01a:以**根连杆**判定(整个主体只占一个 EntityId,
+                    // rec.handle = 根;连杆相对根的偏移 ≤ 包络,不会根还在
+                    // 界内而整只判定跨阈值——以根判定即整只移除)。
+                    if let Some(agent) = self.agents.remove(&id) {
+                        for handle in agent.links.values().copied().collect::<Vec<_>>() {
+                            self.phys.remove_body(handle);
+                        }
+                        self.walker_holds.remove(&id);
+                    }
                     self.entities.remove(&id).expect("存在");
                     self.phys.remove_body(handle);
                     self.locomotion.remove(&id);
@@ -3421,11 +3437,21 @@ impl ShardSim {
         for (id, rec) in &self.entities {
             let idx = rec.collider.into_raw_parts();
             table.insert((idx.0, idx.1), *id);
-            if rec.desc.shape().is_some() || self.agents.contains_key(id) {
+            if rec.desc.shape().is_some() {
                 let body = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 for ch in body.colliders() {
                     let idx = ch.into_raw_parts();
                     table.insert((idx.0, idx.1), *id);
+                }
+            } else if let Some(agent) = self.agents.get(id) {
+                // REQ-012 A01/B01a(§3):主体的**全部连杆**碰撞体登记
+                // (多连杆每连杆一个刚体,逐连杆收它的 collider)。
+                for &handle in agent.links.values() {
+                    let body = self.phys.bodies.get(handle).expect("handle 有效");
+                    for ch in body.colliders() {
+                        let idx = ch.into_raw_parts();
+                        table.insert((idx.0, idx.1), *id);
+                    }
                 }
             }
         }
@@ -4610,6 +4636,23 @@ impl ShardSim {
                 // 收口在 `apply_agent_intent`(agent.rs)。
                 if self.apply_agent_intent(entity, move_xz, yaw, jump).is_err() {
                     self.outbox.agent_intent_rejected += 1;
+                }
+            }
+            SimCommand::AgentJointTargets { entity, targets } => {
+                // 关节目标(REQ-012 B01a,§2.2 关节层级):**内核不信任它**
+                // ——本命令可能来自日志回放,这里重做全部检查,不 panic:
+                // - 非主体 / dof = 0 / 长度不符 / 非有限值 → 类型化拒绝 +
+                //   遥测(世界不变,AC-B5);
+                // - 超限目标 → 钳到限位(每夹一个 +1 遥测钳制计数,AC-B5
+                //   "超出关节范围的目标在进入内核前钳制")。
+                // 生效拍与 `AgentIntent` 同口径(命令 = 盖章输入,下一拍
+                // apply_prefix 时点生效);目标写进 AgentRecord 保持状态
+                // (直到下一条命令,随快照走),电机目标逐关节更新,目标
+                // 变化唤醒整只主体。计数与写入都收口在
+                // `apply_agent_joint_targets`(agent.rs)。
+                match self.apply_agent_joint_targets(entity, &targets) {
+                    Ok(clamped) => self.outbox.agent_joint_targets_clamped += u64::from(clamped),
+                    Err(_) => self.outbox.agent_joint_targets_rejected += 1,
                 }
             }
             SimCommand::RemoveEntity { entity } => {

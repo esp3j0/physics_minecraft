@@ -637,6 +637,27 @@ impl Session {
         )
     }
 
+    /// 按实体当前 owner 投递关节目标(REQ-012 B01a 第 3.4 节;写法同
+    /// `send_agent_intent_to`):owner 查不到(迁移在途窗口/不存在)→
+    /// `Rejected("实体不存在或迁移窗口")`。成功入日志(盖章同 `send_from`,
+    /// source = 调用方;§2.2 关节层级,回放再生)。**本单不接网络**(B02
+    /// 开协议面)。
+    pub fn send_agent_joint_targets_to(
+        &mut self,
+        source: InputSource,
+        entity: EntityId,
+        targets: Vec<f32>,
+    ) -> Result<LogEntry, SessionError> {
+        let owner = self
+            .entity_owner(entity)
+            .ok_or(SessionError::Rejected("实体不存在或迁移窗口"))?;
+        self.send_from(
+            source,
+            owner.shard,
+            SimCommand::AgentJointTargets { entity, targets },
+        )
+    }
+
     /// 调度器透传(REQ-002 §4.4):装载一个 chunk(驱动经 provider 取数后回填)。
     /// REQ-007 任务 01(①② 拆分/D17):激活已启用 → 只装 ①(体素),② 由
     /// 下一拍激活决策构建(细则 11);未启用 → 合一装 ①②(现状,§14-9)。
