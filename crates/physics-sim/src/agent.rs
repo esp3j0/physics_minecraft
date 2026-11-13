@@ -2970,6 +2970,31 @@ anchor = [0.0, 0.0, 0.0]
         (sim, hash)
     }
 
+    /// load_flat_ground 的地面顶面(chunk y 下标 64 → 世界 y ∈ [0,1])。
+    /// B01a-R1(P1):四足原先生成在 y=0.448,整只在地面方块内部,造出
+    /// "不自然入睡/滑移 0.118"两条假结论;正确出生点 = 顶面 + 0.45。
+    const GROUND_TOP_Y: f32 = 1.0;
+
+    /// 四足生成位置:关节角全 0 时足底在根下方 0.448;留 2 mm 间隙。
+    fn quad_origin(x: f32, z: f32) -> Vec3 {
+        Vec3::new(x, GROUND_TOP_Y + 0.45, z)
+    }
+
+    /// 布景自检:全部连杆碰撞体的世界 AABB 最低点 ≥ GROUND_TOP_Y − 1e-3
+    /// (不许再出现"生成进地面方块内部"的布景错误)。
+    fn assert_quad_above_ground(s: &crate::sim::ShardSim, a: types::EntityId) {
+        let record = s.agents.get(&a).expect("主体登记");
+        for &ch in &record.colliders {
+            let collider = s.phys.colliders.get(ch).expect("连杆碰撞体存在");
+            let aabb = collider.compute_aabb();
+            assert!(
+                aabb.mins.y >= GROUND_TOP_Y - 1e-3,
+                "布景自检:碰撞体 {ch:?} 世界 AABB 最低 {} < 地面顶面 {GROUND_TOP_Y}",
+                aabb.mins.y
+            );
+        }
+    }
+
     /// 生成一只四足的出生 state(关节角全 0 的竖直链,足端在 origin 下方
     /// 0.34 m;测试把它放在平板上方一点,由电机拉到站立姿态)。
     fn quad_spawn_state(origin: Vec3) -> types::EntityState {
@@ -2987,13 +3012,9 @@ anchor = [0.0, 0.0, 0.0]
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
         let record = s.agents.get(&a).expect("主体登记");
         // 13 刚体登记(links 表 = 13 条;实体记录 handle = 根连杆)。
         assert_eq!(record.links.len(), 13, "13 连杆");
@@ -3061,13 +3082,9 @@ anchor = [0.0, 0.0, 0.0]
         let colliders_before = s.phys.colliders.len();
         let mb_before = s.phys.multibody_joints.iter().count();
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
         assert_eq!(s.phys.bodies.len(), bodies_before + 13);
         assert_eq!(s.phys.colliders.len(), colliders_before + 13);
         assert_eq!(s.phys.multibody_joints.iter().count(), mb_before + 12);
@@ -3088,13 +3105,9 @@ anchor = [0.0, 0.0, 0.0]
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
         let record = s.agents.get(&a).expect("主体登记");
         let mb_index = s.agent_multibody_index(record).expect("mb");
         let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
@@ -3145,6 +3158,7 @@ anchor = [0.0, 0.0, 0.0]
         let a = types::EntityId::from_parts(1, 1);
         s.spawn_agent(a, hash, quad_spawn_state(origin), None)
             .expect("四足生成");
+        assert_quad_above_ground(s, a);
         let observers = [origin + Vec3::new(0.0, 2.0, 0.0)];
         let targets = s.agent_joint_targets(a).expect("目标表").to_vec();
         let mut trace = Vec::with_capacity(n);
@@ -3172,26 +3186,24 @@ anchor = [0.0, 0.0, 0.0]
     }
 
     /// K3(AC-B1):平地、默认目标、3600 拍。全程无 NaN;第 120 拍以后
-    /// 机身 up·y ≥ 0.95;第 600 拍以后高度标准差 ≤ 1 cm;第 600 拍以后
-    /// 关节 RMS ≤ 0.15 rad。允许自然睡眠(睡眠判据 = 根刚体 is_sleeping,
-    /// 睡着期间逐拍位移恒 0)。另跑一组强制醒着,只报水平滑移速度。
+    /// 机身 up·y ≥ 0.95;第 600 拍以后高度标准差 ≤ 1 cm、关节 RMS ≤ 0.15 rad、
+    /// 机身平均高度 − 地面顶面 ∈ [0.27, 0.29]。自然睡眠:首次入睡 ≤ 第 300 拍、
+    /// 睡眠拍数 ≥ 3000,睡着期间逐拍位移恒 0。另跑一组强制醒着,只报水平
+    /// 滑移速度(不设门槛)。
     #[test]
     fn k3_stand_3600_ticks() {
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
-        let observers = [Vec3::new(24.0, 2.34, 24.0)];
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
         let targets = s.agent_joint_targets(a).expect("目标表").to_vec();
         let mut min_up = f32::INFINITY;
         let mut max_rms = 0.0f32;
-        // 睡眠统计:睡着的拍数与睡着期间的最大逐拍位移。
+        // 睡眠统计:首次入睡拍号、睡着的拍数与睡着期间的最大逐拍位移。
+        let mut first_sleep: Option<usize> = None;
         let mut slept_ticks = 0usize;
         let mut max_sleep_shift = 0.0f32;
         let mut prev_sleeping_pos: Option<rapier3d::prelude::Vector> = None;
@@ -3213,8 +3225,13 @@ anchor = [0.0, 0.0, 0.0]
             let up = *rb.rotation() * types::glam::Vec3::Y;
             let height = rb.translation().y;
             let pos = rb.translation();
+            // 全程无 NaN(判据口径:3600 拍逐拍)。
+            assert!(up.is_finite() && height.is_finite(), "拍 {tick}:状态非有限");
             let sleeping = rb.is_sleeping();
             if sleeping {
+                if first_sleep.is_none() {
+                    first_sleep = Some(tick);
+                }
                 slept_ticks += 1;
                 if let Some(prev) = prev_sleeping_pos {
                     let d = (pos - prev).length();
@@ -3226,7 +3243,6 @@ anchor = [0.0, 0.0, 0.0]
             }
             if tick >= 120 {
                 min_up = min_up.min(up.y);
-                assert!(up.is_finite() && height.is_finite(), "拍 {tick}:状态非有限");
             }
             if tick % 600 == 0 {
                 println!(
@@ -3261,14 +3277,27 @@ anchor = [0.0, 0.0, 0.0]
         let std = var.sqrt();
         assert!(std <= 0.01, "第 600 拍以后高度标准差 {std} m,须 ≤ 0.01");
         assert!(max_rms <= 0.15, "第 600 拍以后关节 RMS {max_rms},须 ≤ 0.15");
-        // 睡着期间逐拍位移恒 0。
+        // 站高(新布景判据):平均机身高度 − 地面顶面 ∈ [0.27, 0.29]
+        // (§13 demo 设计值 0.28)。
+        let stand_height = mean - GROUND_TOP_Y;
+        assert!(
+            (0.27..=0.29).contains(&stand_height),
+            "机身平均高度 − 地面顶面 {stand_height} m,须在 [0.27, 0.29]"
+        );
+        // 自然睡眠(新布景判据;旧布景整只在地面方块内部,从不入睡):
+        // 首次入睡不晚于第 300 拍、睡眠拍数 ≥ 3000;睡着期间逐拍位移恒 0
+        // (站对位置后不再是平凡成立)。
+        let fs = first_sleep.expect("全程无入睡(布景或睡眠参数问题)");
+        assert!(fs <= 300, "首次入睡在第 {fs} 拍,须不晚于第 300 拍");
+        assert!(slept_ticks >= 3000, "睡眠拍数 {slept_ticks},须 ≥ 3000");
         assert!(
             max_sleep_shift == 0.0,
             "睡着期间逐拍位移 {max_sleep_shift},恒为 0"
         );
         let sleep_ratio = slept_ticks as f32 / 3600.0;
         println!(
-            "K3 实测:up·y 最小 {min_up};高度标准差 {std};关节 RMS 最大 {max_rms};睡眠占比 {sleep_ratio}"
+            "K3 实测:up·y 最小 {min_up};高度标准差 {std};关节 RMS 最大 {max_rms};\
+             站高 {stand_height};首次入睡第 {fs} 拍;睡眠拍数 {slept_ticks}(占比 {sleep_ratio})"
         );
         // 单只四足每拍耗时粗测(不设门槛,B04 再定):站立段(600..)的均值
         // 与 P95(含 apply_activation/step/outbox 全生产路径,debug 口径见
@@ -3284,14 +3313,10 @@ anchor = [0.0, 0.0, 0.0]
         let (mut s2, hash2) = quad_sim_with(0.01);
         load_flat_ground(&mut s2);
         let a2 = types::EntityId::from_parts(1, 1);
-        s2.spawn_agent(
-            a2,
-            hash2,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成(醒着组)");
-        let observers2 = [Vec3::new(24.0, 2.34, 24.0)];
+        s2.spawn_agent(a2, hash2, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成(醒着组)");
+        assert_quad_above_ground(&s2, a2);
+        let observers2 = [Vec3::new(24.0, 3.45, 24.0)];
         let mut hsum = 0.0f32;
         let mut hn = 0usize;
         for tick in 0..3600usize {
@@ -3316,7 +3341,7 @@ anchor = [0.0, 0.0, 0.0]
             }
         }
         let drift = hsum / hn as f32;
-        println!("K3 强制醒着:水平滑移速度平均 {drift} m/s(已知现象 ~0.08,只报数)");
+        println!("K3 强制醒着:水平滑移速度平均 {drift} m/s(只报数,不设门槛)");
     }
 
     /// K4:k = 1/100 与 k = 1 两组站立,第 600 拍机身高度相差 ≤ 2 mm。
@@ -3326,7 +3351,7 @@ anchor = [0.0, 0.0, 0.0]
         for (i, k) in [0.01f32, 1.0].into_iter().enumerate() {
             let (mut s, hash) = quad_sim_with(k);
             load_flat_ground(&mut s);
-            let trace = stand_probe(&mut s, hash, Vec3::new(24.0, 0.448, 24.0), 1200);
+            let trace = stand_probe(&mut s, hash, quad_origin(24.0, 24.0), 1200);
             heights[i] = trace[600..].iter().map(|t| t.1).sum::<f32>() / 600.0;
             println!("K4 k = {k}:第 600 拍后平均机身高度 {}", heights[i]);
         }
@@ -3334,50 +3359,42 @@ anchor = [0.0, 0.0, 0.0]
         assert!(diff <= 0.002, "两组高度差 {diff} m,须 ≤ 0.002");
     }
 
-    /// K5:四足睡着后改目标 → 下一拍醒来,关节朝新目标动。
+    /// K5:四足睡着后改目标 → 下一拍醒来,关节朝新目标动。B01a-R1:前置
+    /// 改成**真实的自然入睡**(站到睡着为止,上限 600 拍,超限 panic 并写明
+    /// 在等什么;旧版手动 `rb.sleep()` 的构造不再用)。
     #[test]
     fn k5_new_target_wakes_sleeping_quad() {
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
-        let observers = [Vec3::new(24.0, 2.34, 24.0)];
-        for _ in 0..900 {
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 前置:站到自然入睡为止(上限 600 拍;K3 实测 ~2 秒 = 120 拍量级)。
+        let mut asleep_before = false;
+        for tick in 0..600usize {
             s.apply_activation(&observers);
             s.step();
             let _ = s.take_outbox();
-        }
-        // 平地站立不自然入睡(§13:站立滑移 ~0.1 m/s → drift 门永不满足;
-        // K3 实测睡眠占比 0)。sleeping 前置用 rapier 的手动 sleep 构造
-        // (mass demo M5 的睡眠判据同 API);判据要验证的是"目标变化唤醒"。
-        let rec = s.entities.get(&a).expect("root");
-        let root_handle = rec.handle;
-        let record0 = s.agents.get(&a).expect("record");
-        let mb0 = s.agent_multibody_index(record0).expect("mb");
-        let handles0: Vec<_> = {
-            let mb = s.phys.multibody_joints.get_multibody(mb0).expect("mb");
-            mb.links()
-                .map(|l| l.rigid_body_handle())
-                .chain(std::iter::once(root_handle))
-                .collect()
-        };
-        for h in &handles0 {
-            if let Some(rb) = s.phys.bodies.get_mut(*h) {
-                rb.sleep();
+            let rec = s.entities.get(&a).expect("root");
+            if s.phys
+                .bodies
+                .get(rec.handle)
+                .map(|rb| rb.is_sleeping())
+                .unwrap_or(false)
+            {
+                println!("K5:第 {tick} 拍自然入睡");
+                asleep_before = true;
+                break;
             }
         }
-        let asleep_before = s
-            .phys
-            .bodies
-            .get(root_handle)
-            .map(|rb| rb.is_sleeping())
-            .unwrap_or(false);
+        assert!(
+            asleep_before,
+            "前置失败:站了 600 拍仍未自然入睡(在等根刚体 is_sleeping;布景或睡眠参数问题)"
+        );
+        let rec = s.entities.get(&a).expect("root");
+        let root_handle = rec.handle;
         let q_before = s.agent_joint_positions(a).expect("q");
         // 改 hip 列目标(−0.85 → −0.6,限位内;其余不动)。
         let mut targets = s.agent_joint_targets(a).expect("targets").to_vec();
@@ -3396,7 +3413,7 @@ anchor = [0.0, 0.0, 0.0]
             .unwrap_or(false);
         assert!(
             asleep_before,
-            "前置:站立 900 拍后应已自然睡眠(实测未睡——布景或参数问题)"
+            "前置失败:站了 600 拍仍未自然入睡(在等根刚体 is_sleeping;布景或睡眠参数问题)"
         );
         assert!(!awake, "改目标后下一拍必须醒来");
         // 关节朝新目标动:hip 关节角向 −0.6(= 旧目标 −0.8536 → −0.6 方向,
@@ -3450,14 +3467,10 @@ anchor = [0.0, 0.0, 0.0]
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
-        let observers = [Vec3::new(24.0, 2.34, 24.0)];
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
         for _ in 0..30 {
             s.apply_activation(&observers);
             s.step();
@@ -3590,13 +3603,9 @@ anchor = [0.0, 0.0, 0.0]
         };
         let (mut s2, hash2) = quad_sim_with(0.01);
         load_flat_ground(&mut s2);
-        s2.spawn_agent(
-            a,
-            hash2,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成(对照)");
+        s2.spawn_agent(a, hash2, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成(对照)");
+        assert_quad_above_ground(&s2, a);
         for _ in 0..30 {
             s2.apply_activation(&observers);
             s2.step();
@@ -3644,13 +3653,9 @@ anchor = [0.0, 0.0, 0.0]
         let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
-            a,
-            hash,
-            quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-            None,
-        )
-        .expect("四足生成");
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
         let out0 = s.take_outbox();
         assert_eq!(out0.agent_joint_targets_clamped, 0);
         // 全部超上限(+100):quad 12 关节全有限位 → 全部被钳。走命令路径
@@ -3678,7 +3683,8 @@ anchor = [0.0, 0.0, 0.0]
         }
         let out = s.take_outbox();
         assert_eq!(out.agent_joint_targets_clamped, 12, "钳制计数 = 超限个数");
-        // 对照:限位内目标(全 0)不计数。
+        // 对照:限位内目标(全 0)不计数。只取一次 outbox(B01a-R1:连取
+        // 两次时第二次永远为空,"限位内不计数"成了空转断言)。
         s.apply_prefix(&[messaging::StampedInput {
             apply_at: types::Tick::ZERO,
             source: messaging::InputSource::SCHEDULER,
@@ -3689,7 +3695,6 @@ anchor = [0.0, 0.0, 0.0]
             }),
         }]);
         s.step();
-        let _ = s.take_outbox();
         let out2 = s.take_outbox();
         assert_eq!(out2.agent_joint_targets_clamped, 0, "限位内不计数");
     }
@@ -3702,14 +3707,10 @@ anchor = [0.0, 0.0, 0.0]
             let (mut s, hash) = quad_sim_with(0.01);
             load_flat_ground(&mut s);
             let a = types::EntityId::from_parts(1, 1);
-            s.spawn_agent(
-                a,
-                hash,
-                quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-                None,
-            )
-            .expect("四足生成");
-            let observers = [Vec3::new(24.0, 2.34, 24.0)];
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            assert_quad_above_ground(&s, a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
             for tick in 0..600usize {
                 if tick % 2 == 0 {
                     s.apply_agent_joint_targets(a, &current_sine_targets(tick))
@@ -3734,14 +3735,10 @@ anchor = [0.0, 0.0, 0.0]
             let (mut s, hash) = quad_sim_with(0.01);
             load_flat_ground(&mut s);
             let a = types::EntityId::from_parts(1, 1);
-            s.spawn_agent(
-                a,
-                hash,
-                quad_spawn_state(Vec3::new(24.0, 0.448, 24.0)),
-                None,
-            )
-            .expect("四足生成");
-            let observers = [Vec3::new(24.0, 2.34, 24.0)];
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            assert_quad_above_ground(&s, a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
             let mut restored: Option<crate::sim::ShardSim> = None;
             for tick in 0..600usize {
                 if tick % 2 == 0 {
@@ -3888,6 +3885,131 @@ anchor = [0.0, 0.0, 0.0]
             s.voxel().get_block(shank_cell),
             types::BlockId(1),
             "主体移除后暂缓写入生效"
+        );
+    }
+
+    /// K13(B01a-R1 P2):多连杆主体掉进虚空 → **整只移除**:刚体数、碰撞体
+    /// 数、multibody 数回到生成前;`agents`、`entities` 里没有它;上报与
+    /// 单连杆同口径(`despawned` + `void_removed` 各一条、`void_removals`
+    /// +1)。布景:没有地面(不 load_flat_ground),四足生成后自由下落,
+    /// y 越过 WORLD_Y_MIN − void_despawn_depth_m(−64 − 16 = −80)即触发。
+    /// 对照线 = 单连杆胶囊同场景(口径基准)。
+    #[test]
+    fn k13_void_removal_removes_whole_multibody() {
+        // ---- 单连杆对照线(口径基准;先跑,拿它的上报形状)----
+        let (mut sc, caphash) = test_sim();
+        let cap = types::EntityId::from_parts(1, 1);
+        sc.spawn_agent(
+            cap,
+            caphash,
+            types::EntityState {
+                translation: Vec3::new(24.0, 20.0, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("capsule 生成");
+        sc.apply_activation(&[Vec3::new(24.0, 20.0, 24.0)]);
+        let _ = sc.take_outbox();
+        let mut fell = false;
+        for _ in 0..1200usize {
+            sc.step();
+            sc.run_transient_lifecycle();
+            let out = sc.take_outbox();
+            if out.void_removed.contains(&cap) {
+                fell = true;
+                break;
+            }
+        }
+        assert!(
+            fell,
+            "对照线:胶囊 1200 拍内应越过虚空阈值(在等 outbox.void_removed)"
+        );
+        // ---- 多连杆主体同场景 ----
+        let (mut s, hash) = quad_sim_with(0.01);
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let mb_before = s.phys.multibody_joints.iter().count();
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(Vec3::new(24.0, 20.0, 24.0)), None)
+            .expect("四足生成");
+        assert_eq!(s.phys.bodies.len(), bodies_before + 13, "布景自检:13 刚体");
+        s.apply_activation(&[Vec3::new(24.0, 20.0, 24.0)]);
+        let _ = s.take_outbox();
+        let mut removed = false;
+        for _ in 0..1200usize {
+            s.step();
+            s.run_transient_lifecycle();
+            let out = s.take_outbox();
+            if out.void_removed.contains(&a) {
+                removed = true;
+                assert!(
+                    out.despawned.contains(&a),
+                    "上报与单连杆同口径:despawned 也有一条"
+                );
+                break;
+            }
+        }
+        assert!(
+            removed,
+            "四足 1200 拍内应整只越过虚空阈值被移除(在等 outbox.void_removed)"
+        );
+        // 全部连杆拆除:三项计数回到生成前;agents/entities 无它。
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体数回到生成前");
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before,
+            "碰撞体数回到生成前"
+        );
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            mb_before,
+            "multibody 数回到生成前"
+        );
+        assert!(!s.agents.contains_key(&a), "agents 表无它");
+        assert!(!s.entities.contains_key(&a), "entities 表无它");
+    }
+
+    /// K14(B01a-R1 P2):形状 offset 进碰撞体——shank 是 compound(胶囊 +
+    /// 带偏移 [0, −0.1065, 0] 的脚球),连杆局部系 AABB 最低点 =
+    /// −(0.1065 + 0.022);对照 thigh(单形状无偏移胶囊)= −(0.1065 + 0.02)。
+    /// 变异"多形状分支忽略 offset"使脚球回到原点,最低点变 −(0.1065+0.012),
+    /// 本测试红。
+    #[test]
+    fn k14_shape_offset_reaches_collider() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let record = s.agents.get(&a).expect("主体登记");
+        let def = s.bodies.get(&record.body_hash).expect("def").clone();
+        // links[3] = leg0 的 shank;links[2] = leg0 的 thigh(顺序同资产)。
+        let shank_name = def.links[3].name.clone();
+        let thigh_name = def.links[2].name.clone();
+        // 布景自检:shank 有两个形状(第二形状带 offset),thigh 单形状。
+        assert_eq!(def.links[3].shapes.len(), 2, "shank = 胶囊 + 脚球");
+        assert_eq!(def.links[2].shapes.len(), 1, "thigh = 单胶囊");
+        let local_min_y = |name: &str| -> f32 {
+            let &h = record.links.get(name).expect("连杆 handle");
+            let rb = s.phys.bodies.get(h).expect("连杆刚体");
+            // 每连杆一个 collider(多形状 = 单 compound)。
+            assert_eq!(rb.colliders().len(), 1, "连杆 {} 单碰撞体", name);
+            let collider = s.phys.colliders.get(rb.colliders()[0]).expect("连杆碰撞体");
+            collider.shape().compute_local_aabb().mins.y
+        };
+        let shank_min = local_min_y(&shank_name);
+        let thigh_min = local_min_y(&thigh_name);
+        assert!(
+            (shank_min - -(0.1065 + 0.022)).abs() <= 1e-4,
+            "shank 连杆局部 AABB 最低 {shank_min},期望 −(0.1065+0.022) = {}",
+            -(0.1065 + 0.022)
+        );
+        assert!(
+            (thigh_min - -(0.1065 + 0.02)).abs() <= 1e-4,
+            "thigh 连杆局部 AABB 最低 {thigh_min},期望 −(0.1065+0.02) = {}",
+            -(0.1065 + 0.02)
         );
     }
 }

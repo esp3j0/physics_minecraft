@@ -7365,6 +7365,112 @@ mod tests {
         assert!(msg.contains("9"), "错误信息指认旧版本: {msg}");
     }
 
+    /// D3(B01a-R1 P3):`validate_external_command` 的 `AgentJointTargets`
+    /// 分支——四种拒绝各一条(网络来源、非有限、实体不存在、非主体),
+    /// 加一条合法本地命令通过的对照。变红实现:任一拒绝分支被删/放过。
+    #[test]
+    fn d3_joint_targets_guard_rejections() {
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        // 分片带 capsule 注册表(生成命令在内核 tick 时查表;空注册表 =
+        // UnknownBody 拒绝,主体登记不上,对照线会空转)。
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        session.register(ShardSim::new_with_bodies(
+            {
+                let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+                cfg.solidify = SolidifyConfig {
+                    enabled: false,
+                    ..SolidifyConfig::default()
+                };
+                cfg.cohesion.enabled = false;
+                cfg
+            },
+            Box::new(SimpleRegistry::builtin()),
+            bodies.clone(),
+        ));
+        session.apply_chunk_load(
+            shard_id(0, 0),
+            types::ChunkPos::new(0, 0),
+            voxel::Chunk::air(),
+        );
+        // 主体(capsule)与普通 dynamic 实体,同一 session。
+        let agent = EntityId::from_parts(1, 1);
+        let plain = EntityId::from_parts(1, 2);
+        session
+            .spawn_agent_from(
+                messaging::InputSource(1),
+                shard_id(0, 0),
+                agent,
+                bodies.hash_of("capsule").expect("capsule 已装"),
+                EntityState {
+                    translation: types::glam::Vec3::new(8.5, -58.0, 8.5),
+                    ..EntityState::default()
+                },
+            )
+            .expect("主体生成");
+        session.tick();
+        session
+            .send(
+                shard_id(0, 0),
+                messaging::SimCommand::SpawnDynamic {
+                    entity: plain,
+                    state: EntityState {
+                        translation: types::glam::Vec3::new(20.5, -58.0, 8.5),
+                        ..EntityState::default()
+                    },
+                    desc: EntityDesc::default(),
+                },
+            )
+            .expect("普通实体生成");
+        session.tick();
+        let jt = |entity: EntityId, targets: Vec<f32>| messaging::SimCommand::AgentJointTargets {
+            entity,
+            targets,
+        };
+        // ① 网络来源拒绝(协议面 B02 开;本地受信通道专用)。
+        assert!(
+            validate_external_command(
+                &session,
+                Some(messaging::InputSource(1)),
+                shard_id(0, 0),
+                &jt(agent, vec![0.0; 1])
+            )
+            .is_err(),
+            "网络来源的 AgentJointTargets 必须拒绝"
+        );
+        // ② 非有限 targets 拒绝(NaN;inf 同分支)。
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &jt(agent, vec![f32::NAN]))
+                .is_err(),
+            "非有限 targets 必须拒绝"
+        );
+        // ③ 实体不存在(或迁移窗口)拒绝。
+        let ghost = EntityId::from_parts(1, 9_999_999);
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &jt(ghost, vec![0.0]))
+                .is_err(),
+            "不存在实体的 AgentJointTargets 必须拒绝"
+        );
+        // ④ 非主体实体拒绝(dynamic 有 owner、is_agent = false)。
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &jt(plain, vec![0.0]))
+                .is_err(),
+            "非主体实体的 AgentJointTargets 必须拒绝"
+        );
+        // 对照:合法本地命令(对主体、有限、长度 = dof)通过。
+        assert!(
+            validate_external_command(&session, None, shard_id(0, 0), &jt(agent, vec![0.0; 1]))
+                .is_ok(),
+            "合法本地 AgentJointTargets 必须通过(对照)"
+        );
+        session.shutdown();
+    }
+
     /// R2-4(#25):重生待附身超时的失败收口——`begin_possess_wait` 登记
     /// 一个**不存在的实体**(生成被内核拒绝的等价情形),推过宽限期
     /// (`POSSESS_GRACE_TICKS`)后 `flush_pending_respawn_possess`:

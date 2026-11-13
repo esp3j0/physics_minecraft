@@ -2963,11 +2963,25 @@ impl ShardSim {
                     // B01a:以**根连杆**判定(整个主体只占一个 EntityId,
                     // rec.handle = 根;连杆相对根的偏移 ≤ 包络,不会根还在
                     // 界内而整只判定跨阈值——以根判定即整只移除)。
+                    // B01a-R1:全部连杆(含根)在循环里各移除一次;根连杆
+                    // 不再走循环外那行(旧代码根被移除两次——rapier 对无效
+                    // 句柄静默 no-op,行为未变,但账目不对)。单连杆路径:
+                    // 循环移除唯一连杆 = 原行为,逐句等价。
                     if let Some(agent) = self.agents.remove(&id) {
                         for handle in agent.links.values().copied().collect::<Vec<_>>() {
                             self.phys.remove_body(handle);
                         }
                         self.walker_holds.remove(&id);
+                        self.entities.remove(&id).expect("存在");
+                        self.locomotion.remove(&id);
+                        self.forced_pending.remove(&id);
+                        self.forced_reasons.remove(&id);
+                        self.outbox.despawned.push(id);
+                        self.outbox.void_removed.push(id);
+                        // 06c 遥测:虚空移除只计 void_removals(§4.16:落地失败
+                        // 转虚空移除的、虚空线以下生成的,都不算强制落地)。
+                        self.activation_events.void_removals += 1;
+                        continue;
                     }
                     self.entities.remove(&id).expect("存在");
                     self.phys.remove_body(handle);
