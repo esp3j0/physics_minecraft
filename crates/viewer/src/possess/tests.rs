@@ -590,3 +590,74 @@ fn r2_3_input_routing_by_possession() {
         "附身:三项全 false(空格=跳跃/滚轮=相机距离/WASD=行走意图),实得 {possessed:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// R3(#25 §6 修订):camera_after_body_lost / p_press_hint
+// ---------------------------------------------------------------------------
+
+/// 相机在世界高度以内 → 原样返回(主动按 P 退出附身的常规路径不受影响)。
+/// 变红实现:恒返回 `current` 且情形不分(变异 7 同型)。
+#[test]
+fn r3_camera_within_world_height_returned_as_is() {
+    let cur = Vec3::new(30.0, -40.0, 20.0);
+    let got = camera_after_body_lost(cur, Some(Vec3::new(1.0, 2.0, 3.0)), -64.0);
+    assert_eq!(got, cur, "y ≥ y_min → 原样返回(last_safe 不用)");
+}
+
+/// 相机落到世界底下(y < y_min)→ 用附身期间记录的最后一个安全位。
+#[test]
+fn r3_camera_below_world_uses_last_safe() {
+    let cur = Vec3::new(30.0, -75.0, 20.0);
+    let safe = Vec3::new(24.5, -50.0, 12.5);
+    let got = camera_after_body_lost(cur, Some(safe), -64.0);
+    assert_eq!(got, safe, "世界底下 → 放回最后安全相机位");
+}
+
+/// 世界底下且没有记录(last_safe = None)→ 只把 y 抬到 y_min + 16,
+/// x/z 保持(至少回到能拾取地面的高度)。
+#[test]
+fn r3_camera_below_world_without_last_safe_lifts_y() {
+    let cur = Vec3::new(30.0, -75.0, 20.0);
+    let got = camera_after_body_lost(cur, None, -64.0);
+    assert_eq!(
+        got,
+        Vec3::new(30.0, -48.0, 20.0),
+        "无 last_safe → y = y_min + 16,x/z 保持"
+    );
+}
+
+/// p_press_hint 各相位:只有 `NoBody` 且无拾取目标才提示;其余相位
+/// (有身体、请求在途、已附身)与 `NoBody` 有目标都不提示。
+#[test]
+fn r3_p_press_hint_by_phase_and_target() {
+    assert_eq!(
+        p_press_hint(Phase::NoBody, false),
+        Some("aim at the ground, then press P"),
+        "NoBody 且无拾取目标 → 提示"
+    );
+    for (phase, name) in [
+        (Phase::NoBody, "NoBody"),
+        (Phase::SpawnRequested, "SpawnRequested"),
+        (Phase::HasBody, "HasBody"),
+        (Phase::PossessRequested, "PossessRequested"),
+        (Phase::Possessed, "Possessed"),
+    ] {
+        assert_eq!(
+            p_press_hint(phase, true),
+            None,
+            "{name} 有拾取目标 → 不提示"
+        );
+    }
+    for (phase, name) in [
+        (Phase::SpawnRequested, "SpawnRequested"),
+        (Phase::HasBody, "HasBody"),
+        (Phase::PossessRequested, "PossessRequested"),
+        (Phase::Possessed, "Possessed"),
+    ] {
+        assert_eq!(
+            p_press_hint(phase, false),
+            None,
+            "{name} 无拾取目标也不提示(有身体/请求在途/已附身的按 P 有别的语义)"
+        );
+    }
+}

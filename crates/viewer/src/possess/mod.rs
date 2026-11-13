@@ -399,6 +399,32 @@ pub fn possessed_camera_position(root: Vec3, yaw_deg: f32, pitch_deg: f32, dist:
     third_person_camera(root, yaw_deg, pitch_deg, dist).0
 }
 
+/// 身体没了、相机落在世界底下时的放回位置(R3 §6 修订:附身走远掉出
+/// 世界后,相机跟到世界底下,准星下没有可拾取的地面,按 P 生成不了)。
+/// - `current.y ≥ y_min` → 原样返回(主动按 P 退出附身时相机还在世界
+///   高度以内,不受影响);
+/// - 否则 `last_safe` 有值用它(附身期间记录的最后一次安全相机位),
+///   没有就只把 y 抬到 `y_min + 16`。
+pub fn camera_after_body_lost(current: Vec3, last_safe: Option<Vec3>, y_min: f32) -> Vec3 {
+    if current.y >= y_min {
+        return current;
+    }
+    match last_safe {
+        Some(pos) => pos,
+        None => Vec3::new(current.x, y_min + 16.0, current.z),
+    }
+}
+
+/// 按 P 但发不出命令时给用户的提示(R3 §6 修订;能发命令或不需要提示
+/// 时 None)。`NoBody` 且没有拾取目标 → 掉出世界后相机在世界底下时用户
+/// 按 P 无任何反馈的兜底提示。
+pub fn p_press_hint(phase: Phase, has_target: bool) -> Option<&'static str> {
+    match phase {
+        Phase::NoBody if !has_target => Some("aim at the ground, then press P"),
+        _ => None,
+    }
+}
+
 /// 输入路由表(R2-3):附身/非附身两态下,通用交互键各自是否仍生效。
 /// 附身时全 false——空格是跳跃、滚轮是相机距离、WASD 是行走意图,原有
 /// 的"空格切换耦合 / 滚轮调发射预设速度 / WASD 平移相机"必须让路(R1

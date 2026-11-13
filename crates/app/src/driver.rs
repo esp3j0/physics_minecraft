@@ -841,9 +841,12 @@ pub struct AgentCounters {
     pub bodies_removed_on_recovery: u64,
     /// 玩家身体被虚空移除后在出生点重生并自动附身的次数(A06 §6)。
     pub player_respawned: u64,
-    /// 重生失败次数(A06 §6:出生点 chunk 未装载/分片未注册;连接收到
+    /// 重生失败次数(A06 §6:出生点 chunk 未装载超时/无安全落点;连接收到
     /// `Possessed(None)` 回观察者状态)。
     pub player_respawn_failed: u64,
+    /// 等待中的重生被该连接自己的 `SpawnAgent` 取消的次数(R3 §6 修订:
+    /// "等待期间这个连接自己发 SpawnAgent 并被接受时,取消等待中的重生")。
+    pub respawn_wait_cancelled: u64,
 }
 
 impl std::ops::Add for AgentCounters {
@@ -863,6 +866,7 @@ impl std::ops::Add for AgentCounters {
                 + rhs.bodies_removed_on_recovery,
             player_respawned: self.player_respawned + rhs.player_respawned,
             player_respawn_failed: self.player_respawn_failed + rhs.player_respawn_failed,
+            respawn_wait_cancelled: self.respawn_wait_cancelled + rhs.respawn_wait_cancelled,
         }
     }
 }
@@ -1428,15 +1432,12 @@ impl ObserveOrchestrator {
         }
     }
 
-    /// 玩家回出生点(A06,§6"玩家回出生点"):每拍末调用,取走本拍被虚空
-    /// 移除的主体列表;逐个查归属表(哪条连接的玩家身体):
-    /// - 玩家身体 → 在该连接的出生点重生 + 自动附身。**生成与附身都走与
-    ///   网络请求同一条校验/日志路径**(`handle_spawn_agent`/
-    ///   `handle_possess`,经日志 → 回放再生,判据 A06-6);出生点不可用
-    ///   (chunk 未装载、分片未注册等,`handle_spawn_agent` 校验拒绝)→
-    ///   计 `player_respawn_failed`,连接保持观察者状态(`reap_removed_
-    ///   agents` 已发过 `Possessed(None)`;此处不重发、不计数重生成功)。
-    ///   成功 → 计 `player_respawned`。
+    /// 玩家回出生点(A06,§6"玩家回出生点";R3 修订 = **只登记**):每拍
+    /// 末调用,取走本拍被虚空移除的主体列表;逐个查归属表(哪条连接的
+    /// 玩家身体):
+    /// - 玩家身体 → `begin_respawn_wait` 登记等区块装载,并把这个连接的
+    ///   观察者移到出生点(区块流中心同步过去;写法同 `handle_possess`)。
+    ///   实际生成在 [`Self::flush_pending_respawns`](装载好再生成)。
     /// - AI 主体(source = None)/服务端主体 → 只移除,不重生(§6 掉出
     ///   世界行;A06-4 对照线)。
     /// - 归属表查不到(断线移除、恢复清扫、本地受信通道的 RemoveEntity
@@ -1460,36 +1461,107 @@ impl ObserveOrchestrator {
             let Some((player, point)) = self.respawn.on_void_removed(entity) else {
                 continue;
             };
-            // 生成走与网络请求同一条校验/日志路径;被拒(出生点 chunk 未
-            // 装载、分片未注册等)→ 失败计数,连接保持 reap 已发的
-            // Possessed(None)(回观察者状态)。
-            let had_body = self.player_body_of(session, player).is_some();
-            if had_body {
-                // 防御:连接已有身体(不该发生——虚空移除的正是它的身体);
-                // 不重生不计数,保持现状。
+            // 防御:连接已有身体(不该发生——虚空移除的正是它的身体);
+            // 不登记不计数,保持现状。
+            if self.player_body_of(session, player).is_some() {
                 continue;
             }
-            let spawned_entity = self.handle_spawn_agent(
-                player,
-                point.body.clone(),
-                point.position,
-                point.yaw,
-                session,
-                log,
-                hub,
-            );
-            let Some(new_entity) = spawned_entity else {
-                // 出生点不可用:失败计数;连接已收 Possessed(None)(reap)。
-                self.agent_counters.player_respawn_failed += 1;
-                continue;
-            };
-            // 生成成功:自动附身**跨拍**——生成命令 apply_at = 下一拍(分片
-            // 收件箱),同拍归属表还没有新身体。登记待附身表(期限按条目算,
-            // issued_at = 本拍),实体在内核出现后再走 `handle_possess`(与
-            // 网络请求同一条路径;Spawned 回执已在 handle_spawn_agent 内按
-            // 顺序发出)。
+            // 等区块装载(§6 修订):登记后先移观察者到出生点——chunk 流
+            // 中心同步过去,出生点 chunk 装载好才能生成(写法同
+            // `handle_possess` 里那段)。
             self.respawn
-                .begin_possess_wait(player, new_entity, session.tick_now());
+                .begin_respawn_wait(player, point.clone(), session.tick_now());
+            match session.move_observer_from(player, point.position) {
+                Ok(entry) => log.append(entry),
+                Err(other) => panic!("观察者移动失败(非预期):{other:?}"),
+            }
+            hub.set_stream_center(player, root_to_chunk(point.position));
+        }
+    }
+
+    /// 重生等区块装载的续随(R3 §6"等区块装载/安全落点";每拍末,
+    /// `respawn_void_removed_players` 之后、`flush_pending_respawn_possess`
+    /// 之前)。等待条目逐条判定:
+    /// 1. 该连接已有存活身体 → 出表,不计数(连接自己生成取消了等待)。
+    /// 2. 出生点 chunk 未装载/分片未注册 → 没超时留着;超时
+    ///    (`RESPAWN_LOAD_TIMEOUT_TICKS`)→ 出表计失败。
+    /// 3. 已装载 → `safe_spawn_position` 找落点:`NotLoaded` 同第 2 步;
+    ///    `NoGround` → 失败;`Found(pos)` → 生成(与网络请求同一条校验/
+    ///    日志路径),成功还原出生点(落点不覆盖出生点)+ 登记待附身。
+    fn flush_pending_respawns(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+        hub: &OutboundHub,
+    ) {
+        if self.respawn.pending_respawns().is_empty() {
+            return;
+        }
+        let now = session.tick_now();
+        let entries = self.respawn.pending_respawns();
+        for (player, point, issued_at) in entries {
+            // ① 已有存活身体:等待已被(网络生成)取消,静默出表。
+            if self.player_body_of(session, player).is_some() {
+                self.respawn.end_respawn_wait(player);
+                continue;
+            }
+            // 出生点列地形探询的前置:chunk 未装载/分片未注册 → 等或超时。
+            let cell = types::BlockPos::new(
+                point.position.x.floor() as i32,
+                point.position.y.floor() as i32,
+                point.position.z.floor() as i32,
+            );
+            let chunk = cell.chunk_of();
+            let shard =
+                types::ShardId::new(types::WorldId(0), types::DimensionId(0), chunk.shard_of());
+            let loaded =
+                session.shard_ids().contains(&shard) && session.is_chunk_loaded(shard, chunk);
+            if !loaded {
+                if now.0 >= issued_at.0 + crate::respawn::RESPAWN_LOAD_TIMEOUT_TICKS {
+                    self.respawn.end_respawn_wait(player);
+                    self.fail_respawn_possess(player, hub);
+                }
+                continue;
+            }
+            // ② 已装载:安全落点(脚下实心 + 占用两格非实心,否则换列)。
+            let solid = |pos: types::BlockPos| session.block_solid_at(shard, pos);
+            match crate::respawn::safe_spawn_position(point.position, 0.9, WORLD_Y_MIN, solid) {
+                crate::respawn::SafeSpot::Found(pos) => {
+                    self.respawn.end_respawn_wait(player);
+                    let spawned = self.handle_spawn_agent(
+                        player,
+                        point.body.clone(),
+                        pos,
+                        point.yaw,
+                        session,
+                        log,
+                        hub,
+                    );
+                    match spawned {
+                        Some(new_entity) => {
+                            // 落点不覆盖出生点(§6"安全落点"):换列生成的
+                            // 落点若被 `handle_spawn_agent` 的覆盖写登记成
+                            // 新出生点,下次重生会越漂越远——还原。
+                            self.respawn.restore_spawn_point(player, point.clone());
+                            self.respawn
+                                .begin_possess_wait(player, new_entity, session.tick_now());
+                        }
+                        None => self.fail_respawn_possess(player, hub),
+                    }
+                }
+                crate::respawn::SafeSpot::NotLoaded => {
+                    // 出生点列读得到 chunk 但落点列还有格读不到(候选列
+                    // 未装载的同款窗口):同第 2 步,等或超时。
+                    if now.0 >= issued_at.0 + crate::respawn::RESPAWN_LOAD_TIMEOUT_TICKS {
+                        self.respawn.end_respawn_wait(player);
+                        self.fail_respawn_possess(player, hub);
+                    }
+                }
+                crate::respawn::SafeSpot::NoGround => {
+                    self.respawn.end_respawn_wait(player);
+                    self.fail_respawn_possess(player, hub);
+                }
+            }
         }
     }
 
@@ -1615,8 +1687,12 @@ impl ObserveOrchestrator {
                 DriverCommand::MoveObserver { position } => {
                     // REQ-012 A03 §5(AC-A7):附身期间该连接的 MoveObserver
                     // 一律忽略并计数(防止客户端把视野和身体分开;服务端用
-                    // 跟随簿记替它移)。未附身 → 照旧入日志生效。
-                    if self.possessed_by.contains_key(&player) {
+                    // 跟随簿记替它移)。R3 §6:重生等区块装载期间同样忽略
+                    // (观察者已被驱动移到出生点,客户端移动会拉走 chunk 流
+                    // 中心,出生点永远装载不好)。未附身 → 照旧入日志生效。
+                    if self.possessed_by.contains_key(&player)
+                        || self.respawn.is_respawn_pending(player)
+                    {
                         self.agent_counters.move_observer_ignored += 1;
                         return;
                     }
@@ -1671,7 +1747,16 @@ impl ObserveOrchestrator {
                     position,
                     yaw,
                 } => {
-                    self.handle_spawn_agent(player, body, position, yaw, session, log, hub);
+                    // §6 修订:等待期间这个连接自己发 SpawnAgent 并**被接受**
+                    // 时,取消等待中的重生(生成命令由新请求接管;重生落点
+                    // 不再生成)。取消放在网络入口一侧,不进 `handle_spawn_
+                    // agent`——重生路径自己也调它,在那里取消会吃掉自己的
+                    // 登记。
+                    let spawned =
+                        self.handle_spawn_agent(player, body, position, yaw, session, log, hub);
+                    if spawned.is_some() && self.respawn.end_respawn_wait(player) {
+                        self.agent_counters.respawn_wait_cancelled += 1;
+                    }
                 }
                 DriverCommand::Possess { entity } => {
                     self.handle_possess(player, entity, session, log, hub);
@@ -2420,6 +2505,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     // 并自动附身(与网络请求同一条校验/日志路径);AI 主体只
                     // 移除。在 reap 之后(被迫解除先落地,重生回执随后)。
                     orchestrator.respawn_void_removed_players(&mut session, &mut log, hub);
+                    // 重生等区块装载的续随(R3 §6 修订):装载好再生成,
+                    // 在 `flush_pending_respawn_possess` 之前。
+                    orchestrator.flush_pending_respawns(&mut session, &mut log, hub);
                     orchestrator.flush_pending_respawn_possess(&mut session, &mut log, hub);
                     orchestrator.flush_pending_intents(&mut session, &mut log);
                     orchestrator.follow_observers(&mut session, &mut log, hub);
@@ -7272,5 +7360,252 @@ mod tests {
         let got_possessed_none = std::iter::from_fn(|| outbound.try_pop())
             .any(|msg| msg == S2C::Possessed { entity: None });
         assert!(got_possessed_none, "Ready 被拒也必须补发 Possessed(None)");
+    }
+
+    // -------------------------------------------------------------------
+    // R3(§6 等区块装载/安全落点):等待表、MoveObserver 忽略、超时、
+    // 网络生成取消、出生点还原
+    // -------------------------------------------------------------------
+
+    /// R3 布景:装载了 chunk(0,0) 的会话,出生点列在 (cx, cz) 全平地
+    /// (y ≤ ground_y 实心),并在格 (cx, ground_y) 放实心(平地已实心,
+    /// ground_y 即顶面格)。返回 (session, hub, outbound)。
+    fn respawn_flat_session(
+        config: &Config,
+        ground_y: i32,
+    ) -> (sim_api::session::Session, OutboundHub, crate::net::Outbound) {
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        let mut chunk = voxel::Chunk::air();
+        let stone = types::BlockId(1);
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                chunk.set(x, (ground_y - types::WORLD_Y_MIN) as usize, z, stone);
+            }
+        }
+        session.apply_chunk_load(shard_id(0, 0), types::ChunkPos::new(0, 0), chunk);
+        let hub = OutboundHub::new();
+        let outbound = crate::net::Outbound::new();
+        (session, hub, outbound)
+    }
+
+    /// D1(R3 §6):等待重生期间该连接的 `MoveObserver` 被忽略并计数;
+    /// 对照:不在等待时同一命令生效(观察者表位置更新)。变红实现:
+    /// `is_respawn_pending` 判断缺失(等待期间 MoveObserver 入日志生效)。
+    #[test]
+    fn d1_move_observer_ignored_while_respawn_pending() {
+        let config = test_config(600);
+        let (mut session, _hub, _outbound) = respawn_flat_session(&config, -59);
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        let player = messaging::InputSource(1);
+        // 对照线:不在等待时,MoveObserver 生效(观察者表里有位置;
+        // 命令 apply_at = 当前拍,tick 一次生效)。
+        let far = types::glam::Vec3::new(8.0, -56.0, 8.0);
+        let entry = session.move_observer_from(player, far).expect("生效");
+        log.append(entry);
+        session.tick();
+        assert!(
+            session.observers().iter().any(|(p, _)| *p == player),
+            "对照:不在等待时 MoveObserver 生效"
+        );
+        // 布景:登记等待 → 同一连接再发 MoveObserver(走 consume_net_up 的
+        // DriverCommand 分支,与网络同路径)→ 应被忽略并计数。
+        o.respawn.begin_respawn_wait(
+            player,
+            crate::respawn::SpawnPoint {
+                position: types::glam::Vec3::new(8.5, -58.0, 8.5),
+                yaw: 0.0,
+                body: "capsule".to_owned(),
+            },
+            session.tick_now(),
+        );
+        let mut commands_rejected = 0_u64;
+        o.consume_net_up(
+            NetUp::DriverCommand {
+                player,
+                cmd: DriverCommand::MoveObserver {
+                    position: types::glam::Vec3::new(60.0, -56.0, 60.0),
+                },
+            },
+            &mut session,
+            &mut log,
+            &mut commands_rejected,
+            &_hub,
+        );
+        assert_eq!(
+            o.agent_counters.move_observer_ignored, 1,
+            "等待期间 MoveObserver 被忽略(实得 {})",
+            o.agent_counters.move_observer_ignored
+        );
+        // 等待期间的移动没有入日志生效:tick 后观察者位置仍 = 对照那次。
+        session.tick();
+        assert_eq!(
+            session
+                .observers()
+                .iter()
+                .find(|(p, _)| *p == player)
+                .map(|(_, v)| *v),
+            Some(far),
+            "观察者位置仍 = 登记等待前那次(等待期间的移动被忽略)"
+        );
+    }
+
+    /// D2(R3 §6):chunk 一直不装载,推到 600 拍超时 → `player_respawn_
+    /// failed` = 1、出站有 `Possessed(None)`;599 拍时还没有。变红实现:
+    /// 超时判断去掉(等待永不失败)。
+    #[test]
+    fn d2_respawn_wait_timeout_fails_at_600_ticks() {
+        let config = test_config(600);
+        // 不装载任何 chunk:出生点 (8.5, ·, 8.5) 所在 chunk 永远缺。
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(sim(0, 0));
+        let hub = OutboundHub::new();
+        let mut outbound = crate::net::Outbound::new();
+        let player = messaging::InputSource(1);
+        hub.register(player, outbound.world_writer());
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        o.respawn.begin_respawn_wait(
+            player,
+            crate::respawn::SpawnPoint {
+                position: types::glam::Vec3::new(8.5, -58.0, 8.5),
+                yaw: 0.0,
+                body: "capsule".to_owned(),
+            },
+            session.tick_now(),
+        );
+        // 逐拍 flush(生产 run 同节奏):发起拍 = t0,第 t0+600 拍判超时
+        // (issued_at + RESPAWN_LOAD_TIMEOUT_TICKS ≤ now),之前都不判。
+        // i 从 1 计:t0+i 拍 tick 后 flush;i ≤ 599 时不应失败。
+        let timeout = crate::respawn::RESPAWN_LOAD_TIMEOUT_TICKS;
+        for i in 1..timeout {
+            session.tick();
+            o.flush_pending_respawns(&mut session, &mut log, &hub);
+            o.flush_pending_respawn_possess(&mut session, &mut log, &hub);
+            assert_eq!(
+                o.agent_counters.player_respawn_failed, 0,
+                "拍 +{i}:未到超时,不应判失败"
+            );
+            assert!(o.respawn.is_respawn_pending(player), "拍 +{i}:仍在等待");
+        }
+        // 第 600 拍(发起 + 600 拍):超时到期,判失败。
+        session.tick();
+        o.flush_pending_respawns(&mut session, &mut log, &hub);
+        assert_eq!(
+            o.agent_counters.player_respawn_failed, 1,
+            "600 拍超时 → player_respawn_failed = 1(实得 {})",
+            o.agent_counters.player_respawn_failed
+        );
+        assert!(!o.respawn.is_respawn_pending(player), "超时后条目出表");
+        let got_possessed_none = std::iter::from_fn(|| outbound.try_pop())
+            .any(|msg| msg == S2C::Possessed { entity: None });
+        assert!(got_possessed_none, "超时失败补发 Possessed(None)");
+    }
+
+    /// D3(R3 §6):等待期间网络 `SpawnAgent` 被接受 → 等待出表,之后
+    /// 虚空移除不再触发重生路径补生成(等待已取消)。变红实现:网络生成
+    /// 不取消等待(变异 6)。
+    #[test]
+    fn d3_network_spawn_cancels_pending_respawn() {
+        let config = test_config(600);
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let (mut session, hub, _outbound) = respawn_flat_session(&config, -59);
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::with_bodies(ObserveCadence::default(), 0, bodies);
+        let player = messaging::InputSource(1);
+        // 等待中(chunk 已装载,落点完好)。
+        o.respawn.begin_respawn_wait(
+            player,
+            crate::respawn::SpawnPoint {
+                position: types::glam::Vec3::new(8.5, -58.0, 8.5),
+                yaw: 0.0,
+                body: "capsule".to_owned(),
+            },
+            session.tick_now(),
+        );
+        // 网络 SpawnAgent(另一位置)被接受。
+        let mut commands_rejected = 0_u64;
+        o.consume_net_up(
+            NetUp::DriverCommand {
+                player,
+                cmd: DriverCommand::SpawnAgent {
+                    body: "capsule".to_owned(),
+                    position: types::glam::Vec3::new(12.5, -58.0, 12.5),
+                    yaw: 90.0,
+                },
+            },
+            &mut session,
+            &mut log,
+            &mut commands_rejected,
+            &hub,
+        );
+        assert!(
+            !o.respawn.is_respawn_pending(player),
+            "网络生成被接受 → 等待出表(spawn_rejected={})",
+            o.agent_counters.spawn_rejected
+        );
+        assert_eq!(
+            o.agent_counters.respawn_wait_cancelled, 1,
+            "取消计数(实得 {})",
+            o.agent_counters.respawn_wait_cancelled
+        );
+        // 之后 flush 不再生成(等不到出生点重生;队列里只有网络生成那条)。
+        o.flush_pending_respawns(&mut session, &mut log, &hub);
+        assert_eq!(o.agent_counters.player_respawned, 0, "取消后不再走重生生成");
+    }
+
+    /// D4(R3 §6"安全落点"):出生点列挖穿,重生落在换列位置;
+    /// `spawn_point(player)` 仍等于**原出生点**(落点不覆盖出生点)。
+    /// 变红实现:重生后不 `restore_spawn_point`(变异 4——落点经
+    /// `handle_spawn_agent` 覆盖写成为新出生点,下次重生漂移)。
+    #[test]
+    fn d4_respawn_at_neighbor_column_keeps_original_spawn_point() {
+        let config = test_config(600);
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let (mut session, hub, _outbound) = respawn_flat_session(&config, -59);
+        // 出生点列 (8, ·, 8) 全空气(挖穿);邻列平地完好 → 落点必在
+        // 第 1 环第一列 (7, 7)(先 z 后 x)。
+        let shard = shard_id(0, 0);
+        for y in types::WORLD_Y_MIN..=-59 {
+            session
+                .set_block(shard, types::BlockPos::new(8, y, 8), types::BlockId::AIR)
+                .expect("挖穿出生点列");
+        }
+        session.tick();
+        let mut log = sim_api::log::CommandLog::new();
+        let mut o = ObserveOrchestrator::with_bodies(ObserveCadence::default(), 0, bodies);
+        let player = messaging::InputSource(1);
+        let original = crate::respawn::SpawnPoint {
+            position: types::glam::Vec3::new(8.5, -58.0, 8.5),
+            yaw: 0.0,
+            body: "capsule".to_owned(),
+        };
+        o.respawn
+            .begin_respawn_wait(player, original.clone(), session.tick_now());
+        // flush:装载完好 → 安全落点换列 → 生成。
+        o.flush_pending_respawns(&mut session, &mut log, &hub);
+        assert_eq!(
+            o.agent_counters.player_respawn_failed, 0,
+            "换列落点应成功(实得失败 {})",
+            o.agent_counters.player_respawn_failed
+        );
+        // 生成已投递(handle_spawn_agent 成功 = 新出生点被覆盖写成落点),
+        // spawn_point 必须 = 原出生点。
+        assert_eq!(
+            o.respawn.spawn_point(player),
+            Some(&original),
+            "落点不覆盖出生点(restore_spawn_point 生效)"
+        );
     }
 }

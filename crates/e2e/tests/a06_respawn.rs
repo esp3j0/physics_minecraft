@@ -9,11 +9,12 @@
 //!   `Possessed(Some(新 ID))`;`player_respawned` = 3、`player_respawn_failed`
 //!   = 0;新身体的意图能驱动它走。对照:AI 主体(source = None)掉虚空只
 //!   移除不重生。
-//! - **A06-5(=T3/T4)**:恢复清扫**真的重启**(带玩家身体写检查点 → 关停 →
+//! - **A06-5(=T3)**:恢复清扫**真的重启**(带玩家身体写检查点 → 关停 →
 //!   同一存储起新驱动 → 第一拍清扫移除 → 再跑 60 拍),`player_respawned`
-//!   = 0、`bodies_removed_on_recovery` ≥ 1;出生点不可用(驱动层单测,
-//!   a06_5_spawn_point_unavailable)计 `player_respawn_failed` = 1、
-//!   `player_respawned` = 0、连接收 `Possessed(None)`;断线移除不重生。
+//!   = 0、`bodies_removed_on_recovery` ≥ 1;断线移除不重生。R3(§6 修订)
+//!   起"出生点不可用"改为**等区块装载 + 安全落点**:走远掉出世界 → 观察
+//!   者移回出生点 → chunk 重载 → 重生(E1);洞在出生点正下方 → 换列落点
+//!   (E2);600 拍超时失败口径在驱动层单测(app D2)。
 //! - **A06-6(=T5)**:含一次重生的会话,拼接日志**从头回放两次**,逐拍
 //!   比较全部主体状态逐位相同;并与在线会话末态逐位相同。
 //!
@@ -147,6 +148,56 @@ async fn wait_respawn_possessed(
             }
         }
         let _ = a; // 保留参数形状(未来需要补发意图时用)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// chunk 流装卸帧等待(R3:chunk 流装卸证据的辅助)
+// ---------------------------------------------------------------------------
+
+/// 排干后等某 chunk 的 `ChunkUnload` 帧(客户端流侧卸载证据;泵的卸载请求
+/// 与服务端 `apply_chunk_unload` 同一驱动路径)。
+async fn wait_chunk_unload(rx: &mut mpsc::UnboundedReceiver<S2C>, pos: types::ChunkPos) {
+    let deadline = Deadline::new("出生点 chunk 的 ChunkUnload 帧(客户端流侧卸载证据)");
+    let mut frames = 0usize;
+    loop {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET {
+            panic!("等 ChunkUnload({pos:?}) 超预算(在等:客户端流卸载出生点 chunk)");
+        }
+        advance_ticks(1).await;
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(rx).await {
+                Some(S2C::ChunkUnload { pos: p }) if p == pos => return,
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+}
+
+/// 排干后等某 chunk 的 `ChunkData` 帧(重生等待期间观察者被移回出生点、
+/// chunk 重载的结构证据;只在驱动 `apply_chunk_load` 之后由泵发出)。
+async fn wait_chunk_reload(rx: &mut mpsc::UnboundedReceiver<S2C>, pos: types::ChunkPos) {
+    let deadline = Deadline::new("出生点 chunk 重载(ChunkData 重到)");
+    let mut frames = 0usize;
+    loop {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET {
+            panic!("等 ChunkData({pos:?}) 超预算(在等:重生等待把观察者移回出生点后 chunk 重载)");
+        }
+        advance_ticks(1).await;
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(rx).await {
+                Some(S2C::ChunkData { pos: p, .. }) if p == pos => return,
+                Some(_) => {}
+                None => break,
+            }
+        }
     }
 }
 
@@ -1056,37 +1107,32 @@ fn stitched_log(checkpoints: &[(types::Tick, Vec<u8>)]) -> CommandLog {
 }
 
 // ---------------------------------------------------------------------------
-// A06-5(=T4,R1):出生点不可用 → player_respawn_failed = 1 + Possessed(None)
+// A06 R3(§6 修订):E1 等区块装载 / E2 安全落点
 // ---------------------------------------------------------------------------
 
-/// T4:出生点 chunk 卸载后身体被虚空移除 → 不重生,计
-/// `player_respawn_failed` = 1、`player_respawned` = 0,连接收到
-/// `Possessed(None)`。
+/// E1(§6"等区块装载";替代旧 T4"出生点不可用"——返修单第 3 节授权
+/// "按新条文改成 E1"):走远后出生点 chunk 卸载,掉出世界能回来。
 ///
-/// 构造:玩家在 A=(8.5, ·, 8.5) 生成(view 4);观察者移到远处 B(≈140 m,
-/// 出观察票"出"区域)→ A 区 chunk 由激活决策卸载(无票、冷却后);挖穿
-/// 身体脚下(B 区)→ 身体掉虚空 → 驱动重生回 A → `handle_spawn_agent`
-/// 校验"出生 chunk 已装载"拒绝 → 失败计数;连接收 `Possessed(None)`
-/// (reap 在移除拍已发一次;TimedOut 分支不再重发——本判据等 reap 那条)。
+/// 流程:view=1 join → 出生点 (8.5,·,8.5) 生成附身 → 意图 +x 走 ~100 m
+/// (1400 拍)→ 停稳 → **对照线:先断言出生点 chunk 已卸载**(客户端流的
+/// `ChunkUnload(0,0)` 帧;泵的卸载请求与驱动 `apply_chunk_unload` 同一
+/// 路径)→ 洞挖在停点 → 身体掉虚空 → 驱动把观察者移回出生点(等待期间
+/// 该连接的 `MoveObserver` 被忽略)→ chunk 重载(收到 `ChunkData(0,0)`)
+/// → 安全落点重生 → 自动附身 `Possessed(Some)`、新身体在出生点附近。
 #[tokio::test(start_paused = true)]
-async fn a06_5_spawn_point_unavailable_respawn_failed() {
+async fn a06_r3_e1_walk_far_chunk_unloaded_respawn() {
     let h = harness(base_config()).await;
     let (mut a, mut rxa) = client(h.addr).await;
     tokio::task::yield_now().await;
-    join(&mut a, &mut rxa, 4).await;
+    join(&mut a, &mut rxa, 1).await;
     a.send(&C2S::MoveObserver {
         position: Vec3::new(8.0, GROUND_TOP_Y + 2.0, 8.0),
     })
     .await
     .expect("MoveObserver");
     advance_ticks(30).await;
-    let body = spawn_agent_expect(
-        &mut a,
-        &mut rxa,
-        Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5),
-        0.0,
-    )
-    .await;
+    let spawn_pos = Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5);
+    let body = spawn_agent_expect(&mut a, &mut rxa, spawn_pos, 0.0).await;
     advance_ticks(30).await;
     possess_expect(&mut a, &mut rxa, body).await;
     for _ in 0..60 {
@@ -1094,12 +1140,8 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
         let _ = agent_pose_drained(&mut rxa, body).await;
     }
 
-    // 身体**用意图走远**(附身中观察者被服务器跟随拉回身体旁,MoveObserver
-    // 会被覆写):逐拍发意图 +x,固定走 700 拍(虚拟时钟下 60 拍/s × 4.3
-    // m/s ≈ 50 m;**不依赖下行帧采样**——CI 帧投递时序不可判是 R1/R2/R3
-    // 的既证结论)。行走距离按拍数解析推算(末速见 eprintln 的本地标定):
-    // 出生点 (8.5,·,8.5) 距身体 > 48 m(默认 data_unload_radius)即出卸载圈。
-    for _ in 0..700 {
+    // 走远:逐拍发意图 +x,1400 拍(4.3 m/s × 1400/60 ≈ 100 m)。
+    for _ in 0..1400 {
         a.send(&C2S::AgentIntent {
             entity: body,
             move_xz: (4.3, 0.0),
@@ -1110,8 +1152,7 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
         .expect("走远");
         advance_ticks(1).await;
     }
-    // 发零意图停住(刹车 ~120 拍,a03 系"先 settle 等刹车"同款),再给卸载
-    // 决策与冷却留拍数(数据预算逐拍装卸)。
+    // 停住(刹车 ~120 拍)+ 留数据卸载决策与冷却拍数(旧 T4 同款 600)。
     a.send(&C2S::AgentIntent {
         entity: body,
         move_xz: (0.0, 0.0),
@@ -1123,40 +1164,50 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
     advance_ticks(120).await;
     advance_ticks(600).await;
 
-    // 洞挖在**固定坐标**(身体解析行程 ≈ 700 × 4.3/60 ≈ 50 m → 停在
-    // x ≈ 58;挖 x=56..58、z=8..9 整列 AIR——身体停稳点落在洞上,零意图
-    // 后不再移动)。世界底全深挖穿,身体悬空掉虚空。
-    // 停稳位置解析推算:700 拍 × 4.3/60 ≈ 50.2 m + 刹车滑行 → x ≈ 59.6
-    // (本地实测 59.64;CI 同虚拟时钟,拍数即距离)。洞挖 x=58..60、
-    // z=8..9 整列 AIR,覆盖停稳格。
-    let bx = 58_i32;
-    let bz = 8_i32;
+    // 对照线(先断言):出生点 chunk 已卸载(客户端流 ChunkUnload 帧)。
+    wait_chunk_unload(&mut rxa, types::ChunkPos::new(0, 0)).await;
+
+    // 读身体实际停点;断言确实走出了 48 m 数据卸载圈。
+    let stopped = agent_pose_drained(&mut rxa, body)
+        .await
+        .unwrap_or_else(|| panic!("读身体停点失败(在等:身体停稳后的 AgentStates 帧)"));
+    let walked = stopped.x - spawn_pos.x;
+    eprintln!(
+        "E1:身体停点 ({:.2}, {:.2}),距出生点 {walked:.1} m",
+        stopped.x, stopped.z
+    );
+    assert!(
+        walked > 48.0,
+        "身体应走出数据卸载圈 48 m(实走 {walked:.1} m)"
+    );
+
+    // 洞挖在停点(x ± 1、z 两列,世界底全深)→ 身体悬空掉虚空。
+    let bx = stopped.x.floor() as i32;
+    let bz = stopped.z.floor() as i32;
     let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
-    for x in [bx, bx + 1] {
-        for z in [bz, bz + 1] {
+    for x in (bx - 1)..=(bx + 1) {
+        for z in bz..=(bz + 1) {
             for y in (types::WORLD_Y_MIN..=top_cell).rev() {
                 set_block(&mut a, BlockPos::new(x, y, z), types::BlockId::AIR).await;
             }
         }
     }
-    // 等虚空移除 + 重生尝试(失败)。终点判据 = 旧身体 removed(虚空移除)+
-    // Possessed(None) 到达,**两条独立置位**(reap 的 Possessed(None) 与
-    // removed 帧同拍不同通道,先后顺序不可依赖——CI 时序不可判是 R1/R2/R3
-    // 的既证结论)。
+
+    // 等虚空移除 → 等区块装载 → 重生 → 自动附身(Possessed(Some(≠旧)))。
     let mut removed_seen = false;
-    let mut possessed_none = false;
     let mut frames = 0usize;
-    let deadline = Deadline::new("虚空移除 → 重生失败 → Possessed(None)");
-    loop {
+    let deadline = Deadline::new("虚空移除 → 等区块装载 → 重生 → Possessed(Some)");
+    let new_body = loop {
         deadline.check();
         if frames >= FRAME_BUDGET {
             panic!(
-                "等出生点不可用的失败重生超预算:{FRAME_BUDGET} 帧;removed_seen={removed_seen} \
-                 possessed_none={possessed_none}(在等:虚空移除 → 重生失败 → Possessed(None))"
+                "等重生自动附身超预算:{FRAME_BUDGET} 帧;removed_seen={removed_seen} \
+                 (在等:虚空移除 → 等区块装载 → 重生 → Possessed(Some(≠{body:?})))"
             );
         }
         frames += 1;
         advance_ticks(1).await;
+        let mut done = None;
         for _ in 0..32 {
             real_yield().await;
             match next_frame(&mut rxa).await {
@@ -1165,30 +1216,161 @@ async fn a06_5_spawn_point_unavailable_respawn_failed() {
                         removed_seen = true;
                     }
                 }
-                Some(S2C::Possessed { entity: None }) => {
-                    possessed_none = true;
+                Some(S2C::Possessed { entity: Some(x) }) if x != body => {
+                    done = Some(x);
+                    break;
                 }
                 Some(_) => {}
                 None => break,
             }
         }
-        if removed_seen && possessed_none {
-            break;
+        if let Some(x) = done {
+            break x;
+        }
+    };
+    assert!(removed_seen, "旧身体应出现在 AgentStates.removed(虚空移除)");
+
+    // 出生点 chunk 重载证据:ChunkData(0,0) 重到(驱动先 apply_chunk_load,
+    // 泵才发 ChunkData——装载好了才可能生成)。
+    wait_chunk_reload(&mut rxa, types::ChunkPos::new(0, 0)).await;
+
+    // 新身体在出生点附近(原位置落点 = Found(point) 原样,水平差 < 2 m)。
+    let root = agent_pose_drained(&mut rxa, new_body)
+        .await
+        .unwrap_or_else(|| panic!("读新身体位置失败(在等:新身体的 AgentStates 帧)"));
+    eprintln!("E1:重生落点 ({:.2}, {:.2}, {:.2})", root.x, root.y, root.z);
+    assert!(
+        (root.x - spawn_pos.x).abs() <= 2.0 && (root.z - spawn_pos.z).abs() <= 2.0,
+        "新身体应在出生点附近(根位置 {root:?} vs 出生点 {spawn_pos:?})"
+    );
+
+    drop(a);
+    let outcome = shutdown(h).await;
+    assert_eq!(
+        respawned(&outcome),
+        1,
+        "player_respawned = 1(实得 {})",
+        outcome.agent.player_respawned
+    );
+    assert_eq!(
+        respawn_failed(&outcome),
+        0,
+        "player_respawn_failed = 0(实得 {})",
+        outcome.agent.player_respawn_failed
+    );
+}
+
+/// E2(§6"安全落点";用户人工验收复现的无限重生 bug):洞挖在出生点
+/// 正下方 → 掉出世界后重生在**邻列**,之后 300 拍内没有第二次虚空移除
+/// (修订前 ~124 拍一轮无限重生停不下来)。`player_respawned` = 1。
+/// 变红实现:`safe_spawn_position` 恒返回 `Found(point)`(原地重生 →
+/// 再掉 → 循环)。
+#[tokio::test(start_paused = true)]
+async fn a06_r3_e2_hole_under_spawn_respawn_neighbor_no_loop() {
+    let h = harness(base_config()).await;
+    let (mut a, mut rxa) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    join(&mut a, &mut rxa, 4).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(8.0, GROUND_TOP_Y + 2.0, 8.0),
+    })
+    .await
+    .expect("MoveObserver");
+    advance_ticks(30).await;
+    let spawn_pos = Vec3::new(8.5, GROUND_TOP_Y + 1.2, 8.5);
+    let body = spawn_agent_expect(&mut a, &mut rxa, spawn_pos, 0.0).await;
+    advance_ticks(30).await;
+    possess_expect(&mut a, &mut rxa, body).await;
+    for _ in 0..60 {
+        advance_ticks(1).await;
+        let _ = agent_pose_drained(&mut rxa, body).await;
+    }
+
+    // 洞挖在出生点正下方(出生点列 (8,·,8) 世界底全深;观察者就在出生点,
+    // chunk 全程装载)。
+    let top_cell = (GROUND_TOP_Y - 1.0).floor() as i32;
+    for y in (types::WORLD_Y_MIN..=top_cell).rev() {
+        set_block(&mut a, BlockPos::new(8, y, 8), types::BlockId::AIR).await;
+    }
+
+    // 掉落 → 虚空移除 → 安全落点重生 → 自动附身。
+    let mut removed_seen = false;
+    let mut frames = 0usize;
+    let deadline = Deadline::new("虚空移除 → 安全落点重生 → Possessed(Some)");
+    let new_body = loop {
+        deadline.check();
+        if frames >= FRAME_BUDGET {
+            panic!(
+                "等重生超预算:{FRAME_BUDGET} 帧;removed_seen={removed_seen} \
+                 (在等:虚空移除 → 安全落点重生 → Possessed(Some(≠{body:?})))"
+            );
+        }
+        frames += 1;
+        advance_ticks(1).await;
+        let mut done = None;
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(&mut rxa).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    if removed.contains(&body) {
+                        removed_seen = true;
+                    }
+                }
+                Some(S2C::Possessed { entity: Some(x) }) if x != body => {
+                    done = Some(x);
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if let Some(x) = done {
+            break x;
+        }
+    };
+    assert!(removed_seen, "旧身体应出现在 AgentStates.removed(虚空移除)");
+
+    // 新身体落在邻列(第 1 环第一列 (7,7):cx=8、cz=8;落点 = 顶格 -61
+    // + 1 + 1.0 = -59.0,水平 (7.5, 7.5))。
+    let root = agent_pose_drained(&mut rxa, new_body)
+        .await
+        .unwrap_or_else(|| panic!("读新身体位置失败(在等:新身体的 AgentStates 帧)"));
+    eprintln!("E2:重生落点 ({:.2}, {:.2}, {:.2})", root.x, root.y, root.z);
+    assert!(
+        (root.x - 7.5).abs() <= 0.3 && (root.z - 7.5).abs() <= 0.3,
+        "重生应落在邻列 (7.5, ·, 7.5)(实得 {root:?};出生点列已挖穿,不得原地重生)"
+    );
+
+    // 300 拍内没有第二次虚空移除(修订前的循环 ≈124 拍一轮)。
+    for i in 0..300 {
+        advance_ticks(1).await;
+        for _ in 0..32 {
+            real_yield().await;
+            match next_frame(&mut rxa).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    assert!(
+                        !removed.contains(&new_body),
+                        "拍 {i}:新身体再次被虚空移除(重生应已跳出洞,不再循环)"
+                    );
+                }
+                Some(_) => {}
+                None => break,
+            }
         }
     }
 
     drop(a);
     let outcome = shutdown(h).await;
     assert_eq!(
-        respawn_failed(&outcome),
+        respawned(&outcome),
         1,
-        "出生点不可用:player_respawn_failed = 1(实得 {})",
-        outcome.agent.player_respawn_failed
+        "player_respawned = 1(实得 {})",
+        outcome.agent.player_respawned
     );
     assert_eq!(
-        respawned(&outcome),
+        respawn_failed(&outcome),
         0,
-        "player_respawned = 0(实得 {})",
-        outcome.agent.player_respawned
+        "player_respawn_failed = 0(实得 {})",
+        outcome.agent.player_respawn_failed
     );
 }

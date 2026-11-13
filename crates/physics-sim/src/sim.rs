@@ -743,6 +743,17 @@ impl ShardSim {
         &self.voxels
     }
 
+    /// 只读读方块实心性(REQ-012 A06 R3 §6"等区块装载":重生安全落点
+    /// 的地形探询;不进快照、不改状态)。chunk 未加载 → None(调用方等
+    /// 装载重试);y 界外 → 世界口径 AIR(非实心,与 [`VoxelWorld::
+    /// get_block`] 一致);其余 = 方块注册表的实心判定。
+    pub fn block_solid_at(&self, pos: types::BlockPos) -> Option<bool> {
+        self.voxels.get_chunk(pos.chunk_of()).map(|_| {
+            let block = self.voxels.get_block(pos);
+            self.registry.is_solid(block)
+        })
+    }
+
     pub fn entity_count(&self) -> usize {
         self.entities.len()
     }

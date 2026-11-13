@@ -298,6 +298,13 @@ impl Session {
         self.scheduler.voxel_chunk(shard, pos)
     }
 
+    /// 只读读方块实心性(REQ-012 A06 R3 §6"等区块装载":重生安全落点
+    /// 的地形探询;不进快照、不改状态、不写日志)。chunk 未加载或分片
+    /// 未注册 → None(调用方等装载重试)。
+    pub fn block_solid_at(&self, shard: ShardId, pos: types::BlockPos) -> Option<bool> {
+        self.scheduler.block_solid_at(shard, pos)
+    }
+
     /// Router 待投递信封的目的分片(REQ-005 D5;驱动 tick 末 ensure 用;
     /// 调度器透传)。
     pub fn pending_shard_destinations(&self) -> std::collections::BTreeSet<ShardId> {

@@ -914,6 +914,10 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
     // REQ-012 A06:附身状态机 + 身体形状表(启动时读 assets/bodies)。
     let mut possess_state = PossessState::new();
     let mut body_table = BodyShapeTable::from_dir(std::path::Path::new("assets/bodies"));
+    // R3(§6 修订):附身期间相机在世界高度以内时逐帧记录;身体没了且
+    // 相机落在世界底下时,用它放回(camera_after_body_lost)。
+    let mut last_safe_camera: Option<types::glam::Vec3> = None;
+    let mut was_possessed = false;
 
     loop {
         let dt = get_frame_time();
@@ -1060,6 +1064,15 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                 #[allow(clippy::disallowed_methods)] // 墙钟(P 按下沿时刻;渲染侧授权)
                 let now = Instant::now();
                 let commands = possess_state.on_p_pressed(spawn_target, now);
+                // R3(§6 修订):按 P 发不出命令(NoBody 且准星下没有可
+                // 拾取的地面,典型 = 掉出世界后相机在世界底下)→ 提示
+                // (复用工具提示通道,3 秒过期)。
+                if commands.is_empty()
+                    && let Some(hint) =
+                        possess::p_press_hint(possess_state.phase(), target.is_none())
+                {
+                    tools.reject(hint);
+                }
                 let intent_target = possess_state.possessed();
                 for command in commands {
                     forward_possess_command(command, intent_target, &control);
@@ -1287,7 +1300,27 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                 possess_state.camera_dist(),
             );
             camera.position = vec3(pos.x, pos.y, pos.z);
+            // R3(§6 修订):附身中、相机在世界高度以内 → 逐帧记录最后
+            // 安全位(身体掉出世界时相机跟到底下,放回用)。
+            if camera.position.y >= types::WORLD_Y_MIN as f32 {
+                last_safe_camera = Some(types::glam::Vec3::new(
+                    camera.position.x,
+                    camera.position.y,
+                    camera.position.z,
+                ));
+            }
         }
+        // R3(§6 修订):上一帧附身、这一帧不附身(身体被虚空移除,相机
+        // 落在世界底下)→ 用 camera_after_body_lost 放回。主动按 P 退出
+        // 附身时相机还在世界高度以内,该函数原样返回,不受影响。
+        if was_possessed && possessed_id.is_none() {
+            let cur =
+                types::glam::Vec3::new(camera.position.x, camera.position.y, camera.position.z);
+            let fixed =
+                possess::camera_after_body_lost(cur, last_safe_camera, types::WORLD_Y_MIN as f32);
+            camera.position = vec3(fixed.x, fixed.y, fixed.z);
+        }
+        was_possessed = possessed_id.is_some();
         set_camera(&camera.to_camera());
         for mesh in world.meshes.values() {
             draw_mesh(mesh);

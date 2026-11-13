@@ -907,6 +907,13 @@ impl Scheduler {
         self.sims.get(&shard)?.voxel().get_chunk(pos)
     }
 
+    /// 只读读方块实心性(REQ-012 A06 R3 §6"等区块装载":重生安全落点
+    /// 的地形探询;两拍之间读,分片由调度器持有,无锁竞争)。chunk 未
+    /// 加载或分片未注册 → None(调用方等装载重试)。
+    pub fn block_solid_at(&self, shard: ShardId, pos: types::BlockPos) -> Option<bool> {
+        self.sims.get(&shard)?.block_solid_at(pos)
+    }
+
     /// ② 是否已建(REQ-007 任务 01;基线比对/断言观测用)。
     /// 分片未注册 → false。
     pub fn has_collider(&self, shard: ShardId, pos: ChunkPos) -> bool {
