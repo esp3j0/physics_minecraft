@@ -213,6 +213,19 @@ struct Outcome {
     isolation_hash: u64,
     iso_pos_sum: f32,
     state_hash: u64,
+    // ---- B01b-R2 同口径度量(R2-1;追加列,现有列算法不变)----
+    /// 最后 120 拍里,地面顶面 − 全部连杆碰撞体世界 AABB 最低点的最大值
+    /// (负数取 0)。与生产 `quad_penetration` 同定义。
+    rest_pen_aabb: f32,
+    /// 最后 120 拍里,连杆对地接触点 `dist` 的最小值取反(真正最深的点;
+    /// 旧 static_pen_bg 取的是每流形最浅点,见验收 Q2)。
+    rest_pen_deepest: f32,
+    /// 首次击中(机身速度首次 > 0.05)后 120 拍起的连杆速度峰值。
+    late_spike_max: f32,
+    /// 晚期尖峰所在拍。
+    late_spike_tick: Option<usize>,
+    /// 结束时方块与任一连杆有接触点。
+    block_on_end: bool,
 }
 
 fn hash_f32(h: u64, v: f32) -> u64 {
@@ -367,7 +380,7 @@ fn panic_line(name: &str, msg: &str, snap: &PrePanicSnapshot) -> String {
         "no_snapshot".to_string()
     };
     format!(
-        "{name},false,true,0,\"{msg} [{evidence}]\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-,-,0,0,-,0,PANIC"
+        "{name},false,true,0,\"{msg} [{evidence}]\",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,-,-,0,0,-,0,PANIC,0,0,0,-,false"
     )
 }
 
@@ -517,6 +530,18 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     let static_window = 120usize;
     let mut static_pen_bb = 0.0f32;
     let mut static_pen_bg = 0.0f32;
+    // ---- B01b-R2 同口径度量采样(R2-1;只加不改)----
+    // rest_pen_aabb:末 120 拍"地面顶面 − 全部连杆碰撞体世界 AABB 最低点"
+    // 的最大值(负取 0;生产 quad_penetration 同定义)。
+    let mut rest_pen_aabb = 0.0f32;
+    // rest_pen_deepest:末 120 拍连杆对地接触点 dist 的最小值取反(最深点)。
+    let mut rest_pen_deepest = 0.0f32;
+    // 晚期尖峰:首次击中(机身速度 > 0.05)后 120 拍起的连杆速度峰值/所在拍。
+    let mut first_hit_tick: Option<usize> = None;
+    let mut late_spike_max = 0.0f32;
+    let mut late_spike_tick: Option<usize> = None;
+    // 结束时方块与任一连杆有接触点(主循环里逐拍刷新;结束后读末拍值)。
+    let mut block_contact_last = false;
     // 动态穿透(R2-7):撞击窗口(spawn 后 300 拍)内 body-block 的最大
     // 穿透深度;比较口径 = 该拍 (|方块速度| + 机身速度)·dt 的最大值。
     let mut dyn_pen_max = 0.0f32;
@@ -853,6 +878,17 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         }
         max_body_speed = max_body_speed.max(body.linvel().length());
 
+        // ---- B01b-R2 晚期尖峰采样(R2-1;只加不改)----
+        // 首次击中 = 机身速度首次 > 0.05;晚期窗口 = hit + 120 之后。
+        if first_hit_tick.is_none() && body.linvel().length() > 0.05 {
+            first_hit_tick = Some(tick);
+        }
+        if let Some(hit) = first_hit_tick {
+            if tick > hit + 120 && tick_link_max > late_spike_max {
+                late_spike_max = tick_link_max;
+                late_spike_tick = Some(tick);
+            }
+        }
         // 方块速度 / 上抛 / 位移;M1 撞后窗口。
         let in_post_window = tick >= spawn_tick && tick < spawn_tick + 300;
         if in_post_window {
@@ -895,6 +931,7 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         block_disp_max = block_disp_max.max(cur_block_disp);
 
         // 穿透:主体侧(全部连杆+机身)对地、对方块;动态/静置分开。
+        let mut block_contact_this_tick = false;
         for pair in world.narrow_phase.contact_graph().interactions() {
             if let PairContacts::Rigid(rigid) = &pair.contacts {
                 let c1 = pair.collider1;
@@ -952,12 +989,18 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                         max_pen_bg = max_pen_bg.min(deepest);
                         if in_static {
                             static_pen_bg = static_pen_bg.min(deepest);
+                            // B01b-R2(R2-1):末 120 拍接触点深度的最小值取反
+                            // (旧口径 reduce(f32::max) 取每流形最浅点,验收 Q2)。
+                            rest_pen_deepest = rest_pen_deepest.max(-deepest);
                         }
                     } else {
                         max_pen_bb = max_pen_bb.min(deepest);
                         if in_static {
                             static_pen_bb = static_pen_bb.min(deepest);
                         }
+                        // B01b-R2(R2-1):方块-连杆接触点(任意拍;结束时
+                        // 是否仍接触按末拍值)。
+                        block_contact_this_tick = true;
                         // 动态穿透(R2-7):撞击窗口内取**最大**穿透,与该拍
                         // (方块速度 + 机身速度)·dt 的最大值比(旧版只看第一次)。
                         if deepest < 0.0 && tick >= spawn_tick && tick < spawn_tick + 300 {
@@ -972,6 +1015,22 @@ fn run_inner(cfg: &Cfg) -> Outcome {
                         }
                     }
                 }
+            }
+        }
+        // B01b-R2(R2-1):本拍方块-连杆是否接触(结束时取末拍值)。
+        block_contact_last = block_contact_this_tick;
+
+        // B01b-R2(R2-1)rest_pen_aabb:末 120 拍"地面顶面 − 全部连杆碰撞体
+        // 世界 AABB 最低点"的最大值(负取 0;生产 quad_penetration 同定义)。
+        if tick >= total_ticks.saturating_sub(static_window) {
+            let mut min_aabb_y = f32::INFINITY;
+            for &ch in &robot.colliders {
+                if let Some(co) = world.colliders.get(ch) {
+                    min_aabb_y = min_aabb_y.min(co.compute_aabb().mins.y);
+                }
+            }
+            if min_aabb_y.is_finite() {
+                rest_pen_aabb = rest_pen_aabb.max((GROUND_TOP - min_aabb_y).max(0.0));
             }
         }
 
@@ -1052,6 +1111,11 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             isolation_hash: iso_hash,
             iso_pos_sum: iso_pos_sum as f32,
             state_hash: iso_hash,
+            rest_pen_aabb: 0.0,
+            rest_pen_deepest: 0.0,
+            late_spike_max: 0.0,
+            late_spike_tick: None,
+            block_on_end: false,
         };
     }
 
@@ -1101,6 +1165,12 @@ fn run_inner(cfg: &Cfg) -> Outcome {
             isolation_hash: 0,
             iso_pos_sum: 0.0,
             state_hash: hash,
+            rest_pen_aabb,
+            rest_pen_deepest,
+            late_spike_max,
+            late_spike_tick,
+            // 主体已移除:无连杆碰撞体可接触 → false。
+            block_on_end: false,
         };
     };
     let end_up = end_body.rotation() * Vector::new(0.0, 1.0, 0.0);
@@ -1114,6 +1184,8 @@ fn run_inner(cfg: &Cfg) -> Outcome {
     } else {
         None
     };
+    // B01b-R2(R2-1):block_on_end = 结束拍方块与任一连杆有接触点。
+    let block_on_end = block_contact_last;
 
     Outcome {
         name: cfg.name.clone(),
@@ -1158,7 +1230,406 @@ fn run_inner(cfg: &Cfg) -> Outcome {
         isolation_hash: iso_hash,
         iso_pos_sum: iso_pos_sum as f32,
         state_hash: hash,
+        rest_pen_aabb,
+        rest_pen_deepest,
+        late_spike_max,
+        late_spike_tick,
+        block_on_end,
     }
+}
+
+// ---- B01b-R2(R2-1)--census:与生产 xd_a / xd_b 同口径的普查入口 ----
+
+/// census 单组记录。
+#[derive(Clone, Copy)]
+struct CensusRow {
+    dx: f32,
+    dz: f32,
+    d: f32,
+    late_spike_max: f32,
+    late_spike_tick: Option<usize>,
+    block_on_end: bool,
+    rest_pen_aabb: f32,
+    guard_removed: bool,
+}
+
+/// census 单组:四足站立(demo 现有 180 拍站立序列)→ 第 180 拍生成单格
+/// 方块(h = 10,落点 = 当时机身位姿 + (dx, dz),出生中心 y =
+/// body_top + BLOCK_HALF + h + d,与 M1Body10 同款)→ 方块生成后再跑
+/// 1800 拍。k = 1/100,V_GUARD = 200。电机、阻尼、求解参数沿用 demo
+/// 现有代码(production_params / spawn_robot_yawed / set_target /
+/// DampMode::Scaled)。
+fn run_census_group(dx: f32, dz: f32, d: f32) -> CensusRow {
+    let s = 1.0 / 100.0f32;
+    let mut world = PhysicsWorld::new();
+    world.gravity = Vector::new(0.0, -9.81, 0.0);
+    world.integration_parameters = production_params(1.0 / 60.0);
+    let _ = world.insert(
+        RigidBodyBuilder::fixed().translation(Vector::new(0.0, GROUND_TOP - 0.5, 0.0)),
+        ColliderBuilder::cuboid(200.0, 0.5, 200.0)
+            .friction(quad::GROUND_FRICTION)
+            .restitution(GROUND_RESTITUTION),
+    );
+    let gait = default_gait();
+    let y0 = GROUND_TOP + 2.0 * quad::L + quad::FOOT_R + 0.002;
+    let robot = spawn_robot_yawed(
+        &mut world,
+        Vector::new(0.0, y0, 0.0),
+        quad::yaw_quat(0.0),
+        s,
+        quad::GROUND_FRICTION,
+        DampMode::Scaled,
+    );
+    let tau = s * TAU_LIMIT;
+    let kp = s * quad::DEFAULT_KP;
+    let kd = s * quad::DEFAULT_KD;
+    let mut targets = [0.0f32; N_JOINTS];
+    let rise_ticks = 60usize;
+    // 方块生成后跑 1800 拍(生产 xd_a 口径);加站立段合计 1980。
+    let total_ticks = STAND_TICKS + 1800;
+    let mut blocks: Vec<rapier3d::dynamics::RigidBodyHandle> = Vec::new();
+    let mut first_hit_tick: Option<usize> = None;
+    let mut late_spike_max = 0.0f32;
+    let mut late_spike_tick: Option<usize> = None;
+    let mut rest_pen_aabb = 0.0f32;
+    let mut block_contact_last = false;
+    let mut robot_alive = true;
+    let mut guard_removed = false;
+
+    for tick in 0..total_ticks {
+        // 站立序列(与 demo 现有 M1Body 同款;第 STAND_TICKS 拍生成方块)。
+        if robot_alive && tick % 2 == 0 {
+            for leg in 0..4 {
+                let foot = if tick < rise_ticks {
+                    let a = tick as f32 / rise_ticks as f32;
+                    let sm = a * a * (3.0 - 2.0 * a);
+                    let (x, _) = gait.stand_foot();
+                    (
+                        x,
+                        quad::FULL_STRETCH_DY + (-gait.h - quad::FULL_STRETCH_DY) * sm,
+                    )
+                } else {
+                    gait.stand_foot()
+                };
+                let (dxj, dyj) = foot;
+                let (a, k) = ik(dxj, dyj);
+                targets[leg * 3] = 0.0;
+                targets[leg * 3 + 1] = a;
+                targets[leg * 3 + 2] = k;
+            }
+            for (dof, tgt) in targets.iter().enumerate() {
+                set_target(&mut world, &robot, dof, *tgt, kp, kd, tau);
+            }
+        }
+        if tick == STAND_TICKS && blocks.is_empty() {
+            let body = world.bodies.get(robot.body).expect("alive");
+            let bp = body.translation();
+            let body_top = bp.y + quad::BODY_HALF[1];
+            blocks.push(spawn_block(
+                &mut world,
+                Vector::new(bp.x + dx, body_top + BLOCK_HALF + 10.0 + d, bp.z + dz),
+                Vector::ZERO,
+                1.0,
+            ));
+        }
+        world.step();
+        // guard(与生产同款:V_GUARD 200;非有限或超速整移除)。
+        if robot_alive {
+            let mut kill = false;
+            for lh in robot
+                .links
+                .iter()
+                .copied()
+                .chain(std::iter::once(robot.body))
+            {
+                if let Some(rb) = world.bodies.get(lh) {
+                    let v = rb.linvel();
+                    if v.length() > 200.0
+                        || ![
+                            v.x,
+                            v.y,
+                            v.z,
+                            rb.translation().x,
+                            rb.translation().y,
+                            rb.translation().z,
+                        ]
+                        .iter()
+                        .all(|c| c.is_finite())
+                    {
+                        kill = true;
+                    }
+                }
+            }
+            if kill {
+                let mut all_handles: Vec<_> = robot.links.clone();
+                all_handles.push(robot.body);
+                for h in all_handles {
+                    world.remove_body(h);
+                }
+                robot_alive = false;
+                guard_removed = true;
+            }
+        }
+        if !robot_alive {
+            continue;
+        }
+        let body = world.bodies.get(robot.body).expect("alive");
+        // 晚期尖峰(生产口径:机身速度首次 > 0.05 后 120 拍起)。
+        let body_v = body.linvel().length();
+        if first_hit_tick.is_none() && body_v > 0.05 {
+            first_hit_tick = Some(tick);
+        }
+        if let Some(hit) = first_hit_tick {
+            if tick > hit + 120 {
+                let mut tick_link_max = 0.0f32;
+                for lh in robot
+                    .links
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(robot.body))
+                {
+                    if let Some(rb) = world.bodies.get(lh) {
+                        tick_link_max = tick_link_max.max(rb.linvel().length());
+                    }
+                }
+                if tick_link_max > late_spike_max {
+                    late_spike_max = tick_link_max;
+                    late_spike_tick = Some(tick);
+                }
+            }
+        }
+        // rest_pen_aabb(末 120 拍;生产 quad_penetration 同定义)。
+        if tick >= total_ticks.saturating_sub(120) {
+            let mut min_aabb_y = f32::INFINITY;
+            for &ch in &robot.colliders {
+                if let Some(co) = world.colliders.get(ch) {
+                    min_aabb_y = min_aabb_y.min(co.compute_aabb().mins.y);
+                }
+            }
+            if min_aabb_y.is_finite() {
+                rest_pen_aabb = rest_pen_aabb.max((GROUND_TOP - min_aabb_y).max(0.0));
+            }
+        }
+        // 方块-连杆接触(任意点;末拍值 = block_on_end)。
+        let mut contact = false;
+        for pair in world.narrow_phase.contact_graph().interactions() {
+            if let PairContacts::Rigid(rigid) = &pair.contacts {
+                let is_robot = |c| robot.colliders.contains(&c);
+                if !(is_robot(pair.collider1) || is_robot(pair.collider2)) {
+                    continue;
+                }
+                let other = if is_robot(pair.collider1) {
+                    pair.collider2
+                } else {
+                    pair.collider1
+                };
+                let other_is_block = world
+                    .colliders
+                    .get(other)
+                    .and_then(|co| co.parent())
+                    .map(|ph| blocks.contains(&ph))
+                    .unwrap_or(false);
+                if !other_is_block {
+                    continue;
+                }
+                if rigid.manifolds.iter().any(|m| !m.points.is_empty()) {
+                    contact = true;
+                    break;
+                }
+            }
+        }
+        block_contact_last = contact;
+    }
+    CensusRow {
+        dx,
+        dz,
+        d,
+        late_spike_max,
+        late_spike_tick,
+        block_on_end: block_contact_last,
+        rest_pen_aabb,
+        guard_removed,
+    }
+}
+
+/// `--census` 汇总:25 落点 × 9 微扰 = 225 组,输出字段与生产 XD_A / XD_B
+/// 一一对应。另打印 demo 站立自检(站稳后 rest_pen_aabb,应与生产 13.4 mm
+/// 接近;差得多停下报告)。
+fn run_census() {
+    let jitters = [
+        0.0f32, 0.004, 0.009, 0.013, 0.017, 0.021, 0.034, 0.051, 0.068,
+    ];
+    // 站立自检:跑一组 h=10 落点 (0,0) j0,取其站立段末(方块生成前)的
+    // AABB 穿透。直接复用 census 组的 rest_pen_aabb 不行(它含砸后窗口),
+    // 单独起一个小世界量站立末态。
+    {
+        let s = 1.0 / 100.0f32;
+        let mut world = PhysicsWorld::new();
+        world.gravity = Vector::new(0.0, -9.81, 0.0);
+        world.integration_parameters = production_params(1.0 / 60.0);
+        let _ = world.insert(
+            RigidBodyBuilder::fixed().translation(Vector::new(0.0, GROUND_TOP - 0.5, 0.0)),
+            ColliderBuilder::cuboid(200.0, 0.5, 200.0)
+                .friction(quad::GROUND_FRICTION)
+                .restitution(GROUND_RESTITUTION),
+        );
+        let gait = default_gait();
+        let y0 = GROUND_TOP + 2.0 * quad::L + quad::FOOT_R + 0.002;
+        let robot = spawn_robot_yawed(
+            &mut world,
+            Vector::new(0.0, y0, 0.0),
+            quad::yaw_quat(0.0),
+            s,
+            quad::GROUND_FRICTION,
+            DampMode::Scaled,
+        );
+        let tau = s * TAU_LIMIT;
+        let kp = s * quad::DEFAULT_KP;
+        let kd = s * quad::DEFAULT_KD;
+        let mut targets = [0.0f32; N_JOINTS];
+        let rise_ticks = 60usize;
+        let mut stand_pen_end = 0.0f32;
+        // 0..300:站立序列 180 拍 + 续站到 300 拍(生产口径"站到入睡或
+        // 300 拍"),看静置穿透是否还在发展。
+        for tick in 0..300 {
+            if tick % 2 == 0 {
+                for leg in 0..4 {
+                    let foot = if tick < rise_ticks {
+                        let a = tick as f32 / rise_ticks as f32;
+                        let sm = a * a * (3.0 - 2.0 * a);
+                        let (x, _) = gait.stand_foot();
+                        (
+                            x,
+                            quad::FULL_STRETCH_DY + (-gait.h - quad::FULL_STRETCH_DY) * sm,
+                        )
+                    } else {
+                        gait.stand_foot()
+                    };
+                    let (dxj, dyj) = foot;
+                    let (a, k) = ik(dxj, dyj);
+                    targets[leg * 3] = 0.0;
+                    targets[leg * 3 + 1] = a;
+                    targets[leg * 3 + 2] = k;
+                }
+                for (dof, tgt) in targets.iter().enumerate() {
+                    set_target(&mut world, &robot, dof, *tgt, kp, kd, tau);
+                }
+            }
+            world.step();
+            let mut min_aabb_y = f32::INFINITY;
+            for &ch in &robot.colliders {
+                if let Some(co) = world.colliders.get(ch) {
+                    min_aabb_y = min_aabb_y.min(co.compute_aabb().mins.y);
+                }
+            }
+            if min_aabb_y.is_finite() {
+                stand_pen_end = (GROUND_TOP - min_aabb_y).max(0.0);
+            }
+            // 时点序列:站立序列结束后再续跑到 300 拍(生产口径是
+            // "站到入睡或 300 拍"),看穿透是否还在发展。
+            if tick == 179 || tick == 239 || tick == 299 {
+                println!(
+                    "CENSUS 站立自检 t={}: rest_pen_aabb = {stand_pen_end:.4} m",
+                    tick + 1
+                );
+            }
+            if tick == 299 {
+                break;
+            }
+        }
+        println!(
+            "CENSUS 站立自检(第 {STAND_TICKS} 拍,方块生成前):rest_pen_aabb = {stand_pen_end:.4} m(生产站稳自检 0.0134;应接近,差得多停下报告)"
+        );
+    }
+    // 225 组 census。
+    let mut rows: Vec<CensusRow> = Vec::new();
+    for dx in [-0.5f32, -0.25, 0.0, 0.25, 0.5] {
+        for dz in [-0.5f32, -0.25, 0.0, 0.25, 0.5] {
+            for &d in &jitters {
+                rows.push(run_census_group(dx, dz, d));
+            }
+        }
+    }
+    assert_eq!(rows.len(), 225, "225 组");
+    let spike_rows: Vec<&CensusRow> = rows.iter().filter(|r| r.late_spike_max > 20.0).collect();
+    let runaway = rows.iter().filter(|r| r.guard_removed).count();
+    let block_on = rows.iter().filter(|r| r.block_on_end).count();
+    let spike_block_on = spike_rows.iter().filter(|r| r.block_on_end).count();
+    let mut spike_ticks: Vec<usize> = spike_rows
+        .iter()
+        .filter_map(|r| r.late_spike_tick)
+        .collect();
+    spike_ticks.sort_unstable();
+    let (earliest, median, latest) = if spike_ticks.is_empty() {
+        (0, 0, 0)
+    } else {
+        (
+            spike_ticks[0],
+            spike_ticks[spike_ticks.len() / 2],
+            spike_ticks[spike_ticks.len() - 1],
+        )
+    };
+    let worst = rows
+        .iter()
+        .max_by(|a, b| a.late_spike_max.total_cmp(&b.late_spike_max))
+        .expect("非空");
+    // rest_pen_aabb 分布(XD_B 口径):全部 + 按 block_on 分组。
+    let mut pens: Vec<f32> = rows.iter().map(|r| r.rest_pen_aabb).collect();
+    pens.sort_by(|a, b| a.total_cmp(b));
+    let (on_n, on_med, on_max) = {
+        let mut v: Vec<f32> = rows
+            .iter()
+            .filter(|r| r.block_on_end)
+            .map(|r| r.rest_pen_aabb)
+            .collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        (
+            v.len(),
+            v.get(v.len() / 2).copied().unwrap_or(0.0),
+            v.last().copied().unwrap_or(0.0),
+        )
+    };
+    let (off_n, off_med, off_max) = {
+        let mut v: Vec<f32> = rows
+            .iter()
+            .filter(|r| !r.block_on_end)
+            .map(|r| r.rest_pen_aabb)
+            .collect();
+        v.sort_by(|a, b| a.total_cmp(b));
+        (
+            v.len(),
+            v.get(v.len() / 2).copied().unwrap_or(0.0),
+            v.last().copied().unwrap_or(0.0),
+        )
+    };
+    println!(
+        "CENSUS_A(XD_A 对应): 组数 {};晚期尖峰组 {};尖峰最大 {:.1}(所在组 d({:+.2},{:+.2}) j{:+.3} 拍 {:?});失控组 {};block_on 组 {};有尖峰组里 block_on 占比 {}/{};尖峰拍 最早 {} 中位 {} 最晚 {}",
+        rows.len(),
+        spike_rows.len(),
+        worst.late_spike_max,
+        worst.dx,
+        worst.dz,
+        worst.d,
+        worst.late_spike_tick,
+        runaway,
+        block_on,
+        spike_block_on,
+        spike_rows.len(),
+        earliest,
+        median,
+        latest,
+    );
+    println!(
+        "CENSUS_B(XD_B 对应): rest_pen_aabb 最大 {:.4} 中位 {:.4};block_on(n={}) 中位 {:.4} 最大 {:.4};无 block_on(n={}) 中位 {:.4} 最大 {:.4}",
+        pens.last().copied().unwrap_or(0.0),
+        pens.get(pens.len() / 2).copied().unwrap_or(0.0),
+        on_n,
+        on_med,
+        on_max,
+        off_n,
+        off_med,
+        off_max,
+    );
 }
 
 /// 从组名解析 M1 网格偏移(`M1Body5_ox-0.15_oz0.3_comp` → (−0.15, 0.3))。
@@ -1178,9 +1649,10 @@ fn m1_offsets(name: &str) -> (f32, f32) {
 
 fn outcome_csv(o: &Outcome) -> String {
     // 列序与表头一致(R2-7:旧版表头 27 列、数据 30 列;新版 30 列对齐,
-    // 新增 isolation_hash 在 state_hash 前)。
+    // 新增 isolation_hash 在 state_hash 前)。B01b-R2(R2-1)末尾追加 5 列
+    // 同口径度量;现有列算法不变。
     format!(
-        "{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{},{:.4},{:016x},{:.6},{:016x}",
+        "{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{:.4},{},{:.4},{:.4},{:.4},{},{:.4},{:.4},{},{},{:.4},{:.4},{:.4},{},{:.4},{:016x},{:.6},{:016x},{:.4},{:.4},{:.4},{},{}",
         o.name,
         o.nan,
         o.panicked,
@@ -1215,6 +1687,12 @@ fn outcome_csv(o: &Outcome) -> String {
         o.isolation_hash,
         o.iso_pos_sum,
         o.state_hash,
+        o.rest_pen_aabb,
+        o.rest_pen_deepest,
+        o.late_spike_max,
+        o.late_spike_tick
+            .map_or_else(|| "-".to_string(), |t| t.to_string()),
+        o.block_on_end,
     )
 }
 
@@ -1226,6 +1704,13 @@ fn main() {
         for c in all {
             println!("{}", c.name);
         }
+        return;
+    }
+    // B01b-R2(R2-1)--census:单格方块 h=10,落点 5×5(±0.5 步长 0.25,
+    // 以机身生成点为原点,与生产 X1 网格相同)× 微扰 9 档,每组 1800 拍,
+    // k = 1/100,V_GUARD 200。输出汇总行,字段与生产 XD_A / XD_B 对应。
+    if args.first().map(String::as_str) == Some("--census") {
+        run_census();
         return;
     }
     let det_mode = args.iter().any(|a| a == "det");
@@ -1257,7 +1742,8 @@ fn main() {
          static_pen_bb,static_pen_bg,dyn_pen_le_step,torque_sat_ratio,end_body_y,\
          end_up_y,block_disp_max,block_upthrow_after_settle,block_rebound_speed,\
          anomaly_tick,m5_height_change,m5_sleep_ratio,m5awake_slide,first_hit_link,\
-         pushed_dist,isolation_hash,iso_pos_sum,state_hash\n",
+         pushed_dist,isolation_hash,iso_pos_sum,state_hash,\
+         rest_pen_aabb,rest_pen_deepest,late_spike_max,late_spike_tick,block_on_end\n",
     );
     for cfg in &all {
         let selected = if det_mode {

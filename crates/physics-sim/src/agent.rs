@@ -6479,18 +6479,230 @@ anchor = [0.0, 0.0, 0.0]
         println!("{report}");
     }
 
-    /// xd_d demo 对照:用 `demos/agents/mass` 跑同一组(h=10、单格方块,
-    /// 水平落点 (0.25, 0)、微扰 0.013——即 P1 那组),报 demo 的静置穿透
-    /// (static_pen_bg/static_pen_bb)与方块是否压在机身上。
-    /// 注:demo 矩阵的落点网格是 ox ∈ {0,±0.15,±0.3}、微扰档是
-    /// {0,0.017,0.034,0.051,0.068};ox=0.25 与 d=0.013 都不在矩阵里,demo
-    /// 无现成单组入口(名字过滤),按返修单要求**不改 demo**,跑最近档
-    /// `M1Body10_ox0.3_oz0_comp` + `M1Body10_ox0_oz0_comp` 对照并说明差异。
-    #[ignore = "诊断:跑 demos/agents/mass,非 cargo test"]
+    /// xd_e 单组跑法(R2-3 二分):xd_a 同款流程,`ground`/`block` 两个
+    /// 开关选布景。
+    /// - ground = Chunk:`load_flat_ground`(现状);Raw:直接往 `s.phys`
+    ///   插固定 `cuboid(200, 0.5, 200)`(中心 y = 0.5,顶面 = 1.0),
+    ///   摩擦 0.6,不装 chunk。
+    /// - block = SpawnDynamic(现状);Raw:直接往 `s.phys` 插动态
+    ///   `cuboid(0.5, 0.5, 0.5)`(质量 = density 1 × 体积 1 = 1),摩擦
+    ///   0.6、恢复系数 0.1(生产 spawn 实体的取值,sim.rs ~:4846),不
+    ///   登记成实体。
+    fn run_xe_group(
+        drop: &XDrop,
+        jitter: f32,
+        raw_ground: bool,
+        raw_block: bool,
+    ) -> (crate::sim::ShardSim, types::EntityId, XStats) {
+        let (mut s, hash) = quad_sim_with(0.01);
+        if raw_ground {
+            // E1/E3:raw 地面(不装 chunk)。顶面 y = 0.5 + 0.5 = 1.0 =
+            // GROUND_TOP_Y(生产 load_flat_ground 的地面顶面)。
+            s.phys.insert(
+                rapier3d::prelude::RigidBodyBuilder::fixed()
+                    .translation(crate::conv::vec3_to_rapier(Vec3::new(0.0, 0.5, 0.0))),
+                rapier3d::prelude::ColliderBuilder::cuboid(200.0, 0.5, 200.0).friction(0.6),
+            );
+        } else {
+            load_flat_ground(&mut s);
+        }
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..300usize {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let _ = s.take_outbox();
+            let asleep = s
+                .phys
+                .bodies
+                .get(s.entities.get(&a).expect("在场").handle)
+                .expect("根刚体")
+                .is_sleeping();
+            if asleep {
+                break;
+            }
+        }
+        if raw_block {
+            // E2/E3:raw 方块(不登记实体;同 SpawnDynamic 的初始位姿与
+            // 材质:density 1、friction 0.6、restitution 0.1)。
+            let start_y = GROUND_TOP_Y + drop.height + jitter + drop.half_size;
+            s.phys.insert(
+                rapier3d::prelude::RigidBodyBuilder::dynamic().translation(
+                    crate::conv::vec3_to_rapier(Vec3::new(drop.dx, start_y, drop.dz)),
+                ),
+                rapier3d::prelude::ColliderBuilder::cuboid(
+                    drop.half_size,
+                    drop.half_size,
+                    drop.half_size,
+                )
+                .density(1.0)
+                .friction(0.6)
+                .restitution(0.1),
+            );
+        } else {
+            let start_y = GROUND_TOP_Y + drop.height + jitter + drop.half_size;
+            let id = types::EntityId::from_parts(2, 1);
+            let state = types::EntityState {
+                translation: Vec3::new(drop.dx, start_y, drop.dz),
+                ..types::EntityState::default()
+            };
+            let desc = types::EntityDesc {
+                half_size: drop.half_size,
+                ..types::EntityDesc::default()
+            };
+            s.apply_prefix(&[messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 0,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: id,
+                    state,
+                    desc,
+                }),
+            }]);
+        }
+        let mut st = XStats {
+            all_finite: true,
+            ..XStats::default()
+        };
+        let ticks = 1800usize;
+        let mut rest_pen_window: Vec<f32> = Vec::new();
+        for tick in 0..ticks {
+            s.apply_activation(&observers);
+            s.step();
+            s.run_transient_lifecycle();
+            let out = s.take_outbox();
+            let Some(record) = s.agents.get(&a) else {
+                st.end = if out.agent_runaway_removed > 0 {
+                    XEnd::RunawayRemoved
+                } else if out.void_removed.contains(&a) {
+                    XEnd::VoidRemoved
+                } else {
+                    panic!("xd_e:主体消失但 outbox 两者都不是:t{tick}");
+                };
+                st.removed_tick = Some(tick);
+                st.block_on_agent_end =
+                    block_touching_agent(&s, types::EntityId::from_parts(2, 1), a);
+                for _ in tick + 1..ticks {
+                    s.apply_activation(&observers);
+                    s.step();
+                    s.run_transient_lifecycle();
+                    let _ = s.take_outbox();
+                }
+                break;
+            };
+            let mut link_peak = 0.0f32;
+            for &h in record.links.values() {
+                let rb = s.phys.bodies.get(h).expect("连杆在场");
+                let v3 = crate::conv::rapier_to_vec3(rb.linvel());
+                link_peak = link_peak.max(v3.length());
+            }
+            st.peak_link_v = st.peak_link_v.max(link_peak);
+            let body_v = crate::conv::rapier_to_vec3(
+                s.phys
+                    .bodies
+                    .get(s.entities.get(&a).expect("在场").handle)
+                    .expect("根刚体")
+                    .linvel(),
+            )
+            .length();
+            if st.hit_tick.is_none() && body_v > 0.05 {
+                st.hit_tick = Some(tick);
+            }
+            if let Some(hit) = st.hit_tick
+                && tick > hit + 120
+                && link_peak > st.late_spike_max
+            {
+                st.late_spike_max = link_peak;
+                st.late_spike_tick = Some(tick);
+            }
+            if tick + 120 >= ticks {
+                rest_pen_window.push(quad_penetration(&s, a));
+            }
+        }
+        if st.removed_tick.is_none() {
+            st.end = XEnd::Alive;
+        }
+        st.rest_pen_max = rest_pen_window.iter().copied().fold(0.0f32, f32::max);
+        if st.end == XEnd::Alive {
+            st.block_on_agent_end = block_touching_agent(&s, types::EntityId::from_parts(2, 1), a);
+        }
+        (s, a, st)
+    }
+
+    /// xd_e 二分(R2-3;只在 R2-2 判"demo 明显更好"时跑):取 xd_a 里
+    /// `block_on` 的前 30 组(按 xd_a 的遍历序 = x1_grid 5×5 逐行 × 微扰
+    /// 9 档),各跑四种布景,报 `rest_pen_aabb`(同 rest_pen_max 口径)中位
+    /// 和尖峰组数。E1/E3 无 chunk:`apply_activation`/生命周期若因缺 chunk
+    /// 移除/冻结四足,断言会红(停下说明,不改生产代码)。
+    #[ignore = "诊断:cargo test -p physics-sim --release --lib -- --ignored xd_e"]
     #[test]
-    fn xd_d_demo_side_by_side() {
-        // 占位:实际跑法见测试上方注释与回报(demo 是独立 crate,不能在
-        // physics-sim 测试里调用;此测试不自动执行任何逻辑)。
-        panic!("xd_d 走 demos/agents/mass 的 CLI(cargo run -p mass-demo -- <name>);见测试文档注释");
+    fn xd_e_bisect() {
+        // 先重跑 xd_a census 取 block_on 前 30 组(遍历序与 run_xd_census
+        // 一致:x1_grid 逐行 × 微扰)。
+        let jitters = [
+            0.0f32, 0.004, 0.009, 0.013, 0.017, 0.021, 0.034, 0.051, 0.068,
+        ];
+        let grid = x1_grid();
+        let mut picked: Vec<(f32, f32, f32)> = Vec::new();
+        'outer: for &(dx, dz) in &grid {
+            for &j in &jitters {
+                let drop = XDrop {
+                    dx: 24.0 + dx,
+                    dz: 24.0 + dz,
+                    height: 10.0,
+                    half_size: 0.5,
+                };
+                let (_s, _a, st) = run_xd_group(&drop, j, 1800, false);
+                if st.block_on_agent_end {
+                    picked.push((dx, dz, j));
+                    if picked.len() == 30 {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+        assert_eq!(picked.len(), 30, "block_on 前 30 组取齐");
+        let label = |g: bool, b: bool| match (g, b) {
+            (false, false) => "E0(chunk+SpawnDynamic)",
+            (true, false) => "E1(raw地面)",
+            (false, true) => "E2(raw方块)",
+            (true, true) => "E3(双raw)",
+        };
+        for &(raw_g, raw_b) in &[(false, false), (true, false), (false, true), (true, true)] {
+            let mut pens: Vec<f32> = Vec::new();
+            let mut spikes = 0usize;
+            let mut ends = std::collections::BTreeMap::<&'static str, usize>::new();
+            for &(dx, dz, j) in &picked {
+                let drop = XDrop {
+                    dx: 24.0 + dx,
+                    dz: 24.0 + dz,
+                    height: 10.0,
+                    half_size: 0.5,
+                };
+                let (_s, _a, st) = run_xe_group(&drop, j, raw_g, raw_b);
+                pens.push(st.rest_pen_max);
+                if st.late_spike_max > 20.0 {
+                    spikes += 1;
+                }
+                let tag = match st.end {
+                    XEnd::Alive => "Alive",
+                    XEnd::RunawayRemoved => "RunawayRemoved",
+                    XEnd::VoidRemoved => "VoidRemoved",
+                };
+                *ends.entry(tag).or_default() += 1;
+            }
+            pens.sort_by(|a, b| a.total_cmp(b));
+            println!(
+                "XD_E {}: 30 组 rest_pen_aabb 中位 {:.4} 最大 {:.4};尖峰组 {spikes};结局 {ends:?}",
+                label(raw_g, raw_b),
+                pens[pens.len() / 2],
+                pens[pens.len() - 1],
+            );
+        }
     }
 }
