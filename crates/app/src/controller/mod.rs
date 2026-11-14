@@ -7,8 +7,8 @@
 //!
 //! B02b(§2.3/§2.4):槽位追加活动范围(`leash`,检查点随
 //! `ControllerRecord` 走);`apply_leash` 对超出活动圆的 `QuadTrot` 永久
-//! 改挂 `QuadStand`——B03 做完多连杆迁移后放宽(届时迁移兜底接管,
-//! leash 只是临时护栏)。
+//! 改挂 `QuadStand`——B03a 起是普通配置项:脚本主体的活动半径(迁移
+//! 已落地,走出分片边界不再停机)。
 
 pub mod gait;
 
@@ -43,8 +43,9 @@ pub enum ControllerKind {
     Script(ScriptKind),
 }
 
-/// 活动范围(§2.4;B03 之前的临时保护):水平距离根连杆超出 `radius_m`
-/// 的 `QuadTrot` 永久改挂 `QuadStand`(attached_at 不动,不再恢复行走)。
+/// 活动范围(§2.4;配置项:脚本主体的活动半径):水平距离根连杆超出
+/// `radius_m` 的 `QuadTrot` 永久改挂 `QuadStand`(attached_at 不动,不再
+/// 恢复行走)。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Leash {
     /// 活动圆心(世界 xz;= 配置的生成点)。
@@ -82,6 +83,8 @@ pub struct ControllerCounters {
     pub send_rejected: u64,
     /// leash 触发的永久改挂次数(§2.4;只增不减)。
     pub leash_stops: u64,
+    /// 主体迁移在途,本拍跳过发目标的次数(B03a 2.1;只增不减)。
+    pub skipped_in_transit: u64,
 }
 
 /// 挂载失败原因(类型化,不 panic)。
@@ -198,10 +201,23 @@ impl ControllerHost {
 
     /// 调 [`Self::actions_for_tick`],逐条
     /// `session.send_agent_joint_targets_to(InputSource::SCHEDULER, ..)`。
-    /// 成功:条目 append 进 `log`,`actions_emitted += 1`;被拒(迁移窗口
-    /// 等):`send_rejected += 1`,`log` 不动,继续下一条,不 panic。
-    pub fn drive(&mut self, session: &mut Session, log: &mut CommandLog, now: Tick) {
+    /// `skip` = 本拍迁移在途的主体集合(B03a 2.1:在途投递会被内核静默
+    /// 拒绝,提前跳过,不算 `send_rejected`、不进日志;驱动在 `drive` 之前
+    /// 取一次 `in_transit_entities()` 传入)。成功:条目 append 进 `log`,
+    /// `actions_emitted += 1`;在途跳过:`skipped_in_transit += 1`;被拒
+    /// (其他原因):`send_rejected += 1`,`log` 不动,继续下一条,不 panic。
+    pub fn drive(
+        &mut self,
+        session: &mut Session,
+        log: &mut CommandLog,
+        now: Tick,
+        skip: &std::collections::BTreeSet<EntityId>,
+    ) {
         for (entity, targets) in self.actions_for_tick(now) {
+            if skip.contains(&entity) {
+                self.counters.skipped_in_transit += 1;
+                continue;
+            }
             match session.send_agent_joint_targets_to(InputSource::SCHEDULER, entity, targets) {
                 Ok(entry) => {
                     log.append(entry);
@@ -212,8 +228,7 @@ impl ControllerHost {
         }
     }
 
-    /// 活动范围(§2.4;**B03 做完多连杆迁移后放宽**——届时迁移兜底接管,
-    /// 本函数只是"走不到分片边界"的临时护栏):对每个带 leash 的
+    /// 活动范围(§2.4;配置项:脚本主体的活动半径):对每个带 leash 的
     /// `Script(QuadTrot)` 条目,读根连杆位置(经 `root_xz` 闭包,驱动侧从
     /// `session.agent_states()` 取);水平距离 **>** `radius_m` → kind 永久
     /// 改成 `Script(QuadStand)`,`attached_at` 不动,`leash_stops += 1`。

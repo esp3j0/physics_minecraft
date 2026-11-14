@@ -380,7 +380,12 @@ fn h5_drive_rejected_counted() {
     // 空会话:实体不存在 → owner 查表必拒(迁移窗口同路径)。
     let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
     let mut log = sim_api::log::CommandLog::new();
-    host.drive(&mut session, &mut log, Tick(0));
+    host.drive(
+        &mut session,
+        &mut log,
+        Tick(0),
+        &std::collections::BTreeSet::new(),
+    );
     session.shutdown();
     assert_eq!(host.counters.send_rejected, 1, "被拒恰计 1 次");
     assert_eq!(host.counters.actions_emitted, 0, "被拒不算发出");

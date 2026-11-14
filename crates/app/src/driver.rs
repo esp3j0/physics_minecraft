@@ -1080,17 +1080,8 @@ impl ObserveOrchestrator {
             self.agent_counters.spawn_rejected += 1;
             return None;
         };
-        // ①-b 多连杆身体拒绝(B01a 放行第 3.7 节):B03 做完迁移之前,网络
-        // 不能生成多连杆身体(否则把它推到分片边界就能让服务器停机——迁移
-        // 路径对多连杆 fail-stop)。对照:capsule(单连杆)不受影响。
-        if self
-            .bodies
-            .get(&body_hash)
-            .is_some_and(|def| def.links.len() > 1)
-        {
-            self.agent_counters.spawn_rejected += 1;
-            return None;
-        }
+        // ①-b(已删,B03a 2.2):多连杆身体的网络生成拒绝在迁移落地后拆除
+        // ——迁移兜底接管,quad 现在与 capsule 同径成功。
         // ② 坐标与 yaw 都是有限值;出生 y 在世界内。
         if !position.is_finite()
             || !yaw.is_finite()
@@ -2533,7 +2524,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 // ① startup.poll——配置生成的待生成项(放票 → 出生列可读且
                 //    碰撞体已建 → 生成 + 挂载;600 拍超时放弃);
                 // ② host.apply_leash——活动范围:走出 leash 圆的 QuadTrot
-                //    永久改挂 QuadStand(B03 前的临时保护);
+                //    永久改挂 QuadStand(配置项:脚本主体的活动半径);
                 // ③ host.drive——本拍该发的关节目标(经日志盖章投递)。
                 // 三步无配置/无挂载时零动作(AC-A8:世界与日志逐位不变)。
                 let now = session.tick_now();
@@ -2555,6 +2546,15 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     },
                     now,
                 );
+                // B03a 2.1:本拍迁移在途的主体集合(无挂载时不调 Session;
+                // 有挂载时取一次传给 drive 与拍末 retain_alive 共用)。
+                let in_transit_default = std::collections::BTreeSet::new();
+                let in_transit = if host.first_slot().is_some() {
+                    Some(session.in_transit_entities())
+                } else {
+                    None
+                };
+                let in_transit = in_transit.as_ref().unwrap_or(&in_transit_default);
                 if host.first_slot().is_some() {
                     let root_xz = |id| {
                         session
@@ -2562,7 +2562,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                             .map(|p| [p.x, p.z])
                     };
                     host.apply_leash(root_xz);
-                    host.drive(&mut session, &mut log, now);
+                    host.drive(&mut session, &mut log, now, in_transit);
                 }
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。
@@ -2571,8 +2571,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 telemetry.record(t0.elapsed());
                 ticks_run += 1;
                 // ④ 主体没了就摘控制者(§2.3:每拍末;EntityId 不在主体表 =
-                // 摘)。无挂载时空转。
-                host.retain_alive(|id| session.is_agent(id));
+                // 摘)。B03a 2.1:迁移在途的主体 `is_agent` 恒 false,并入
+                // 在途集合一起判,否则四足迁移那一拍控制者会被误摘。
+                host.retain_alive(|id| session.is_agent(id) || in_transit.contains(&id));
                 // tick 末端编排(REQ-002 §4.4/§4.5,顺序固定 ①②③④):
                 // ensure 观察者分片 → 激活请求取数回填/卸载 → despawn 候选 +
                 // 持久化屏障 → chunk 流请求取数回执。无观察者且无挂起流请求时
@@ -7448,15 +7449,33 @@ mod tests {
         );
     }
 
-    /// D1(B01a 放行第 3.7 节):网络 `C2S::SpawnAgent` 请求 `quad`(多连杆)
-    /// → 拒绝并计 `spawn_rejected`;对照 `capsule`(单连杆)成功。
-    /// B03 做完迁移之前,网络不能生成多连杆身体(把它推到分片边界就能让
-    /// 服务器停机)。
+    /// D1(B03a 2.2 改写):网络 `C2S::SpawnAgent` 请求 `quad`(多连杆)
+    /// → **成功**,主体 13 连杆;同连接第二只(capsule)仍按"一个连接一个
+    /// 身体"拒绝。(B03a 迁移落地,原"多连杆拒绝"临时保护已拆。)
     #[test]
-    fn d1_network_spawn_agent_multi_link_rejected() {
+    fn d1_network_spawn_agent_multi_link_accepted() {
         let config = test_config(600);
         let mut session = sim_api::session::Session::new(config.session_config());
-        session.register(sim(0, 0));
+        // 分片带 quad+capsule 注册表(与 orchestrator 同表;`sim()` 是空
+        // 身体注册表,生成 quad 会被内核 UnknownBody 拒)。
+        let sim_bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+                .expect("quad 合法");
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            {
+                let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+                cfg.solidify.enabled = false;
+                cfg.cohesion.enabled = false;
+                cfg
+            },
+            Box::new(SimpleRegistry::builtin()),
+            sim_bodies,
+        ));
         // 出生点 chunk 必须已装载(③ 校验)。
         session.apply_chunk_load(
             shard_id(0, 0),
@@ -7475,7 +7494,7 @@ mod tests {
         let mut log = sim_api::log::CommandLog::new();
         let mut o = ObserveOrchestrator::with_bodies(ObserveCadence::default(), 0, bodies);
         let player = messaging::InputSource(1);
-        // quad(13 连杆)→ 拒绝 + 计数。
+        // quad(13 连杆)→ 成功。
         let quad = o.handle_spawn_agent(
             player,
             "quad".to_owned(),
@@ -7485,9 +7504,18 @@ mod tests {
             &mut log,
             &hub,
         );
-        assert!(quad.is_none(), "多连杆身体必须拒绝(B03 前网络不生成)");
-        assert_eq!(o.agent_counters.spawn_rejected, 1, "spawn_rejected +1");
-        // 对照:capsule 同布景成功,计数不变。
+        assert!(quad.is_some(), "多连杆身体现在接受(B03a 迁移兜底)");
+        assert_eq!(o.agent_counters.spawn_rejected, 0, "拒绝计数不动");
+        // 生成的主体在主体表里,13 连杆(生成命令走分片收件箱,先走一拍)。
+        session.tick();
+        let entity = quad.expect("实体");
+        let states = session.agent_states();
+        let rec = states
+            .iter()
+            .find(|(id, _, _)| *id == entity)
+            .expect("主体在 AgentStates");
+        assert_eq!(rec.2.len(), 13, "quad 13 连杆姿态(实得 {})", rec.2.len());
+        // 对照(同一连接已有身体):capsule 被拒(D1/D12 一个连接一个身体)。
         let cap = o.handle_spawn_agent(
             player,
             "capsule".to_owned(),
@@ -7497,8 +7525,8 @@ mod tests {
             &mut log,
             &hub,
         );
-        assert!(cap.is_some(), "单连杆 capsule 不受影响(对照)");
-        assert_eq!(o.agent_counters.spawn_rejected, 1, "对照成功不计数");
+        assert!(cap.is_none(), "同连接第二只身体仍拒绝(一个连接一个身体)");
+        assert_eq!(o.agent_counters.spawn_rejected, 1, "spawn_rejected +1");
     }
 
     /// D2(B01c 任务书 D5,继承):检查点版本 12(B01c 起,AgentRecord 追加

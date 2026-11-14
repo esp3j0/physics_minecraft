@@ -200,7 +200,7 @@ pub struct StartupAgentConfig {
     /// 控制者种类;默认 [`StartupController::None`]。
     #[serde(default)]
     pub controller: StartupController,
-    /// 活动半径 m(B03 之前的临时保护;默认 16,范围见校验)。
+    /// 活动半径 m(配置项:脚本主体的活动半径;默认 16,范围见校验)。
     #[serde(default = "default_leash_m")]
     pub leash_m: f32,
 }
@@ -228,8 +228,6 @@ pub const STARTUP_AGENTS_MAX: usize = 16;
 pub const LEASH_MIN_M: f32 = 2.0;
 /// `leash_m` 上限 m(§2.1)。
 pub const LEASH_MAX_M: f32 = 32.0;
-/// 多连杆活动圆必须距分片边界的余量 m(§2.1 校验第 5 条)。
-pub const SHARD_EDGE_MARGIN_M: f32 = 8.0;
 /// 启动票据在 leash 圆之外再扩的半径 m(§2.2)。
 pub const STARTUP_TICKET_EXTRA_M: f32 = 16.0;
 
@@ -551,19 +549,17 @@ impl Config {
         Ok(())
     }
 
-    /// 启动主体的注册表与分片几何校验(§2.1 第 2/4/5 条;启动装配期,
+    /// 启动主体的注册表与分片几何校验(§2.1 第 2/4 条;启动装配期,
     /// `load_body_registry` 之后调——需要加载好的身体注册表):
     /// - `body` 在注册表里;
-    /// - `quad_stand` / `quad_trot` 要求身体 dof = 12;
-    /// - 多连杆身体:以 `position` 为圆心、`leash_m + SHARD_EDGE_MARGIN_M`
-    ///   为半径的圆必须完全落在同一个分片内(多连杆迁移 B03 才做,走到
-    ///   分片边界会 fail-stop;本条与运行期的 leash 一起保证它走不到)。
+    /// - `quad_stand` / `quad_trot` 要求身体 dof = 12。
+    ///
+    /// (B03a 2.2:原第 5 条"多连杆活动圆必须落在一个分片内"已删——
+    /// 多连杆迁移落地后该保护不再需要,`leash_m` 保留为普通配置项。)
     pub fn validate_startup_agents(
         &self,
         bodies: &physics_sim::BodyRegistry,
     ) -> Result<(), ConfigError> {
-        // 一格 = 1 m,一分片 = SHARD_CHUNKS × CHUNK_X = 128 m。
-        const SHARD_SPAN_M: f32 = (types::SHARD_CHUNKS * voxel::CHUNK_X as i32) as f32;
         for (i, a) in self.agents.iter().enumerate() {
             let idx = i + 1;
             let Some(hash) = bodies.hash_of(&a.body) else {
@@ -594,25 +590,6 @@ impl Config {
                     a.body,
                     def.dof_count()
                 )));
-            }
-            if def.links.len() > 1 {
-                let r = a.leash_m + SHARD_EDGE_MARGIN_M;
-                let x = a.position[0];
-                let z = a.position[2];
-                let cx = (x / SHARD_SPAN_M).floor();
-                let cz = (z / SHARD_SPAN_M).floor();
-                let min_x = cx * SHARD_SPAN_M;
-                let min_z = cz * SHARD_SPAN_M;
-                let edge = |p: f32, min: f32| (p - min).min(min + SHARD_SPAN_M - p);
-                let d = edge(x, min_x).min(edge(z, min_z));
-                if d < r {
-                    return Err(ConfigError::StartupAgent(format!(
-                        "第 {idx} 条 [[agents]]:多连杆身体的活动圆(半径 leash {r} m \
-                         = leash {} + margin {SHARD_EDGE_MARGIN_M})超出分片 \
-                         ({cx:.0},{cz:.0}) 边界:距最近边界 {d:.3} m < {r:.3} m",
-                        a.leash_m
-                    )));
-                }
             }
         }
         Ok(())
@@ -1772,34 +1749,29 @@ unload_radius = 64
             .validate_startup_agents(&bodies)
             .expect("capsule 配 none 应通过");
 
-        // ⑤ 多连杆身体离分片边界:leash + margin − 0.5 m 拒绝、+ 0.5 m 通过。
-        // leash = 16 → r = 24;分片 (0,0) x ∈ [0, 128):距最近边界 = 64 − r。
-        // x = 64 + r − 0.5 = 87.5 → 距右边界 40.5 < 40.996…?r = 24,边界距
-        // = min(x, 128 − x) = 40.5;r + margin?此处直接按定义:距边界
-        // d ≥ r 才通过。d = r − 0.5 → 拒绝;d = r + 0.5 → 通过。
-        // 取 x = 128 − (16 + 8) + 0.5 = 104.5(d = 23.5 = r − 0.5 → 拒绝)。
+        // ⑤(B03a 2.2 改写):多连杆身体贴边配置**现在接受**——原"活动圆
+        // 必须落在一个分片内"的临时保护已删(迁移兜底),单连杆/多连杆
+        // 同径通过。原来 d = r − 0.5 / d = r + 0.5 两档都改判接受
+        // (x = 128 − 24 + 0.5 = 104.5 / x = 103.5,leash = 16)。
         let near = base(&format!(
             "[[agents]]\nbody = \"quad\"\nposition = [{}, -59.5, 64.0]\nleash_m = 16.0\ncontroller = \"quad_trot\"\n",
-            128.0 - (16.0 + SHARD_EDGE_MARGIN_M) + 0.5
+            128.0 - (16.0 + 8.0) + 0.5
         ));
-        let err = near
-            .validate_startup_agents(&bodies)
-            .expect_err("距边界 r − 0.5 应拒绝");
-        assert!(format!("{err}").contains("超出分片"), "{err}");
-        // x = 128 − (16 + 8) − 0.5 = 103.5(d = 24.5 = r + 0.5 → 通过)。
+        near.validate_startup_agents(&bodies)
+            .expect("贴边多连杆配置现在接受(B03a 拆第 5 条)");
+        // x = 128 − 24 − 0.5 = 103.5(原通过档,仍通过)。
         let far = base(&format!(
             "[[agents]]\nbody = \"quad\"\nposition = [{}, -59.5, 64.0]\nleash_m = 16.0\ncontroller = \"quad_trot\"\n",
-            128.0 - (16.0 + SHARD_EDGE_MARGIN_M) - 0.5
+            128.0 - (16.0 + 8.0) - 0.5
         ));
         far.validate_startup_agents(&bodies)
-            .expect("距边界 r + 0.5 应通过");
-        // 单连杆身体(capsule)不受第 5 条约束:贴边也通过(迁移对单连杆
-        // 已实现)。
+            .expect("离边更远的多连杆配置同样通过");
+        // 单连杆身体(capsule)贴边也通过(行为不变)。
         let single = base(
             "[[agents]]\nbody = \"capsule\"\nposition = [127.0, -59.5, 64.0]\nleash_m = 16.0\n",
         );
         single
             .validate_startup_agents(&bodies)
-            .expect("单连杆不查分片边界");
+            .expect("单连杆贴边通过(行为不变)");
     }
 }

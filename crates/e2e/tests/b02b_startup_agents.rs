@@ -828,17 +828,18 @@ fn e5_config_errors_reject_startup() {
         _other => panic!("dof 不足应返回 Config(StartupAgent)"),
     };
     assert!(msg.contains("dof"), "错误写明 dof:{msg}");
-    // ③ 离分片边界太近:leash 16 + margin 8 = 24;距右边界 23.5 m < 24 → 拒。
+    // ③(B03a 2.2 改写):离分片边界近的多连杆配置**现在接受**(原第 5 条
+    // 已删;装配不再因此拒绝)。装配应成功返回。
     let c = mk(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
     let mut c = c;
     c.agents[0].position[0] = 128.0 - 24.0 + 0.5; // x = 104.5,距 128 边 23.5
-    let msg = match app::driver::wire_provider_and_new_sim(c, &store, || {
-        Box::new(SimpleRegistry::builtin())
-    }) {
-        Err(app::driver::AppError::Config(app::config::ConfigError::StartupAgent(m))) => m,
-        _other => panic!("活动圆出分片应返回 Config(StartupAgent)"),
-    };
-    assert!(msg.contains("超出分片"), "错误写明原因:{msg}");
+    let wired =
+        app::driver::wire_provider_and_new_sim(c, &store, || Box::new(SimpleRegistry::builtin()));
+    assert!(
+        wired.is_ok(),
+        "贴边多连杆配置现在接受(B03a 拆第 5 条;实得 {:?})",
+        wired.err()
+    );
 }
 
 // ---- E6:RemoveEntity 摘条目 -------------------------------------------------

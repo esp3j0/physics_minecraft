@@ -289,7 +289,7 @@ impl Metrics {
 }
 
 /// 平地会话 + 四足,跑 `total_ticks` 拍的公共驱动:
-/// - `host`:可挂控制者(None 档传空 host);每拍先 `host.drive(&mut session, now)`
+/// - `host`:可挂控制者(None 档传空 host);每拍先 `host.drive(&mut session, now, &空集)`
 ///   再 `session.tick()`(任务书 §2.2 调用时机);
 /// - 从 `sample_from` 拍开始采样;
 /// - 返回 (metrics, 逐拍根位姿, void_removed 主体数, 日志)。`now` 从 0 计
@@ -333,7 +333,7 @@ fn run_quad(
     for tick in 0..total_ticks {
         let now = Tick(u64::from(tick) + 1); // 已走过 spawn 后那一拍
         if let Some(host) = host.as_deref_mut() {
-            host.drive(&mut session, log, now);
+            host.drive(&mut session, log, now, &std::collections::BTreeSet::new());
         }
         let summary = session.tick();
         void_removed_total += summary.telemetry.void_removals;
@@ -565,7 +565,12 @@ fn b6_trot_600_replay_bitwise() {
         let now = Tick(u64::from(tick) + 1);
         // R1:全程走 drive——条目由 drive append 进日志(B02b 接驱动后
         // 同一路径,回放不缺动作)。
-        host.drive(&mut session, &mut log, now);
+        host.drive(
+            &mut session,
+            &mut log,
+            now,
+            &std::collections::BTreeSet::new(),
+        );
         session.tick();
         assert!(
             session.take_void_removed_agents().is_empty(),
@@ -684,7 +689,12 @@ fn b1b_stand_script_3600() {
     let mut root_changed_after_asleep = 0u64;
     for tick in 0..3600u32 {
         let now = Tick(u64::from(tick) + 1);
-        host.drive(&mut session, &mut log, now);
+        host.drive(
+            &mut session,
+            &mut log,
+            now,
+            &std::collections::BTreeSet::new(),
+        );
         session.tick();
         assert!(
             session.take_void_removed_agents().is_empty(),
@@ -923,7 +933,12 @@ fn b2b_trot_3600_shuffled_order() {
     let mut still_tick: Vec<Option<u32>> = vec![None; block_ids.len()];
     for tick in 1..=3600u32 {
         let now = Tick(u64::from(tick));
-        host.drive(&mut session, &mut log, now);
+        host.drive(
+            &mut session,
+            &mut log,
+            now,
+            &std::collections::BTreeSet::new(),
+        );
         let summary = session.tick();
         void_removed_total += summary.telemetry.void_removals;
         assert!(
