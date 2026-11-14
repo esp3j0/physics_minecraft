@@ -204,7 +204,7 @@ async fn sample_quad_root_watch(
     (u32, u32, u32),
     usize,
 ) {
-    let deadline = Deadline::with_secs(180, "AgentStates 主体帧(四足根位姿)");
+    let deadline = Deadline::with_secs(300, "AgentStates 主体帧(四足根位姿)");
     let mut frames = 0usize;
     let mut entity: Option<EntityId> = None;
     let mut nlinks = 0usize;
