@@ -203,6 +203,7 @@ async fn sample_quad_root_watch(
     usize,
     (u32, u32, u32),
     usize,
+    (u64, Option<u64>, Option<u64>),
 ) {
     let deadline = Deadline::with_secs(300, "AgentStates 主体帧(四足根位姿)");
     let mut frames = 0usize;
@@ -215,6 +216,11 @@ async fn sample_quad_root_watch(
     let mut bad_link_ticks = 0u32;
     let mut max_links = 0usize;
     let mut ticks_pushed = 0u32;
+    // 验收 R1(§3):三个里程碑拍号——首次出现在 AgentStates、根 x 首次
+    // ≥ 128、根 x 首次 ≥ 130。
+    let mut first_seen_tick: Option<u64> = None;
+    let mut cross128_tick: Option<u64> = None;
+    let mut cross130_tick: Option<u64> = None;
     loop {
         deadline.check();
         frames += 1;
@@ -269,10 +275,19 @@ async fn sample_quad_root_watch(
                 nlinks = *nlinks_frame;
             }
             max_links = max_links.max(*nlinks_frame);
+            if first_seen_tick.is_none() {
+                first_seen_tick = Some(tick.0);
+            }
             match root {
                 Some(r) if samples.last().map(|s| s.tick.0) != Some(tick.0) => {
                     samples.push(*r);
                     present_ticks += 1;
+                    if cross128_tick.is_none() && r.pos.x >= 128.0 {
+                        cross128_tick = Some(tick.0);
+                    }
+                    if cross130_tick.is_none() && r.pos.x >= 130.0 {
+                        cross130_tick = Some(tick.0);
+                    }
                 }
                 Some(_) => {}
                 None => {
@@ -307,6 +322,11 @@ async fn sample_quad_root_watch(
         id_changes,
         (present_ticks, absent_ticks, bad_link_ticks),
         max_links,
+        (
+            first_seen_tick.expect("至少见过一次主体帧"),
+            cross128_tick,
+            cross130_tick,
+        ),
     )
 }
 
@@ -424,7 +444,7 @@ fn stitched_log(checkpoints: &[(Tick, Vec<u8>)]) -> CommandLog {
 // ---- X1:走过分片边界 ---------------------------------------------------------
 
 /// X1:quad_trot 出生 (124.5, -59.5, 24.5)、yaw 0、leash 16。跑到根 x ≥ 130
-/// (上限 2400 拍)。断言:
+/// (首现 AgentStates → x≥130 ≤ 2400 拍;里程碑拍号照实打印)。断言:
 /// - 全程 EntityId 不变;每拍 13 连杆或不在(在途),不在 ≤ 4 拍;
 /// - 至少一次迁移(根分片 (0,0) → (1,0));
 /// - 全程 up·y ≥ 0.7;
@@ -443,16 +463,37 @@ async fn x1_cross_shard_boundary() {
     .await
     .expect("MoveObserver 写入");
 
-    let (_entity, _nlinks, samples, id_changes, (present, absent, bad_links), max_links) =
-        sample_quad_root_watch(&mut rx, 2200).await;
-    // 根 x ≥ 130(上限 2400 拍;不够 = 布景异常如实红)。
-    let last = *samples.last().expect("非空");
-    assert!(
-        last.pos.x >= 130.0,
-        "{} 采样拍内根 x = {:.3} < 130(没走到边界)",
-        samples.len(),
-        last.pos.x
+    let (
+        _entity,
+        _nlinks,
+        samples,
+        id_changes,
+        (present, absent, bad_links),
+        max_links,
+        (first_seen, cross128, cross130),
+    ) = sample_quad_root_watch(&mut rx, 4800).await;
+    // 验收 R1(§3):三个里程碑拍号照实打印。
+    println!(
+        "X1 里程碑: 首现 AgentStates 拍 {first_seen},根 x≥128 拍 {:?},根 x≥130 拍 {:?}",
+        cross128, cross130
     );
+    // 任务书口径:从首次出现到 x ≥ 130 不超过 2400 拍。
+    match cross130 {
+        Some(t130) => {
+            let span = t130 - first_seen;
+            println!("X1: 首现拍 {first_seen} → x≥130 拍 {t130},历时 {span} 拍(≤ 2400?)");
+            assert!(
+                span <= 2400,
+                "首现拍 {first_seen} → x≥130 拍 {t130} 历时 {span} 拍 > 2400(任务书原意口径)"
+            );
+        }
+        None => panic!(
+            "推拍窗口内根 x 未达 130(首现拍 {first_seen},末采样 x = {:.3};\
+             布景异常或里程超限,如实红)",
+            samples.last().expect("非空").pos.x
+        ),
+    }
+    let last = *samples.last().expect("非空");
     // 全程 EntityId 不变;连杆态:恰 13 或不在;在途拍数 ≤ 4。
     assert_eq!(
         id_changes, 0,
@@ -527,7 +568,7 @@ async fn x2_replay_through_migration_bitwise() {
     })
     .await
     .expect("MoveObserver 写入");
-    let (_entity, _n, samples, _, _, _) = sample_quad_root_watch(&mut rx, 2200).await;
+    let (_entity, _n, samples, _, _, _, _) = sample_quad_root_watch(&mut rx, 2200).await;
     let online_last = *samples.last().expect("非空");
     drop(a);
     let cps_dir = h.data_dir.clone();
@@ -638,7 +679,7 @@ async fn x3_double_run_bitwise() {
         })
         .await
         .expect("MoveObserver 写入");
-        let (_entity, _n, samples, _, _, _) = sample_quad_root_watch(&mut rx, 2200).await;
+        let (_entity, _n, samples, _, _, _, _) = sample_quad_root_watch(&mut rx, 2200).await;
         shutdown(h).await;
         samples
     };
@@ -678,7 +719,7 @@ async fn x4_restart_after_migration_preserves_agent() {
     })
     .await
     .expect("MoveObserver 写入");
-    let (entity0, _n, samples, _, _, _) = sample_quad_root_watch(&mut rx, 900).await;
+    let (entity0, _n, samples, _, _, _, _) = sample_quad_root_watch(&mut rx, 900).await;
     // 布景自检:关服前发生过迁移(根曾越过 x = 128;任务书只要求
     // "迁移之后关服")。
     let crossed = samples.iter().any(|s| s.pos.x >= 128.0);
@@ -756,7 +797,7 @@ async fn x4_restart_after_migration_preserves_agent() {
     })
     .await
     .expect("MoveObserver 写入(跟随主体新位置)");
-    let (entity1, nlinks1, samples2, _, _, _) = sample_quad_root_watch(&mut rx2, 200).await;
+    let (entity1, nlinks1, samples2, _, _, _, _) = sample_quad_root_watch(&mut rx2, 200).await;
     assert_eq!(entity1, entity0, "重启后仍是同一个 EntityId");
     assert_eq!(nlinks1, 13, "重启后主体 13 连杆(实得 {nlinks1})");
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
