@@ -213,6 +213,46 @@ fn h1_period_gating() {
             "period 1 拍 {now} 应有动作"
         );
     }
+    // B02b 第 0 节(验收缺口 1):奇数拍挂载——period 2 挂在拍 11,拍
+    // 11–20 里只有 11、13、15、17、19 有动作(n = now − attached_at 的
+    // 偶数门;`n` 不减 `attached_at` 的变异在偶数拍挂载的布景下活,这里
+    // 钉住奇数拍挂载)。
+    let host = host_with(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        11,
+    );
+    for now in 11..21u64 {
+        let acts = host.actions_for_tick(Tick(now));
+        if now % 2 == 1 {
+            assert_eq!(acts.len(), 1, "拍 {now} 应有动作(奇数拍)");
+            assert_eq!(acts[0].0, e(1));
+            assert_eq!(acts[0].1.len(), QUAD_DOF);
+        } else {
+            assert!(acts.is_empty(), "拍 {now} 不应有动作(偶数拍)");
+        }
+    }
+    // 同缺口第二组:QuadTrot 挂在拍 7——settle 边界随挂载拍平移:第 126 拍
+    // (n = 119)仍是站立目标,第 127 拍(n = 120)起是步态(t = 0)。
+    let host = host_with(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        7,
+    );
+    let stand = stand_targets(&Gait::DEFAULT).to_vec();
+    let at126 = host.actions_for_tick(Tick(126));
+    assert_eq!(at126.len(), 1, "第 126 拍应有动作(period 1)");
+    assert_eq!(at126[0].1, stand, "第 126 拍(n = 119)仍是站立目标");
+    let at127 = host.actions_for_tick(Tick(127));
+    assert_eq!(
+        at127[0].1,
+        trot_targets(&Gait::DEFAULT, 0.0).to_vec(),
+        "第 127 拍(n = 120)起走 trot 分支(t = 0)"
+    );
 }
 
 /// H2:多只主体按 EntityId 升序输出;`None` 不输出。

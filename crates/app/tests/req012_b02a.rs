@@ -595,6 +595,14 @@ fn b6_trot_600_replay_bitwise() {
         .filter(|e| matches!(e.command, SimCommand::SpawnAgent { .. }))
         .collect();
     assert_eq!(spawn_entries.len(), 1, "日志恰有一条 SpawnAgent");
+    // B02b 第 0 节(验收缺口 2):成功路径计数——600 拍每 2 拍一条恰
+    // 300 条全成功;`drive` 成功不加 `actions_emitted` 的变异在此变红
+    // (此前没有测试断言成功路径上的计数)。
+    assert_eq!(
+        host.counters.actions_emitted, 300,
+        "actions_emitted 应恰为 300(600 拍每 2 拍一条)"
+    );
+    assert_eq!(host.counters.send_rejected, 0, "不应有任何被拒");
 
     // 回放:拍 0 快照 + 全日志,末态根位姿与原线逐位相同。
     let new_registry = || -> Box<dyn voxel::BlockRegistry> { Box::new(SimpleRegistry::builtin()) };
