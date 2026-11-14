@@ -741,17 +741,22 @@ impl ShardSim {
         Ok(())
     }
 
-    /// 迁移重建入口(REQ-012 A04 放行第 2 节):按身体哈希走 `spawn_agent`
-    /// 同一条生成路径(碰撞体挂钩子标志、`actor = true`、登记进 `agents`、
-    /// `outbox.spawned` 照常),再写回控制器保持状态(意图 + `WalkerHold`)
-    /// 与常驻运动票触顶标记(04a 遗留返修同款:计数连续,不借迁移绕上限)。
-    /// **不施加力**——迁移那一拍的施力由本拍 `step` 内的控制器段照常进行
-    /// (60 Hz 施力先 `reset_forces` 再施加保持力;§13 `migrate`:写回必须
-    /// 在下一次步进之前,否则失力 1–2 拍)。单连杆预留字段非空 = 内部一致
-    /// 性违规 fail-stop(B01 才带关节状态)。`source` 写回(R1-P8:A03 玩家
-    /// 生成主体后迁移不能丢来源;实体归属表的 `EntityOwner.source` 由调度器
-    /// 按 outbox 口径维护,此处对齐 EntityRecord)。
-    #[allow(clippy::too_many_arguments)] // 信封字段逐项透传(B01 前恒空三项)
+    /// 迁移重建入口(REQ-012 A04 放行第 2 节 / B03a 1.3):按身体哈希走
+    /// `spawn_agent` 同一条生成路径(碰撞体挂钩子标志、`actor = true`、
+    /// 登记进 `agents`、`outbox.spawned` 照常),多连杆再写回关节状态
+    /// (`restore_agent_joint_state`)+ 经 `apply_agent_joint_targets` 写回
+    /// `last_targets`(电机目标与 `AgentRecord.joint_targets` 都要是它),
+    /// 然后写回控制器保持状态(意图 + `WalkerHold`)与常驻运动票触顶标记
+    /// (04a 遗留返修同款:计数连续,不借迁移绕上限)。**不施加力**——迁移
+    /// 那一拍的施力由本拍 `step` 内的控制器段照常进行(60 Hz 施力先
+    /// `reset_forces` 再施加保持力;§13 `migrate`:写回必须在下一次步进
+    /// 之前,否则失力 1–2 拍)。单连杆预留字段必须为空、多连杆三个表长度
+    /// 都必须 = dof,违规 = 内部一致性违规 fail-stop(信息含 "MigrateAgent")
+    /// 。`source` 写回(R1-P8:A03 玩家生成主体后迁移不能丢来源;实体归属
+    /// 表的 `EntityOwner.source` 由调度器按 outbox 口径维护,此处对齐
+    /// EntityRecord)。`embedded_ticks` 从 0 重新计(B01c 已定:spawn_agent
+    /// 生成即 0)。
+    #[allow(clippy::too_many_arguments)] // 信封字段逐项透传(单连杆恒空三项)
     pub(crate) fn migrate_agent_in(
         &mut self,
         entity: EntityId,
@@ -768,14 +773,36 @@ impl ShardSim {
         joint_qd: &[f32],
         last_targets: &[f32],
     ) {
-        // B01 预留字段:单连杆一律为空;非空 = 内部一致性违规(B01 之前
-        // 不可能产出,信封来源只可能是同版本内核)。
-        assert!(
-            joint_q.is_empty() && joint_qd.is_empty() && last_targets.is_empty(),
-            "MigrateAgent 带多连杆关节状态(单连杆恒空,内部一致性违规,fail-stop)"
-        );
         self.spawn_agent(entity, body, state, source)
             .expect("MigrateAgent 的身体哈希必在注册表(接收方 fail-stop 前置已查)");
+        // 关节状态写回(B03a):长度契约按接收侧 dof 校验——dof > 0 时三表
+        // 都必须恰为 dof 长;dof == 0 时三表必须为空(保留原单连杆断言语义
+        // ,方向反过来:违规都在接收侧 fail-stop,信息含 "MigrateAgent")。
+        let dof = self
+            .bodies
+            .get(&body)
+            .map(|def| def.dof_count())
+            .expect("身体哈希必在注册表(spawn_agent 刚成功,fail-stop)");
+        let length_ok = if dof == 0 {
+            joint_q.is_empty() && joint_qd.is_empty() && last_targets.is_empty()
+        } else {
+            joint_q.len() == dof && joint_qd.len() == dof && last_targets.len() == dof
+        };
+        assert!(
+            length_ok,
+            "MigrateAgent 关节状态长度不符(fail-stop):dof = {dof}, joint_q = {}, \
+             joint_qd = {}, last_targets = {}(内部一致性违规)",
+            joint_q.len(),
+            joint_qd.len(),
+            last_targets.len()
+        );
+        if dof > 0 {
+            self.restore_agent_joint_state(entity, state.linvel, state.angvel, joint_q, joint_qd);
+            // last_targets 经命令同一条路径写回:电机目标与
+            // AgentRecord.joint_targets 都被更新(长度已验,必 Ok)。
+            self.apply_agent_joint_targets(entity, last_targets)
+                .expect("last_targets 长度已验 = dof,MigrateAgent 写回必成功");
+        }
         let record = self
             .agents
             .get_mut(&entity)
@@ -801,16 +828,7 @@ impl ShardSim {
     /// 移除后刚体数、碰撞体数、multibody 数回到生成前(K2)。
     /// 主体不存在 → panic(fail-stop;调用方先判 `is_agent`)。
     pub fn despawn_agent(&mut self, id: EntityId) {
-        let record = self.agents.remove(&id).expect("主体存在(fail-stop)");
-        self.entities.remove(&id).expect("实体记录存在(fail-stop)");
-        // 全部连杆逐个 remove_body(挂它的碰撞体与关节随之拆除;根连杆也走
-        // 同一路径)。links 表按名字序,与生成序无关——拆刚体之间没有顺序
-        // 依赖(rapier remove_body 自动处理悬挂关节引用)。
-        for handle in record.links.values().copied().collect::<Vec<_>>() {
-            self.phys.remove_body(handle);
-        }
-        // A02a:控制器保持态随主体增删(移除后不残留)。
-        self.walker_holds.remove(&id);
+        let _record = self.remove_agent_bodies(id);
         // 调度器据此 release 全局 ownership(REQ-006 任务 00)。
         self.outbox.despawned.push(id);
     }
@@ -1066,6 +1084,199 @@ impl ShardSim {
     /// 主体当前关节目标(自由度顺序;命令保持状态)。非主体 → None。
     pub fn agent_joint_targets(&self, id: EntityId) -> Option<&[f32]> {
         self.agents.get(&id).map(|r| r.joint_targets.as_slice())
+    }
+
+    /// 主体的关节坐标与关节速度(自由度顺序,与 `agent_joint_positions` /
+    /// `agent_joint_velocities` 同源读法)。单连杆或 dof = 0 → 两个空表
+    /// (B03a 1.1:迁移信封的 `joint_q` / `joint_qd` 提取口)。
+    pub(crate) fn agent_joint_state(&self, id: EntityId) -> (Vec<f32>, Vec<f32>) {
+        let Some(record) = self.agents.get(&id) else {
+            return (Vec::new(), Vec::new());
+        };
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        if def.dof_count() == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let Some(mb_index) = self.agent_multibody_index(record) else {
+            return (Vec::new(), Vec::new());
+        };
+        let mb = self
+            .phys
+            .multibody_joints
+            .get_multibody(mb_index)
+            .expect("multibody 存在(fail-stop)");
+        let mut q = Vec::with_capacity(def.dof_count());
+        let mut qd = Vec::with_capacity(def.dof_count());
+        for j in def.dof_joints() {
+            let &handle = record
+                .links
+                .get(&j.child)
+                .expect("连杆句柄在登记表(fail-stop)");
+            let link_id = self
+                .phys
+                .multibody_joints
+                .rigid_body_link(handle)
+                .expect("连杆在 multibody 中(fail-stop)");
+            let link = mb.link(link_id.id).expect("multibody link 存在(fail-stop)");
+            let axis = match j.kind.joint_type() {
+                types::JointType::Revolute => rapier3d::prelude::JointAxis::AngX,
+                types::JointType::Prismatic => rapier3d::prelude::JointAxis::LinX,
+                types::JointType::Fixed => unreachable!("dof_joints 已过滤 fixed"),
+            };
+            q.push(link.joint.coords()[axis as usize]);
+            // 单自由度关节:速度向量的第 0 项即该轴(读数口径同上)。
+            qd.push(mb.joint_velocity(link)[0]);
+        }
+        (q, qd)
+    }
+
+    /// 把关节状态写回刚重建的多连杆主体(B03a 1.3:迁移、以后 B03b 唤醒
+    /// 共用)。步骤照 demo `restore_robot`:
+    /// 1. `apply_displacements`:按每个自由度关节的 assembly_id 填 q(刚生成
+    ///    时关节坐标为 0,增量 = q);
+    /// 2. `generalized_velocity_mut`:根 6 维 = (linvel, angvel),各关节 = qd;
+    /// 3. 根刚体 `set_linvel` / `set_angvel`;
+    /// 4. `forward_kinematics(&bodies, true)` + `update_rigid_bodies(&mut bodies, false)`;
+    /// 5. 全部连杆 `wake_up(true)`。
+    ///
+    /// 根速度写两份的原因(§13):广义速度供下一拍 solver 的
+    /// update_velocities 重建连杆速度,刚体速度供接触/读数。调用方负责
+    /// q/qd 长度 = dof(迁移入口在调用前 fail-stop)。
+    pub(crate) fn restore_agent_joint_state(
+        &mut self,
+        id: EntityId,
+        root_linvel: types::glam::Vec3,
+        root_angvel: types::glam::Vec3,
+        q: &[f32],
+        qd: &[f32],
+    ) {
+        let record = self
+            .agents
+            .get(&id)
+            .expect("主体在登记表(fail-stop;迁移入口 spawn_agent 刚登记)");
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        let root_handle = record
+            .links
+            .values()
+            .next()
+            .copied()
+            .expect("主体至少一根连杆(fail-stop)");
+        let mb_index = self
+            .agent_multibody_index(record)
+            .expect("多连杆主体必有 multibody(fail-stop)");
+        // 关节 child 的 link 下标与 assembly_id(先查表再可变借;两个查询段
+        // 不重叠,apply_agent_joint_targets 同款)。
+        let dof_infos: Vec<(usize, usize)> = def
+            .dof_joints()
+            .map(|j| {
+                let &handle = record
+                    .links
+                    .get(&j.child)
+                    .expect("连杆句柄在登记表(fail-stop)");
+                let lid = self
+                    .phys
+                    .multibody_joints
+                    .rigid_body_link(handle)
+                    .expect("连杆在 multibody 中(fail-stop)");
+                let mb = self
+                    .phys
+                    .multibody_joints
+                    .get_multibody(mb_index)
+                    .expect("multibody 存在(fail-stop)");
+                let link = mb.link(lid.id).expect("multibody link 存在(fail-stop)");
+                (lid.id, link.assembly_id())
+            })
+            .collect();
+        // 步骤 1:广义坐标增量(fresh 关节坐标恒 0,delta = q;disp 按
+        // assembly_id 落位)。
+        {
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody_mut(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            let mut disp = vec![0.0f32; mb.ndofs()];
+            for ((link_id, aid), &qi) in dof_infos.iter().zip(q) {
+                let _ = link_id; // disp 按 assembly_id 落位;link_id 校验在上方
+                disp[*aid] = qi;
+            }
+            mb.apply_displacements(&disp);
+            // 步骤 2:关节广义速度 = qd;根 6 维 = (linvel, angvel)
+            // (根 free 关节前 3 维线性 / 后 3 维角,demo 口径)。
+            let mut gv = mb.generalized_velocity_mut();
+            for ((_, aid), &v) in dof_infos.iter().zip(qd) {
+                gv[*aid] = v;
+            }
+            gv[0] = root_linvel.x;
+            gv[1] = root_linvel.y;
+            gv[2] = root_linvel.z;
+            gv[3] = root_angvel.x;
+            gv[4] = root_angvel.y;
+            gv[5] = root_angvel.z;
+        }
+        // 步骤 3:根刚体速度(供接触/读数)。
+        if let Some(rb) = self.phys.bodies.get_mut(root_handle) {
+            rb.set_linvel(crate::conv::vec3_to_rapier(root_linvel), false);
+            rb.set_angvel(crate::conv::vec3_to_rapier(root_angvel), false);
+        }
+        // 步骤 4:FK + 写回全部连杆刚体(update_rigid_bodies,false = 不改
+        // 速度;与 demo restore_robot 同参)。bodies 的可变借用经
+        // RigidBodySet trait 方法拿(multibody_mut 的 &mut self 与 bodies
+        // 的 &self 来自同一结构体,先分件再借)。
+        {
+            let bodies = &mut self.phys.bodies;
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody_mut(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            mb.forward_kinematics(&*bodies, true);
+            mb.update_rigid_bodies(bodies, false);
+        }
+        // 步骤 5:状态注入 = "目标变化"级事件,按生产语义强唤醒整只
+        // (根 + 全部连杆)。
+        let handles: Vec<rapier3d::prelude::RigidBodyHandle> = {
+            let mb = self
+                .phys
+                .multibody_joints
+                .get_multibody(mb_index)
+                .expect("multibody 存在(fail-stop)");
+            mb.links()
+                .map(|l| l.rigid_body_handle())
+                .chain(std::iter::once(root_handle))
+                .collect()
+        };
+        for h in handles {
+            if let Some(rb) = self.phys.bodies.get_mut(h) {
+                rb.wake_up(true);
+            }
+        }
+    }
+
+    /// 主体被移除时的完整清理(B03a 1.2:`despawn_agent` 的移除段提出来
+    /// 共用——迁移的整只移除走同一条路径,不复制一份):拆全部连杆刚体
+    /// (碰撞体与 multibody 关节随刚体移除一并拆)、清 `agents`/
+    /// `entities`/`walker_holds`。**不推** `outbox.despawned`(迁移的记账
+    /// 随 `MigrateAgent` 载荷走,由调用方决定;despawn_agent 的记账在它
+    /// 自己函数里推)。主体不存在 → panic(fail-stop)。
+    pub(crate) fn remove_agent_bodies(&mut self, id: EntityId) -> AgentRecord {
+        let record = self.agents.remove(&id).expect("主体存在(fail-stop)");
+        self.entities.remove(&id).expect("实体记录存在(fail-stop)");
+        // 全部连杆逐个 remove_body(挂它的碰撞体与关节随之拆除;根连杆也走
+        // 同一路径)。links 表按名字序,与生成序无关——拆刚体之间没有顺序
+        // 依赖(rapier remove_body 自动处理悬挂关节引用)。
+        for handle in record.links.values().copied().collect::<Vec<_>>() {
+            self.phys.remove_body(handle);
+        }
+        // A02a:控制器保持态随主体增删(移除后不残留)。
+        self.walker_holds.remove(&id);
+        record
     }
 
     /// 主体的 multibody 索引(按 links 表反查任意连杆;都不在 multibody 里
@@ -1469,9 +1680,15 @@ pub(crate) mod tests {
 
     /// 载入 3×3 chunk 平板地形(层 0 全石,世界 y = 64-64 = 0)。
     pub(crate) fn load_flat_ground(sim: &mut crate::sim::ShardSim) {
+        load_flat_ground_patch(sim, 0, 0);
+    }
+
+    /// 同款平板,基点 chunk 坐标可指定(M2 双分片布景:目的分片 (1,0) 的
+    /// 本体区 x ∈ [128,256),地面补丁放 chunk (9..12) 对齐主体落点)。
+    pub(crate) fn load_flat_ground_patch(sim: &mut crate::sim::ShardSim, cx0: i32, cz0: i32) {
         let stone = types::BlockId(1);
-        for cx in 0..3i32 {
-            for cz in 0..3i32 {
+        for cx in cx0..cx0 + 3i32 {
+            for cz in cz0..cz0 + 3i32 {
                 let mut chunk = voxel::Chunk::air();
                 for x in 0..voxel::CHUNK_X {
                     for z in 0..voxel::CHUNK_Z {
@@ -4011,26 +4228,622 @@ anchor = [0.0, 0.0, 0.0]
         assert_eq!(uninterrupted, interrupted, "快照恢复续跑与不中断逐位相同");
     }
 
-    /// K11:多连杆主体被推过分片边界 → fail-stop,信息含 "B03"。
-    /// (`should_panic`)布景:四足生成到相邻分片的 chunk 中,step 的迁移
-    /// 检测(核心区外)即触发。
+    /// K11(B03a 1.4 改写):四足被推过分片边界 → 不 panic;同拍
+    /// `outbox.migrations` 恰一条 `MigrateAgent`,三个表长度都是 12,
+    /// `last_targets` 等于移除前的 `joint_targets`;`outbox.despawned` 含该
+    /// 实体;本分片刚体数、碰撞体数、multibody 数回到生成前。布景:四足
+    /// 生成后直写根连杆位姿到相邻分片(x = 132),step 的迁移检测即触发。
     #[test]
-    #[should_panic(expected = "B03")]
-    fn k11_multi_link_migration_fail_stop() {
+    fn k11_multi_link_migration_atomically() {
         let (mut s, hash) = quad_sim_with(0.01);
-        // 分片 = 8×8 chunk(0..128);四足放在 x = 132(相邻分片 (1,0))→
-        // 不在本分片核心区。生成路径不查归属(§3 与 SpawnDynamic 同口径),
-        // 迁移检测在 step 内触发。
+        load_flat_ground(&mut s);
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let mb_before = s.phys.multibody_joints.iter().count();
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        // 先站 40 拍让姿态稳定(生成姿态关节角全 0;迁移前给 joint_targets
+        // 一条非零目标,验证 last_targets 随信封走)。
+        let targets: Vec<f32> = vec![0.1; 12];
+        s.apply_agent_joint_targets(a, &targets).expect("合法");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..40 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let targets_before = s.agent_joint_targets(a).expect("主体在表").to_vec();
+        assert_eq!(targets_before, targets, "布景自检:目标已写");
+        let (q_before, _qd_before) = s.agent_joint_state(a);
+        assert_eq!(q_before.len(), 12, "布景自检:关节状态 12 项");
+
+        // 推过边界:直写根连杆到相邻分片 x = 132(迁移检测按根中心判定)。
+        {
+            let rec = s.entities.get(&a).expect("在场");
+            let handle = rec.handle;
+            let body = s.phys.bodies.get_mut(handle).expect("刚体在场");
+            let t = body.translation();
+            body.set_translation(
+                crate::conv::pose_to_rapier(Vec3::new(132.0, t.y, 24.0), *body.rotation())
+                    .translation,
+                true,
+            );
+            body.set_linvel(crate::conv::vec3_to_rapier(Vec3::new(1.0, 0.0, 0.0)), true);
+        }
+        s.apply_activation(&observers);
+        s.step();
+        let outbox = s.take_outbox();
+
+        // 不 panic;agents 表已清,拍末恰一条 MigrateAgent。
+        assert!(!s.agents.contains_key(&a), "发出侧主体已原子移除");
+        assert_eq!(
+            outbox.migrations.len(),
+            1,
+            "拍末恰一条迁移信封(实得 {})",
+            outbox.migrations.len()
+        );
+        let messaging::EnvelopePayload::MigrateAgent {
+            entity,
+            body: body_hash,
+            joint_q,
+            joint_qd,
+            last_targets,
+            ..
+        } = &outbox.migrations[0].payload
+        else {
+            panic!("载荷必为 MigrateAgent");
+        };
+        assert_eq!(*entity, a, "信封实体一致");
+        assert_eq!(*body_hash, hash, "信封身体哈希一致");
+        assert_eq!(joint_q.len(), 12, "joint_q 恰 12 项");
+        assert_eq!(joint_qd.len(), 12, "joint_qd 恰 12 项");
+        assert_eq!(
+            last_targets.as_slice(),
+            targets_before.as_slice(),
+            "last_targets = 移除前的 joint_targets"
+        );
+        assert!(
+            outbox.despawned.contains(&a),
+            "outbox.despawned 含该实体(调度器 release ownership)"
+        );
+        // 本分片计数回到生成前(整只移除,无残余)。
+        assert_eq!(s.phys.bodies.len(), bodies_before, "刚体数回到生成前");
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before,
+            "碰撞体数回到生成前"
+        );
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            mb_before,
+            "multibody 数回到生成前"
+        );
+    }
+
+    /// M1 共用布景(B03a 1.4):四足按步态目标走到非平凡姿态(关节角、关节
+    /// 速度都不为 0;先自检),然后在**同一拍末**手工提取完整信封(根状态
+    /// + 关节坐标/速度 + 目标 + 全部连杆位姿)投给接收分片。
+    ///
+    /// 迁移检测发生在 step() 内部物理步进之后,测试拿不到"检测时刻"的源
+    /// 位姿;信封本身就是检测时刻的完整快照,手工构造等价于真实信封
+    /// (a04_p8 的盖章模式)。
+    ///
+    /// 返回(接收分片、实体 ID、信封四元组、移除前的连杆位姿表)。
+    ///
+    /// 连杆位姿表顺序 = BodyDef.links 顺序(生成序;restore 后按
+    /// AgentRecord.links 名字序读,比较时按名字对齐)。
+    #[allow(clippy::type_complexity)] // 测试布景返回值
+    fn m1_walk_and_envelope() -> (
+        crate::sim::ShardSim,
+        crate::sim::ShardSim,
+        types::EntityId,
+        types::EntityState,
+        (Vec<f32>, Vec<f32>, Vec<f32>),
+        Vec<(String, rapier3d::math::Vector, rapier3d::math::Rotation)>,
+    ) {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 步态目标走到非平凡姿态:每控制拍(偶数拍)写正弦目标(K9/K10 同款
+        // 序列),步进让关节动起来。
+        for tick in 0..400usize {
+            if tick % 2 == 0 {
+                s.apply_agent_joint_targets(a, &current_sine_targets(tick))
+                    .expect("合法");
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 自检:关节角、关节速度都不为 0(非平凡姿态)。
+        let (q, qd) = s.agent_joint_state(a);
+        assert_eq!(q.len(), 12, "布景自检:12 项");
+        let default_q: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                .collect()
+        };
+        let max_q_dev = q
+            .iter()
+            .zip(&default_q)
+            .map(|(v, d)| (v - d).abs())
+            .fold(0.0f32, f32::max);
+        let max_qd = qd.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_q_dev > 0.1,
+            "布景自检:关节角离默认姿态最大偏差 {max_q_dev} ≤ 0.1(姿态平凡)"
+        );
+        assert!(max_qd > 0.1, "布景自检:最大关节速度 {max_qd} ≤ 0.1(静止)");
+        // 同一拍末提取完整快照(信封 + 连杆位姿;先读后造)。
+        let rec = s.entities.get(&a).expect("在场");
+        let root = s.phys.bodies.get(rec.handle).expect("根在场");
+        let state = types::EntityState {
+            translation: crate::conv::rapier_to_vec3(root.translation()),
+            rotation: crate::conv::rapier_to_quat(root.rotation()),
+            linvel: crate::conv::rapier_to_vec3(root.linvel()),
+            angvel: crate::conv::rapier_to_vec3(root.angvel()),
+        };
+        let last_targets = s.agent_joint_targets(a).expect("主体在表").to_vec();
+        let mut link_poses = Vec::new();
+        {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            for link in &def.links {
+                let &h = record.links.get(&link.name).expect("连杆句柄");
+                let rb = s.phys.bodies.get(h).expect("连杆在场");
+                link_poses.push((link.name.clone(), rb.translation(), *rb.rotation()));
+            }
+        }
+        // 移除源分片的主体(整只;信封照 K11 同款直接构造,不再走 step——
+        // 源侧逻辑 K11 已覆盖,这里专注重建误差)。
+        let _ = s.remove_agent_bodies(a);
+        // 接收分片:同注册表哈希(共表口径)+ 同地形。
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+        let mut dst = crate::sim::ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_registry_clone(&s),
+        );
+        load_flat_ground(&mut dst);
+        dst.migrate_agent_in(
             a,
             hash,
-            quad_spawn_state(Vec3::new(132.0, 0.448, 24.0)),
+            state,
             None,
-        )
-        .expect("四足生成");
-        s.apply_activation(&[Vec3::new(132.0, 2.34, 24.0)]);
-        s.step();
+            None,
+            false,
+            (0.0, 0.0),
+            0.0,
+            None,
+            None,
+            &q,
+            &qd,
+            &last_targets,
+        );
+        (s, dst, a, state, (q, qd, last_targets), link_poses)
+    }
+
+    /// M1(B03a 1.4)重建误差:非平凡姿态四足迁到另一个 ShardSim,接收分片
+    /// **步进之前**比较——
+    /// - 关节坐标与信封逐项差 < 1e-4 rad;
+    /// - 13 个连杆的世界位置与移除前逐项差 < 1e-4 m,朝向差 < 1e-4 rad;
+    /// - 根线速度、角速度与信封相等;关节速度与信封逐项差 < 1e-4;
+    /// - `agent_joint_targets` = `last_targets`,rapier 电机里的目标也等于它
+    ///   (照 K10 的读法:电机恒在 AngX/motors[3] 槽)。
+    #[test]
+    fn m1_restore_error_bounded() {
+        let (s, dst, a, state, (q, qd, last_targets), link_poses) = m1_walk_and_envelope();
+        let _ = s; // 源分片主体已移除,只用其注册表克隆
+        // 关节坐标逐项 < 1e-4 rad。
+        let q_after = dst.agent_joint_positions(a).expect("关节位");
+        assert_eq!(q_after.len(), 12);
+        let max_q_err = q_after
+            .iter()
+            .zip(&q)
+            .map(|(v, e)| (v - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_q_err < 1e-4,
+            "关节坐标最大误差 {max_q_err:.3e} ≥ 1e-4 rad"
+        );
+        // 关节速度逐项 < 1e-4(读数与信封同源:joint_velocity(link)[0])。
+        let qd_after = dst.agent_joint_velocities(a).expect("关节速");
+        assert_eq!(qd_after.len(), 12);
+        let max_qd_err = qd_after
+            .iter()
+            .zip(&qd)
+            .map(|(v, e)| (v - e).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_qd_err < 1e-4,
+            "关节速度最大误差 {max_qd_err:.3e} ≥ 1e-4"
+        );
+        // 13 个连杆(含根)世界位置/朝向:按名字对齐比较(移除前位姿表 =
+        // BodyDef.links 顺序;AgentRecord.links 名字序读回)。
+        let record = dst.agents.get(&a).expect("主体登记");
+        let def = dst.bodies.get(&record.body_hash).expect("def");
+        let mut max_pos_err = 0.0f32;
+        let mut max_rot_err = 0.0f32;
+        let mut root_checked = false;
+        for link in &def.links {
+            let &h = record.links.get(&link.name).expect("连杆句柄");
+            let rb = dst.phys.bodies.get(h).expect("连杆在场");
+            let before = &link_poses
+                .iter()
+                .find(|(n, _, _)| n == &link.name)
+                .expect("移除前位姿表含该连杆");
+            let d = rb.translation() - before.1;
+            max_pos_err = max_pos_err.max(d.length());
+            // 旋转差:2·|sin(θ/2)| ≈ 相对转角(demo measure_restore_error
+            // 同款公式)。
+            let dq = rb.rotation() * before.2.inverse();
+            let ang = 2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length();
+            max_rot_err = max_rot_err.max(ang);
+            if link.name == def.links[0].name {
+                root_checked = true;
+                // 根线速度、角速度与信封相等(逐位;restore 直接 set)。
+                assert_eq!(
+                    crate::conv::rapier_to_vec3(rb.linvel()),
+                    state.linvel,
+                    "根线速度与信封相等"
+                );
+                assert_eq!(
+                    crate::conv::rapier_to_vec3(rb.angvel()),
+                    state.angvel,
+                    "根角速度与信封相等"
+                );
+            }
+        }
+        assert!(root_checked, "布景自检:根连杆已核对");
+        assert_eq!(link_poses.len(), 13, "布景自检:13 连杆");
+        assert!(
+            max_pos_err < 1e-4,
+            "连杆位置最大误差 {max_pos_err:.3e} m ≥ 1e-4"
+        );
+        assert!(
+            max_rot_err < 1e-4,
+            "连杆朝向最大误差 {max_rot_err:.3e} rad ≥ 1e-4"
+        );
+        println!(
+            "M1: q_err {max_q_err:.3e} rad, qd_err {max_qd_err:.3e}, \
+             pos_err {max_pos_err:.3e} m, rot_err {max_rot_err:.3e} rad"
+        );
+        // joint_targets = last_targets;电机目标也等于它(K10 读法)。
+        let targets_after = dst.agent_joint_targets(a).expect("目标表");
+        assert_eq!(targets_after, last_targets.as_slice(), "joint_targets 写回");
+        let mb_index = dst
+            .agent_multibody_index(record)
+            .expect("多连杆主体必有 mb");
+        let mb = dst
+            .phys
+            .multibody_joints
+            .get_multibody(mb_index)
+            .expect("mb");
+        for (dof_i, j) in def.dof_joints().enumerate() {
+            let &handle = record.links.get(&j.child).expect("child");
+            let lid = dst
+                .phys
+                .multibody_joints
+                .rigid_body_link(handle)
+                .expect("link");
+            let link = mb.link(lid.id).expect("link");
+            assert!(
+                (link.joint.data.motors[3].target_pos - last_targets[dof_i]).abs() < 1e-6,
+                "电机目标 = last_targets(dof {dof_i})"
+            );
+        }
+    }
+
+    /// M2(B03a 1.4)来回迁移:站立的四足在两个 ShardSim 之间每 30 拍迁一次
+    /// ,共 10 次。每次重建误差满足 M1 的前两条(关节坐标逐项 < 1e-4 rad、
+    /// 连杆位姿差 < 1e-4);全程 `up·y ≥ 0.9`;结束时机身高度与不迁移对照
+    /// 差 < 2 cm。
+    #[test]
+    fn m2_round_trip_migration_stays_standing() {
+        let build = |migrate: bool| {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            assert_quad_above_ground(&s, a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            // 站立目标(QuadStand 同款恒站立;迁移组每 30 拍迁一次)。
+            let stand: Vec<f32> = {
+                let record = s.agents.get(&a).expect("主体");
+                let def = s.bodies.get(&record.body_hash).expect("def");
+                def.dof_joints()
+                    .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                    .collect()
+            };
+            let cfg = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+            let mut dst = crate::sim::ShardSim::new_with_bodies(
+                cfg,
+                Box::new(SimpleRegistry::builtin()),
+                fresh_registry_clone(&s),
+            );
+            // 目的分片地面补丁对齐本体区(x ∈ [128,256) → chunk (9,0) 起,
+            // 同 3×3 形状平移 8 chunk;主体落点 152 = 24 + 128 恰在补丁内)。
+            load_flat_ground_patch(&mut dst, 9, 0);
+            let mut in_dst = false;
+            let mut max_q_err = 0.0f32;
+            let mut max_pos_err = 0.0f32;
+            let mut max_rot_err = 0.0f32;
+            let mut up_min = f32::INFINITY;
+            let mut root_y_final = f32::NAN;
+            // 首拍写站立目标,然后 300 拍(10 次 × 30 拍)。迁移的往返:
+            // 当前分片 → 对面分片,位置带 128 的 x 偏移(两片本体区互补,
+            // 主体始终落在对面分片的核心区内,下一拍不再触发迁移)。
+            for tick in 0..300usize {
+                if tick % 2 == 0 {
+                    let sim = if in_dst { &mut dst } else { &mut s };
+                    sim.apply_agent_joint_targets(a, &stand).expect("合法");
+                }
+                if migrate && tick > 0 && tick % 30 == 0 {
+                    // 迁移:从当前分片整只读出 → 移除 → 对面重建(照
+                    // M1 布景的手工信封口径;信封即检测时刻快照)。位置
+                    // x 平移 ±128(分片跨度),其余状态原样。
+                    let (src, dstm) = if in_dst {
+                        (&mut dst, &mut s)
+                    } else {
+                        (&mut s, &mut dst)
+                    };
+                    let rec = src.entities.get(&a).expect("在场");
+                    let root = src.phys.bodies.get(rec.handle).expect("根");
+                    let mut state = types::EntityState {
+                        translation: crate::conv::rapier_to_vec3(root.translation()),
+                        rotation: crate::conv::rapier_to_quat(root.rotation()),
+                        linvel: crate::conv::rapier_to_vec3(root.linvel()),
+                        angvel: crate::conv::rapier_to_vec3(root.angvel()),
+                    };
+                    if in_dst {
+                        state.translation.x -= 128.0;
+                    } else {
+                        state.translation.x += 128.0;
+                    }
+                    let (q, qd) = src.agent_joint_state(a);
+                    let targets = src.agent_joint_targets(a).expect("目标").to_vec();
+                    // 移除前的连杆位姿(名字序;比较时同样把目的侧位姿平移
+                    // 回源侧坐标系)。
+                    let before: Vec<(String, rapier3d::math::Vector, rapier3d::math::Rotation)> = {
+                        let rec2 = src.agents.get(&a).expect("主体");
+                        let def2 = src.bodies.get(&rec2.body_hash).expect("def");
+                        def2.links
+                            .iter()
+                            .map(|l| {
+                                let &h = rec2.links.get(&l.name).expect("句柄");
+                                let rb = src.phys.bodies.get(h).expect("在场");
+                                // 位姿留在源侧坐标系(不平移;目的侧比较时
+                                // 再平移过来)。
+                                (l.name.clone(), rb.translation(), *rb.rotation())
+                            })
+                            .collect()
+                    };
+                    src.remove_agent_bodies(a);
+                    dstm.migrate_agent_in(
+                        a,
+                        hash,
+                        state,
+                        None,
+                        None,
+                        false,
+                        (0.0, 0.0),
+                        0.0,
+                        None,
+                        None,
+                        &q,
+                        &qd,
+                        &targets,
+                    );
+                    // 重建误差(M1 前两条;步进之前比较;目的侧位姿平移回
+                    // 源侧坐标系)。
+                    let q_after = dstm.agent_joint_positions(a).expect("关节位");
+                    max_q_err = max_q_err.max(
+                        q_after
+                            .iter()
+                            .zip(&q)
+                            .map(|(v, e)| (v - e).abs())
+                            .fold(0.0f32, f32::max),
+                    );
+                    let rec3 = dstm.agents.get(&a).expect("主体");
+                    for l in def_links_of(dstm, rec3) {
+                        let &h = rec3.links.get(&l).expect("句柄");
+                        let rb = dstm.phys.bodies.get(h).expect("在场");
+                        // 目的侧位姿平移回源侧坐标系(源在 dst 时源坐标 =
+                        // 目的坐标 − 128;源在 s 时目的坐标 = 源 + 128,
+                        // 反向平移)。
+                        let mut p = rb.translation();
+                        if in_dst {
+                            p.x += 128.0;
+                        } else {
+                            p.x -= 128.0;
+                        }
+                        let b = before
+                            .iter()
+                            .find(|(n, _, _)| n == &l)
+                            .expect("移除前含该连杆");
+                        let perr = (p - b.1).length();
+                        // 旋转差:两个单位四元数夹角的 2·|sin(θ/2)| ≈ 相对转角(小角下;
+                        // demo measure_restore_error 同款公式,acos 在 w ≥ 1 时出 NaN)。
+                        let dq = rb.rotation() * b.2.inverse();
+                        let rerr = 2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length();
+                        max_pos_err = max_pos_err.max(perr);
+                        max_rot_err = max_rot_err.max(rerr);
+                    }
+                    in_dst = !in_dst;
+                }
+                let sim = if in_dst { &mut dst } else { &mut s };
+                sim.apply_activation(&observers);
+                sim.step();
+                let _ = sim.take_outbox();
+                // up·y 全程采样(含迁移拍;取根连杆 +y 轴向的世界 y)。
+                {
+                    let sim = if in_dst { &dst } else { &s };
+                    let rec = sim.entities.get(&a).expect("在场");
+                    let root = sim.phys.bodies.get(rec.handle).expect("根");
+                    let up_y = (root.rotation() * types::glam::Vec3::Y).y;
+                    up_min = up_min.min(up_y);
+                    root_y_final = root.translation().y;
+                }
+            }
+            (max_q_err, max_pos_err, max_rot_err, up_min, root_y_final)
+        };
+        let (q_err, pos_err, rot_err, up_min, y_mig) = build(true);
+        let (_, _, _, _, y_ref) = build(false);
+        println!(
+            "M2: q_err {q_err:.3e}, pos_err {pos_err:.3e} m, rot_err {rot_err:.3e} rad, \
+             up_min {up_min:.4}, y_mig {y_mig:.4} vs y_ref {y_ref:.4}"
+        );
+        assert!(q_err < 1e-4, "关节坐标最大误差 {q_err:.3e} ≥ 1e-4 rad");
+        assert!(pos_err < 1e-4, "连杆位置最大误差 {pos_err:.3e} m ≥ 1e-4");
+        assert!(rot_err < 1e-4, "连杆朝向最大误差 {rot_err:.3e} rad ≥ 1e-4");
+        assert!(up_min >= 0.9, "全程 up·y 最小 {up_min} < 0.9(倒了)");
+        assert!(
+            (y_mig - y_ref).abs() < 0.02,
+            "结束时机身高度差 {:.4} m ≥ 2 cm(迁移 {y_mig:.4} vs 对照 {y_ref:.4})",
+            (y_mig - y_ref).abs()
+        );
+    }
+
+    /// 测试辅助(M2):按 BodyDef.links 顺序取连杆名列表。
+    fn def_links_of(s: &crate::sim::ShardSim, record: &AgentRecord) -> Vec<String> {
+        let def = s.bodies.get(&record.body_hash).expect("def");
+        def.links.iter().map(|l| l.name.clone()).collect()
+    }
+
+    /// M3(B03a 1.4)长度不符:四足信封 `joint_q` 长度 5 → panic(信息含
+    /// "MigrateAgent");单连杆信封带非空 `joint_q` → 同样 panic(原行为)。
+    #[test]
+    #[should_panic(expected = "MigrateAgent")]
+    fn m3_quad_envelope_wrong_length_fails() {
+        let (s, mut dst, a, state, (_q, qd, last_targets), _) = m1_walk_and_envelope();
+        let _ = s;
+        // helper 已把主体迁入 dst:先整只移除,再试长度违规的信封。
+        dst.remove_agent_bodies(a);
+        let hash = dst
+            .bodies
+            .hashes()
+            .into_iter()
+            .find(|h| dst.bodies.get(h).is_some_and(|def| def.dof_count() == 12))
+            .expect("quad 哈希");
+        // joint_q 长度 5(≠ dof 12)→ fail-stop。
+        let q5 = vec![0.0f32; 5];
+        dst.migrate_agent_in(
+            a,
+            hash,
+            state,
+            None,
+            None,
+            false,
+            (0.0, 0.0),
+            0.0,
+            None,
+            None,
+            &q5,
+            &qd,
+            &last_targets,
+        );
+    }
+
+    /// M3 第二案:单连杆(capsule)信封带非空 `joint_q` → panic(原行为;
+    /// dof = 0 时三表必须为空)。
+    #[test]
+    #[should_panic(expected = "MigrateAgent")]
+    fn m3_single_link_envelope_nonempty_fails() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+        let mut dst = crate::sim::ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_capsule_registry(),
+        );
+        load_flat_ground(&mut dst);
+        let a = types::EntityId::from_parts(1, 1);
+        let state = types::EntityState {
+            translation: Vec3::new(130.0, 1.9, 24.0),
+            ..types::EntityState::default()
+        };
+        dst.migrate_agent_in(
+            a,
+            hash,
+            state,
+            None,
+            None,
+            false,
+            (0.0, 0.0),
+            0.0,
+            None,
+            None,
+            &[0.0], // 非空 joint_q(dof 0)→ fail-stop
+            &[],
+            &[],
+        );
+        let _ = s;
+    }
+
+    /// M4(B03a 1.4)压垮计数:迁移前 `embedded_ticks = 30` 的主体,迁移后
+    /// 为 0(B01c 已定:embedded_ticks 从 0 重新计;spawn_agent 生成即 0)。
+    #[test]
+    fn m4_embedded_ticks_reset_on_migration() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        // 直写计数到 30(布景;字段随快照走,直写等价于陷入 30 拍)。
+        s.agents.get_mut(&a).expect("主体").embedded_ticks = 30;
+        assert_eq!(
+            s.agents.get(&a).expect("主体").embedded_ticks,
+            30,
+            "布景自检:迁移前 30"
+        );
+        let rec = s.entities.get(&a).expect("在场");
+        let root = s.phys.bodies.get(rec.handle).expect("根");
+        let state = types::EntityState {
+            translation: crate::conv::rapier_to_vec3(root.translation()),
+            rotation: crate::conv::rapier_to_quat(root.rotation()),
+            linvel: crate::conv::rapier_to_vec3(root.linvel()),
+            angvel: crate::conv::rapier_to_vec3(root.angvel()),
+        };
+        let (q, qd) = s.agent_joint_state(a);
+        let targets = s.agent_joint_targets(a).expect("目标").to_vec();
+        let _ = s.remove_agent_bodies(a);
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+        let mut dst = crate::sim::ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_registry_clone(&s),
+        );
+        load_flat_ground(&mut dst);
+        dst.migrate_agent_in(
+            a,
+            hash,
+            state,
+            None,
+            None,
+            false,
+            (0.0, 0.0),
+            0.0,
+            None,
+            None,
+            &q,
+            &qd,
+            &targets,
+        );
+        assert_eq!(
+            dst.agents.get(&a).expect("主体").embedded_ticks,
+            0,
+            "迁移后 embedded_ticks 从 0 重新计(B01c)"
+        );
     }
 
     /// K12:一格方块放进四足某条腿占的格 → 暂缓写入(A05 的规则对非根

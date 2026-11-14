@@ -1665,30 +1665,30 @@ impl ShardSim {
             }
 
             // ---- 迁移检测(实体中心离开本体区,demo A)----
-            // REQ-012 A04(放行第 2 节):主体走 `MigrateAgent` 真迁移——
-            // 判定以根连杆中心为准(单连杆 = 胶囊中心,与普通实体同点),
-            // 同一拍原子移除(agents/walker_holds/刚体/碰撞体都不留残余),
-            // 控制器保持状态(意图 + 保持的力)随载荷走(§13 `migrate`:
-            // 迁移那一拍照常施加保持的力)。
+            // REQ-012 A04(放行第 2 节)/ B03a 1.2:主体走 `MigrateAgent`
+            // 真迁移——判定以根连杆中心为准(单连杆 = 胶囊中心,与普通实体
+            // 同点),同一拍原子移除(agents/walker_holds/刚体/碰撞体都不留
+            // 残余),控制器保持状态(意图 + 保持的力)随载荷走(§13
+            // `migrate`:迁移那一拍照常施加保持的力)。多连杆(B03a):先在
+            // 主体还完整时读关节状态与目标,再整只移除(与 despawn_agent 同
+            // 一条清理路径);信封 `joint_q`/`joint_qd` 取 1.1 读数,
+            // `last_targets` = `AgentRecord.joint_targets`;单连杆三项恒空。
             if !self.core_contains(state.translation) {
                 let dest = ShardId::new(
                     self.cfg.shard.world,
                     self.cfg.shard.dimension,
                     pos_chunk(state.translation).shard_of(),
                 );
-                if let Some(agent) = self.agents.remove(&id) {
-                    // 主体迁移:多连杆在 B03 实现。assert 而非 debug_assert
-                    // (A04 R1-P9):release 构建同样 fail-stop,与接收方
-                    // migrate_agent_in 的一致性 assert 对齐。
-                    assert!(
-                        agent.links.len() == 1,
-                        "多连杆主体迁移在 B03 实现(B01a fail-stop:{:?} 带 {} 个连杆)",
-                        id,
-                        agent.links.len()
-                    );
+                if self.agents.contains_key(&id) {
+                    // 主体迁移:先读后删(主体完整时取关节状态;移除走
+                    // remove_agent_bodies = despawn_agent 同一条清理)。
+                    let (joint_q, joint_qd) = self.agent_joint_state(id);
+                    let last_targets = {
+                        let record = self.agents.get(&id).expect("主体在表(上面已查)");
+                        record.joint_targets.clone()
+                    };
                     let hold = self.walker_holds.remove(&id).unwrap_or_default();
-                    self.entities.remove(&id).expect("存在");
-                    self.phys.remove_body(handle);
+                    let agent = self.remove_agent_bodies(id);
                     self.outbox.despawned.push(id);
                     self.outbox.migrations.push(Intent {
                         destination: dest,
@@ -1696,7 +1696,7 @@ impl ShardSim {
                             entity: id,
                             body: agent.body_hash,
                             state,
-                            actor,
+                            actor: true,
                             source,
                             actor_motion_ticks,
                             intent_move: agent.intent_move,
@@ -1704,9 +1704,9 @@ impl ShardSim {
                             intent_jump: agent.intent_jump,
                             held_force: hold.held_force,
                             last_yaw: hold.last_yaw,
-                            joint_q: Vec::new(),
-                            joint_qd: Vec::new(),
-                            last_targets: Vec::new(),
+                            joint_q,
+                            joint_qd,
+                            last_targets,
                         },
                     });
                     continue;
