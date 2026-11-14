@@ -1720,7 +1720,7 @@ unload_radius = 64
 
         // ② body 在注册表里:未知身体拒绝(经 validate_startup_agents);
         // quad(在)通过。
-        let mut c = base("[[agents]]\nbody = \"no_such_body\"\nposition = [64.0, -59.5, 64.0]\n");
+        let c = base("[[agents]]\nbody = \"no_such_body\"\nposition = [64.0, -59.5, 64.0]\n");
         c.validate().expect("纯数值校验过");
         let err = c
             .validate_startup_agents(&bodies)

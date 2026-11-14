@@ -246,3 +246,229 @@ impl StartupAgents {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use sim_api::session::{Session, SessionConfig};
+    use types::glam::Vec3;
+    use types::{BlockId, ChunkPos, DimensionId, ShardId, ShardPos, WorldId};
+    use voxel::{Chunk, SimpleRegistry};
+
+    use super::*;
+    use crate::controller::ControllerKind;
+
+    const STONE: BlockId = BlockId(1);
+
+    fn shard_id(x: i32, z: i32) -> ShardId {
+        ShardId::new(WorldId(0), DimensionId(0), ShardPos::new(x, z))
+    }
+
+    fn quad_registry() -> physics_sim::BodyRegistry {
+        let mut b = physics_sim::BodyRegistry::new();
+        b.insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad 合法");
+        b
+    }
+
+    fn quad_cfg(position: [f32; 3], controller: StartupController) -> StartupAgentConfig {
+        StartupAgentConfig {
+            body: "quad".to_owned(),
+            position,
+            yaw_deg: 0.0,
+            controller,
+            leash_m: 16.0,
+        }
+    }
+
+    fn cfg() -> SessionConfig {
+        SessionConfig::default()
+    }
+
+    /// 平地一层石头(chunk (0,0) 层 world y = 0 全石,顶面 1.0),注册分片。
+    fn load_ground(session: &mut Session) {
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            physics_sim::ShardSimConfig::new(shard_id(0, 0)),
+            Box::new(SimpleRegistry::builtin()),
+            quad_registry(),
+        ));
+        let mut chunk = Chunk::air();
+        for x in 0..voxel::CHUNK_X {
+            for z in 0..voxel::CHUNK_Z {
+                chunk.set(x, 64, z, STONE);
+            }
+        }
+        session.apply_chunk_load(shard_id(0, 0), ChunkPos::new(0, 0), chunk);
+    }
+
+    fn alloc(session: &Session) -> EntityId {
+        thread_local! {
+            static SEQ: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        loop {
+            let seq = SEQ.get();
+            SEQ.set(seq + 1);
+            let e = EntityId::from_parts(0, seq);
+            if session.entity_owner(e).is_none() {
+                return e;
+            }
+        }
+    }
+
+    /// S1:装载完成后生成并挂载——出生点 (8.5, 1.45, 8.5)(地面顶面 1.0 +
+    /// 0.45)在已装载 chunk (0,0) 内;首拍 poll 放票(不可读,票当拍才生效),
+    /// 下一拍装载判定过 → 生成;owner.source = None(SCHEDULER);host 挂
+    /// QuadTrot,leash 圆心 = position;spawned = 1;日志恰 1 条 SetAreaTicket
+    /// + 1 条 SpawnAgent;票据 ID 在保留区间。
+    #[test]
+    fn s1_spawn_when_loaded_and_attach() {
+        let bodies = quad_registry();
+        let mut startup =
+            StartupAgents::new(&[quad_cfg([8.5, 1.45, 8.5], StartupController::QuadTrot)], &bodies)
+                .expect("构造");
+        let mut session = Session::new(cfg());
+        load_ground(&mut session);
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+
+        // 第 1 拍前:票当拍生效(调度器票据收件箱),chunk 装载判定已过
+        // (布景直载)→ 当拍即生成。
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 1, "装载好的出生点当拍生成");
+        assert!(startup.pending.is_empty(), "出表");
+        session.shutdown();
+
+        // 日志:SetAreaTicket 1(保留区间 ID)+ SpawnAgent 1(SCHEDULER)。
+        let mut tickets = 0u64;
+        let mut spawns = 0u64;
+        let mut ticket_id = None;
+        for e in log.entries() {
+            match &e.command {
+                messaging::SimCommand::SetAreaTicket { id, radius_m, .. } => {
+                    tickets += 1;
+                    ticket_id = Some(*id);
+                    assert!(
+                        (radius_m - (16.0 + STARTUP_TICKET_EXTRA_M)).abs() < 1e-4,
+                        "票半径 = leash + extra,实得 {radius_m}"
+                    );
+                }
+                messaging::SimCommand::SpawnAgent { entity, .. } => {
+                    spawns += 1;
+                    assert_eq!(*entity, EntityId::from_parts(0, 0), "服务端序号 0 起");
+                    assert_eq!(e.source, InputSource::SCHEDULER, "SCHEDULER 盖章");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tickets, 1, "恰一张区域票");
+        assert_eq!(spawns, 1, "恰一条 SpawnAgent");
+        let id = ticket_id.expect("票 ID");
+        assert!(
+            id >= STARTUP_TICKET_BASE
+                && id - STARTUP_TICKET_BASE < STARTUP_AGENTS_MAX as u64,
+            "票据 ID 在保留区间 [{STARTUP_TICKET_BASE}, +{STARTUP_AGENTS_MAX}):{id}"
+        );
+    }
+
+    /// S2:超时放弃——出生点在未注册分片的坐标上(分片没注册 = 列读不到),
+    /// 走 STARTUP_SPAWN_TIMEOUT_TICKS 拍后 spawn_timeouts = 1、不 panic、
+    /// 出表;票已放(第一次见到时)。
+    #[test]
+    fn s2_timeout_gives_up_without_panic() {
+        let bodies = quad_registry();
+        let mut startup = StartupAgents::new(
+            &[quad_cfg([8.5, -59.5, 8.5], StartupController::None)],
+            &bodies,
+        )
+        .expect("构造");
+        let mut session = Session::new(cfg());
+        // 不注册任何分片:shard_ids 空 → loaded false → 永等。
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        for now in 0..=STARTUP_SPAWN_TIMEOUT_TICKS as u64 {
+            startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(now));
+        }
+        assert_eq!(startup.counters.spawn_timeouts, 1, "600 拍后超时放弃");
+        assert_eq!(startup.counters.spawned, 0, "从未生成");
+        assert!(startup.pending.is_empty(), "出表");
+        assert!(host.first_slot().is_none(), "没有挂载");
+        // 票在第一次见到时放了一条(第 0 拍)。
+        let tickets = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.command, messaging::SimCommand::SetAreaTicket { .. }))
+            .count();
+        assert_eq!(tickets, 1, "首拍放票 1 张");
+        session.shutdown();
+    }
+
+    /// S3:多条目——两条不同位置,同拍生成两条;EntityId 序号递增;每条
+    /// 各一张票(ID 相邻,保留区间内);挂载两个槽位。
+    #[test]
+    fn s3_two_entries_spawn_and_attach() {
+        let bodies = quad_registry();
+        let cfgs = vec![
+            quad_cfg([8.5, 1.45, 8.5], StartupController::QuadStand),
+            quad_cfg([14.5, 1.45, 8.5], StartupController::None),
+        ];
+        let mut startup = StartupAgents::new(&cfgs, &bodies).expect("构造");
+        let mut session = Session::new(cfg());
+        load_ground(&mut session);
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 2);
+        session.shutdown();
+        let spawns = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.command, messaging::SimCommand::SpawnAgent { .. }))
+            .count();
+        assert_eq!(spawns, 2);
+        // 两个槽位:QuadStand 与 None。
+        let ids: Vec<EntityId> = {
+            let recs = host.to_records();
+            recs.iter().map(|r| r.entity).collect()
+        };
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            host.kind_of(ids[0]),
+            Some(ControllerKind::Script(crate::controller::ScriptKind::QuadStand))
+        );
+        assert_eq!(host.kind_of(ids[1]), Some(ControllerKind::None));
+        // leash 圆心 = 各自 position。
+        let recs = host.to_records();
+        assert_eq!(recs[0].slot.leash.as_ref().map(|l| l.center_xz), Some([8.5, 8.5]));
+        // 票 ID 相邻且都在保留区间。
+        let mut ticket_ids: Vec<u64> = log
+            .entries()
+            .iter()
+            .filter_map(|e| match e.command {
+                messaging::SimCommand::SetAreaTicket { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        ticket_ids.sort_unstable();
+        assert_eq!(
+            ticket_ids,
+            vec![STARTUP_TICKET_BASE, STARTUP_TICKET_BASE + 1],
+            "票 ID 按条目序取保留区间相邻两值"
+        );
+        let _ = Vec3::ZERO;
+    }
+
+    /// S4:恢复启动传空表 → pending 空、poll 零动作(AC-A8 的 startup 侧)。
+    #[test]
+    fn s4_empty_config_noop() {
+        let bodies = quad_registry();
+        let mut startup = StartupAgents::new(&[], &bodies).expect("构造");
+        let mut session = Session::new(cfg());
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        assert_eq!(startup.counters, StartupCounters::default());
+        assert!(log.entries().is_empty(), "空配置零日志条目");
+        session.shutdown();
+    }
+}
