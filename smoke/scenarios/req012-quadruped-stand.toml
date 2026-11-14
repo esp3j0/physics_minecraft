@@ -1,0 +1,46 @@
+name = "req012-quadruped-stand"
+req = "REQ-012"
+description = "配置生成的四足(脚本站立)在平地上站稳不倒(AC-B1 的图形面);viewer 按连杆朝向画出躯干和四条腿。"
+timeout_secs = 240
+
+[server]
+world_seed = 3
+
+[[server.agents]]
+body = "quad"
+position = [24.5, -59.5, 24.5]
+controller = "quad_stand"
+leash_m = 4.0
+
+[[step]]
+label = "相机就位"
+camera = { pos = [21.5, -58.3, 27.5], yaw = -45.0, pitch = -20.0 }
+
+[[step]]
+look_at = { target = [24.5, -59.75, 24.5] }
+
+[[step]]
+wait_until = { block = { pos = [24, -61, 24], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+label = "认领四足"
+adopt_agent = { label = "dog", near = [24.5, -59.5, 24.5], within = 2.0, timeout_ticks = 1200 }
+
+# 站稳:根高度 = 地面顶面 −60 + 0.2775 ≈ −59.72;水平不离开出生列 0.5 m。
+[[step]]
+label = "站稳 2 秒"
+wait_until = { agent_in = { label = "dog", from = [24.0, -59.85, 24.0], to = [25.0, -59.60, 25.0] }, hold_ticks = 120, timeout_ticks = 1200 }
+
+[[step]]
+screenshot = { name = "standing", expect = "棕色平地上站着一只品红色的四足：一块扁平的长方体躯干水平离地，四条腿从躯干四角向下伸到地面，每条腿由两段细圆柱组成并与躯干相连；没有零件散落、悬空或陷进地面，整体没有侧翻。" }
+
+[[step]]
+label = "再站 5 秒仍在原地"
+wait_ticks = { n = 300 }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "仍站在原地原高度"
+check = { agent_in = { label = "dog", from = [24.0, -59.85, 24.0], to = [25.0, -59.60, 25.0] } }
