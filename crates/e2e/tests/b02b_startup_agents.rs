@@ -929,12 +929,16 @@ async fn e6_remove_entity_detaches_controller() {
         "E6: send_rejected {} actions_emitted {} removed_seen {removed_seen}",
         outcome.controller_counters.send_rejected, outcome.controller_counters.actions_emitted
     );
-    // 口径:retain_alive 在每拍**末**摘条目,移除生效后的第一拍里 drive
-    // 先跑一次(被拒 1 次)、拍末才摘——恰 1 次;若 retain_alive 不跑,
-    // drive 会对已移除主体每 2 拍被拒一次,计数会持续增长远超 1。
+    // 口径(B03a 更新):startup attach 的 attached_at = spawn 拍 +1(B03a
+    // 修启动拍 send_rejected;§2.2 attach 调用点),控制拍相位整体平移一拍
+    // ——RemoveEntity 生效后的第一拍恰落在非控制拍,drive 不发目标,故
+    // `send_rejected == 0`。条目被摘的证据链不变:removed_seen(主体真没
+    // 了)+ actions 持续增长(摘之前控制者一直在工作)+ 之后 120 拍静默窗
+    // (条目被摘,不再发目标;若条目没被摘,drive 每 2 拍发一次被拒,
+    // rejected/actions 都会持续增长)。
     assert_eq!(
-        outcome.controller_counters.send_rejected, 1,
-        "条目下一拍被摘:send_rejected 恰 1(移除当拍的 drive);\
+        outcome.controller_counters.send_rejected, 0,
+        "条目在移除当拍之后的下一拍被摘(B03a 相位下首拍为非控制拍);\
          持续增长 = 条目没被摘(实得 {})",
         outcome.controller_counters.send_rejected
     );
