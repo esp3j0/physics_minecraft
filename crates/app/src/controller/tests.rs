@@ -645,3 +645,67 @@ fn l3_records_roundtrip() {
         leash: None,
     };
 }
+
+/// H6(B03a 验收 R1):在途跳过——挂一只脚本控制者(QuadStand、period 1,
+/// attached_at = 0,Tick(10) 是控制拍),`drive` 的 `skip` 含该实体。
+/// 断言 `skipped_in_transit == 1`、`send_rejected == 0`、
+/// `actions_emitted == 0`、日志为空(在途投递会被内核静默拒绝,提前跳过
+/// 不走被拒路径)。对照:同一布景 `skip` 为空时 `send_rejected == 1`
+/// (H5 已覆盖空会话拒绝路径,此处不再重复建对照布景)。
+/// 变异 9(drive 不跳过在途)注入后本测试红。
+#[test]
+fn h6_drive_skips_in_transit() {
+    let mut host = host_with(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        1,
+        0,
+    );
+    // 空会话:实体不存在 → 若不跳过,send 必被拒(H5 同路径)。skip 含
+    // 该实体 → 在途分支接管。
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    let mut log = sim_api::log::CommandLog::new();
+    let mut skip = std::collections::BTreeSet::new();
+    skip.insert(e(1));
+    host.drive(&mut session, &mut log, Tick(10), &skip);
+    session.shutdown();
+    assert_eq!(host.counters.skipped_in_transit, 1, "在途跳过恰计 1 次");
+    assert_eq!(host.counters.send_rejected, 0, "跳过不走被拒路径");
+    assert_eq!(host.counters.actions_emitted, 0, "跳过不算发出");
+    assert!(log.entries().is_empty(), "跳过时 log 不追加");
+}
+
+/// H7(B03a 验收 R1):挂载拍在未来——`attached_at = Tick(5)`、周期 2。
+/// `actions_for_tick(Tick(3))`、`Tick(4)` 为空(挂载拍在未来不发目标);
+/// `Tick(5)` 有 1 条;`Tick(6)` 为空(n=1 非控制拍);`Tick(7)` 有 1 条。
+/// startup attach 的 `attached_at = spawn 拍 +1` 落在这里:去掉
+/// `now.0 < slot.attached_at.0` 判断后 Tick(3/4) 会因 saturating_sub 下溢
+/// 把 n 折 0 误触发,本测试红。
+#[test]
+fn h7_future_attached_at_not_emitted() {
+    let host = host_with(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        5,
+    );
+    assert!(
+        host.actions_for_tick(Tick(3)).is_empty(),
+        "挂载拍在未来(Tick(3) < Tick(5)):不发目标"
+    );
+    assert!(
+        host.actions_for_tick(Tick(4)).is_empty(),
+        "挂载拍在未来(Tick(4) < Tick(5)):不发目标"
+    );
+    let at5 = host.actions_for_tick(Tick(5));
+    assert_eq!(at5.len(), 1, "挂载拍 Tick(5):n = 0,恰发 1 条");
+    assert_eq!(at5[0].0, e(1));
+    assert!(
+        host.actions_for_tick(Tick(6)).is_empty(),
+        "Tick(6):n = 1 非控制拍,不发"
+    );
+    let at7 = host.actions_for_tick(Tick(7));
+    assert_eq!(at7.len(), 1, "Tick(7):n = 2 控制拍,发 1 条");
+}
