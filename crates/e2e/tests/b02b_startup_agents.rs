@@ -371,8 +371,7 @@ async fn e1_startup_quad_trot_walks() {
     config.checkpoint_interval_ticks = 6000;
     let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
-    let _player = join(&mut a, &mut rx, 8).await;
-    // 观察者挪到出生点(视距内看得到四足)。
+    let _player = join(&mut a, &mut rx, 8).await;    // 观察者挪到出生点(视距内看得到四足)。
     a.send(&C2S::MoveObserver {
         position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
     })
@@ -444,6 +443,52 @@ async fn e1_startup_quad_trot_walks() {
     // spawned = 1、无超时。
     assert_eq!(outcome.startup_counters.spawned, 1);
     assert_eq!(outcome.startup_counters.spawn_timeouts, 0);
+}
+
+/// E1b(返修 R1-3):`yaw_deg` 决定行走航向——同款布景分别以
+/// `yaw_deg = 0` 与 `yaw_deg = 90` 生成,起步后 300 拍的位移主方向
+/// 相差 90° ± 30°(生成时忽略 yaw 的变异两组方向相同 → 红)。
+/// 位移不足 0.5 m 的一组按布景异常如实 panic(不放宽)。
+#[tokio::test(start_paused = true)]
+async fn e1b_yaw_deg_sets_heading() {
+    // 一组布景跑一段:返回起步 130 拍后 → 末采样的位移向量。
+    let run = |yaw_deg: f32| async move {
+        let mut agent = quad_agent(StartupController::QuadTrot, 16.0);
+        agent.yaw_deg = yaw_deg;
+        let mut config = quad_config(vec![agent]);
+        config.checkpoint_interval_ticks = 6000;
+        let h = bootstrap_harness(config).await;
+        let (mut a, mut rx) = client(h.addr).await;
+        let _player = join(&mut a, &mut rx, 8).await;
+        a.send(&C2S::MoveObserver {
+            position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+        })
+        .await
+        .expect("MoveObserver 写入");
+        let (_entity, _n, samples) = sample_quad_root(&mut rx, 460).await;
+        shutdown(h).await;
+        let start_idx = 130.min(samples.len() - 1);
+        let s0 = samples[start_idx];
+        let s1 = *samples.last().expect("非空");
+        (s1.pos.x - s0.pos.x, s1.pos.z - s0.pos.z)
+    };
+    let (dx0, dz0) = run(0.0).await;
+    let (dx90, dz90) = run(90.0).await;
+    let m0 = (dx0 * dx0 + dz0 * dz0).sqrt();
+    let m90 = (dx90 * dx90 + dz90 * dz90).sqrt();
+    println!(
+        "E1b: yaw0 位移 ({dx0:.3},{dz0:.3}) |{m0:.3}| m; yaw90 位移 ({dx90:.3},{dz90:.3}) |{m90:.3}| m"
+    );
+    assert!(m0 >= 0.5, "yaw0 组行走进度 {m0:.3} m < 0.5 m(布景异常)");
+    assert!(m90 >= 0.5, "yaw90 组行走进度 {m90:.3} m < 0.5 m(布景异常)");
+    // 两组方向的夹角(点积/模积;数值误差截到 ±1)。
+    let cos = ((dx0 * dx90 + dz0 * dz90) / (m0 * m90)).clamp(-1.0, 1.0);
+    let angle = cos.acos().to_degrees();
+    println!("E1b: 两组航向夹角 {angle:.1}°");
+    assert!(
+        (angle - 90.0).abs() <= 30.0,
+        "yaw0 与 yaw90 位移主方向夹角 {angle:.1}° 偏离 90° 超 30°"
+    );
 }
 
 // ---- E2:检查点重启续跑 ------------------------------------------------------

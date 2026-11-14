@@ -447,8 +447,10 @@ mod tests {
         // 不注册任何分片:shard_ids 空 → loaded false → 永等。
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        // 第 599 拍后:还没超时(600 拍整不放弃,601 拍才超——R1-3 口径)。
-        for now in 0..STARTUP_SPAWN_TIMEOUT_TICKS as u64 {
+        // 第 599 拍(第 600 次 poll)后:还没超时——阈值 600 绝对锚定,
+        // 不引用常量(变异把阈值改小时断言不跟着走,R1-3)。第 600 拍整
+        // 不放弃(waited == 600 不 > 600),第 601 拍(waited 601)才超。
+        for now in 0..600u64 {
             startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(now));
         }
         assert_eq!(
@@ -456,15 +458,9 @@ mod tests {
             "第 600 次 poll 后未超时"
         );
         assert_eq!(startup.pending.len(), 1, "仍在等");
-        // 最后一拍:waited 超限 → 放弃。
-        startup.poll(
-            &mut session,
-            &mut log,
-            &mut host,
-            &mut alloc,
-            Tick(STARTUP_SPAWN_TIMEOUT_TICKS as u64),
-        );
-        assert_eq!(startup.counters.spawn_timeouts, 1, "600 拍后超时放弃");
+        // 第 601 次 poll:waited 超限 → 放弃。
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(600));
+        assert_eq!(startup.counters.spawn_timeouts, 1, "第 601 次 poll 后超时");
         assert_eq!(startup.counters.spawned, 0, "从未生成");
         assert!(startup.pending.is_empty(), "出表");
         assert!(host.first_slot().is_none(), "没有挂载");
@@ -624,64 +620,108 @@ mod tests {
         }
     }
 
-    /// S6(返修 R1-4):生成投递被拒的重试——router 收件箱容量压到 1 并
-    /// 先占满(load_ground 之后直投一条),第 0 拍放票成功(观察者收件箱,
-    /// 不受 router 容量影响)、生成投递被拒(Keep,waited 1);tick 兑现后
-    /// 第 1 拍生成。断言:等待期间 SetAreaTicket 恰 1 条(不重复放票)、
-    /// 重试拍生成恰 1 条 SpawnAgent。
+    /// S7(返修 R1-3):`yaw_deg` 进入生成状态——`yaw_deg = 90` 的条目
+    /// 生成后,SpawnAgent 日志条目的 rotation 逐分量等于
+    /// `Quat::from_rotation_y(90°)`(容差 1e-6)。生成时忽略 yaw 的变异
+    /// (rotation 恒 identity)在此红。
     #[test]
-    fn s6_spawn_retry_places_ticket_once() {
+    fn s7_yaw_deg_goes_into_spawn_rotation() {
         let bodies = quad_registry();
-        let mut startup = StartupAgents::new(
-            &[quad_cfg([8.5, 1.45, 8.5], StartupController::None)],
-            &bodies,
-        )
-        .expect("构造");
-        let mut cfg0 = cfg();
-        cfg0.scheduler.router.inbox_capacity = 1;
-        let mut session = Session::new(cfg0);
+        let mut agent_cfg = quad_cfg([8.5, 1.45, 8.5], StartupController::None);
+        agent_cfg.yaw_deg = 90.0;
+        let mut startup = StartupAgents::new(&[agent_cfg], &bodies).expect("构造");
+        let mut session = Session::new(cfg());
         load_ground(&mut session);
-        // 预占收件箱(容量 1):poll 的 spawn_agent_from 将被拒。
-        let shard = shard_id(0, 0);
-        session
-            .submit_raw(
-                shard,
-                messaging::StampedInput {
-                    apply_at: Tick(0),
-                    source: InputSource::SCHEDULER,
-                    sequence: 0,
-                    payload: messaging::InputPayload::Command(messaging::SimCommand::SetBlock {
-                        pos: types::BlockPos::new(-100, 0, -100),
-                        block: STONE,
-                    }),
-                },
-            )
-            .expect("预占入箱");
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        // 第 0 拍:放票成功、生成投递被拒(Keep)。
         startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
-        assert_eq!(startup.counters.spawned, 0, "投递被拒未生成");
-        assert_eq!(startup.pending.len(), 1, "留表重试");
         session.tick();
-        // 第 1 拍:收件箱已排空 → 生成。
+        assert_eq!(startup.counters.spawned, 1);
+        session.shutdown();
+        let rot = log
+            .entries()
+            .iter()
+            .find_map(|e| match e.command {
+                messaging::SimCommand::SpawnAgent { state, .. } => Some(state.rotation),
+                _ => None,
+            })
+            .expect("恰一条 SpawnAgent(S1 同布景)");
+        let want = types::glam::Quat::from_rotation_y(90f32.to_radians());
+        assert!(
+            (rot.x - want.x).abs() < 1e-6
+                && (rot.y - want.y).abs() < 1e-6
+                && (rot.z - want.z).abs() < 1e-6
+                && (rot.w - want.w).abs() < 1e-6,
+            "rotation = from_rotation_y(90°)(实得 {rot:?},want {want:?})"
+        );
+    }
+
+    /// S8(返修 R1-3,变异 7):碰撞体未建不生成——放一张布景区域票让激活
+    /// 启用(`tickets_ever_set`)后 `apply_chunk_load` 只装 ①(体素),
+    /// `has_collider == false`:poll 判定不过、不生成;激活决策(单独构建档)
+    /// 建好 ② 后的 poll 才生成。poll 里去掉 `has_collider` 判定的变异在此红
+    /// (首拍就生成)。
+    ///
+    /// 布景细节:startup 条目的票半径 = leash + extra = 18(最小 leash 2),
+    /// 锚取 (10.5,10.5) 使覆盖 = {(0,0),(1,0),(0,1)}(CHUNK_SIZE 16:
+    /// 三个中心距 3.5/13.7/13.7 ≤ 18,(-1,0)/(0,-1) 18.7 > 18 出圈,且
+    /// 覆盖集全在分片 (0,0)——不跨 owner)。覆盖内未载邻居会进 pending
+    /// 每拍占满 ② 预算(2)、单独构建档永不上桌——所以把 (1,0)/(0,1)
+    /// 手工预载(只 ①):三 chunk 全走"单独构建"候选,ChunkPos 升序
+    /// 2 个/拍,(0,0) 第 1 位首拍建好。
+    #[test]
+    fn s8_no_spawn_until_collider_built() {
+        let bodies = quad_registry();
+        let mut agent_cfg = quad_cfg([10.5, 1.45, 10.5], StartupController::None);
+        agent_cfg.leash_m = crate::config::LEASH_MIN_M; // 票半径 = 2 + 16 = 18
+        let mut startup = StartupAgents::new(&[agent_cfg], &bodies).expect("构造");
+        let mut session = Session::new(cfg());
+        // 布景票(低位 ID,与保留区间无关;半径 8 只覆盖 chunk (0,0))→
+        // 激活启用;tick 兑现(submit_observer 的票在下一次 tick 生效)。
+        session
+            .set_area_ticket(7, Vec3::new(10.5, 1.45, 10.5), 8.0, 0b011, None)
+            .expect("布景票");
+        session.tick();
+        load_ground(&mut session);
+        // startup 票(18)覆盖的另外两个 chunk 手工预载(激活启用 → 只 ①),
+        // 平地一层石头,同 load_ground 口径;都在分片 (0,0) 本地。
+        for (cx, cz) in [(1i32, 0i32), (0, 1)] {
+            let mut chunk = voxel::Chunk::air();
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    chunk.set(x, 64, z, STONE);
+                }
+            }
+            session.apply_chunk_load(shard_id(0, 0), types::ChunkPos::new(cx, cz), chunk);
+        }
+        let shard = shard_id(0, 0);
+        assert!(
+            session.is_chunk_loaded(shard, types::ChunkPos::new(0, 0)),
+            "布景:chunk 已装载(①)"
+        );
+        assert!(
+            !session.has_collider(shard, types::ChunkPos::new(0, 0)),
+            "布景:激活启用 → ② 未建"
+        );
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        // 第 0 拍 poll:startup 自己的票照放;出生列可读但 ② 未建 → 不生成。
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        assert_eq!(
+            startup.counters.spawned, 0,
+            "碰撞体未建不生成(实得生成 {})",
+            startup.counters.spawned
+        );
+        // 一拍:激活决策(单独构建档)建好 ② → 下一次 poll 生成。
+        session.tick();
+        assert!(
+            session.has_collider(shard, types::ChunkPos::new(0, 0)),
+            "tick 后激活决策已建 ②"
+        );
         startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(1));
         session.tick();
-        assert_eq!(startup.counters.spawned, 1, "重试拍生成");
+        assert_eq!(startup.counters.spawned, 1, "碰撞体建好后生成");
         assert!(startup.pending.is_empty(), "出表");
         session.shutdown();
-        // 放票恰 1 次(第 0 拍),重试拍没有再放。
-        let tickets = log
-            .entries()
-            .iter()
-            .filter(|e| matches!(e.command, messaging::SimCommand::SetAreaTicket { .. }))
-            .count();
-        assert_eq!(tickets, 1, "等待期间 SetAreaTicket 恰 1 条(实得 {tickets})");
-        let spawns = log
-            .entries()
-            .iter()
-            .filter(|e| matches!(e.command, messaging::SimCommand::SpawnAgent { .. }))
-            .count();
-        assert_eq!(spawns, 1, "重试拍恰 1 条 SpawnAgent");
     }
 }

@@ -508,6 +508,57 @@ fn l1_apply_leash_stops_trot() {
         Some(ControllerKind::Script(ScriptKind::QuadTrot)),
         "根读不到不触发"
     );
+    // R1-3:距离必须含 z 分量(dx²+dz²)——z 向/斜向组。圆心 (0,0)、半径 2:
+    // (0, 2.1) 距离 2.1 → 触发;(1.5, 1.5) 距离 ≈2.12 → 触发;
+    // (1.4, 1.4) 距离 ≈1.98 → 不触发。变异 `dx*dx + 0*dz` 下前两条存活。
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(3),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        Tick(0),
+        leash([0.0, 0.0], 2.0),
+    )
+    .expect("挂载合法");
+    host.apply_leash(|_| Some([0.0, 2.1]));
+    assert_eq!(
+        host.kind_of(e(3)),
+        Some(ControllerKind::Script(ScriptKind::QuadStand)),
+        "(0, 2.1):纯 z 向出圈,触发(实得仍 QuadTrot)"
+    );
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(4),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        Tick(0),
+        leash([0.0, 0.0], 2.0),
+    )
+    .expect("挂载合法");
+    host.apply_leash(|_| Some([1.5, 1.5]));
+    assert_eq!(
+        host.kind_of(e(4)),
+        Some(ControllerKind::Script(ScriptKind::QuadStand)),
+        "(1.5, 1.5):斜向距离 2.12 > 2,触发(实得仍 QuadTrot)"
+    );
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(5),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        Tick(0),
+        leash([0.0, 0.0], 2.0),
+    )
+    .expect("挂载合法");
+    host.apply_leash(|_| Some([1.4, 1.4]));
+    assert_eq!(
+        host.kind_of(e(5)),
+        Some(ControllerKind::Script(ScriptKind::QuadTrot)),
+        "(1.4, 1.4):斜向距离 1.98 < 2,不触发(实得 QuadStand)"
+    );
 }
 
 /// L2(§3):`retain_alive` 摘掉不在的条目并返回条数。
