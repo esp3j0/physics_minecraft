@@ -2848,13 +2848,16 @@ fn entities_server_next_seq(session: &sim_api::session::Session) -> u32 {
 }
 
 /// bootstrap 返回元组(装配五件 + 检查点控制者条目;type_complexity 别名)。
+/// 第 6 项:`Some` = 恢复启动(检查点条目回填宿主,配置不重新生成)、
+/// `None` = 全新启动(宿主空,配置 `[[agents]]` 由 startup 逐条生成)——
+/// "是不是恢复"只在 bootstrap 里判一次(R1-1:main 透传,不再二次包装)。
 pub type BootstrapParts = (
     sim_api::session::Session,
     sim_api::log::CommandLog,
     storage::worker::StoreWorker,
     Option<types::Tick>,
     u32,
-    Vec<crate::controller::ControllerRecord>,
+    Option<Vec<crate::controller::ControllerRecord>>,
 );
 
 pub fn bootstrap(
@@ -2908,7 +2911,13 @@ pub fn bootstrap(
                 .spawn_next_seq
                 .max(log_server_next_seq(&log))
                 .max(entities_server_next_seq(&session));
-            (session, log, Some(at), spawn_next_seq, bundle.controllers)
+            (
+                session,
+                log,
+                Some(at),
+                spawn_next_seq,
+                Some(bundle.controllers),
+            )
         }
         None => {
             // session_config 内已注入激活配置(F3:观察者票规格唯一来源)。
@@ -2920,13 +2929,7 @@ pub fn bootstrap(
             // MARGIN 校验同口径,恢复路径早已有)。校验失败 = 类型化错误
             // 拒绝启动(注册表本身由 wire_provider_and_new_sim 另交驱动)。
             let _bodies = load_body_registry(config)?;
-            (
-                session,
-                sim_api::log::CommandLog::new(),
-                None,
-                0,
-                Vec::new(),
-            )
+            (session, sim_api::log::CommandLog::new(), None, 0, None)
         }
     };
 

@@ -22,7 +22,7 @@ use messaging::InputSource;
 use physics_sim::BodyRegistry;
 use sim_api::log::CommandLog;
 use sim_api::proto::{C2S, S2C, decode_frame, encode_c2s_frame};
-use sim_api::session::Session;
+use storage::traits::CheckpointStore as _;
 use storage::worker::StoreWorker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -118,50 +118,6 @@ impl Deadline {
         if std::time::Instant::now() >= self.at {
             panic!("等待墙钟超限({WAIT_WALL_SECS} s):{}", self.what);
         }
-    }
-}
-
-// ---- 检查点记录存储(a03_session_determinism 同款) --------------------------
-
-type CheckpointRecords = Arc<std::sync::Mutex<Vec<(Tick, Vec<u8>)>>>;
-
-#[derive(Default, Clone)]
-struct RecordingCheckpointStore {
-    records: CheckpointRecords,
-}
-
-impl RecordingCheckpointStore {
-    fn read_all(&self) -> Vec<(Tick, Vec<u8>)> {
-        self.records.lock().expect("锁不毒").clone()
-    }
-}
-
-impl storage::traits::CheckpointStore for RecordingCheckpointStore {
-    fn append(
-        &mut self,
-        at: Tick,
-        blob: &[u8],
-    ) -> Result<storage::traits::CheckpointId, storage::traits::StoreError> {
-        let mut records = self.records.lock().expect("锁不毒");
-        records.push((at, blob.to_vec()));
-        Ok(storage::traits::CheckpointId(records.len() as u64))
-    }
-
-    fn read_latest(&self) -> Result<Option<(Tick, Vec<u8>)>, storage::traits::StoreError> {
-        Ok(self.records.lock().expect("锁不毒").last().cloned())
-    }
-
-    fn read(
-        &self,
-        id: storage::traits::CheckpointId,
-    ) -> Result<Option<(Tick, Vec<u8>)>, storage::traits::StoreError> {
-        Ok(self
-            .records
-            .lock()
-            .expect("锁不毒")
-            .iter()
-            .find(|(i, _)| storage::traits::CheckpointId(i.0 + 1) == id)
-            .cloned())
     }
 }
 
@@ -289,16 +245,53 @@ async fn sample_quad_root(
     (entity.expect("至少见过一次主体帧"), nlinks, samples)
 }
 
-// ---- harness(网络面 + RecordingCheckpointStore;a03 同款) -------------------
+// ---- harness(真实 bootstrap 起服 + 真实存储;a06 R2 同款起跑) --------------
 
 struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
-    checkpoints: RecordingCheckpointStore,
+    /// 数据目录(checkpoints.redb 所在;关服后读检查点用)。
+    data_dir: std::path::PathBuf,
 }
 
-async fn harness(config: Config, _bodies: BodyRegistry) -> Harness {
+/// 关服后从 data_dir 读出全部检查点(ID 1..=latest;keep 默认 10,
+/// E3 期中+终末都留得住)。
+fn read_all_checkpoints(data_dir: &std::path::Path) -> Vec<(Tick, Vec<u8>)> {
+    let store = storage::redb::RedbStore::open(&data_dir.join("checkpoints.redb"))
+        .expect("checkpoint 库可开");
+    let latest = store
+        .read_latest()
+        .expect("读最新不失败")
+        .expect("至少一个检查点");
+    let mut all = Vec::new();
+    for id in 1..=latest.0.0 {
+        if let Some(rec) = store
+            .read(storage::traits::CheckpointId(id))
+            .expect("读不失败")
+        {
+            all.push(rec);
+        }
+    }
+    all
+}
+
+/// 起服辅助(R1-1:唯一写法)——**经真实 `bootstrap`**装配(全新启动分支
+/// = 第 6 项 `None`),第 6 项原样填进 `DriverArgs`,不手工挑 `None`/`Some`;
+/// 存储用 bootstrap 打开的 redb 文件(temp 下唯一目录,不碰本地 data/)。
+async fn bootstrap_harness(config: Config) -> Harness {
+    // 目录唯一性:原子计数(并行测试同纳秒会撞 redb 文件锁)。
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let data_dir = std::env::temp_dir().join(format!("b02b_r1_{}_{}", std::process::id(), unique));
+    // data_dir 必须指到 temp:bootstrap 从 config 读目录(默认 "data" = 仓库
+    // 本地库,测试绝不碰;E1 首轮踩过——残留检查点让 bootstrap 走恢复分支)。
+    let mut config = config;
+    config.data_dir = data_dir.clone();
+    let (session, log, store, _resume_from, spawn_next_seq, startup_controllers) =
+        app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
+            .expect("bootstrap 装配成功");
+
     let net_cfg = NetConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         read_timeout_secs: 3600,
@@ -315,13 +308,7 @@ async fn harness(config: Config, _bodies: BodyRegistry) -> Harness {
         .expect("监听成功");
     std::mem::forget(bcast_tx);
 
-    let session = Session::new(config.session_config());
     let (tx, rx) = mpsc::channel::<DriverCommand>(256);
-    let checkpoints = RecordingCheckpointStore::default();
-    let store = StoreWorker::new(
-        Box::new(storage::mem::MemChunkStore::new()),
-        Box::new(checkpoints.clone()),
-    );
     let (provider, new_sim, loaded) =
         app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
             Box::new(SimpleRegistry::builtin())
@@ -331,7 +318,7 @@ async fn harness(config: Config, _bodies: BodyRegistry) -> Harness {
         config,
         session,
         store,
-        log: CommandLog::new(),
+        log,
         commands: rx,
         listen_ctrl_c: false,
         provider,
@@ -341,15 +328,15 @@ async fn harness(config: Config, _bodies: BodyRegistry) -> Harness {
             hub,
             cadence,
         }),
-        spawn_next_seq: 0,
+        spawn_next_seq,
         bodies: loaded,
-        startup_controllers: None,
+        startup_controllers,
     }));
     Harness {
         tx,
         driver: Some(driver),
         addr,
-        checkpoints,
+        data_dir,
     }
 }
 
@@ -382,7 +369,7 @@ fn stitched_log(checkpoints: &[(Tick, Vec<u8>)]) -> CommandLog {
 async fn e1_startup_quad_trot_walks() {
     let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
     config.checkpoint_interval_ticks = 6000;
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     // 观察者挪到出生点(视距内看得到四足)。
@@ -417,7 +404,7 @@ async fn e1_startup_quad_trot_walks() {
     assert!(dist >= 0.5, "起步后 300 拍内前进 {dist:.3} m < 0.5 m");
     assert!(up_min >= 0.7, "up·y 最小 {up_min} < 0.7");
 
-    let cps_store = h.checkpoints.clone();
+    let cps_dir = h.data_dir.clone();
     let outcome = shutdown(h).await;
     println!(
         "E1 counters: actions_emitted {} send_rejected {} spawned {} timeouts {}",
@@ -431,8 +418,8 @@ async fn e1_startup_quad_trot_walks() {
         "actions_emitted > 0"
     );
     // 日志:SpawnAgent 恰 1 条(SCHEDULER 盖章)+ AgentJointTargets 若干。
-    // 终末检查点在 shutdown 时落盘:store 是 Arc 克隆,关服后仍可读。
-    let log = stitched_log(&cps_store.read_all());
+    // 终末检查点在 shutdown 时落盘:从 data_dir 的 checkpoint 库读取。
+    let log = stitched_log(&read_all_checkpoints(&cps_dir));
     let mut spawns = 0usize;
     let mut joints = 0usize;
     let mut spawn_sources = Vec::new();
@@ -467,8 +454,11 @@ async fn e1_startup_quad_trot_walks() {
 async fn e2_restart_preserves_agent_and_controllers() {
     let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
     config.checkpoint_interval_ticks = 6000;
-    let bodies = quad_registry();
-    let h = harness(config.clone(), bodies.clone()).await;
+    let h = bootstrap_harness(config.clone()).await;
+    // 重启段 bootstrap 的配置:同 harness 的 data_dir(唯一 temp 目录),
+    // 其余同 config。
+    let mut restart_config = config.clone();
+    restart_config.data_dir = h.data_dir.clone();
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -478,7 +468,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
     .expect("MoveObserver 写入");
     let (entity0, _n, _samples) = sample_quad_root(&mut rx, 200).await;
     drop(a);
-    let cps1_store = h.checkpoints.clone();
+    let data_dir = h.data_dir.clone();
     let outcome1 = shutdown(h).await;
     assert_eq!(outcome1.startup_counters.spawned, 1, "首段生成恰 1 只");
     assert_eq!(
@@ -486,41 +476,43 @@ async fn e2_restart_preserves_agent_and_controllers() {
         "首段(全新启动)没有恢复移除"
     );
 
-    // —— 重启:读终末 bundle(shutdown 时落盘;store 是 Arc 克隆),replay
-    //    恢复 + controllers 回填 ——
-    let checkpoints = cps1_store.read_all();
-    let (snap_tick, blob) = checkpoints.last().expect("终末检查点存在").clone();
-    let bundle = app::driver::decode_checkpoint(&blob).expect("v13 档可解");
-    assert_eq!(
-        bundle.format_version,
-        app::driver::CHECKPOINT_FORMAT_VERSION,
-        "bundle 版本 = 13"
+    // —— 重启:同一 data_dir 再走一次**真实 bootstrap**(读终末 bundle:
+    //    replay 恢复 + controllers 回填,第 6 项 = Some(检查点条目) 原样
+    //    透传给 run)。注意先读库再 bootstrap:redb 单写锁,bootstrap 会
+    //    持有目录里两个库的锁,读完成后再装配。——
+    {
+        let cps = read_all_checkpoints(&data_dir);
+        let (_, blob) = cps.last().expect("终末检查点存在").clone();
+        let bundle = app::driver::decode_checkpoint(&blob).expect("v13 档可解");
+        assert_eq!(
+            bundle.format_version,
+            app::driver::CHECKPOINT_FORMAT_VERSION,
+            "bundle 版本 = 13"
+        );
+        assert_eq!(
+            bundle.controllers.len(),
+            1,
+            "检查点恰 1 条 ControllerRecord(实得 {})",
+            bundle.controllers.len()
+        );
+    }
+    let (resumed, _log2, store2, resume_from, spawn_next_seq, startup_controllers) =
+        app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+            .expect("重启 bootstrap 装配成功");
+    assert!(
+        resume_from.is_some(),
+        "重启段 bootstrap 走恢复分支(续跑自拍)"
     );
-    assert_eq!(
-        bundle.controllers.len(),
-        1,
-        "检查点恰 1 条 ControllerRecord(实得 {})",
-        bundle.controllers.len()
+    assert!(
+        startup_controllers.is_some() && startup_controllers.as_ref().expect("Some").len() == 1,
+        "bootstrap 第 6 项 = Some(恰 1 条)"
     );
-    let resumed = sim_api::replay::replay_world_with_bodies(
-        &bundle.world,
-        &CommandLog::new(),
-        {
-            let mut c = config.session_config();
-            c.scheduler.start_tick = snap_tick;
-            c
-        },
-        || Box::new(SimpleRegistry::builtin()),
-        || bodies.clone(),
-    )
-    .expect("恢复");
     assert!(
         resumed.is_agent(entity0),
         "恢复后主体仍在(同一 EntityId {entity0:?})"
     );
 
-    // 起新驱动(网络面 + 检查点回填:startup_controllers = 检查点条目,
-    // 配置不重新生成)。
+    // 起新驱动(网络面;DriverArgs 全部来自 bootstrap 返回值)。
     let net_cfg = NetConfig {
         listen_addr: "127.0.0.1:0".to_string(),
         read_timeout_secs: 3600,
@@ -537,20 +529,15 @@ async fn e2_restart_preserves_agent_and_controllers() {
         .expect("监听成功");
     std::mem::forget(bcast_tx);
     let (tx, rxq) = mpsc::channel::<DriverCommand>(16);
-    let checkpoints2 = RecordingCheckpointStore::default();
-    let store = StoreWorker::new(
-        Box::new(storage::mem::MemChunkStore::new()),
-        Box::new(checkpoints2.clone()),
-    );
     let (provider, new_sim, loaded) =
-        app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
+        app::driver::wire_provider_and_new_sim(config.clone(), &store2, || {
             Box::new(SimpleRegistry::builtin())
         })
         .expect("装配失败");
     let driver = tokio::spawn(run(DriverArgs {
         config,
         session: resumed,
-        store,
+        store: store2,
         log: CommandLog::new(),
         commands: rxq,
         listen_ctrl_c: false,
@@ -561,9 +548,9 @@ async fn e2_restart_preserves_agent_and_controllers() {
             hub,
             cadence,
         }),
-        spawn_next_seq: bundle.spawn_next_seq,
+        spawn_next_seq,
         bodies: loaded,
-        startup_controllers: Some(bundle.controllers),
+        startup_controllers,
     }));
 
     // 重启段:客户端重连采样(观察者回出生点),采 200 拍主体帧,再走够
@@ -620,7 +607,7 @@ async fn e3_replay_bitwise_matches_online() {
     let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
     // 期中票落在 240 拍(主体已在走),回放窗口 = 检查点之后的动作。
     config.checkpoint_interval_ticks = 240;
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -630,12 +617,12 @@ async fn e3_replay_bitwise_matches_online() {
     .expect("MoveObserver 写入");
     let (_entity, _n, samples) = sample_quad_root(&mut rx, 420).await;
     drop(a);
-    let cps_store = h.checkpoints.clone();
+    let cps_dir = h.data_dir.clone();
     let outcome = shutdown(h).await;
     let _ = outcome;
 
     // 最早检查点 + 其后拼接日志(终末在 shutdown 时落盘)。
-    let checkpoints = cps_store.read_all();
+    let checkpoints = read_all_checkpoints(&cps_dir);
     assert!(
         checkpoints.len() >= 2,
         "期中 + 终末都有(实得 {})",
@@ -694,7 +681,7 @@ async fn e3_replay_bitwise_matches_online() {
 #[tokio::test(start_paused = true)]
 async fn e4_leash_stops_trot() {
     let config = quad_config(vec![quad_agent(StartupController::QuadTrot, 2.0)]);
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -817,7 +804,7 @@ fn e5_config_errors_reject_startup() {
 #[tokio::test(start_paused = true)]
 async fn e6_remove_entity_detaches_controller() {
     let config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -920,9 +907,9 @@ async fn e6_remove_entity_detaches_controller() {
 async fn e7_no_agents_world_unchanged() {
     let mut config = quad_config(Vec::new());
     config.checkpoint_interval_ticks = 6000;
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     advance_ticks(120).await;
-    let cps_owned = h.checkpoints.clone();
+    let cps_dir = h.data_dir.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.controller_counters,
@@ -932,7 +919,7 @@ async fn e7_no_agents_world_unchanged() {
         outcome.startup_counters,
         app::startup_agents::StartupCounters::default()
     );
-    let cps = cps_owned.read_all();
+    let cps = read_all_checkpoints(&cps_dir);
     let (_, blob) = cps.last().expect("终末检查点").clone();
     let bundle = app::driver::decode_checkpoint(&blob).expect("可解");
     let window = CommandLog::from_bytes(&bundle.log_bytes).expect("窗口可解");
@@ -953,7 +940,7 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
     let mut agent = quad_agent(StartupController::None, 16.0);
     agent.position[1] = -200.0; // 世界底(WORLD_Y_MIN = -64)之下,列永不装载
     let config = quad_config(vec![agent]);
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     advance_ticks(660).await; // 600 超时 + 余量
     let outcome = shutdown(h).await;
     assert_eq!(
@@ -982,7 +969,7 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
 #[tokio::test(start_paused = true)]
 async fn e9_client_receives_agent_states() {
     let config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
-    let h = harness(config, quad_registry()).await;
+    let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -1023,4 +1010,48 @@ async fn e9_client_receives_agent_states() {
     }
     let _ = seen;
     shutdown(h).await;
+}
+
+// ---- E10:bootstrap 全新/恢复两段,第 6 项往返(R1-1) ------------------------
+
+/// E10(返修 R1-1):带一条 `[[agents]]` 的配置——空 data_dir 上
+/// `bootstrap` 第 6 项 `is_none()`(全新启动,配置条目由 startup 生成);
+/// 跑到写出检查点后关服,同一 data_dir 再 `bootstrap`,第 6 项是 `Some`
+/// 且恰 1 条、`entity` 等于第一段生成的那只。
+#[tokio::test(start_paused = true)]
+async fn e10_bootstrap_roundtrip_startup_controllers() {
+    let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
+    config.checkpoint_interval_ticks = 6000;
+    let h = bootstrap_harness(config.clone()).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    // 等到主体帧出现(= 已生成),拿到生成的 EntityId。
+    let (entity0, _n, _samples) = sample_quad_root(&mut rx, 120).await;
+    drop(a);
+    let data_dir = h.data_dir.clone();
+    let outcome = shutdown(h).await;
+    assert_eq!(outcome.startup_counters.spawned, 1, "首段生成 1 只");
+    // 同一 data_dir 重启 bootstrap:第 6 项 = Some 恰 1 条,entity 对得上。
+    let mut restart_config = config;
+    restart_config.data_dir = data_dir.clone();
+    let (_session, _log, _store, resume_from, _seq, controllers) =
+        app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+            .expect("重启 bootstrap 成功");
+    assert!(resume_from.is_some(), "重启走恢复分支");
+    let records = controllers.expect("第 6 项 = Some(恢复启动)");
+    assert_eq!(
+        records.len(),
+        1,
+        "第 6 项恰 1 条 ControllerRecord(实得 {})",
+        records.len()
+    );
+    assert_eq!(
+        records[0].entity, entity0,
+        "ControllerRecord.entity = 第一段生成的那只"
+    );
 }
