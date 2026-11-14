@@ -381,6 +381,7 @@ fn run_trot_600(sample_from: u32) -> (Metrics, CommandLog) {
         QUAD_DOF,
         2,
         Tick(0),
+        None,
     )
     .expect("挂载合法");
     let (metrics, _poses, void_removed) = run_quad(600, sample_from, Some(&mut host), &mut log);
@@ -536,6 +537,7 @@ fn b6_trot_600_replay_bitwise() {
         QUAD_DOF,
         2,
         Tick(0),
+        None,
     )
     .expect("挂载合法");
 
@@ -666,6 +668,7 @@ fn b1b_stand_script_3600() {
         QUAD_DOF,
         2,
         Tick(0),
+        None,
     )
     .expect("挂载合法");
 
@@ -762,6 +765,7 @@ fn b2a_trot_3600_clean() {
         QUAD_DOF,
         2,
         Tick(0),
+        None,
     )
     .expect("挂载合法");
     let (metrics, _poses, void_removed) = run_quad(
@@ -813,6 +817,7 @@ fn b2b_trot_3600_shuffled_order() {
             QUAD_DOF,
             2,
             Tick(0),
+            None,
         )
         .expect("挂载合法");
         run_quad(
@@ -905,6 +910,7 @@ fn b2b_trot_3600_shuffled_order() {
         QUAD_DOF,
         2,
         Tick(0),
+        None,
     )
     .expect("挂载合法");
 

@@ -2552,7 +2552,7 @@ pub(crate) mod tests {
             ..crate::config::Config::default()
         };
         let _ = std::fs::remove_dir_all(&config.data_dir);
-        let (session, log, store, _resume, _spawn_next_seq) =
+        let (session, log, store, _resume, _spawn_next_seq, _controllers) =
             bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("装配");
         let (provider, new_sim, _bodies) =
             crate::driver::wire_provider_and_new_sim(config.clone(), &store, || {
@@ -2572,6 +2572,7 @@ pub(crate) mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         };
         let driver = tokio::spawn(crate::driver::run(args));
 
@@ -2772,6 +2773,7 @@ pub(crate) mod tests {
             observe: Some(handle.observe),
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
 
         // 外部客户端连入:Hello + Subscribe → 首帧 Welcome(ACV1 冒烟)。

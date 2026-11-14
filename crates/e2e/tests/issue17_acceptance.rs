@@ -132,6 +132,7 @@ fn bundle(format_version: u32, log_bytes: Vec<u8>) -> CheckpointBundle {
         world,
         log_bytes,
         spawn_next_seq: 42,
+        controllers: Vec::new(),
     }
 }
 
@@ -218,7 +219,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         checkpoint_keep: 3,
         ..Config::default()
     };
-    let (session, log, store, resume_from, _seq) =
+    let (session, log, store, resume_from, _seq, _controllers) =
         app::driver::bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None);
     let (provider, new_sim, _bodies) =
@@ -237,6 +238,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     tx.send(DriverCommand::MoveObserver {
         position: Vec3::new(8.0, types::WORLD_Y_MIN as f32 + 6.0, 8.0),
@@ -268,7 +270,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         tick
     };
 
-    let (session, _log, store, resume_from, _seq) =
+    let (session, _log, store, resume_from, _seq, _controllers) =
         app::driver::bootstrap(&config, new_registry()).expect("同一目录重新装配");
     assert_eq!(resume_from, Some(latest_tick), "从最新的 checkpoint 续跑");
     session.shutdown();

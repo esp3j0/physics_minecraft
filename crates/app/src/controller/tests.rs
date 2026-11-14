@@ -3,7 +3,9 @@
 use types::{EntityId, Tick};
 
 use super::gait::{Gait, QUAD_DOF, QUAD_L, ik, stand_targets, trot_targets};
-use super::{AttachError, ControllerHost, ControllerKind, ScriptKind, TROT_SETTLE_TICKS};
+use super::{
+    AttachError, ControllerCounters, ControllerHost, ControllerKind, ScriptKind, TROT_SETTLE_TICKS,
+};
 
 /// T1 的期望站立角(资产 `default_angle`,任务书 §3)。
 const STAND_HIP: f32 = -0.853_596_4;
@@ -173,7 +175,7 @@ fn host_with(
     now: u64,
 ) -> ControllerHost {
     let mut host = ControllerHost::default();
-    host.attach(entity, kind, dof, period, Tick(now))
+    host.attach(entity, kind, dof, period, Tick(now), None)
         .expect("挂载合法");
     host
 }
@@ -267,10 +269,11 @@ fn h2_multi_entity_sorted_and_none_silent() {
             QUAD_DOF,
             1,
             Tick(0),
+            None,
         )
         .expect("挂载合法");
     }
-    host.attach(e(2), ControllerKind::None, 1, 1, Tick(0))
+    host.attach(e(2), ControllerKind::None, 1, 1, Tick(0), None)
         .expect("None 不限 dof");
     let acts = host.actions_for_tick(Tick(0));
     let ids: Vec<EntityId> = acts.iter().map(|(id, _)| *id).collect();
@@ -317,6 +320,7 @@ fn h3_detach_remove_and_attach_errors() {
         QUAD_DOF,
         1,
         Tick(0),
+        None,
     )
     .expect("首次挂载合法");
     assert_eq!(
@@ -325,7 +329,8 @@ fn h3_detach_remove_and_attach_errors() {
             ControllerKind::Script(ScriptKind::QuadStand),
             QUAD_DOF,
             1,
-            Tick(0)
+            Tick(0),
+            None,
         ),
         Err(AttachError::AlreadyAttached)
     );
@@ -335,7 +340,8 @@ fn h3_detach_remove_and_attach_errors() {
             ControllerKind::Script(ScriptKind::QuadStand),
             11,
             1,
-            Tick(0)
+            Tick(0),
+            None,
         ),
         Err(AttachError::DofMismatch {
             expected: QUAD_DOF,
@@ -343,7 +349,7 @@ fn h3_detach_remove_and_attach_errors() {
         })
     );
     // None 不限 dof:11 也收。
-    host.attach(e(4), ControllerKind::None, 11, 1, Tick(0))
+    host.attach(e(4), ControllerKind::None, 11, 1, Tick(0), None)
         .expect("None 不限 dof");
     assert_eq!(
         host.attach(
@@ -351,7 +357,8 @@ fn h3_detach_remove_and_attach_errors() {
             ControllerKind::Script(ScriptKind::QuadStand),
             QUAD_DOF,
             0,
-            Tick(0)
+            Tick(0),
+            None,
         ),
         Err(AttachError::ZeroPeriod)
     );
@@ -417,4 +424,170 @@ fn h4_trot_settle_boundary_and_pure() {
     );
     let again = host.actions_for_tick(Tick(TROT_SETTLE_TICKS));
     assert_eq!(after, again, "纯函数:同一拍两次调用结果相同");
+}
+
+// ---- B02b(§2.3/§2.4/§2.5):L1 / L2 / L3 ----
+
+use super::{ControllerRecord, ControllerSlot, Leash};
+
+fn leash(center: [f32; 2], radius: f32) -> Option<Leash> {
+    Some(Leash {
+        center_xz: center,
+        radius_m: radius,
+    })
+}
+
+/// L1(§3):`apply_leash`——半径 2、圆心 (0,0):根在 1.9 m → 仍是
+/// `QuadTrot`;2.1 m → 变 `QuadStand`、`leash_stops == 1`;再调一次不重复
+/// 计数;走回圈内也不恢复。
+#[test]
+fn l1_apply_leash_stops_trot() {
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        Tick(0),
+        leash([0.0, 0.0], 2.0),
+    )
+    .expect("挂载合法");
+    // 1.9 m:圈内,不触发。
+    host.apply_leash(|id| {
+        assert_eq!(id, e(1));
+        Some([1.9, 0.0])
+    });
+    assert_eq!(
+        host.kind_of(e(1)),
+        Some(ControllerKind::Script(ScriptKind::QuadTrot)),
+        "1.9 m < 2.0 m:仍 QuadTrot"
+    );
+    assert_eq!(host.counters.leash_stops, 0, "未触发不计数");
+    // 2.1 m:圈外,触发。
+    host.apply_leash(|_| Some([2.1, 0.0]));
+    assert_eq!(
+        host.kind_of(e(1)),
+        Some(ControllerKind::Script(ScriptKind::QuadStand)),
+        "2.1 m > 2.0 m:永久改挂 QuadStand"
+    );
+    assert_eq!(host.counters.leash_stops, 1, "触发恰计 1 次");
+    // attached_at 不动(改挂不重置相位)。
+    let records = host.to_records();
+    assert_eq!(records[0].slot.attached_at, Tick(0), "attached_at 不动");
+    // 再调一次:已是 QuadStand,不再检查、不重复计数。
+    host.apply_leash(|_| Some([100.0, 100.0]));
+    assert_eq!(host.counters.leash_stops, 1, "不重复计数");
+    // 走回圈内也不恢复(kind 已是 QuadStand,永不回 QuadTrot)。
+    host.apply_leash(|_| Some([0.0, 0.0]));
+    assert_eq!(
+        host.kind_of(e(1)),
+        Some(ControllerKind::Script(ScriptKind::QuadStand)),
+        "改挂后不恢复"
+    );
+    assert_eq!(host.counters.leash_stops, 1);
+    // 无 leash 的 QuadTrot 不受约束;根读不到(root_xz = None)也不触发。
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(2),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        1,
+        Tick(0),
+        None,
+    )
+    .expect("挂载合法(无 leash)");
+    host.apply_leash(|_| Some([1000.0, 1000.0]));
+    assert_eq!(
+        host.kind_of(e(2)),
+        Some(ControllerKind::Script(ScriptKind::QuadTrot)),
+        "无 leash 不约束"
+    );
+    host.apply_leash(|_| None);
+    assert_eq!(
+        host.kind_of(e(2)),
+        Some(ControllerKind::Script(ScriptKind::QuadTrot)),
+        "根读不到不触发"
+    );
+}
+
+/// L2(§3):`retain_alive` 摘掉不在的条目并返回条数。
+#[test]
+fn l2_retain_alive_removes_and_counts() {
+    let mut host = ControllerHost::default();
+    for id in [1u32, 2, 3] {
+        host.attach(
+            e(id),
+            ControllerKind::Script(ScriptKind::QuadStand),
+            QUAD_DOF,
+            1,
+            Tick(0),
+            None,
+        )
+        .expect("挂载合法");
+    }
+    // e(2) 已不在:e(1)、e(3) 留。返回 1,输出只剩 2 条。
+    let removed = host.retain_alive(|id| id != e(2));
+    assert_eq!(removed, 1, "摘掉 1 条");
+    assert_eq!(host.kind_of(e(2)), None, "e(2) 已摘");
+    assert_eq!(
+        host.kind_of(e(1)).is_some() && host.kind_of(e(3)).is_some(),
+        true
+    );
+    let removed = host.retain_alive(|_| true);
+    assert_eq!(removed, 0, "全活:摘 0 条");
+    let removed = host.retain_alive(|_| false);
+    assert_eq!(removed, 2, "全死:摘 2 条");
+    assert_eq!(host.to_records().len(), 0);
+}
+
+/// L3(§3):`to_records` / `from_records` 往返相等;序列化再反序列化相等。
+#[test]
+fn l3_records_roundtrip() {
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadTrot),
+        QUAD_DOF,
+        2,
+        Tick(7),
+        leash([3.0, 4.0], 16.0),
+    )
+    .expect("挂载合法");
+    host.attach(
+        e(2),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        1,
+        Tick(9),
+        None,
+    )
+    .expect("挂载合法");
+    host.attach(e(3), ControllerKind::None, 11, 1, Tick(0), None)
+        .expect("None 不限 dof");
+    // 往返:to_records → from_records → to_records 逐条相等。
+    let records = host.to_records();
+    let rebuilt = ControllerHost::from_records(records.clone());
+    assert_eq!(rebuilt.to_records(), records, "往返逐条相等");
+    // 计数清零(遥测不进检查点)。
+    assert_eq!(rebuilt.counters, ControllerCounters::default());
+    // 序列化再反序列化相等(bincode;检查点就是这个编码面)。
+    let bytes = bincode::serde::encode_to_vec(&records, bincode::config::standard())
+        .expect("records 可编码");
+    let (back, _): (Vec<ControllerRecord>, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .expect("records 可解码");
+    assert_eq!(back, records, "序列化往返相等");
+    let rebuilt = ControllerHost::from_records(back);
+    assert_eq!(
+        rebuilt.kind_of(e(1)),
+        Some(ControllerKind::Script(ScriptKind::QuadTrot))
+    );
+    assert_eq!(rebuilt.to_records()[0].slot.leash, leash([3.0, 4.0], 16.0));
+    let _ = ControllerSlot {
+        kind: ControllerKind::None,
+        dof: 0,
+        period_ticks: 1,
+        attached_at: Tick(0),
+        leash: None,
+    };
 }

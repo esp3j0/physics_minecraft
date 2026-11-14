@@ -95,6 +95,7 @@ async fn start_server(
         }),
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     (tx, driver, addr)
 }

@@ -124,6 +124,7 @@ async fn drive(
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -159,7 +160,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     let config = disk_config(dir.path(), 5);
 
     // —— 段 1:全新目录,resume_from 为 None,跑 7 拍 ——
-    let (session, log, store, resume_from, _spawn_next_seq) =
+    let (session, log, store, resume_from, _spawn_next_seq, _controllers) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "空目录:无检查点,全新会话");
     let outcome1 = drive(config.clone(), session, log, store, 7).await;
@@ -171,7 +172,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     );
 
     // —— 段 2:同目录续跑,起始拍对齐段 1 终末快照;再跑 3 拍 ——
-    let (session2, log2, store2, resume_from2, _spawn_next_seq2) =
+    let (session2, log2, store2, resume_from2, _spawn_next_seq2, _controllers) =
         bootstrap(&config, new_registry()).expect("续跑装配");
     assert_eq!(resume_from2, Some(Tick(7)), "续跑起始拍 == 段 1 终末 7");
     let outcome2 = drive(config.clone(), session2, log2, store2, 3).await;
@@ -183,7 +184,7 @@ async fn resume_from_redb_checkpoint_continues_ticks() {
     );
 
     // —— 段 3:再续跑,起始拍 == 10(链式续跑)——
-    let (session3, _log3, store3, resume_from3, _spawn_next_seq3) =
+    let (session3, _log3, store3, resume_from3, _spawn_next_seq3, _controllers) =
         bootstrap(&config, new_registry()).expect("二次续跑装配");
     assert_eq!(resume_from3, Some(Tick(10)), "链式续跑:起始拍 == 10");
     assert_eq!(session3.tick_now(), Tick(10), "会话拍号与续跑起点一致");
@@ -202,7 +203,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
     let entity = EntityId::from_parts(1, 1);
 
     // —— 段 1:带地形分片 + SpawnDynamic,跑 7 拍关停 ——
-    let (mut session, log, store, resume_from, _spawn_next_seq) =
+    let (mut session, log, store, resume_from, _spawn_next_seq, _controllers) =
         bootstrap(&config, new_registry()).expect("装配");
     assert_eq!(resume_from, None);
     session.register(ground_sim());
@@ -222,6 +223,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -236,7 +238,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
     assert_eq!(outcome1.checkpoints_written, vec![Tick(5), Tick(7)]);
 
     // —— 续跑:恢复的分片与实体在快照里可见 ——
-    let (session2, log2, store2, resume_from2, _spawn_next_seq2) =
+    let (session2, log2, store2, resume_from2, _spawn_next_seq2, _controllers) =
         bootstrap(&config, new_registry()).expect("续跑装配");
     assert_eq!(resume_from2, Some(Tick(7)));
     assert_eq!(session2.shard_ids(), vec![shard], "分片经快照恢复注册");
@@ -262,6 +264,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -335,7 +338,7 @@ fn fresh_bootstrap_without_store_starts_at_zero() {
     let dir = tempfile::tempdir().expect("创建临时目录");
     let config = disk_config(dir.path(), 5);
 
-    let (session, log, store, resume_from, _spawn_next_seq) =
+    let (session, log, store, resume_from, _spawn_next_seq, _controllers) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!(resume_from, None, "全新目录:无检查点可续");
     assert_eq!(session.tick_now(), Tick::ZERO, "拍号从 0 起");
@@ -382,6 +385,7 @@ async fn telemetry_wired_into_driver_outcome() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -420,7 +424,7 @@ async fn spawn_high_water_survives_restart() {
 
     // —— 段 1:spawn (0,77) → despawn(Remove)→ 跨两次 checkpoint(第二次
     //    无 spawn 日志)→ 关停。验证高水位不因空日志窗口回退(评审 B1)。——
-    let (session, log, store, resume_from, _seq0) =
+    let (session, log, store, resume_from, _seq0, _controllers) =
         bootstrap(&config, new_registry()).expect("装配空目录");
     assert_eq!((resume_from, _seq0), (None, 0), "空目录:无高水位");
     let mut session = session;
@@ -441,6 +445,7 @@ async fn spawn_high_water_survives_restart() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
+        startup_controllers: Vec::new(),
     }));
     let old = EntityId::from_parts(0, 77);
     tx.send(DriverCommand::Send {
@@ -467,7 +472,7 @@ async fn spawn_high_water_survives_restart() {
 
     // —— 段 2:同目录恢复——实体已 despawn、最后一次 checkpoint 无 spawn
     //    日志,高水位仍 ≥ 78(不回退到 0);新分配首 ID 严格大于旧 ID。——
-    let (session2, _log2, store2, resume_from2, spawn_next_seq2) =
+    let (session2, _log2, store2, resume_from2, spawn_next_seq2, _controllers) =
         bootstrap(&config, new_registry()).expect("续跑装配");
     assert_eq!(resume_from2, outcome1.checkpoints_written.last().copied());
     assert!(

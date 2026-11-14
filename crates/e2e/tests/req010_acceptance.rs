@@ -1616,7 +1616,7 @@ mod unit02 {
     /// 会变红的实现:信封、出站写入与待转换集合的格式变了却没升版本。
     #[test]
     fn acc_c12_checkpoint_version_is_v8() {
-        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 12);
+        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 13);
     }
 }
 

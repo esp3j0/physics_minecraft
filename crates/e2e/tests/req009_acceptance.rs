@@ -140,10 +140,11 @@ mod unit01 {
                 world_kind: kind,
                 ..Config::default()
             };
-            let (session, _log, store, _resume, _seq) = app::driver::bootstrap(&config, || {
-                Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
-            })
-            .expect("装配");
+            let (session, _log, store, _resume, _seq, _controllers) =
+                app::driver::bootstrap(&config, || {
+                    Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
+                })
+                .expect("装配");
             let (provider, _new_sim, _bodies) =
                 app::driver::wire_provider_and_new_sim(config.clone(), &store, || {
                     Box::new(SimpleRegistry::builtin()) as Box<dyn BlockRegistry>
@@ -1793,6 +1794,7 @@ mod unit05 {
             world: a.world_snapshot(),
             log_bytes: log.to_bytes(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         let back = decode_checkpoint(&encode_checkpoint(&bundle)).expect("v6 往返");
         let replay_log = CommandLog::from_bytes(&back.log_bytes).expect("日志");

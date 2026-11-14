@@ -307,6 +307,7 @@ async fn harness_recording(config: Config) -> Harness {
         }),
         spawn_next_seq: 0,
         bodies,
+        startup_controllers: Vec::new(),
     }));
     Harness {
         tx,
@@ -711,6 +712,7 @@ async fn a03_10b_checkpoint_resume_server_agent() {
             observe: None,
             spawn_next_seq: 0,
             bodies: BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
         // 推进 30 拍(清扫在第一拍;a03_recovery_sweep 同款推进)。
         for _ in 0..30 {

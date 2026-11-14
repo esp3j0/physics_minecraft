@@ -2225,7 +2225,7 @@ fn acc_06c_all_params_injectable() {
     let dir = tempfile::tempdir().expect("临时目录");
     let mut boot = config.clone();
     boot.data_dir = dir.path().to_path_buf();
-    let (mut session, _log, store, _resume, _seq) =
+    let (mut session, _log, store, _resume, _seq, _controllers) =
         app::driver::bootstrap(&boot, || Box::new(voxel::SimpleRegistry::builtin()))
             .expect("bootstrap");
     assert!(

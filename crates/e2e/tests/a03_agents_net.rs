@@ -446,6 +446,7 @@ async fn harness(config: Config, observe: (u64, u64)) -> Harness {
         }),
         spawn_next_seq: 0,
         bodies,
+        startup_controllers: Vec::new(),
     }));
     Harness { tx, driver, addr }
 }

@@ -313,6 +313,7 @@ fn determinism_repeat_and_checkpoint_resume() {
             world: a.world_snapshot(),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         }));
         frames_a.push(a.entity_states(shard()).unwrap_or_default());
     }
@@ -333,6 +334,7 @@ fn determinism_repeat_and_checkpoint_resume() {
             world: b.world_snapshot(),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         });
         assert_eq!(
             snap_b, snap_a[i],
@@ -366,6 +368,7 @@ fn determinism_repeat_and_checkpoint_resume() {
         world: c.world_snapshot(),
         log_bytes: log_c.to_bytes(),
         spawn_next_seq: 0,
+        controllers: Vec::new(),
     };
     let back = decode_checkpoint(&encode_checkpoint(&bundle)).expect("往返");
     let replay_log = CommandLog::from_bytes(&back.log_bytes).expect("日志");
@@ -382,6 +385,7 @@ fn determinism_repeat_and_checkpoint_resume() {
             world: r.world_snapshot(),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         });
         assert_eq!(
             snap_r, snap_a[i],

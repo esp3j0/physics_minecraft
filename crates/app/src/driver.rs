@@ -487,6 +487,10 @@ pub struct DriverArgs {
     /// 装配 = `wire_provider_and_new_sim` 已加载的同一份(不再读目录);测试
     /// 装配不涉主体时给空表(生成被拒即正确行为)。
     pub bodies: physics_sim::BodyRegistry,
+    /// 检查点恢复出的控制者条目(B02b §2.5):`bootstrap` 从 bundle 读出;
+    /// 恢复启动非空(`ControllerHost::from_records` 重建宿主),全新启动
+    /// 空表(配置生成的主体由 `startup_agents` 在首拍起生成并挂载)。
+    pub startup_controllers: Vec<crate::controller::ControllerRecord>,
 }
 
 /// 观察输出缝(REQ-003 §4.4;任务书 03 装配件):网络层 `serve` 的 up 接收端
@@ -562,6 +566,10 @@ pub struct DriverOutcome {
     /// 主体协议面遥测(REQ-012 A03 §6;生成/附身/意图等计数,不改
     /// DebugCounters——bincode 协议结构,加字段破坏兼容)。
     pub agent: AgentCounters,
+    /// 控制者宿主计数(B02b §2.3;退出时快照)。
+    pub controller_counters: crate::controller::ControllerCounters,
+    /// 启动主体计数(B02b §2.2;退出时快照)。
+    pub startup_counters: crate::startup_agents::StartupCounters,
 }
 
 /// 检查点格式版本(REQ-005 D8;REQ-007 任务 01 升版,B5):预发布阶段不兼容
@@ -619,7 +627,12 @@ pub struct DriverOutcome {
 /// (连续陷入拍数随快照走)且 `Outbox` 布局追加 `agent_crush_removed`
 /// (压垮移除计数;REQ-012 §6"压垮",2026-11-13 用户裁定)——v11 及更早
 /// 档解码失败/版本拒绝,必须清 `data_dir`(不做迁移)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 12;
+///
+/// **v13**(REQ-012 B02b,#25):`CheckpointBundle` 追加尾字段
+/// `controllers`(`crate::controller::ControllerRecord` 表 = 驱动层控制者
+/// 宿主的检查点条目;§2.5)——bundle 布局变化,v12 及更早档解码失败/版本
+/// 拒绝,必须清 `data_dir`(不做迁移)。计数(遥测)不进检查点。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 13;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -633,6 +646,11 @@ pub struct CheckpointBundle {
     /// 这里开始",不是"最后用过的序号"。恢复时与增量日志中 server
     /// namespace 已分配序号取 max(覆盖 checkpoint 后、崩溃前的窗口)。
     pub spawn_next_seq: u32,
+    /// 驱动层控制者宿主的检查点条目(B02b §2.5;`host.to_records()`,
+    /// EntityId 升序):恢复时 `ControllerHost::from_records` 重建。世界
+    /// 快照里的主体本身(连杆/关节保持状态)在 `world` 内,本字段只承载
+    /// "谁挂着什么控制者"的驱动层簿记。
+    pub controllers: Vec<crate::controller::ControllerRecord>,
 }
 
 /// 驱动层可预期失败(类型化;蓝图 §4)。
@@ -713,6 +731,7 @@ fn write_checkpoint(
     checkpoints_written: &mut Vec<types::Tick>,
     previous_spawn_high: u32,
     orchestrator_spawn_next_seq: u32,
+    controllers: &[crate::controller::ControllerRecord],
 ) -> u32 {
     // spawn 高水位(#12;返修 B1):单调不回退——
     // next = max(上一次落盘值, 分配器当前值, 本日志窗口扫描)。
@@ -731,6 +750,7 @@ fn write_checkpoint(
         world,
         log_bytes: encode_log(taken),
         spawn_next_seq,
+        controllers: controllers.to_vec(),
     };
     let tick = bundle.world.shards.tick;
     store.append_checkpoint(tick, encode_checkpoint(&bundle));
@@ -2383,10 +2403,23 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         observe,
         spawn_next_seq,
         bodies,
+        startup_controllers,
     } = args;
     // 会话 source(commands 通道本地权威命令的日志 source;网络路径用玩家,
     // REQ-005 D9)。
     let session_source = config.session_config().source;
+
+    // 控制者宿主(B02b §2.3):恢复启动 = 检查点条目重建(世界快照里已有
+    // 这些主体,配置不重新生成);全新启动 = 空(配置的 [[agents]] 由
+    // startup 逐条生成并挂载)。计数是遥测,不随检查点恢复。
+    let mut host = crate::controller::ControllerHost::from_records(startup_controllers);
+    // 启动主体(§2.2):只全新启动带配置;恢复启动传空表(§2.2 契约)。
+    let mut startup = crate::startup_agents::StartupAgents::new(&config.agents, &bodies)
+        .expect("启动主体构造失败(校验已在 load_body_registry 前置,fail-stop 防御)");
+    // startup 的服务端序号分配器(spawn_next_seq 那一套,#12 语义):与
+    // observe 编排器的分配器同一起点、同"跳过现存 ID"策略,不会重复;
+    // checkpoint 的高水位 max 把它计入(见下方 checkpoint 分支)。
+    let mut startup_next_seq = spawn_next_seq;
 
     let mut ticker = tokio::time::interval(Duration::from_secs_f32(config.dt));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -2483,12 +2516,50 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 // 顶部注释);喂 telemetry 的只有现成 Duration。
                 #[allow(clippy::disallowed_methods)]
                 let t0 = std::time::Instant::now();
+                // 控制者编排(B02b §2.3 每拍顺序,全部在 session.tick() 之前):
+                // ① startup.poll——配置生成的待生成项(放票 → 出生列可读且
+                //    碰撞体已建 → 生成 + 挂载;600 拍超时放弃);
+                // ② host.apply_leash——活动范围:走出 leash 圆的 QuadTrot
+                //    永久改挂 QuadStand(B03 前的临时保护);
+                // ③ host.drive——本拍该发的关节目标(经日志盖章投递)。
+                // 三步无配置/无挂载时零动作(AC-A8:世界与日志逐位不变)。
+                let now = session.tick_now();
+                startup.poll(
+                    &mut session,
+                    &mut log,
+                    &mut host,
+                    &mut |sess| {
+                        loop {
+                            let seq = startup_next_seq;
+                            startup_next_seq = seq
+                                .checked_add(1)
+                                .expect("服务端 EntityId 序号耗尽(fail-stop)");
+                            let entity = types::EntityId::from_parts(0, seq);
+                            if sess.entity_owner(entity).is_none() {
+                                return entity;
+                            }
+                        }
+                    },
+                    now,
+                );
+                if host.first_slot().is_some() {
+                    let root_xz = |id| {
+                        session
+                            .agent_root_position(id)
+                            .map(|p| [p.x, p.z])
+                    };
+                    host.apply_leash(root_xz);
+                    host.drive(&mut session, &mut log, now);
+                }
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。
                 // TODO(REQ-003):tick() 移入 spawn_blocking,消掉驱动的阻塞段。
                 let summary = session.tick();
                 telemetry.record(t0.elapsed());
                 ticks_run += 1;
+                // ④ 主体没了就摘控制者(§2.3:每拍末;EntityId 不在主体表 =
+                // 摘)。无挂载时空转。
+                host.retain_alive(|id| session.is_agent(id));
                 // tick 末端编排(REQ-002 §4.4/§4.5,顺序固定 ①②③④):
                 // ensure 观察者分片 → 激活请求取数回填/卸载 → despawn 候选 +
                 // 持久化屏障 → chunk 流请求取数回执。无观察者且无挂起流请求时
@@ -2567,11 +2638,13 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 if ticks_run.is_multiple_of(config.checkpoint_interval_ticks) {
                     // spawn 高水位(#12 返修 B1):跨 checkpoint 单调——
                     // max(上一次落盘值, 分配器当前值, 本日志窗口扫描)。
-                    // 第二项 observe 缝不在场(无网络)恒 0。
+                    // 第二项 observe 缝不在场(无网络)恒 0;第三项 startup
+                    // 分配器(B02b:配置生成的主体走它,同样要进高水位)。
                     let orchestrator_seq = observe_state
                         .as_ref()
                         .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
-                        .unwrap_or(0);
+                        .unwrap_or(0)
+                        .max(startup_next_seq);
                     spawn_high_water = write_checkpoint(
                         &session,
                         &mut log,
@@ -2579,6 +2652,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                         &mut checkpoints_written,
                         spawn_high_water,
                         orchestrator_seq,
+                        &host.to_records(),
                     );
                     ticks_at_last_checkpoint = ticks_run;
                 }
@@ -2679,7 +2753,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         let orchestrator_seq = observe_state
             .as_ref()
             .map(|(orchestrator, ..)| orchestrator.spawn_next_seq())
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(startup_next_seq);
         // 终末后驱动即退出:单调状态不再续用,返回值显式弃(落盘值以
         // bundle 为准,bootstrap 读回)。
         let _final_high_water = write_checkpoint(
@@ -2689,6 +2764,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
             &mut checkpoints_written,
             spawn_high_water,
             orchestrator_seq,
+            &host.to_records(),
         );
     }
     // flush 只在关停:屏障 = 此前全部操作(期中 + 终末)已落库。
@@ -2715,6 +2791,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         chunks_loaded,
         chunks_unloaded,
         agent: agent_counters,
+        controller_counters: host.counters,
+        startup_counters: startup.counters,
     }
 }
 
@@ -2766,6 +2844,7 @@ pub fn bootstrap(
         storage::worker::StoreWorker,
         Option<types::Tick>,
         u32,
+        Vec<crate::controller::ControllerRecord>,
     ),
     AppError,
 > {
@@ -2783,7 +2862,7 @@ pub fn bootstrap(
 
     // read_latest 必须在移交 worker 之前(决策 6:移交后文件锁在手)。
     let latest = checkpoints.read_latest()?;
-    let (session, log, resume_from, spawn_next_seq) = match latest {
+    let (session, log, resume_from, spawn_next_seq, controllers) = match latest {
         Some((at, blob)) => {
             // 有检查点:解码 bundle(v5 前缀 + 压缩体;replay_world 恢复
             // Session + scheduler 状态 + log 续跑,拍号对齐)。旧格式/未知
@@ -2816,7 +2895,7 @@ pub fn bootstrap(
                 .spawn_next_seq
                 .max(log_server_next_seq(&log))
                 .max(entities_server_next_seq(&session));
-            (session, log, Some(at), spawn_next_seq)
+            (session, log, Some(at), spawn_next_seq, bundle.controllers)
         }
         None => {
             // session_config 内已注入激活配置(F3:观察者票规格唯一来源)。
@@ -2824,12 +2903,25 @@ pub fn bootstrap(
             // 区域票上限注入(REQ-007 任务 02 细则 10;config 两键)。
             let (max_r, max_c) = config.area_ticket_caps();
             session.set_area_ticket_caps(max_r, max_c);
-            (session, sim_api::log::CommandLog::new(), None, 0)
+            (
+                session,
+                sim_api::log::CommandLog::new(),
+                None,
+                0,
+                Vec::new(),
+            )
         }
     };
 
     let store = storage::worker::StoreWorker::new(Box::new(chunks), Box::new(checkpoints));
-    Ok((session, log, store, resume_from, spawn_next_seq))
+    Ok((
+        session,
+        log,
+        store,
+        resume_from,
+        spawn_next_seq,
+        controllers,
+    ))
 }
 
 /// 加载身体注册表(REQ-012 A01 第 1 节:启动时从目录加载 `*.body.toml`,
@@ -3437,6 +3529,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
         // 推进 30 拍(清扫在第一拍)。
         for _ in 0..30 {
@@ -4178,6 +4271,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         };
         (args, tx, checkpoints)
     }
@@ -4604,6 +4698,7 @@ mod tests {
             },
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
             spawn_next_seq: 42,
+            controllers: Vec::new(),
         };
         let decoded = decode_checkpoint(&encode_checkpoint(&bundle)).expect("自有编码必可解码");
         assert_eq!(
@@ -4625,6 +4720,7 @@ mod tests {
             },
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         let decoded = decode_checkpoint(&encode_checkpoint(&empty)).expect("空 bundle 必可解码");
         assert!(decoded.world.shards.per_shard.is_empty(), "0 分片快照合法");
@@ -4649,6 +4745,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: sim_api::log::CommandLog::new().to_bytes(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         let bytes = encode_checkpoint(&future);
         match decode_checkpoint(&bytes) {
@@ -4670,6 +4767,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         assert!(
             decode_checkpoint(&encode_checkpoint(&zero)).is_err(),
@@ -4682,6 +4780,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v1)) {
             Err(AppError::Decode(msg)) => {
@@ -4727,6 +4826,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v2)) {
             Err(AppError::Decode(msg)) => {
@@ -4771,6 +4871,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v3)) {
             Err(AppError::Decode(msg)) => {
@@ -4790,6 +4891,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v7)) {
             Err(AppError::Decode(msg)) => {
@@ -4809,6 +4911,7 @@ mod tests {
             world: mk_world(types::Tick(7)),
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v8)) {
             Err(AppError::Decode(msg)) => {
@@ -4828,7 +4931,7 @@ mod tests {
     /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 12, "REQ-012 B01c 起 = v12");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 13, "REQ-012 B02b 起 = v13");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -4837,6 +4940,7 @@ mod tests {
             },
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         match decode_checkpoint(&encode_checkpoint(&v3)) {
             Err(AppError::Decode(msg)) => assert!(
@@ -4864,6 +4968,7 @@ mod tests {
             },
             log_bytes: vec![0u8; 1_000_000],
             spawn_next_seq: 42,
+            controllers: Vec::new(),
         };
         let v6 = mk(CHECKPOINT_FORMAT_VERSION);
         let bytes = encode_checkpoint(&v6);
@@ -4973,7 +5078,7 @@ mod tests {
             },
         });
         let mut written = Vec::new();
-        let high = write_checkpoint(&session, &mut log, &store, &mut written, 0, 3);
+        let high = write_checkpoint(&session, &mut log, &store, &mut written, 0, 3, &[]);
         store.shutdown().expect("关停");
         let bundle = latest_bundle(&checkpoints);
         assert_eq!(
@@ -5031,6 +5136,7 @@ mod tests {
             &mut written,
             0,
             0,
+            &[],
         );
         assert_eq!(high1, 101, "第一张:max(0,0,101) = 101");
         flush_barrier!(store);
@@ -5038,7 +5144,15 @@ mod tests {
 
         // 第二张:日志已被 take 清空,无新 spawn → 仍 101(不回退)。
         let mut log_empty = mk_log_with(None);
-        let high2 = write_checkpoint(&session, &mut log_empty, &store, &mut written, high1, 0);
+        let high2 = write_checkpoint(
+            &session,
+            &mut log_empty,
+            &store,
+            &mut written,
+            high1,
+            0,
+            &[],
+        );
         assert_eq!(
             high2, 101,
             "第二张空窗口:max(101,0,0) = 101(评审 B1 失败序列)"
@@ -5048,7 +5162,15 @@ mod tests {
 
         // 第三张:再空 → 仍 101。
         let mut log_empty2 = mk_log_with(None);
-        let high3 = write_checkpoint(&session, &mut log_empty2, &store, &mut written, high2, 0);
+        let high3 = write_checkpoint(
+            &session,
+            &mut log_empty2,
+            &store,
+            &mut written,
+            high2,
+            0,
+            &[],
+        );
         assert_eq!(high3, 101);
         flush_barrier!(store);
         assert_eq!(latest_bundle(&checkpoints).spawn_next_seq, 101);
@@ -5291,6 +5413,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
 
         // 进区(分片 (1,0))→ 等装载 → 瞬移远走(分片 (50,0),超卸载半径)。
@@ -5374,6 +5497,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
 
         advance_ticks(3).await;
@@ -5773,6 +5897,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         }));
 
         // 编辑 chunk (8,0)(owner = 片 (1,0);两片各持一份 → 广播两片)。
@@ -6021,6 +6146,7 @@ mod tests {
             }),
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
+            startup_controllers: Vec::new(),
         };
         (args, tx, hub, addr, checkpoints)
     }
@@ -7360,7 +7486,7 @@ mod tests {
     /// 拒绝(v11 档解码不兼容;不做迁移)。
     #[test]
     fn d2_checkpoint_version_11_rejects_v10() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 12, "B01c 起 = v12");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 13, "B02b 起 = v13");
         let bundle = CheckpointBundle {
             format_version: 10,
             world: sim_api::snapshot::WorldSnapshot {
@@ -7369,6 +7495,7 @@ mod tests {
             },
             log_bytes: Vec::new(),
             spawn_next_seq: 0,
+            controllers: Vec::new(),
         };
         let bytes = encode_checkpoint(&bundle);
         let msg = match decode_checkpoint(&bytes) {
