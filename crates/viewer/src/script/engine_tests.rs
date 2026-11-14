@@ -29,6 +29,8 @@ struct FlatWorld {
     unloaded: std::collections::BTreeSet<(i32, i32, i32)>,
     /// 当前主体(根位置;A06 检查用;None = 无主体)。
     agent: Option<(EntityId, Vec3)>,
+    /// 主体表(B02c:多主体;EntityId 升序不强制,由实现排序)。
+    agents: Vec<(EntityId, Vec3)>,
 }
 
 impl FlatWorld {
@@ -37,6 +39,18 @@ impl FlatWorld {
             entities: entities.to_vec(),
             chunks: 4,
             agent: None,
+            agents: Vec::new(),
+            ..Self::default()
+        }
+    }
+
+    /// 主体表布景(B02c A 组)。
+    fn with_agents(agents: &[(EntityId, Vec3)]) -> Self {
+        Self {
+            entities: Vec::new(),
+            chunks: 4,
+            agent: None,
+            agents: agents.to_vec(),
             ..Self::default()
         }
     }
@@ -64,6 +78,15 @@ impl WorldQuery for FlatWorld {
     }
     fn live_agent(&self) -> Option<(EntityId, Vec3)> {
         self.agent
+    }
+    fn live_agents(&self) -> Vec<(EntityId, Vec3)> {
+        let mut v = self.agents.clone();
+        if v.is_empty()
+            && let Some(a) = self.agent
+        {
+            v.push(a);
+        }
+        v
     }
 }
 
@@ -407,6 +430,7 @@ impl FlatWorld {
             overrides: self.overrides.clone(),
             unloaded: self.unloaded.clone(),
             agent: self.agent,
+            agents: self.agents.clone(),
         }
     }
 }
@@ -1186,4 +1210,202 @@ possess = { label = \"p\" }",
         Some((eid(9), false)),
         "possess 附身的是队列里 Agent 槽位的 eid(9),不是先到的方块 eid(1)"
     );
+}
+
+// ---- B02c §2:多主体认领(A5)----
+
+/// A5 多主体检查:两只配置生成的四足被两条 `adopt_agent` 分别认领后,
+/// `agent_in` 对两个标签各自取各自的位置——旧实现(`live_agent()` 只返回
+/// "唯一主体")只认第一只,本测试在改前应当红(解析层拒绝 `adopt_agent`)。
+#[test]
+fn agent_checks_resolve_each_adopted_label_separately() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+adopt_agent = { label = \"b\", near = [20.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+wait_until = { agent_in = { label = \"a\", from = [9.0, -1.0, -1.0], to = [11.0, 1.0, 1.0] }, timeout_ticks = 50 }
+[[step]]
+wait_until = { agent_in = { label = \"b\", from = [19.0, -1.0, -1.0], to = [21.0, 1.0, 1.0] }, timeout_ticks = 50 }
+[[step]]
+check = { agent_alive = { label = \"b\" } }",
+    );
+    // 假世界两只主体:各在各的 near 附近。
+    let mut w = FlatWorld::with_entities(&[]);
+    w.agents = vec![
+        (eid(1), Vec3::new(10.0, 0.0, 0.0)),
+        (eid(2), Vec3::new(20.0, 0.0, 0.0)),
+    ];
+    // 帧 1:两条 adopt_agent 当帧完成(即时步骤,主体表已可见);同帧
+    // 连推语义下,两个 wait_until(agent_in 都成立)与 check 也一并结束。
+    let out = frame(&mut e, 0.016, 1, &w, &[]);
+    let actions: Vec<&str> = out.finished.iter().map(|r| r.action.as_str()).collect();
+    assert_eq!(
+        actions,
+        vec![
+            "adopt_agent",
+            "adopt_agent",
+            "wait_until",
+            "wait_until",
+            "check"
+        ],
+        "一帧内五步连推完成"
+    );
+    for rec in &out.finished {
+        assert_eq!(
+            rec.outcome,
+            StepOutcome::Ok,
+            "全部步骤应 Ok(rec = {}):{:?}",
+            rec.action,
+            rec.outcome
+        );
+    }
+    assert!(
+        matches!(e.status(), EngineStatus::Done { .. }),
+        "场景应 Done"
+    );
+}
+
+// ---- B02c §2:A1–A4、A6(adopt_agent / mark_agent at)----
+
+/// A1 认领:两只主体分别在两个 near 附近 → 两条 adopt_agent 各认到对的那只。
+#[test]
+fn adopt_agent_claims_the_nearest_matching_agent() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+adopt_agent = { label = \"b\", near = [20.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }",
+    );
+    let w = FlatWorld::with_agents(&[
+        (eid(1), Vec3::new(10.5, 0.0, 0.0)),
+        (eid(2), Vec3::new(20.5, 0.0, 0.0)),
+    ]);
+    let out = frame(&mut e, 0.016, 1, &w, &[]);
+    assert_eq!(out.finished.len(), 2, "两条 adopt_agent 当帧完成");
+    assert!(out.finished.iter().all(|r| r.outcome == StepOutcome::Ok));
+    assert_eq!(actions_of(&out), vec!["adopt_agent", "adopt_agent"]);
+}
+
+/// A2 取最近:两只都在 within 内 → 认最近的;第二条同参数的 adopt_agent
+/// 认到剩下那只(已登记的不再被认)。
+#[test]
+fn adopt_agent_prefers_closest_then_remaining() {
+    // 两只都在 (10,0,0) 附近:eid(1) 距 0.5、eid(2) 距 1.5 → a 认 eid(1)。
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+adopt_agent = { label = \"b\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }",
+    );
+    let w = FlatWorld::with_agents(&[
+        (eid(1), Vec3::new(10.5, 0.0, 0.0)),
+        (eid(2), Vec3::new(11.5, 0.0, 0.0)),
+    ]);
+    let out = frame(&mut e, 0.016, 1, &w, &[]);
+    assert_eq!(out.finished.len(), 2, "两条 adopt_agent 当帧完成");
+    assert!(out.finished.iter().all(|r| r.outcome == StepOutcome::Ok));
+    // 已登记的 eid(1) 不再被认:b 认到剩下那只 eid(2)——用 agent_in 盒
+    // (只包住 eid(2) 的位置)验证 b 的根位置。
+    let mut e2 = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+adopt_agent = { label = \"b\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+wait_until = { agent_in = { label = \"b\", from = [11.0, -1.0, -1.0], to = [12.0, 1.0, 1.0] }, timeout_ticks = 50 }",
+    );
+    let out = frame(&mut e2, 0.016, 1, &w, &[]);
+    assert!(
+        out.finished.iter().all(|r| r.outcome == StepOutcome::Ok),
+        "b 应认到 eid(2)(盒只包 eid(2))"
+    );
+}
+
+/// A3 等待:开始时主体表为空,第 N 帧出现 → 那一帧完成。
+#[test]
+fn adopt_agent_waits_for_agent_to_appear() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }",
+    );
+    let empty = FlatWorld::with_agents(&[]);
+    let out = frame(&mut e, 0.016, 10, &empty, &[]);
+    assert!(out.finished.is_empty(), "主体表空:第 1 帧不结束");
+    let mut w = empty.clone_shallow();
+    w.agents = vec![(eid(7), Vec3::new(10.0, 0.0, 0.0))];
+    let out = frame(&mut e, 0.016, 11, &w, &[]);
+    assert_eq!(out.finished.len(), 1, "主体出现的帧完成");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+}
+
+/// A4 超时:一直没有 → 失败,信息含 near 和 within、以及当时主体表。
+#[test]
+fn adopt_agent_timeout_reports_near_within_and_table() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }",
+    );
+    // 有一只主体但在 within 之外。
+    let w = FlatWorld::with_agents(&[(eid(1), Vec3::new(50.0, 0.0, 0.0))]);
+    frame(&mut e, 0.016, 100, &w, &[]);
+    frame(&mut e, 0.016, 199, &w, &[]);
+    let out = frame(&mut e, 0.016, 200, &w, &[]);
+    assert!(
+        matches!(e.status(), EngineStatus::Failed { step: 1, .. }),
+        "拍 200 = 100 + 100,超时"
+    );
+    match out.finished.last().map(|r| &r.outcome) {
+        Some(StepOutcome::Error(msg)) => {
+            assert!(msg.contains("10"), "信息含 near:{msg}");
+            assert!(msg.contains("2"), "信息含 within:{msg}");
+            assert!(msg.contains("主体"), "信息含主体表:{msg}");
+        }
+        other => panic!("应 Error,实为 {other:?}"),
+    }
+}
+
+/// A6 mark_agent 带 at:agent_moved 的距离从 at 起算(不读主体当前位置,
+/// 但标签必须已登记)。
+#[test]
+fn mark_agent_with_at_measures_from_at_point() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+mark_agent = { label = \"a\", at = [10.0, 0.0, 0.0] }
+[[step]]
+wait_until = { agent_moved = { label = \"a\", ge = 4.0 }, timeout_ticks = 50 }",
+    );
+    // 主体实际位置 (11,0,0) 距 at 基准 1.0 m(< 4)→ 不成立。
+    let w = FlatWorld::with_agents(&[(eid(1), Vec3::new(11.0, 0.0, 0.0))]);
+    let out = frame(&mut e, 0.016, 1, &w, &[]);
+    // 前两步完成,wait_until 不结束(1.0 < 4.0)。
+    assert_eq!(out.finished.len(), 2, "adopt + mark 完成,wait_until 不结束");
+    assert_eq!(actions_of(&out), vec!["adopt_agent", "mark_agent"]);
+    // 主体走到 (14,0,0):距 at 基准 4.0 ≥ 4 → wait_until 那帧成立结束。
+    let mut w2 = w.clone_shallow();
+    w2.agents = vec![(eid(1), Vec3::new(14.0, 0.0, 0.0))];
+    let out = frame(&mut e, 0.016, 2, &w2, &[]);
+    assert_eq!(out.finished.len(), 1, "wait_until(位移 ≥ 4)成立");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+}
+
+/// A6 补充:mark_agent 带 at 但标签从未登记 → 解析期拒绝(标签必须已
+/// 登记;防线在解析层,运行期分支不可达)。
+#[test]
+fn mark_agent_with_at_requires_registered_label() {
+    let text = scenario_text("[[step]]\nmark_agent = { label = \"a\", at = [10.0, 0.0, 0.0] }");
+    let err = parse_scenario(&text).expect_err("未登记标签应解析失败");
+    assert!(
+        err.message.contains("spawn_agent/adopt_agent"),
+        "错误信息指明登记来源:{:?}",
+        err.message
+    );
+}
+
+/// A7 回归辅助:actions_of(测试工具)。
+fn actions_of(out: &crate::script::FrameOutput) -> Vec<&str> {
+    out.finished.iter().map(|r| r.action.as_str()).collect()
 }

@@ -134,9 +134,23 @@ pub enum Action {
         yaw: f32,
         jump: bool,
     },
-    /// 记下当前主体根位置(A06 §4;供 `agent_moved` 用)。
+    /// 记下主体根位置(A06 §4;供 `agent_moved` 用)。`at` = Some 时基准点
+    /// 用它(B02c §2.3:配置生成的四足在 viewer 连上前可能已走远,场景要
+    /// 量"离出生点多远"),不读主体当前位置(标签必须已登记);None 时行为
+    /// 不变。
     MarkAgent {
         label: String,
+        at: Option<Vec3>,
+    },
+    /// 认领主体(B02c §2.2):配置 `[[agents]]` 生成的四足不由脚本生成,
+    /// 无回执;每帧在主体表里找**未被任何标签登记**、根位置距 `near` ≤
+    /// `within` 的主体(多只取最近,同距取 EntityId 小),登记标签即完成。
+    /// 超时(`timeout_ticks`,按服务器拍号)未找到 = 失败。不发任何命令。
+    AdoptAgent {
+        label: String,
+        near: Vec3,
+        within: f32,
+        timeout_ticks: u64,
     },
 }
 
@@ -268,6 +282,11 @@ pub trait WorldQuery {
     /// 假世界可不实现(默认 None)。
     fn live_agent(&self) -> Option<(EntityId, Vec3)> {
         None
+    }
+    /// 主体表里全部主体及其根位置,EntityId 升序(B02c §2.1)。默认 =
+    /// `live_agent` 那一只。
+    fn live_agents(&self) -> Vec<(EntityId, Vec3)> {
+        self.live_agent().into_iter().collect()
     }
 }
 

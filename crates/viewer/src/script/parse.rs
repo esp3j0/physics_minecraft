@@ -24,8 +24,9 @@ const TOP_KEYS: [&str; 7] = [
 ];
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
-/// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作)。
-const ACTION_KEYS: [&str; 17] = [
+/// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作,B02c
+/// 追加 `adopt_agent`)。
+const ACTION_KEYS: [&str; 18] = [
     "camera",
     "look_at",
     "fly",
@@ -43,6 +44,7 @@ const ACTION_KEYS: [&str; 17] = [
     "unpossess",
     "intent",
     "mark_agent",
+    "adopt_agent",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -336,7 +338,9 @@ fn parse_action(
         "possess" => &["label", "follow"],
         "unpossess" => &[],
         "intent" => &["move", "yaw", "jump"],
-        "mark_agent" => &["label"],
+        "mark_agent" => &["label", "at"],
+        // B02c §2.2:timeout_ticks 可省(默认 600)。
+        "adopt_agent" => &["label", "near", "within", "timeout_ticks"],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -630,8 +634,45 @@ fn parse_action(
             let label = t
                 .get("label")
                 .ok_or_else(|| e("动作 mark_agent 缺必填参数 label".into()))?;
+            let at = match t.get("at") {
+                Some(v) => Some(vec3(v, "mark_agent.at").map_err(e)?),
+                None => None,
+            };
             Ok(Action::MarkAgent {
                 label: str_of(label, "mark_agent.label").map_err(e)?,
+                at,
+            })
+        }
+        "adopt_agent" => {
+            let label = t
+                .get("label")
+                .ok_or_else(|| e("动作 adopt_agent 缺必填参数 label".into()))?;
+            let near = t
+                .get("near")
+                .ok_or_else(|| e("动作 adopt_agent 缺必填参数 near".into()))?;
+            let within = t
+                .get("within")
+                .ok_or_else(|| e("动作 adopt_agent 缺必填参数 within".into()))?;
+            let timeout_ticks = match t.get("timeout_ticks") {
+                Some(v) => u64_of(v, "adopt_agent.timeout_ticks").map_err(e)?,
+                None => 600,
+            };
+            if timeout_ticks < 1 {
+                return Err(e("动作 adopt_agent 的 timeout_ticks 应 ≥ 1".into()));
+            }
+            let label: String = str_of(label, "adopt_agent.label").map_err(e)?;
+            if label.is_empty() {
+                return Err(e("动作 adopt_agent 的 label 应非空".into()));
+            }
+            let within = f32_of(within, "adopt_agent.within").map_err(e)?;
+            if !within.is_finite() || within <= 0.0 {
+                return Err(e("动作 adopt_agent 的 within 应为有限正数".into()));
+            }
+            Ok(Action::AdoptAgent {
+                label,
+                near: vec3(near, "adopt_agent.near").map_err(e)?,
+                within,
+                timeout_ticks,
             })
         }
         // reject_unknown + 上面的 match 已穷尽 ACTION_KEYS。
@@ -933,18 +974,32 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
     // A06 §4 校验(解析期,跨步骤):错误各指名步骤(从 1 起)。
     // ① 主体动作的引用链:possess 的 label 必须先有 spawn_agent 登记(同
     //    标签);agent_moved 的 label 必须先有同标签的 mark_agent;
-    //    agent_in/agent_alive 的 label 必须已由 spawn_agent 定义。
-    // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4)。
+    //    agent_in/agent_alive 的 label 必须已由 spawn_agent/adopt_agent 定义。
+    // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4);adopt_agent
+    //    条数不限,但标签不许与 spawn_agent/其他 adopt_agent 重复(B02c §2.2)。
     // ③ intent/unpossess/mark_agent 前必须有 possess(没有身体可操作 =
-    //    解析错误)。
+    //    解析错误);mark_agent 带 `at` 时操作认领标签,不需要 possess
+    //    (B02c §2.3,标签仍必须已登记)。
     {
         let mut spawned: Option<(usize, String)> = None; // (步骤, 标签)
+        let mut adopted: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
         let mut possessed: Option<usize> = None; // 步骤
         let mut marks: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
+        // 主体标签登记来源:spawn_agent(最多一条)与 adopt_agent(多条),
+        // 标签全局唯一。fn 闭包会整体借用 spawned/adopted,后续赋值冲突,
+        // 故用局部 fn 传引用。
+        fn is_registered(
+            label: &str,
+            spawned: &Option<(usize, String)>,
+            adopted: &std::collections::BTreeMap<String, usize>,
+        ) -> bool {
+            adopted.contains_key(label) || spawned.as_ref().is_some_and(|(_, name)| name == label)
+        }
         for (i, step) in steps.iter().enumerate() {
             let step_no = i + 1;
-            let refer = |label: &str, what: &str| -> Result<(), ScriptError> {
+            let refer_spawned = |label: &str, what: &str| -> Result<(), ScriptError> {
                 match &spawned {
                     Some((_, name)) if name == label => Ok(()),
                     Some((_, name)) => Err(step_err(
@@ -959,6 +1014,7 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                     )),
                 }
             };
+            // 附身/意图类:只能引用 spawn_agent 登记的标签(认领主体不附身)。
             match &step.action {
                 Action::SpawnAgent { label, .. } => {
                     if spawned.is_some() {
@@ -970,10 +1026,34 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                             ),
                         ));
                     }
+                    if adopted.contains_key(label) {
+                        return Err(step_err(
+                            step_no,
+                            format!(
+                                "spawn_agent 的标签 \"{label}\" 与第 {} 步的 adopt_agent 重复",
+                                adopted[label]
+                            ),
+                        ));
+                    }
                     spawned = Some((step_no, label.clone()));
                 }
+                Action::AdoptAgent { label, .. } => {
+                    if is_registered(label, &spawned, &adopted) {
+                        let src = spawned
+                            .as_ref()
+                            .filter(|(_, name)| name == label)
+                            .map(|(s, _)| *s)
+                            .or_else(|| adopted.get(label).copied())
+                            .unwrap_or(0);
+                        return Err(step_err(
+                            step_no,
+                            format!("adopt_agent 的标签 \"{label}\" 已在第 {src} 步登记"),
+                        ));
+                    }
+                    adopted.insert(label.clone(), step_no);
+                }
                 Action::Possess { label, .. } => {
-                    refer(label, "possess")?;
+                    refer_spawned(label, "possess")?;
                     possessed = Some(step_no);
                 }
                 Action::Unpossess => {
@@ -987,17 +1067,34 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                         return Err(step_err(step_no, "intent 前没有 possess"));
                     }
                 }
-                Action::MarkAgent { label } => {
-                    if possessed.is_none() {
-                        return Err(step_err(step_no, "mark_agent 前没有 possess"));
+                Action::MarkAgent { label, at } => {
+                    match at {
+                        // 带 `at`:基准点不来自附身主体,只需标签已登记
+                        // (spawn_agent 或 adopt_agent)。
+                        Some(_) => {
+                            if !is_registered(label, &spawned, &adopted) {
+                                return Err(step_err(
+                                    step_no,
+                                    format!(
+                                        "mark_agent 引用标签 \"{label}\",但此前没有 spawn_agent/adopt_agent 登记"
+                                    ),
+                                ));
+                            }
+                        }
+                        None => {
+                            if possessed.is_none() {
+                                return Err(step_err(step_no, "mark_agent 前没有 possess"));
+                            }
+                            refer_spawned(label, "mark_agent")?;
+                        }
                     }
-                    refer(label, "mark_agent")?;
                     marks.insert(label.clone(), step_no);
                 }
                 _ => {}
             }
         }
-        // 检查项的引用校验(独立遍历:check/wait_until 里出现的)。
+        // 检查项的引用校验(独立遍历:check/wait_until 里出现的);标签
+        // 来源 = spawn_agent ∪ adopt_agent。
         for (i, step) in steps.iter().enumerate() {
             let step_no = i + 1;
             let checks: &[Check] = match &step.action {
@@ -1005,45 +1102,35 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                 Action::WaitUntil { checks, .. } => checks,
                 _ => continue,
             };
+            let refer_label = |label: &str, what: &str| -> Result<(), ScriptError> {
+                if is_registered(label, &spawned, &adopted) {
+                    return Ok(());
+                }
+                match &spawned {
+                    Some((_, name)) => Err(step_err(
+                        step_no,
+                        format!("{what} 引用标签 \"{label}\",但登记的是 \"{name}\""),
+                    )),
+                    None if adopted.is_empty() => Err(step_err(
+                        step_no,
+                        format!("{what} 引用标签 \"{label}\",但场景没有 spawn_agent/adopt_agent"),
+                    )),
+                    None => Err(step_err(
+                        step_no,
+                        format!("{what} 引用标签 \"{label}\",但登记的是 {}", {
+                            let names: Vec<&str> = adopted.keys().map(String::as_str).collect();
+                            format!("\"{}\"", names.join("\", \""))
+                        }),
+                    )),
+                }
+            };
             for check in checks {
                 match check {
-                    Check::AgentIn { label, .. } | Check::AgentAlive { label } => match &spawned {
-                        Some((_, name)) if name == label => {}
-                        Some((_, name)) => {
-                            return Err(step_err(
-                                step_no,
-                                format!(
-                                    "主体检查引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\""
-                                ),
-                            ));
-                        }
-                        None => {
-                            return Err(step_err(
-                                step_no,
-                                format!("主体检查引用标签 \"{label}\",但场景没有 spawn_agent"),
-                            ));
-                        }
-                    },
+                    Check::AgentIn { label, .. } | Check::AgentAlive { label } => {
+                        refer_label(label, "主体检查")?;
+                    }
                     Check::AgentMoved { label, .. } => {
-                        match &spawned {
-                            Some((_, name)) if name == label => {}
-                            Some((_, name)) => {
-                                return Err(step_err(
-                                    step_no,
-                                    format!(
-                                        "agent_moved 引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\""
-                                    ),
-                                ));
-                            }
-                            None => {
-                                return Err(step_err(
-                                    step_no,
-                                    format!(
-                                        "agent_moved 引用标签 \"{label}\",但场景没有 spawn_agent"
-                                    ),
-                                ));
-                            }
-                        }
+                        refer_label(label, "agent_moved")?;
                         if !marks.contains_key(label) {
                             return Err(step_err(
                                 step_no,

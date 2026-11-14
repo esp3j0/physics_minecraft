@@ -554,3 +554,101 @@ fn agent_checks_ok_forms() {
     .expect("agent_in 在 wait_until 里合法");
     assert_eq!(s.steps.len(), 2);
 }
+
+// ---- B02c §2:P1/P2(adopt_agent、mark_agent at 的解析)----
+
+/// P1 解析:adopt_agent 四个参数、默认超时 600、未知键拒绝、标签与
+/// spawn_agent 重复拒绝、两条 adopt_agent 同标签拒绝、within = 0 拒绝。
+#[test]
+fn adopt_agent_parse_full_default_and_rejections() {
+    // 四个参数齐全。
+    let s = parse_scenario(&one_step(
+        "adopt_agent = { label = \"dog\", near = [24.5, -59.5, 24.5], within = 2.0, timeout_ticks = 1200 }",
+    ))
+    .expect("四参数应可解析");
+    assert_eq!(
+        s.steps[0].action,
+        Action::AdoptAgent {
+            label: "dog".into(),
+            near: Vec3::new(24.5, -59.5, 24.5),
+            within: 2.0,
+            timeout_ticks: 1200,
+        }
+    );
+    // timeout_ticks 缺省 = 600。
+    let s = parse_scenario(&one_step(
+        "adopt_agent = { label = \"d\", near = [0, 0, 0], within = 1.0 }",
+    ))
+    .expect("缺省超时应可解析");
+    match &s.steps[0].action {
+        Action::AdoptAgent { timeout_ticks, .. } => assert_eq!(*timeout_ticks, 600, "默认 600"),
+        other => panic!("应为 AdoptAgent,实为 {other:?}"),
+    }
+    // 未知键拒绝。
+    let e = err(&one_step(
+        "adopt_agent = { label = \"d\", near = [0, 0, 0], within = 1.0, bogus = 1 }",
+    ));
+    assert!(e.message.contains("未知键"), "{}", e.message);
+    // 标签与 spawn_agent 重复拒绝。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"x\" }}\n[[step]]\nadopt_agent = {{ label = \"x\", near = [0, 0, 0], within = 1.0 }}\n"
+    ));
+    assert!(e.message.contains("已在第 1 步登记"), "{}", e.message);
+    // 两条 adopt_agent 同标签拒绝。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nadopt_agent = {{ label = \"x\", near = [0, 0, 0], within = 1.0 }}\n[[step]]\nadopt_agent = {{ label = \"x\", near = [5, 0, 0], within = 1.0 }}\n"
+    ));
+    assert!(e.message.contains("已在第 1 步登记"), "{}", e.message);
+    // within = 0 拒绝。
+    let e = err(&one_step(
+        "adopt_agent = { label = \"d\", near = [0, 0, 0], within = 0.0 }",
+    ));
+    assert!(e.message.contains("within"), "{}", e.message);
+    // within 非有限(NaN 在 toml 里写不出;用字符串探类型)拒绝。
+    let e = err(&one_step(
+        "adopt_agent = { label = \"d\", near = [0, 0, 0], within = \"x\" }",
+    ));
+    assert!(e.message.contains("within"), "{}", e.message);
+    // timeout_ticks = 0 拒绝(须 ≥ 1)。
+    let e = err(&one_step(
+        "adopt_agent = { label = \"d\", near = [0, 0, 0], within = 1.0, timeout_ticks = 0 }",
+    ));
+    assert!(e.message.contains("timeout_ticks"), "{}", e.message);
+}
+
+/// P2 解析:mark_agent 带 at、不带 at。
+#[test]
+fn mark_agent_parse_with_and_without_at() {
+    // 带 at(附身场景,行为不变的老路径)。
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\", at = [24.5, -59.72, 34.5] }}\n"
+    ))
+    .expect("mark_agent 带 at 应可解析");
+    match &s.steps[2].action {
+        Action::MarkAgent { label, at } => {
+            assert_eq!(label, "p");
+            assert_eq!(*at, Some(Vec3::new(24.5, -59.72, 34.5)));
+        }
+        other => panic!("应为 MarkAgent,实为 {other:?}"),
+    }
+    // 不带 at(缺省 None;老语义)。
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\" }}\n"
+    ))
+    .expect("mark_agent 不带 at 应可解析");
+    match &s.steps[2].action {
+        Action::MarkAgent { at, .. } => assert_eq!(*at, None),
+        other => panic!("应为 MarkAgent,实为 {other:?}"),
+    }
+    // 未知键拒绝。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\", bogus = 1 }}\n"
+    ));
+    assert!(e.message.contains("未知键"), "{}", e.message);
+    // 认领标签 + mark_agent at(无 possess)合法。
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nadopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n[[step]]\nmark_agent = {{ label = \"dog\", at = [1, 2, 3] }}\n[[step]]\nwait_until = {{ agent_moved = {{ label = \"dog\", le = 5.0 }}, timeout_ticks = 10 }}\n"
+    ))
+    .expect("认领标签可 mark_agent(at)");
+    assert_eq!(s.steps.len(), 3);
+}

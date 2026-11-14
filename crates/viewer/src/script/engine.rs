@@ -103,6 +103,10 @@ enum WaitState {
         start_tick: u64,
         emitted: bool,
     },
+    /// adopt_agent 等待(B02c §2.2):按服务器拍号计超时,与 wait_until 同口径。
+    Adopt {
+        start_tick: u64,
+    },
 }
 
 impl WaitState {
@@ -110,7 +114,8 @@ impl WaitState {
         match self {
             WaitState::Fly { start_tick }
             | WaitState::WaitTicks { start_tick }
-            | WaitState::Possess { start_tick, .. } => start_tick,
+            | WaitState::Possess { start_tick, .. }
+            | WaitState::Adopt { start_tick } => start_tick,
             WaitState::WaitUntil { start_tick, .. } => start_tick,
             WaitState::Spawn { start_tick, .. } => start_tick,
         }
@@ -825,13 +830,22 @@ impl EngineInner {
                         tick,
                     );
                 }
-                // mark_agent:记下当前根位置(主体表无该主体 = 失败)。
-                Action::MarkAgent { label } => {
-                    let pos = self
-                        .possessed
-                        .and_then(|_| input.world.live_agent())
-                        .filter(|(id, _)| Some(*id) == self.possessed)
-                        .map(|(_, p)| p);
+                // mark_agent:记下主体根位置(主体表无该主体 = 失败)。
+                // B02c §2.3:带 `at` 时不读主体当前位置,基准点 = `at`
+                // (标签必须已登记;用途 = 配置生成的四足连上前已走远)。
+                Action::MarkAgent { label, at } => {
+                    let pos = match at {
+                        Some(p) => {
+                            if self.agent_labels.contains_key(&label) {
+                                Some(p)
+                            } else {
+                                None
+                            }
+                        }
+                        None => self
+                            .possessed
+                            .and_then(|id| Self::agent_root(input.world, id)),
+                    };
                     match pos {
                         Some(p) => {
                             self.agent_marks.insert(label.clone(), p);
@@ -863,6 +877,99 @@ impl EngineInner {
                                 reason,
                             };
                             break;
+                        }
+                    }
+                }
+                // adopt_agent(B02c §2.2):配置 `[[agents]]` 生成的主体无回执,
+                // 每帧在主体表里找未被登记、距 `near` ≤ `within` 的最近一只
+                // (同距取 EntityId 小);登记即完成,超时 = 失败。不附身、
+                // 不发命令。
+                Action::AdoptAgent {
+                    label,
+                    near,
+                    within,
+                    timeout_ticks,
+                } => {
+                    let start_tick = self.enter_wait(|t| WaitState::Adopt { start_tick: t }, tick);
+                    // 候选:未被任何标签登记、距离 ≤ within。多只取最近;
+                    // 距离相同取 EntityId 小(live_agents 升序 + 不取等号即
+                    // 保留先见者)。
+                    let claimed: std::collections::BTreeSet<EntityId> =
+                        self.agent_labels.values().copied().collect();
+                    let mut best: Option<(EntityId, Vec3, f32)> = None;
+                    for (id, pos) in input.world.live_agents() {
+                        if claimed.contains(&id) {
+                            continue;
+                        }
+                        let dist = (pos - near).length();
+                        if dist <= within {
+                            match best {
+                                // 严格小于才换:同距保留 EntityId 小的
+                                // (升序遍历先见)。
+                                Some((_, _, best_dist)) if dist < best_dist => {
+                                    best = Some((id, pos, dist));
+                                }
+                                None => best = Some((id, pos, dist)),
+                                _ => {}
+                            }
+                        }
+                    }
+                    match best {
+                        Some((id, _pos, _dist)) => {
+                            self.agent_labels.insert(label.clone(), id);
+                            self.finish_step(
+                                &mut out,
+                                step_no,
+                                Some(label.clone()),
+                                "adopt_agent",
+                                StepOutcome::Ok,
+                                None,
+                                start_tick,
+                                tick,
+                            );
+                        }
+                        None => {
+                            if tick >= start_tick.saturating_add(timeout_ticks) {
+                                let positions: Vec<String> = input
+                                    .world
+                                    .live_agents()
+                                    .iter()
+                                    .map(|(id, p)| {
+                                        format!(
+                                            "主体 {id:?} = ({:.2}, {:.2}, {:.2})",
+                                            p.x, p.y, p.z
+                                        )
+                                    })
+                                    .collect();
+                                let reason = format!(
+                                    "adopt_agent 超时:{timeout_ticks} 拍内主体表里没有距 near ({:.2}, {:.2}, {:.2}) ≤ {within} m 且未登记的主体(当时主体表:{})",
+                                    near.x,
+                                    near.y,
+                                    near.z,
+                                    if positions.is_empty() {
+                                        "空".to_owned()
+                                    } else {
+                                        positions.join(", ")
+                                    }
+                                );
+                                self.finish_step(
+                                    &mut out,
+                                    step_no,
+                                    Some(label.clone()),
+                                    "adopt_agent",
+                                    StepOutcome::Error(reason.clone()),
+                                    None,
+                                    start_tick,
+                                    tick,
+                                );
+                                self.status = EngineStatus::Failed {
+                                    step: step_no,
+                                    reason,
+                                };
+                                break;
+                            } else {
+                                break;
+                            }
                         }
                     }
                 }
@@ -1076,8 +1183,8 @@ impl EngineInner {
                         ));
                         continue;
                     };
-                    match input.world.live_agent().filter(|(lid, _)| lid == id) {
-                        Some((_, p)) => {
+                    match Self::agent_root(input.world, *id) {
+                        Some(p) => {
                             let inside = p.x >= from.x
                                 && p.x <= to.x
                                 && p.y >= from.y
@@ -1109,8 +1216,8 @@ impl EngineInner {
                         ));
                         continue;
                     };
-                    match input.world.live_agent().filter(|(lid, _)| lid == id) {
-                        Some((_, p)) => {
+                    match Self::agent_root(input.world, *id) {
+                        Some(p) => {
                             let dist = (p - *mark).length();
                             if let Some(ge_m) = ge
                                 && dist < *ge_m
@@ -1129,9 +1236,10 @@ impl EngineInner {
                     }
                 }
                 Check::AgentAlive { label } => {
-                    let alive = self.agent_labels.get(label).is_some_and(|id| {
-                        input.world.live_agent().is_some_and(|(lid, _)| lid == *id)
-                    });
+                    let alive = self
+                        .agent_labels
+                        .get(label)
+                        .is_some_and(|id| Self::agent_root(input.world, *id).is_some());
                     if !alive {
                         msgs.push(format!("agent_alive:标签 \"{label}\" 的主体不在主体表"));
                     }
@@ -1139,6 +1247,17 @@ impl EngineInner {
             }
         }
         msgs
+    }
+
+    /// 主体表里按 id 查根位置(B02c §2.1):`agent_in`/`agent_moved`/
+    /// `agent_alive`/`mark_agent` 统一走 `live_agents()`,多主体各自取各自
+    /// 的位置(旧 `live_agent()` 写法只认第一只)。
+    fn agent_root(world: &dyn WorldQuery, id: EntityId) -> Option<Vec3> {
+        world
+            .live_agents()
+            .into_iter()
+            .find(|(lid, _)| *lid == id)
+            .map(|(_, p)| p)
     }
 
     /// `no_floating`(细则 9):存在"底面高出所在柱最高实心方块顶面 `height` 米以上、

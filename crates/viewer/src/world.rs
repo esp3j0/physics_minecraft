@@ -246,6 +246,20 @@ impl WorldQuery for WorldState {
         })
     }
 
+    /// 主体表全部主体及根位置,EntityId 升序(BTreeMap 键序;B02c §2.1)。
+    fn live_agents(&self) -> Vec<(EntityId, Vec3)> {
+        self.agents
+            .iter()
+            .map(|(id, (_, poses))| {
+                let pos = poses
+                    .first()
+                    .map(|p| p.translation)
+                    .unwrap_or(types::glam::Vec3::ZERO);
+                (*id, pos)
+            })
+            .collect()
+    }
+
     fn block_at(&self, pos: BlockPos) -> Option<BlockId> {
         let (lx, ly, lz) = Self::local(pos);
         if ly >= voxel::CHUNK_Y {
