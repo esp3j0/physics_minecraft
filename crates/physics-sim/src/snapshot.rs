@@ -291,6 +291,9 @@ impl ShardSim {
             // 失控防护开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
             #[cfg(test)]
             agent_runaway_guard_enabled: true,
+            // 压垮开关不入快照(测试对照专用;恢复线恒开 = 生产语义)。
+            #[cfg(test)]
+            agent_crush_enabled: true,
             bodies,
             chunk_bodies: snap.chunk_bodies,
             built_colliders: snap.built_colliders,

@@ -614,7 +614,12 @@ pub struct DriverOutcome {
 /// **v11**(REQ-012 B01b,#25):`Outbox` 布局追加 `agent_runaway_removed`
 /// (失控移除计数随快照走,任务书 B01b 第 3.1 节)——v10 及更早档解码
 /// 失败/版本拒绝,必须清 `data_dir`(不做迁移)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 11;
+///
+/// **v12**(REQ-012 B01c,#25):`AgentRecord` 布局追加 `embedded_ticks`
+/// (连续陷入拍数随快照走)且 `Outbox` 布局追加 `agent_crush_removed`
+/// (压垮移除计数;REQ-012 §6"压垮",2026-11-13 用户裁定)——v11 及更早
+/// 档解码失败/版本拒绝,必须清 `data_dir`(不做迁移)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 12;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -4819,7 +4824,7 @@ mod tests {
     /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 11, "REQ-012 B01b 起 = v11");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 12, "REQ-012 B01c 起 = v12");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -7346,12 +7351,12 @@ mod tests {
         assert_eq!(o.agent_counters.spawn_rejected, 1, "对照成功不计数");
     }
 
-    /// D2(B01a 放行第 3.5/3.7 节,继承):检查点版本 11(B01b 起,Outbox
-    /// 追加 agent_runaway_removed);版本 10 的档被显式拒绝(v10 档解码
-    /// 不兼容;不做迁移)。
+    /// D2(B01c 任务书 D5,继承):检查点版本 12(B01c 起,AgentRecord 追加
+    /// embedded_ticks + Outbox 追加 agent_crush_removed);版本 11 的档被显式
+    /// 拒绝(v11 档解码不兼容;不做迁移)。
     #[test]
     fn d2_checkpoint_version_11_rejects_v10() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 11, "B01b 起 = v11");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 12, "B01c 起 = v12");
         let bundle = CheckpointBundle {
             format_version: 10,
             world: sim_api::snapshot::WorldSnapshot {

@@ -329,6 +329,11 @@ pub struct Outbox {
     /// 非有限的主体按"掉出世界"移除,每移除一只 +1。纯计数(随 Outbox
     /// 走,不影响确定性)。
     pub agent_runaway_removed: u64,
+    /// 本拍因压垮被移除的主体数(REQ-012 §6,B01c):步进后防护把连续
+    /// 陷入实心方块数满 `AGENT_CRUSH_TICKS` 的主体按"掉出世界"移除,每移除
+    /// 一只 +1。纯计数(随 Outbox 走,不影响确定性;**v12 追加**:Outbox
+    /// 布局变化,旧档解码失败/版本拒绝)。
+    pub agent_crush_removed: u64,
 }
 
 /// 强制落地的原因(06c 遥测;§4.16"截止、预算分计")。
@@ -607,6 +612,11 @@ pub struct ShardSim {
     /// 不进检查点,同 `seam_fix_enabled` 口径)。
     #[cfg(test)]
     pub(crate) agent_runaway_guard_enabled: bool,
+    /// 压垮开关(**测试对照专用**,B01c C7):关掉后 `agent_runaway_guard`
+    /// 只跑失控段、压垮检查不执行(失控防护照常)。生产恒 true,不入快照
+    /// (同 `agent_runaway_guard_enabled` 口径)。
+    #[cfg(test)]
+    pub(crate) agent_crush_enabled: bool,
 }
 
 /// 撞击冲量流的按实体事件累计(F02a,§5.7.1;`evaluate_impacts` 采样)。
@@ -686,6 +696,8 @@ impl ShardSim {
             deferred_set_blocks: BTreeMap::new(),
             #[cfg(test)]
             agent_runaway_guard_enabled: true,
+            #[cfg(test)]
+            agent_crush_enabled: true,
         }
     }
 

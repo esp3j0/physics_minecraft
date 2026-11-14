@@ -161,7 +161,17 @@ pub struct AgentRecord {
     /// 当前关节目标(长度 = `dof_count`;单连杆为空)。保持状态,直到下一条
     /// 命令;随快照走(B01a:恢复后必须与电机里的目标一致,K10)。
     pub joint_targets: Vec<f32>,
+    /// 连续陷入拍数(B01c,REQ-012 §6"压垮"):任一连杆原点陷进实心方块内
+    /// `AGENT_CRUSH_DEPTH` 时每拍 +1(saturating),脱困清零,数满
+    /// `AGENT_CRUSH_TICKS` 按"掉出世界"移除。随快照走(检查点 v12)。
+    pub embedded_ticks: u16,
 }
+
+/// 压垮判定深度(m)(B01c,REQ-012 §6"压垮"):连杆原点及其六个轴向 ± 此
+/// 距离的采样点都在实心方块内才算陷入。常量,不进配置。
+pub const AGENT_CRUSH_DEPTH: f32 = 0.05;
+/// 连续陷入多少拍后按"掉出世界"处理(REQ-012 §6"压垮")。常量,不进配置。
+pub const AGENT_CRUSH_TICKS: u16 = 60;
 
 /// 主体生成失败原因(类型化拒绝;不 panic)。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -461,6 +471,7 @@ impl ShardSim {
                 intent_yaw: None,
                 intent_jump: false,
                 joint_targets: Vec::new(),
+                embedded_ticks: 0,
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
@@ -723,6 +734,7 @@ impl ShardSim {
                 intent_yaw: None,
                 intent_jump: false,
                 joint_targets,
+                embedded_ticks: 0,
             },
         );
         self.outbox.spawned.push(entity);
@@ -1156,12 +1168,76 @@ impl ShardSim {
         }
     }
 
-    /// 步进后的失控防护(B01b 第 3.2/3.3 节):每个主体过一遍
-    /// [`ShardSim::agent_runaway_reason`],命中即按"掉出世界"移除
-    /// ( [`ShardSim::remove_agent_as_void`] + `outbox.agent_runaway_removed`
-    /// 计数)。无主体时立即返回。调用点 = `step()` 内 `phys.step_with_events`
-    /// 之后、`collect_contact_wake_compensation()` 之前——失控主体在被移除
-    /// 后不再进入本拍余下各段(撞击采样等)。
+    /// 世界坐标点是否在实心方块内(B01c,REQ-012 §6"压垮";纯读)。方块
+    /// 坐标 = `crate::settle::cell_of`(与凝固桥同口径,中心取 floor;不另写
+    /// 一份取整)。方块所在 chunk 未装载 → false(界外即"不在实心内",与
+    /// `block_solid_at` 的 None 一致)。
+    fn point_in_solid(&self, p: types::glam::Vec3) -> bool {
+        let cell = crate::settle::cell_of(p.x, p.y, p.z);
+        matches!(self.block_solid_at(cell), Some(true))
+    }
+
+    /// 点 p 及 p ± `AGENT_CRUSH_DEPTH`·{x, y, z} 共 7 个采样点都在实心方块内
+    /// (B01c;纯读)。先查 p,不在实心内直接返回 false(6 个偏移点只在
+    /// 中心点已陷入时才查)。
+    pub(crate) fn point_embedded(&self, p: types::glam::Vec3) -> bool {
+        if !self.point_in_solid(p) {
+            return false;
+        }
+        let d = AGENT_CRUSH_DEPTH;
+        for off in [
+            types::glam::Vec3::new(d, 0.0, 0.0),
+            types::glam::Vec3::new(-d, 0.0, 0.0),
+            types::glam::Vec3::new(0.0, d, 0.0),
+            types::glam::Vec3::new(0.0, -d, 0.0),
+            types::glam::Vec3::new(0.0, 0.0, d),
+            types::glam::Vec3::new(0.0, 0.0, -d),
+        ] {
+            if !self.point_in_solid(p + off) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 主体是否有任一连杆的原点(刚体 translation)陷入(B01c;纯读)。
+    /// 连杆按 `BodyDef.links` 的顺序查,命中即返回。主体不存在 → false
+    /// (防护段在 agents 表上迭代,不会以不存在的 ID 调用)。
+    pub(crate) fn agent_embedded(&self, id: EntityId) -> bool {
+        let Some(record) = self.agents.get(&id) else {
+            return false;
+        };
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        for link in &def.links {
+            let &handle = record
+                .links
+                .get(&link.name)
+                .expect("连杆句柄在登记表(fail-stop)");
+            let rb = self.phys.bodies.get(handle).expect("连杆刚体存在");
+            let p = crate::conv::rapier_to_vec3(rb.translation());
+            if self.point_embedded(p) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 步进后的失控防护(B01b 第 3.2/3.3 节)+ 压垮规则(B01c,REQ-012 §6
+    /// "压垮"):每个主体每拍——
+    /// 1. [`ShardSim::agent_runaway_reason`] 命中即按"掉出世界"移除
+    ///    ([`ShardSim::remove_agent_as_void`] + `outbox.agent_runaway_removed`
+    ///    计数)。失控优先于压垮:非有限/超速状态不拿去查方块。
+    /// 2. [`ShardSim::agent_embedded`] 为真:`embedded_ticks` +1(saturating),
+    ///    数满 `AGENT_CRUSH_TICKS` 同路径移除 + `outbox.agent_crush_removed`;
+    ///    为假清零。**不看刚体是否睡眠**:睡着的主体照样计数。
+    ///
+    /// 无主体时立即返回。调用点 = `step()` 内 `phys.step_with_events` 之后、
+    /// `collect_contact_wake_compensation()` 之前——失控/压垮主体在被移除后
+    /// 不再进入本拍余下各段(撞击采样等)。`#[cfg(test)]` 的
+    /// `agent_crush_enabled` 关掉时压垮段不执行(失控防护照常),给对照线用。
     pub(crate) fn agent_runaway_guard(&mut self) {
         if self.agents.is_empty() {
             return;
@@ -1171,8 +1247,34 @@ impl ShardSim {
             if self.agent_runaway_reason(id).is_some() {
                 self.remove_agent_as_void(id);
                 self.outbox.agent_runaway_removed += 1;
+                continue;
+            }
+            #[cfg(test)]
+            if !self.agent_crush_enabled {
+                continue;
+            }
+            if self.agent_embedded(id) {
+                let record = self.agents.get_mut(&id).expect("本拍刚查过在场");
+                record.embedded_ticks = record.embedded_ticks.saturating_add(1);
+                if record.embedded_ticks >= AGENT_CRUSH_TICKS {
+                    self.remove_agent_as_void(id);
+                    self.outbox.agent_crush_removed += 1;
+                }
+            } else {
+                self.agents
+                    .get_mut(&id)
+                    .expect("本拍刚查过在场")
+                    .embedded_ticks = 0;
             }
         }
+    }
+
+    /// 压垮对照开关(**测试对照专用**,B01c C7):关掉后防护只跑失控段,
+    /// 压垮检查不执行。生产恒 true,不入快照(同 `agent_runaway_guard_enabled`
+    /// 口径)。
+    #[cfg(test)]
+    pub(crate) fn set_agent_crush_enabled_for_test(&mut self, enabled: bool) {
+        self.agent_crush_enabled = enabled;
     }
 }
 
@@ -4733,7 +4835,7 @@ anchor = [0.0, 0.0, 0.0]
 
     // ---- B01b:极端接触(AC-B8;任务书第 4 节 X1/X2/X3)----
 
-    /// 主体结局(R1-2 统计口径)。
+    /// 主体结局(B01c 新口径;R1-2 三结局 + 压垮)。
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     enum XEnd {
         /// 全程在场。
@@ -4743,6 +4845,9 @@ anchor = [0.0, 0.0, 0.0]
         RunawayRemoved,
         /// 虚空移除(`void_removed` 含它;单格方块不该把四足压出世界)。
         VoidRemoved,
+        /// 压垮移除(`agent_crush_removed > 0` 的那一拍消失;B01c,REQ-012
+        /// §6"压垮")。判定顺序:失控优先,压垮次之,虚空最后。
+        CrushRemoved,
     }
 
     /// X 系列单组判据统计。
@@ -4776,6 +4881,10 @@ anchor = [0.0, 0.0, 0.0]
         rest_pen_max: f32,
         /// 结束时砸块仍是动态实体且与任一连杆碰撞体有接触对。
         block_on_agent_end: bool,
+        /// 结束时主体是否有任一连杆原点陷入(B01c;被移除 = false)。
+        embedded_end: bool,
+        /// 陷入计数的全程最大值(B01c;X1 判据辅助)。
+        embedded_ticks_max: u16,
     }
 
     /// 末态分类(任务书 X1 打印项):站回 / 倒地 / 蹲低。口径(demo mass
@@ -4936,19 +5045,24 @@ anchor = [0.0, 0.0, 0.0]
             s.run_transient_lifecycle();
             let out = s.take_outbox();
             st.runaway_removed += out.agent_runaway_removed;
+            // 结局判定(B01c 新口径):失控优先 → 压垮 → 虚空。
+            if out.agent_runaway_removed > 0 {
+                st.end = XEnd::RunawayRemoved;
+            } else if out.agent_crush_removed > 0 {
+                st.end = XEnd::CrushRemoved;
+            }
             let Some(record) = s.agents.get(&a) else {
-                // 主体已移除:结局判定(R1-2)——本拍 outbox 先看
-                // `agent_runaway_removed > 0` → RunawayRemoved;否则
-                // `void_removed` 含它 → VoidRemoved;两者都不是 → panic。
-                st.end = if out.agent_runaway_removed > 0 {
-                    XEnd::RunawayRemoved
-                } else if out.void_removed.contains(&a) {
-                    XEnd::VoidRemoved
-                } else {
-                    panic!("主体消失但 outbox 两者都不是:t{tick} st={st:?}");
-                };
+                // 主体已移除:结局本拍已按 outbox 判(上面);仍都不是 → panic。
+                if st.end == XEnd::Alive {
+                    if out.void_removed.contains(&a) {
+                        st.end = XEnd::VoidRemoved;
+                    } else {
+                        panic!("主体消失但 outbox 三者都不是:t{tick} st={st:?}");
+                    }
+                }
                 st.removed_tick = Some(tick);
                 st.block_on_agent_end = block_touching_agent(&s, id, a);
+                st.embedded_end = false;
                 // 世界继续跑完剩余拍(不早退),统计终止。
                 for _ in tick + 1..total {
                     s.apply_activation(&observers);
@@ -4976,6 +5090,8 @@ anchor = [0.0, 0.0, 0.0]
                 link_peak = link_peak.max(v3.length());
             }
             st.peak_link_v = st.peak_link_v.max(link_peak);
+            // 压垮统计(B01c):每拍读陷入计数(embedded_end 在移除分支/收尾设)。
+            st.embedded_ticks_max = st.embedded_ticks_max.max(record.embedded_ticks);
             let body_v = crate::conv::rapier_to_vec3(
                 s.phys
                     .bodies
@@ -5018,6 +5134,7 @@ anchor = [0.0, 0.0, 0.0]
         // 结局收尾(R1-2):全程在场 = Alive;穿透与砸块接触状态按结束时算。
         if st.removed_tick.is_none() {
             st.end = XEnd::Alive;
+            st.embedded_end = s.agent_embedded(a);
         }
         st.rest_pen_max = rest_pen_window.iter().copied().fold(0.0f32, f32::max);
         if st.end == XEnd::Alive {
@@ -5055,9 +5172,11 @@ anchor = [0.0, 0.0, 0.0]
         let mut body_v_fail = Vec::new();
         let mut tail_fail = Vec::new();
         let mut runaway_fail = Vec::new();
+        let mut embedded_end_fail = Vec::new();
         let mut void_removed = Vec::new();
         let mut alive_groups = 0usize;
         let mut runaway_end_groups = 0usize;
+        let mut crush_end_groups = 0usize;
         let mut classes = std::collections::BTreeMap::<&'static str, usize>::new();
         // 该行 5 个落点(row 0..4 → i = row−2;j 全扫)。
         for &(dx, dz) in grid.iter().skip(row * 5).take(5) {
@@ -5093,21 +5212,28 @@ anchor = [0.0, 0.0, 0.0]
                 if st.peak_body_v > cap {
                     body_v_fail.push(tag.clone());
                 }
-                if st.tail_body_v_max >= 1.0 {
-                    tail_fail.push(tag.clone());
-                }
                 if st.runaway_removed != 0 {
                     runaway_fail.push(tag.clone());
                 }
-                // 结局统计(R1-2):VoidRemoved 单独列出并判失败(单格方块
-                // 不该把四足压出世界)。
+                // 结局统计(B01c 新 AC-B8):结局只能是 Alive 或 CrushRemoved;
+                // RunawayRemoved/VoidRemoved 都是失败。
                 match st.end {
-                    XEnd::Alive => alive_groups += 1,
+                    XEnd::Alive => {
+                        alive_groups += 1;
+                        // Alive 组判据:末 60 拍机身 < 1 m/s 且未陷入。
+                        if st.tail_body_v_max >= 1.0 {
+                            tail_fail.push(tag.clone());
+                        }
+                        if st.embedded_end {
+                            embedded_end_fail.push(tag.clone());
+                        }
+                        if let Some(c) = end_state_class(&s, a) {
+                            *classes.entry(c).or_default() += 1;
+                        }
+                    }
+                    XEnd::CrushRemoved => crush_end_groups += 1,
                     XEnd::VoidRemoved => void_removed.push(tag.clone()),
                     XEnd::RunawayRemoved => runaway_end_groups += 1,
-                }
-                if let Some(c) = end_state_class(&s, a) {
-                    *classes.entry(c).or_default() += 1;
                 }
             }
         }
@@ -5118,7 +5244,7 @@ anchor = [0.0, 0.0, 0.0]
             "X1 h={h} r{row} j{j:.3} Alive 组数 {alive_groups} ≠ 末态分类计数和 {classed}(分类 {classes:?})"
         );
         println!(
-            "X1 h={h} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups};连杆峰值 {peak_link:.1};             最长超限 {worst_overrun};机身峰值 {worst_body_v:.1};末60拍 {worst_tail_v:.3};末态 {classes:?};结局 Alive {alive_groups}/VoidRemoved {}/RunawayRemoved {runaway_end_groups}",
+            "X1 h={h} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups};连杆峰值 {peak_link:.1};             最长超限 {worst_overrun};机身峰值 {worst_body_v:.1};末60拍 {worst_tail_v:.3};末态 {classes:?};结局 Alive {alive_groups}/CrushRemoved {crush_end_groups}/VoidRemoved {}/RunawayRemoved {runaway_end_groups}",
             void_removed.len()
         );
         assert!(
@@ -5140,11 +5266,19 @@ anchor = [0.0, 0.0, 0.0]
         );
         assert!(
             tail_fail.is_empty(),
-            "X1 h={h} r{row} j{j:.3} 末态发散组 {tail_fail:?}"
+            "X1 h={h} r{row} j{j:.3} Alive 组末态发散组 {tail_fail:?}"
         );
         assert!(
             runaway_fail.is_empty(),
             "X1 h={h} r{row} j{j:.3} 误移除组 {runaway_fail:?}"
+        );
+        assert!(
+            embedded_end_fail.is_empty(),
+            "X1 h={h} r{row} j{j:.3} Alive 组结束时仍陷入 {embedded_end_fail:?}"
+        );
+        assert!(
+            runaway_end_groups == 0,
+            "X1 h={h} r{row} j{j:.3} 结局出现 RunawayRemoved {runaway_end_groups} 组(新 AC-B8:只能 Alive/CrushRemoved)"
         );
     }
 
@@ -5163,6 +5297,7 @@ anchor = [0.0, 0.0, 0.0]
         let mut end_alive = 0usize;
         let mut end_runaway = 0usize;
         let mut end_void = 0usize;
+        let mut end_crush = 0usize;
         let mut void_tags = Vec::new();
         let mut peak_link_alive = 0.0f32;
         let mut nonfinite_alive = Vec::new();
@@ -5189,6 +5324,7 @@ anchor = [0.0, 0.0, 0.0]
                     end_void += 1;
                     void_tags.push(tag.clone());
                 }
+                XEnd::CrushRemoved => end_crush += 1,
             }
             if st.runaway_removed > 0 {
                 // 与结局自洽:runaway_removed > 0 ⇔ 结局 = RunawayRemoved。
@@ -5207,7 +5343,7 @@ anchor = [0.0, 0.0, 0.0]
             }
         }
         println!(
-            "X2 m{mass} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups};结局 Alive {end_alive}/RunawayRemoved {end_runaway}/VoidRemoved {end_void};             未移除组连杆峰值 {peak_link_alive:.1}"
+            "X2 m{mass} r{row} j{j:+.3}: 组数 {groups} panic {panic_groups};结局 Alive {end_alive}/RunawayRemoved {end_runaway}/VoidRemoved {end_void}/CrushRemoved {end_crush};             未移除组连杆峰值 {peak_link_alive:.1}"
         );
         assert_eq!(panic_groups, 0, "X2 m{mass} r{row} j{j:.3} 无 panic");
         assert!(
@@ -5215,17 +5351,19 @@ anchor = [0.0, 0.0, 0.0]
             "X2 m{mass} r{row} j{j:.3} 未移除但非有限 {nonfinite_alive:?}"
         );
         if mass == 8.0 {
+            // B01c 新 AC-B8:质量 8 无 RunawayRemoved(三档四结局分别报数)。
             assert_eq!(
-                end_alive, groups,
-                "X2 m8 r{row} j{j:.3} 质量 8 要求全部 Alive(实测 Alive {end_alive}/{groups};RunawayRemoved {end_runaway} VoidRemoved {end_void} {void_tags:?})"
+                end_runaway, 0,
+                "X2 m8 r{row} j{j:.3} 质量 8 不触发失控(实测 RunawayRemoved {end_runaway})"
             );
         }
     }
 
-    /// X3 切片 Runner:质量档 half × 微扰档 j,跑全部 9 落点(防护关闭 +
-    /// catch_unwind),共 9 组。报数:panic 组数、未 panic 组连杆速度峰值、
-    /// 三种结局(R1-2;防护关了失控防护,主体若消失 = 虚空移除)。
-    fn run_x3_slice(half: f32, j: f32) -> (usize, usize, f32, usize, usize, usize) {
+    /// X3 切片 Runner:质量档 half × 微扰档 j,跑全部 9 落点(失控防护关闭
+    /// 加 `catch_unwind`,压垮照开),共 9 组。报数:panic 组数、未 panic 组
+    /// 连杆速度峰值、四种结局(B01c;防护关了失控防护,主体若消失按
+    /// outbox 区分失控/压垮/虚空)。
+    fn run_x3_slice(half: f32, j: f32) -> (usize, usize, f32, usize, usize, usize, usize) {
         let mut grid = Vec::new();
         for i in -1i32..=1 {
             for jz in -1i32..=1 {
@@ -5238,6 +5376,7 @@ anchor = [0.0, 0.0, 0.0]
         let mut end_alive = 0usize;
         let mut end_runaway = 0usize;
         let mut end_void = 0usize;
+        let mut end_crush = 0usize;
         for &(dx, dz) in &grid {
             let drop = XDrop {
                 dx: 24.0 + dx,
@@ -5256,6 +5395,7 @@ anchor = [0.0, 0.0, 0.0]
                         XEnd::Alive => end_alive += 1,
                         XEnd::RunawayRemoved => end_runaway += 1,
                         XEnd::VoidRemoved => end_void += 1,
+                        XEnd::CrushRemoved => end_crush += 1,
                     }
                     if st.peak_link_v.is_finite() {
                         max_peak = max_peak.max(st.peak_link_v);
@@ -5263,7 +5403,15 @@ anchor = [0.0, 0.0, 0.0]
                 }
             }
         }
-        (total, panics, max_peak, end_alive, end_runaway, end_void)
+        (
+            total,
+            panics,
+            max_peak,
+            end_alive,
+            end_runaway,
+            end_void,
+            end_crush,
+        )
     }
 
     // ---- 参数化测试阵列(代码生成;每片 debug 档 ≤ 5 分钟)----
@@ -5966,9 +6114,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m64_j0() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(2.0, 0.0);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(2.0, 0.0);
         println!(
-            "X3 m64 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m64 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -5976,9 +6124,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m64_j1() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(2.0, 0.017);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(2.0, 0.017);
         println!(
-            "X3 m64 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m64 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -5986,9 +6134,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m64_j2() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(2.0, 0.034);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(2.0, 0.034);
         println!(
-            "X3 m64 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m64 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -5996,9 +6144,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m64_j3() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(2.0, 0.051);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(2.0, 0.051);
         println!(
-            "X3 m64 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m64 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6006,9 +6154,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m64_j4() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(2.0, 0.068);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(2.0, 0.068);
         println!(
-            "X3 m64 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m64 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6016,9 +6164,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m512_j0() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(4.0, 0.0);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(4.0, 0.0);
         println!(
-            "X3 m512 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m512 j+0.0: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6026,9 +6174,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m512_j1() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(4.0, 0.017);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(4.0, 0.017);
         println!(
-            "X3 m512 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m512 j+0.017: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6036,9 +6184,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m512_j2() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(4.0, 0.034);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(4.0, 0.034);
         println!(
-            "X3 m512 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m512 j+0.034: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6046,9 +6194,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m512_j3() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(4.0, 0.051);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(4.0, 0.051);
         println!(
-            "X3 m512 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m512 j+0.051: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6056,9 +6204,9 @@ anchor = [0.0, 0.0, 0.0]
     #[ignore = "AC-B8 矩阵:cargo test -p physics-sim --release --lib -- --ignored x1_ x2_ x3_"]
     #[test]
     fn x3_m512_j4() {
-        let (total, panics, peak, ea, er, ev) = run_x3_slice(4.0, 0.068);
+        let (total, panics, peak, ea, er, ev, ec) = run_x3_slice(4.0, 0.068);
         println!(
-            "X3 m512 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}"
+            "X3 m512 j+0.068: 组数 {total} panic {panics};未 panic 组连杆峰值 {peak:.3e} m/s;结局 Alive {ea}/RunawayRemoved {er}/VoidRemoved {ev}/CrushRemoved {ec}"
         );
     }
 
@@ -6088,18 +6236,23 @@ anchor = [0.0, 0.0, 0.0]
     /// `SpawnDynamic`(`apply_prefix`,y = GROUND_TOP_Y + h + j + 0.5)→
     /// 每拍 `apply_activation`/`step`/`run_transient_lifecycle`/
     /// `take_outbox`)。`run_x_group` 的 600 拍窗不够 xd_a 的 1800 拍,
-    /// 这里展开同流程,ticks 参数化;ground 参数选地面布景。
+    /// 这里展开同流程,ticks 参数化;ground 参数选地面布景;`crush_on` =
+    /// 压垮开关(B01c 对照线,关掉应回到 B01b R1 的数字)。
     fn run_xd_group(
         drop: &XDrop,
         jitter: f32,
         ticks: usize,
         thick_ground: bool,
+        crush_on: bool,
     ) -> (crate::sim::ShardSim, types::EntityId, XStats) {
         let (mut s, hash) = quad_sim_with(0.01);
         if thick_ground {
             load_thick_ground(&mut s);
         } else {
             load_flat_ground(&mut s);
+        }
+        if !crush_on {
+            s.set_agent_crush_enabled_for_test(false);
         }
         let a = types::EntityId::from_parts(1, 1);
         s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
@@ -6152,15 +6305,19 @@ anchor = [0.0, 0.0, 0.0]
             s.run_transient_lifecycle();
             let out = s.take_outbox();
             let Some(record) = s.agents.get(&a) else {
+                // 结局判定(B01c 新口径):失控优先 → 压垮 → 虚空。
                 st.end = if out.agent_runaway_removed > 0 {
                     XEnd::RunawayRemoved
+                } else if out.agent_crush_removed > 0 {
+                    XEnd::CrushRemoved
                 } else if out.void_removed.contains(&a) {
                     XEnd::VoidRemoved
                 } else {
-                    panic!("xd:主体消失但 outbox 两者都不是:t{tick}");
+                    panic!("xd:主体消失但 outbox 三者都不是:t{tick}");
                 };
                 st.removed_tick = Some(tick);
                 st.block_on_agent_end = block_touching_agent(&s, id, a);
+                st.embedded_end = false;
                 for _ in tick + 1..ticks {
                     s.apply_activation(&observers);
                     s.step();
@@ -6187,6 +6344,8 @@ anchor = [0.0, 0.0, 0.0]
                 link_peak = link_peak.max(v3.length());
             }
             st.peak_link_v = st.peak_link_v.max(link_peak);
+            // 压垮统计(B01c)。
+            st.embedded_ticks_max = st.embedded_ticks_max.max(record.embedded_ticks);
             let body_v = crate::conv::rapier_to_vec3(
                 s.phys
                     .bodies
@@ -6216,6 +6375,7 @@ anchor = [0.0, 0.0, 0.0]
         }
         if st.removed_tick.is_none() {
             st.end = XEnd::Alive;
+            st.embedded_end = s.agent_embedded(a);
         }
         st.rest_pen_max = rest_pen_window.iter().copied().fold(0.0f32, f32::max);
         if st.end == XEnd::Alive {
@@ -6237,11 +6397,14 @@ anchor = [0.0, 0.0, 0.0]
         block_on_agent_end: bool,
         rest_pen_max: f32,
         end_y: f32,
+        /// 移除拍(B01c 报 CrushRemoved 的移除拍分布;在场 = None)。
+        removed_tick: Option<usize>,
     }
 
     /// xd_a 共用 runner:25 落点 × 微扰档,每组 ticks 拍,10 线程
-    /// (每线程自建 sim),返回逐组记录。
-    fn run_xd_census(jitters: &[f32], ticks: usize) -> Vec<XdRow> {
+    /// (每线程自建 sim),返回逐组记录。`crush_on` = 压垮开关(B01c 对照:
+    /// 关掉应回到 B01b R1 的数字)。
+    fn run_xd_census(jitters: &[f32], ticks: usize, crush_on: bool) -> Vec<XdRow> {
         let grid = x1_grid();
         let mut jobs: Vec<(f32, f32, f32)> = Vec::new();
         for &(dx, dz) in &grid {
@@ -6263,7 +6426,7 @@ anchor = [0.0, 0.0, 0.0]
                             height: 10.0,
                             half_size: 0.5,
                         };
-                        let (s, _a, st) = run_xd_group(&drop, j, ticks, false);
+                        let (s, _a, st) = run_xd_group(&drop, j, ticks, false, crush_on);
                         let end_y = s
                             .agents
                             .get(&types::EntityId::from_parts(1, 1))
@@ -6285,6 +6448,7 @@ anchor = [0.0, 0.0, 0.0]
                             block_on_agent_end: st.block_on_agent_end,
                             rest_pen_max: st.rest_pen_max,
                             end_y,
+                            removed_tick: st.removed_tick,
                         });
                     }
                     rows
@@ -6298,25 +6462,33 @@ anchor = [0.0, 0.0, 0.0]
         })
     }
 
-    /// xd_a 晚期尖峰普查:h=10,25 落点 × 微扰 {0,0.004,0.009,0.013,0.017,
-    /// 0.021,0.034,0.051,0.068} = 225 组,每组 1800 拍。只报数:有晚期尖峰
-    /// (late_spike_max > 20)的组数、late_spike_max 最大值和所在组、触发失控
-    /// (RunawayRemoved)的组数、block_on_agent_end 的组数、有尖峰组里
-    /// block_on_agent_end 占比、尖峰拍分布(最早/中位/最晚)。
-    /// P1 那组 d(+0.25,0) j0.013 必须在其中复现(第 597 拍前后,峰值 ≈127.7)。
+    /// xd_a 晚期尖峰普查(B01c 新口径,压垮开):h=10,25 落点 × 微扰
+    /// {0,0.004,0.009,0.013,0.017,0.021,0.034,0.051,0.068} = 225 组,每组
+    /// 1800 拍。报:四种结局组数;Alive 组里晚期尖峰组数和最大值;Alive 组
+    /// 的 rest_pen_max 中位和最大;CrushRemoved 的移除拍分布(最早/中位/
+    /// 最晚);晚期尖峰拍分布;P1 那组 d(+0.25,0) j0.013。
     #[ignore = "诊断:cargo test -p physics-sim --release --lib -- --ignored xd_a"]
     #[test]
     fn xd_a_late_spike_census() {
         let rows = run_xd_census(
             &[0.0, 0.004, 0.009, 0.013, 0.017, 0.021, 0.034, 0.051, 0.068],
             1800,
+            true,
         );
+        report_xd_rows("XD_A(压垮开)", &rows);
+    }
+
+    /// xd_a 报数(B01c):四结局、Alive 尖峰与穿透、CrushRemoved 移除拍分布。
+    fn report_xd_rows(tag: &str, rows: &[XdRow]) {
         assert_eq!(rows.len(), 225, "225 组");
+        let alive_rows: Vec<&XdRow> = rows.iter().filter(|r| r.end == XEnd::Alive).collect();
         let spike_rows: Vec<&XdRow> = rows.iter().filter(|r| r.late_spike_max > 20.0).collect();
         let runaway = rows
             .iter()
             .filter(|r| r.end == XEnd::RunawayRemoved)
             .count();
+        let crush = rows.iter().filter(|r| r.end == XEnd::CrushRemoved).count();
+        let void_removed = rows.iter().filter(|r| r.end == XEnd::VoidRemoved).count();
         let block_on = rows.iter().filter(|r| r.block_on_agent_end).count();
         let spike_block_on = spike_rows.iter().filter(|r| r.block_on_agent_end).count();
         let mut spike_ticks: Vec<usize> = spike_rows
@@ -6333,36 +6505,80 @@ anchor = [0.0, 0.0, 0.0]
                 spike_ticks[spike_ticks.len() - 1],
             )
         };
+        // Alive 组:晚期尖峰(只统计 Alive 组内的)与 rest_pen_max。
+        let alive_spike: Vec<&XdRow> = alive_rows
+            .iter()
+            .copied()
+            .filter(|r| r.late_spike_max > 20.0)
+            .collect();
+        let alive_spike_max = alive_rows
+            .iter()
+            .map(|r| r.late_spike_max)
+            .fold(0.0f32, f32::max);
+        let mut alive_pens: Vec<f32> = alive_rows.iter().map(|r| r.rest_pen_max).collect();
+        alive_pens.sort_by(|a, b| a.total_cmp(b));
+        let alive_pen_med = alive_pens[alive_pens.len() / 2];
+        let alive_pen_max = alive_pens[alive_pens.len() - 1];
+        // CrushRemoved 的移除拍分布(砸块生成后的拍号)。
+        let mut crush_ticks: Vec<usize> = crush_groups(rows, XEnd::CrushRemoved);
+        crush_ticks.sort_unstable();
+        let (c_early, c_med, c_late) = if crush_ticks.is_empty() {
+            (0, 0, 0)
+        } else {
+            (
+                crush_ticks[0],
+                crush_ticks[crush_ticks.len() / 2],
+                crush_ticks[crush_ticks.len() - 1],
+            )
+        };
         let worst = rows
             .iter()
             .max_by(|a, b| a.late_spike_max.total_cmp(&b.late_spike_max))
             .expect("非空");
+        println!(
+            "{tag}: 组数 {};结局 Alive {}/CrushRemoved {crush}/RunawayRemoved {runaway}/VoidRemoved {void_removed};block_on 组 {block_on};\
+             Alive 组:晚期尖峰 {alive_spike_n} 组、尖峰最大 {alive_spike_max:.1}、有尖峰组里 block_on 占比 {spike_block_on}/{alive_spike_n}、rest_pen_max 中位 {alive_pen_med:.4} 最大 {alive_pen_max:.4};\
+             全表尖峰最大 {:.1}(所在组 d({:+.2},{:+.2}) j{:+.3} 拍 {:?});尖峰拍 最早 {earliest} 中位 {median} 最晚 {latest};\
+             CrushRemoved 移除拍 最早 {c_early} 中位 {c_med} 最晚 {c_late}",
+            rows.len(),
+            alive_rows.len(),
+            worst.late_spike_max,
+            worst.dx,
+            worst.dz,
+            worst.j,
+            worst.late_spike_tick,
+            alive_spike_n = alive_spike.len(),
+        );
         // P1 组复现检查:d(+0.25,0) j0.013。
         let p1 = rows
             .iter()
             .find(|r| (r.dx - 0.25).abs() < 1e-6 && r.dz.abs() < 1e-6 && (r.j - 0.013).abs() < 1e-6)
             .expect("P1 组在网格内");
         println!(
-            "XD_A: 组数 {};晚期尖峰组 {};尖峰最大 {:.1}(所在组 d({:+.2},{:+.2}) j{:+.3} 拍 {:?});失控组 {};block_on 组 {};有尖峰组里 block_on 占比 {}/{};尖峰拍 最早 {} 中位 {} 最晚 {};P1 组 = 尖峰最大 {:.1} 拍 {:?} block_on {} end {:?}",
-            rows.len(),
-            spike_rows.len(),
-            worst.late_spike_max,
-            worst.dx,
-            worst.dz,
-            worst.j,
-            worst.late_spike_tick,
-            runaway,
-            block_on,
-            spike_block_on,
-            spike_rows.len(),
-            earliest,
-            median,
-            latest,
-            p1.late_spike_max,
-            p1.late_spike_tick,
-            p1.block_on_agent_end,
-            p1.end,
+            "{tag} P1 组 = 尖峰最大 {:.1} 拍 {:?} block_on {} end {:?} removed_tick {:?}",
+            p1.late_spike_max, p1.late_spike_tick, p1.block_on_agent_end, p1.end, p1.removed_tick,
         );
+    }
+
+    /// 取指定结局全部组的移除拍(removed_tick)。
+    fn crush_groups(rows: &[XdRow], end: XEnd) -> Vec<usize> {
+        rows.iter()
+            .filter(|r| r.end == end)
+            .filter_map(|r| r.removed_tick)
+            .collect()
+    }
+
+    /// xd_a 关压垮对照(B01c 任务书:应回到 B01b R1 的数字——14 组尖峰、
+    /// 最大 146.2)。只报数。
+    #[ignore = "诊断:cargo test -p physics-sim --release --lib -- --ignored xd_a_crush_off"]
+    #[test]
+    fn xd_a_crush_off_census() {
+        let rows = run_xd_census(
+            &[0.0, 0.004, 0.009, 0.013, 0.017, 0.021, 0.034, 0.051, 0.068],
+            1800,
+            false,
+        );
+        report_xd_rows("XD_A(压垮关对照)", &rows);
     }
 
     /// xd_b 静置穿透分布:与 xd_a 同一批数据(重跑,口径独立),报
@@ -6373,6 +6589,7 @@ anchor = [0.0, 0.0, 0.0]
         let rows = run_xd_census(
             &[0.0, 0.004, 0.009, 0.013, 0.017, 0.021, 0.034, 0.051, 0.068],
             1800,
+            true,
         );
         let mut pens: Vec<f32> = rows.iter().map(|r| r.rest_pen_max).collect();
         pens.sort_by(|a, b| a.total_cmp(b));
@@ -6423,6 +6640,7 @@ anchor = [0.0, 0.0, 0.0]
             let mut alive = 0usize;
             let mut runaway = 0usize;
             let mut void_removed = 0usize;
+            let mut crush = 0usize;
             let mut pens: Vec<f32> = Vec::new();
             let mut end_ys: Vec<f32> = Vec::new();
             for &(dx, dz) in &grid {
@@ -6432,11 +6650,12 @@ anchor = [0.0, 0.0, 0.0]
                     height: 5.0,
                     half_size: half,
                 };
-                let (s, _a, st) = run_xd_group(&drop, 0.0, 600, true);
+                let (s, _a, st) = run_xd_group(&drop, 0.0, 600, true, true);
                 match st.end {
                     XEnd::Alive => alive += 1,
                     XEnd::RunawayRemoved => runaway += 1,
                     XEnd::VoidRemoved => void_removed += 1,
+                    XEnd::CrushRemoved => crush += 1,
                 }
                 pens.push(st.rest_pen_max);
                 end_ys.push(
@@ -6456,7 +6675,7 @@ anchor = [0.0, 0.0, 0.0]
             let med_pen = pens[pens.len() / 2];
             end_ys.sort_by(|a, b| a.total_cmp(b));
             report.push_str(&format!(
-                "XD_C m{}(9 组,厚地面): Alive {alive}/RunawayRemoved {runaway}/VoidRemoved {void_removed};rest_pen_max 中位 {med_pen:.4} 最大 {:.4};末 y 最小 {:.3} 最大 {:.3}\n",
+                "XD_C m{}(9 组,厚地面): Alive {alive}/CrushRemoved {crush}/RunawayRemoved {runaway}/VoidRemoved {void_removed};rest_pen_max 中位 {med_pen:.4} 最大 {:.4};末 y 最小 {:.3} 最大 {:.3}\n",
                 8.0 * half * half * half,
                 pens.iter().copied().fold(0.0f32, f32::max),
                 end_ys[0],
@@ -6470,7 +6689,7 @@ anchor = [0.0, 0.0, 0.0]
             height: 10.0,
             half_size: 0.5,
         };
-        let (s, _a, st) = run_xd_group(&drop, 0.013, 1800, true);
+        let (s, _a, st) = run_xd_group(&drop, 0.013, 1800, true, true);
         report.push_str(&format!(
             "XD_C P1组(厚地面,1800 拍): end {:?} removed_tick {:?};late_spike_max {:.1} 拍 {:?};rest_pen_max {:.4};block_on {}\n",
             st.end, st.removed_tick, st.late_spike_max, st.late_spike_tick, st.rest_pen_max, st.block_on_agent_end,
@@ -6657,7 +6876,7 @@ anchor = [0.0, 0.0, 0.0]
                     height: 10.0,
                     half_size: 0.5,
                 };
-                let (_s, _a, st) = run_xd_group(&drop, j, 1800, false);
+                let (_s, _a, st) = run_xd_group(&drop, j, 1800, false, true);
                 if st.block_on_agent_end {
                     picked.push((dx, dz, j));
                     if picked.len() == 30 {
@@ -6693,6 +6912,7 @@ anchor = [0.0, 0.0, 0.0]
                     XEnd::Alive => "Alive",
                     XEnd::RunawayRemoved => "RunawayRemoved",
                     XEnd::VoidRemoved => "VoidRemoved",
+                    XEnd::CrushRemoved => "CrushRemoved",
                 };
                 *ends.entry(tag).or_default() += 1;
             }
@@ -6704,5 +6924,567 @@ anchor = [0.0, 0.0, 0.0]
                 pens[pens.len() - 1],
             );
         }
+    }
+
+    // ---- B01c:压垮规则(C1–C7;任务书第 3 节)----
+
+    /// 每拍生产节奏 helper(C 系列共用):apply_activation → step →
+    /// run_transient_lifecycle → take_outbox。
+    fn c_step(s: &mut crate::sim::ShardSim, observers: &[Vec3]) -> crate::sim::Outbox {
+        s.apply_activation(observers);
+        s.step();
+        s.run_transient_lifecycle();
+        s.take_outbox()
+    }
+
+    /// C1:`point_embedded` 纯判定(地面顶面 y = 1.0;chunk y 下标 64 层
+    /// 全石,x/z ∈ [0, 48))。
+    #[test]
+    fn c1_point_embedded_pure() {
+        let (mut s, _hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let p = |x: f32, y: f32, z: f32| types::glam::Vec3::new(x, y, z);
+        // y = 1.02:地面上方 → false。
+        assert!(
+            !s.point_embedded(p(24.0, 1.02, 24.0)),
+            "y=1.02(地面上方 2 cm)→ false"
+        );
+        // y = 0.98:只进 2 cm,6 个 ±5 cm 采样点含 y=1.03(空气)→ false。
+        assert!(
+            !s.point_embedded(p(24.0, 0.98, 24.0)),
+            "y=0.98(只进 2 cm)→ false"
+        );
+        // y = 0.94:进 6 cm,p 和 ±5 cm 采样点(y ∈ [0.89, 0.99])全在
+        // y ∈ [0,1) 层内 → true。
+        assert!(
+            s.point_embedded(p(24.0, 0.94, 24.0)),
+            "y=0.94(进 6 cm)→ true"
+        );
+        // y = 0.5:层中心 → true。
+        assert!(s.point_embedded(p(24.0, 0.5, 24.0)), "y=0.5(层中心)→ true");
+        // y = 0.03:离底面 3 cm < 5 cm,采样点 y = −0.02 在方块外 → false。
+        assert!(
+            !s.point_embedded(p(24.0, 0.03, 24.0)),
+            "y=0.03(离底面不足 5 cm)→ false"
+        );
+        // chunk 未装载处(x = 60 在 3×3 chunk(x∈[0,48])之外)→ false。
+        assert!(
+            !s.point_embedded(p(60.0, 0.5, 24.0)),
+            "chunk 未装载 → false"
+        );
+        // 紧贴地面边缘外侧:地面层 x ∈ [0,48),点 x = 48.01 的 −5 cm 采样点
+        // (x = 47.96)在层内但 x = 48.06 在空气格 → false。
+        assert!(
+            !s.point_embedded(p(48.01, 0.5, 24.0)),
+            "紧贴地面边缘外侧(x=48.01)→ false"
+        );
+    }
+
+    /// C2:站立四足、倒地四足(生成时机身绕 z 转 90° 后落定 300 拍)、
+    /// 单连杆胶囊站立:`agent_embedded` 全 false,600 拍 embedded_ticks 恒 0。
+    #[test]
+    fn c2_no_false_embedded() {
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 案 A:站立四足。
+        {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            assert_quad_above_ground(&s, a);
+            assert!(!s.agent_embedded(a), "案 A 自检:刚生成的站立四足不陷入");
+            for tick in 0..600usize {
+                let out = c_step(&mut s, &observers);
+                assert!(
+                    out.agent_crush_removed == 0 && out.agent_runaway_removed == 0,
+                    "案 A:t{tick} 不发生移除"
+                );
+                let rec = s.agents.get(&a).expect("全程在场");
+                assert_eq!(rec.embedded_ticks, 0, "案 A:t{tick} embedded_ticks 恒 0");
+            }
+        }
+        // 案 B:倒地四足(生成时机身绕 z 转 90°;机身 half.y = 0.057 →
+        // 横躺时半高 = 0.19,出生 y = 1.0 + 0.19 + 0.002)。
+        {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            let origin = Vec3::new(24.0, GROUND_TOP_Y + 0.192, 24.0);
+            let state = types::EntityState {
+                translation: origin,
+                rotation: types::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                ..types::EntityState::default()
+            };
+            s.spawn_agent(a, hash, state, None).expect("四足生成");
+            for tick in 0..600usize {
+                let out = c_step(&mut s, &observers);
+                assert!(
+                    out.agent_crush_removed == 0,
+                    "案 B(倒地):t{tick} 不发生压垮移除"
+                );
+                if let Some(rec) = s.agents.get(&a) {
+                    assert_eq!(
+                        rec.embedded_ticks, 0,
+                        "案 B(倒地):t{tick} embedded_ticks 恒 0"
+                    );
+                } else {
+                    panic!("案 B(倒地):t{tick} 主体被移除(不该发生)");
+                }
+            }
+        }
+        // 案 C:单连杆胶囊站立(capsule_y 0.6/0.3,总半高 0.9;出生 y =
+        // 顶面 + 0.9 + 2mm)。
+        {
+            let (mut s, hash) = test_sim();
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            let origin = Vec3::new(24.0, GROUND_TOP_Y + 0.902, 24.0);
+            s.spawn_agent(a, hash, quad_spawn_state(origin), None)
+                .expect("胶囊生成");
+            for tick in 0..600usize {
+                let out = c_step(&mut s, &observers);
+                assert!(
+                    out.agent_crush_removed == 0,
+                    "案 C(胶囊):t{tick} 不发生压垮移除"
+                );
+                let rec = s.agents.get(&a).expect("全程在场");
+                assert_eq!(
+                    rec.embedded_ticks, 0,
+                    "案 C(胶囊):t{tick} embedded_ticks 恒 0"
+                );
+            }
+        }
+    }
+
+    /// C3:计数与移除。注入方式 = 站稳四足的**非根连杆**原点 `set_translation`
+    /// 到地面内(任务书首选;直调防护避开 multibody FK 覆盖——每步 FK 从
+    /// 关节坐标重算连杆位姿,step 内的注入会被丢弃,故计数段不走 step、
+    /// 每拍直调 `agent_runaway_guard`,与 step 内调用点同一函数同一判据)。
+    /// 先用"整只生成在地面内"的对照布景确认主体不会自己弹出来(embedded
+    /// 单调增到移除),再断言第 59 拍还在、第 60 拍移除、账面回到生成前。
+    #[test]
+    fn c3_crush_counts_and_removes() {
+        // 对照(注入方式确认):整只生成在地面内,600 拍 step 节奏,
+        // embedded_ticks 单调 +1 直到移除(不会自己弹出来)。
+        {
+            let (mut s_ctrl, hash_ctrl) = quad_sim_with(0.01);
+            load_flat_ground(&mut s_ctrl);
+            let ac = types::EntityId::from_parts(1, 1);
+            s_ctrl
+                .spawn_agent(
+                    ac,
+                    hash_ctrl,
+                    quad_spawn_state(Vec3::new(24.0, 0.55, 24.0)),
+                    None,
+                )
+                .expect("对照四足生成");
+            let observers_c = [Vec3::new(24.0, 3.45, 24.0)];
+            let mut prev = 0u16;
+            let mut ctrl_ok = false;
+            for _ in 0..600usize {
+                let _ = c_step(&mut s_ctrl, &observers_c);
+                match s_ctrl.agents.get(&ac) {
+                    Some(rec) => {
+                        assert!(
+                            rec.embedded_ticks == prev + 1,
+                            "对照:embedded_ticks 单调 +1(上一拍 {prev},本拍 {})",
+                            rec.embedded_ticks
+                        );
+                        prev = rec.embedded_ticks;
+                    }
+                    None => {
+                        ctrl_ok = prev == 59;
+                        break;
+                    }
+                }
+            }
+            assert!(ctrl_ok, "对照:主体不自己弹出,第 60 拍被压垮移除");
+        }
+        // 主布景:站稳 → 非根连杆(leg0 shank)原点 set_translation 到
+        // y = 0.6(地面内 0.4 m,±5 cm 采样点 y ∈ [0.55, 0.65] 全在层内)。
+        let (mut s, _hash, a) = stand_quad();
+        let record = s.agents.get(&a).expect("主体登记").clone();
+        let def = s.bodies.get(&record.body_hash).expect("def").clone();
+        let root_name = def.links[0].name.clone();
+        let shank = "leg0_front_left_shank".to_string();
+        assert_ne!(shank, root_name, "注入目标必须是非根连杆");
+        // 注入前账面(移除后要对齐)。
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let multibodies_before = s.phys.multibody_joints.iter().count();
+        let void_removals_before = s.take_activation_events().void_removals;
+        // 根连杆原点在地面上方(站稳自检),"只查根连杆"的变异在此布景下不红。
+        {
+            let &root_h = record.links.get(&root_name).expect("根句柄");
+            let root_y = crate::conv::rapier_to_vec3(
+                s.phys.bodies.get(root_h).expect("根刚体").translation(),
+            )
+            .y;
+            assert!(
+                root_y >= GROUND_TOP_Y,
+                "布景自检:根连杆原点 {root_y} 在地面顶面之上(区分只查根的前提)"
+            );
+        }
+        let &shank_h = record.links.get(&shank).expect("shank 句柄");
+        s.phys
+            .bodies
+            .get_mut(shank_h)
+            .expect("shank 刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 0.6, 24.0)),
+                true,
+            );
+        assert!(s.agent_embedded(a), "注入后 agent_embedded == true");
+        // 计数段:每拍直调防护(与 step 内同一调用点;step 会把 FK 重算的
+        // 站立位姿写回,注入保持不了 60 拍)。
+        let mut crush_tick: Option<usize> = None;
+        let mut prev_embedded = 0u16;
+        for tick in 0..120usize {
+            s.agent_runaway_guard();
+            if let Some(rec) = s.agents.get(&a) {
+                let e = rec.embedded_ticks;
+                assert!(
+                    e == prev_embedded + 1,
+                    "t{tick}:embedded_ticks 单调 +1(上一拍 {prev_embedded},本拍 {e})"
+                );
+                prev_embedded = e;
+                if tick < 59 {
+                    assert!(e < 60, "t{tick}:未到 60 拍不移除");
+                }
+            } else {
+                crush_tick = Some(tick);
+                break;
+            }
+        }
+        let ct = crush_tick.expect("120 拍内必有移除(嵌入深度远超阈值)");
+        assert_eq!(ct, 59, "第 59 拍还在、第 60 拍(下标 59)移除");
+        // 移除后账面:quad 的全部连杆刚体/碰撞体/multibody 被拆
+        // (布景里的 chunk 地面刚体/碰撞体不动;stand_quad 激活加载
+        // 3×3 chunk,物理世界里恒有 9 个地面刚体)。
+        let link_n = record.links.len();
+        assert_eq!(
+            s.phys.bodies.len(),
+            bodies_before - link_n,
+            "刚体数回到生成前(只拆 quad 的 {link_n} 连杆)"
+        );
+        assert_eq!(
+            s.phys.colliders.len(),
+            colliders_before - record.colliders.len(),
+            "碰撞体数回到生成前"
+        );
+        // multibody_joints.iter() 数的是关节(quad = 12 条 revolute);移除
+        // 拆掉全部 quad 关节,回到布景基准(0)。
+        let joints_before = multibodies_before;
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            joints_before - (def.joints.len()),
+            "multibody 关节数回到生成前"
+        );
+        assert!(
+            !s.entities.contains_key(&a) && !s.agents.contains_key(&a),
+            "实体与主体表都清了"
+        );
+        let ev = s.take_activation_events();
+        assert_eq!(
+            ev.void_removals,
+            void_removals_before + 1,
+            "void_removals 加 1"
+        );
+        // outbox 计数:移除那一拍在直调防护后、take 之前拿(c_step 不用,
+        // 这里 outbox 只含防护产出)。
+        let (mut s2, _hash2, a2) = stand_quad();
+        let record2 = s2.agents.get(&a2).expect("主体登记").clone();
+        let &shank_h2 = record2.links.get(&shank).expect("shank 句柄");
+        s2.phys
+            .bodies
+            .get_mut(shank_h2)
+            .expect("shank 刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 0.6, 24.0)),
+                true,
+            );
+        let mut crush_removed = 0u64;
+        let mut runaway_removed = 0u64;
+        let mut despawned = 0usize;
+        let mut void_removed = 0usize;
+        for _ in 0..60usize {
+            s2.agent_runaway_guard();
+            let out = s2.take_outbox();
+            crush_removed += out.agent_crush_removed;
+            runaway_removed += out.agent_runaway_removed;
+            despawned += out.despawned.len();
+            void_removed += out.void_removed.len();
+            if !s2.agents.contains_key(&a2) {
+                break;
+            }
+        }
+        assert!(!s2.agents.contains_key(&a2), "重放:60 拍内已移除");
+        assert_eq!(crush_removed, 1, "agent_crush_removed == 1");
+        assert_eq!(runaway_removed, 0, "agent_runaway_removed == 0");
+        assert_eq!(despawned, 1, "despawned 一条");
+        assert_eq!(void_removed, 1, "void_removed 一条");
+    }
+
+    /// C4:中途脱困清零。单连杆胶囊:连杆原点无 FK 覆盖,`set_translation`
+    /// 注入可靠。陷入 30 拍 → 挪回地面上方 → 下一拍 embedded_ticks == 0;
+    /// 再陷入要重新数满 60 拍。
+    #[test]
+    fn c4_embedded_reset_on_escape() {
+        let (mut s, hash) = test_sim();
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        // 生成在地面内(胶囊原点 y = 0.5,层中心)。
+        s.spawn_agent(a, hash, quad_spawn_state(Vec3::new(24.0, 0.5, 24.0)), None)
+            .expect("胶囊生成");
+        assert!(s.agent_embedded(a), "布景自检:胶囊陷入");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for tick in 0..30usize {
+            let out = c_step(&mut s, &observers);
+            assert!(out.agent_crush_removed == 0, "t{tick}:未满 60 拍不移除");
+            let rec = s.agents.get(&a).expect("在场");
+            assert_eq!(
+                rec.embedded_ticks,
+                (tick + 1) as u16,
+                "t{tick}:embedded_ticks = {}",
+                tick + 1
+            );
+        }
+        // 脱困:挪回地面上方(原点 y = 顶面 + 0.92;单连杆直接写位姿,
+        // 无 FK 覆盖)。
+        {
+            let h = s.entities.get(&a).expect("在场").handle;
+            s.phys.bodies.get_mut(h).expect("胶囊刚体").set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, GROUND_TOP_Y + 0.92, 24.0)),
+                true,
+            );
+        }
+        let out = c_step(&mut s, &observers);
+        assert!(out.agent_crush_removed == 0, "脱困拍不移除");
+        let rec = s.agents.get(&a).expect("脱困后在场");
+        assert_eq!(rec.embedded_ticks, 0, "脱困下一拍 embedded_ticks == 0");
+        // 对照:同拍判定为未陷入(不在实心内)。
+        assert!(!s.agent_embedded(a), "脱困后 agent_embedded == false");
+        // 再陷入:重新数。60 拍后移除(从清零重新计)。
+        {
+            let h = s.entities.get(&a).expect("在场").handle;
+            s.phys.bodies.get_mut(h).expect("胶囊刚体").set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 0.5, 24.0)),
+                true,
+            );
+        }
+        let mut removed_at: Option<usize> = None;
+        for tick in 0..70usize {
+            let _out = c_step(&mut s, &observers);
+            if s.agents.contains_key(&a) {
+                let rec = s.agents.get(&a).expect("在场");
+                assert_eq!(
+                    rec.embedded_ticks,
+                    (tick + 1) as u16,
+                    "再陷入:t{tick} 从 0 重新计(embedded_ticks = {})",
+                    tick + 1
+                );
+            } else {
+                removed_at = Some(tick);
+                break;
+            }
+        }
+        assert_eq!(removed_at, Some(59), "再陷入重新数满 60 拍后移除");
+    }
+
+    /// C5:快照。陷入 30 拍时取快照、恢复、续跑,与不中断线逐位相同,
+    /// 且都在同一拍被移除。
+    #[test]
+    fn c5_snapshot_carries_embedded_ticks() {
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let setup = || -> (crate::sim::ShardSim, types::EntityId) {
+            let (mut s, hash) = test_sim();
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(a, hash, quad_spawn_state(Vec3::new(24.0, 0.5, 24.0)), None)
+                .expect("胶囊生成");
+            (s, a)
+        };
+        // 金线:一直跑到移除,记录移除拍。
+        let (mut golden, ga) = setup();
+        let golden_removed: usize = {
+            let mut removed = None;
+            for tick in 0..80usize {
+                let _ = c_step(&mut golden, &observers);
+                if !golden.agents.contains_key(&ga) {
+                    removed = Some(tick);
+                    break;
+                }
+            }
+            removed.expect("金线 80 拍内移除")
+        };
+        // 中断线:30 拍取快照(拍 30 的 embedded_ticks = 30)、恢复、续跑。
+        let (mut interrupted, ia) = setup();
+        let snap_bytes = {
+            for _ in 0..30usize {
+                let _ = c_step(&mut interrupted, &observers);
+            }
+            assert_eq!(
+                interrupted.agents.get(&ia).expect("在场").embedded_ticks,
+                30,
+                "取快照时 embedded_ticks == 30"
+            );
+            interrupted.snapshot()
+        };
+        let mut resumed = crate::sim::ShardSim::restore_with_bodies(
+            &snap_bytes,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_capsule_registry(),
+        )
+        .expect("恢复成功");
+        let mut resumed_removed: Option<usize> = None;
+        for tick in 0..80usize {
+            let _ = c_step(&mut resumed, &observers);
+            if !resumed.agents.contains_key(&ia) {
+                resumed_removed = Some(30 + tick);
+                break;
+            }
+        }
+        assert_eq!(
+            resumed_removed,
+            Some(golden_removed),
+            "恢复线与金线在同一拍移除(金线拍 {golden_removed},恢复线 {resumed_removed:?})"
+        );
+        // 变异 7 的红色判据:恢复线若把 embedded_ticks 丢成 0,移除拍会晚
+        // 30 拍——上面的同拍断言已封死。这里再断言恢复线在第 30 拍快照点
+        // 的续跑计数从 30 继续(间接由同拍移除保证)。
+    }
+
+    /// C6:确定性。x0 的布景(P1 组 h = 10,d(+0.25, 0),j = 0.013)跑两遍,
+    /// 1800 拍快照逐位相同。
+    #[test]
+    fn c6_crush_deterministic() {
+        let run = || -> Vec<Vec<u8>> {
+            let (mut s, hash) = quad_sim_with(0.01);
+            load_flat_ground(&mut s);
+            let a = types::EntityId::from_parts(1, 1);
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+                .expect("四足生成");
+            assert_quad_above_ground(&s, a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            for _ in 0..300usize {
+                let _ = c_step(&mut s, &observers);
+                if s.phys
+                    .bodies
+                    .get(s.entities.get(&a).expect("在场").handle)
+                    .expect("根刚体")
+                    .is_sleeping()
+                {
+                    break;
+                }
+            }
+            let id = types::EntityId::from_parts(2, 1);
+            let start_y = GROUND_TOP_Y + 10.0 + 0.013 + 0.5;
+            let state = types::EntityState {
+                translation: Vec3::new(24.25, start_y, 24.0),
+                ..types::EntityState::default()
+            };
+            let desc = types::EntityDesc {
+                half_size: 0.5,
+                ..types::EntityDesc::default()
+            };
+            s.apply_prefix(&[messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 0,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: id,
+                    state,
+                    desc,
+                }),
+            }]);
+            let mut snaps = Vec::new();
+            for _ in 0..1800usize {
+                let _ = c_step(&mut s, &observers);
+                snaps.push(s.snapshot());
+            }
+            snaps
+        };
+        let a_snaps = run();
+        let b_snaps = run();
+        assert_eq!(a_snaps.len(), b_snaps.len(), "两遍拍数一致");
+        for (i, (x, y)) in a_snaps.iter().zip(b_snaps.iter()).enumerate() {
+            assert_eq!(x, y, "C6:第 {i} 拍快照逐位相同");
+        }
+    }
+
+    /// C7:对照。关掉 `agent_crush_enabled`,C3 的注入布景(站稳 + shank
+    /// 移入地面 + 直调防护)120 拍后主体仍在(失控防护照常;embedded_ticks
+    /// 不再增长也不清零——压垮段整体跳过)。
+    #[test]
+    fn c7_crush_disabled_control() {
+        let (mut s, _hash, a) = stand_quad();
+        let record = s.agents.get(&a).expect("主体登记").clone();
+        let &shank_h = record
+            .links
+            .get("leg0_front_left_shank")
+            .expect("shank 句柄");
+        s.phys
+            .bodies
+            .get_mut(shank_h)
+            .expect("shank 刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 0.6, 24.0)),
+                true,
+            );
+        assert!(s.agent_embedded(a), "布景自检:陷入成立");
+        s.set_agent_crush_enabled_for_test(false);
+        for tick in 0..120usize {
+            s.agent_runaway_guard();
+            assert!(s.agents.contains_key(&a), "t{tick}:主体仍在(压垮关)");
+        }
+    }
+
+    /// C8(变异 8 判据):失控优先于压垮。同一只主体陷入已 59 拍、且连杆
+    /// 超速时,下一拍防护按**失控**移除(`agent_runaway_removed == 1`、
+    /// `agent_crush_removed == 0`):非有限/超速状态不拿去查方块,计数去向
+    /// 是失控不是压垮(REQ-012 §6,B01b 第 3.2 节顺序)。
+    #[test]
+    fn c8_runaway_takes_precedence_over_crush() {
+        let (mut s, _hash, a) = stand_quad();
+        let record = s.agents.get(&a).expect("主体登记").clone();
+        let &shank_h = record
+            .links
+            .get("leg0_front_left_shank")
+            .expect("shank 句柄");
+        // 陷入注入(与 C3 同款);先数到 59 拍。
+        s.phys
+            .bodies
+            .get_mut(shank_h)
+            .expect("shank 刚体")
+            .set_translation(
+                crate::conv::vec3_to_rapier(Vec3::new(24.0, 0.6, 24.0)),
+                true,
+            );
+        for tick in 0..59usize {
+            s.agent_runaway_guard();
+            assert!(s.agents.contains_key(&a), "t{tick}:未满 60 拍不移除");
+        }
+        assert_eq!(
+            s.agents.get(&a).expect("在场").embedded_ticks,
+            59,
+            "陷入已 59 拍"
+        );
+        // 同一只主体注入超速:直调防护场景没有 step(FK 不跑,广义速度
+        // 不会写回根刚体),直接写根刚体 linvel(防护连杆层检查的读取口)。
+        {
+            let root_h = s.entities.get(&a).expect("在场").handle;
+            s.phys.bodies.get_mut(root_h).expect("根刚体").wake_up(true);
+            s.phys.bodies.get_mut(root_h).expect("根刚体").set_linvel(
+                crate::conv::vec3_to_rapier(Vec3::new(0.0, 300.0, 0.0)),
+                true,
+            );
+        }
+        // 下一拍防护:必须按失控移除。
+        s.agent_runaway_guard();
+        assert!(!s.agents.contains_key(&a), "主体已被移除");
+        let out = s.take_outbox();
+        assert_eq!(out.agent_runaway_removed, 1, "失控移除(优先)");
+        assert_eq!(out.agent_crush_removed, 0, "不是压垮移除");
     }
 }

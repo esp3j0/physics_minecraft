@@ -74,6 +74,10 @@ fn s1_joint_targets_via_session_log_replay_is_bitwise() {
     let mut log = CommandLog::new();
 
     let hash = registry().hash_of("quad").expect("quad 已装");
+    // B01c 修订(压垮规则):原出生 y = 0.448 在地面方块内部(B01a-R1 同款
+    // 布景缺陷,当时本文件不在修复范围)——压垮规则生效后连杆陷入 60 拍会被
+    // 按"掉出世界"移除。出生点上移到地面顶面(1.0)+ 0.45,与内核测试
+    // quad_origin 同口径;断言全部不动。
     let entry = session
         .spawn_agent_from(
             messaging::InputSource::SCHEDULER,
@@ -81,7 +85,7 @@ fn s1_joint_targets_via_session_log_replay_is_bitwise() {
             a,
             hash,
             EntityState {
-                translation: Vec3::new(24.0, 0.448, 24.0),
+                translation: Vec3::new(24.0, 1.45, 24.0),
                 ..EntityState::default()
             },
         )
