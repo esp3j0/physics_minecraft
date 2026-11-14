@@ -942,6 +942,7 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
     let config = quad_config(vec![agent]);
     let h = bootstrap_harness(config).await;
     advance_ticks(660).await; // 600 超时 + 余量
+    let cps_dir = h.data_dir.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.startup_counters.spawn_timeouts, 1,
@@ -959,6 +960,28 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
         outcome.ticks_run >= 600,
         "服务器照常运行({} 拍)",
         outcome.ticks_run
+    );
+    // R1-4:放弃后撤票——日志窗口有对应的 RemoveAreaTicket(同一保留区间
+    // ID),且 SetAreaTicket 全程恰 1 条(重试不重复放票)。
+    let log = stitched_log(&read_all_checkpoints(&cps_dir));
+    let mut set_ids: Vec<u64> = Vec::new();
+    let mut removed_ids: Vec<u64> = Vec::new();
+    for e in log.entries() {
+        match e.command {
+            messaging::SimCommand::SetAreaTicket { id, .. } => set_ids.push(id),
+            messaging::SimCommand::RemoveAreaTicket { id } => removed_ids.push(id),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        set_ids,
+        vec![app::startup_agents::STARTUP_TICKET_BASE],
+        "全程恰一张区域票(实得 {set_ids:?})"
+    );
+    assert_eq!(
+        removed_ids,
+        vec![app::startup_agents::STARTUP_TICKET_BASE],
+        "放弃后撤同一张票(实得 {removed_ids:?})"
     );
 }
 

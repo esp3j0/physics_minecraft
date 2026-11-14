@@ -52,7 +52,10 @@ struct PendingStartup {
     dof: usize,
     /// 区域票 ID(保留区间内按条目序分配)。
     ticket_id: u64,
-    /// 已等待拍数。
+    /// 已放票(R1-4:放票只做一次——重试拍不重复放票、不重复写
+    /// SetAreaTicket 日志)。
+    ticket_placed: bool,
+    /// 已等待拍数(生成投递被拒的重试拍也计入——重试不是免费等待)。
     waited: u32,
 }
 
@@ -104,6 +107,7 @@ impl StartupAgents {
                 hash,
                 dof,
                 ticket_id,
+                ticket_placed: false,
                 waited: 0,
             });
         }
@@ -146,10 +150,12 @@ impl StartupAgents {
             Abandoned,
         }
         let mut outcomes: Vec<Outcome> = Vec::with_capacity(self.pending.len());
+        let mut ticket_ids_to_remove: Vec<u64> = Vec::new();
         for item in self.pending.iter_mut() {
             // ① 首次见到:放区域票(常驻;①② 档 = 数据 + 碰撞体;票计费
-            // 不用条目自己——生成完不移除,主体常驻其活动区)。
-            if item.waited == 0 {
+            // 不用条目自己——生成完不移除,主体常驻其活动区)。R1-4:只放
+            // 一次,重试拍不再重复放票。
+            if !item.ticket_placed {
                 let center = types::glam::Vec3::new(
                     item.cfg.position[0],
                     item.cfg.position[1],
@@ -157,10 +163,13 @@ impl StartupAgents {
                 );
                 let radius = item.cfg.leash_m + STARTUP_TICKET_EXTRA_M;
                 match session.set_area_ticket(item.ticket_id, center, radius, 0b011, None) {
-                    Ok(entry) => log.append(entry),
+                    Ok(entry) => {
+                        log.append(entry);
+                        item.ticket_placed = true;
+                    }
                     // 上限拒(半径/数量):配置校验已挡(radius ≤ leash_max +
                     // extra = 48 < 默认上限 128);这里照任务书"不 panic",
-                    // 计超时放弃。
+                    // 计超时放弃(票没放上,无需撤)。
                     Err(err) => {
                         eprintln!(
                             "[startup-agents] 第 {} 条区域票拒绝,放弃生成:{err:?}",
@@ -213,6 +222,21 @@ impl StartupAgents {
                     Ok(entry) => log.append(entry),
                     Err(err) => {
                         // 分片收件箱满等:留表下一拍重试(不 panic;票仍在)。
+                        // R1-4:重试拍计入等待(否则重试不计超时,可无限重试);
+                        // 超限同样放弃(撤票)。
+                        item.waited += 1;
+                        if item.waited > STARTUP_SPAWN_TIMEOUT_TICKS {
+                            eprintln!(
+                                "[startup-agents] 第 {} 条生成投递持续被拒超 {} 拍,放弃生成",
+                                item.index, STARTUP_SPAWN_TIMEOUT_TICKS
+                            );
+                            if item.ticket_placed {
+                                ticket_ids_to_remove.push(item.ticket_id);
+                            }
+                            outcomes.push(Outcome::Abandoned);
+                        } else {
+                            outcomes.push(Outcome::Keep);
+                        }
                         eprintln!(
                             "[startup-agents] 第 {} 条生成投递被拒,下一拍重试:{err:?}",
                             item.index
@@ -253,10 +277,23 @@ impl StartupAgents {
                         "[startup-agents] 第 {} 条({})等待装载超 {} 拍,放弃生成",
                         item.index, item.cfg.body, STARTUP_SPAWN_TIMEOUT_TICKS
                     );
+                    // R1-4:放弃时撤掉已放的区域票(否则那片区域永远装载)。
+                    if item.ticket_placed {
+                        ticket_ids_to_remove.push(item.ticket_id);
+                    }
                     outcomes.push(Outcome::Abandoned);
                 } else {
                     outcomes.push(Outcome::Keep);
                 }
+            }
+        }
+        // 撤票(放弃条;R1-4):条目进日志(回放同款再生)。撤票失败不放弃
+        // 撤票语义(票可能已被外部同名 ID 覆盖——保留区间约定下不可能,
+        // 防御性忽略),照旧出表。
+        for id in ticket_ids_to_remove {
+            match session.remove_area_ticket(id) {
+                Ok(entry) => log.append(entry),
+                Err(err) => eprintln!("[startup-agents] 撤区域票 {id} 失败:{err:?}"),
             }
         }
         // 出表(一次性;保留 Keep,放弃计数按结果加)。
@@ -396,7 +433,8 @@ mod tests {
 
     /// S2:超时放弃——出生点在未注册分片的坐标上(分片没注册 = 列读不到),
     /// 走 STARTUP_SPAWN_TIMEOUT_TICKS 拍后 spawn_timeouts = 1、不 panic、
-    /// 出表;票已放(第一次见到时)。
+    /// 出表;票已放(第一次见到时,全程恰 1 条——重试不重复放票,R1-4);
+    /// 放弃后撤票(RemoveAreaTicket 恰 1 条、同一 ID,R1-4)。
     #[test]
     fn s2_timeout_gives_up_without_panic() {
         let bodies = quad_registry();
@@ -409,20 +447,45 @@ mod tests {
         // 不注册任何分片:shard_ids 空 → loaded false → 永等。
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        for now in 0..=STARTUP_SPAWN_TIMEOUT_TICKS as u64 {
+        // 第 599 拍后:还没超时(600 拍整不放弃,601 拍才超——R1-3 口径)。
+        for now in 0..STARTUP_SPAWN_TIMEOUT_TICKS as u64 {
             startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(now));
         }
+        assert_eq!(
+            startup.counters.spawn_timeouts, 0,
+            "第 600 次 poll 后未超时"
+        );
+        assert_eq!(startup.pending.len(), 1, "仍在等");
+        // 最后一拍:waited 超限 → 放弃。
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &mut alloc,
+            Tick(STARTUP_SPAWN_TIMEOUT_TICKS as u64),
+        );
         assert_eq!(startup.counters.spawn_timeouts, 1, "600 拍后超时放弃");
         assert_eq!(startup.counters.spawned, 0, "从未生成");
         assert!(startup.pending.is_empty(), "出表");
         assert!(host.first_slot().is_none(), "没有挂载");
-        // 票在第一次见到时放了一条(第 0 拍)。
-        let tickets = log
+        // 票在第一次见到时放了恰 1 条(600 拍等待期间不重复放票,R1-4)。
+        let mut ticket_ids: Vec<u64> = Vec::new();
+        for e in log.entries() {
+            if let messaging::SimCommand::SetAreaTicket { id, .. } = e.command {
+                ticket_ids.push(id);
+            }
+        }
+        assert_eq!(ticket_ids, vec![STARTUP_TICKET_BASE], "首拍放票 1 张");
+        // 放弃后撤票:RemoveAreaTicket 恰 1 条、同一 ID(R1-4)。
+        let removed: Vec<u64> = log
             .entries()
             .iter()
-            .filter(|e| matches!(e.command, messaging::SimCommand::SetAreaTicket { .. }))
-            .count();
-        assert_eq!(tickets, 1, "首拍放票 1 张");
+            .filter_map(|e| match e.command {
+                messaging::SimCommand::RemoveAreaTicket { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(removed, vec![STARTUP_TICKET_BASE], "放弃后撤同一张票");
         session.shutdown();
     }
 
@@ -559,5 +622,66 @@ mod tests {
                 "顺序 {order}:生成的是装好那条(位置核对)"
             );
         }
+    }
+
+    /// S6(返修 R1-4):生成投递被拒的重试——router 收件箱容量压到 1 并
+    /// 先占满(load_ground 之后直投一条),第 0 拍放票成功(观察者收件箱,
+    /// 不受 router 容量影响)、生成投递被拒(Keep,waited 1);tick 兑现后
+    /// 第 1 拍生成。断言:等待期间 SetAreaTicket 恰 1 条(不重复放票)、
+    /// 重试拍生成恰 1 条 SpawnAgent。
+    #[test]
+    fn s6_spawn_retry_places_ticket_once() {
+        let bodies = quad_registry();
+        let mut startup = StartupAgents::new(
+            &[quad_cfg([8.5, 1.45, 8.5], StartupController::None)],
+            &bodies,
+        )
+        .expect("构造");
+        let mut cfg0 = cfg();
+        cfg0.scheduler.router.inbox_capacity = 1;
+        let mut session = Session::new(cfg0);
+        load_ground(&mut session);
+        // 预占收件箱(容量 1):poll 的 spawn_agent_from 将被拒。
+        let shard = shard_id(0, 0);
+        session
+            .submit_raw(
+                shard,
+                messaging::StampedInput {
+                    apply_at: Tick(0),
+                    source: InputSource::SCHEDULER,
+                    sequence: 0,
+                    payload: messaging::InputPayload::Command(messaging::SimCommand::SetBlock {
+                        pos: types::BlockPos::new(-100, 0, -100),
+                        block: STONE,
+                    }),
+                },
+            )
+            .expect("预占入箱");
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        // 第 0 拍:放票成功、生成投递被拒(Keep)。
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        assert_eq!(startup.counters.spawned, 0, "投递被拒未生成");
+        assert_eq!(startup.pending.len(), 1, "留表重试");
+        session.tick();
+        // 第 1 拍:收件箱已排空 → 生成。
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(1));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 1, "重试拍生成");
+        assert!(startup.pending.is_empty(), "出表");
+        session.shutdown();
+        // 放票恰 1 次(第 0 拍),重试拍没有再放。
+        let tickets = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.command, messaging::SimCommand::SetAreaTicket { .. }))
+            .count();
+        assert_eq!(tickets, 1, "等待期间 SetAreaTicket 恰 1 条(实得 {tickets})");
+        let spawns = log
+            .entries()
+            .iter()
+            .filter(|e| matches!(e.command, messaging::SimCommand::SpawnAgent { .. }))
+            .count();
+        assert_eq!(spawns, 1, "重试拍恰 1 条 SpawnAgent");
     }
 }
