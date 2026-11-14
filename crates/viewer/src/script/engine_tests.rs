@@ -1292,7 +1292,8 @@ adopt_agent = { label = \"b\", near = [20.0, 0.0, 0.0], within = 2.0, timeout_ti
 /// 认到剩下那只(已登记的不再被认)。
 #[test]
 fn adopt_agent_prefers_closest_then_remaining() {
-    // 两只都在 (10,0,0) 附近:eid(1) 距 0.5、eid(2) 距 1.5 → a 认 eid(1)。
+    // 两只都在 (10,0,0) 附近且 EntityId 序与距离序**相反**:eid(1) 距 1.5、
+    // eid(2) 距 0.5 → a 认 eid(2)(最近;取第一只的变异实现会错认 eid(1))。
     let mut e = engine(
         "[[step]]
 adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
@@ -1300,15 +1301,28 @@ adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ti
 adopt_agent = { label = \"b\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }",
     );
     let w = FlatWorld::with_agents(&[
-        (eid(1), Vec3::new(10.5, 0.0, 0.0)),
-        (eid(2), Vec3::new(11.5, 0.0, 0.0)),
+        (eid(1), Vec3::new(11.5, 0.0, 0.0)),
+        (eid(2), Vec3::new(10.5, 0.0, 0.0)),
     ]);
     let out = frame(&mut e, 0.016, 1, &w, &[]);
     assert_eq!(out.finished.len(), 2, "两条 adopt_agent 当帧完成");
     assert!(out.finished.iter().all(|r| r.outcome == StepOutcome::Ok));
-    // 已登记的 eid(1) 不再被认:b 认到剩下那只 eid(2)——用 agent_in 盒
-    // (只包住 eid(2) 的位置)验证 b 的根位置。
+    // a 认到 eid(2)(最近的):agent_in 盒只包 eid(2) 的位置(10.5)。
     let mut e2 = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+wait_until = { agent_in = { label = \"a\", from = [10.0, -1.0, -1.0], to = [11.0, 1.0, 1.0] }, timeout_ticks = 50 }",
+    );
+    let out = frame(&mut e2, 0.016, 1, &w, &[]);
+    assert_eq!(
+        actions_of(&out),
+        vec!["adopt_agent", "wait_until"],
+        "a 必须认到最近的 eid(2)(盒只包 10.5;错认 eid(1) 则 wait_until 留空)"
+    );
+    // 已登记的 eid(2) 不再被认:b 认到剩下那只 eid(1)——用 agent_in 盒
+    // (只包住 eid(1) 的位置 11.5)验证 b 的根位置。
+    let mut e3 = engine(
         "[[step]]
 adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
 [[step]]
@@ -1316,10 +1330,15 @@ adopt_agent = { label = \"b\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ti
 [[step]]
 wait_until = { agent_in = { label = \"b\", from = [11.0, -1.0, -1.0], to = [12.0, 1.0, 1.0] }, timeout_ticks = 50 }",
     );
-    let out = frame(&mut e2, 0.016, 1, &w, &[]);
+    let out = frame(&mut e3, 0.016, 1, &w, &[]);
+    assert_eq!(
+        actions_of(&out),
+        vec!["adopt_agent", "adopt_agent", "wait_until"],
+        "三步当帧全部结束(wait_until 必须真的完成,不是留空)"
+    );
     assert!(
         out.finished.iter().all(|r| r.outcome == StepOutcome::Ok),
-        "b 应认到 eid(2)(盒只包 eid(2))"
+        "b 应认到剩下那只 eid(1)(盒只包 eid(1))"
     );
 }
 
