@@ -113,6 +113,12 @@ impl StartupAgents {
         })
     }
 
+    /// 预置已等待拍数(仅测试:构造"同拍一条生成、另一条到点放弃"的布景)。
+    #[cfg(test)]
+    fn set_waited(&mut self, index: usize, waited: u32) {
+        self.pending[index - 1].waited = waited;
+    }
+
     /// 每拍在 `session.tick()` 之前调(§2.3 顺序)。对每条待生成项:
     /// 放票(首次)→ 出生列可读且碰撞体已建 → 生成 + 挂载;超时放弃。
     /// `alloc_id` = 驱动的服务端序号分配器(`spawn_next_seq` 那一套;
@@ -128,9 +134,19 @@ impl StartupAgents {
         if self.pending.is_empty() {
             return;
         }
-        let mut done: Vec<usize> = Vec::new();
-        let mut timed_out: Vec<usize> = Vec::new();
-        for (i, item) in self.pending.iter_mut().enumerate() {
+        // 一拍内每条恰好一个结果;循环结束后按结果**一次性**出表(R1-2:
+        // 生成表/放弃表分开倒序 remove 时,第二轮下标相对原表已错位——
+        // 同拍既有生成又有放弃会删错条目或越界 panic)。
+        enum Outcome {
+            /// 继续等(票已放但还没装载好,或生成投递被拒下一拍重试)。
+            Keep,
+            /// 本拍已生成 + 挂载。
+            Spawned,
+            /// 本拍放弃(超时 / 放票被拒)。
+            Abandoned,
+        }
+        let mut outcomes: Vec<Outcome> = Vec::with_capacity(self.pending.len());
+        for item in self.pending.iter_mut() {
             // ① 首次见到:放区域票(常驻;①② 档 = 数据 + 碰撞体;票计费
             // 不用条目自己——生成完不移除,主体常驻其活动区)。
             if item.waited == 0 {
@@ -150,7 +166,7 @@ impl StartupAgents {
                             "[startup-agents] 第 {} 条区域票拒绝,放弃生成:{err:?}",
                             item.index
                         );
-                        timed_out.push(i);
+                        outcomes.push(Outcome::Abandoned);
                         continue;
                     }
                 }
@@ -228,7 +244,7 @@ impl StartupAgents {
                     );
                 }
                 self.counters.spawned += 1;
-                done.push(i);
+                outcomes.push(Outcome::Spawned);
             } else {
                 // ③ 等装载;超时放弃(§2.2:写错误日志,不 panic)。
                 item.waited += 1;
@@ -237,18 +253,20 @@ impl StartupAgents {
                         "[startup-agents] 第 {} 条({})等待装载超 {} 拍,放弃生成",
                         item.index, item.cfg.body, STARTUP_SPAWN_TIMEOUT_TICKS
                     );
-                    timed_out.push(i);
+                    outcomes.push(Outcome::Abandoned);
+                } else {
+                    outcomes.push(Outcome::Keep);
                 }
             }
         }
-        // 出表(倒序 remove,保序)。
-        for i in done.into_iter().rev() {
-            self.pending.remove(i);
-        }
-        for i in timed_out.into_iter().rev() {
-            self.counters.spawn_timeouts += 1;
-            self.pending.remove(i);
-        }
+        // 出表(一次性;保留 Keep,放弃计数按结果加)。
+        self.counters.spawn_timeouts += outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Abandoned))
+            .count() as u64;
+        let mut it = outcomes.into_iter();
+        self.pending
+            .retain(|_| matches!(it.next(), Some(Outcome::Keep)));
     }
 }
 
@@ -481,5 +499,65 @@ mod tests {
         assert_eq!(startup.counters, StartupCounters::default());
         assert!(log.entries().is_empty(), "空配置零日志条目");
         session.shutdown();
+    }
+
+    /// S5(返修 R1-2):同一拍里一条生成、另一条放弃——出表只做一次,
+    /// 不因两张下标表错位而删错条目/越界 panic。
+    /// 布景:生成条在已装载分片(当拍可读 → 生成);放弃条在出世界列
+    /// (y 远低于世界底,列恒不可读,E8 同款),`set_waited`(#[cfg(test)])
+    /// 预置到超时临界 → 本拍 waited+1 超限放弃。旧实现两张下标表都指向
+    /// 原 pending:顺序 A(先生成 i=0、后放弃 i=1)在 remove(0) 后
+    /// remove(1) 越界 panic;顺序 B 恰好被倒序救住——修法(retain 一遍)
+    /// 不依赖顺序,两个都跑。
+    #[test]
+    fn s5_spawn_and_timeout_same_tick_retains_consistent() {
+        let spawned_at = [8.5f32, 1.45, 8.5];
+        let timeout_at = [8.5f32, -200.0, 8.5];
+        for order in 0..2 {
+            let cfgs = if order == 0 {
+                vec![
+                    quad_cfg(spawned_at, StartupController::None),
+                    quad_cfg(timeout_at, StartupController::None),
+                ]
+            } else {
+                vec![
+                    quad_cfg(timeout_at, StartupController::None),
+                    quad_cfg(spawned_at, StartupController::None),
+                ]
+            };
+            let bodies = quad_registry();
+            let mut startup = StartupAgents::new(&cfgs, &bodies).expect("构造");
+            // 放弃条(顺序 0 = 第 2 条、顺序 1 = 第 1 条)预置到超时临界:
+            // 本拍 waited+1 即超限(600 拍等不完)。
+            let timeout_index = if order == 0 { 2 } else { 1 };
+            startup.set_waited(timeout_index, STARTUP_SPAWN_TIMEOUT_TICKS);
+            let mut session = Session::new(cfg());
+            load_ground(&mut session);
+            let mut log = CommandLog::new();
+            let mut host = crate::controller::ControllerHost::default();
+            startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+            session.tick();
+            assert_eq!(startup.counters.spawned, 1, "顺序 {order}:当拍生成 1 条");
+            assert_eq!(
+                startup.counters.spawn_timeouts, 1,
+                "顺序 {order}:当拍放弃 1 条"
+            );
+            assert!(
+                startup.pending.is_empty(),
+                "顺序 {order}:两笔同拍出表,表空(残留 {:?})",
+                startup.pending.iter().map(|p| p.index).collect::<Vec<_>>()
+            );
+            session.shutdown();
+            // 生成的恰是装好那条:日志 SpawnAgent 的位置 = spawned_at。
+            let spawn_pos = log.entries().iter().find_map(|e| match e.command {
+                messaging::SimCommand::SpawnAgent { state, .. } => Some(state.translation),
+                _ => None,
+            });
+            assert_eq!(
+                spawn_pos,
+                Some(Vec3::new(spawned_at[0], spawned_at[1], spawned_at[2])),
+                "顺序 {order}:生成的是装好那条(位置核对)"
+            );
+        }
     }
 }
