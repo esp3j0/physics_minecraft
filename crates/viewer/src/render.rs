@@ -15,7 +15,9 @@ use macroquad::input::{
     mouse_delta_position, mouse_wheel, set_cursor_grab, show_mouse,
 };
 use macroquad::math::vec3;
-use macroquad::models::{Mesh, draw_cube, draw_cube_wires, draw_cylinder, draw_mesh, draw_sphere};
+use macroquad::models::{
+    Mesh, draw_affine_parallelepiped, draw_cube, draw_cube_wires, draw_mesh, draw_sphere,
+};
 use macroquad::text::draw_text;
 use macroquad::time::{get_fps, get_frame_time};
 use macroquad::window::{clear_background, next_frame, screen_height, screen_width};
@@ -378,45 +380,73 @@ const AGENT_COLOR: macroquad::color::Color = macroquad::color::Color::from_rgba(
 const POSSESSED_AGENT_COLOR: macroquad::color::Color =
     macroquad::color::Color::from_rgba(92, 240, 178, 255);
 
-/// 画一个连杆(A06 §1):按 [`LinkShape`] 画胶囊(等高圆柱)/盒/球;
-/// 未知形状退化画 0.9 m 立方体。`pos` = 连杆姿态 translation(types 系)。
-fn draw_link(shape: &LinkShape, pos: types::glam::Vec3, color: macroquad::color::Color) {
-    // B01a:形状在连杆局部系里的平移(offset)加到连杆位姿上;零偏移时
-    // 与改前逐位一致(加零不改变浮点值)。
-    let [ox, oy, oz] = match shape {
+/// 一个形状在世界系里的绘制几何(types 系 glam)。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum LinkGeom {
+    /// 有向盒:中心 + 三条半轴向量(已含旋转和半长)。
+    Box {
+        center: TVec3,
+        half_axes: [TVec3; 3],
+    },
+    /// 圆柱(胶囊的等高近似):两端面中心 + 半径。
+    Cylinder {
+        start: TVec3,
+        end: TVec3,
+        radius: f32,
+    },
+    Sphere {
+        center: TVec3,
+        radius: f32,
+    },
+}
+
+/// center = pose.translation + pose.rotation * offset。
+/// - Box(half, _):half_axes[i] = pose.rotation * (单位轴 i * half[i])。
+/// - CapsuleY:轴 = pose.rotation * Y;start/end = center ∓ 轴 * (half_height + radius)。
+/// - Sphere:只动中心。
+/// - ConvexHull:取局部包围盒,mid = 包围盒中心(局部),
+///   center = pose.translation + pose.rotation * (offset + mid),half_axes 同 Box。
+pub(crate) fn link_geom(shape: &LinkShape, pose: &EntityState) -> LinkGeom {
+    let offset = match shape {
         LinkShape::Box(_, offset)
         | LinkShape::Sphere(_, offset)
         | LinkShape::CapsuleY { offset, .. }
         | LinkShape::ConvexHull(_, offset) => *offset,
     };
-    let center = vec3(pos.x + ox, pos.y + oy, pos.z + oz);
+    let offset_v = TVec3::from_array(offset);
+    let center = pose.translation + pose.rotation * offset_v;
     match shape {
+        LinkShape::Box(half, _) => {
+            let axes = [
+                pose.rotation * TVec3::new(half[0], 0.0, 0.0),
+                pose.rotation * TVec3::new(0.0, half[1], 0.0),
+                pose.rotation * TVec3::new(0.0, 0.0, half[2]),
+            ];
+            LinkGeom::Box {
+                center,
+                half_axes: axes,
+            }
+        }
         LinkShape::CapsuleY {
             half_height,
             radius,
             ..
         } => {
-            // 等高圆柱:总高 2·(half_height + radius),直径 2·radius。
-            // macroquad draw_cylinder 的 position = **底面中心**(顶点 y 从 0
-            // 长到 height),连杆位姿是胶囊中心 → 下移半高对齐。
-            let height = 2.0 * (half_height + radius);
-            let base = vec3(center.x, center.y - half_height - radius, center.z);
-            draw_cylinder(base, *radius, *radius, height, None, color);
+            let axis = pose.rotation * TVec3::Y;
+            let half_len = *half_height + *radius;
+            LinkGeom::Cylinder {
+                start: center - axis * half_len,
+                end: center + axis * half_len,
+                radius: *radius,
+            }
         }
-        LinkShape::Box(half, _) => {
-            draw_cube(
-                center,
-                vec3(half[0] * 2.0, half[1] * 2.0, half[2] * 2.0),
-                None,
-                color,
-            );
-        }
-        LinkShape::Sphere(radius, _) => {
-            draw_sphere(center, *radius, None, color);
-        }
+        LinkShape::Sphere(radius, _) => LinkGeom::Sphere {
+            center,
+            radius: *radius,
+        },
         LinkShape::ConvexHull(points, _) => {
             // 凸包画包围盒(§5.1:viewer 只画碰撞形状;凸包的盒包围足够
-            // 辨识,不做网格化)。
+            // 辨识,不做网格化)。包围盒在**连杆局部系**里取,再随连杆旋转。
             let mut min = [f32::MAX; 3];
             let mut max = [f32::MIN; 3];
             for p in points {
@@ -425,14 +455,155 @@ fn draw_link(shape: &LinkShape, pos: types::glam::Vec3, color: macroquad::color:
                     max[axis] = max[axis].max(p[axis]);
                 }
             }
-            let size = vec3(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
-            let mid = vec3(
-                center.x + (min[0] + max[0]) * 0.5,
-                center.y + (min[1] + max[1]) * 0.5,
-                center.z + (min[2] + max[2]) * 0.5,
+            let mid_local = TVec3::new(
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                (min[2] + max[2]) * 0.5,
             );
-            draw_cube(mid, size, None, color);
+            let half = [
+                (max[0] - min[0]) * 0.5,
+                (max[1] - min[1]) * 0.5,
+                (max[2] - min[2]) * 0.5,
+            ];
+            let center = pose.translation + pose.rotation * (offset_v + mid_local);
+            let axes = [
+                pose.rotation * TVec3::new(half[0], 0.0, 0.0),
+                pose.rotation * TVec3::new(0.0, half[1], 0.0),
+                pose.rotation * TVec3::new(0.0, 0.0, half[2]),
+            ];
+            LinkGeom::Box {
+                center,
+                half_axes: axes,
+            }
         }
+    }
+}
+
+/// 画一个连杆(A06 §1):按 [`LinkShape`] 画胶囊(等高圆柱)/盒/球;
+/// 未知形状退化画 0.9 m 立方体。几何计算在 [`link_geom`](B02c:随连杆
+/// 旋转;`pose` = 连杆姿态,types 系),本函数只做绘制。
+fn draw_link(shape: &LinkShape, pose: &EntityState, color: macroquad::color::Color) {
+    match link_geom(shape, pose) {
+        LinkGeom::Box { center, half_axes } => {
+            // 原点 = 中心 − 三条半轴之和;三条边 = 半轴 × 2。
+            let origin = center - half_axes[0] - half_axes[1] - half_axes[2];
+            draw_affine_parallelepiped(
+                mq_vec3(origin),
+                mq_vec3(half_axes[0]) * 2.0,
+                mq_vec3(half_axes[1]) * 2.0,
+                mq_vec3(half_axes[2]) * 2.0,
+                None,
+                color,
+            );
+        }
+        LinkGeom::Cylinder { start, end, radius } => {
+            // 等高圆柱:B02c 起胶囊轴随连杆旋转,macroquad 0.4 的
+            // draw_cylinder(_ex) 只有 +y 轴向、没有两端点签名 → 临时网格
+            // 自画(start/end = 两端面中心,与 link_geom 的 LinkGeom::Cylinder
+            // 语义一致)。单位旋转 + 零偏移时端面中心 = 中心 ∓ (half_height
+            // + radius)·Y,与改前逐位同。
+            draw_mesh(&cylinder_mesh(mq_vec3(start), mq_vec3(end), radius, color));
+        }
+        LinkGeom::Sphere { center, radius } => {
+            draw_sphere(mq_vec3(center), radius, None, color);
+        }
+    }
+}
+
+/// types glam Vec3 → macroquad glam Vec3(字段换算;跨界纪律同 mq_quat)。
+fn mq_vec3(v: TVec3) -> macroquad::math::Vec3 {
+    macroquad::math::vec3(v.x, v.y, v.z)
+}
+
+/// 两端点圆柱网格(B02c):`start`/`end` = 两端面中心。轴向 = (end −
+/// start).normalize() 任意朝向,16 侧圆周与 `DrawCylinderParams::default()`
+/// 同值;端盖各 1 个三角形扇心 + 侧面 16×2 三角。仅逐帧临时构造(quad
+/// 连杆每帧 ≤ 8 条圆柱,量小)。
+fn cylinder_mesh(
+    start: macroquad::math::Vec3,
+    end: macroquad::math::Vec3,
+    radius: f32,
+    color: macroquad::color::Color,
+) -> Mesh {
+    const SIDES: usize = 16;
+    let axis = end - start;
+    let len = axis.length();
+    // 退化(两端重合)画不出东西:返回空网格,draw_mesh 空网格是 no-op。
+    if len <= 1e-6 {
+        return Mesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            texture: None,
+        };
+    }
+    let axis = axis / len;
+    // 与轴正交的两个单位基向量:取与轴最不平行的坐标轴作叉积起点,轴接近
+    // 该轴时换另一根(避免叉积退化)。
+    let helper = if axis.x.abs() < 0.9 {
+        macroquad::math::vec3(1.0, 0.0, 0.0)
+    } else {
+        macroquad::math::vec3(0.0, 1.0, 0.0)
+    };
+    let u = axis.cross(helper).normalize();
+    let v = axis.cross(u);
+    let rgba: [u8; 4] = [
+        (color.r * 255.0) as u8,
+        (color.g * 255.0) as u8,
+        (color.b * 255.0) as u8,
+        (color.a * 255.0) as u8,
+    ];
+    let normal = macroquad::math::Vec4::new(axis.x, axis.y, axis.z, 0.0);
+    let mut vertices: Vec<macroquad::models::Vertex> = Vec::with_capacity(SIDES * 2 + 2);
+    let mut indices: Vec<u16> = Vec::with_capacity(SIDES * 6 + SIDES * 3 * 2);
+    let ring = |i: usize, base: macroquad::math::Vec3| -> macroquad::math::Vec3 {
+        let a = (i as f32) * (std::f32::consts::TAU / SIDES as f32);
+        let (s, c) = a.sin_cos();
+        base + (u * c + v * s) * radius
+    };
+    for i in 0..SIDES {
+        // 侧面:两端环各一顶点,四角两三角。
+        let b0 = vertices.len() as u16;
+        for p in [
+            ring(i, start),
+            ring(i, end),
+            ring(i + 1, end),
+            ring(i + 1, start),
+        ] {
+            vertices.push(macroquad::models::Vertex {
+                position: p,
+                uv: macroquad::math::vec2(0.0, 0.0),
+                color: rgba,
+                normal,
+            });
+        }
+        indices.extend([b0, b0 + 1, b0 + 2, b0, b0 + 2, b0 + 3]);
+    }
+    // 端盖:start/end 各一个扇心 + SIDES 个三角。
+    for (cap_center, cap_normal) in [(start, -normal), (end, normal)] {
+        let c = vertices.len() as u16;
+        vertices.push(macroquad::models::Vertex {
+            position: cap_center,
+            uv: macroquad::math::vec2(0.0, 0.0),
+            color: rgba,
+            normal: cap_normal,
+        });
+        for i in 0..SIDES {
+            let b = vertices.len() as u16;
+            for p in [ring(i, cap_center), ring(i + 1, cap_center)] {
+                vertices.push(macroquad::models::Vertex {
+                    position: p,
+                    uv: macroquad::math::vec2(0.0, 0.0),
+                    color: rgba,
+                    normal: cap_normal,
+                });
+            }
+            indices.extend([c, b, b + 1]);
+        }
+    }
+    Mesh {
+        vertices,
+        indices,
+        texture: None,
     }
 }
 
@@ -452,7 +623,7 @@ fn draw_agent(
                     continue;
                 };
                 for shape in ls {
-                    draw_link(shape, pose.translation, color);
+                    draw_link(shape, pose, color);
                 }
             }
         }
@@ -1745,5 +1916,247 @@ mod tests {
             "单格 desc 仍为默认(逐位不变)"
         );
         assert!(rx.try_recv().is_err(), "通道应已收干(恰好 4 条消息)");
+    }
+
+    // ---- B02c §1:link_geom 纯函数(不开窗口) ----
+
+    use crate::bodies::BodyShapeTable;
+    use types::BodyDef;
+
+    /// 恒等姿态:平移 t、单位旋转。
+    fn pose_at(t: types::glam::Vec3) -> EntityState {
+        EntityState {
+            translation: t,
+            ..EntityState::default()
+        }
+    }
+
+    /// V1 单位旋转、零偏移:三种形状的几何与改前(平移 + offset,世界轴)
+    /// 一致——盒中心与半轴、圆柱两端 = 中心 ∓ (half_height + radius)·Y、球心。
+    #[test]
+    fn link_geom_identity_pose_matches_pre_change_geometry() {
+        let t = types::glam::Vec3::new(10.0, -58.0, 4.0);
+
+        // Box:half (0.19, 0.057, 0.047)。
+        let box_shape = LinkShape::Box([0.19, 0.057, 0.047], [0.0; 3]);
+        let LinkGeom::Box { center, half_axes } = link_geom(&box_shape, &pose_at(t)) else {
+            panic!("Box 应产出 LinkGeom::Box");
+        };
+        assert_eq!(center, t, "单位旋转 + 零偏移:盒中心 = 平移");
+        assert_eq!(half_axes[0], types::glam::Vec3::new(0.19, 0.0, 0.0));
+        assert_eq!(half_axes[1], types::glam::Vec3::new(0.0, 0.057, 0.0));
+        assert_eq!(half_axes[2], types::glam::Vec3::new(0.0, 0.0, 0.047));
+
+        // CapsuleY:总高 2·(half_height + radius),两端沿 ±Y。
+        let cap = LinkShape::CapsuleY {
+            half_height: 0.1065,
+            radius: 0.02,
+            offset: [0.0; 3],
+        };
+        let LinkGeom::Cylinder { start, end, radius } = link_geom(&cap, &pose_at(t)) else {
+            panic!("CapsuleY 应产出 LinkGeom::Cylinder");
+        };
+        let half_len = 0.1065 + 0.02;
+        assert_eq!(radius, 0.02);
+        assert_eq!(
+            start,
+            t - types::glam::Vec3::new(0.0, half_len, 0.0),
+            "下端面中心"
+        );
+        assert_eq!(
+            end,
+            t + types::glam::Vec3::new(0.0, half_len, 0.0),
+            "上端面中心"
+        );
+
+        // Sphere。
+        let sphere = LinkShape::Sphere(0.035, [0.0; 3]);
+        let LinkGeom::Sphere { center, radius } = link_geom(&sphere, &pose_at(t)) else {
+            panic!("Sphere 应产出 LinkGeom::Sphere");
+        };
+        assert_eq!(center, t);
+        assert_eq!(radius, 0.035);
+    }
+
+    /// V2 偏移与半轴随旋转:连杆绕 Z 转 90°,Box 偏移 (0.2, 0, 0) → 中心 =
+    /// 平移 + (0, 0.2, 0);half (0.19, 0.057, 0.047) 的第一条半轴 = (0, 0.19, 0)。
+    #[test]
+    fn link_geom_box_offset_and_axes_follow_rotation() {
+        let q = types::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2);
+        let pose = EntityState {
+            translation: types::glam::Vec3::new(1.0, 2.0, 3.0),
+            rotation: q,
+            ..EntityState::default()
+        };
+        let shape = LinkShape::Box([0.19, 0.057, 0.047], [0.2, 0.0, 0.0]);
+        let LinkGeom::Box { center, half_axes } = link_geom(&shape, &pose) else {
+            panic!("Box 应产出 LinkGeom::Box");
+        };
+        let expect = |v: types::glam::Vec3, got: types::glam::Vec3, what: &str| {
+            assert!((v - got).length() < 1e-6, "{what}:期望 {v:?},实得 {got:?}");
+        };
+        expect(
+            types::glam::Vec3::new(1.0, 2.2, 3.0),
+            center,
+            "中心 = 平移 + 旋转·偏移",
+        );
+        expect(
+            types::glam::Vec3::new(0.0, 0.19, 0.0),
+            half_axes[0],
+            "第一条半轴随旋转",
+        );
+    }
+
+    /// V3 胶囊轴随旋转:连杆绕 X 转 90° → start/end 沿 ±Z,长度 =
+    /// 2·(half_height + radius)。
+    #[test]
+    fn link_geom_capsule_axis_follows_rotation() {
+        let q = types::glam::Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+        let t = types::glam::Vec3::new(0.0, -59.0, 0.0);
+        let pose = EntityState {
+            translation: t,
+            rotation: q,
+            ..EntityState::default()
+        };
+        let cap = LinkShape::CapsuleY {
+            half_height: 0.1065,
+            radius: 0.02,
+            offset: [0.0; 3],
+        };
+        let LinkGeom::Cylinder { start, end, .. } = link_geom(&cap, &pose) else {
+            panic!("CapsuleY 应产出 LinkGeom::Cylinder");
+        };
+        let total = 2.0 * (0.1065 + 0.02);
+        assert!(
+            ((end - start).length() - total).abs() < 1e-6,
+            "长度 = 2·(half_height + radius),实得 {}",
+            (end - start).length()
+        );
+        // 绕 X 转 90°:+Y → ±Z(手算:Y 轴转到 −Z,取模 1e-6 带符号比较)。
+        let half_len = 0.1065 + 0.02;
+        assert!(
+            (start.z + t.z + half_len).abs() < 1e-6 && (start.y - t.y).abs() < 1e-6,
+            "start 沿 −Z:期望 z = {:+},实得 {}",
+            -(t.z + half_len),
+            start.z - t.z
+        );
+        assert!(
+            (end.z - t.z - half_len).abs() < 1e-6 && (end.y - t.y).abs() < 1e-6,
+            "end 沿 +Z:实得 z 偏移 {}",
+            end.z - t.z
+        );
+    }
+
+    /// V4 凸包:非对称点集(包围盒中心不在原点),绕 Y 转 90° 后中心等于
+    /// 手算值(offset + mid 随旋转)。
+    #[test]
+    fn link_geom_convex_hull_center_includes_local_bbox_mid() {
+        // 顶点集包围盒 x∈[0,1] y∈[0,0.5] z∈[0,0.25] → mid = (0.5, 0.25, 0.125)。
+        let points = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.5, 0.0],
+            [0.0, 0.5, 0.25],
+            [1.0, 0.5, 0.25],
+        ];
+        let offset = [0.1, 0.0, 0.0];
+        let q = types::glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        let t = types::glam::Vec3::new(5.0, -59.0, 6.0);
+        let pose = EntityState {
+            translation: t,
+            rotation: q,
+            ..EntityState::default()
+        };
+        let shape = LinkShape::ConvexHull(points, offset);
+        let LinkGeom::Box { center, half_axes } = link_geom(&shape, &pose) else {
+            panic!("ConvexHull 应产出 LinkGeom::Box");
+        };
+        // 局部点 (offset + mid) = (0.6, 0.25, 0.125);绕 Y 转 90°:(x,z) → (z, −x)
+        // → (0.125, 0.25, −0.6)。
+        let expect = t + types::glam::Vec3::new(0.125, 0.25, -0.6);
+        assert!(
+            (center - expect).length() < 1e-6,
+            "中心 = 平移 + 旋转·(offset + mid):期望 {expect:?},实得 {center:?}"
+        );
+        // 半轴 = 包围盒半尺寸随旋转:x 半轴 (0.5,0,0) → (0,0,−0.5)。
+        assert!(
+            (half_axes[0] - types::glam::Vec3::new(0.0, 0.0, -0.5)).length() < 1e-6,
+            "x 半轴随旋转:实得 {:?}",
+            half_axes[0]
+        );
+    }
+
+    /// V5 真实资产:quad 形状表,每根连杆不同旋转 → |center − 平移| ==
+    /// |offset(+mid)|(旋转保长),盒三条半轴两两正交。
+    #[test]
+    fn link_geom_quad_asset_rotations_preserve_lengths_and_orthogonality() {
+        let def = BodyDef::from_toml_str(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad 资产应可解析");
+        let table = BodyShapeTable::from_defs(&[def]);
+        // 任取一哈希(只有一个)拿形状表。
+        let def = BodyDef::from_toml_str(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad 资产应可解析");
+        let hash = def.hash();
+        let links = table.get(&hash).expect("哈希应已登记");
+
+        // 每根连杆不同旋转(绕各轴取不同角度),平移同一处。
+        let rotations = [
+            types::glam::Quat::from_rotation_x(0.3),
+            types::glam::Quat::from_rotation_z(-0.8),
+            types::glam::Quat::from_rotation_y(1.1),
+            types::glam::Quat::from_axis_angle(
+                types::glam::Vec3::new(0.3, 0.5, 0.81).normalize(),
+                0.9,
+            ),
+        ];
+        let t = types::glam::Vec3::new(24.5, -59.7, 24.5);
+        let mut link_i = 0;
+        for (i, shapes) in links.iter().enumerate() {
+            let pose = EntityState {
+                translation: t,
+                rotation: rotations[i % rotations.len()],
+                ..EntityState::default()
+            };
+            for shape in shapes {
+                let geom = link_geom(shape, &pose);
+                let _ = link_i;
+                link_i += 1;
+                // offset 长度 = |center − translation|(Sphere/Box/Capsule 同式;
+                // ConvexHull 含 mid,资产里没有凸包,但断言式统一写 |offset|)。
+                let offset = match shape {
+                    LinkShape::Box(_, o)
+                    | LinkShape::Sphere(_, o)
+                    | LinkShape::CapsuleY { offset: o, .. }
+                    | LinkShape::ConvexHull(_, o) => types::glam::Vec3::from_array(*o),
+                };
+                let center = match &geom {
+                    LinkGeom::Box { center, .. } | LinkGeom::Sphere { center, .. } => *center,
+                    LinkGeom::Cylinder { .. } => {
+                        // 圆柱没有单中心字段:两端中点即中心。
+                        let LinkGeom::Cylinder { start, end, .. } = geom else {
+                            unreachable!()
+                        };
+                        (start + end) * 0.5
+                    }
+                };
+                let d = (center - pose.translation).length();
+                assert!(
+                    (d - offset.length()).abs() < 1e-5,
+                    "连杆 {i}:|center − 平移| {d} 应 = |offset| {}(旋转保长)",
+                    offset.length()
+                );
+                // 盒半轴两两正交(点积 < 1e-5)。
+                if let LinkGeom::Box { half_axes, .. } = &geom {
+                    for (a, b) in [(0, 1), (0, 2), (1, 2)] {
+                        assert!(
+                            half_axes[a].dot(half_axes[b]).abs() < 1e-5,
+                            "连杆 {i}:半轴 {a}·{b} 应为 0,实得 {}",
+                            half_axes[a].dot(half_axes[b])
+                        );
+                    }
+                }
+            }
+        }
+        assert!(link_i >= 13, "quad 资产应有 ≥ 13 个形状,实得 {link_i}");
     }
 }
