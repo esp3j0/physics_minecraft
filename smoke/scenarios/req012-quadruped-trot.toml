@@ -1,0 +1,70 @@
+name = "req012-quadruped-trot"
+req = "REQ-012"
+description = "配置生成的四足(脚本小跑,活动半径 4 m)走出去、到半径边缘改为站立并停住(AC-B2 的图形面 + B02b 活动半径)。viewer 连上时它可能已经在走或已停,所以只判终态。"
+timeout_secs = 300
+
+[server]
+world_seed = 3
+
+[[server.agents]]
+body = "quad"
+position = [24.5, -59.5, 24.5]
+controller = "quad_trot"
+leash_m = 4.0
+
+[[step]]
+label = "相机就位(俯视活动圆)"
+camera = { pos = [24.5, -50.0, 34.5], yaw = -90.0, pitch = -45.0 }
+
+[[step]]
+look_at = { target = [24.5, -59.75, 24.5] }
+
+[[step]]
+wait_until = { block = { pos = [24, -61, 24], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+label = "认领四足"
+adopt_agent = { label = "dog", near = [24.5, -59.5, 24.5], within = 7.0, timeout_ticks = 1200 }
+
+[[step]]
+label = "基准点 = 出生点"
+mark_agent = { label = "dog", at = [24.5, -59.72, 24.5] }
+
+# 走出活动半径：离出生点 ≥ 3.5 m 并保持 3 秒(agent_moved 只能给 ge/le 之一)。
+[[step]]
+label = "走到半径边缘"
+wait_until = { agent_moved = { label = "dog", ge = 3.5 }, hold_ticks = 180, timeout_ticks = 2400 }
+
+[[step]]
+label = "没有走远(离出生点 ≤ 6.5 m)"
+check = { agent_moved = { label = "dog", le = 6.5 } }
+
+[[step]]
+screenshot = { name = "stopped", expect = "俯视棕色平地,一只品红色四足站在地面上:扁平躯干加四条向下的腿,腿与躯干相连;没有侧翻,没有零件散落或陷进地面。" }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "停住时没有倒(根高度在站立带内)"
+check = { agent_in = { label = "dog", from = [17.5, -59.85, 17.5], to = [31.5, -59.60, 31.5] } }
+
+[[step]]
+label = "仍在半径边缘(≥ 3.5 m)"
+check = { agent_moved = { label = "dog", ge = 3.5 } }
+
+[[step]]
+label = "仍没有走远(≤ 6.5 m)"
+check = { agent_moved = { label = "dog", le = 6.5 } }
+
+# 停住：再过 5 秒仍不超过 6.5 m(还在走的话 5 秒会再走 2 m 以上，超出上限)。
+[[step]]
+wait_ticks = { n = 300 }
+
+[[step]]
+label = "5 秒后仍没有走远(已停住)"
+check = { agent_moved = { label = "dog", le = 6.5 } }
+
+[[step]]
+label = "5 秒后仍没有倒"
+check = { agent_in = { label = "dog", from = [17.5, -59.85, 17.5], to = [31.5, -59.60, 31.5] } }
