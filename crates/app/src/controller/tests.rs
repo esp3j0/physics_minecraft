@@ -529,10 +529,8 @@ fn l2_retain_alive_removes_and_counts() {
     let removed = host.retain_alive(|id| id != e(2));
     assert_eq!(removed, 1, "摘掉 1 条");
     assert_eq!(host.kind_of(e(2)), None, "e(2) 已摘");
-    assert_eq!(
-        host.kind_of(e(1)).is_some() && host.kind_of(e(3)).is_some(),
-        true
-    );
+    assert!(host.kind_of(e(1)).is_some(), "e(1) 应仍在");
+    assert!(host.kind_of(e(3)).is_some(), "e(3) 应仍在");
     let removed = host.retain_alive(|_| true);
     assert_eq!(removed, 0, "全活:摘 0 条");
     let removed = host.retain_alive(|_| false);

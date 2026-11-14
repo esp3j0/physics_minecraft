@@ -156,16 +156,21 @@ impl StartupAgents {
                 }
             }
             // ② 出生点装载判定(与 A06 `flush_pending_respawns` 同缝:分片
-            // 注册 + chunk 已载;再加 ② 碰撞体已建 + 出生列可读)。
+            // 注册 + chunk 已载;再加 ② 碰撞体已建 + 出生列可读)。y 出世界
+            // (网络生成同款校验,handle_spawn_agent ②)的列**永远不可读**,
+            // 走超时放弃(E8 口径"不会被装载");越界生成会让主体掉虚空,
+            // void 移除孤儿运动票触发内核 I3-2 fail-stop。
             let cell = BlockPos::new(
                 item.cfg.position[0].floor() as i32,
                 item.cfg.position[1].floor() as i32,
                 item.cfg.position[2].floor() as i32,
             );
+            let y_in_world = (types::WORLD_Y_MIN..=types::WORLD_Y_MAX).contains(&cell.y);
             let chunk = cell.chunk_of();
             let shard =
                 types::ShardId::new(types::WorldId(0), types::DimensionId(0), chunk.shard_of());
-            let loaded = session.shard_ids().contains(&shard)
+            let loaded = y_in_world
+                && session.shard_ids().contains(&shard)
                 && session.is_chunk_loaded(shard, chunk)
                 && session.has_collider(shard, chunk);
             let readable = loaded && session.block_solid_at(shard, cell).is_some();
@@ -322,9 +327,11 @@ mod tests {
     #[test]
     fn s1_spawn_when_loaded_and_attach() {
         let bodies = quad_registry();
-        let mut startup =
-            StartupAgents::new(&[quad_cfg([8.5, 1.45, 8.5], StartupController::QuadTrot)], &bodies)
-                .expect("构造");
+        let mut startup = StartupAgents::new(
+            &[quad_cfg([8.5, 1.45, 8.5], StartupController::QuadTrot)],
+            &bodies,
+        )
+        .expect("构造");
         let mut session = Session::new(cfg());
         load_ground(&mut session);
         let mut log = CommandLog::new();
@@ -364,8 +371,7 @@ mod tests {
         assert_eq!(spawns, 1, "恰一条 SpawnAgent");
         let id = ticket_id.expect("票 ID");
         assert!(
-            id >= STARTUP_TICKET_BASE
-                && id - STARTUP_TICKET_BASE < STARTUP_AGENTS_MAX as u64,
+            id >= STARTUP_TICKET_BASE && id - STARTUP_TICKET_BASE < STARTUP_AGENTS_MAX as u64,
             "票据 ID 在保留区间 [{STARTUP_TICKET_BASE}, +{STARTUP_AGENTS_MAX}):{id}"
         );
     }
@@ -434,12 +440,17 @@ mod tests {
         assert_eq!(ids.len(), 2);
         assert_eq!(
             host.kind_of(ids[0]),
-            Some(ControllerKind::Script(crate::controller::ScriptKind::QuadStand))
+            Some(ControllerKind::Script(
+                crate::controller::ScriptKind::QuadStand
+            ))
         );
         assert_eq!(host.kind_of(ids[1]), Some(ControllerKind::None));
         // leash 圆心 = 各自 position。
         let recs = host.to_records();
-        assert_eq!(recs[0].slot.leash.as_ref().map(|l| l.center_xz), Some([8.5, 8.5]));
+        assert_eq!(
+            recs[0].slot.leash.as_ref().map(|l| l.center_xz),
+            Some([8.5, 8.5])
+        );
         // 票 ID 相邻且都在保留区间。
         let mut ticket_ids: Vec<u64> = log
             .entries()

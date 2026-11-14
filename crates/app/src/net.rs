@@ -2572,7 +2572,7 @@ pub(crate) mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         };
         let driver = tokio::spawn(crate::driver::run(args));
 
@@ -2773,7 +2773,7 @@ pub(crate) mod tests {
             observe: Some(handle.observe),
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         }));
 
         // 外部客户端连入:Hello + Subscribe → 首帧 Welcome(ACV1 冒烟)。

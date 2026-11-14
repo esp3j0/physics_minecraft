@@ -124,7 +124,7 @@ async fn drive(
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     advance_ticks(ticks).await;
     tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
@@ -223,7 +223,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -264,7 +264,7 @@ async fn commands_after_resume_apply_to_restored_shards() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -385,7 +385,7 @@ async fn telemetry_wired_into_driver_outcome() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     tx.send(DriverCommand::Send {
         shard,
@@ -445,7 +445,7 @@ async fn spawn_high_water_survives_restart() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     let old = EntityId::from_parts(0, 77);
     tx.send(DriverCommand::Send {

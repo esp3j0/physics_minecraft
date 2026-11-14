@@ -59,7 +59,7 @@ fn main() {
             observe: Some(network.observe),
             spawn_next_seq,
             bodies,
-            startup_controllers: Vec::new(),
+            startup_controllers: Some(startup_controllers),
         }));
         handle.await.expect("驱动任务 panic(fail-stop)")
     });

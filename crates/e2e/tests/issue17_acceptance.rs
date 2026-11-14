@@ -238,7 +238,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     tx.send(DriverCommand::MoveObserver {
         position: Vec3::new(8.0, types::WORLD_Y_MIN as f32 + 6.0, 8.0),

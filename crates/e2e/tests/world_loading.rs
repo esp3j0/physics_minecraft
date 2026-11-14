@@ -275,7 +275,7 @@ async fn acg3_observer_walk_builds_playable_world() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
 
     // 观察者进分片 (1,0) 新区(x=200 → chunk 12 → 分片 (1,0));y 取地面顶面
@@ -405,7 +405,7 @@ async fn acg4_lifecycle_roundtrip_preserves_data() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
 
     let shard = shard_id(1, 0);
@@ -908,7 +908,7 @@ async fn acg6_persisted_after_process_restart() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
 
     let shard = shard_id(1, 0);

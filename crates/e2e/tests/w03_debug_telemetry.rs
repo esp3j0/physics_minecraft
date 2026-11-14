@@ -196,7 +196,7 @@ async fn harness() -> Harness {
         }),
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     Harness { tx, driver, addr }
 }

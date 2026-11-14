@@ -487,10 +487,12 @@ pub struct DriverArgs {
     /// 装配 = `wire_provider_and_new_sim` 已加载的同一份(不再读目录);测试
     /// 装配不涉主体时给空表(生成被拒即正确行为)。
     pub bodies: physics_sim::BodyRegistry,
-    /// 检查点恢复出的控制者条目(B02b §2.5):`bootstrap` 从 bundle 读出;
-    /// 恢复启动非空(`ControllerHost::from_records` 重建宿主),全新启动
-    /// 空表(配置生成的主体由 `startup_agents` 在首拍起生成并挂载)。
-    pub startup_controllers: Vec<crate::controller::ControllerRecord>,
+    /// 检查点恢复出的控制者条目(B02b §2.5):`bootstrap` 从 bundle 读出。
+    /// `Some(records)` = 恢复启动——`ControllerHost::from_records` 重建宿主,
+    /// 且**不按配置生成**(`[[agents]]` 的主体已在世界快照里,§2.2"恢复启动
+    /// 传空表"的口径);`None` = 全新启动——宿主空,配置条目由 startup_agents
+    /// 逐条生成并挂载。
+    pub startup_controllers: Option<Vec<crate::controller::ControllerRecord>>,
 }
 
 /// 观察输出缝(REQ-003 §4.4;任务书 03 装配件):网络层 `serve` 的 up 接收端
@@ -2409,12 +2411,23 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // REQ-005 D9)。
     let session_source = config.session_config().source;
 
-    // 控制者宿主(B02b §2.3):恢复启动 = 检查点条目重建(世界快照里已有
-    // 这些主体,配置不重新生成);全新启动 = 空(配置的 [[agents]] 由
-    // startup 逐条生成并挂载)。计数是遥测,不随检查点恢复。
-    let mut host = crate::controller::ControllerHost::from_records(startup_controllers);
+    // 控制者宿主(B02b §2.3/§2.5):恢复启动(Some)= 检查点条目重建(世界
+    // 快照里已有这些主体,**不按配置重新生成**);全新启动(None)= 宿主空,
+    // 配置的 [[agents]] 由 startup 逐条生成并挂载。计数是遥测,不随检查点
+    // 恢复。
+    let (host, startup_cfgs) = match startup_controllers {
+        Some(records) => (
+            crate::controller::ControllerHost::from_records(records),
+            &[] as &[crate::config::StartupAgentConfig],
+        ),
+        None => (
+            crate::controller::ControllerHost::default(),
+            config.agents.as_slice(),
+        ),
+    };
+    let mut host = host;
     // 启动主体(§2.2):只全新启动带配置;恢复启动传空表(§2.2 契约)。
-    let mut startup = crate::startup_agents::StartupAgents::new(&config.agents, &bodies)
+    let mut startup = crate::startup_agents::StartupAgents::new(startup_cfgs, &bodies)
         .expect("启动主体构造失败(校验已在 load_body_registry 前置,fail-stop 防御)");
     // startup 的服务端序号分配器(spawn_next_seq 那一套,#12 语义):与
     // observe 编排器的分配器同一起点、同"跳过现存 ID"策略,不会重复;
@@ -2834,20 +2847,20 @@ fn entities_server_next_seq(session: &sim_api::session::Session) -> u32 {
         })
 }
 
+/// bootstrap 返回元组(装配五件 + 检查点控制者条目;type_complexity 别名)。
+pub type BootstrapParts = (
+    sim_api::session::Session,
+    sim_api::log::CommandLog,
+    storage::worker::StoreWorker,
+    Option<types::Tick>,
+    u32,
+    Vec<crate::controller::ControllerRecord>,
+);
+
 pub fn bootstrap(
     config: &Config,
     new_registry: impl Fn() -> Box<dyn voxel::BlockRegistry>,
-) -> Result<
-    (
-        sim_api::session::Session,
-        sim_api::log::CommandLog,
-        storage::worker::StoreWorker,
-        Option<types::Tick>,
-        u32,
-        Vec<crate::controller::ControllerRecord>,
-    ),
-    AppError,
-> {
+) -> Result<BootstrapParts, AppError> {
     let data_dir = &config.data_dir;
     // 目录创建失败经 ConfigError::Io 上抛(AppError 无 IO 变体,任务书签名固定;
     // 配置指定的数据目录不可创建归配置错误)。
@@ -2903,6 +2916,10 @@ pub fn bootstrap(
             // 区域票上限注入(REQ-007 任务 02 细则 10;config 两键)。
             let (max_r, max_c) = config.area_ticket_caps();
             session.set_area_ticket_caps(max_r, max_c);
+            // 全新启动也加载身体注册表(B02b:启动校验第 2/4/5 条需要它;
+            // MARGIN 校验同口径,恢复路径早已有)。校验失败 = 类型化错误
+            // 拒绝启动(注册表本身由 wire_provider_and_new_sim 另交驱动)。
+            let _bodies = load_body_registry(config)?;
             (
                 session,
                 sim_api::log::CommandLog::new(),
@@ -3529,7 +3546,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         }));
         // 推进 30 拍(清扫在第一拍)。
         for _ in 0..30 {
@@ -4271,7 +4288,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         };
         (args, tx, checkpoints)
     }
@@ -5413,7 +5430,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         }));
 
         // 进区(分片 (1,0))→ 等装载 → 瞬移远走(分片 (50,0),超卸载半径)。
@@ -5497,7 +5514,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         }));
 
         advance_ticks(3).await;
@@ -5897,7 +5914,7 @@ mod tests {
             observe: None,
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         }));
 
         // 编辑 chunk (8,0)(owner = 片 (1,0);两片各持一份 → 广播两片)。
@@ -6146,7 +6163,7 @@ mod tests {
             }),
             spawn_next_seq: 0,
             bodies: physics_sim::BodyRegistry::new(),
-            startup_controllers: Vec::new(),
+            startup_controllers: None,
         };
         (args, tx, hub, addr, checkpoints)
     }

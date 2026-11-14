@@ -398,7 +398,7 @@ async fn harness(config: Config, pump: PumpConfig, observe: (u64, u64), zero_g: 
         }),
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: Vec::new(),
+        startup_controllers: None,
     }));
     Harness {
         tx,
