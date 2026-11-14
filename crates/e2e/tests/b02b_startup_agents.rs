@@ -371,7 +371,7 @@ async fn e1_startup_quad_trot_walks() {
     config.checkpoint_interval_ticks = 6000;
     let h = bootstrap_harness(config).await;
     let (mut a, mut rx) = client(h.addr).await;
-    let _player = join(&mut a, &mut rx, 8).await;    // 观察者挪到出生点(视距内看得到四足)。
+    let _player = join(&mut a, &mut rx, 8).await; // 观察者挪到出生点(视距内看得到四足)。
     a.send(&C2S::MoveObserver {
         position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
     })
