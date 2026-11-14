@@ -7487,4 +7487,38 @@ anchor = [0.0, 0.0, 0.0]
         assert_eq!(out.agent_runaway_removed, 1, "失控移除(优先)");
         assert_eq!(out.agent_crush_removed, 0, "不是压垮移除");
     }
+
+    /// 压垮检查耗时(B01c 回报项):100 只四足(5×20 网格,生成后走 120 拍
+    /// 生产节奏),release 档直调 `agent_runaway_guard` 计 200 拍窗的每拍
+    /// 均值。只报数不设门槛。`#[ignore]`:debug 档 100 只×120 拍站不稳窗
+    /// 分钟级,门禁不留;计时窗本身在 release 下才有意义。
+    #[ignore = "耗时诊断:cargo test -p physics-sim --release --lib -- --ignored crush_guard_timing --nocapture"]
+    #[test]
+    #[allow(clippy::disallowed_methods)] // 计时窗;crate 级禁 Instant 指 demos 路径
+    fn crush_guard_timing_100_agents() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let n = 100usize;
+        for i in 0..n {
+            let x = 10.0 + (i % 20) as f32 * 1.0;
+            let z = 10.0 + (i / 20) as f32 * 1.0;
+            let a = types::EntityId::from_parts(1, (i + 1) as u32);
+            s.spawn_agent(a, hash, quad_spawn_state(quad_origin(x, z)), None)
+                .expect("四足生成");
+        }
+        let observers = [Vec3::new(20.0, 3.45, 20.0)];
+        for _ in 0..120usize {
+            let _ = c_step(&mut s, &observers);
+        }
+        assert_eq!(s.agent_count(), n, "100 只全部在场");
+        let ticks = 200usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ticks {
+            s.agent_runaway_guard();
+        }
+        let per_tick_us = t0.elapsed().as_secs_f64() * 1e6 / ticks as f64;
+        println!(
+            "CRUSH_TIMING: {n} 只四足,agent_runaway_guard 每拍均值 {per_tick_us:.1} us({ticks} 拍窗)"
+        );
+    }
 }
