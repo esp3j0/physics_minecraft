@@ -11,6 +11,7 @@
 //! 图纸:[docs/design/codebase-layout.md §3 app](../../docs/design/codebase-layout.md)
 
 pub mod config;
+pub mod controller;
 pub mod driver;
 pub mod net;
 pub mod respawn;
