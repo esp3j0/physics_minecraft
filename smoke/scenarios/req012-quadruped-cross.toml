@@ -1,0 +1,46 @@
+name = "req012-quadruped-cross"
+req = "REQ-012"
+description = "配置生成的四足(脚本小跑)从分片 (0,0) 走过 x = 128 的分片边界进入分片 (1,0),不倒、不消失(AC-B3 的图形面)。viewer 连上时它可能已经过了边界,所以只判终态。"
+timeout_secs = 300
+
+[server]
+world_seed = 3
+
+[[server.agents]]
+body = "quad"
+position = [124.5, -59.5, 24.5]
+controller = "quad_trot"
+leash_m = 16.0
+
+[[step]]
+label = "相机就位(边界东侧上方)"
+camera = { pos = [133.0, -52.0, 36.0], yaw = -90.0, pitch = -35.0 }
+
+[[step]]
+look_at = { target = [133.0, -59.75, 24.5] }
+
+[[step]]
+wait_until = { block = { pos = [132, -61, 24], is = "dirt" }, timeout_ticks = 1200 }
+
+[[step]]
+label = "认领四足"
+adopt_agent = { label = "dog", near = [124.5, -59.5, 24.5], within = 20.0, timeout_ticks = 1200 }
+
+[[step]]
+label = "基准点 = 出生点"
+mark_agent = { label = "dog", at = [124.5, -59.72, 24.5] }
+
+# 过了边界：根 x ≥ 129,高度在站立带内,保持 2 秒。
+[[step]]
+label = "已在分片 (1,0) 一侧"
+wait_until = { agent_in = { label = "dog", from = [129.0, -59.85, 8.0], to = [143.0, -59.60, 41.0] }, hold_ticks = 120, timeout_ticks = 3600 }
+
+[[step]]
+screenshot = { name = "crossed", expect = "俯视棕色平地,一只品红色四足站在或走在地面上:扁平躯干加四条向下的腿,腿与躯干相连;没有侧翻,没有零件散落或陷进地面。" }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "离出生点不超过 18.5 m(活动半径仍生效)"
+check = { agent_moved = { label = "dog", le = 18.5 } }
