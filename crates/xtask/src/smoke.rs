@@ -288,4 +288,40 @@ mod tests {
         );
         assert_eq!(overall_exit_code(&[]), 1);
     }
+
+    /// X1(B02c §3):`[server]` 表里的 `agents` 数组过白名单,产出的
+    /// `Config.agents` 条数和字段正确;非法条目(未知 controller 名)报错。
+    ///
+    /// 会变红的实现:白名单不含 `agents`(场景里的 `[[server.agents]]`
+    /// 被"未知覆盖键"拒绝)。
+    #[test]
+    fn server_config_accepts_agents_array_and_rejects_bad_entries() {
+        let data = Path::new("C:/tmp/smoke-unit-x1");
+        let cfg = server_config(
+            &table(
+                "world_seed = 3\n[[agents]]\nbody = \"quad\"\nposition = [24.5, -59.5, 24.5]\ncontroller = \"quad_stand\"\nleash_m = 4.0\n\n[[agents]]\nbody = \"quad\"\nposition = [30.5, -59.5, 24.5]\ncontroller = \"quad_trot\"\n",
+            ),
+            "127.0.0.1:36001",
+            data,
+        )
+        .expect("agents 数组应在白名单里");
+        assert_eq!(cfg.agents.len(), 2, "两条 [[agents]]");
+        assert_eq!(cfg.agents[0].body, "quad");
+        assert_eq!(cfg.agents[0].position, [24.5, -59.5, 24.5]);
+        assert_eq!(
+            cfg.agents[0].controller,
+            app::config::StartupController::QuadStand
+        );
+        assert_eq!(cfg.agents[0].leash_m, 4.0);
+        assert_eq!(
+            cfg.agents[1].controller,
+            app::config::StartupController::QuadTrot
+        );
+        assert_eq!(cfg.agents[1].leash_m, 16.0, "缺省 leash_m = 默认 16");
+        // 非法条目:未知 controller 名 → Config 校验报错。
+        let bad = "world_seed = 3\n[[agents]]\nbody = \"quad\"\nposition = [24.5, -59.5, 24.5]\ncontroller = \"no_such_controller\"\n";
+        let e = server_config(&table(bad), "127.0.0.1:36001", data)
+            .expect_err("未知 controller 应报错");
+        assert!(e.contains("controller"), "报错指明 controller:{e}");
+    }
 }
