@@ -179,6 +179,14 @@ impl ControllerHost {
             let ControllerKind::Script(script) = slot.kind else {
                 continue;
             };
+            // 挂载拍在未来的条目不发目标(B03a:startup attach 的
+            // attached_at = spawn 拍 +1,spawn 命令拍末 tick 才应用、owner
+            // 拍末才 claim;saturating_sub 的下溢会把 n 折成 0,0%period==0
+            // 误触发同拍发目标 → send_rejected)。now ≥ attached_at 后
+            // 与原口径逐位一致。
+            if now.0 < slot.attached_at.0 {
+                continue;
+            }
             let n = now.0.saturating_sub(slot.attached_at.0);
             if n % u64::from(slot.period_ticks) != 0 {
                 continue;

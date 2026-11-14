@@ -246,6 +246,11 @@ impl StartupAgents {
                 }
                 // 挂控制者(§2.2:leash 圆心 = position);attach 失败 =
                 // 布景/配置错误(挂载契约:dof/period/重复),不静默。
+                // attached_at = now.next()(B03a X1:spawn 命令 apply_at =
+                // now,拍末 tick 应用、owner 拍末 claim;attached_at = now 时
+                // 同拍 drive 的 n = 0 会立即发目标,owner 还没 claim →
+                // send_rejected 1 次。相位整体晚一拍起算,第一次发目标在
+                // now+3;§2.2 的 30 Hz 周期不变)。
                 let kind = match item.cfg.controller {
                     StartupController::None => ControllerKind::None,
                     StartupController::QuadStand => ControllerKind::Script(ScriptKind::QuadStand),
@@ -256,7 +261,7 @@ impl StartupAgents {
                     kind,
                     item.dof,
                     DEFAULT_CONTROL_PERIOD_TICKS,
-                    now,
+                    now.next(),
                     Some(Leash {
                         center_xz: [item.cfg.position[0], item.cfg.position[2]],
                         radius_m: item.cfg.leash_m,

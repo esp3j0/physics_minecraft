@@ -2572,8 +2572,14 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 ticks_run += 1;
                 // ④ 主体没了就摘控制者(§2.3:每拍末;EntityId 不在主体表 =
                 // 摘)。B03a 2.1:迁移在途的主体 `is_agent` 恒 false,并入
-                // 在途集合一起判,否则四足迁移那一拍控制者会被误摘。
-                host.retain_alive(|id| session.is_agent(id) || in_transit.contains(&id));
+                // 在途集合一起判,否则四足迁移那一拍控制者会被误摘。**此处
+                // 现取**在途集合——本拍 step 产出的迁移信封此刻才进 Router,
+                // 拍首为 drive 取的快照不含它(tick 后信封必然在途,dispatch
+                // 在下一拍 tick 开头)。
+                let in_transit_post = session.in_transit_entities();
+                host.retain_alive(|id| {
+                    session.is_agent(id) || in_transit_post.contains(&id)
+                });
                 // tick 末端编排(REQ-002 §4.4/§4.5,顺序固定 ①②③④):
                 // ensure 观察者分片 → 激活请求取数回填/卸载 → despawn 候选 +
                 // 持久化屏障 → chunk 流请求取数回执。无观察者且无挂起流请求时
