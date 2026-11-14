@@ -14,6 +14,7 @@ mod tests;
 use std::collections::BTreeMap;
 
 use messaging::InputSource;
+use sim_api::log::CommandLog;
 use sim_api::session::Session;
 use types::{EntityId, Tick};
 
@@ -162,12 +163,15 @@ impl ControllerHost {
 
     /// 调 [`Self::actions_for_tick`],逐条
     /// `session.send_agent_joint_targets_to(InputSource::SCHEDULER, ..)`。
-    /// 成功 `actions_emitted += 1`;被拒(迁移窗口等)`send_rejected += 1`,
-    /// 继续下一条,不 panic。
-    pub fn drive(&mut self, session: &mut Session, now: Tick) {
+    /// 成功:条目 append 进 `log`,`actions_emitted += 1`;被拒(迁移窗口
+    /// 等):`send_rejected += 1`,`log` 不动,继续下一条,不 panic。
+    pub fn drive(&mut self, session: &mut Session, log: &mut CommandLog, now: Tick) {
         for (entity, targets) in self.actions_for_tick(now) {
             match session.send_agent_joint_targets_to(InputSource::SCHEDULER, entity, targets) {
-                Ok(_) => self.counters.actions_emitted += 1,
+                Ok(entry) => {
+                    log.append(entry);
+                    self.counters.actions_emitted += 1;
+                }
                 Err(_) => self.counters.send_rejected += 1,
             }
         }

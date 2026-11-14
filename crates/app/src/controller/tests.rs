@@ -318,8 +318,9 @@ fn h3_detach_remove_and_attach_errors() {
 }
 
 /// H5:drive 的被拒计数——send_agent_joint_targets_to 被拒(实体不存在,
-/// 迁移窗口等)时 send_rejected += 1、actions_emitted 不变,且继续不 panic。
-/// 变异 9(drive 被拒不计数)的捕手。
+/// 迁移窗口等)时 send_rejected += 1、actions_emitted 不变、log 长度不变,
+/// 且继续不 panic。变异 9(drive 被拒不计数)/变异 11(drive 成功不
+/// append)的捕手。
 #[test]
 fn h5_drive_rejected_counted() {
     let mut host = host_with(
@@ -331,10 +332,12 @@ fn h5_drive_rejected_counted() {
     );
     // 空会话:实体不存在 → owner 查表必拒(迁移窗口同路径)。
     let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
-    host.drive(&mut session, Tick(0));
+    let mut log = sim_api::log::CommandLog::new();
+    host.drive(&mut session, &mut log, Tick(0));
     session.shutdown();
     assert_eq!(host.counters.send_rejected, 1, "被拒恰计 1 次");
     assert_eq!(host.counters.actions_emitted, 0, "被拒不算发出");
+    assert!(log.entries().is_empty(), "被拒时 log 不追加");
 }
 
 /// H4:QuadTrot 第 119 拍还是站立目标,第 120 拍起是步态;两次调用

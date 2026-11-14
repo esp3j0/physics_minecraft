@@ -333,7 +333,7 @@ fn run_quad(
     for tick in 0..total_ticks {
         let now = Tick(u64::from(tick) + 1); // 已走过 spawn 后那一拍
         if let Some(host) = host.as_deref_mut() {
-            host.drive(&mut session, now);
+            host.drive(&mut session, log, now);
         }
         let summary = session.tick();
         void_removed_total += summary.telemetry.void_removals;
@@ -561,15 +561,9 @@ fn b6_trot_600_replay_bitwise() {
     let mut original_tail: Vec<EntityState> = Vec::new();
     for tick in 0..600u32 {
         let now = Tick(u64::from(tick) + 1);
-        // B6 显式经 send_agent_joint_targets_to(条目自己 append 进日志;
-        // 与 drive 等价——drive 就是逐条调它,但 drive 吞掉返回的 LogEntry,
-        // 日志由调用方维护,这里要核对条数)。
-        for (entity, targets) in host.actions_for_tick(now) {
-            let entry = session
-                .send_agent_joint_targets_to(InputSource::SCHEDULER, entity, targets)
-                .expect("盖章入日志");
-            log.append(entry);
-        }
+        // R1:全程走 drive——条目由 drive append 进日志(B02b 接驱动后
+        // 同一路径,回放不缺动作)。
+        host.drive(&mut session, &mut log, now);
         session.tick();
         assert!(
             session.take_void_removed_agents().is_empty(),
@@ -667,6 +661,7 @@ fn b1b_stand_script_3600() {
     )
     .expect("挂载合法");
 
+    let mut log = CommandLog::new();
     let mut metrics = Metrics::new();
     let mut prev_root: Option<EntityState> = None;
     let mut frozen: Vec<EntityState> = Vec::new();
@@ -678,7 +673,7 @@ fn b1b_stand_script_3600() {
     let mut root_changed_after_asleep = 0u64;
     for tick in 0..3600u32 {
         let now = Tick(u64::from(tick) + 1);
-        host.drive(&mut session, now);
+        host.drive(&mut session, &mut log, now);
         session.tick();
         assert!(
             session.take_void_removed_agents().is_empty(),
@@ -792,9 +787,11 @@ fn b2a_trot_3600_clean() {
     assert!(v >= 0.1, "沿航向平均速度 {v:.5} < 0.1 m/s");
 }
 
-/// B2b:同 B2a,但先在 10 m 外生成 16 个动态方块、等它们全部睡着,再生成
-/// 四足(打乱连杆顺序)。同样的判据。自检:末态根位置与 B2a 不逐位相同
-/// (证明顺序确实被打乱了)。
+/// B2b:同 B2a,但四足生成**同批同拍**先插入 16 个动态方块(打乱连杆
+/// 顺序)。同样的判据。自检:①每个方块第一次速度全零的拍号全部晚于四足
+/// 生成拍(§13 的打乱靠"在四足之前插入、在四足存在期间才入睡"的刚体——
+/// 等睡了再生成四足不改变顺序,旧布景即栽在这里);②与干净线(= B2a)
+/// 相比速度差 ≥ 0.01 m/s 或航向变化差 ≥ 5°,证明打乱可见。
 #[test]
 #[ignore = "release 档:3600 拍 trot + 16 方块,任务书 §3 B2b"]
 fn b2b_trot_3600_shuffled_order() {
@@ -826,18 +823,22 @@ fn b2b_trot_3600_shuffled_order() {
     session.register(quad_sim());
     load_flat_ground(&mut session);
 
-    // 16 个动态方块:10 m 外(+x),4×4 排布,间隔 1.5 m,放在地面顶面上。
-    // MarkActor(actor = true)豁免睡眠兜底凝固(A02b 同款手法):§13 连杆
-    // 顺序的打乱要求"主体之前插入的会睡着的刚体"在主体生成时**仍然存在**
-    // ——首版布景没豁免凝固,16 个方块入睡即被凝固 despawn,四足生成时
-    // 世界已干净,顺序没被打乱(B2a ≈ B2b,自检要抓的正是这个)。
+    // R1-2 布景:16 个动态方块与四足**同批同拍**生成。canonical 序
+    // SpawnDynamic(1) < MarkActor(5) < SpawnAgent(11),方块刚体先插进
+    // 活跃集、四足排在其后;方块在四足存在期间入睡时,swap_remove 把
+    // 四足连杆搬到前面——§13 的打乱机制。旧布景"等方块睡了再生成四足"
+    // 不改变顺序(入睡的刚体不搬还没出生的主体),已废弃。
+    // 摆放:10 m 外(+x)4×4,间隔 1.5 m,底面离地 2 cm(出生即下落,
+    // 静止判定是一个"从非零到零"的过程,不会在生成拍就全零)。
+    // MarkActor(actor = true)豁免睡眠兜底凝固(A02b 同款手法):方块睡着
+    // 后必须仍在世界里,被凝固 despawn 即布景错误(主循环逐拍自检)。
     let mut block_ids = Vec::new();
     for i in 0..16u32 {
         let id = EntityId::from_parts(100 + i, 1);
         let state = EntityState {
             translation: Vec3::new(
                 SPAWN.x + 10.0 + (i % 4) as f32 * 1.5,
-                1.5,
+                GROUND_TOP + 0.5 + 0.02,
                 SPAWN.z + (i / 4) as f32 * 1.5,
             ),
             ..EntityState::default()
@@ -870,33 +871,6 @@ fn b2b_trot_3600_shuffled_order() {
             .expect("盖章入日志");
         block_ids.push(id);
     }
-    // 等全部睡着:Session 层没有 awake 读口,用结构证据——actor 豁免凝固,
-    // 方块必须仍在(entity_state 为 Some,变 None = 凝固桥吃了它 = 布景
-    // 错误,自检必败)且速度恰 0。连续 60 拍满足视为全睡(超限 600 拍
-    // panic,写明在等什么)。
-    let mut still_n = 0u32;
-    let mut waited = 0u32;
-    while still_n < 60 {
-        session.tick();
-        waited += 1;
-        assert!(
-            waited <= 600,
-            "等 16 个方块睡着超 600 拍(在等全部方块速度连续 60 拍为 0)"
-        );
-        let all_still = block_ids
-            .iter()
-            .all(|&id| match session.entity_state(shard, id) {
-                None => panic!("方块 {id:?} 被凝固 despawn:MarkActor 豁免未生效,布景错误"),
-                Some(s) => s.linvel == Vec3::ZERO && s.angvel == Vec3::ZERO,
-            });
-        if all_still {
-            still_n += 1;
-        } else {
-            still_n = 0;
-        }
-    }
-    // 顺序打乱自检放在末态对照(与 B2a 比)。
-
     let hash = registry().hash_of("quad").expect("quad 已装");
     session
         .spawn_agent_from(
@@ -910,6 +884,10 @@ fn b2b_trot_3600_shuffled_order() {
             },
         )
         .expect("盖章入日志");
+    // 出生拍:同一批命令在这一拍生效,方块与四足同时出生。生成拍记 0,
+    // 下面的首次静止拍号以它为原点(spawn 后这一拍 physics 已步进,方块
+    // 带下落速度进入主循环)。
+    let quad_spawn_tick = 0u32;
     session.tick();
 
     let mut host = ControllerHost::default();
@@ -922,19 +900,36 @@ fn b2b_trot_3600_shuffled_order() {
     )
     .expect("挂载合法");
 
+    let mut log = CommandLog::new();
     let mut metrics = Metrics::new();
     let mut void_removed_total = 0u64;
     let mut first_sample = true;
-    for tick in 0..3600u32 {
-        let now = Tick(u64::from(tick) + 1);
-        host.drive(&mut session, now);
+    // 每个方块第一次线速度、角速度全零的拍号(静止判定与旧布景相同);
+    // None = 到跑完还没静止过,布景错误。
+    let mut still_tick: Vec<Option<u32>> = vec![None; block_ids.len()];
+    for tick in 1..=3600u32 {
+        let now = Tick(u64::from(tick));
+        host.drive(&mut session, &mut log, now);
         let summary = session.tick();
         void_removed_total += summary.telemetry.void_removals;
         assert!(
             session.take_void_removed_agents().is_empty(),
             "拍 {tick} 四足被移除"
         );
-        if tick + 1 > TROT_SETTLE_TICKS as u32 {
+        for (i, &id) in block_ids.iter().enumerate() {
+            if still_tick[i].is_some() {
+                continue;
+            }
+            match session.entity_state(shard, id) {
+                None => panic!("方块 {id:?} 被凝固 despawn:MarkActor 豁免未生效,布景错误"),
+                Some(s) => {
+                    if s.linvel == Vec3::ZERO && s.angvel == Vec3::ZERO {
+                        still_tick[i] = Some(tick);
+                    }
+                }
+            }
+        }
+        if tick > TROT_SETTLE_TICKS as u32 {
             let states = session
                 .agent_states()
                 .into_iter()
@@ -955,19 +950,43 @@ fn b2b_trot_3600_shuffled_order() {
     assert_eq!(void_removed_total, 0, "没有任何移除");
     assert!(!metrics.out_of_ground, "走出地面");
     assert!(metrics.all_finite, "出现非有限值");
+    // R1-2 自检①:16 个方块的首次静止拍全部晚于四足生成拍——§13 的打乱
+    // 需要"在四足之前插入、在四足存在期间才入睡"的刚体;有任何一个早于
+    // 或等于生成拍,布景就是错的(循环从拍 1 起,结构上只能晚于或缺失)。
+    let mut still_min = u32::MAX;
+    let mut still_max = 0u32;
+    for (i, t) in still_tick.iter().enumerate() {
+        let t = t.unwrap_or_else(|| {
+            panic!(
+                "方块 {:?} 在 3600 拍内从未静止(线/角速度全零):布景错误",
+                block_ids[i]
+            )
+        });
+        assert!(
+            t > quad_spawn_tick,
+            "方块 {:?} 首次静止拍 {t} 早于或等于四足生成拍:布景错误",
+            block_ids[i]
+        );
+        still_min = still_min.min(t);
+        still_max = still_max.max(t);
+    }
     let v = metrics.vfwd_mean();
+    let heading = metrics.heading_change_deg();
     println!(
         "B2b: up_min {:.4} pen_max {:.6} vfwd_mean {:.5} net {:.4} heading {:.1}° \
-         final_root ({:.4},{:.4},{:.4}) waited_for_blocks {}",
+         final_root ({:.4},{:.4},{:.4}) blocks_still {}/16 ticks [{},{}], quad_spawn_tick {}",
         metrics.up_min,
         metrics.pen_max,
         v,
         metrics.net_displacement(),
-        metrics.heading_change_deg(),
+        heading,
         final_root.x,
         final_root.y,
         final_root.z,
-        waited
+        still_tick.iter().filter(|t| t.is_some()).count(),
+        still_min,
+        still_max,
+        quad_spawn_tick
     );
     assert!(metrics.up_min >= 0.7, "up·y 最小 {} < 0.7", metrics.up_min);
     assert!(
@@ -976,17 +995,26 @@ fn b2b_trot_3600_shuffled_order() {
         metrics.pen_max
     );
     assert!(v >= 0.1, "沿航向平均速度 {v:.5} < 0.1 m/s");
-    // 顺序打乱自检(任务书 §3 B2b):末态根位置与干净世界(同代码 B2a)
-    // 不逐位相同,证明 16 个先睡的刚体确实打乱了连杆顺序。
-    assert_ne!(
-        final_root, clean_metrics.last_root,
-        "末态根位置与干净世界逐位相同:连杆顺序没有被打破(自检失败)"
-    );
+    // R1-2 自检②:打乱可见——与干净线(同代码 B2a)相比,沿航向平均速度
+    // 差 ≥ 0.01 m/s 或航向变化差 ≥ 5°。达不到即自检失败,如实报实测值。
+    let clean_v = clean_metrics.vfwd_mean();
+    let clean_heading = clean_metrics.heading_change_deg();
+    let dv = (v - clean_v).abs();
+    let dheading = (heading - clean_heading).abs();
     println!(
-        "B2b 对照: clean final_root ({:.4},{:.4},{:.4}) vfwd {:.5}",
+        "B2b 对照: clean final_root ({:.4},{:.4},{:.4}) vfwd {:.5} heading {:.1}° \
+         | Δv {:.5} Δheading {:.1}°",
         clean_metrics.last_root.x,
         clean_metrics.last_root.y,
         clean_metrics.last_root.z,
-        clean_metrics.vfwd_mean()
+        clean_v,
+        clean_heading,
+        dv,
+        dheading
+    );
+    assert!(
+        dv >= 0.01 || dheading >= 5.0,
+        "B2b 与干净线无可见差别(Δv {dv:.5} m/s < 0.01 且 Δheading {dheading:.1}° < 5°):\
+         连杆顺序没有被打破(自检失败)"
     );
 }
