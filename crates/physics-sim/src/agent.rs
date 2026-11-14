@@ -1161,12 +1161,14 @@ impl ShardSim {
             .bodies
             .get(&record.body_hash)
             .expect("主体身体哈希必在注册表(fail-stop)");
-        let root_handle = record
-            .links
-            .values()
-            .next()
-            .copied()
-            .expect("主体至少一根连杆(fail-stop)");
+        // 根句柄 = EntityRecord.handle(与 apply_agent_joint_targets 同一口径
+        // ;返修 R1-M5:links 是名字序 BTreeMap,第一项不一定是根——四足的
+        // 根 body 恰排第一掩盖了它,根名排后的身体会把根速度写到别的连杆)。
+        let root_handle = self
+            .entities
+            .get(&id)
+            .map(|rec| rec.handle)
+            .expect("主体 EntityRecord 存在(fail-stop)");
         let mb_index = self
             .agent_multibody_index(record)
             .expect("多连杆主体必有 multibody(fail-stop)");
@@ -4717,6 +4719,172 @@ anchor = [0.0, 0.0, 0.0]
     fn def_links_of(s: &crate::sim::ShardSim, record: &AgentRecord) -> Vec<String> {
         let def = s.bodies.get(&record.body_hash).expect("def");
         def.links.iter().map(|l| l.name.clone()).collect()
+    }
+
+    /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
+    /// 之后(BTreeMap 名字序 = a_arm 第一项),一个 revolute 关节(z 轴)。
+    /// 专杀 `restore_agent_joint_state` 旧实现"根 = links 表第一项"的取法
+    /// (quad 的根 body 恰好排第一,掩盖了缺陷)。
+    fn two_link_root_last_toml() -> String {
+        String::from(
+            r#"
+name = "two_link_zbase"
+
+[[links]]
+name = "z_base"
+mass = 2.0
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.05, 0.05]
+
+[[links]]
+name = "a_arm"
+mass = 0.5
+friction = 0.6
+restitution = 0.0
+[[links.shapes]]
+kind = "capsule_y"
+half_height = 0.1
+radius = 0.02
+
+[[joints]]
+parent = "z_base"
+child = "a_arm"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [0.1, 0.0, 0.0]
+child_anchor = [0.0, 0.1, 0.0]
+limits = { lower = -1.6, upper = 1.6 }
+max_torque = 10.0
+kp = 50.0
+kd = 2.0
+"#,
+        )
+    }
+
+    /// 返修 M5(验收 R1 第 1 节):根连杆名字序排后(`z_base` > `a_arm`)
+    /// 的两连杆身体手工信封迁入,步进前——根刚体(`entities[id].handle`,
+    /// 与 `apply_agent_joint_targets` 同一口径)的线速度/角速度与信封逐位
+    /// 相等;读回的关节坐标/关节速度与信封差 < 1e-4。旧实现取
+    /// `links.values().next()`(名字序第一项 = `a_arm`),根速度会被写到
+    /// 手臂连杆上,这里红。
+    #[test]
+    fn m5_restore_root_link_by_entity_record() {
+        let cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
+        let mut bodies = BodyRegistry::new();
+        let hash = bodies
+            .insert_toml(&two_link_root_last_toml())
+            .expect("two_link 身体合法");
+        let mut s = crate::sim::ShardSim::new_with_bodies(
+            cfg,
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        );
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        let origin = quad_origin(24.0, 24.0);
+        s.spawn_agent(a, hash, quad_spawn_state(origin), None)
+            .expect("两连杆生成");
+        // 布景自检:根 = links[0] = z_base,但名字序第一项是 a_arm(句柄
+        // 不同——旧实现取第一项会把根速度写到 a_arm 上)。
+        let record = s.agents.get(&a).expect("主体登记");
+        let def = s.bodies.get(&record.body_hash).expect("def");
+        assert_eq!(def.links[0].name, "z_base", "根连杆在 links[0]");
+        let first_by_name = record.links.values().next().copied().expect("非空");
+        let arm_handle = record.links.get("a_arm").copied().expect("a_arm 句柄");
+        let root_handle_expected = s
+            .entities
+            .get(&a)
+            .map(|rec| rec.handle)
+            .expect("EntityRecord");
+        assert_eq!(
+            first_by_name, arm_handle,
+            "布景自检:名字序第一项 = a_arm"
+        );
+        assert_ne!(
+            first_by_name, root_handle_expected,
+            "布景自检:名字序第一项 ≠ 根(布景成立的前提)"
+        );
+        let _ = s.remove_agent_bodies(a);
+
+        // 接收分片:手工信封(根线速度/角速度非平凡;关节 q/qd 非零)。
+        let cfg_dst = crate::sim::ShardSimConfig::new(shard_id(1, 0));
+        let mut dst = crate::sim::ShardSim::new_with_bodies(
+            cfg_dst,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_registry_clone(&s),
+        );
+        load_flat_ground(&mut dst);
+        let state = types::EntityState {
+            translation: origin,
+            rotation: types::glam::Quat::IDENTITY,
+            linvel: Vec3::new(1.0, 0.0, 0.5),
+            angvel: Vec3::new(0.0, 0.3, 0.0),
+        };
+        let q = [0.4f32];
+        let qd = [0.2f32];
+        let last_targets = [0.4f32];
+        dst.migrate_agent_in(
+            a,
+            hash,
+            state,
+            None,
+            None,
+            false,
+            (0.0, 0.0),
+            0.0,
+            None,
+            None,
+            &q,
+            &qd,
+            &last_targets,
+        );
+        // 步进前断言(任务书原文:根刚体速度逐位相等 + 关节状态 < 1e-4)。
+        let rec = dst.entities.get(&a).expect("主体 EntityRecord");
+        let root = dst.phys.bodies.get(rec.handle).expect("根刚体在场");
+        assert_eq!(
+            crate::conv::rapier_to_vec3(root.linvel()),
+            state.linvel,
+            "根刚体(entities[id].handle)线速度与信封逐位相等"
+        );
+        assert_eq!(
+            crate::conv::rapier_to_vec3(root.angvel()),
+            state.angvel,
+            "根刚体(entities[id].handle)角速度与信封逐位相等"
+        );
+        let q_after = dst.agent_joint_positions(a).expect("关节位");
+        assert_eq!(q_after.len(), 1);
+        let q_err = (q_after[0] - q[0]).abs();
+        assert!(q_err < 1e-4, "关节坐标误差 {q_err:.3e} ≥ 1e-4");
+        let qd_after = dst.agent_joint_velocities(a).expect("关节速");
+        assert_eq!(qd_after.len(), 1);
+        let qd_err = (qd_after[0] - qd[0]).abs();
+        assert!(qd_err < 1e-4, "关节速度误差 {qd_err:.3e} ≥ 1e-4");
+        // 非根连杆刚体速度不被 restore 污染(spawn 子连杆速度恒 0;restore
+        // 只准写根)。旧实现把根速度写进名字序第一项 = a_arm,这里红——
+        // 根刚体自身的两条断言旧实现测不到(spawn_agent_multi 的 i==0 分支
+        // 已把信封根速度写进根刚体,恰好掩盖)。
+        let arm_handle = dst
+            .agents
+            .get(&a)
+            .expect("主体登记")
+            .links
+            .get("a_arm")
+            .copied()
+            .expect("a_arm 句柄");
+        let arm = dst.phys.bodies.get(arm_handle).expect("a_arm 刚体在场");
+        assert_eq!(
+            crate::conv::rapier_to_vec3(arm.linvel()),
+            Vec3::ZERO,
+            "非根连杆 a_arm 线速度应为 0(根速度不得写到非根连杆)"
+        );
+        assert_eq!(
+            crate::conv::rapier_to_vec3(arm.angvel()),
+            Vec3::ZERO,
+            "非根连杆 a_arm 角速度应为 0(根速度不得写到非根连杆)"
+        );
     }
 
     /// M3(B03a 1.4)长度不符:四足信封 `joint_q` 长度 5 → panic(信息含
