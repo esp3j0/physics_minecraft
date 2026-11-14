@@ -186,6 +186,53 @@ impl Default for CohesionConfig {
     }
 }
 
+/// 启动主体(REQ-012 B02b §2.1):`[[agents]]` 表数组,服务器全新启动时
+/// 由驱动生成并挂控制者;恢复启动不重新生成(世界快照里已有)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StartupAgentConfig {
+    /// 身体名(必须在 `bodies_dir` 注册表里)。
+    pub body: String,
+    /// 根连杆生成位置(world 坐标)。
+    pub position: [f32; 3],
+    /// 初始朝向(度,绕 y 轴;默认 0)。
+    #[serde(default)]
+    pub yaw_deg: f32,
+    /// 控制者种类;默认 [`StartupController::None`]。
+    #[serde(default)]
+    pub controller: StartupController,
+    /// 活动半径 m(B03 之前的临时保护;默认 16,范围见校验)。
+    #[serde(default = "default_leash_m")]
+    pub leash_m: f32,
+}
+
+/// 启动主体的控制者种类(§2.1;snake_case:`"none" | "quad_stand" | "quad_trot"`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupController {
+    /// 无控制者:电机保持最后目标(默认)。
+    #[default]
+    None,
+    /// 恒发站立目标。
+    QuadStand,
+    /// 先站 2 s,之后对角小跑。
+    QuadTrot,
+}
+
+fn default_leash_m() -> f32 {
+    16.0
+}
+
+/// 启动主体条数上限(§2.1)。
+pub const STARTUP_AGENTS_MAX: usize = 16;
+/// `leash_m` 下限 m(§2.1)。
+pub const LEASH_MIN_M: f32 = 2.0;
+/// `leash_m` 上限 m(§2.1)。
+pub const LEASH_MAX_M: f32 = 32.0;
+/// 多连杆活动圆必须距分片边界的余量 m(§2.1 校验第 5 条)。
+pub const SHARD_EDGE_MARGIN_M: f32 = 8.0;
+/// 启动票据在 leash 圆之外再扩的半径 m(§2.2)。
+pub const STARTUP_TICKET_EXTRA_M: f32 = 16.0;
+
 /// 结构体级 `#[serde(default)]`:toml 文件可只写要覆写的字段。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -237,6 +284,8 @@ pub struct Config {
     /// 服务器监听地址(REQ-004A 决策 4;main 网络装配 `assemble_network`
     /// 的 listen 输入;端口 0 = OS 分配,测试用)。
     pub listen_addr: String,
+    /// 启动主体(REQ-012 B02b §2.1;`[[agents]]` 表数组,默认空)。
+    pub agents: Vec<StartupAgentConfig>,
 }
 
 impl Default for Config {
@@ -263,6 +312,7 @@ impl Default for Config {
             world_kind: WorldKind::Superflat,
             bodies_dir: PathBuf::from("assets/bodies"),
             listen_addr: "127.0.0.1:25565".to_string(),
+            agents: Vec::new(),
         }
     }
 }
@@ -274,6 +324,8 @@ pub enum ConfigError {
     Parse(String),
     #[error("配置校验失败:{0}")]
     Validate(String),
+    #[error("启动主体配置错误:{0}")]
+    StartupAgent(String),
     #[error("配置读取失败:{0}")]
     Io(#[from] std::io::Error),
 }
@@ -468,6 +520,100 @@ impl Config {
                 "impact_flow_max_events_per_tick ({}) 须 ≥ 1",
                 c.impact_flow_max_events_per_tick
             )));
+        }
+        // 启动主体的纯数值校验(§2.1 第 1、3 条;第 2/4/5 条需要身体注册表
+        // 与分片几何,在 `validate_startup_agents`)。
+        if self.agents.len() > STARTUP_AGENTS_MAX {
+            return Err(ConfigError::StartupAgent(format!(
+                "第 {} 条起的 [[agents]] 超上限:共 {} 条 > {}",
+                STARTUP_AGENTS_MAX,
+                self.agents.len(),
+                STARTUP_AGENTS_MAX
+            )));
+        }
+        for (i, a) in self.agents.iter().enumerate() {
+            let idx = i + 1;
+            let finite = a.position.iter().all(|v| v.is_finite()) && a.yaw_deg.is_finite();
+            if !finite {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]](body = {}):position/yaw_deg 须为有限值",
+                    a.body
+                )));
+            }
+            if !a.leash_m.is_finite() || !(LEASH_MIN_M..=LEASH_MAX_M).contains(&a.leash_m) {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]](body = {}):leash_m ({}) 须为有限值且在 \
+                     [{LEASH_MIN_M}, {LEASH_MAX_M}] m",
+                    a.body, a.leash_m
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 启动主体的注册表与分片几何校验(§2.1 第 2/4/5 条;启动装配期,
+    /// `load_body_registry` 之后调——需要加载好的身体注册表):
+    /// - `body` 在注册表里;
+    /// - `quad_stand` / `quad_trot` 要求身体 dof = 12;
+    /// - 多连杆身体:以 `position` 为圆心、`leash_m + SHARD_EDGE_MARGIN_M`
+    ///   为半径的圆必须完全落在同一个分片内(多连杆迁移 B03 才做,走到
+    ///   分片边界会 fail-stop;本条与运行期的 leash 一起保证它走不到)。
+    pub fn validate_startup_agents(
+        &self,
+        bodies: &physics_sim::BodyRegistry,
+    ) -> Result<(), ConfigError> {
+        // 一格 = 1 m,一分片 = SHARD_CHUNKS × CHUNK_X = 128 m。
+        const SHARD_SPAN_M: f32 = (types::SHARD_CHUNKS * voxel::CHUNK_X as i32) as f32;
+        for (i, a) in self.agents.iter().enumerate() {
+            let idx = i + 1;
+            let Some(hash) = bodies.hash_of(&a.body) else {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]]:身体 \"{}\" 不在注册表里(bodies_dir = {:?})",
+                    a.body, self.bodies_dir
+                )));
+            };
+            let Some(def) = bodies.get(&hash) else {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]]:身体 \"{}\" 的哈希在注册表里缺失(内部错误)",
+                    a.body
+                )));
+            };
+            if matches!(
+                a.controller,
+                StartupController::QuadStand | StartupController::QuadTrot
+            ) && def.dof_count() != crate::controller::gait::QUAD_DOF
+            {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]]:controller = {} 要求身体 dof = {},\
+                     身体 \"{}\" 的 dof = {}",
+                    match a.controller {
+                        StartupController::QuadStand => "quad_stand",
+                        _ => "quad_trot",
+                    },
+                    crate::controller::gait::QUAD_DOF,
+                    a.body,
+                    def.dof_count()
+                )));
+            }
+            if def.links.len() > 1 {
+                let r = a.leash_m + SHARD_EDGE_MARGIN_M;
+                let x = a.position[0];
+                let z = a.position[2];
+                let cx = (x / SHARD_SPAN_M).floor();
+                let cz = (z / SHARD_SPAN_M).floor();
+                let min_x = cx * SHARD_SPAN_M;
+                let min_z = cz * SHARD_SPAN_M;
+                let edge = |p: f32, min: f32| (p - min).min(min + SHARD_SPAN_M - p);
+                let d = edge(x, min_x).min(edge(z, min_z));
+                if d < r {
+                    return Err(ConfigError::StartupAgent(format!(
+                        "第 {idx} 条 [[agents]]:多连杆身体的活动圆(半径 leash {r} m \
+                         = leash {} + margin {SHARD_EDGE_MARGIN_M})超出分片 \
+                         ({cx:.0},{cz:.0}) 边界:距最近边界 {d:.3} m < {r:.3} m",
+                        a.leash_m
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -1489,5 +1635,171 @@ unload_radius = 64
             types::ShardPos::new(0, 0),
         ));
         assert!(!core_off.cohesion.compound_flow, "直传 false");
+    }
+
+    // ---- REQ-012 B02b(§2.1 配置):G1 / G2 ----
+
+    /// quad 身体 toml(B02b 测试共用;单元测试内嵌,与 assets 同一份)。
+    fn quad_toml() -> &'static str {
+        include_str!("../../../assets/bodies/quad.body.toml")
+    }
+
+    /// capsule 身体 toml(dof = 0 的对照)。
+    fn capsule_toml() -> &'static str {
+        include_str!("../../../assets/bodies/capsule.body.toml")
+    }
+
+    fn quad_registry() -> physics_sim::BodyRegistry {
+        let mut b = physics_sim::BodyRegistry::new();
+        b.insert_toml(quad_toml()).expect("quad 合法");
+        b.insert_toml(capsule_toml()).expect("capsule 合法");
+        b
+    }
+
+    /// G1(§3):配置解析——缺省值(`controller = none`、`leash_m = 16`、
+    /// `yaw_deg = 0`);没有 `[[agents]]` 时为空表。
+    #[test]
+    fn g1_startup_agents_parse_defaults() {
+        // 没有 [[agents]]:空表(默认配置与显式 toml 两口径)。
+        let c = Config::load(None).expect("默认配置");
+        assert!(c.agents.is_empty(), "默认无 [[agents]]");
+        let c = Config::from_toml_str("dt = 0.016\n").expect("无 agents 的 toml");
+        assert!(c.agents.is_empty(), "toml 无 [[agents]] → 空表");
+        // 全默认:controller = none、leash_m = 16、yaw_deg = 0。
+        let c =
+            Config::from_toml_str("[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\n")
+                .expect("一条最小 [[agents]]");
+        assert_eq!(c.agents.len(), 1);
+        let a = &c.agents[0];
+        assert_eq!(a.body, "quad");
+        assert_eq!(a.position, [64.0, -59.5, 64.0]);
+        assert_eq!(a.controller, StartupController::None, "默认 none");
+        assert_eq!(a.yaw_deg, 0.0, "默认 yaw 0");
+        assert_eq!(a.leash_m, 16.0, "默认 leash 16");
+        // 三种 controller 名都能解析(snake_case)。
+        for (name, want) in [
+            ("none", StartupController::None),
+            ("quad_stand", StartupController::QuadStand),
+            ("quad_trot", StartupController::QuadTrot),
+        ] {
+            let c = Config::from_toml_str(&format!(
+                "[[agents]]\nbody = \"quad\"\nposition = [64.0, 0.0, 64.0]\ncontroller = \"{name}\"\n"
+            ))
+            .unwrap_or_else(|e| panic!("{name} 应可解析:{e}"));
+            assert_eq!(c.agents[0].controller, want);
+        }
+        // roundtrip。
+        let rt = Config::from_toml_str(&c.to_toml_string()).expect("roundtrip");
+        assert_eq!(rt.agents, c.agents);
+    }
+
+    /// G2(§3):校验五条——各一个拒绝用例和一个通过对照;第 5 条用
+    /// "离分片边界 `leash + margin − 0.5` m" 拒绝、"`+ 0.5` m" 通过。
+    #[test]
+    fn g2_startup_agents_validation_five_rules() {
+        let bodies = quad_registry();
+        let base = |toml: &str| Config::from_toml_str(toml).expect("布景配置应可解析");
+
+        // ① 条数 ≤ STARTUP_AGENTS_MAX:17 条拒绝、16 条通过。
+        let many: String = (0..17)
+            .map(|i| format!("[[agents]]\nbody = \"capsule\"\nposition = [{i}.0, -59.5, 64.0]\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // from_toml_str 内部即调 validate:17 条在解析期即被拒。
+        let err = Config::from_toml_str(&many).expect_err("17 条应拒绝");
+        assert!(
+            matches!(err, ConfigError::StartupAgent(_)),
+            "错误应为 StartupAgent:{err:?}"
+        );
+        assert!(format!("{err}").contains("17 条"), "错误写明条数:{err}");
+        let ok16: String = (0..16)
+            .map(|i| format!("[[agents]]\nbody = \"capsule\"\nposition = [{i}.0, -59.5, 64.0]\n"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        base(&ok16).validate().expect("16 条应通过");
+
+        // ② body 在注册表里:未知身体拒绝(经 validate_startup_agents);
+        // quad(在)通过。
+        let mut c = base("[[agents]]\nbody = \"no_such_body\"\nposition = [64.0, -59.5, 64.0]\n");
+        c.validate().expect("纯数值校验过");
+        let err = c
+            .validate_startup_agents(&bodies)
+            .expect_err("未知身体应拒绝");
+        assert!(format!("{err}").contains("第 1 条"), "错误写明第几条:{err}");
+        base("[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\n")
+            .validate_startup_agents(&bodies)
+            .expect("quad 在注册表里,应通过");
+
+        // ③ 有限值与 leash 范围:NaN 位置拒绝;leash 越界([2,32] 之外)拒绝;
+        // leash = 2 / 32 通过。(from_toml_str 内部即 validate:拒绝组直接
+        // expect_err。)
+        let err =
+            Config::from_toml_str("[[agents]]\nbody = \"capsule\"\nposition = [64.0, nan, 64.0]\n")
+                .expect_err("NaN 位置应拒绝");
+        assert!(matches!(err, ConfigError::StartupAgent(_)), "{err:?}");
+        let err = Config::from_toml_str(
+            "[[agents]]\nbody = \"capsule\"\nposition = [64.0, -59.5, 64.0]\nleash_m = 1.9\n",
+        )
+        .expect_err("leash < 2 应拒绝");
+        assert!(format!("{err}").contains("第 1 条"), "{err}");
+        let err = Config::from_toml_str(
+            "[[agents]]\nbody = \"capsule\"\nposition = [64.0, -59.5, 64.0]\nleash_m = 32.5\n",
+        )
+        .expect_err("leash > 32 应拒绝");
+        assert!(matches!(err, ConfigError::StartupAgent(_)), "{err:?}");
+        for leash in [2.0f32, 32.0] {
+            let c = base(&format!(
+                "[[agents]]\nbody = \"capsule\"\nposition = [64.0, -59.5, 64.0]\nleash_m = {leash}\n"
+            ));
+            c.validate().expect("边界值应通过");
+        }
+
+        // ④ quad_stand / quad_trot 要求 dof = 12:quad(12)通过、capsule(0)拒绝;
+        // capsule 配 none 不受 dof 限制,通过。
+        for controller in ["quad_stand", "quad_trot"] {
+            let c = base(&format!(
+                "[[agents]]\nbody = \"capsule\"\nposition = [64.0, -59.5, 64.0]\ncontroller = \"{controller}\"\n"
+            ));
+            let err = c
+                .validate_startup_agents(&bodies)
+                .expect_err("capsule 配 quad 控制者应拒绝");
+            assert!(format!("{err}").contains("dof"), "错误写明 dof:{err}");
+        }
+        base("[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\ncontroller = \"quad_trot\"\n")
+            .validate_startup_agents(&bodies)
+            .expect("quad 配 quad_trot 应通过");
+        base("[[agents]]\nbody = \"capsule\"\nposition = [64.0, -59.5, 64.0]\ncontroller = \"none\"\n")
+            .validate_startup_agents(&bodies)
+            .expect("capsule 配 none 应通过");
+
+        // ⑤ 多连杆身体离分片边界:leash + margin − 0.5 m 拒绝、+ 0.5 m 通过。
+        // leash = 16 → r = 24;分片 (0,0) x ∈ [0, 128):距最近边界 = 64 − r。
+        // x = 64 + r − 0.5 = 87.5 → 距右边界 40.5 < 40.996…?r = 24,边界距
+        // = min(x, 128 − x) = 40.5;r + margin?此处直接按定义:距边界
+        // d ≥ r 才通过。d = r − 0.5 → 拒绝;d = r + 0.5 → 通过。
+        // 取 x = 128 − (16 + 8) + 0.5 = 104.5(d = 23.5 = r − 0.5 → 拒绝)。
+        let near = base(&format!(
+            "[[agents]]\nbody = \"quad\"\nposition = [{}, -59.5, 64.0]\nleash_m = 16.0\ncontroller = \"quad_trot\"\n",
+            128.0 - (16.0 + SHARD_EDGE_MARGIN_M) + 0.5
+        ));
+        let err = near
+            .validate_startup_agents(&bodies)
+            .expect_err("距边界 r − 0.5 应拒绝");
+        assert!(format!("{err}").contains("超出分片"), "{err}");
+        // x = 128 − (16 + 8) − 0.5 = 103.5(d = 24.5 = r + 0.5 → 通过)。
+        let far = base(&format!(
+            "[[agents]]\nbody = \"quad\"\nposition = [{}, -59.5, 64.0]\nleash_m = 16.0\ncontroller = \"quad_trot\"\n",
+            128.0 - (16.0 + SHARD_EDGE_MARGIN_M) - 0.5
+        ));
+        far.validate_startup_agents(&bodies)
+            .expect("距边界 r + 0.5 应通过");
+        // 单连杆身体(capsule)不受第 5 条约束:贴边也通过(迁移对单连杆
+        // 已实现)。
+        let single = base(
+            "[[agents]]\nbody = \"capsule\"\nposition = [127.0, -59.5, 64.0]\nleash_m = 16.0\n",
+        );
+        single
+            .validate_startup_agents(&bodies)
+            .expect("单连杆不查分片边界");
     }
 }

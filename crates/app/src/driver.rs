@@ -2880,6 +2880,10 @@ pub fn load_body_registry(config: &Config) -> Result<physics_sim::BodyRegistry, 
             vmax,
         });
     }
+    // 启动主体校验(REQ-012 B02b §2.1 第 2/4/5 条;注册表与分片几何两样
+    // 都在手了才做;第 1/3 条纯数值在 Config::validate)。任何一条不过 =
+    // 类型化配置错误,拒绝启动。
+    config.validate_startup_agents(&bodies)?;
     Ok(bodies)
 }
 
