@@ -5387,10 +5387,7 @@ anchor = [0.0, 0.0, 0.0]
         let block_pos = Vec3::new(pose0.0.x, torso_top + 0.02 + 0.5, pose0.0.z);
         let blk = types::EntityId::from_parts(9, 9);
         s.spawn_entity_for_test(blk, block_pos);
-        assert!(
-            s.entities.contains_key(&blk),
-            "布景自检:方块已生成在实体表"
-        );
+        assert!(s.entities.contains_key(&blk), "布景自检:方块已生成在实体表");
         let mut momentum_at_touch: Option<f32> = None;
         let mut touch_tick: Option<usize> = None;
         let mut agent_woken_total = 0u64;
@@ -5403,7 +5400,10 @@ anchor = [0.0, 0.0, 0.0]
             agent_woken_total += out.agent_woken;
             if !s.entities.contains_key(&blk) {
                 block_gone = true;
-                println!("F3b-轻: 方块在第 {tick} 拍后不在实体表;flow_event = {:?}", out.flow_event);
+                println!(
+                    "F3b-轻: 方块在第 {tick} 拍后不在实体表;flow_event = {:?}",
+                    out.flow_event
+                );
                 break;
             }
             // 触地检测:方块与障碍物碰撞体的接触对出现**非零冲量**的那一拍
@@ -5427,8 +5427,7 @@ anchor = [0.0, 0.0, 0.0]
                         } else {
                             pair.collider1
                         };
-                        s.phys.colliders.get(other).and_then(|c| c.parent())
-                            == Some(obstacle)
+                        s.phys.colliders.get(other).and_then(|c| c.parent()) == Some(obstacle)
                     })
                     .map(|pair| pair.total_impulse_magnitude())
                     .fold(0.0f32, f32::max);
@@ -5461,9 +5460,17 @@ anchor = [0.0, 0.0, 0.0]
         // 判据 3:方块停在躯干上方(中心 y ≥ 躯干顶面 + 半高 − 2 cm)。
         let block_y = {
             let rec = s.entities.get(&blk).expect("方块在场");
-            s.phys.bodies.get(rec.handle).expect("方块刚体").translation().y
+            s.phys
+                .bodies
+                .get(rec.handle)
+                .expect("方块刚体")
+                .translation()
+                .y
         };
-        println!("F3b-轻: 方块停稳中心 y {block_y:.4}(要求 ≥ {})", torso_top + 0.5 - 0.02);
+        println!(
+            "F3b-轻: 方块停稳中心 y {block_y:.4}(要求 ≥ {})",
+            torso_top + 0.5 - 0.02
+        );
         assert!(
             block_y >= torso_top + 0.5 - 0.02,
             "方块中心 {block_y} < 躯干顶面 {} + 半高 0.5 − 2 cm:穿过去了",
@@ -5547,17 +5554,23 @@ anchor = [0.0, 0.0, 0.0]
             if touch_tick.is_none() && s.entities.contains_key(&blk) {
                 let block_col = s.entities.get(&blk).expect("方块在场").collider;
                 let obstacle = f_obstacle_handle(&s, a);
-                let hit = s.phys.narrow_phase.contact_pairs_with(block_col).any(|pair| {
-                    let other = if pair.collider1 == block_col {
-                        pair.collider2
-                    } else {
-                        pair.collider1
-                    };
-                    s.phys.colliders.get(other).and_then(|c| c.parent()) == Some(obstacle)
-                });
+                let hit = s
+                    .phys
+                    .narrow_phase
+                    .contact_pairs_with(block_col)
+                    .any(|pair| {
+                        let other = if pair.collider1 == block_col {
+                            pair.collider2
+                        } else {
+                            pair.collider1
+                        };
+                        s.phys.colliders.get(other).and_then(|c| c.parent()) == Some(obstacle)
+                    });
                 if hit {
                     touch_tick = Some(tick);
-                    println!("F3b-重: 首个接触对出现拍 {tick}(该拍 step 后主体冻结 = {now_frozen})");
+                    println!(
+                        "F3b-重: 首个接触对出现拍 {tick}(该拍 step 后主体冻结 = {now_frozen})"
+                    );
                 }
             }
             if woken_tick.is_some() && tick >= woken_tick.unwrap() + 60 {
@@ -5611,7 +5624,6 @@ anchor = [0.0, 0.0, 0.0]
             "方块仍在实体表(探针实测未被撞击流/凝固移除;若实现变化移除了它,须停下归因)"
         );
     }
-
 
     /// F4 唤醒误差:先让关节动起来(冻结前 30 拍把目标改成偏离默认姿态的
     /// 一组,自检 `max|q − 默认| > 0.1`、`max|qd| > 0.1`、根角速度模 > 1e-3)
@@ -5930,6 +5942,7 @@ anchor = [0.0, 0.0, 0.0]
     /// - `walker_holds` 里没有它(决策段不重新写入保持态);
     /// - 障碍物朝向逐位不变(冻结后 yaw 1.0 ≠ prev_yaw 0;若决策段跑到
     ///   冻结主体,会对 kinematic 障碍物 set_rotation,朝向即变)。
+    ///
     /// 变异自证:去掉 walker.rs 该跳过 → 本测试红(双断言各自都红:
     /// walker_holds 出现该主体;障碍物朝向被写)。
     #[test]
@@ -5950,8 +5963,7 @@ anchor = [0.0, 0.0, 0.0]
         .expect("胶囊生成");
         let observers = [Vec3::new(24.0, 3.45, 24.0)];
         // 冻结前:意图向前走 + yaw 0(决策段把 prev_yaw 写成 0)。
-        let mut inputs = Vec::new();
-        inputs.push(intent_input(a_cap, 1, (2.0, 0.0), 0.0, false));
+        let inputs = vec![intent_input(a_cap, 1, (2.0, 0.0), 0.0, false)];
         s.apply_prefix(&inputs);
         for _ in 0..2 {
             s.apply_activation(&observers);
@@ -5978,8 +5990,7 @@ anchor = [0.0, 0.0, 0.0]
         // YAW_EPS 之外,变异下必触发 set_rotation)。全程空观察者——不能放
         // 观察者:plan 计划唤醒(W1 路径)会把冻结主体唤醒,wake_agent 把
         // hold 写回,测的就不再是决策段的跳过了。
-        let mut inputs2 = Vec::new();
-        inputs2.push(intent_input(a_cap, 2, (2.0, 0.0), 1.0, false));
+        let inputs2 = vec![intent_input(a_cap, 2, (2.0, 0.0), 1.0, false)];
         s.apply_prefix(&inputs2);
         let pose0 = f_obstacle_pose(&s, a_cap);
         // 冻结时 walker_holds 已被 freeze_agent 移除:先确认空。
@@ -6006,7 +6017,10 @@ anchor = [0.0, 0.0, 0.0]
         );
         let pose1 = f_obstacle_pose(&s, a_cap);
         assert_eq!(pose0.0, pose1.0, "障碍物位置逐位不变");
-        assert_eq!(pose0.1, pose1.1, "障碍物朝向逐位不变(set_rotation 不得触达)");
+        assert_eq!(
+            pose0.1, pose1.1,
+            "障碍物朝向逐位不变(set_rotation 不得触达)"
+        );
     }
 
     /// F8 单连杆:胶囊持有行走意图走 60 拍后冻结,步进 300 拍,位置逐位不
