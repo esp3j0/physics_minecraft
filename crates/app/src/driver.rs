@@ -959,6 +959,48 @@ impl std::ops::Add for AgentCounters {
     }
 }
 
+/// `Add` 逐字段(B04 第 4 节第 6 条):漏加任何字段(含 B04 新增的
+/// joint_targets_rejected/clamped)即红——右侧每字段 +1,左侧每字段 1,
+/// 和必须 == 2。
+#[test]
+fn agent_counters_add_covers_every_field() {
+    let one = AgentCounters {
+        spawn_rejected: 1,
+        possess_rejected: 1,
+        intent_rejected: 1,
+        intent_deferred: 1,
+        intent_overwritten: 1,
+        move_observer_ignored: 1,
+        entity_command_rejected: 1,
+        bodies_removed_on_disconnect: 1,
+        bodies_removed_on_recovery: 1,
+        player_respawned: 1,
+        player_respawn_failed: 1,
+        respawn_wait_cancelled: 1,
+        agent_frozen: 1,
+        agent_woken: 1,
+        joint_targets_rejected: 1,
+        joint_targets_clamped: 1,
+    };
+    let sum = one + one;
+    assert_eq!(sum.spawn_rejected, 2);
+    assert_eq!(sum.possess_rejected, 2);
+    assert_eq!(sum.intent_rejected, 2);
+    assert_eq!(sum.intent_deferred, 2);
+    assert_eq!(sum.intent_overwritten, 2);
+    assert_eq!(sum.move_observer_ignored, 2);
+    assert_eq!(sum.entity_command_rejected, 2);
+    assert_eq!(sum.bodies_removed_on_disconnect, 2);
+    assert_eq!(sum.bodies_removed_on_recovery, 2);
+    assert_eq!(sum.player_respawned, 2);
+    assert_eq!(sum.player_respawn_failed, 2);
+    assert_eq!(sum.respawn_wait_cancelled, 2);
+    assert_eq!(sum.agent_frozen, 2);
+    assert_eq!(sum.agent_woken, 2);
+    assert_eq!(sum.joint_targets_rejected, 2);
+    assert_eq!(sum.joint_targets_clamped, 2);
+}
+
 /// 外部 spawn 请求(REQ-006 任务 02;降低 handler 参数)。
 struct SpawnRequest {
     player: messaging::InputSource,
