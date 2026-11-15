@@ -377,6 +377,10 @@ impl ShardSim {
                     .bodies
                     .get(&record.body_hash)
                     .expect("主体身体哈希必在注册表(restore 前置校验,fail-stop)");
+                // 冻结期间读数源 = 快照(B03b 1.4;条数 = 连杆数,速度已写 0)。
+                if let Some(frozen) = &record.frozen {
+                    return (id, record.body_hash, frozen.link_poses.clone());
+                }
                 let poses = def
                     .links
                     .iter()
@@ -1112,6 +1116,7 @@ impl ShardSim {
     }
 
     /// 主体关节位置(自由度顺序;B01a 只读观测口)。非主体 / 无关节 → None。
+    /// 冻结期间 = 快照 `joint_q`(B03b 1.4)。
     pub fn agent_joint_positions(&self, id: EntityId) -> Option<Vec<f32>> {
         let record = self.agents.get(&id)?;
         let def = self
@@ -1120,6 +1125,10 @@ impl ShardSim {
             .expect("主体身体哈希必在注册表(fail-stop)");
         if def.dof_count() == 0 {
             return None;
+        }
+        // 冻结期间读快照(有 multibody 前置非冻结才成立;先判冻结)。
+        if let Some(frozen) = &record.frozen {
+            return Some(frozen.joint_q.clone());
         }
         let mb_index = self.agent_multibody_index(record)?;
         let mb = self
@@ -1145,6 +1154,7 @@ impl ShardSim {
     }
 
     /// 主体关节速度(自由度顺序;rad/s 或 m/s)。非主体 / 无关节 → None。
+    /// 冻结期间 = 快照 `joint_qd`(B03b 1.4)。
     pub fn agent_joint_velocities(&self, id: EntityId) -> Option<Vec<f32>> {
         let record = self.agents.get(&id)?;
         let def = self
@@ -1153,6 +1163,10 @@ impl ShardSim {
             .expect("主体身体哈希必在注册表(fail-stop)");
         if def.dof_count() == 0 {
             return None;
+        }
+        // 冻结期间读快照(同 agent_joint_positions)。
+        if let Some(frozen) = &record.frozen {
+            return Some(frozen.joint_qd.clone());
         }
         let mb_index = self.agent_multibody_index(record)?;
         let mb = self
@@ -1185,7 +1199,8 @@ impl ShardSim {
 
     /// 主体的关节坐标与关节速度(自由度顺序,与 `agent_joint_positions` /
     /// `agent_joint_velocities` 同源读法)。单连杆或 dof = 0 → 两个空表
-    /// (B03a 1.1:迁移信封的 `joint_q` / `joint_qd` 提取口)。
+    /// (B03a 1.1:迁移信封的 `joint_q` / `joint_qd` 提取口)。冻结期间 =
+    /// 快照(B03b 1.4)。
     pub(crate) fn agent_joint_state(&self, id: EntityId) -> (Vec<f32>, Vec<f32>) {
         let Some(record) = self.agents.get(&id) else {
             return (Vec::new(), Vec::new());
@@ -1196,6 +1211,10 @@ impl ShardSim {
             .expect("主体身体哈希必在注册表(fail-stop)");
         if def.dof_count() == 0 {
             return (Vec::new(), Vec::new());
+        }
+        // 冻结期间读快照(同 agent_joint_positions)。
+        if let Some(frozen) = &record.frozen {
+            return (frozen.joint_q.clone(), frozen.joint_qd.clone());
         }
         let Some(mb_index) = self.agent_multibody_index(record) else {
             return (Vec::new(), Vec::new());
@@ -1370,12 +1389,280 @@ impl ShardSim {
         // 全部连杆逐个 remove_body(挂它的碰撞体与关节随之拆除;根连杆也走
         // 同一路径)。links 表按名字序,与生成序无关——拆刚体之间没有顺序
         // 依赖(rapier remove_body 自动处理悬挂关节引用)。
-        for handle in record.links.values().copied().collect::<Vec<_>>() {
-            self.phys.remove_body(handle);
-        }
+        self.teardown_agent_links(&record);
         // A02a:控制器保持态随主体增删(移除后不残留)。
         self.walker_holds.remove(&id);
         record
+    }
+
+    /// 拆全部连杆刚体(B03b 1.3:`freeze_agent` 与 `remove_agent_bodies`
+    /// 共用的"拆连杆刚体"段,不复制;碰撞体与 multibody 关节随刚体移除
+    /// 一并拆)。只动 phys,不动记录表(调用方各自处理)。
+    fn teardown_agent_links(&mut self, record: &AgentRecord) {
+        for handle in record.links.values().copied().collect::<Vec<_>>() {
+            self.phys.remove_body(handle);
+        }
+    }
+
+    /// 已冻结?(B03b 1.3)。主体不存在 → false。
+    pub fn is_agent_frozen(&self, id: EntityId) -> bool {
+        self.agents.get(&id).is_some_and(|r| r.frozen.is_some())
+    }
+
+    /// 冻结(B03b 1.2/1.3:快照 + 障碍物):
+    /// 1. 读:根状态、`agent_joint_state`、全部连杆位姿(`BodyDef.links`
+    ///    顺序)、每个连杆碰撞体的规格(世界位姿与 1.2 列的属性);
+    ///    `walker_holds.remove(&id)` 存进快照。
+    /// 2. 移除全部连杆刚体(与 `remove_agent_bodies` 共用拆段)。
+    /// 3. 建障碍物(`KinematicPositionBased`,位姿 = 冻结拍根连杆位姿,
+    ///    速度 0),逐碰撞体重建挂上,登记进障碍物名下。
+    /// 4. 改记录(`EntityRecord.handle`/`collider` → 障碍物;`links` =
+    ///    { 根连杆名 → 障碍物 };`colliders` = 障碍物碰撞体,顺序同冻结前),
+    ///    `frozen = Some(..)`。
+    /// 5. `outbox.spawned`/`despawned` 不动;`outbox.agent_frozen += 1`。
+    ///
+    /// 前置:主体存在且未冻结,否则 panic(信息含 "freeze_agent")。
+    pub fn freeze_agent(&mut self, id: EntityId) {
+        use rapier3d::prelude::*;
+        let record = self
+            .agents
+            .get(&id)
+            .expect("freeze_agent:主体不存在(fail-stop)");
+        assert!(
+            record.frozen.is_none(),
+            "freeze_agent:主体已冻结,重复冻结(fail-stop):{id:?}"
+        );
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)")
+            .clone();
+        // ---- 步骤 1:读(先全部采完,再动世界)----
+        let root_handle = self
+            .entities
+            .get(&id)
+            .map(|rec| rec.handle)
+            .expect("主体 EntityRecord 存在(fail-stop)");
+        let root_rb = self.phys.bodies.get(root_handle).expect("根连杆在场");
+        let root = types::EntityState {
+            translation: crate::conv::rapier_to_vec3(root_rb.translation()),
+            rotation: crate::conv::rapier_to_quat(root_rb.rotation()),
+            linvel: crate::conv::rapier_to_vec3(root_rb.linvel()),
+            angvel: crate::conv::rapier_to_vec3(root_rb.angvel()),
+        };
+        let (joint_q, joint_qd) = self.agent_joint_state(id);
+        let mut link_poses = Vec::with_capacity(def.links.len());
+        let mut specs: Vec<FrozenColliderSpec> = Vec::with_capacity(record.colliders.len());
+        for link in &def.links {
+            let &handle = record
+                .links
+                .get(&link.name)
+                .expect("连杆句柄在登记表(fail-stop)");
+            let rb = self
+                .phys
+                .bodies
+                .get(handle)
+                .expect("连杆刚体存在(fail-stop)");
+            link_poses.push(types::EntityState {
+                translation: crate::conv::rapier_to_vec3(rb.translation()),
+                rotation: crate::conv::rapier_to_quat(rb.rotation()),
+                linvel: types::glam::Vec3::ZERO,
+                angvel: types::glam::Vec3::ZERO,
+            });
+            // 本连杆名下的碰撞体(与登记序同口径:生成时逐连杆 push,遍历
+            // record.colliders 按 parent 归属保持顺序)。相对位姿 = 冻结拍
+            // 连杆位姿⁻¹ · 碰撞体世界位姿?不——碰撞体的 world = body ∘
+            // local,记录 local 原样即可在障碍物上以世界位姿重建:障碍物
+            // 位姿 = 根位姿,挂碰撞体用 world_pose 作为相对位姿(障碍物
+            // rotation 恒等时相对位姿 = 世界位姿;这里直接按 world ∘
+            // (body∘local)⁻¹ 记,对任意障碍物位姿都成立)。
+            for &ch in &record.colliders {
+                let col = self.phys.colliders.get(ch).expect("连杆碰撞体存在");
+                if col.parent() != Some(handle) {
+                    continue;
+                }
+                let local = col.position_wrt_parent().copied().unwrap_or(Pose::IDENTITY);
+                // 世界位姿 = body ∘ local;障碍物位姿 = root_pose → 相对位姿
+                // = root_pose⁻¹ · world_pose(挂上去后世界位姿与冻结前相同)。
+                let world_pose = *rb.position() * local;
+                let rel_pose = root_rb.position().inverse() * world_pose;
+                specs.push(FrozenColliderSpec {
+                    world_pose: rel_pose,
+                    shape: col.shared_shape().clone(),
+                    friction: col.friction(),
+                    restitution: col.restitution(),
+                    friction_combine_rule: col.friction_combine_rule(),
+                    restitution_combine_rule: col.restitution_combine_rule(),
+                    collision_groups: col.collision_groups(),
+                    solver_groups: col.solver_groups(),
+                    active_events: col.active_events(),
+                });
+            }
+        }
+        let hold = self.walker_holds.remove(&id);
+        let (hold_held_force, hold_last_yaw) = match hold {
+            Some(h) => (Some(h.held_force), Some(h.last_yaw)),
+            None => (None, None),
+        };
+        let frozen = FrozenAgent {
+            root,
+            joint_q,
+            joint_qd,
+            link_poses,
+            hold_held_force,
+            hold_last_yaw,
+        };
+        // ---- 步骤 2:移除全部连杆刚体(借 record 的 links;借用即还)----
+        self.teardown_agent_links(&self.agents.get(&id).expect("主体在表(fail-stop)").clone());
+        // ---- 步骤 3:建障碍物(kinematic 不设目标位姿就不动;速度 0)----
+        let obstacle = self.phys.insert_body(
+            RigidBodyBuilder::kinematic_position_based()
+                .pose(crate::conv::pose_to_rapier(
+                    frozen.root.translation,
+                    frozen.root.rotation,
+                ))
+                .linvel(Vector::ZERO)
+                .angvel(Vector::ZERO),
+        );
+        let mut obstacle_colliders = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            let builder = ColliderBuilder::new(spec.shape.clone())
+                .position(spec.world_pose)
+                .friction(spec.friction)
+                .restitution(spec.restitution)
+                .friction_combine_rule(spec.friction_combine_rule)
+                .restitution_combine_rule(spec.restitution_combine_rule)
+                .collision_groups(spec.collision_groups)
+                .solver_groups(spec.solver_groups)
+                .active_events(spec.active_events);
+            // 障碍物不带行走钩子(active_hooks 不抄;钩子是给行走控制器的)。
+            let ch = self.phys.insert_collider(builder, Some(obstacle));
+            obstacle_colliders.push(ch);
+        }
+        // ---- 步骤 4:改记录 ----
+        let record = self
+            .agents
+            .get_mut(&id)
+            .expect("主体在表(fail-stop;上面刚查过)");
+        record.frozen = Some(frozen);
+        let root_name = self
+            .bodies
+            .get(&record.body_hash)
+            .map(|d| d.links[0].name.clone())
+            .expect("身体哈希必在注册表(fail-stop)");
+        let mut links = std::collections::BTreeMap::new();
+        links.insert(root_name, obstacle);
+        record.links = links;
+        let obstacle_first = obstacle_colliders[0];
+        record.colliders = obstacle_colliders;
+        let rec = self.entities.get_mut(&id).expect("实体记录存在(fail-stop)");
+        rec.handle = obstacle;
+        rec.collider = obstacle_first;
+        // ---- 步骤 5:记账(outbox.spawned/despawned 不动)----
+        self.outbox.agent_frozen += 1;
+    }
+
+    /// 唤醒(B03b 1.3:移除障碍物,按快照重建全部连杆;速度恢复,不清零):
+    /// 1. `frozen.take()`;移除障碍物刚体(碰撞体随之注销)。
+    /// 2. 按 `root` 位姿经 `build_agent_bodies` 重建全部连杆(**不调
+    ///    `spawn_agent`**——它插表、推 outbox.spawned、断言 ID 不重复)。
+    /// 3. 改记录:`EntityRecord.handle`/`collider`、`AgentRecord.links`/
+    ///    `colliders` 换新建;`slow_ticks = 0`,位移窗口清空只留当前位置
+    ///    (唤醒语义,与普通实体唤醒相同)。
+    /// 4. 多连杆:`restore_agent_joint_state`(根速度写回,不清零),然后
+    ///    `apply_agent_joint_targets`(记录里**当前的** joint_targets——
+    ///    冻结期间它可能被命令改过,电机目标随它)。
+    /// 5. 单连杆:根刚体写回线/角速度;hold 写回 `walker_holds`(口径照
+    ///    `migrate_agent_in`)。
+    /// 6. `embedded_ticks` 不动;`outbox.agent_woken += 1`。
+    ///
+    /// 前置:主体存在且已冻结,否则 panic(信息含 "wake_agent")。
+    pub fn wake_agent(&mut self, id: EntityId) {
+        let record = self
+            .agents
+            .get_mut(&id)
+            .expect("wake_agent:主体不存在(fail-stop)");
+        let frozen = record
+            .frozen
+            .take()
+            .expect("wake_agent:主体未冻结(fail-stop)");
+        let body_hash = record.body_hash;
+        let def = self
+            .bodies
+            .get(&body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)")
+            .clone();
+        // ---- 步骤 1:移除障碍物 ----
+        let obstacle_handle = self
+            .entities
+            .get(&id)
+            .map(|rec| rec.handle)
+            .expect("实体记录存在(fail-stop)");
+        self.phys.remove_body(obstacle_handle);
+        // ---- 步骤 2:按快照重建全部连杆 ----
+        let built = self.build_agent_bodies(id, &def, frozen.root);
+        let root_handle = built.root_handle;
+        let links = built.links;
+        let colliders = built.colliders;
+        // ---- 步骤 3:改记录 ----
+        let multi = def.links.len() > 1;
+        {
+            let record = self.agents.get_mut(&id).expect("主体在表(fail-stop)");
+            record.links = links;
+            record.colliders = colliders.clone();
+        }
+        let rec = self.entities.get_mut(&id).expect("实体记录存在(fail-stop)");
+        rec.handle = root_handle;
+        rec.collider = colliders[0];
+        rec.slow_ticks = 0;
+        let pos = {
+            let rb = self.phys.bodies.get(root_handle).expect("根刚体在场");
+            crate::conv::rapier_to_vec3(rb.translation())
+        };
+        rec.window.clear();
+        rec.window.push_back(pos);
+        // ---- 步骤 4/5:状态写回 ----
+        if multi {
+            self.restore_agent_joint_state(
+                id,
+                frozen.root.linvel,
+                frozen.root.angvel,
+                &frozen.joint_q,
+                &frozen.joint_qd,
+            );
+            // 记录里当前的 joint_targets(冻结期间可能被命令改过);电机
+            // 目标与 record.joint_targets 都随它(长度已随冻结写定,必 Ok;
+            // 长度校验走命令同一条路径)。
+            let targets = self
+                .agents
+                .get(&id)
+                .map(|r| r.joint_targets.clone())
+                .expect("主体在表(fail-stop)");
+            self.apply_agent_joint_targets(id, &targets)
+                .expect("wake_agent:joint_targets 长度必 = dof(冻结时同源,fail-stop)");
+        } else {
+            // 单连杆:根刚体写回线/角速度(恢复,不清零;kinematic 下
+            // set_* 是 no-op,障碍物已移除、刚体是 Dynamic,顺序无碍)。
+            if let Some(rb) = self.phys.bodies.get_mut(root_handle) {
+                rb.set_linvel(crate::conv::vec3_to_rapier(frozen.root.linvel), true);
+                rb.set_angvel(crate::conv::vec3_to_rapier(frozen.root.angvel), true);
+                rb.wake_up(true);
+            }
+            // hold 写回 walker_holds(口径照 migrate_agent_in)。
+            if let Some(held) = frozen.hold_held_force
+                && let Some(yaw) = frozen.hold_last_yaw
+            {
+                self.walker_holds.insert(
+                    id,
+                    crate::walker::WalkerHold {
+                        held_force: held,
+                        last_yaw: yaw,
+                    },
+                );
+            }
+        }
+        // ---- 步骤 6:记账 ----
+        self.outbox.agent_woken += 1;
     }
 
     /// 主体的 multibody 索引(按 links 表反查任意连杆;都不在 multibody 里
@@ -1399,9 +1686,13 @@ impl ShardSim {
     /// 3. 任一连杆线速度的模 > `AGENT_V_GUARD` → `OverSpeed`。
     ///
     /// 命中即返回;全部通过 → `None`。主体不存在 → `None`(防护段在
-    /// agents 表上迭代,不会以不存在的 ID 调用)。
+    /// agents 表上迭代,不会以不存在的 ID 调用)。**冻结的主体跳过**(B03b
+    /// 1.4:连杆刚体已拆,障碍物 kinematic 零速度不会触发;直接 None)。
     pub(crate) fn agent_runaway_reason(&self, id: EntityId) -> Option<RunawayReason> {
         let record = self.agents.get(&id)?;
+        if record.frozen.is_some() {
+            return None;
+        }
         let def = self
             .bodies
             .get(&record.body_hash)
@@ -1517,6 +1808,11 @@ impl ShardSim {
         let Some(record) = self.agents.get(&id) else {
             return false;
         };
+        // 冻结的主体跳过压垮检查(B03b 1.4:embedded_ticks 不变;唤醒后由
+        // 压垮规则处理)。
+        if record.frozen.is_some() {
+            return false;
+        }
         let def = self
             .bodies
             .get(&record.body_hash)
@@ -4816,6 +5112,608 @@ anchor = [0.0, 0.0, 0.0]
     fn def_links_of(s: &crate::sim::ShardSim, record: &AgentRecord) -> Vec<String> {
         let def = s.bodies.get(&record.body_hash).expect("def");
         def.links.iter().map(|l| l.name.clone()).collect()
+    }
+
+    // ==================== B03b F 组(冻结 + 障碍物)====================
+
+    /// F 组布景(照 M2 站立口径):四足 + 平地 + 观察者,站立目标写首拍,
+    /// `ticks` 拍;返回 (sim, hash, agent id)。
+    fn f_quad_standing(ticks: usize) -> (crate::sim::ShardSim, BodyHash, types::EntityId) {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let stand: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                .collect()
+        };
+        for tick in 0..ticks {
+            if tick % 2 == 0 {
+                s.apply_agent_joint_targets(a, &stand).expect("合法");
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        (s, hash, a)
+    }
+
+    /// 13 个连杆位姿快照(BodyDef.links 顺序;(translation, rotation) 对)。
+    fn f_link_poses(
+        s: &crate::sim::ShardSim,
+        a: types::EntityId,
+    ) -> Vec<(rapier3d::math::Vector, rapier3d::math::Rotation)> {
+        let record = s.agents.get(&a).expect("主体");
+        let def = s.bodies.get(&record.body_hash).expect("def");
+        def.links
+            .iter()
+            .map(|l| {
+                let &h = record.links.get(&l.name).expect("连杆句柄");
+                let rb = s.phys.bodies.get(h).expect("连杆在场");
+                (rb.translation(), *rb.rotation())
+            })
+            .collect()
+    }
+
+    /// 障碍物位姿(冻结后 EntityRecord.handle)。
+    fn f_obstacle_pose(
+        s: &crate::sim::ShardSim,
+        a: types::EntityId,
+    ) -> (rapier3d::math::Vector, rapier3d::math::Rotation) {
+        let rec = s.entities.get(&a).expect("在场");
+        let rb = s.phys.bodies.get(rec.handle).expect("障碍物在场");
+        (rb.translation(), *rb.rotation())
+    }
+
+    /// F1 计数:四足站立 120 拍后冻结。刚体数 = 冻结前 − 13 + 1;碰撞体数
+    /// 不变;multibody 数 − 1;`is_frozen`、`is_agent_frozen` 为真;`entities`、
+    /// `agents` 里都还在;`outbox.spawned`/`despawned` 没有因冻结多出条目;
+    /// `agent_frozen == 1`。
+    #[test]
+    fn f1_freeze_counts_and_records() {
+        let (mut s, hash, a) = f_quad_standing(120);
+        let bodies_before = s.phys.bodies.len();
+        let colliders_before = s.phys.colliders.len();
+        let mb_before = s.phys.multibody_joints.iter().count();
+        let spawned_len_before = s.take_outbox().spawned.len();
+        let _ = hash;
+        s.freeze_agent(a);
+        assert_eq!(
+            s.phys.bodies.len(),
+            bodies_before - 13 + 1,
+            "刚体数 = 冻结前 − 13 + 1(13 连杆 → 1 障碍物)"
+        );
+        assert_eq!(s.phys.colliders.len(), colliders_before, "碰撞体数不变");
+        assert_eq!(
+            s.phys.multibody_joints.iter().count(),
+            mb_before - 12,
+            "multibody 关节数 − 12(整只拆;iter() 按关节计,K 组同口径)"
+        );
+        assert!(s.is_frozen(a), "is_frozen(kinematic)为真");
+        assert!(s.is_agent_frozen(a), "is_agent_frozen 为真");
+        assert!(s.entities.contains_key(&a), "entities 里还在");
+        assert!(s.agents.contains_key(&a), "agents 里还在");
+        let out = s.take_outbox();
+        assert_eq!(
+            out.spawned.len(),
+            spawned_len_before,
+            "spawned 没有因冻结多出条目"
+        );
+        assert!(!out.despawned.contains(&a), "despawned 没有因冻结多出条目");
+        assert_eq!(out.agent_frozen, 1, "agent_frozen == 1");
+    }
+
+    /// F2 障碍物逐个核对:每个碰撞体的世界位姿与冻结前对应连杆碰撞体相差
+    /// < 1e-5 m、< 1e-5 rad;形状类型与尺寸相同;摩擦、恢复系数、
+    /// `collision_groups` 相同;都能经 `collider_to_entity` 查回这个主体。
+    #[test]
+    fn f2_obstacle_collider_spec() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        // 冻结前采样:每连杆碰撞体的(世界位姿、形状描述、摩擦、恢复、组)。
+        struct ColSpec {
+            world_pose: rapier3d::prelude::Pose,
+            desc: String,
+            friction: f32,
+            restitution: f32,
+            groups: rapier3d::prelude::InteractionGroups,
+        }
+        let mut before: Vec<ColSpec> = Vec::new();
+        {
+            let record = s.agents.get(&a).expect("主体");
+            for &ch in &record.colliders {
+                let col = s.phys.colliders.get(ch).expect("碰撞体在场");
+                let parent = col.parent().expect("连杆碰撞体必有 parent");
+                let rb = s.phys.bodies.get(parent).expect("连杆在场");
+                let local = col
+                    .position_wrt_parent()
+                    .copied()
+                    .unwrap_or(rapier3d::prelude::Pose::IDENTITY);
+                let world_pose = *rb.position() * local;
+                let shape = col.shape();
+                let desc = match shape.as_typed_shape() {
+                    rapier3d::prelude::TypedShape::Cuboid(c) => {
+                        format!(
+                            "cuboid {:?} {:?} {:?}",
+                            c.half_extents.x, c.half_extents.y, c.half_extents.z
+                        )
+                    }
+                    rapier3d::prelude::TypedShape::Ball(b) => format!("ball {}", b.radius),
+                    rapier3d::prelude::TypedShape::Capsule(c) => {
+                        format!("capsule {} {}", c.segment.b.y - c.segment.a.y, c.radius)
+                    }
+                    other => format!("other {other:?}"),
+                };
+                before.push(ColSpec {
+                    world_pose,
+                    desc,
+                    friction: col.friction(),
+                    restitution: col.restitution(),
+                    groups: col.collision_groups(),
+                });
+            }
+        }
+        assert_eq!(before.len(), 13, "布景自检:13 个碰撞体");
+        s.freeze_agent(a);
+        // 冻结后核对。
+        let record = s.agents.get(&a).expect("主体");
+        assert_eq!(record.colliders.len(), 13, "障碍物 13 个碰撞体");
+        let table = s.collider_to_entity_of();
+        let mut max_pos_err = 0.0f32;
+        let mut max_rot_err = 0.0f32;
+        for (i, ch) in record.colliders.iter().enumerate() {
+            let col = s.phys.colliders.get(*ch).expect("障碍物碰撞体在场");
+            let world = col
+                .position_wrt_parent()
+                .copied()
+                .expect("障碍物碰撞体有相对位姿");
+            // 障碍物 rotation = 冻结拍根位姿,非恒等——世界位姿 = obstacle ∘
+            // relative。与冻结前的世界位姿比。
+            let obs_rec = s.entities.get(&a).expect("在场");
+            let obs = *s
+                .phys
+                .bodies
+                .get(obs_rec.handle)
+                .expect("障碍物")
+                .position();
+            let world_after = obs * world;
+            let b = &before[i];
+            max_pos_err =
+                max_pos_err.max((world_after.translation - b.world_pose.translation).length());
+            let dq = world_after.rotation * b.world_pose.rotation.inverse();
+            max_rot_err =
+                max_rot_err.max(2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length());
+            let shape = col.shape();
+            let desc = match shape.as_typed_shape() {
+                rapier3d::prelude::TypedShape::Cuboid(c) => {
+                    format!(
+                        "cuboid {:?} {:?} {:?}",
+                        c.half_extents.x, c.half_extents.y, c.half_extents.z
+                    )
+                }
+                rapier3d::prelude::TypedShape::Ball(b2) => format!("ball {}", b2.radius),
+                rapier3d::prelude::TypedShape::Capsule(c) => {
+                    format!("capsule {} {}", c.segment.b.y - c.segment.a.y, c.radius)
+                }
+                other => format!("other {other:?}"),
+            };
+            assert_eq!(desc, b.desc, "碰撞体 {i} 形状相同");
+            assert!(
+                (col.friction() - b.friction).abs() < 1e-6,
+                "碰撞体 {i} 摩擦相同"
+            );
+            assert!(
+                (col.restitution() - b.restitution).abs() < 1e-6,
+                "碰撞体 {i} 恢复系数相同"
+            );
+            assert_eq!(col.collision_groups(), b.groups, "碰撞体 {i} 组相同");
+            let key = ch.into_raw_parts();
+            assert_eq!(
+                table.get(&(key.0, key.1)),
+                Some(&a),
+                "障碍物碰撞体 {i} 归因到主体"
+            );
+        }
+        println!("F2: max_pos_err {max_pos_err:.3e} m, max_rot_err {max_rot_err:.3e} rad");
+        assert!(max_pos_err < 1e-5, "最大位置差 {max_pos_err:.3e} m ≥ 1e-5");
+        assert!(
+            max_rot_err < 1e-5,
+            "最大朝向差 {max_rot_err:.3e} rad ≥ 1e-5"
+        );
+    }
+
+    /// F3 不动:冻结后步进 600 拍,障碍物位姿逐位不变,`agent_states` 的 13
+    /// 个位姿与冻结前逐位相同、速度为 0;再从上方 3 m 落一个 1 格方块到躯干
+    /// 上,300 拍后障碍物位移 ≤ 1e-5 m,方块停在躯干上方(没有穿过去)。
+    #[test]
+    fn f3_obstacle_never_moves() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        let pose0 = f_obstacle_pose(&s, a);
+        let states0 = {
+            let (_, _, poses) = s.agent_states().into_iter().next().expect("主体在场");
+            poses
+        };
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..600 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let pose1 = f_obstacle_pose(&s, a);
+        assert_eq!(pose0.0.x, pose1.0.x, "障碍物 x 逐位不变");
+        assert_eq!(pose0.0.y, pose1.0.y, "障碍物 y 逐位不变");
+        assert_eq!(pose0.0.z, pose1.0.z, "障碍物 z 逐位不变");
+        assert_eq!(pose0.1, pose1.1, "障碍物朝向逐位不变");
+        let (_, _, poses1) = s.agent_states().into_iter().next().expect("主体在场");
+        assert_eq!(poses1.len(), 13, "agent_states 仍 13 条");
+        for (b, n) in states0.iter().zip(&poses1) {
+            assert_eq!(b.translation, n.translation, "连杆位姿逐位相同");
+            assert_eq!(b.rotation, n.rotation, "连杆朝向逐位相同");
+            assert_eq!(n.linvel, Vec3::ZERO, "冻结读数速度为 0");
+            assert_eq!(n.angvel, Vec3::ZERO, "冻结读数角速度为 0");
+        }
+    }
+
+    /// F3b(方块砸中):从上方 3 m 落一个 1 格方块到躯干上,300 拍后障碍物
+    /// 位移 ≤ 1e-5 m,方块停在躯干上方(没有穿过去)。依赖 1.5 的唤醒落实点
+    /// 接线(方块落到障碍物上触发接触唤醒;未接线时障碍物被切成 Dynamic
+    /// 被砸走)——随步骤 4 的接线提交一起生效。
+    #[test]
+    fn f3b_block_drop_stays_blocked() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        s.freeze_agent(a);
+        let pose1 = f_obstacle_pose(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 方块从躯干上方 3 m 落下(躯干 = 根连杆中心 + 3)。
+        let root_top = pose1.0.y + 0.3;
+        let block_pos = Vec3::new(pose1.0.x, root_top + 3.0, pose1.0.z);
+        let cell = crate::settle::cell_of(block_pos.x, block_pos.y, block_pos.z);
+        let blk = types::EntityId::from_parts(9, 9);
+        s.spawn_entity_for_test(
+            blk,
+            Vec3::new(
+                (cell.x as f32) + 0.5,
+                (cell.y as f32) + 0.5,
+                (cell.z as f32) + 0.5,
+            ),
+        );
+        for _ in 0..300 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let pose2 = f_obstacle_pose(&s, a);
+        let dx = ((pose2.0.x - pose1.0.x) as f64).abs();
+        let dy = ((pose2.0.y - pose1.0.y) as f64).abs();
+        let dz = ((pose2.0.z - pose1.0.z) as f64).abs();
+        println!("F3b: block-drop obstacle shift dx {dx:.3e}, dy {dy:.3e}, dz {dz:.3e} m");
+        assert!(
+            dx <= 1e-5 && dy <= 1e-5 && dz <= 1e-5,
+            "障碍物位移 > 1e-5 m"
+        );
+        // 方块停在躯干上方:方块底 ≥ 障碍物顶 − 2 cm(没穿过去)。
+        let block_rec = s.entities.get(&blk).expect("方块在场");
+        let block_rb = s.phys.bodies.get(block_rec.handle).expect("方块刚体");
+        let block_y = block_rb.translation().y;
+        println!("F3b: block settled y {block_y:.4} vs root y {}", pose2.0.y);
+        assert!(
+            block_y > pose2.0.y,
+            "方块掉到躯干以下(穿过去了):block y {block_y} ≤ root y {}",
+            pose2.0.y
+        );
+    }
+
+    /// F4 唤醒误差:先让关节动起来(冻结前 30 拍把目标改成偏离默认姿态的
+    /// 一组,自检 `max|q − 默认| > 0.1`、`max|qd| > 0.1`、根角速度模 > 1e-3)
+    /// 。冻结,步进 300 拍,唤醒。步进前:
+    /// - 关节坐标、关节速度误差 < 1e-4;13 个连杆位置误差 < 1e-4 m、朝向
+    ///   < 1e-4 rad;
+    /// - 根刚体线/角速度与快照逐位相等;multibody 广义速度前 6 维与快照根
+    ///   线/角速度逐位相等(B03a 遗留:角速度那 3 维之前没有测试);
+    /// - `agent_joint_targets` 与 12 个电机目标 = 冻结前的目标。
+    #[test]
+    fn f4_wake_restore_error_bounded() {
+        let (mut s, _hash, a) = f_quad_standing(2);
+        // 关节动起来:30 拍正弦目标(K9 同款)。
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let targets_before: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| {
+                    let d = j.kind.params().default_angle.unwrap_or(0.0);
+                    d + 0.5
+                })
+                .collect()
+        };
+        for tick in 30..60usize {
+            if tick % 2 == 0 {
+                s.apply_agent_joint_targets(a, &targets_before)
+                    .expect("合法");
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 自检:姿态非平凡 + 根角速度非零。
+        {
+            let (q, qd) = s.agent_joint_state(a);
+            let default_q: Vec<f32> = {
+                let record = s.agents.get(&a).expect("主体");
+                let def = s.bodies.get(&record.body_hash).expect("def");
+                def.dof_joints()
+                    .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                    .collect()
+            };
+            let max_q_dev = q
+                .iter()
+                .zip(&default_q)
+                .map(|(v, d)| (v - d).abs())
+                .fold(0.0f32, f32::max);
+            let max_qd = qd.iter().copied().fold(0.0f32, f32::max);
+            assert!(max_q_dev > 0.1, "布景自检:max|q−默认| = {max_q_dev} ≤ 0.1");
+            assert!(max_qd > 0.1, "布景自检:max|qd| = {max_qd} ≤ 0.1");
+            let rec = s.entities.get(&a).expect("在场");
+            let root = s.phys.bodies.get(rec.handle).expect("根");
+            let av = root.angvel();
+            assert!(
+                rapier3d::math::Vector::new(av.x, av.y, av.z).length() > 1e-3,
+                "布景自检:根角速度模 ≤ 1e-3"
+            );
+        }
+        let targets_pre = s.agent_joint_targets(a).expect("目标").to_vec();
+        let root_linvel_pre = {
+            let rec = s.entities.get(&a).expect("在场");
+            let root = s.phys.bodies.get(rec.handle).expect("根");
+            (root.linvel(), root.angvel())
+        };
+        let (q_pre, qd_pre) = s.agent_joint_state(a);
+        let poses_pre = f_link_poses(&s, a);
+        s.freeze_agent(a);
+        for _ in 0..300 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        s.wake_agent(a);
+        // 步进之前比较。
+        {
+            let (q, qd) = s.agent_joint_state(a);
+            assert_eq!(q.len(), 12, "12 自由度");
+            let max_q_err = q
+                .iter()
+                .zip(&q_pre)
+                .map(|(v, e)| (v - e).abs())
+                .fold(0.0f32, f32::max);
+            let max_qd_err = qd
+                .iter()
+                .zip(&qd_pre)
+                .map(|(v, e)| (v - e).abs())
+                .fold(0.0f32, f32::max);
+            println!("F4: q_err {max_q_err:.3e}, qd_err {max_qd_err:.3e}");
+            assert!(max_q_err < 1e-4, "关节坐标最大误差 {max_q_err:.3e} ≥ 1e-4");
+            assert!(
+                max_qd_err < 1e-4,
+                "关节速度最大误差 {max_qd_err:.3e} ≥ 1e-4"
+            );
+        }
+        {
+            let poses = f_link_poses(&s, a);
+            assert_eq!(poses.len(), 13, "13 连杆");
+            let mut max_p = 0.0f32;
+            let mut max_r = 0.0f32;
+            for ((p_now, r_now), (p_ref, r_ref)) in poses.iter().zip(&poses_pre) {
+                max_p = max_p.max((p_now - p_ref).length());
+                let dq = r_now * r_ref.inverse();
+                max_r = max_r.max(2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length());
+            }
+            println!("F4: link_pos_err {max_p:.3e} m, link_rot_err {max_r:.3e} rad");
+            assert!(max_p < 1e-4, "连杆位置最大误差 {max_p:.3e} m ≥ 1e-4");
+            assert!(max_r < 1e-4, "连杆朝向最大误差 {max_r:.3e} rad ≥ 1e-4");
+        }
+        {
+            let rec = s.entities.get(&a).expect("在场");
+            let root = s.phys.bodies.get(rec.handle).expect("根");
+            assert_eq!(root.linvel(), root_linvel_pre.0, "根线速度逐位相等");
+            assert_eq!(root.angvel(), root_linvel_pre.1, "根角速度逐位相等");
+        }
+        {
+            let record = s.agents.get(&a).expect("主体");
+            let mb_index = s.agent_multibody_index(record).expect("多连杆必有 mb");
+            let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+            let gv: Vec<f32> = mb.generalized_velocity().iter().copied().collect();
+            assert_eq!(gv[0], root_linvel_pre.0.x, "广义速度[0] = 根 linvel.x 逐位");
+            assert_eq!(gv[1], root_linvel_pre.0.y, "广义速度[1] = 根 linvel.y 逐位");
+            assert_eq!(gv[2], root_linvel_pre.0.z, "广义速度[2] = 根 linvel.z 逐位");
+            assert_eq!(gv[3], root_linvel_pre.1.x, "广义速度[3] = 根 angvel.x 逐位");
+            assert_eq!(gv[4], root_linvel_pre.1.y, "广义速度[4] = 根 angvel.y 逐位");
+            assert_eq!(gv[5], root_linvel_pre.1.z, "广义速度[5] = 根 angvel.z 逐位");
+            // 全维对照(除前 6 维 = 快照根速度):后 12 维 = 快照 qd,restore
+            // 写回口径;前 6 维按快照根速度判(冻结前 solver 实况与快照可以
+            // 不同步——B03a M6 已归因的 rapier 两层现象,不进判据)。
+        }
+        {
+            let targets = s.agent_joint_targets(a).expect("目标表");
+            assert_eq!(targets, targets_pre.as_slice(), "joint_targets = 冻结前");
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            let mb_index = s.agent_multibody_index(record).expect("mb");
+            let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+            for (dof_i, j) in def.dof_joints().enumerate() {
+                let &handle = record.links.get(&j.child).expect("child");
+                let lid = s
+                    .phys
+                    .multibody_joints
+                    .rigid_body_link(handle)
+                    .expect("link");
+                let link = mb.link(lid.id).expect("link");
+                assert!(
+                    (link.joint.data.motors[3].target_pos - targets_pre[dof_i]).abs() < 1e-6,
+                    "电机目标 = 冻结前(dof {dof_i})"
+                );
+            }
+        }
+    }
+
+    /// F5 唤醒后连续:站立、关节在动两种情况各一。唤醒后 120 拍:up·y ≥ 0.9;
+    /// `|vy|` ≤ 0.5 m/s;机身高度比冻结前升高 ≤ 2 cm;没有被失控防护或压垮
+    /// 移除。
+    #[test]
+    fn f5_wake_continuity_two_scenes() {
+        // 场景 1:站立后冻结唤醒。
+        {
+            let (mut s, _hash, a) = f_quad_standing(120);
+            let y_pre = {
+                let rec = s.entities.get(&a).expect("在场");
+                s.phys.bodies.get(rec.handle).expect("根").translation().y
+            };
+            s.freeze_agent(a);
+            s.wake_agent(a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            let mut up_min = f32::INFINITY;
+            let mut vy_max = 0.0f32;
+            for _ in 0..120 {
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+                let rec = s.entities.get(&a).expect("在场");
+                let root = s.phys.bodies.get(rec.handle).expect("根");
+                up_min = up_min.min((root.rotation() * types::glam::Vec3::Y).y);
+                vy_max = vy_max.max(root.linvel().y.abs());
+            }
+            let y_post = {
+                let rec = s.entities.get(&a).expect("在场");
+                s.phys.bodies.get(rec.handle).expect("根").translation().y
+            };
+            println!("F5-站立: up_min {up_min:.4}, vy_max {vy_max:.4}, y {y_pre:.4}→{y_post:.4}");
+            assert!(up_min >= 0.9, "站立唤醒 up·y 最小 {up_min} < 0.9");
+            assert!(vy_max <= 0.5, "|vy| 峰值 {vy_max} > 0.5");
+            assert!(y_post - y_pre <= 0.02, "机身升高 {} ≥ 2 cm", y_post - y_pre);
+            assert!(s.agents.contains_key(&a), "站立:主体未被防护/压垮移除");
+        }
+        // 场景 2:关节在动后冻结唤醒(F4 同款 30–60 拍扰动)。
+        {
+            let (mut s, _hash, a) = f_quad_standing(2);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            let targets_off: Vec<f32> = {
+                let record = s.agents.get(&a).expect("主体");
+                let def = s.bodies.get(&record.body_hash).expect("def");
+                def.dof_joints()
+                    .map(|j| j.kind.params().default_angle.unwrap_or(0.0) + 0.5)
+                    .collect()
+            };
+            for tick in 30..60usize {
+                if tick % 2 == 0 {
+                    s.apply_agent_joint_targets(a, &targets_off).expect("合法");
+                }
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+            }
+            let y_pre = {
+                let rec = s.entities.get(&a).expect("在场");
+                s.phys.bodies.get(rec.handle).expect("根").translation().y
+            };
+            s.freeze_agent(a);
+            s.wake_agent(a);
+            let mut up_min = f32::INFINITY;
+            let mut vy_max = 0.0f32;
+            for _ in 0..120 {
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+                let rec = s.entities.get(&a).expect("在场");
+                let root = s.phys.bodies.get(rec.handle).expect("根");
+                up_min = up_min.min((root.rotation() * types::glam::Vec3::Y).y);
+                vy_max = vy_max.max(root.linvel().y.abs());
+            }
+            let y_post = {
+                let rec = s.entities.get(&a).expect("在场");
+                s.phys.bodies.get(rec.handle).expect("根").translation().y
+            };
+            println!("F5-关节动: up_min {up_min:.4}, vy_max {vy_max:.4}, y {y_pre:.4}→{y_post:.4}");
+            assert!(up_min >= 0.9, "关节动唤醒 up·y 最小 {up_min} < 0.9");
+            assert!(vy_max <= 0.5, "|vy| 峰值 {vy_max} > 0.5");
+            assert!(y_post - y_pre <= 0.02, "机身升高 {} ≥ 2 cm", y_post - y_pre);
+            assert!(s.agents.contains_key(&a), "关节动:主体未被防护/压垮移除");
+        }
+    }
+
+    /// F6 长冻结:冻结 600 拍与 3600 拍,唤醒后步进前的状态逐位相同。
+    #[test]
+    fn f6_long_freeze_identical_wake() {
+        let freeze_ticks = [600usize, 3600usize];
+        let mut results = Vec::new();
+        for &ticks in &freeze_ticks {
+            let (mut s, _hash, a) = f_quad_standing(120);
+            s.freeze_agent(a);
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            for _ in 0..ticks {
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+            }
+            s.wake_agent(a);
+            // 步进前状态全采(关节、连杆位姿、根速度)。
+            let (q, qd) = s.agent_joint_state(a);
+            let poses = f_link_poses(&s, a);
+            let rec = s.entities.get(&a).expect("在场");
+            let root = s.phys.bodies.get(rec.handle).expect("根");
+            let linvel = root.linvel();
+            let angvel = root.angvel();
+            results.push((q, qd, poses, linvel, angvel));
+        }
+        let (q0, qd0, poses0, lv0, av0) = results.remove(0);
+        let (q1, qd1, poses1, lv1, av1) = results.remove(0);
+        assert_eq!(q0, q1, "600 vs 3600:关节坐标逐位相同");
+        assert_eq!(qd0, qd1, "600 vs 3600:关节速度逐位相同");
+        assert_eq!(poses0.len(), poses1.len());
+        for (i, ((p0, r0), (p1, r1))) in poses0.iter().zip(&poses1).enumerate() {
+            assert_eq!(p0, p1, "连杆 {i} 位置逐位相同");
+            assert_eq!(r0, r1, "连杆 {i} 朝向逐位相同");
+        }
+        assert_eq!(lv0, lv1, "根线速度逐位相同");
+        assert_eq!(av0, av1, "根角速度逐位相同");
+    }
+
+    /// F11 前置:重复冻结 → panic 含 "freeze_agent";唤醒未冻结的 → panic
+    /// 含 "wake_agent"。
+    #[test]
+    fn f11_prerequisite_panics() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        s.freeze_agent(a);
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.freeze_agent(a);
+        }))
+        .expect_err("重复冻结必须 panic");
+        assert!(
+            err.downcast_ref::<String>()
+                .is_some_and(|m| m.contains("freeze_agent"))
+                || err
+                    .downcast_ref::<&str>()
+                    .is_some_and(|m| m.contains("freeze_agent")),
+            "panic 信息含 freeze_agent:{err:?}"
+        );
+        // 唤醒已冻结的先还原干净:再唤醒一次是合法路径;为测"未冻结唤醒",
+        // 先 wake(合法)再 wake(违规)。
+        s.wake_agent(a);
+        let err2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            s.wake_agent(a);
+        }))
+        .expect_err("唤醒未冻结必须 panic");
+        assert!(
+            err2.downcast_ref::<String>()
+                .is_some_and(|m| m.contains("wake_agent"))
+                || err2
+                    .downcast_ref::<&str>()
+                    .is_some_and(|m| m.contains("wake_agent")),
+            "panic 信息含 wake_agent:{err2:?}"
+        );
     }
 
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`

@@ -334,6 +334,13 @@ pub struct Outbox {
     /// 一只 +1。纯计数(随 Outbox 走,不影响确定性;**v12 追加**:Outbox
     /// 布局变化,旧档解码失败/版本拒绝)。
     pub agent_crush_removed: u64,
+    /// 本拍被冻结的主体数(B03b:`freeze_agent`,REQ-012 §3"快照 + 障碍物
+    /// "):每次冻结 +1。纯计数(随 Outbox 走,不影响确定性)。生产路径
+    /// 当前无调用点(主体在各冻结入口豁免;B03c 接冻结决策)。
+    pub agent_frozen: u64,
+    /// 本拍被唤醒的主体数(B03b:`wake_agent`,REQ-012 §3):每次唤醒 +1。
+    /// 纯计数(随 Outbox 走,不影响确定性)。
+    pub agent_woken: u64,
 }
 
 /// 强制落地的原因(06c 遥测;§4.16"截止、预算分计")。
