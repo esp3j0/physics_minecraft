@@ -251,8 +251,10 @@ struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
-    /// 数据目录(checkpoints.redb 所在;关服后读检查点用)。
-    data_dir: std::path::PathBuf,
+    /// 数据目录的持有者(checkpoints.redb 所在;最后一个持有者 drop 时
+    /// 目录被删除,测试 panic 时也会)。重启段裸调 `app::driver::bootstrap`
+    /// 时用 `h.data.clone()` 克隆 Arc 把目录续命到第二次起服。
+    data: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// 关服后从 data_dir 读出全部检查点(ID 1..=latest;keep 默认 10,
@@ -278,16 +280,23 @@ fn read_all_checkpoints(data_dir: &std::path::Path) -> Vec<(Tick, Vec<u8>)> {
 
 /// 起服辅助(R1-1:唯一写法)——**经真实 `bootstrap`**装配(全新启动分支
 /// = 第 6 项 `None`),第 6 项原样填进 `DriverArgs`,不手工挑 `None`/`Some`;
-/// 存储用 bootstrap 打开的 redb 文件(temp 下唯一目录,不碰本地 data/)。
+/// 存储用 bootstrap 打开的 redb 文件(TempDir 持有的唯一目录,不碰本地 data/)。
 async fn bootstrap_harness(config: Config) -> Harness {
-    // 目录唯一性:原子计数(并行测试同纳秒会撞 redb 文件锁)。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let data_dir = std::env::temp_dir().join(format!("b02b_r1_{}_{}", std::process::id(), unique));
+    let data = std::sync::Arc::new(
+        tempfile::Builder::new()
+            .prefix("b02b_r1_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    bootstrap_harness_in(config, data).await
+}
+
+/// 在给定的数据目录上起服(重启类测试用:同一目录可再次起服)。
+async fn bootstrap_harness_in(config: Config, data: std::sync::Arc<tempfile::TempDir>) -> Harness {
     // data_dir 必须指到 temp:bootstrap 从 config 读目录(默认 "data" = 仓库
     // 本地库,测试绝不碰;E1 首轮踩过——残留检查点让 bootstrap 走恢复分支)。
     let mut config = config;
-    config.data_dir = data_dir.clone();
+    config.data_dir = data.path().to_path_buf();
     let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
@@ -336,7 +345,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         tx,
         driver: Some(driver),
         addr,
-        data_dir,
+        data,
     }
 }
 
@@ -403,7 +412,7 @@ async fn e1_startup_quad_trot_walks() {
     assert!(dist >= 0.5, "起步后 300 拍内前进 {dist:.3} m < 0.5 m");
     assert!(up_min >= 0.7, "up·y 最小 {up_min} < 0.7");
 
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     println!(
         "E1 counters: actions_emitted {} send_rejected {} spawned {} timeouts {}",
@@ -418,7 +427,7 @@ async fn e1_startup_quad_trot_walks() {
     );
     // 日志:SpawnAgent 恰 1 条(SCHEDULER 盖章)+ AgentJointTargets 若干。
     // 终末检查点在 shutdown 时落盘:从 data_dir 的 checkpoint 库读取。
-    let log = stitched_log(&read_all_checkpoints(&cps_dir));
+    let log = stitched_log(&read_all_checkpoints(cps_dir.path()));
     let mut spawns = 0usize;
     let mut joints = 0usize;
     let mut spawn_sources = Vec::new();
@@ -503,7 +512,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
     // 重启段 bootstrap 的配置:同 harness 的 data_dir(唯一 temp 目录),
     // 其余同 config。
     let mut restart_config = config.clone();
-    restart_config.data_dir = h.data_dir.clone();
+    restart_config.data_dir = h.data.path().to_path_buf();
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -513,7 +522,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
     .expect("MoveObserver 写入");
     let (entity0, _n, _samples) = sample_quad_root(&mut rx, 200).await;
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome1 = shutdown(h).await;
     assert_eq!(outcome1.startup_counters.spawned, 1, "首段生成恰 1 只");
     assert_eq!(
@@ -526,7 +535,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
     //    透传给 run)。注意先读库再 bootstrap:redb 单写锁,bootstrap 会
     //    持有目录里两个库的锁,读完成后再装配。——
     {
-        let cps = read_all_checkpoints(&data_dir);
+        let cps = read_all_checkpoints(data_dir.path());
         let (_, blob) = cps.last().expect("终末检查点存在").clone();
         let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
         assert_eq!(
@@ -662,12 +671,12 @@ async fn e3_replay_bitwise_matches_online() {
     .expect("MoveObserver 写入");
     let (_entity, _n, samples) = sample_quad_root(&mut rx, 420).await;
     drop(a);
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     let _ = outcome;
 
     // 最早检查点 + 其后拼接日志(终末在 shutdown 时落盘)。
-    let checkpoints = read_all_checkpoints(&cps_dir);
+    let checkpoints = read_all_checkpoints(cps_dir.path());
     assert!(
         checkpoints.len() >= 2,
         "期中 + 终末都有(实得 {})",
@@ -799,9 +808,15 @@ fn e5_config_errors_reject_startup() {
         _other => panic!("未知身体应返回 Config(StartupAgent)"),
     };
     assert!(msg.contains("不在注册表"), "错误写明原因:{msg}");
-    // bootstrap 同口径拒绝(不 panic;data_dir 指向临时目录防碰本地 data/)。
+    // bootstrap 同口径拒绝(不 panic;data_dir 用完即删的临时目录防碰本地
+    // data/)。拒绝发生在开库前,但 bootstrap 先 `create_dir_all`,目录会留下
+    // ——由 TempDir 持有回收。
     let mut cb = c.clone();
-    cb.data_dir = std::env::temp_dir().join("b02b_e5_bootstrap");
+    let e5_dir = tempfile::Builder::new()
+        .prefix("b02b_e5_bootstrap_")
+        .tempdir()
+        .expect("临时目录");
+    cb.data_dir = e5_dir.path().to_path_buf();
     let boot = app::driver::bootstrap(&cb, || Box::new(SimpleRegistry::builtin()));
     assert!(
         matches!(
@@ -959,7 +974,7 @@ async fn e7_no_agents_world_unchanged() {
     config.checkpoint_interval_ticks = 6000;
     let h = bootstrap_harness(config).await;
     advance_ticks(120).await;
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.controller_counters,
@@ -969,7 +984,7 @@ async fn e7_no_agents_world_unchanged() {
         outcome.startup_counters,
         app::startup_agents::StartupCounters::default()
     );
-    let cps = read_all_checkpoints(&cps_dir);
+    let cps = read_all_checkpoints(cps_dir.path());
     let (_, blob) = cps.last().expect("终末检查点").clone();
     let bundle = app::driver::decode_checkpoint(&blob).expect("可解");
     let window = CommandLog::from_bytes(&bundle.log_bytes).expect("窗口可解");
@@ -992,7 +1007,7 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
     let config = quad_config(vec![agent]);
     let h = bootstrap_harness(config).await;
     advance_ticks(660).await; // 600 超时 + 余量
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.startup_counters.spawn_timeouts, 1,
@@ -1013,7 +1028,7 @@ async fn e8_spawn_timeout_gives_up_gracefully() {
     );
     // R1-4:放弃后撤票——日志窗口有对应的 RemoveAreaTicket(同一保留区间
     // ID),且 SetAreaTicket 全程恰 1 条(重试不重复放票)。
-    let log = stitched_log(&read_all_checkpoints(&cps_dir));
+    let log = stitched_log(&read_all_checkpoints(cps_dir.path()));
     let mut set_ids: Vec<u64> = Vec::new();
     let mut removed_ids: Vec<u64> = Vec::new();
     for e in log.entries() {
@@ -1106,12 +1121,12 @@ async fn e10_bootstrap_roundtrip_startup_controllers() {
     // 等到主体帧出现(= 已生成),拿到生成的 EntityId。
     let (entity0, _n, _samples) = sample_quad_root(&mut rx, 120).await;
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(outcome.startup_counters.spawned, 1, "首段生成 1 只");
     // 同一 data_dir 重启 bootstrap:第 6 项 = Some 恰 1 条,entity 对得上。
     let mut restart_config = config;
-    restart_config.data_dir = data_dir.clone();
+    restart_config.data_dir = data_dir.path().to_path_buf();
     let (_session, _log, _store, resume_from, _seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 成功");
@@ -1126,5 +1141,59 @@ async fn e10_bootstrap_roundtrip_startup_controllers() {
     assert_eq!(
         records[0].entity, entity0,
         "ControllerRecord.entity = 第一段生成的那只"
+    );
+}
+
+// ---- 夹具自证:数据目录用完即删 ------------------------------------------------
+
+/// 起服 → 推 10 拍 → 关服 → 记下路径 → drop 全部持有者 → 目录必须不存在。
+/// `TempDir` drop 删除失败不报错(如 redb 句柄未关,Windows 删不掉);
+/// 这条测试就是用来抓这种泄漏的。
+#[tokio::test(start_paused = true)]
+async fn harness_data_dir_removed_after_use() {
+    let path;
+    {
+        let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
+        config.checkpoint_interval_ticks = 6000;
+        let h = bootstrap_harness(config).await;
+        path = h.data.path().to_path_buf();
+        advance_ticks(10).await;
+        let _ = shutdown(h).await;
+    }
+    assert!(
+        !path.exists(),
+        "数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
+    );
+}
+
+/// 重启流程同款(E10 口径:起服 → 关服 → 同目录裸调 `bootstrap`,断言
+/// `resume_from.is_some()`)→ 全部持有者 drop → 目录必须不存在(redb 单写
+/// 锁:第二次 `bootstrap` 的 store 隐含关掉了首段的文件句柄)。
+#[tokio::test(start_paused = true)]
+async fn restart_data_dir_removed_after_use() {
+    let path;
+    {
+        let mut config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
+        config.checkpoint_interval_ticks = 6000;
+        let h = bootstrap_harness(config.clone()).await;
+        let data = h.data.clone();
+        // 推 1 拍再关服:终末检查点写到库,重启才有恢复分支(z1/b03d 同口径)。
+        advance_ticks(1).await;
+        shutdown(h).await;
+        let mut restart_config = config.clone();
+        restart_config.data_dir = data.path().to_path_buf();
+        let (_resumed, _log2, store2, resume_from, _seq, _resume) =
+            app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+                .expect("重启 bootstrap 装配成功");
+        assert!(resume_from.is_some(), "重启段走恢复分支");
+        path = data.path().to_path_buf();
+        drop(store2);
+        drop(data);
+    }
+    assert!(
+        !path.exists(),
+        "重启后的数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
     );
 }
