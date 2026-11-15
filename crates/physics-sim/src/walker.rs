@@ -283,6 +283,12 @@ impl ShardSim {
             let Some(record) = self.agents.get(id) else {
                 continue;
             };
+            // 冻结的主体不决策、不施力(B03b 1.4:行为表"行走控制段"——
+            // walker_holds 里没有它;这里再挡控制拍决策本身,防止决策段
+            // 重新写 walker_holds 与 set_rotation)。
+            if record.frozen.is_some() {
+                continue;
+            }
             let Some(walker) = self.bodies.get(&record.body_hash).and_then(|d| d.walker) else {
                 continue;
             };

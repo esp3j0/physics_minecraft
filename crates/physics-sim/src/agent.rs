@@ -5716,6 +5716,307 @@ anchor = [0.0, 0.0, 0.0]
         );
     }
 
+    /// F8 单连杆:胶囊持有行走意图走 60 拍后冻结,步进 300 拍,位置逐位不
+    /// 变;唤醒后意图与保持的力与冻结前相同,120 拍后沿航向速度 ≥ 冻结前
+    /// 的 80%。
+    #[test]
+    fn f8_single_link_freeze_wake_resume() {
+        let (mut s, _hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let capsule = s.bodies.hash_of("capsule").expect("capsule 已装");
+        let a_cap = types::EntityId::from_parts(2, 2);
+        s.spawn_agent(
+            a_cap,
+            capsule,
+            types::EntityState {
+                translation: Vec3::new(24.0, GROUND_TOP_Y + 0.95, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("胶囊生成");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 持意图向前走 60 拍(意图命令路径:apply_prefix)。
+        for tick in 0..60usize {
+            let mut inputs = Vec::new();
+            if tick == 0 {
+                inputs.push(intent_input(a_cap, 1, (2.0, 0.0), 0.0, false));
+            }
+            if !inputs.is_empty() {
+                s.apply_prefix(&inputs);
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 自检:在走(vfwd > 0.5)。
+        let vfwd_pre = {
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            rb.linvel().x
+        };
+        println!("F8: 冻结前 vfwd {vfwd_pre:.4} m/s");
+        assert!(vfwd_pre > 0.5, "布景自检:冻结前进速度 {vfwd_pre} ≤ 0.5");
+        let (intent_pre, hold_pre, pos_pre, linvel_pre) = {
+            let record = s.agents.get(&a_cap).expect("主体");
+            let hold = s.walker_holds.get(&a_cap).copied();
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            (
+                (record.intent_move, record.intent_yaw),
+                hold,
+                rb.translation(),
+                rb.linvel(),
+            )
+        };
+        assert!(intent_pre.0.is_some(), "布景自检:意图在记录里");
+        s.freeze_agent(a_cap);
+        let freeze_pose = f_obstacle_pose(&s, a_cap);
+        for _ in 0..300 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 位置逐位不变(障碍物)。
+        let pose_frozen = f_obstacle_pose(&s, a_cap);
+        assert_eq!(freeze_pose.0, pose_frozen.0, "冻结期间障碍物位姿逐位不变");
+        assert_eq!(freeze_pose.1, pose_frozen.1, "冻结期间障碍物朝向逐位不变");
+        s.wake_agent(a_cap);
+        // 唤醒后意图与保持的力与冻结前相同。
+        {
+            let record = s.agents.get(&a_cap).expect("主体");
+            assert_eq!(record.intent_move, intent_pre.0, "意图 move 与冻结前相同");
+            assert_eq!(record.intent_yaw, intent_pre.1, "意图 yaw 与冻结前相同");
+            let hold = s.walker_holds.get(&a_cap).copied();
+            assert_eq!(hold, hold_pre, "保持的力与冻结前相同");
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            assert_eq!(rb.translation(), pos_pre, "根位置 = 冻结前逐位");
+            assert_eq!(rb.linvel(), linvel_pre, "根线速度 = 冻结前逐位(恢复)");
+        }
+        // 120 拍后沿航向速度 ≥ 冻结前的 80%。
+        for _ in 0..120 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let vfwd_post = {
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            rb.linvel().x
+        };
+        println!("F8: 唤醒 120 拍后 vfwd {vfwd_post:.4} vs 冻结前 {vfwd_pre:.4}");
+        assert!(
+            vfwd_post >= 0.8 * vfwd_pre,
+            "唤醒后速度比 {vfwd_post}/{vfwd_pre} < 80%"
+        );
+    }
+
+    /// F9 冻结期间的读数与命令:`agent_joint_positions` = 快照;
+    /// `apply_agent_joint_targets` 长度对 → Ok 且 `joint_targets` 更新,唤醒
+    /// 后电机目标 = 新值;长度错 → 原来的错误;600 拍内失控防护、压垮不
+    /// 触发,`embedded_ticks` 不变。
+    #[test]
+    fn f9_frozen_readings_and_commands() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        let targets_new: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0) + 0.3)
+                .collect()
+        };
+        s.freeze_agent(a);
+        // 读数 = 快照。
+        let (frozen_q, frozen_qd) = {
+            let record = s.agents.get(&a).expect("主体");
+            let f = record.frozen.as_ref().expect("已冻结");
+            (f.joint_q.clone(), f.joint_qd.clone())
+        };
+        assert_eq!(
+            s.agent_joint_positions(a).expect("多连杆有读数"),
+            frozen_q,
+            "agent_joint_positions = 快照 joint_q"
+        );
+        assert_eq!(
+            s.agent_joint_velocities(a).expect("多连杆有读数"),
+            frozen_qd,
+            "agent_joint_velocities = 快照 joint_qd"
+        );
+        // 长度对的命令:Ok 且 joint_targets 更新。
+        let clamped = s.apply_agent_joint_targets(a, &targets_new).expect("合法");
+        let _ = clamped;
+        assert_eq!(
+            s.agent_joint_targets(a).expect("目标表"),
+            targets_new.as_slice(),
+            "冻结期间命令更新 record.joint_targets"
+        );
+        // 长度错:原来的错误(LengthMismatch)。
+        let err = s
+            .apply_agent_joint_targets(a, &[0.0; 5])
+            .expect_err("长度错必拒");
+        assert_eq!(
+            err,
+            AgentJointTargetsError::LengthMismatch,
+            "长度错 → LengthMismatch(原口径)"
+        );
+        // 600 拍:失控防护、压垮不触发,embedded_ticks 不变。
+        let embedded_pre = s.agents.get(&a).expect("主体").embedded_ticks;
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..600 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        assert!(s.agents.contains_key(&a), "600 拍内主体未被移除");
+        assert_eq!(
+            s.agents.get(&a).expect("主体").embedded_ticks,
+            embedded_pre,
+            "embedded_ticks 不变"
+        );
+        assert_eq!(s.take_outbox().agent_runaway_removed, 0, "失控防护不触发");
+        // 唤醒后电机目标 = 新值(冻结期间命令的 target)。
+        s.wake_agent(a);
+        {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            let mb_index = s.agent_multibody_index(record).expect("mb");
+            let mb = s.phys.multibody_joints.get_multibody(mb_index).expect("mb");
+            for (dof_i, j) in def.dof_joints().enumerate() {
+                let &handle = record.links.get(&j.child).expect("child");
+                let lid = s
+                    .phys
+                    .multibody_joints
+                    .rigid_body_link(handle)
+                    .expect("link");
+                let link = mb.link(lid.id).expect("link");
+                assert!(
+                    (link.joint.data.motors[3].target_pos - targets_new[dof_i]).abs() < 1e-6,
+                    "唤醒后电机目标 = 冻结期间的新值(dof {dof_i})"
+                );
+            }
+        }
+    }
+
+    /// F10 冻结中移除:`despawn_agent` 与 `remove_agent_as_void` 各一案,刚
+    /// 体、碰撞体、multibody 数回到生成前。
+    #[test]
+    fn f10_despawn_and_void_from_frozen() {
+        // 生成前基准(f_quad_standing 已生成:四足 = 13 连杆刚体/碰撞体、
+        // 12 个 multibody 关节;从冻结前计数减去即生成前世界)。
+        const QUAD_LINKS: usize = 13;
+        // despawn_agent 案。
+        {
+            let (mut s, _hash, a) = f_quad_standing(120);
+            let bodies_spawn0 = s.phys.bodies.len() - QUAD_LINKS;
+            let colliders_spawn0 = s.phys.colliders.len() - QUAD_LINKS;
+            let mb_spawn0 = s.phys.multibody_joints.iter().count() - 12;
+            s.freeze_agent(a);
+            s.despawn_agent(a);
+            assert!(!s.agents.contains_key(&a), "agents 清");
+            assert!(!s.entities.contains_key(&a), "entities 清");
+            assert_eq!(s.phys.bodies.len(), bodies_spawn0, "刚体数回到生成前");
+            assert_eq!(
+                s.phys.colliders.len(),
+                colliders_spawn0,
+                "碰撞体数回到生成前"
+            );
+            assert_eq!(
+                s.phys.multibody_joints.iter().count(),
+                mb_spawn0,
+                "multibody 数回到生成前"
+            );
+        }
+        // remove_agent_as_void 案。
+        {
+            let (mut s, _hash, a) = f_quad_standing(120);
+            let bodies_spawn0 = s.phys.bodies.len() - QUAD_LINKS;
+            let colliders_spawn0 = s.phys.colliders.len() - QUAD_LINKS;
+            let mb_spawn0 = s.phys.multibody_joints.iter().count() - 12;
+            s.freeze_agent(a);
+            s.remove_agent_as_void(a);
+            assert!(!s.agents.contains_key(&a), "agents 清");
+            assert!(!s.entities.contains_key(&a), "entities 清");
+            assert_eq!(s.phys.bodies.len(), bodies_spawn0, "刚体数回到生成前");
+            assert_eq!(
+                s.phys.colliders.len(),
+                colliders_spawn0,
+                "碰撞体数回到生成前"
+            );
+            assert_eq!(
+                s.phys.multibody_joints.iter().count(),
+                mb_spawn0,
+                "multibody 数回到生成前"
+            );
+        }
+    }
+
+    /// F13 八只:8 只四足同拍冻结、同拍唤醒,各自唤醒误差满足 F4 的位置
+    /// 判据,互不串。
+    #[test]
+    fn f13_eight_agents_freeze_wake() {
+        let (mut s, _hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let quad_hash = {
+            let (_, h) = quad_registry();
+            h
+        };
+        let observers: Vec<Vec3> = (0..8)
+            .map(|i| Vec3::new(16.0 + 2.0 * i as f32, 3.45, 24.0))
+            .collect();
+        let mut ids = Vec::new();
+        for i in 0..8usize {
+            let a = types::EntityId::from_parts(3, i as u32 + 1);
+            let x = 16.0 + 2.0 * i as f32;
+            s.spawn_agent(a, quad_hash, quad_spawn_state(quad_origin(x, 24.0)), None)
+                .expect("四足生成");
+            ids.push(a);
+        }
+        assert_eq!(ids.len(), 8, "8 只");
+        let stand: Vec<f32> = {
+            let def = s.bodies.get(&quad_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                .collect()
+        };
+        for tick in 0..120usize {
+            if tick % 2 == 0 {
+                for a in &ids {
+                    s.apply_agent_joint_targets(*a, &stand).expect("合法");
+                }
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 同拍冻结,各自保留位姿参照。
+        let mut poses_pre = Vec::new();
+        for a in &ids {
+            poses_pre.push(f_link_poses(&s, *a));
+            s.freeze_agent(*a);
+        }
+        for _ in 0..60 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 同拍唤醒,逐只比较位置判据(F4 口径:< 1e-4)。
+        for (i, a) in ids.iter().enumerate() {
+            s.wake_agent(*a);
+            let poses = f_link_poses(&s, *a);
+            let mut max_p = 0.0f32;
+            let mut max_r = 0.0f32;
+            for ((p_now, r_now), (p_ref, r_ref)) in poses.iter().zip(&poses_pre[i]) {
+                max_p = max_p.max((p_now - p_ref).length());
+                let dq = r_now * r_ref.inverse();
+                max_r = max_r.max(2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length());
+            }
+            println!("F13: 第 {i} 只 pos_err {max_p:.3e} m, rot_err {max_r:.3e} rad");
+            assert!(max_p < 1e-4, "第 {i} 只连杆位置误差 {max_p:.3e} ≥ 1e-4");
+            assert!(max_r < 1e-4, "第 {i} 只连杆朝向误差 {max_r:.3e} ≥ 1e-4");
+        }
+    }
+
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
     /// 之后(BTreeMap 名字序 = a_arm 第一项),一个 revolute 关节(z 轴)。
     /// 专杀 `restore_agent_joint_state` 旧实现"根 = links 表第一项"的取法
