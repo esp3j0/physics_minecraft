@@ -889,6 +889,13 @@ impl Session {
             .collect()
     }
 
+    /// 已冻结的主体集合(REQ-012 B03c 第 2 节;做法照
+    /// `in_transit_entities`):各分片 `frozen_agent_ids` 的并集,
+    /// EntityId 升序。驱动侧控制者据此跳过冻结的主体(冻结期间不进日志)。
+    pub fn frozen_agents(&self) -> std::collections::BTreeSet<EntityId> {
+        self.scheduler.frozen_agents()
+    }
+
     /// 主体所在分片的控制器保持态(REQ-012 A04 判据观测口;透传调度器)。
     /// 主体不在任何分片/迁移窗口 → None。
     pub fn walker_hold_of(&self, entity: EntityId) -> Option<(f32, f32, f32)> {

@@ -133,6 +133,11 @@ pub struct TickSummary {
     /// 按"最危险"规则(`s / C` 最大,C=0 视为 ∞;并列按 kind、position 位
     /// 模式升序)取一条。每拍重算、纯只读遥测、不入快照。
     pub flow_event: Option<physics_sim::FlowEventInfo>,
+    /// 本拍主体冻结数合计(REQ-012 B03c 第 2 节;全部分片的
+    /// `Outbox::agent_frozen` 相加)。每拍重算、纯遥测、不入快照。
+    pub agent_frozen: u64,
+    /// 本拍主体唤醒数合计(REQ-012 B03c 第 2 节;同上 `agent_woken`)。
+    pub agent_woken: u64,
 }
 
 /// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
@@ -1807,6 +1812,9 @@ impl Scheduler {
         // 规则取一条(results 升序迭代 + [`FlowEventInfo::pick`] 的确定
         // 决出,顺序无关且确定)。outbox 每拍取走即清,本值每拍重算。
         let mut flow_event: Option<physics_sim::FlowEventInfo> = None;
+        // 主体冻结/唤醒计数合计(B03c 第 2 节;outbox 每拍取走即清,逐分片相加)。
+        let mut agent_frozen_total = 0u64;
+        let mut agent_woken_total = 0u64;
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
@@ -1829,6 +1837,9 @@ impl Scheduler {
             // 冲量流事件摘要(REQ-011 §3.5.1;W03):并入"最危险"一条。
             flow_event =
                 physics_sim::FlowEventInfo::pick(flow_event.take(), outbox.flow_event.take());
+            // 主体冻结/唤醒计数(B03c 第 2 节):逐分片并入合计。
+            agent_frozen_total += outbox.agent_frozen;
+            agent_woken_total += outbox.agent_woken;
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -2388,6 +2399,8 @@ impl Scheduler {
             destruction,
             cohesion,
             flow_event,
+            agent_frozen: agent_frozen_total,
+            agent_woken: agent_woken_total,
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -2600,6 +2613,16 @@ impl Scheduler {
             .sum()
     }
 
+    /// 已冻结的主体 EntityId 并集(B03c 第 2 节):各分片
+    /// `frozen_agent_ids` 的并集,ShardId 升序逐分片收集(键序确定性)。
+    /// 驱动侧控制者据此跳过冻结的主体。
+    pub fn frozen_agents(&self) -> std::collections::BTreeSet<types::EntityId> {
+        self.sims
+            .values()
+            .flat_map(|sim| sim.frozen_agent_ids())
+            .collect()
+    }
+
     pub fn shard_count(&self) -> usize {
         self.sims.len()
     }
@@ -2714,6 +2737,8 @@ mod tests {
                 destruction: physics_sim::destruction::DestructionStats::default(),
                 cohesion: physics_sim::cohesion::CohesionStats::default(),
                 flow_event: None,
+                agent_frozen: 0,
+                agent_woken: 0,
             }
         );
         sched.shutdown();

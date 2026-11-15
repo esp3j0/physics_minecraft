@@ -906,6 +906,11 @@ pub struct AgentCounters {
     /// 等待中的重生被该连接自己的 `SpawnAgent` 取消的次数(R3 §6 修订:
     /// "等待期间这个连接自己发 SpawnAgent 并被接受时,取消等待中的重生")。
     pub respawn_wait_cancelled: u64,
+    /// 主体被冻结的累计次数(B03c 第 2 节;逐拍累加自
+    /// `TickSummary::agent_frozen` 全分片合计,随 DriverOutcome 上报)。
+    pub agent_frozen: u64,
+    /// 主体被唤醒的累计次数(B03c 第 2 节;同上 `agent_woken`)。
+    pub agent_woken: u64,
 }
 
 impl std::ops::Add for AgentCounters {
@@ -926,6 +931,8 @@ impl std::ops::Add for AgentCounters {
             player_respawned: self.player_respawned + rhs.player_respawned,
             player_respawn_failed: self.player_respawn_failed + rhs.player_respawn_failed,
             respawn_wait_cancelled: self.respawn_wait_cancelled + rhs.respawn_wait_cancelled,
+            agent_frozen: self.agent_frozen + rhs.agent_frozen,
+            agent_woken: self.agent_woken + rhs.agent_woken,
         }
     }
 }
@@ -2655,6 +2662,10 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
                     orchestrator.record_debug_telemetry(&summary, session.tick_now());
                     orchestrator.maybe_emit_debug_stats(hub, session.tick_now());
+                    // 主体冻结/唤醒计数(B03c 第 2 节):逐拍累加自本拍
+                    // TickSummary 的全分片合计,随 DriverOutcome 上报。
+                    agent_counters.agent_frozen += summary.agent_frozen;
+                    agent_counters.agent_woken += summary.agent_woken;
                     // 主体遥测并入累计(§6:退出时随 DriverOutcome 上报)。
                     agent_counters = agent_counters + orchestrator.agent_counters_delta();
                 }
@@ -7199,6 +7210,8 @@ mod tests {
             destruction,
             cohesion,
             flow_event,
+            agent_frozen: 0,
+            agent_woken: 0,
         }
     }
 
