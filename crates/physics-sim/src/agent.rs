@@ -335,6 +335,9 @@ impl ShardSim {
     /// 本分片主体的连杆形状表条目(REQ-012 §6"暂缓写入",A05):调度器在
     /// 每拍步进前汇总全部分片的条目(∪ 在途信封)下发给每个分片。位姿 =
     /// 连杆刚体的世界位姿;形状与生成层同一映射。EntityId 升序。
+    /// 冻结的主体(B03c 1.3,补 B03b 漏项):`record.links` 只剩根一条,
+    /// 按 `frozen.link_poses` 逐连杆给条目(位姿取快照,形状与包络半径同
+    /// 生成层),条数 = 连杆数——冻结的主体的腿同样受暂缓写入保护。
     pub fn agent_shape_entries(&self) -> crate::agent_shape::AgentShapeTable {
         let mut table = crate::agent_shape::AgentShapeTable::default();
         for (&id, record) in &self.agents {
@@ -342,23 +345,37 @@ impl ShardSim {
                 .bodies
                 .get(&record.body_hash)
                 .expect("主体身体哈希必在注册表(restore 前置校验,fail-stop)");
-            let links = def
-                .links
-                .iter()
-                .filter_map(|link| {
-                    record.links.get(&link.name).and_then(|&handle| {
-                        self.phys
-                            .bodies
-                            .get(handle)
-                            .map(|rb| crate::agent_shape::AgentLinkEntry {
-                                pose: *rb.position(),
-                                shape: agent_link_shared_shape(&link.shapes),
-                                bound_radius: crate::agent_shape::link_bound_radius(&link.shapes),
-                                center: crate::conv::rapier_to_vec3(rb.translation()),
-                            })
+            let links = if let Some(frozen) = &record.frozen {
+                frozen
+                    .link_poses
+                    .iter()
+                    .zip(&def.links)
+                    .map(|(pose, link)| crate::agent_shape::AgentLinkEntry {
+                        pose: crate::conv::pose_to_rapier(pose.translation, pose.rotation),
+                        shape: agent_link_shared_shape(&link.shapes),
+                        bound_radius: crate::agent_shape::link_bound_radius(&link.shapes),
+                        center: pose.translation,
                     })
-                })
-                .collect();
+                    .collect()
+            } else {
+                def.links
+                    .iter()
+                    .filter_map(|link| {
+                        record.links.get(&link.name).and_then(|&handle| {
+                            self.phys.bodies.get(handle).map(|rb| {
+                                crate::agent_shape::AgentLinkEntry {
+                                    pose: *rb.position(),
+                                    shape: agent_link_shared_shape(&link.shapes),
+                                    bound_radius: crate::agent_shape::link_bound_radius(
+                                        &link.shapes,
+                                    ),
+                                    center: crate::conv::rapier_to_vec3(rb.translation()),
+                                }
+                            })
+                        })
+                    })
+                    .collect()
+            };
             table.links.insert(id, links);
         }
         table
@@ -6466,6 +6483,156 @@ anchor = [0.0, 0.0, 0.0]
         for (i, (x, y)) in run_a.iter().zip(&run_b).enumerate() {
             assert_eq!(x, y, "第 {i} 条记录逐位不同");
         }
+    }
+
+    /// T7(B03c 1.3):冻结的四足 `agent_shape_entries` 有 13 条、位姿与
+    /// 冻结前逐位相同(冻结分支按 `frozen.link_poses` 逐连杆给条目);往
+    /// 一条腿所在的格发实心 SetBlock → 被暂缓(照 K12/A05 的断言方式);
+    /// 主体唤醒并走开后补写生效。旧代码(冻结分支漏项)上本测试红:
+    /// 形状表只有根 1 条,腿格不重叠 → SetBlock 直接生效、暂缓队列为空。
+    #[test]
+    fn t7_shape_table_covers_frozen_legs_deferred_write() {
+        // 布景 = K12 同款:机身绕 z 转 90° 横躺悬空(24.9, 2.0, 24.5)——
+        // 腿链水平伸向 +x,shank 格 (25,·,·) 与机身格 (24,·,·) 分离(站立
+        // 姿态下所有连杆共享同一竖直格,判据区分不出"非根连杆在表里")。
+        // 冻结前先把站立目标写进记录一次(wake_agent 步骤 4 按记录当前的
+        // joint_targets 写电机,空表会 LengthMismatch panic;B01a K 组同款)。
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(24.9, 2.0, 24.5),
+                rotation: types::glam::Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("四足生成");
+        let stand: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                .collect()
+        };
+        s.apply_agent_joint_targets(a, &stand).expect("合法");
+        // 冻结前:一条腿(shank,links[3])所在的格 + 表条目(K12 口径)。
+        let (shank_cell, entries_pre) = {
+            let record = s.agents.get(&a).expect("主体登记");
+            let shank_name = s.bodies.get(&record.body_hash).expect("def").links[3]
+                .name
+                .clone();
+            let &shank_handle = record.links.get(&shank_name).expect("shank");
+            let rb = s.phys.bodies.get(shank_handle).expect("shank rb");
+            let p = crate::conv::rapier_to_vec3(rb.translation());
+            let cell =
+                types::BlockPos::new(p.x.floor() as i32, p.y.floor() as i32, p.z.floor() as i32);
+            let table = s.agent_shape_entries();
+            let entries = table.links.get(&a).expect("布景自检:表里有该主体");
+            (cell, entries.clone())
+        };
+        assert_eq!(
+            entries_pre.len(),
+            13,
+            "布景自检:冻结前形状表 13 条(实得 {})",
+            entries_pre.len()
+        );
+        // 布景自检:shank 格与根格不同(判据的区分前提;K12 同款)。
+        {
+            let rec = s.entities.get(&a).expect("在场");
+            let root_rb = s.phys.bodies.get(rec.handle).expect("根");
+            let rp = crate::conv::rapier_to_vec3(root_rb.translation());
+            let root_cell = types::BlockPos::new(
+                rp.x.floor() as i32,
+                rp.y.floor() as i32,
+                rp.z.floor() as i32,
+            );
+            assert_ne!(
+                shank_cell, root_cell,
+                "布景自检:shank 格必须与根格分离(shank {shank_cell:?},root {root_cell:?})"
+            );
+        }
+        s.freeze_agent(a);
+        // 1.3 判据:冻结后形状表仍 13 条,位姿与冻结前逐位相同(快照)。
+        let table = s.agent_shape_entries();
+        let entries = table.links.get(&a).expect("冻结后表里仍有该主体");
+        assert_eq!(
+            entries.len(),
+            13,
+            "冻结的形状表 13 条(实得 {}——旧代码只给根 1 条)",
+            entries.len()
+        );
+        for (i, (pre, post)) in entries_pre.iter().zip(entries.iter()).enumerate() {
+            assert_eq!(pre.pose, post.pose, "第 {i} 条位姿逐位相同");
+            assert!(shape_kind_matches(pre, post), "第 {i} 条形状相同");
+        }
+        // 暂缓写入判定用调度器口径(拍首注入上一拍末的形状表)。
+        s.set_agent_shape_table(table);
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 9,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SetBlock {
+                pos: shank_cell,
+                block: types::BlockId(1),
+            }),
+        }]);
+        s.step();
+        let _ = s.take_outbox();
+        assert!(
+            s.deferred_set_blocks().contains_key(&shank_cell),
+            "腿占的格的 SetBlock 被暂缓(冻结主体非根连杆同规则)"
+        );
+        // 主体唤醒(观察者在场 → plan 计划唤醒 → wake_agent),落地后电机
+        // 把机身拉回站立姿态(腿收回机身格)→ shank 格不再重叠 → 补写生效。
+        // "走开"在内核层落地为"腿离开冻结时的腿格";驱动层行走见 Y 组。
+        {
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+            assert!(
+                !s.is_agent_frozen(a),
+                "布景自检:观察者在场,主体已被计划唤醒"
+            );
+        }
+        for tick in 0..240usize {
+            if tick % 2 == 0 {
+                s.apply_agent_joint_targets(a, &stand).expect("合法");
+            }
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        {
+            let rec = s.entities.get(&a).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            let p = crate::conv::rapier_to_vec3(rb.translation());
+            println!("T7: 唤醒 240 拍后根位置 ({:.2},{:.2},{:.2})", p.x, p.y, p.z);
+        }
+        s.set_agent_shape_table(s.agent_shape_entries());
+        s.flush_agent_deferred_writes();
+        assert_eq!(
+            s.voxel().get_block(shank_cell),
+            types::BlockId(1),
+            "主体唤醒站起离开腿格后暂缓写入生效"
+        );
+    }
+
+    /// 两条形状条目的类型与尺寸一致(用形状特征比较:`compound` 长度、
+    /// `ball` 半径、AABB 半尺寸;不依赖 `Debug`/`PartialEq`)。
+    fn shape_kind_matches(
+        a: &crate::agent_shape::AgentLinkEntry,
+        b: &crate::agent_shape::AgentLinkEntry,
+    ) -> bool {
+        let va = a.shape.compute_local_aabb();
+        let vb = b.shape.compute_local_aabb();
+        let d = va.half_extents() - vb.half_extents();
+        d.x.abs() < 1e-6 && d.y.abs() < 1e-6 && d.z.abs() < 1e-6
     }
 
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
