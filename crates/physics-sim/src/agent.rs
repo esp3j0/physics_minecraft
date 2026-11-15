@@ -6080,6 +6080,118 @@ anchor = [0.0, 0.0, 0.0]
         assert!(s.is_agent(a), "仍是主体");
     }
 
+    /// F7 快照:冻结 → 快照 → restore 到新分片 → 唤醒,步进前与不中断线
+    /// 逐位相同;再各步进 60 拍仍逐位相同。检查点版本 = 14,旧 v13 档被拒
+    /// (app/driver 版本测试锚)。
+    #[test]
+    fn f7_frozen_snapshot_restore_wake() {
+        // 不中断线:站立 120 → 冻结 → 唤醒(60 拍冻结窗保持冻结)。
+        let (mut s0, _hash, a0) = f_quad_standing(120);
+        s0.freeze_agent(a0);
+        for _ in 0..60 {
+            s0.apply_activation(&[]);
+            s0.step();
+            let _ = s0.take_outbox();
+        }
+        s0.wake_agent(a0);
+        // 恢复线:同样走到冻结 60 拍,中途快照 restore 到新分片再唤醒。
+        let (mut s1, hash1, a1) = f_quad_standing(120);
+        s1.freeze_agent(a1);
+        for _ in 0..60 {
+            s1.apply_activation(&[]);
+            s1.step();
+            let _ = s1.take_outbox();
+        }
+        let bytes = s1.snapshot();
+        let restored = crate::sim::ShardSim::restore_with_bodies(
+            &bytes,
+            Box::new(SimpleRegistry::builtin()),
+            fresh_registry_clone(&s1),
+        )
+        .expect("冻结快照 restore");
+        let mut s1 = restored;
+        // restore 后仍是冻结的(状态往返)。
+        assert!(s1.is_agent_frozen(a1), "restore 后仍冻结");
+        s1.wake_agent(a1);
+        // 步进前逐位比较(关节、连杆位姿、根速度)。
+        {
+            let (q0, qd0) = s0.agent_joint_state(a0);
+            let (q1, qd1) = s1.agent_joint_state(a1);
+            assert_eq!(q0, q1, "关节坐标逐位");
+            assert_eq!(qd0, qd1, "关节速度逐位");
+            let p0 = f_link_poses(&s0, a0);
+            let p1 = f_link_poses(&s1, a1);
+            assert_eq!(p0.len(), p1.len());
+            for (i, ((pa, ra), (pb, rb))) in p0.iter().zip(&p1).enumerate() {
+                assert_eq!(pa, pb, "连杆 {i} 位置逐位");
+                assert_eq!(ra, rb, "连杆 {i} 朝向逐位");
+            }
+            let rec0 = s0.entities.get(&a0).expect("在场");
+            let rec1 = s1.entities.get(&a1).expect("在场");
+            let r0 = s0.phys.bodies.get(rec0.handle).expect("根");
+            let r1 = s1.phys.bodies.get(rec1.handle).expect("根");
+            assert_eq!(r0.linvel(), r1.linvel(), "根线速度逐位");
+            assert_eq!(r0.angvel(), r1.angvel(), "根角速度逐位");
+            let _ = hash1;
+        }
+        // 各步进 60 拍仍逐位相同。
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..60 {
+            s0.apply_activation(&observers);
+            s0.step();
+            let _ = s0.take_outbox();
+            s1.apply_activation(&observers);
+            s1.step();
+            let _ = s1.take_outbox();
+        }
+        let p0 = f_link_poses(&s0, a0);
+        let p1 = f_link_poses(&s1, a1);
+        for (i, ((pa, ra), (pb, rb))) in p0.iter().zip(&p1).enumerate() {
+            assert_eq!(pa, pb, "60 拍后连杆 {i} 位置逐位");
+            assert_eq!(ra, rb, "60 拍后连杆 {i} 朝向逐位");
+        }
+        let (q0, qd0) = s0.agent_joint_state(a0);
+        let (q1, qd1) = s1.agent_joint_state(a1);
+        assert_eq!(q0, q1, "60 拍后关节坐标逐位");
+        assert_eq!(qd0, qd1, "60 拍后关节速度逐位");
+    }
+
+    /// F12 双跑:站立 120 拍 → 冻结 → 200 拍 → 唤醒 → 200 拍,两次运行
+    /// 逐拍逐位相同。
+    #[test]
+    fn f12_freeze_wake_double_run_identical() {
+        let run = || {
+            let (mut s, _hash, a) = f_quad_standing(120);
+            s.freeze_agent(a);
+            let mut per_tick = Vec::new();
+            // 冻结 200 拍(空观察者;每拍记录障碍物位姿)。
+            for _ in 0..200 {
+                s.apply_activation(&[]);
+                s.step();
+                let _ = s.take_outbox();
+                let pose = f_obstacle_pose(&s, a);
+                per_tick.push((pose.0, pose.1));
+            }
+            s.wake_agent(a);
+            // 唤醒 200 拍(观察者在场;每拍记录 13 连杆位姿哈希替身 = 位姿表)。
+            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            for _ in 0..200 {
+                s.apply_activation(&observers);
+                s.step();
+                let _ = s.take_outbox();
+                let poses = f_link_poses(&s, a);
+                per_tick.extend(poses.iter().map(|(p, r)| (*p, *r)));
+            }
+            per_tick
+        };
+        let run_a = run();
+        let run_b = run();
+        assert_eq!(run_a.len(), run_b.len(), "拍数相同");
+        for (i, (x, y)) in run_a.iter().zip(&run_b).enumerate() {
+            assert_eq!(x, y, "第 {i} 条记录逐位不同");
+        }
+    }
+
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
     /// 之后(BTreeMap 名字序 = a_arm 第一项),一个 revolute 关节(z 轴)。
     /// 专杀 `restore_agent_joint_state` 旧实现"根 = links 表第一项"的取法
