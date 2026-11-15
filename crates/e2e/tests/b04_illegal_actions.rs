@@ -178,15 +178,25 @@ struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
+    /// 数据目录的持有者。最后一个持有者 drop 时目录被删除(测试 panic 时也会)。
+    data: std::sync::Arc<tempfile::TempDir>,
 }
 
+/// 新建数据目录并起服。
 async fn bootstrap_harness(config: Config) -> Harness {
-    // 目录唯一性:原子计数(并行测试同纳秒会撞 redb 文件锁)。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let data_dir = std::env::temp_dir().join(format!("b04_ia_{}_{}", std::process::id(), unique));
+    let data = std::sync::Arc::new(
+        tempfile::Builder::new()
+            .prefix("b04_ia_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    bootstrap_harness_in(config, data).await
+}
+
+/// 在给定的数据目录上起服(重启类测试用:两次起服共用同一个目录)。
+async fn bootstrap_harness_in(config: Config, data: std::sync::Arc<tempfile::TempDir>) -> Harness {
     let mut config = config;
-    config.data_dir = data_dir;
+    config.data_dir = data.path().to_path_buf();
     let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(voxel::SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
@@ -235,6 +245,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         tx,
         driver: Some(driver),
         addr,
+        data,
     }
 }
 
@@ -522,5 +533,30 @@ async fn v2_trot_no_illegal_actions_zero_counters() {
         outcome.agent.joint_targets_clamped, 0,
         "trot 零钳制(实得 {};> 0 = 小跑撞限位,照实上报)",
         outcome.agent.joint_targets_clamped
+    );
+}
+
+// ---- 夹具自证:数据目录用完即删 ------------------------------------------------
+
+/// 起服 → 推 10 拍 → 关服 → 记下路径 → drop 全部持有者 → 目录必须不存在。
+/// `TempDir` drop 删除失败不报错(如 redb 句柄未关,Windows 删不掉);
+/// 这条测试就是用来抓这种泄漏的。
+#[tokio::test(start_paused = true)]
+async fn harness_data_dir_removed_after_use() {
+    let path;
+    {
+        let h = bootstrap_harness(quad_config(vec![quad_agent(
+            StartupController::QuadStand,
+            16.0,
+        )]))
+        .await;
+        path = h.data.path().to_path_buf();
+        advance_ticks(10).await;
+        let _ = shutdown(h).await;
+    }
+    assert!(
+        !path.exists(),
+        "数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
     );
 }
