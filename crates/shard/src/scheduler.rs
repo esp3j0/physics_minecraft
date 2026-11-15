@@ -138,6 +138,13 @@ pub struct TickSummary {
     pub agent_frozen: u64,
     /// 本拍主体唤醒数合计(REQ-012 B03c 第 2 节;同上 `agent_woken`)。
     pub agent_woken: u64,
+    /// 本拍关节目标被拒数合计(REQ-012 B04 第 1 节 AC-B5;全部分片的
+    /// `Outbox::agent_joint_targets_rejected` 相加)。每拍重算、纯遥测、
+    /// 不入快照。
+    pub agent_joint_targets_rejected: u64,
+    /// 本拍关节目标被钳制个数合计(REQ-012 B04 第 1 节 AC-B5;同上
+    /// `agent_joint_targets_clamped`)。每拍重算、纯遥测、不入快照。
+    pub agent_joint_targets_clamped: u64,
 }
 
 /// 激活遥测(REQ-007 §4.16;任务 06c)。**总架构师接口桩:字段与方法签名固定,
@@ -1815,6 +1822,9 @@ impl Scheduler {
         // 主体冻结/唤醒计数合计(B03c 第 2 节;outbox 每拍取走即清,逐分片相加)。
         let mut agent_frozen_total = 0u64;
         let mut agent_woken_total = 0u64;
+        // 关节目标拒绝/钳制计数合计(B04 第 1 节 AC-B5;同款逐分片相加)。
+        let mut agent_joint_targets_rejected_total = 0u64;
+        let mut agent_joint_targets_clamped_total = 0u64;
         // 凝固写入收集(REQ-003 观察输出源②,任务书 00):每拍重收
         // (上一拍的已两拍之间被取走;未取即被本拍覆盖,恰一次语义由取走即清保证)。
         self.solidified.clear();
@@ -1840,6 +1850,9 @@ impl Scheduler {
             // 主体冻结/唤醒计数(B03c 第 2 节):逐分片并入合计。
             agent_frozen_total += outbox.agent_frozen;
             agent_woken_total += outbox.agent_woken;
+            // 关节目标拒绝/钳制(B04 第 1 节 AC-B5):同款并入合计。
+            agent_joint_targets_rejected_total += outbox.agent_joint_targets_rejected;
+            agent_joint_targets_clamped_total += outbox.agent_joint_targets_clamped;
             // 06c 遥测:事件量按分片合计(加法可交换,顺序无关)。
             events.forced_landings_deadline += shard_events.forced_landings_deadline;
             events.forced_landings_budget += shard_events.forced_landings_budget;
@@ -2401,6 +2414,8 @@ impl Scheduler {
             flow_event,
             agent_frozen: agent_frozen_total,
             agent_woken: agent_woken_total,
+            agent_joint_targets_rejected: agent_joint_targets_rejected_total,
+            agent_joint_targets_clamped: agent_joint_targets_clamped_total,
             telemetry: ActivationTelemetry {
                 tickets: telemetry.tickets,
                 chunks_data: telemetry.chunks_data,
@@ -2739,6 +2754,8 @@ mod tests {
                 flow_event: None,
                 agent_frozen: 0,
                 agent_woken: 0,
+                agent_joint_targets_rejected: 0,
+                agent_joint_targets_clamped: 0,
             }
         );
         sched.shutdown();
@@ -2905,6 +2922,125 @@ mod tests {
                 "近处实体未被冻结(零重力:匀速保持原位)"
             );
         }
+        sched.shutdown();
+    }
+
+    /// U1(B04 第 1 节 AC-B5):两个分片各有一只四足,同一拍给分片 A 发
+    /// 1 条长度不符(11 个目标)、给分片 B 发 1 条全部超限(12 个 100.0)
+    /// 的关节目标 → 该拍 `TickSummary` 的 rejected == 1、clamped == 12
+    /// (clamped 按被钳**个数**计,quad 12 关节全有限位);下一拍两者都是
+    /// 0(每拍重算,outbox 每拍取走即清)。
+    #[test]
+    fn u1_joint_targets_rejected_clamped_per_tick() {
+        use types::glam::Vec3;
+
+        let mut bodies = physics_sim::BodyRegistry::new();
+        bodies
+            .insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad 合法");
+        let hash = bodies.hash_of("quad").expect("quad 在注册表");
+
+        let mut sim_a = {
+            let mut cfg = ShardSimConfig::new(shard_id(0, 0));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies.clone())
+        };
+        let mut sim_b = {
+            let mut cfg = ShardSimConfig::new(shard_id(1, 0));
+            cfg.gravity = Vec3::ZERO;
+            cfg.solidify = SolidifyConfig {
+                enabled: false,
+                ..SolidifyConfig::default()
+            };
+            ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies.clone())
+        };
+        let quad_a = types::EntityId::from_parts(0, 1);
+        let quad_b = types::EntityId::from_parts(1, 2);
+        for (sim, x) in [(&mut sim_a, 8.0f32), (&mut sim_b, 136.0f32)] {
+            sim.apply_prefix(&[messaging::StampedInput {
+                apply_at: Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 0,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnAgent {
+                    entity: if x < 100.0 { quad_a } else { quad_b },
+                    body: hash,
+                    state: types::EntityState {
+                        translation: Vec3::new(x, 1.45, 8.0),
+                        ..types::EntityState::default()
+                    },
+                }),
+            }]);
+        }
+
+        let mut sched = Scheduler::new(sched_cfg(2));
+        sched.register(sim_a);
+        sched.register(sim_b);
+        let summary0 = sched.tick();
+        assert_eq!(
+            (
+                summary0.agent_joint_targets_rejected,
+                summary0.agent_joint_targets_clamped
+            ),
+            (0, 0),
+            "生成拍无关节目标:两计数 0"
+        );
+
+        // 同一拍:分片 A 长度不符(dof = 12,发 11)、分片 B 全部超限。
+        sched
+            .submit(
+                shard_id(0, 0),
+                messaging::StampedInput {
+                    apply_at: sched.tick_now(),
+                    source: messaging::InputSource::SCHEDULER,
+                    sequence: 1,
+                    payload: messaging::InputPayload::Command(
+                        messaging::SimCommand::AgentJointTargets {
+                            entity: quad_a,
+                            targets: vec![0.0; 11],
+                        },
+                    ),
+                },
+            )
+            .expect("入箱 A");
+        sched
+            .submit(
+                shard_id(1, 0),
+                messaging::StampedInput {
+                    apply_at: sched.tick_now(),
+                    source: messaging::InputSource::SCHEDULER,
+                    sequence: 1,
+                    payload: messaging::InputPayload::Command(
+                        messaging::SimCommand::AgentJointTargets {
+                            entity: quad_b,
+                            targets: vec![100.0; 12],
+                        },
+                    ),
+                },
+            )
+            .expect("入箱 B");
+        let summary1 = sched.tick();
+        assert_eq!(
+            (
+                summary1.agent_joint_targets_rejected,
+                summary1.agent_joint_targets_clamped
+            ),
+            (1, 12),
+            "拍 1:长度不符拒 1 条;超限 12 关节全被钳"
+        );
+        // 下一拍:两计数归零(outbox 每拍取走即清 = 每拍重算)。
+        let summary2 = sched.tick();
+        assert_eq!(
+            (
+                summary2.agent_joint_targets_rejected,
+                summary2.agent_joint_targets_clamped
+            ),
+            (0, 0),
+            "拍 2:每拍重算,两计数归零"
+        );
         sched.shutdown();
     }
 

@@ -925,6 +925,12 @@ pub struct AgentCounters {
     pub agent_frozen: u64,
     /// 主体被唤醒的累计次数(B03c 第 2 节;同上 `agent_woken`)。
     pub agent_woken: u64,
+    /// 关节目标被拒的累计条数(B04 第 1 节 AC-B5;逐拍累加自
+    /// `TickSummary::agent_joint_targets_rejected`,随 DriverOutcome 上报)。
+    pub joint_targets_rejected: u64,
+    /// 关节目标被钳制个数的累计(B04 第 1 节 AC-B5;同上
+    /// `agent_joint_targets_clamped`)。
+    pub joint_targets_clamped: u64,
 }
 
 impl std::ops::Add for AgentCounters {
@@ -947,6 +953,8 @@ impl std::ops::Add for AgentCounters {
             respawn_wait_cancelled: self.respawn_wait_cancelled + rhs.respawn_wait_cancelled,
             agent_frozen: self.agent_frozen + rhs.agent_frozen,
             agent_woken: self.agent_woken + rhs.agent_woken,
+            joint_targets_rejected: self.joint_targets_rejected + rhs.joint_targets_rejected,
+            joint_targets_clamped: self.joint_targets_clamped + rhs.joint_targets_clamped,
         }
     }
 }
@@ -2706,6 +2714,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     // TickSummary 的全分片合计,随 DriverOutcome 上报。
                     agent_counters.agent_frozen += summary.agent_frozen;
                     agent_counters.agent_woken += summary.agent_woken;
+                    // 关节目标拒绝/钳制(B04 第 1 节 AC-B5):同款逐拍累加。
+                    agent_counters.joint_targets_rejected += summary.agent_joint_targets_rejected;
+                    agent_counters.joint_targets_clamped += summary.agent_joint_targets_clamped;
                     // 主体遥测并入累计(§6:退出时随 DriverOutcome 上报)。
                     agent_counters = agent_counters + orchestrator.agent_counters_delta();
                 }
@@ -7316,6 +7327,8 @@ mod tests {
             flow_event,
             agent_frozen: 0,
             agent_woken: 0,
+            agent_joint_targets_rejected: 0,
+            agent_joint_targets_clamped: 0,
         }
     }
 
