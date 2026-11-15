@@ -6919,20 +6919,52 @@ anchor = [0.0, 0.0, 0.0]
     }
 
     /// T4 预算豁免仍在:主体同时"超预算"且"在范围内" → 不冻结
-    /// (A01 判据的两条预算测试不改、仍绿)。布景:装满醒体预算到超限
-    /// (主体 13 格 + 小方块),把 `max_awake_dynamic` 压到 1(配置注入;
-    /// 生产布景是普通实体超限,这里压配置等价于"全体超预算")——主体在
-    /// 观察者范围内,plan 的 `over_budget_freeze` 含主体,1.2 预算豁免挡下。
+    /// (A01 判据的两条预算测试不改、仍绿)。布景:预算 1 经 `budget_pool_
+    /// cfg()` **构造期注入**(A01 同款;事后改 `s.cfg` 不会同步已构造的
+    /// ActivationController——首轮 T4 布景踩过这个坑,恒不超预算,假绿)。
+    /// 主体(capsule,1 格)距观察者 23 m,2 格复合体距 8 m:格数和 3 > 1,
+    /// 淘汰池距离降序主体第一 → `over_budget_freeze` 含主体,B03c 1.2 豁免
+    /// 挡下;变异(去豁免)= 主体被冻结,断言红。
     #[test]
     fn t4_budget_exemption_still_holds() {
-        let (mut s, hash) = quad_sim_with(0.01);
-        // 压预算:醒体格数上限 1(主体 13 格必超)。
-        s.cfg.activation.max_awake_dynamic = 1;
-        load_flat_ground(&mut s);
+        let (mut s, hash) = budget_sim();
         let a = types::EntityId::from_parts(1, 1);
-        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
-            .expect("四足生成");
-        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: Vec3::new(31.0, 3.0, 8.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("capsule 生成");
+        let neighbor = types::EntityId::from_parts(2, 2);
+        let shape = types::CompoundShape::new(vec![
+            types::ShapeCell {
+                offset: [0, 0, 0],
+                block: types::BlockId(1),
+            },
+            types::ShapeCell {
+                offset: [1, 0, 0],
+                block: types::BlockId(1),
+            },
+        ])
+        .expect("两格形状合法");
+        s.apply_prefix(&[messaging::StampedInput {
+            apply_at: types::Tick::ZERO,
+            source: messaging::InputSource::SCHEDULER,
+            sequence: 1,
+            payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                entity: neighbor,
+                state: types::EntityState {
+                    translation: Vec3::new(16.0, 1.46, 8.0),
+                    ..types::EntityState::default()
+                },
+                desc: types::EntityDesc::compound(0.45, shape),
+            }),
+        }]);
+        let observers = [Vec3::new(8.0, 3.0, 8.0)];
         for _ in 0..300 {
             s.apply_activation(&observers);
             s.step();
