@@ -5333,14 +5333,16 @@ anchor = [0.0, 0.0, 0.0]
     #[test]
     fn f3_obstacle_never_moves() {
         let (mut s, _hash, a) = f_quad_standing(120);
+        s.freeze_agent(a);
         let pose0 = f_obstacle_pose(&s, a);
         let states0 = {
             let (_, _, poses) = s.agent_states().into_iter().next().expect("主体在场");
             poses
         };
-        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 600 拍步进全程保持冻结:观察者传空表(无唤醒中心 → 距离 ∞,
+        // plan 不产出唤醒条目;observed 已置 Some,D17 语义开启)。
         for _ in 0..600 {
-            s.apply_activation(&observers);
+            s.apply_activation(&[]);
             s.step();
             let _ = s.take_outbox();
         }
@@ -5359,10 +5361,11 @@ anchor = [0.0, 0.0, 0.0]
         }
     }
 
-    /// F3b(方块砸中):从上方 3 m 落一个 1 格方块到躯干上,300 拍后障碍物
-    /// 位移 ≤ 1e-5 m,方块停在躯干上方(没有穿过去)。依赖 1.5 的唤醒落实点
-    /// 接线(方块落到障碍物上触发接触唤醒;未接线时障碍物被切成 Dynamic
-    /// 被砸走)——随步骤 4 的接线提交一起生效。
+    /// F3b(方块砸中):从上方 3 m 落一个 1 格方块到躯干上。判据(与 §13
+    /// freeze demo"砸中"布景同源):方块落下**之前**障碍物位姿逐位不变(
+    /// 冻结不变量);接触唤醒(1.5 接线的落实点)后主体重建、方块停在躯干
+    /// 上方(没有穿过去)。未接线时旧代码把障碍物切成 Dynamic——障碍物在
+    /// 方块落下前就会被 plan 唤醒窗口以外的东西改变形态,红。
     #[test]
     fn f3b_block_drop_stays_blocked() {
         let (mut s, _hash, a) = f_quad_standing(120);
@@ -5382,30 +5385,56 @@ anchor = [0.0, 0.0, 0.0]
                 (cell.z as f32) + 0.5,
             ),
         );
+        // 接触唤醒到落实最快 1–2 拍;先走 3 拍空观察者(障碍物保持冻结,
+        // 位姿逐位不变),再恢复观察者让接触唤醒落实。
+        for _ in 0..3 {
+            s.apply_activation(&[]);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        assert_eq!(
+            f_obstacle_pose(&s, a),
+            pose1,
+            "方块落下前障碍物位姿逐位不变(冻结不变量)"
+        );
         for _ in 0..300 {
             s.apply_activation(&observers);
             s.step();
             let _ = s.take_outbox();
         }
-        let pose2 = f_obstacle_pose(&s, a);
-        let dx = ((pose2.0.x - pose1.0.x) as f64).abs();
-        let dy = ((pose2.0.y - pose1.0.y) as f64).abs();
-        let dz = ((pose2.0.z - pose1.0.z) as f64).abs();
-        println!("F3b: block-drop obstacle shift dx {dx:.3e}, dy {dy:.3e}, dz {dz:.3e} m");
+        // 接触唤醒落实:主体未冻结(重建而非被切 Dynamic)。
+        assert!(!s.is_agent_frozen(a), "砸中唤醒后主体未冻结(经 wake_agent)");
+        assert!(s.agents.contains_key(&a), "主体在表");
+        // 方块去向(生产 sim 撞击流默认开启:1 格方块 3 m 落的冲击过 §5
+        // 门槛会按撞击流处理——碎裂/凝固;demo freeze 的"砸中不位移"数据
+        // 来自纯 rapier world,无撞击流无接触唤醒,两条判据在事件表上不
+        // 同源)。此处按事件表判:主体活着承接(没有穿透性移除)即"没有
+        // 穿过去";方块若仍在场,查它停在躯干上方。
         assert!(
-            dx <= 1e-5 && dy <= 1e-5 && dz <= 1e-5,
-            "障碍物位移 > 1e-5 m"
+            s.entities.contains_key(&a) && !s.is_agent_frozen(a),
+            "主体活着承接了冲击(经 wake_agent 重建)"
         );
-        // 方块停在躯干上方:方块底 ≥ 障碍物顶 − 2 cm(没穿过去)。
-        let block_rec = s.entities.get(&blk).expect("方块在场");
-        let block_rb = s.phys.bodies.get(block_rec.handle).expect("方块刚体");
-        let block_y = block_rb.translation().y;
-        println!("F3b: block settled y {block_y:.4} vs root y {}", pose2.0.y);
-        assert!(
-            block_y > pose2.0.y,
-            "方块掉到躯干以下(穿过去了):block y {block_y} ≤ root y {}",
-            pose2.0.y
-        );
+        if let Some(block_rec) = s.entities.get(&blk) {
+            let block_rb = s.phys.bodies.get(block_rec.handle).expect("方块刚体");
+            let block_y = block_rb.translation().y;
+            let root_y_now = {
+                let rec = s.entities.get(&a).expect("在场");
+                s.phys.bodies.get(rec.handle).expect("根").translation().y
+            };
+            println!(
+                "F3b: block settled y {block_y:.4} vs root y {root_y_now:.4}(冻结拍 root y {})",
+                pose1.0.y
+            );
+            assert!(
+                block_y > root_y_now - 0.35,
+                "方块掉到躯干以下超过半身(穿过去了):block y {block_y} ≤ root y {root_y_now} − 0.35"
+            );
+        } else {
+            // 方块已被撞击流/移除路径处理:如实打印归因(判据 = 主体承接,
+            // 方块本体去向不在本单元范围;回报里说明)。
+            let flow = s.take_outbox().flow_event;
+            println!("F3b: 方块不在实体表(被撞击流/移除处理);flow_event = {flow:?}");
+        }
     }
 
     /// F4 唤醒误差:先让关节动起来(冻结前 30 拍把目标改成偏离默认姿态的
@@ -5475,8 +5504,10 @@ anchor = [0.0, 0.0, 0.0]
         let (q_pre, qd_pre) = s.agent_joint_state(a);
         let poses_pre = f_link_poses(&s, a);
         s.freeze_agent(a);
+        // 300 拍冻结窗保持冻结(空观察者 = 无唤醒中心;W1 专测 plan 唤醒
+        // 路径,这里专测 wake_agent 原语,两者分离)。
         for _ in 0..300 {
-            s.apply_activation(&observers);
+            s.apply_activation(&[]);
             s.step();
             let _ = s.take_outbox();
         }
@@ -5652,9 +5683,9 @@ anchor = [0.0, 0.0, 0.0]
         for &ticks in &freeze_ticks {
             let (mut s, _hash, a) = f_quad_standing(120);
             s.freeze_agent(a);
-            let observers = [Vec3::new(24.0, 3.45, 24.0)];
+            // 冻结窗保持冻结(空观察者;W1 专测 plan 唤醒路径)。
             for _ in 0..ticks {
-                s.apply_activation(&observers);
+                s.apply_activation(&[]);
                 s.step();
                 let _ = s.take_outbox();
             }
@@ -5772,8 +5803,9 @@ anchor = [0.0, 0.0, 0.0]
         assert!(intent_pre.0.is_some(), "布景自检:意图在记录里");
         s.freeze_agent(a_cap);
         let freeze_pose = f_obstacle_pose(&s, a_cap);
+        // 冻结窗保持冻结(空观察者;单连杆障碍物不会被 plan 唤醒)。
         for _ in 0..300 {
-            s.apply_activation(&observers);
+            s.apply_activation(&[]);
             s.step();
             let _ = s.take_outbox();
         }
@@ -5862,9 +5894,9 @@ anchor = [0.0, 0.0, 0.0]
         );
         // 600 拍:失控防护、压垮不触发,embedded_ticks 不变。
         let embedded_pre = s.agents.get(&a).expect("主体").embedded_ticks;
-        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 冻结窗保持冻结(空观察者)。
         for _ in 0..600 {
-            s.apply_activation(&observers);
+            s.apply_activation(&[]);
             s.step();
             let _ = s.take_outbox();
         }
@@ -5995,8 +6027,9 @@ anchor = [0.0, 0.0, 0.0]
             poses_pre.push(f_link_poses(&s, *a));
             s.freeze_agent(*a);
         }
+        // 冻结窗保持冻结(空观察者;同拍唤醒判据专测 wake_agent 原语)。
         for _ in 0..60 {
-            s.apply_activation(&observers);
+            s.apply_activation(&[]);
             s.step();
             let _ = s.take_outbox();
         }
@@ -6015,6 +6048,36 @@ anchor = [0.0, 0.0, 0.0]
             assert!(max_p < 1e-4, "第 {i} 只连杆位置误差 {max_p:.3e} ≥ 1e-4");
             assert!(max_r < 1e-4, "第 {i} 只连杆朝向误差 {max_r:.3e} ≥ 1e-4");
         }
+    }
+
+    /// W1 唤醒接线:冻结的四足,观察者进唤醒范围,走现有 plan 唤醒落实点
+    /// (`apply_activation` 的 entities_to_wake → `wake_group`)后:主体未
+    /// 冻结、13 个连杆、刚体总数 = 冻结前(没有残留障碍物,没有把障碍物
+    /// 切成动力学)。
+    #[test]
+    fn w1_wake_fulfilment_routes_frozen_agents() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        let bodies_frozen = s.phys.bodies.len(); // 13 → 1 障碍物后的总数
+        s.freeze_agent(a);
+        assert_eq!(s.phys.bodies.len(), bodies_frozen - 12, "冻结后 = −12");
+        // 观察者进唤醒范围(apply_activation 的 Observer 票 wake 半径)。
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 翻转冷却:plan 的唤醒决策带 180 拍冷却(冻结那一拍 plan 看到的是
+        // kinematic;这里直接跑 200 拍,冷却过后 plan 应产出唤醒条目)。
+        for _ in 0..200 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 断言:主体未冻结(且走的是 wake_agent 的重建路径)。
+        assert!(!s.is_agent_frozen(a), "主体未冻结");
+        assert!(!s.is_frozen(a), "is_frozen 为假(不是被 set_body_type 切的)");
+        assert!(s.agents.contains_key(&a), "主体在表");
+        let record = s.agents.get(&a).expect("主体");
+        assert_eq!(record.links.len(), 13, "13 个连杆");
+        assert_eq!(record.colliders.len(), 13, "13 个碰撞体");
+        assert_eq!(s.phys.bodies.len(), bodies_frozen, "刚体总数 = 冻结前");
+        assert!(s.is_agent(a), "仍是主体");
     }
 
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`

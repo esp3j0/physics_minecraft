@@ -2226,7 +2226,15 @@ impl ShardSim {
             let rec = self.entities.get(id).expect("存在");
             let is_actor = rec.actor;
             let carried_now = !is_actor && rec.carried;
-            {
+            // B03b 1.5:组员是已冻结的主体 → 走 `wake_agent`(拆障碍物 +
+            // 按快照重建连杆),**不要** set_body_type(Dynamic)(把障碍物
+            // 切成动力学刚体只会得到一只被砸飞的单体"主体")。其余簿记
+            // (slow_ticks、窗口、触顶标记)照原样走;wake_agent 自己也重置
+            // slow_ticks 与窗口(同语义,幂等)。
+            let agent_frozen = self.agents.get(id).is_some_and(|r| r.frozen.is_some());
+            if agent_frozen {
+                self.wake_agent(*id);
+            } else {
                 let body = self.phys.bodies.get_mut(rec.handle).expect("handle 有效");
                 body.set_body_type(RigidBodyType::Dynamic, true);
             }
