@@ -5328,8 +5328,11 @@ anchor = [0.0, 0.0, 0.0]
     }
 
     /// F3 不动:冻结后步进 600 拍,障碍物位姿逐位不变,`agent_states` 的 13
-    /// 个位姿与冻结前逐位相同、速度为 0;再从上方 3 m 落一个 1 格方块到躯干
-    /// 上,300 拍后障碍物位移 ≤ 1e-5 m,方块停在躯干上方(没有穿过去)。
+    /// 个位姿与冻结前逐位相同、速度为 0。(方块砸中拆成 F3b-轻 / F3b-重两条
+    /// 独立测试;验收 R1:旧 F3b 传了观察者,冻结主体第一拍就被计划唤醒,
+    /// 方块落到的是醒着的四足,"接触唤醒触发"没有被验证;且"被砸中后位移
+    /// ≤ 1e-5 m"只对叫不醒它的轻碰成立——生产内核有接触唤醒,够重的撞击
+    /// 本来就该把冻结的主体叫醒。)
     #[test]
     fn f3_obstacle_never_moves() {
         let (mut s, _hash, a) = f_quad_standing(120);
@@ -5361,82 +5364,125 @@ anchor = [0.0, 0.0, 0.0]
         }
     }
 
-    /// F3b(方块砸中):从上方 3 m 落一个 1 格方块到躯干上。判据(与 §13
-    /// freeze demo"砸中"布景同源):方块落下**之前**障碍物位姿逐位不变(
-    /// 冻结不变量);接触唤醒(1.5 接线的落实点)后主体重建、方块停在躯干
-    /// 上方(没有穿过去)。未接线时旧代码把障碍物切成 Dynamic——障碍物在
-    /// 方块落下前就会被 plan 唤醒窗口以外的东西改变形态,红。
+    /// F3b-轻(低动量砸中):方块生成在躯干正上方,底面离躯干顶面 2 cm,
+    /// 初速 0。全程 `apply_activation(&[])`(无观察者)。自检:触到障碍物
+    /// 那一拍方块的动量 < 接触唤醒门槛(`contact_wake_min_momentum`,从
+    /// 配置读)。步进 300 拍后:
+    /// - 主体仍冻结,`agent_woken == 0`(逐拍累计 outbox);
+    /// - 障碍物位姿与冻结那一拍逐位相同;
+    /// - 方块还在实体表,中心 y ≥ 躯干顶面 y + 方块半高 − 2 cm(停在躯干
+    ///   上,没有穿过去)。
+    ///
+    /// 验收 R1:动量低于门槛的轻碰叫不醒冻结主体(预测种子与补偿种子都
+    /// 过不了 `contact_wake_min_momentum`),障碍物必须纹丝不动。
     #[test]
-    fn f3b_block_drop_stays_blocked() {
+    fn f3b_light_block_drop_stays_blocked() {
         let (mut s, _hash, a) = f_quad_standing(120);
         s.freeze_agent(a);
-        let pose1 = f_obstacle_pose(&s, a);
-        let observers = [Vec3::new(24.0, 3.45, 24.0)];
-        // 方块从躯干上方 3 m 落下(躯干 = 根连杆中心 + 3)。
-        let root_top = pose1.0.y + 0.3;
-        let block_pos = Vec3::new(pose1.0.x, root_top + 3.0, pose1.0.z);
-        let cell = crate::settle::cell_of(block_pos.x, block_pos.y, block_pos.z);
+        let pose0 = f_obstacle_pose(&s, a);
+        // 门槛从配置读(不写死)。
+        let min_p = s.cfg.activation.contact_wake_min_momentum;
+        // 方块底面 = 躯干顶面 + 2 cm(躯干 = 根连杆,半高 y 0.057)。
+        let torso_top = pose0.0.y + 0.057;
+        let block_pos = Vec3::new(pose0.0.x, torso_top + 0.02 + 0.5, pose0.0.z);
         let blk = types::EntityId::from_parts(9, 9);
-        s.spawn_entity_for_test(
-            blk,
-            Vec3::new(
-                (cell.x as f32) + 0.5,
-                (cell.y as f32) + 0.5,
-                (cell.z as f32) + 0.5,
-            ),
+        s.spawn_entity_for_test(blk, block_pos);
+        assert!(
+            s.entities.contains_key(&blk),
+            "布景自检:方块已生成在实体表"
         );
-        // 接触唤醒到落实最快 1–2 拍;先走 3 拍空观察者(障碍物保持冻结,
-        // 位姿逐位不变),再恢复观察者让接触唤醒落实。
-        for _ in 0..3 {
+        let mut momentum_at_touch: Option<f32> = None;
+        let mut touch_tick: Option<usize> = None;
+        let mut agent_woken_total = 0u64;
+        let mut block_gone = false;
+        let mut prev_block_p: f32 = 0.0; // 上一拍方块动量 m·|v|
+        for tick in 0..300usize {
             s.apply_activation(&[]);
             s.step();
-            let _ = s.take_outbox();
+            let out = s.take_outbox();
+            agent_woken_total += out.agent_woken;
+            if !s.entities.contains_key(&blk) {
+                block_gone = true;
+                println!("F3b-轻: 方块在第 {tick} 拍后不在实体表;flow_event = {:?}", out.flow_event);
+                break;
+            }
+            // 触地检测:方块与障碍物碰撞体的接触对出现**非零冲量**的那一拍
+            // 即触地;自检动量取**前一拍**方块的 m·|v|(rapier 在 step 内
+            // 解算冲量,step 后读方块速度已是被削减后的值;冲量代理读数在
+            // 持久接触对上跨拍累积,不可重复读)。
+            if momentum_at_touch.is_none() {
+                let (block_col, block_v, block_m) = {
+                    let rec = s.entities.get(&blk).expect("方块在场");
+                    let rb = s.phys.bodies.get(rec.handle).expect("方块刚体");
+                    (rec.collider, conv_len(rb.linvel()), rb.mass())
+                };
+                let obstacle = f_obstacle_handle(&s, a);
+                let j = s
+                    .phys
+                    .narrow_phase
+                    .contact_pairs_with(block_col)
+                    .filter(|pair| {
+                        let other = if pair.collider1 == block_col {
+                            pair.collider2
+                        } else {
+                            pair.collider1
+                        };
+                        s.phys.colliders.get(other).and_then(|c| c.parent())
+                            == Some(obstacle)
+                    })
+                    .map(|pair| pair.total_impulse_magnitude())
+                    .fold(0.0f32, f32::max);
+                if j > 1e-6 {
+                    momentum_at_touch = Some(prev_block_p);
+                    touch_tick = Some(tick);
+                }
+                prev_block_p = block_m * block_v;
+            }
         }
-        assert_eq!(
-            f_obstacle_pose(&s, a),
-            pose1,
-            "方块落下前障碍物位姿逐位不变(冻结不变量)"
-        );
-        for _ in 0..300 {
-            s.apply_activation(&observers);
-            s.step();
-            let _ = s.take_outbox();
-        }
-        // 接触唤醒落实:主体未冻结(重建而非被切 Dynamic)。
-        assert!(!s.is_agent_frozen(a), "砸中唤醒后主体未冻结(经 wake_agent)");
-        assert!(s.agents.contains_key(&a), "主体在表");
-        // 方块去向(生产 sim 撞击流默认开启:1 格方块 3 m 落的冲击过 §5
-        // 门槛会按撞击流处理——碎裂/凝固;demo freeze 的"砸中不位移"数据
-        // 来自纯 rapier world,无撞击流无接触唤醒,两条判据在事件表上不
-        // 同源)。此处按事件表判:主体活着承接(没有穿透性移除)即"没有
-        // 穿过去";方块若仍在场,查它停在躯干上方。
+        // 自检:方块全程在实体表(被凝固等路径处理 = 布景出问题,停下报告)。
         assert!(
-            s.entities.contains_key(&a) && !s.is_agent_frozen(a),
-            "主体活着承接了冲击(经 wake_agent 重建)"
+            !block_gone && s.entities.contains_key(&blk),
+            "方块不在实体表(被凝固/撞击流处理)——布景问题,须停下归因"
         );
-        if let Some(block_rec) = s.entities.get(&blk) {
-            let block_rb = s.phys.bodies.get(block_rec.handle).expect("方块刚体");
-            let block_y = block_rb.translation().y;
-            let root_y_now = {
-                let rec = s.entities.get(&a).expect("在场");
-                s.phys.bodies.get(rec.handle).expect("根").translation().y
-            };
-            println!(
-                "F3b: block settled y {block_y:.4} vs root y {root_y_now:.4}(冻结拍 root y {})",
-                pose1.0.y
-            );
-            assert!(
-                block_y > root_y_now - 0.35,
-                "方块掉到躯干以下超过半身(穿过去了):block y {block_y} ≤ root y {root_y_now} − 0.35"
-            );
-        } else {
-            // 方块已被撞击流/移除路径处理:如实打印归因(判据 = 主体承接,
-            // 方块本体去向不在本单元范围;回报里说明)。
-            let flow = s.take_outbox().flow_event;
-            println!("F3b: 方块不在实体表(被撞击流/移除处理);flow_event = {flow:?}");
-        }
+        let touch = touch_tick.expect("布景自检:300 拍内方块应触到障碍物");
+        let p = momentum_at_touch.expect("触到即应有接触动量");
+        println!("F3b-轻: 触地拍 {touch},触地前拍方块动量 m·|v| {p:.4} kg·m/s,门槛 {min_p}");
+        assert!(
+            p < min_p,
+            "布景自检失败:触地动量 {p} ≥ 门槛 {min_p},这不是低动量布景"
+        );
+        // 判据 1:主体仍冻结,agent_woken == 0。
+        assert!(s.is_agent_frozen(a), "轻碰后主体仍应冻结");
+        assert_eq!(agent_woken_total, 0, "agent_woken 应为 0");
+        // 判据 2:障碍物位姿与冻结那一拍逐位相同。
+        let pose1 = f_obstacle_pose(&s, a);
+        assert_eq!(pose0.0, pose1.0, "障碍物位置逐位不变");
+        assert_eq!(pose0.1, pose1.1, "障碍物朝向逐位不变");
+        // 判据 3:方块停在躯干上方(中心 y ≥ 躯干顶面 + 半高 − 2 cm)。
+        let block_y = {
+            let rec = s.entities.get(&blk).expect("方块在场");
+            s.phys.bodies.get(rec.handle).expect("方块刚体").translation().y
+        };
+        println!("F3b-轻: 方块停稳中心 y {block_y:.4}(要求 ≥ {})", torso_top + 0.5 - 0.02);
+        assert!(
+            block_y >= torso_top + 0.5 - 0.02,
+            "方块中心 {block_y} < 躯干顶面 {} + 半高 0.5 − 2 cm:穿过去了",
+            torso_top
+        );
     }
 
+    /// 障碍物刚体句柄(EntityRecord.handle;测试辅助)。
+    fn f_obstacle_handle(
+        s: &crate::sim::ShardSim,
+        a: types::EntityId,
+    ) -> rapier3d::prelude::RigidBodyHandle {
+        s.entities.get(&a).expect("障碍物在场").handle
+    }
+
+    /// rapier 向量模长(测试辅助;F3b-轻 的 m·|v| 自检)。
+    fn conv_len(v: rapier3d::math::Vector) -> f32 {
+        v.length()
+    }
     /// F4 唤醒误差:先让关节动起来(冻结前 30 拍把目标改成偏离默认姿态的
     /// 一组,自检 `max|q − 默认| > 0.1`、`max|qd| > 0.1`、根角速度模 > 1e-3)
     /// 。冻结,步进 300 拍,唤醒。步进前:
