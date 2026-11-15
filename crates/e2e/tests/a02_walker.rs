@@ -137,10 +137,16 @@ fn a02_1_flat_walk_three_speeds_eight_headings() {
                     intent_cmd(a, (dx * speed, dz * speed), (si as f32) * 0.1, false),
                 ),
             ]);
-            let observers = [Vec3::new(48.0, 3.0, 48.0)];
+            // B03c 1.6 布景:观察者每拍跟随主体(5.6 m/s × 4 s ≈ 22.4 m
+            // 会走出固定观察者的 24 m 唤醒半径,走出即冻结、速度归零——
+            // 稳态误差恒 1.0)。断言与期望值不动。
+            let mut observers = [Vec3::new(48.0, 3.0, 48.0)];
             let mut worst_err = 0.0f32;
             for tick in 0..360u32 {
                 production_tick(&mut s, &observers);
+                if let Some(st) = s.entity_state(a) {
+                    observers[0] = Vec3::new(st.translation.x, 3.0, st.translation.z);
+                }
                 if tick >= 240 {
                     // 稳态窗口(tick 240..360 = 最后 2 s;行走从拍 0 直接开始,
                     // 60 拍后必已达稳态;窗口取 240 起 = 行走 4 s 后;窗口内
