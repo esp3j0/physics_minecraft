@@ -5483,6 +5483,136 @@ anchor = [0.0, 0.0, 0.0]
     fn conv_len(v: rapier3d::math::Vector) -> f32 {
         v.length()
     }
+
+    /// F3b-重(从 3 m 落下,动量过接触唤醒门槛):步进到方块触到障碍物之后
+    /// 60 拍。全程 `apply_activation(&[])`——不放观察者,唤醒只能来自接触
+    /// 唤醒路径。先探针打印(唤醒拍、来源计数、连杆/刚体数、方块去向),
+    /// 再按实测断言。
+    ///
+    /// 验收 R1 实测(2026-11-14,1d2f8ee 代码):唤醒在**物理接触之前**
+    /// ——`prestep_contact_wake`(step 开头)的扫掠预测用保守包络 AABB
+    /// (对角 ×√3 + skin),方块还在空中时就命中(探针:唤醒拍 34、首个
+    /// 窄相接触对拍 46),当拍经 `wake_agent` 落实;来源计数 pred=1。
+    /// 因此"触到前障碍物逐位不变"落地为"唤醒前每拍逐位不变"(唤醒拍
+    /// 障碍物已拆除,接触对出现时对方已是重建后的 Dynamic 主体)。
+    #[test]
+    fn f3b_heavy_block_drop_wakes_or_not() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        s.freeze_agent(a);
+        let pose0 = f_obstacle_pose(&s, a);
+        let min_p = s.cfg.activation.contact_wake_min_momentum;
+        let bodies_frozen = s.phys.bodies.len();
+        let torso_top = pose0.0.y + 0.057;
+        // 3 m 落:中心 = 躯干顶面 + 3.0 + 半高 0.5(初速 0;触地速度按能量
+        // 守恒 ≈ sqrt(2·9.81·3) ≈ 7.7 m/s,m=1 → 动量 ≈ 7.7 > 门槛 1.0)。
+        let block_pos = Vec3::new(pose0.0.x, torso_top + 3.0 + 0.5, pose0.0.z);
+        let blk = types::EntityId::from_parts(9, 9);
+        s.spawn_entity_for_test(blk, block_pos);
+        let mut agent_woken_total = 0u64;
+        let mut woken_tick: Option<usize> = None;
+        let mut touch_tick: Option<usize> = None;
+        let mut ev_total = crate::sim::ActivationEvents::default();
+        let mut prev_frozen = true;
+        for tick in 0..400usize {
+            s.apply_activation(&[]);
+            s.step();
+            let out = s.take_outbox();
+            agent_woken_total += out.agent_woken;
+            let ev = s.take_activation_events();
+            ev_total.wakes_contact_pred += ev.wakes_contact_pred;
+            ev_total.wakes_contact_comp += ev.wakes_contact_comp;
+            ev_total.wakes_contact_spread += ev.wakes_contact_spread;
+            ev_total.wakes_terrain += ev.wakes_terrain;
+            let now_frozen = s.is_agent_frozen(a);
+            if prev_frozen && !now_frozen {
+                woken_tick = Some(tick);
+                println!(
+                    "F3b-重: 唤醒拍 {tick},agent_woken={agent_woken_total},累计来源 pred={} comp={} spread={} terrain={}",
+                    ev_total.wakes_contact_pred,
+                    ev_total.wakes_contact_comp,
+                    ev_total.wakes_contact_spread,
+                    ev_total.wakes_terrain
+                );
+            } else if now_frozen && woken_tick.is_none() {
+                // 唤醒前每拍:障碍物位姿逐位不变(冻结不变量;唤醒拍障碍物
+                // 已拆除,本断言只覆盖此前各拍)。
+                assert_eq!(
+                    f_obstacle_pose(&s, a),
+                    pose0,
+                    "唤醒拍 {tick} 前:障碍物位姿与冻结那一拍逐位相同"
+                );
+            }
+            prev_frozen = now_frozen;
+            // 触地检测:方块与障碍物刚体的任一碰撞体成对(narrow phase 建对)。
+            if touch_tick.is_none() && s.entities.contains_key(&blk) {
+                let block_col = s.entities.get(&blk).expect("方块在场").collider;
+                let obstacle = f_obstacle_handle(&s, a);
+                let hit = s.phys.narrow_phase.contact_pairs_with(block_col).any(|pair| {
+                    let other = if pair.collider1 == block_col {
+                        pair.collider2
+                    } else {
+                        pair.collider1
+                    };
+                    s.phys.colliders.get(other).and_then(|c| c.parent()) == Some(obstacle)
+                });
+                if hit {
+                    touch_tick = Some(tick);
+                    println!("F3b-重: 首个接触对出现拍 {tick}(该拍 step 后主体冻结 = {now_frozen})");
+                }
+            }
+            if woken_tick.is_some() && tick >= woken_tick.unwrap() + 60 {
+                break;
+            }
+        }
+        println!(
+            "F3b-重: 终态 is_agent_frozen={} block_in_table={} woken_tick={woken_tick:?} touch_tick={touch_tick:?} agent_woken={agent_woken_total} 门槛 {min_p}",
+            s.is_agent_frozen(a),
+            s.entities.contains_key(&blk)
+        );
+        if let Some(block_rec) = s.entities.get(&blk) {
+            let block_rb = s.phys.bodies.get(block_rec.handle).expect("方块刚体");
+            println!(
+                "F3b-重: 方块终态中心 {:?}(躯干顶面 {torso_top})",
+                crate::conv::rapier_to_vec3(block_rb.translation())
+            );
+        }
+        // ---- 断言(按 2026-11-14 探针实测补:被唤醒,预测种子路径)----
+        // 被唤醒 → 经 `wake_agent` 重建:13 连杆、无残留障碍物、刚体总数
+        // = 冻结前、主体在表。没被唤醒的分支断言(障碍物位姿逐位不变)
+        // 不适用,注释如实记录:F3b-轻 已覆盖该分支。
+        assert!(!s.is_agent_frozen(a), "重砸后主体应被唤醒");
+        assert!(
+            s.entities.contains_key(&a) && s.agents.contains_key(&a),
+            "主体在表"
+        );
+        {
+            let record = s.agents.get(&a).expect("主体在表");
+            assert_eq!(record.links.len(), 13, "唤醒重建 13 连杆");
+            assert_eq!(record.colliders.len(), 13, "13 碰撞体");
+        }
+        assert_eq!(
+            s.phys.bodies.len(),
+            bodies_frozen - 1 + 13 + 1,
+            "刚体总数 = 冻结拍 − 1(障碍物已移除)+ 13(连杆重建)+ 1(方块);实测残留即障碍物没拆"
+        );
+        // 来源断言(实测:wakes_contact_pred 路径;非补偿、非 spread、非地形)。
+        assert!(
+            ev_total.wakes_contact_pred >= 1,
+            "唤醒应计为撞前预测种子(pred),实测 pred={} comp={} spread={} terrain={}",
+            ev_total.wakes_contact_pred,
+            ev_total.wakes_contact_comp,
+            ev_total.wakes_contact_spread,
+            ev_total.wakes_terrain
+        );
+        assert_eq!(agent_woken_total, 1, "agent_woken == 1");
+        // 方块去向(探针实测:仍在实体表,未被撞击流/凝固处理;断言钉住)。
+        assert!(
+            s.entities.contains_key(&blk),
+            "方块仍在实体表(探针实测未被撞击流/凝固移除;若实现变化移除了它,须停下归因)"
+        );
+    }
+
+
     /// F4 唤醒误差:先让关节动起来(冻结前 30 拍把目标改成偏离默认姿态的
     /// 一组,自检 `max|q − 默认| > 0.1`、`max|qd| > 0.1`、根角速度模 > 1e-3)
     /// 。冻结,步进 300 拍,唤醒。步进前:
