@@ -1869,7 +1869,13 @@ impl ShardSim {
         let moving: BTreeSet<EntityId> = self
             .entities
             .iter()
-            .filter(|(_id, rec)| {
+            .filter(|(id, rec)| {
+                // REQ-012 B03c 1.1:主体不受静止前置约束(§3 规则 1——走出
+                // 唤醒范围就冻结,不要求先静止;否则走着的四足永远冻不住,
+                // 会走出已装载的地形掉下去)。
+                if self.agents.contains_key(id) {
+                    return false;
+                }
                 let b = self.phys.bodies.get(rec.handle).expect("handle 有效");
                 if b.is_kinematic() || b.is_sleeping() {
                     return false;
@@ -1977,7 +1983,24 @@ impl ShardSim {
             // over_budget_freeze 字段无消费者(06c 接线补齐,非行为面外扩)。
             // REQ-012 A01(判据 A01-1):**主体豁免预算淘汰**(不被预算冻结、
             // 不被强制落地;跳过,不烧簿记)。
+            // REQ-012 B03c 1.2:主体落冻结(快照 + 障碍物;§3 规则 1/2/3)。
+            // 预算淘汰照旧豁免(A01 判据);已冻结(防御)跳过;常驻体被冻结
+            // 的簿记照 freeze_with_closure 对单个常驻实体做的那几件事原样做
+            // 一遍(撤常驻运动票 End + 翻转冷却簿记),不走闭包(主体不进
+            // 冻结闭包,A01)。
             if self.agents.contains_key(id) {
+                if decisions.over_budget_freeze.contains(id) {
+                    continue;
+                }
+                if self.is_agent_frozen(*id) {
+                    continue;
+                }
+                self.freeze_agent(*id);
+                self.outbox.ticket_ops.push(TicketOpRecord {
+                    entity: *id,
+                    op: TicketOp::End,
+                });
+                self.activation.note_flip(id, now);
                 continue;
             }
             if decisions.over_budget_freeze.contains(id) && !is_actor && !is_transient_carried {

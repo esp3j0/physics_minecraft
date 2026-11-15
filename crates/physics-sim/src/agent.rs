@@ -1426,6 +1426,16 @@ impl ShardSim {
         self.agents.get(&id).is_some_and(|r| r.frozen.is_some())
     }
 
+    /// 本分片已冻结的主体(EntityId 升序)(B03c 1.4):调度器按分片取
+    /// 并集(`Session::frozen_agents`),驱动侧控制者据此跳过冻结的主体。
+    pub fn frozen_agent_ids(&self) -> Vec<EntityId> {
+        self.agents
+            .iter()
+            .filter(|(_, r)| r.frozen.is_some())
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// 冻结(B03b 1.2/1.3:快照 + 障碍物):
     /// 1. 读:根状态、`agent_joint_state`、全部连杆位姿(`BodyDef.links`
     ///    顺序)、每个连杆碰撞体的规格(世界位姿与 1.2 列的属性);
@@ -3530,6 +3540,14 @@ anchor = [0.0, 0.0, 0.0]
         // 全程不冻结(每 10 拍抽查;触顶预期在 ~1640 拍,抽查覆盖到其后)。
         let mut last_x_tick = 0u32;
         for tick in 0..1680u32 {
+            // B03c 1.6:主体出唤醒范围会被滞回冻结(§3 规则 1),布景加一个
+            // 覆盖主体的观察者——每拍跟随根位置(固定观察者盖不住 120 m 的
+            // 行程)。断言零改。
+            let observers = if let Some(p) = s.agent_root_position(a) {
+                [Vec3::new(p.x, p.y + 1.0, p.z)]
+            } else {
+                observers
+            };
             production_tick(&mut s, &observers);
             if tick % 10 == 9 {
                 // entity_state 的存在性自检:主体不被强制落地/虚空移除。
@@ -3610,9 +3628,40 @@ anchor = [0.0, 0.0, 0.0]
 
         // 观察者移远 → 滞回决策(方块 outside + 静止 → 冻结;主体 outside
         // + 静止 → 决策含主体,落实段豁免;闭包从方块递归时主体豁免)。
-        let far = [Vec3::new(500.0, 0.0, 500.0)];
-        for _ in 0..60 {
-            production_tick(&mut s, &far);
+        // B03c 1.6:主体落冻结后(B03c 1.1/1.2),"全无唤醒中心"会让主体也
+        // 被冻结、闭包断言测不到。布景改用一张 ③ 档唤醒半径 1.0 m 的区域
+        // 票锚在主体位置:主体(距锚 0)在范围内保持醒着,方块(距锚 1.4 m)
+        // 仍在范围外照常滞回冻结;断言零改。
+        {
+            let anchor = s.agent_root_position(a).expect("主体在场");
+            let ticket = crate::tickets::TicketView {
+                order: 1,
+                priority: 1,
+                // ①② 与默认观察者同半径(区块装载/碰撞体覆盖维持;原布景
+                // 远观察者会卸载,这里不卸载也无碍——无断言依赖区块状态),
+                // 只把 ③ 唤醒覆盖收窄到 1.0 m。
+                data: crate::tickets::RegionSpec::Radius {
+                    load_m: 32.0,
+                    unload_m: 48.0,
+                },
+                collider: crate::tickets::RegionSpec::Radius {
+                    load_m: 32.0,
+                    unload_m: 48.0,
+                },
+                wake: crate::tickets::WakeSpec::Radius {
+                    load_m: 1.0,
+                    unload_m: 1.0,
+                },
+                state: crate::tickets::TicketState::Active,
+                anchor,
+            };
+            let centers = [anchor];
+            for _ in 0..60 {
+                s.apply_activation_tickets(std::slice::from_ref(&ticket), &centers, &centers);
+                s.step();
+                s.run_transient_lifecycle();
+                let _ = s.take_outbox();
+            }
         }
         // 主体没有被连带冻结,仍是 Dynamic 并仍在表(未被凝固写块)。
         assert!(
@@ -4684,7 +4733,11 @@ anchor = [0.0, 0.0, 0.0]
             );
             body.set_linvel(crate::conv::vec3_to_rapier(Vec3::new(1.0, 0.0, 0.0)), true);
         }
-        s.apply_activation(&observers);
+        // B03c 1.6:推到 x = 132 后主体已在观察者 unload 半径外;1.2 起会
+        // 被滞回冻结、迁移检测不再走。布景加一个覆盖主体的观察者(迁移拍
+        // 专用;本体区 132 在分片 (1,0) 内,fail-stop 纪律不变),断言零改。
+        let observers_mig = [Vec3::new(132.0, 3.45, 24.0)];
+        s.apply_activation(&observers_mig);
         s.step();
         let outbox = s.take_outbox();
 
@@ -5092,6 +5145,16 @@ anchor = [0.0, 0.0, 0.0]
                     }
                     in_dst = !in_dst;
                 }
+                // B03c 1.6:目的分片的固定观察者 (24,·,24) 盖不住迁到
+                // x ≈ 152 的主体;1.2 起主体会被滞回冻结、下一轮迁移检测
+                // 不再走。布景在目的分片侧加一个覆盖主体的观察者,断言零改。
+                let observers: [Vec3; 1] = if in_dst {
+                    dst.agent_root_position(a)
+                        .map(|p| [Vec3::new(p.x, p.y + 1.0, p.z)])
+                        .unwrap_or(observers)
+                } else {
+                    observers
+                };
                 let sim = if in_dst { &mut dst } else { &mut s };
                 sim.apply_activation(&observers);
                 sim.step();
@@ -6633,6 +6696,445 @@ anchor = [0.0, 0.0, 0.0]
         let vb = b.shape.compute_local_aabb();
         let d = va.half_extents() - vb.half_extents();
         d.x.abs() < 1e-6 && d.y.abs() < 1e-6 && d.z.abs() < 1e-6
+    }
+
+    // ==================== B03c T 组(触发接线)====================
+
+    /// T 组布景:站立四足 + 交替关节目标(±0.5,每 30 拍换向)让关节全程
+    /// 在动(F4 同款写法;电机持续纠偏,qd 不衰减到 0)。
+    fn t_quad_joints_moving(ticks: usize) -> (crate::sim::ShardSim, BodyHash, types::EntityId) {
+        let (mut s, hash, a) = f_quad_standing(2);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let base: Vec<f32> = {
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            def.dof_joints()
+                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+                .collect()
+        };
+        for tick in 0..ticks {
+            let sign = if (tick / 30) % 2 == 0 { 0.5 } else { -0.5 };
+            let targets: Vec<f32> = base.iter().map(|d| d + sign).collect();
+            if tick % 2 == 0 {
+                s.apply_agent_joint_targets(a, &targets).expect("合法");
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        (s, hash, a)
+    }
+
+    /// T1 行走中冻结:四足关节在动,观察者移出 unload 半径。冷却过后主体
+    /// 被冻结(§3 规则 1:出了唤醒范围就冻结,不要求先静止),冻结那一拍
+    /// 快照 `joint_qd` 最大值 > 0.1。对照:同布景一个持续在动的普通常驻
+    /// 方块(Teleport 每 10 拍重置静止判据)不被冻结——普通常驻体的静止
+    /// 前置照旧(§3 规则 3:豁免面不变的对偶面)。
+    #[test]
+    fn t1_walking_agent_freezes_without_observer() {
+        let (mut s, _hash, a) = t_quad_joints_moving(30);
+        let block = types::EntityId::from_parts(2, 2);
+        // 对照方块:常驻(MarkActor)、带初速在动;之后每 10 拍 Teleport
+        // 重置静止判据(删除+重建,actor 保留;slow_ticks/窗口清零)。
+        s.apply_prefix(&[
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 1,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::SpawnDynamic {
+                    entity: block,
+                    state: types::EntityState {
+                        translation: Vec3::new(24.0, 1.5, 20.0),
+                        linvel: Vec3::new(0.5, 0.0, 0.0),
+                        ..types::EntityState::default()
+                    },
+                    desc: types::EntityDesc::default(),
+                }),
+            },
+            messaging::StampedInput {
+                apply_at: types::Tick::ZERO,
+                source: messaging::InputSource::SCHEDULER,
+                sequence: 2,
+                payload: messaging::InputPayload::Command(messaging::SimCommand::MarkActor {
+                    entity: block,
+                    actor: true,
+                }),
+            },
+        ]);
+        let mut seq = 3u64;
+        // 观察者移远 → 出 unload 半径;冷却(180 拍)过后冻结。
+        let far = [Vec3::new(500.0, 3.0, 500.0)];
+        let mut frozen_tick: Option<u32> = None;
+        let mut qd_at_freeze = 0.0f32;
+        for tick in 0..400u32 {
+            // 对照方块保持"在动"(每 10 拍重建位姿前移 0.5 m、恢复初速)。
+            if tick % 10 == 5 {
+                let pos = {
+                    let rec = s.entities.get(&block).expect("方块在场");
+                    let rb = s.phys.bodies.get(rec.handle).expect("刚体");
+                    crate::conv::rapier_to_vec3(rb.translation())
+                };
+                s.apply_prefix(&[messaging::StampedInput {
+                    apply_at: types::Tick::ZERO,
+                    source: messaging::InputSource::SCHEDULER,
+                    sequence: seq,
+                    payload: messaging::InputPayload::Command(
+                        messaging::SimCommand::TeleportEntity {
+                            entity: block,
+                            state: types::EntityState {
+                                translation: Vec3::new(pos.x + 0.5, pos.y, pos.z),
+                                linvel: Vec3::new(0.5, 0.0, 0.0),
+                                ..types::EntityState::default()
+                            },
+                        },
+                    ),
+                }]);
+                seq += 1;
+            }
+            s.apply_activation(&far);
+            s.step();
+            let _ = s.take_outbox();
+            if frozen_tick.is_none() && s.is_agent_frozen(a) {
+                frozen_tick = Some(tick);
+                let (_, qd) = s.agent_joint_state(a);
+                qd_at_freeze = qd.iter().copied().fold(0.0f32, f32::max);
+            }
+        }
+        let frozen_tick = frozen_tick.expect("布景自检:400 拍内主体未冻结(触发未接线)");
+        println!("T1: 冻结拍 {frozen_tick},冻结拍快照 max|qd| = {qd_at_freeze:.4}");
+        assert!(qd_at_freeze > 0.1, "冻结拍 max|qd| = {qd_at_freeze} ≤ 0.1");
+        assert!(s.is_agent_frozen(a), "布景自检:冻结后保持冻结(无观察者)");
+        // 对照:在动的普通常驻方块不被冻结(静止前置对普通体照旧)。
+        assert!(
+            !s.is_frozen(block),
+            "对照:在动的普通常驻方块被冻结(静止前置被主体改动波及)"
+        );
+    }
+
+    /// T2 滞回:观察者在 load 半径内 → 不冻结;在 (load, unload] 之间 →
+    /// 保持原状态(醒着的保持醒);出 unload → 冻结;回到 load 内 → 唤醒,
+    /// 13 连杆,唤醒误差满足 F4 的位置判据(位姿 < 1e-4)。
+    #[test]
+    fn t2_hysteresis_freeze_wake_cycle() {
+        let (mut s, _hash, a) = t_quad_joints_moving(10);
+        let center = Vec3::new(24.0, 3.45, 24.0);
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        let awake_load = s.cfg.activation.awake_load_radius;
+        let awake_unload = s.cfg.activation.awake_unload_radius;
+        // 阶段 1:观察者在 load 内 → 保持醒着。
+        let inside = [center];
+        for _ in 0..30 {
+            s.apply_activation(&inside);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        assert!(!s.is_agent_frozen(a), "滞回:load 内的主体被冻结(不应发生)");
+        // 阶段 2:观察者在 (load, unload] 之间 → 滞回带,保持醒着。
+        let band = [center + dir * ((awake_load + awake_unload) * 0.5)];
+        for _ in 0..60 {
+            s.apply_activation(&band);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        assert!(
+            !s.is_agent_frozen(a),
+            "滞回带内的醒着主体被冻结(应保持原状态)"
+        );
+        // 阶段 3:出 unload → 冻结(冷却 180 拍后)。
+        let poses_pre = f_link_poses(&s, a);
+        let (q_pre, qd_pre) = s.agent_joint_state(a);
+        let targets_pre = s.agent_joint_targets(a).expect("目标").to_vec();
+        let far = [center + dir * (awake_unload + 10.0)];
+        let mut frozen_tick: Option<u32> = None;
+        for tick in 0..300u32 {
+            s.apply_activation(&far);
+            s.step();
+            let _ = s.take_outbox();
+            if frozen_tick.is_none() && s.is_agent_frozen(a) {
+                frozen_tick = Some(tick);
+            }
+        }
+        let frozen_tick = frozen_tick.expect("出 unload 后 300 拍未冻结");
+        println!("T2: 冻结拍(出 unload 起)= {frozen_tick}");
+        assert!(s.is_agent_frozen(a), "布景自检:出 unload 冻结后保持");
+        // 阶段 4:回到 load 内 → 计划唤醒,13 连杆,唤醒误差满足 F4 判据。
+        {
+            s.apply_activation(&inside);
+            // 唤醒落实在 apply_activation 内(plan → wake_group →
+            // wake_agent);F4 的误差判据是"步进之前"——先比较再步进。
+            assert!(!s.is_agent_frozen(a), "回到 load 内未唤醒");
+            let record = s.agents.get(&a).expect("主体");
+            let def = s.bodies.get(&record.body_hash).expect("def");
+            assert_eq!(def.links.len(), 13, "唤醒后 13 连杆");
+            // F4 位置判据:关节坐标/速度 < 1e-4;13 连杆位姿 < 1e-4。
+            let (q, qd) = s.agent_joint_state(a);
+            let q_err = q
+                .iter()
+                .zip(&q_pre)
+                .map(|(v, e)| (v - e).abs())
+                .fold(0.0f32, f32::max);
+            let qd_err = qd
+                .iter()
+                .zip(&qd_pre)
+                .map(|(v, e)| (v - e).abs())
+                .fold(0.0f32, f32::max);
+            assert!(q_err < 1e-4, "唤醒关节坐标误差 {q_err:.3e} ≥ 1e-4");
+            assert!(qd_err < 1e-4, "唤醒关节速度误差 {qd_err:.3e} ≥ 1e-4");
+            let poses = f_link_poses(&s, a);
+            let mut pos_err = 0.0f32;
+            let mut rot_err = 0.0f32;
+            for ((pp, pr), (cp, cr)) in poses_pre.iter().zip(&poses) {
+                pos_err = pos_err.max((cp - pp).length());
+                let dq = cr * pr.inverse();
+                rot_err = rot_err.max(2.0 * rapier3d::math::Vector::new(dq.x, dq.y, dq.z).length());
+            }
+            assert!(pos_err < 1e-4, "唤醒连杆位置误差 {pos_err:.3e} ≥ 1e-4");
+            assert!(rot_err < 1e-4, "唤醒连杆朝向误差 {rot_err:.3e} ≥ 1e-4");
+            assert_eq!(
+                s.agent_joint_targets(a).expect("目标").to_vec(),
+                targets_pre,
+                "唤醒后电机目标 = 冻结前的目标"
+            );
+            s.step();
+            let _ = s.take_outbox();
+        }
+    }
+
+    /// T3 无唤醒中心:`apply_activation(&[])`、没有票 → 冷却后冻结。
+    #[test]
+    fn t3_no_wake_center_freezes() {
+        let (mut s, _hash, a) = f_quad_standing(2);
+        let mut frozen_tick: Option<u32> = None;
+        for tick in 0..300u32 {
+            s.apply_activation(&[]);
+            s.step();
+            let _ = s.take_outbox();
+            if frozen_tick.is_none() && s.is_agent_frozen(a) {
+                frozen_tick = Some(tick);
+            }
+        }
+        let frozen_tick = frozen_tick.expect("无唤醒中心 300 拍未冻结");
+        println!("T3: 冻结拍 = {frozen_tick}");
+        assert!(s.is_agent_frozen(a), "布景自检:保持冻结");
+    }
+
+    /// T4 预算豁免仍在:主体同时"超预算"且"在范围内" → 不冻结
+    /// (A01 判据的两条预算测试不改、仍绿)。布景:装满醒体预算到超限
+    /// (主体 13 格 + 小方块),把 `max_awake_dynamic` 压到 1(配置注入;
+    /// 生产布景是普通实体超限,这里压配置等价于"全体超预算")——主体在
+    /// 观察者范围内,plan 的 `over_budget_freeze` 含主体,1.2 预算豁免挡下。
+    #[test]
+    fn t4_budget_exemption_still_holds() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        // 压预算:醒体格数上限 1(主体 13 格必超)。
+        s.cfg.activation.max_awake_dynamic = 1;
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for _ in 0..300 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        assert!(
+            !s.is_agent_frozen(a),
+            "T4:范围内超预算的主体被冻结(预算豁免缺失)"
+        );
+        assert!(s.is_agent(a), "布景自检:主体仍在 agents 表");
+    }
+
+    /// T5 砸醒后重新冻结:冻结的四足、无观察者,3 m 落方块把它砸醒
+    /// (F3b-重 的布景:撞前预测唤醒);观察者继续不在 → 冷却后它再次被
+    /// 冻结(`agent_frozen` 累计 2、`agent_woken` 累计 1),全程不 panic,
+    /// 最后一次冻结后障碍物不动。
+    #[test]
+    fn t5_wake_then_refreeze_counts() {
+        let (mut s, _hash, a) = f_quad_standing(120);
+        s.freeze_agent(a);
+        let pose0 = f_obstacle_pose(&s, a);
+        // 3 m 落方块到躯干正上方(F3b-重 同款)。
+        let torso_top = pose0.0.y + 0.057;
+        let block_pos = Vec3::new(pose0.0.x, torso_top + 3.0 + 0.5, pose0.0.z);
+        let blk = types::EntityId::from_parts(9, 9);
+        s.spawn_entity_for_test(blk, block_pos);
+        let mut agent_frozen_total = 0u64;
+        let mut agent_woken_total = 0u64;
+        let mut woken_tick: Option<u32> = None;
+        let mut second_frozen_tick: Option<u32> = None;
+        let mut post_refreeze_poses: Option<
+            Vec<(rapier3d::math::Vector, rapier3d::math::Rotation)>,
+        > = None;
+        for tick in 0..900u32 {
+            s.apply_activation(&[]);
+            s.step();
+            let out = s.take_outbox();
+            agent_frozen_total += out.agent_frozen;
+            agent_woken_total += out.agent_woken;
+            if woken_tick.is_none() && agent_woken_total > 0 {
+                woken_tick = Some(tick);
+            }
+            if woken_tick.is_some() && second_frozen_tick.is_none() && s.is_agent_frozen(a) {
+                second_frozen_tick = Some(tick);
+            }
+            if second_frozen_tick.is_some() && post_refreeze_poses.is_none() {
+                post_refreeze_poses = Some(vec![f_obstacle_pose(&s, a)]);
+            }
+            // 最后一次冻结之后:障碍物逐拍不动。
+            if let (Some(_), Some(recs)) = (second_frozen_tick, post_refreeze_poses.as_mut()) {
+                let pose = f_obstacle_pose(&s, a);
+                let (p0, r0) = recs[0];
+                assert_eq!(pose.0, p0, "再冻结后障碍物位置不动(拍 {tick})");
+                assert_eq!(pose.1, r0, "再冻结后障碍物朝向不动(拍 {tick})");
+            }
+        }
+        let woken_tick = woken_tick.expect("900 拍内未被砸醒");
+        let second_frozen_tick = second_frozen_tick.expect("砸醒后 900 拍内未再冻结");
+        println!(
+            "T5: 砸醒拍 {woken_tick},再冻结拍 {second_frozen_tick},\
+             agent_frozen 累计 {agent_frozen_total},agent_woken 累计 {agent_woken_total}"
+        );
+        assert_eq!(
+            agent_frozen_total, 2,
+            "agent_frozen 累计 2(手工 + 生产再冻结)"
+        );
+        assert_eq!(agent_woken_total, 1, "agent_woken 累计 1");
+        assert!(s.is_agent_frozen(a), "布景自检:终态冻结");
+    }
+
+    /// T6 单连杆:胶囊(无观察者)同样冻结、观察者回来后唤醒,继续按
+    /// 原意图走(沿航向速度 ≥ 冻结前 80%;F8 同款口径)。
+    #[test]
+    fn t6_single_link_freeze_wake_resume_by_trigger() {
+        let (mut s, _hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let capsule = s.bodies.hash_of("capsule").expect("capsule 已装");
+        let a_cap = types::EntityId::from_parts(2, 2);
+        s.spawn_agent(
+            a_cap,
+            capsule,
+            types::EntityState {
+                translation: Vec3::new(24.0, GROUND_TOP_Y + 0.95, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("胶囊生成");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        for tick in 0..60usize {
+            if tick == 0 {
+                s.apply_prefix(&[intent_input(a_cap, 1, (2.0, 0.0), 0.0, false)]);
+            }
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let vfwd_pre = {
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            rb.linvel().x
+        };
+        println!("T6: 冻结前 vfwd {vfwd_pre:.4} m/s");
+        assert!(vfwd_pre > 0.5, "布景自检:冻结前进速度 {vfwd_pre} ≤ 0.5");
+        // 观察者移远 → 生产路径冻结(不再手工 freeze_agent)。
+        let far = [Vec3::new(500.0, 3.0, 500.0)];
+        let mut frozen = false;
+        for _ in 0..400u32 {
+            s.apply_activation(&far);
+            s.step();
+            let _ = s.take_outbox();
+            if s.is_agent_frozen(a_cap) {
+                frozen = true;
+                break;
+            }
+        }
+        assert!(frozen, "T6:胶囊 400 拍内未被生产路径冻结");
+        assert!(s.is_agent_frozen(a_cap), "布景自检:胶囊保持冻结");
+        // 观察者回来 → 计划唤醒(翻转冷却 180 拍内推迟,等待循环有上限)
+        // → 唤醒后继续按原意图走 120 拍(意图在冻结期间只记下来;唤醒后
+        // hold 写回,继续行走)。
+        let mut woken = false;
+        for _ in 0..400u32 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+            if !s.is_agent_frozen(a_cap) {
+                woken = true;
+                break;
+            }
+        }
+        assert!(woken, "T6:观察者回来 400 拍内未唤醒");
+        // 唤醒后继续按原意图走 120 拍再测速。
+        for _ in 0..120u32 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let vfwd_post = {
+            let rec = s.entities.get(&a_cap).expect("在场");
+            let rb = s.phys.bodies.get(rec.handle).expect("根");
+            rb.linvel().x
+        };
+        println!("T6: 唤醒后 120 拍 vfwd {vfwd_post:.4} vs 冻结前 {vfwd_pre:.4}");
+        assert!(
+            vfwd_post >= 0.8 * vfwd_pre,
+            "唤醒后速度比 {vfwd_post}/{vfwd_pre} < 80%"
+        );
+    }
+
+    /// T8 回放:T2 的全过程双跑逐拍逐位相同。
+    #[test]
+    fn t8_t2_scene_double_run_identical() {
+        let run = || {
+            let (mut s, _hash, a) = t_quad_joints_moving(10);
+            let mut trace: Vec<(rapier3d::math::Vector, rapier3d::math::Rotation)> = Vec::new();
+            let center = Vec3::new(24.0, 3.45, 24.0);
+            let dir = Vec3::new(1.0, 0.0, 0.0);
+            let awake_load = s.cfg.activation.awake_load_radius;
+            let awake_unload = s.cfg.activation.awake_unload_radius;
+            let inside = [center];
+            let band = [center + dir * ((awake_load + awake_unload) * 0.5)];
+            let far = [center + dir * (awake_unload + 10.0)];
+            let mut snap: Option<(Vec<f32>, Vec<f32>)> = None;
+            for stage in 0..4u32 {
+                let obs = match stage {
+                    0 => &inside,
+                    1 => &band,
+                    2 => &far,
+                    _ => &inside,
+                };
+                let ticks = match stage {
+                    0 => 30,
+                    1 => 60,
+                    2 => 300,
+                    _ => 30,
+                };
+                for _ in 0..ticks {
+                    s.apply_activation(obs);
+                    s.step();
+                    let _ = s.take_outbox();
+                    let root = {
+                        let rec = s.entities.get(&a).expect("在场");
+                        let rb = s.phys.bodies.get(rec.handle).expect("根");
+                        (rb.translation(), *rb.rotation())
+                    };
+                    trace.push(root);
+                }
+                if stage == 2 && snap.is_none() {
+                    // 冻结段末:记录快照关节态(逐拍核对的锚点之一)。
+                    snap = Some(s.agent_joint_state(a));
+                }
+            }
+            (trace, snap)
+        };
+        let (trace_a, snap_a) = run();
+        let (trace_b, snap_b) = run();
+        assert_eq!(trace_a.len(), trace_b.len(), "拍数相同");
+        for (i, (x, y)) in trace_a.iter().zip(&trace_b).enumerate() {
+            assert_eq!(x, y, "第 {i} 拍根位姿逐位不同");
+        }
+        assert_eq!(snap_a, snap_b, "冻结段末关节态逐位相同");
     }
 
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
