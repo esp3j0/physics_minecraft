@@ -917,16 +917,14 @@ mod tests {
         assert_eq!(startup.pending.len(), 1, "第 2 条仍在等");
         session.shutdown();
 
-        let spawned_entity = match log.entries()[0].command {
-            _ => log
-                .entries()
-                .iter()
-                .find_map(|e| match e.command {
-                    messaging::SimCommand::SpawnAgent { entity, .. } => Some(entity),
-                    _ => None,
-                })
-                .expect("布景自检:第 1 条已生成"),
-        };
+        let spawned_entity = log
+            .entries()
+            .iter()
+            .find_map(|e| match e.command {
+                messaging::SimCommand::SpawnAgent { entity, .. } => Some(entity),
+                _ => None,
+            })
+            .expect("布景自检:第 1 条已生成");
         let record = startup.to_record();
         assert_eq!(record.pending, vec![1], "在等的是 0 起下标 1(第 2 条)");
         assert_eq!(
@@ -936,7 +934,7 @@ mod tests {
         );
 
         // resume:只第 2 条进待生成表;序号(1 起 = 2)、票号(BASE + 1)。
-        let mut resumed = StartupAgents::resume(&cfgs, &bodies, &record);
+        let resumed = StartupAgents::resume(&cfgs, &bodies, &record);
         assert_eq!(resumed.counters.resume_dropped, 0, "两条都合法");
         assert_eq!(resumed.pending.len(), 1);
         // PendingStartup 私有;经 to_record 往返核对序号,经 poll 首拍放票
@@ -961,7 +959,7 @@ mod tests {
             pending: vec![1, 7],
             tickets: Vec::new(),
         };
-        let mut resumed = StartupAgents::resume(&cfgs, &bodies, &record);
+        let resumed = StartupAgents::resume(&cfgs, &bodies, &record);
         assert_eq!(resumed.counters.resume_dropped, 1, "越界 1 条丢弃");
         assert_eq!(resumed.to_record().pending, vec![1], "留序号 1");
         // 身体不在注册表:空注册表,任何序号都查不到身体。

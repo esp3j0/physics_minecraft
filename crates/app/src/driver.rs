@@ -742,6 +742,7 @@ pub fn decode_checkpoint(bytes: &[u8]) -> Result<CheckpointBundle, AppError> {
 /// `log.take()`,且两者之间不得插入任何 `session` 调用——同一拍边界的
 /// 世界状态与日志窗口才互相一致(先 world 后 log:log 的窗口恰好是
 /// snapshot.tick 之后的命令,与 replay_world 的 `>=` 重放窗对齐)。
+#[allow(clippy::too_many_arguments)] // 高水位两输入 + 控制者/启动主体两簿记,逐项透传(B03d)
 fn write_checkpoint(
     session: &sim_api::session::Session,
     log: &mut sim_api::log::CommandLog,

@@ -17,11 +17,9 @@ use app::driver::{DriverArgs, DriverCommand, DriverOutcome, ObserveCadence, Obse
 use app::net::chunk_stream::PumpConfig;
 use app::net::{NetConfig, NetUp, OutboundHub, serve};
 use messaging::InputSource;
-use physics_sim::BodyRegistry;
 use sim_api::log::CommandLog;
 use sim_api::proto::{C2S, S2C, decode_frame, encode_c2s_frame};
 use storage::traits::CheckpointStore as _;
-use storage::worker::StoreWorker;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -40,14 +38,6 @@ const WAIT_WALL_SECS: u64 = 60;
 /// 出生点:分片 (0,0) 中心 (64,64),地面顶面 + 0.45(B02a 同口径)。
 const QUAD_XZ: [f32; 2] = [64.0, 64.0];
 const QUAD_Y: f32 = GROUND_TOP_Y + 0.45;
-
-fn quad_registry() -> BodyRegistry {
-    let mut bodies = BodyRegistry::new();
-    bodies
-        .insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
-        .expect("quad.body.toml 合法");
-    bodies
-}
 
 fn quad_agent(controller: StartupController, leash_m: f32) -> StartupAgentConfig {
     StartupAgentConfig {
