@@ -1,0 +1,67 @@
+name = "req012-agent-freeze"
+req = "REQ-012"
+description = "玩家离开身体走远,身体被冻结;回来后身体还在原地、直立、没有消失(AC-B4 的图形面)。冻结本身由端到端测试断言,这里只看回来之后的样子。"
+timeout_secs = 300
+
+[server]
+world_seed = 3
+
+[[step]]
+label = "相机就位"
+camera = { pos = [8.5, -54.0, 22.5], yaw = -90.0, pitch = -30.0 }
+
+[[step]]
+look_at = { target = [8.5, -59.0, 14.5] }
+
+[[step]]
+wait_until = { block = { pos = [8, -61, 14], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "生成胶囊"
+spawn_agent = { at = [8.5, -59.05, 14.5], yaw = 90.0, label = "hero" }
+
+[[step]]
+possess = { label = "hero" }
+
+[[step]]
+wait_until = { agent_alive = { label = "hero" }, timeout_ticks = 120 }
+
+[[step]]
+label = "落稳"
+wait_ticks = { n = 90 }
+
+[[step]]
+label = "基准点 = 落稳后的位置"
+mark_agent = { label = "hero" }
+
+[[step]]
+unpossess = {}
+
+[[step]]
+label = "走远(100 m 外,出唤醒范围)"
+camera = { pos = [108.5, -54.0, 22.5], yaw = -90.0, pitch = -30.0 }
+
+[[step]]
+label = "等它被冻结"
+wait_ticks = { n = 420 }
+
+[[step]]
+label = "回来"
+camera = { pos = [8.5, -54.0, 22.5], yaw = -90.0, pitch = -30.0 }
+
+[[step]]
+look_at = { target = [8.5, -59.0, 14.5] }
+
+[[step]]
+label = "身体还在原地"
+wait_until = { agent_in = { label = "hero", from = [8.0, -60.0, 14.0], to = [9.0, -58.0, 15.0] }, hold_ticks = 120, timeout_ticks = 900 }
+
+[[step]]
+screenshot = { name = "back", expect = "棕色平地上立着一个高亮色的竖直圆柱体(胶囊身体),位置在画面中央偏下,没有倒下、没有陷进地面、没有消失。" }
+
+[[step]]
+check = { agent_alive = { label = "hero" } }
+
+[[step]]
+label = "离基准点不超过 0.3 m"
+check = { agent_moved = { label = "hero", le = 0.3 } }
