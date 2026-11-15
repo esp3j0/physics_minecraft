@@ -5923,6 +5923,92 @@ anchor = [0.0, 0.0, 0.0]
         );
     }
 
+    /// 返修 R1 第 2 节:walker 控制拍决策段的冻结跳过(`if record.frozen
+    /// .is_some() { continue; }`)必须有测试钉住。布景 = 冻结的胶囊持有
+    /// 行走意图,冻结后把 yaw 从 0 改成 1.0(意图命令冻结期间照旧写记录,
+    /// B03b 1.4 行为表),步进 120 拍(覆盖 ≥ 2 个 30 Hz 控制拍):
+    /// - `walker_holds` 里没有它(决策段不重新写入保持态);
+    /// - 障碍物朝向逐位不变(冻结后 yaw 1.0 ≠ prev_yaw 0;若决策段跑到
+    ///   冻结主体,会对 kinematic 障碍物 set_rotation,朝向即变)。
+    /// 变异自证:去掉 walker.rs 该跳过 → 本测试红(双断言各自都红:
+    /// walker_holds 出现该主体;障碍物朝向被写)。
+    #[test]
+    fn r1_walker_control_tick_skips_frozen() {
+        let (mut s, _hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let capsule = s.bodies.hash_of("capsule").expect("capsule 已装");
+        let a_cap = types::EntityId::from_parts(2, 2);
+        s.spawn_agent(
+            a_cap,
+            capsule,
+            types::EntityState {
+                translation: Vec3::new(24.0, GROUND_TOP_Y + 0.95, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("胶囊生成");
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        // 冻结前:意图向前走 + yaw 0(决策段把 prev_yaw 写成 0)。
+        let mut inputs = Vec::new();
+        inputs.push(intent_input(a_cap, 1, (2.0, 0.0), 0.0, false));
+        s.apply_prefix(&inputs);
+        for _ in 0..2 {
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        // 自检:意图已写进记录、walker_holds 里有保持态(控制器在正常工作,
+        // prev_yaw = 0)。
+        assert!(
+            s.agents.get(&a_cap).expect("主体").intent_move.is_some(),
+            "布景自检:意图在记录里"
+        );
+        assert!(
+            s.walker_holds.contains_key(&a_cap),
+            "布景自检:冻结前控制器在写保持态"
+        );
+        assert_eq!(
+            s.walker_holds.get(&a_cap).expect("有").last_yaw,
+            0.0,
+            "布景自检:prev_yaw = 0"
+        );
+        s.freeze_agent(a_cap);
+        // 冻结后改发非零 yaw 意图(1.4:意图命令照旧写记录;1.0 rad 也在
+        // YAW_EPS 之外,变异下必触发 set_rotation)。全程空观察者——不能放
+        // 观察者:plan 计划唤醒(W1 路径)会把冻结主体唤醒,wake_agent 把
+        // hold 写回,测的就不再是决策段的跳过了。
+        let mut inputs2 = Vec::new();
+        inputs2.push(intent_input(a_cap, 2, (2.0, 0.0), 1.0, false));
+        s.apply_prefix(&inputs2);
+        let pose0 = f_obstacle_pose(&s, a_cap);
+        // 冻结时 walker_holds 已被 freeze_agent 移除:先确认空。
+        assert!(
+            !s.walker_holds.contains_key(&a_cap),
+            "freeze_agent 应移除 walker_holds"
+        );
+        assert!(s.is_agent_frozen(a_cap), "布景自检:冻结在表");
+        // 120 拍 ≥ 2 个控制拍(is_control_tick 每 2 拍一个)。**全程空观察者
+        // ——不能放观察者:plan 计划唤醒(W1 路径)会把冻结主体唤醒,
+        // wake_agent 把 hold 写回,测的就不再是决策段的跳过了。**
+        for tick in 0..120 {
+            s.apply_activation(&[]);
+            s.step();
+            let _ = s.take_outbox();
+            assert!(
+                s.is_agent_frozen(a_cap),
+                "布景自检:空观察者下主体全程保持冻结(第 {tick} 拍被唤醒 = 布景错)"
+            );
+        }
+        assert!(
+            !s.walker_holds.contains_key(&a_cap),
+            "冻结主体的控制拍不得重新写入 walker_holds"
+        );
+        let pose1 = f_obstacle_pose(&s, a_cap);
+        assert_eq!(pose0.0, pose1.0, "障碍物位置逐位不变");
+        assert_eq!(pose0.1, pose1.1, "障碍物朝向逐位不变(set_rotation 不得触达)");
+    }
+
     /// F8 单连杆:胶囊持有行走意图走 60 拍后冻结,步进 300 拍,位置逐位不
     /// 变;唤醒后意图与保持的力与冻结前相同,120 拍后沿航向速度 ≥ 冻结前
     /// 的 80%。
