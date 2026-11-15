@@ -851,11 +851,7 @@ async fn y2b_player_body_online_freeze_wake_walk() {
 /// 检查点间隔 240(Y4 要一个冻结之前的期中票)。返回
 /// (DriverOutcome, 数据目录持有者, config);目录由 Arc<TempDir> 持有,
 /// 调用方 drop 掉最后一个持有者后目录被删。
-async fn y3_online_stage() -> (
-    DriverOutcome,
-    std::sync::Arc<tempfile::TempDir>,
-    Config,
-) {
+async fn y3_online_stage() -> (DriverOutcome, std::sync::Arc<tempfile::TempDir>, Config) {
     let config = base_config(vec![quad_trot_agent()], 240);
     let h = bootstrap_harness(config.clone()).await;
     // 先跑 120 拍(settle 起步),再撤启动票(票号 = STARTUP_TICKET_BASE)。
@@ -1346,7 +1342,7 @@ async fn restart_data_dir_removed_after_use() {
     {
         let (outcome, data_dir, config) = y3_online_stage().await;
         assert_eq!(outcome.agent.agent_frozen, 1, "布景自检:在线段已冻结");
-        let (mut session, mut host, _snap_tick) = resume_session(&config, data_dir.path());
+        let (session, host, _snap_tick) = resume_session(&config, data_dir.path());
         assert!(!session.frozen_agents().is_empty(), "恢复线恰有冻结主体");
         // 恢复线收尾(drive_tick 同款循环的结束路径:shutdown 释放会话)。
         session.shutdown();
