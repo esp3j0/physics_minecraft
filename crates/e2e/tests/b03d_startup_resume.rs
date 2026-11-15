@@ -374,7 +374,7 @@ async fn z1_restart_with_pending_entry_still_spawns() {
         );
     }
     let mut restart_config = config.clone();
-    restart_config.data_dir = data_dir;
+    restart_config.data_dir = data_dir.clone();
     let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
@@ -436,5 +436,359 @@ async fn z1_restart_with_pending_entry_still_spawns() {
         outcome2.ticks_run < 600,
         "600 拍内生成(实得 {} 拍)",
         outcome2.ticks_run
+    );
+}
+
+// ---- Z2:主体移除后撤票 -------------------------------------------------------
+
+/// Z2:配置一条 `quad_stand`,生成后用 E6 的办法 RemoveEntity。之后 60 拍内
+/// `tickets_released == 1`,票表里没有这张启动票(日志 RemoveAreaTicket 恰
+/// 一条、同一保留区间票号)。
+#[tokio::test(start_paused = true)]
+async fn z2_remove_entity_releases_startup_ticket() {
+    let config = quad_config(vec![quad_agent(StartupController::QuadStand, 16.0)]);
+    let h = bootstrap_harness(config).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let (entity, _n) = wait_quad_13_links(&mut rx, "Z2 首段主体帧(生成)").await;
+    // E6 同款:本地受信通道发 RemoveEntity(管理面路径)。
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    h.tx.send(DriverCommand::Send {
+        shard,
+        command: messaging::SimCommand::RemoveEntity { entity },
+    })
+    .await
+    .expect("RemoveEntity 载体");
+    // 等 removed 帧(结构证据:主体没了)。
+    let deadline = Deadline::new("AgentStates.removed 含四足");
+    let mut frames = 0usize;
+    let mut removed_seen = false;
+    loop {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET {
+            panic!("等 removed 超预算(在等:RemoveEntity 生效后的 removed 帧)");
+        }
+        advance_ticks(1).await;
+        for _ in 0..4 {
+            real_yield().await;
+            match next_frame(&mut rx).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    if removed.contains(&entity) {
+                        removed_seen = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if removed_seen {
+            break;
+        }
+    }
+    assert!(removed_seen, "主体移除可见");
+    // 之后 60 拍内撤票(等 release_dead 的 RemoveAreaTicket 进日志窗口;
+    // 终末检查点在 shutdown 时写,直接关服后从检查点读)。
+    advance_ticks(60).await;
+    let cps_dir = h.data_dir.clone();
+    let outcome = shutdown(h).await;
+    assert_eq!(
+        outcome.startup_counters.tickets_released, 1,
+        "主体没了撤启动票恰一次(实得 {})",
+        outcome.startup_counters.tickets_released
+    );
+    // 日志:RemoveAreaTicket 恰一条、同一保留区间票号;SetAreaTicket 恰 1 条。
+    let log = stitched_log(&read_all_checkpoints(&cps_dir));
+    let mut set_ids: Vec<u64> = Vec::new();
+    let mut removed_ids: Vec<u64> = Vec::new();
+    for e in log.entries() {
+        match e.command {
+            messaging::SimCommand::SetAreaTicket { id, .. } => set_ids.push(id),
+            messaging::SimCommand::RemoveAreaTicket { id } => removed_ids.push(id),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        set_ids,
+        vec![app::startup_agents::STARTUP_TICKET_BASE],
+        "全程放票恰 1 张(实得 {set_ids:?})"
+    );
+    assert_eq!(
+        removed_ids,
+        vec![app::startup_agents::STARTUP_TICKET_BASE],
+        "撤的正是那张启动票(实得 {removed_ids:?})"
+    );
+}
+
+// ---- Z3:生成 → 重启 → 移除 → 撤票(票对照关系进检查点) ----------------------
+
+/// Z3:生成 → 关服(票对照进检查点 startup.tickets)→ 重启(恢复分支,
+/// release_dead 用恢复回填的票表)→ RemoveEntity → 撤票。
+#[tokio::test(start_paused = true)]
+async fn z3_spawn_restart_then_remove_releases() {
+    let mut config = quad_config(vec![quad_agent(StartupController::QuadStand, 16.0)]);
+    config.checkpoint_interval_ticks = 6000;
+    let h = bootstrap_harness(config.clone()).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let (entity0, _n) = wait_quad_13_links(&mut rx, "Z3 首段主体帧(生成)").await;
+    drop(a);
+    let data_dir = h.data_dir.clone();
+    shutdown(h).await;
+
+    // 重启段:真实 bootstrap(恢复分支)。
+    {
+        let cps = read_all_checkpoints(&data_dir);
+        let (_, blob) = cps.last().expect("终末检查点存在").clone();
+        let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
+        assert_eq!(
+            bundle.startup.tickets,
+            vec![(entity0, app::startup_agents::STARTUP_TICKET_BASE)],
+            "检查点带票对照关系(主体, BASE+0)"
+        );
+    }
+    let mut restart_config = config.clone();
+    restart_config.data_dir = data_dir.clone();
+    let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
+        app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+            .expect("重启 bootstrap 装配成功");
+    assert!(resume_from.is_some(), "重启段走恢复分支");
+    assert!(
+        resumed.is_agent(entity0),
+        "恢复后主体仍在(同一 EntityId {entity0:?})"
+    );
+
+    let (addr, up_rx, hub) = serve_restart_net().await;
+    let (tx, rxq) = mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim, loaded) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store2, || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("装配失败");
+    let driver = tokio::spawn(run(DriverArgs {
+        config,
+        session: resumed,
+        store: store2,
+        log: CommandLog::new(),
+        commands: rxq,
+        listen_ctrl_c: false,
+        provider,
+        new_sim,
+        observe: Some(ObserveLink {
+            up: up_rx,
+            hub,
+            cadence: ObserveCadence::default(),
+        }),
+        spawn_next_seq,
+        bodies: loaded,
+        resume,
+    }));
+
+    // 重连(观察者回出生点,主体保持),等主体帧再 RemoveEntity。
+    let (mut a2, mut rx2) = client(addr).await;
+    let _player = join(&mut a2, &mut rx2, 8).await;
+    a2.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let (entity1, _n2) = wait_quad_13_links(&mut rx2, "Z3 重启段主体帧").await;
+    assert_eq!(entity1, entity0, "重启后同一主体");
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    tx.send(DriverCommand::Send {
+        shard,
+        command: messaging::SimCommand::RemoveEntity { entity: entity1 },
+    })
+    .await
+    .expect("RemoveEntity 载体");
+    // 等 removed 帧。
+    let deadline = Deadline::new("Z3 removed 帧");
+    let mut frames = 0usize;
+    let mut removed_seen = false;
+    loop {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET {
+            panic!("等 removed 超预算(在等:重启段 RemoveEntity 生效)");
+        }
+        advance_ticks(1).await;
+        for _ in 0..4 {
+            real_yield().await;
+            match next_frame(&mut rx2).await {
+                Some(S2C::AgentStates { removed, .. }) => {
+                    if removed.contains(&entity1) {
+                        removed_seen = true;
+                    }
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if removed_seen {
+            break;
+        }
+    }
+    assert!(removed_seen, "重启段主体移除可见");
+    advance_ticks(60).await;
+    let cps_dir = data_dir;
+    tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+    let outcome2 = driver.await.expect("驱动不 panic");
+    assert_eq!(
+        outcome2.startup_counters.tickets_released, 1,
+        "重启段撤票(票对照来自检查点;实得 {})",
+        outcome2.startup_counters.tickets_released
+    );
+    let _ = cps_dir;
+}
+
+// ---- Z4:两条配置各走一支(生成 / 永不装载超时) ------------------------------
+
+/// Z4:第 1 条正常(生成);第 2 条出生点 y 在世界外(列恒不可读,永不装载,
+/// E8 同款)。推到第 1 条生成后、第 2 条超时前关服;重启后:第 2 条继续等、
+/// 到点放弃(`spawn_timeouts == 1`),第 1 条不重复生成(全程主体数恰 1、
+/// 恢复段 `spawned == 0`)。
+#[tokio::test(start_paused = true)]
+async fn z4_two_entries_resume_waits_and_timeouts() {
+    let mut second = quad_agent(StartupController::None, 16.0);
+    second.position[1] = -200.0; // 世界底之下,列永不装载(E8 同款)
+    let mut config = quad_config(vec![quad_agent(StartupController::QuadStand, 16.0), second]);
+    config.checkpoint_interval_ticks = 6000;
+    let h = bootstrap_harness(config.clone()).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let (entity0, _n) = wait_quad_13_links(&mut rx, "Z4 第 1 条生成").await;
+    drop(a);
+    let data_dir = h.data_dir.clone();
+    let outcome1 = shutdown(h).await;
+    assert_eq!(outcome1.startup_counters.spawned, 1, "首段只生成第 1 条");
+    assert_eq!(outcome1.startup_counters.spawn_timeouts, 0, "第 2 条未超时");
+
+    // 重启段:恢复分支——pending 只剩第 2 条(下标 1)。
+    {
+        let cps = read_all_checkpoints(&data_dir);
+        let (_, blob) = cps.last().expect("终末检查点存在").clone();
+        let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
+        assert_eq!(
+            bundle.startup.pending,
+            vec![1],
+            "待生成的只剩下标 1(第 2 条)"
+        );
+        assert_eq!(bundle.startup.tickets.len(), 1, "第 1 条的票在检查点");
+    }
+    let mut restart_config = config.clone();
+    restart_config.data_dir = data_dir.clone();
+    let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
+        app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+            .expect("重启 bootstrap 装配成功");
+    assert!(resume_from.is_some(), "重启段走恢复分支");
+
+    let (addr, up_rx, hub) = serve_restart_net().await;
+    let (tx, rxq) = mpsc::channel::<DriverCommand>(16);
+    let (provider, new_sim, loaded) =
+        app::driver::wire_provider_and_new_sim(config.clone(), &store2, || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("装配失败");
+    let driver = tokio::spawn(run(DriverArgs {
+        config,
+        session: resumed,
+        store: store2,
+        log: CommandLog::new(),
+        commands: rxq,
+        listen_ctrl_c: false,
+        provider,
+        new_sim,
+        observe: Some(ObserveLink {
+            up: up_rx,
+            hub,
+            cadence: ObserveCadence::default(),
+        }),
+        spawn_next_seq,
+        bodies: loaded,
+        resume,
+    }));
+
+    // 重连,确认第 1 条不重复生成(仍是同一主体),再推过 600 拍等第 2 条超时。
+    let (mut a2, mut rx2) = client(addr).await;
+    let _player = join(&mut a2, &mut rx2, 8).await;
+    a2.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let (entity1, _n2) = wait_quad_13_links(&mut rx2, "Z4 重启段主体帧").await;
+    assert_eq!(entity1, entity0, "第 1 条不重复生成(同一主体)");
+    advance_ticks(660).await; // 600 超时 + 余量
+    tx.send(DriverCommand::Shutdown).await.expect("驱动仍存活");
+    let outcome2 = driver.await.expect("驱动不 panic");
+    assert_eq!(
+        outcome2.startup_counters.spawn_timeouts, 1,
+        "重启段第 2 条到点放弃(实得 {})",
+        outcome2.startup_counters.spawn_timeouts
+    );
+    assert_eq!(
+        outcome2.startup_counters.spawned, 0,
+        "恢复段不重复生成(实得 {})",
+        outcome2.startup_counters.spawned
+    );
+    assert_eq!(
+        outcome2.agent.bodies_removed_on_recovery, 0,
+        "服务端主体不被恢复清扫移除"
+    );
+}
+
+// ---- Z5:无 [[agents]] 世界与日志不变 -----------------------------------------
+
+/// Z5:没有 `[[agents]]`——120 拍:`bundle.startup` 空、日志窗口 0 条、
+/// startup_counters 全 0(无主体路径不变)。
+#[tokio::test(start_paused = true)]
+async fn z5_no_agents_startup_record_empty() {
+    let mut config = quad_config(Vec::new());
+    config.checkpoint_interval_ticks = 6000;
+    let h = bootstrap_harness(config).await;
+    advance_ticks(120).await;
+    let cps_dir = h.data_dir.clone();
+    let outcome = shutdown(h).await;
+    assert_eq!(
+        outcome.startup_counters,
+        app::startup_agents::StartupCounters::default()
+    );
+    let cps = read_all_checkpoints(&cps_dir);
+    let (_, blob) = cps.last().expect("终末检查点").clone();
+    let bundle = app::driver::decode_checkpoint(&blob).expect("可解");
+    assert_eq!(
+        bundle.startup,
+        app::startup_agents::StartupRecord::default(),
+        "无 [[agents]] 的 startup 记录为空"
+    );
+    let window = CommandLog::from_bytes(&bundle.log_bytes).expect("窗口可解");
+    assert_eq!(
+        window.entries().len(),
+        0,
+        "无 [[agents]] 的 120 拍日志窗口为空(实得 {} 条)",
+        window.entries().len()
     );
 }
