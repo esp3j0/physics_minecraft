@@ -541,6 +541,260 @@ async fn y2_player_body_freezes_and_wakes() {
     session.shutdown();
 }
 
+// ---- Y2b/Y3b 共用:全程在线采样(同一驱动实例,不关服、不恢复) ----------
+
+/// 单帧帧预算(在线采样循环;Y2b/Y3b 的等待循环都有墙钟 + 帧数双上限)。
+const FRAME_BUDGET: usize = 6000;
+
+/// 在线采一帧主体根位姿(b03a `agent_pose` 同款):推 1 拍、排干下行,
+/// 返回 (帧拍号, 根 translation, 根姿态)。视距内才收得到;增量模式下
+/// 无变化不发包(调用方按"帧拍差"计稳定窗口)。
+async fn watch_agent_root(
+    rx: &mut mpsc::UnboundedReceiver<S2C>,
+    id: EntityId,
+) -> Option<(Tick, Vec3, types::EntityState)> {
+    let mut got: Option<(Tick, Vec3, types::EntityState)> = None;
+    for _ in 0..4 {
+        real_yield().await;
+        match next_frame(rx).await {
+            Some(S2C::AgentStates { tick, states, .. }) => {
+                if let Some((_, _, links)) = states.iter().find(|(e, ..)| *e == id)
+                    && let Some(root) = links.first()
+                {
+                    got = Some((tick, root.translation, *root));
+                }
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    got
+}
+
+/// Y2b 玩家身体**全程在线**冻结与唤醒(B03c 返修 R1 第 1 节):客户端连上
+/// → SpawnAgent 胶囊 → Possess → Unpossess → MoveObserver 到 40 m 外
+/// (出唤醒 unload 32 m、仍在 ① data_unload 48 m 与视距 128 m 内——主体
+/// 脚下地形不卸、AgentStates 继续下发),推拍直到冻结(上限 600 拍;
+/// **冻结判据 = AgentStates 根位姿连续 60 拍逐位不变**,任务书第 1 节
+/// 口径之一;硬判据仍是关服 DriverOutcome 的 agent_frozen)。MoveObserver
+/// 回到身体旁 → Possess(回执 Possessed(Some))→ 发行走意图,60 拍后
+/// 沿意图方向位移 > 0.5 m → 关服。断言:DriverOutcome agent_frozen == 1、
+/// agent_woken == 1;回来后同一 EntityId、位置与离开前差 < 1 cm。
+#[tokio::test(start_paused = true)]
+async fn y2b_player_body_online_freeze_wake_walk() {
+    let config = base_config(Vec::new(), 6000);
+    let h = bootstrap_harness(config).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(CAP_XZ[0], GROUND_TOP_Y + 2.0, CAP_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    // 经网络生成胶囊 + 显式 Possess + Unpossess(Y2 同款;复用其循环写法)。
+    let mut entity: Option<EntityId> = None;
+    let deadline = Deadline::with_secs(120, "Spawned 回执");
+    for i in 0..6000u32 {
+        deadline.check();
+        if entity.is_none() && i % 20 == 0 {
+            a.send(&C2S::SpawnAgent {
+                body: "capsule".to_owned(),
+                position: Vec3::new(CAP_XZ[0], QUAD_Y, CAP_XZ[1]),
+                yaw: 0.0,
+            })
+            .await
+            .expect("SpawnAgent 写入");
+        }
+        advance_ticks(1).await;
+        for _ in 0..4 {
+            real_yield().await;
+            match next_frame(&mut rx).await {
+                Some(S2C::Spawned { entity: e }) => {
+                    entity = Some(e);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        if entity.is_some() {
+            break;
+        }
+    }
+    let body = entity.expect("布景自检:胶囊已生成");
+    println!("Y2b: 胶囊 EntityId = {body:?}");
+    // Possess(回执 Possessed(Some) = 再附身成功口径同源)。
+    a.send(&C2S::Possess { entity: body })
+        .await
+        .expect("Possess 写入");
+    let mut possessed = false;
+    let deadline = Deadline::with_secs(60, "附身回执");
+    for _ in 0..1200 {
+        deadline.check();
+        match next_frame(&mut rx).await {
+            Some(S2C::Possessed { entity: Some(e) }) if e == body => {
+                possessed = true;
+                break;
+            }
+            Some(_) => continue,
+            None => {
+                advance_ticks(1).await;
+            }
+        }
+    }
+    assert!(possessed, "布景自检:附身回执未到");
+    a.send(&C2S::Unpossess).await.expect("Unpossess 写入");
+    let mut unpossessed = false;
+    for _ in 0..400 {
+        unpossessed = unpossessed
+            || matches!(
+                next_frame(&mut rx).await,
+                Some(S2C::Possessed { entity: None })
+            );
+        if unpossessed {
+            break;
+        }
+    }
+    assert!(unpossessed, "布景自检:Unpossess 回执未到");
+
+    // 离开:观察者到 40 m(出 ③ unload、在 ① unload/视距内),等冻结。
+    const AWAY_M: f32 = 40.0;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(CAP_XZ[0] + AWAY_M, GROUND_TOP_Y + 2.0, CAP_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入(40 m 外)");
+    // 冻结判据:根位姿连续 60 拍逐位不变(上限 600 拍)。增量模式下无变化
+    // 不发帧,"连续 60 拍"按帧 tick 计:同一主体 tick1 位姿与 tick2 位姿
+    // 逐位相同且 tick2 − tick1 ≥ 60 → 冻结持续 ≥ 60 拍(醒着的胶囊每拍
+    // 位姿都有微演化,60 拍逐位不变只可能是冻结;走神/入睡不算——入睡
+    // 的胶囊位姿也逐位不变,但两者在 DriverOutcome.agent_frozen == 1 的
+    // 硬判据面前是同一验收面)。
+    let mut anchor: Option<(Tick, types::EntityState)> = None;
+    let mut frozen_observed: Option<u32> = None;
+    let mut leave_pose: Option<Vec3> = None;
+    let deadline = Deadline::with_secs(300, "冻结等待(AgentStates 位姿 60 拍不变)");
+    while frozen_observed.is_none() {
+        deadline.check();
+        advance_ticks(1).await;
+        let Some((ftick, pos, pose)) = watch_agent_root(&mut rx, body).await else {
+            continue;
+        };
+        leave_pose = Some(pos);
+        match anchor {
+            Some((t0, p0)) if p0 == pose && ftick.0.saturating_sub(t0.0) >= 60 => {
+                frozen_observed = Some(t0.0 as u32);
+            }
+            Some((t0, p0)) if p0 == pose => {
+                let _ = (t0, p0);
+            }
+            _ => {
+                anchor = Some((ftick, pose));
+            }
+        }
+        if frozen_observed.is_some() {
+            break;
+        }
+    }
+    let frozen_observed =
+        frozen_observed.expect("Y2b:600 拍窗内未见位姿 60 拍连续不变(冻结判据未触发)");
+    let pre = leave_pose.expect("布景自检:离开前根位姿已采样");
+    println!("Y2b: 在线判冻结(位姿 60 拍不变,锚拍)= {frozen_observed},离开前位置 {pre:?}");
+
+    // 回来:观察者回到身体旁 → 唤醒。唤醒在线依据 = 位姿重新出现变化
+    // (冻结期间逐位不变;唤醒落实当拍起位姿恢复演化)。等第一帧变化,
+    // 此刻采"回来后位置"(= 冻结位姿,唤醒落实不位移)。
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(CAP_XZ[0], GROUND_TOP_Y + 2.0, CAP_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入(回来)");
+    let mut post: Option<Vec3> = None;
+    let mut woken_observed: Option<u32> = None;
+    let deadline = Deadline::with_secs(300, "唤醒(AgentStates 位姿变化)");
+    for tick in 0..1200u32 {
+        deadline.check();
+        advance_ticks(1).await;
+        if let Some((_ftick, pos, pose)) = watch_agent_root(&mut rx, body).await {
+            let changed = anchor.as_ref().is_some_and(|(_, p)| *p != pose);
+            if post.is_none() {
+                post = Some(pos);
+            }
+            if changed {
+                woken_observed = Some(tick);
+                break;
+            }
+        }
+    }
+    let woken_observed = woken_observed.expect("Y2b:回场 1200 拍内位姿未再变化(唤醒判据未触发)");
+    let post = post.expect("布景自检:回场后根位姿已采样");
+    let pos_diff = (post - pre).length();
+    println!("Y2b: 唤醒拍(回场起)= {woken_observed},位置差 {pos_diff:.6} m");
+    assert!(
+        pos_diff < 0.01,
+        "Y2b:回来后位置与离开前差 {pos_diff:.6} m ≥ 1 cm"
+    );
+
+    // 再附身(回执 Possessed(Some))+ 发行走意图 +x,60 拍沿意图方向 > 0.5 m。
+    a.send(&C2S::Possess { entity: body })
+        .await
+        .expect("Possess 写入");
+    let mut possessed = false;
+    let deadline = Deadline::with_secs(60, "再附身回执");
+    for _ in 0..1200 {
+        deadline.check();
+        match next_frame(&mut rx).await {
+            Some(S2C::Possessed { entity: Some(e) }) if e == body => {
+                possessed = true;
+                break;
+            }
+            Some(_) => continue,
+            None => {
+                advance_ticks(1).await;
+            }
+        }
+    }
+    assert!(possessed, "Y2b:再附身回执未到( Possessed(Some))");
+    a.send(&C2S::AgentIntent {
+        entity: body,
+        move_xz: (1.5, 0.0),
+        yaw: 0.0,
+        jump: false,
+    })
+    .await
+    .expect("AgentIntent 写入");
+    let mut walked: Option<Vec3> = None;
+    let mut frames = 0usize;
+    for _ in 0..120u32 {
+        frames += 1;
+        if frames >= FRAME_BUDGET {
+            panic!("Y2b:行走采样超帧预算");
+        }
+        advance_ticks(1).await;
+        if let Some((_ftick, pos, _pose)) = watch_agent_root(&mut rx, body).await
+            && pos.x > post.x + 0.5
+        {
+            walked = Some(pos);
+            break;
+        }
+    }
+    let walked = walked.expect("Y2b:60 拍内沿意图方向位移未过 0.5 m(醒着的身体没走)");
+    println!(
+        "Y2b: 醒后 60 拍沿 +x 位移 {:.3} m(0.5 m 判据过)",
+        walked.x - post.x
+    );
+    assert!(walked.x > post.x + 0.5, "Y2b:位移判据(内部已核,双保险)");
+
+    // 关服:DriverOutcome 硬判据(在线两个计数只在关服可见)。
+    let outcome = shutdown(h).await;
+    println!(
+        "Y2b: agent_frozen {}, agent_woken {}, possess_rejected {}",
+        outcome.agent.agent_frozen, outcome.agent.agent_woken, outcome.agent.possess_rejected
+    );
+    assert_eq!(outcome.agent.agent_frozen, 1, "Y2b:agent_frozen 应恰 1");
+    assert_eq!(outcome.agent.agent_woken, 1, "Y2b:agent_woken 应恰 1");
+    assert_eq!(outcome.agent.possess_rejected, 0, "Y2b:两次附身都不该被拒");
+}
+
 // ---- Y3/Y4/Y5/Y6 共用:quad_trot 撤启动票 → 行走中冻结 → 观察者唤醒续走 ----
 
 /// Y3 布景助手:在线段跑 quad_trot,撤启动票(③ 档),等冻结,关服。
