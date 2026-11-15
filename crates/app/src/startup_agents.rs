@@ -203,6 +203,12 @@ impl StartupAgents {
         }
     }
 
+    /// 是否还有启动票条目(B04 第 0 节):没有票时驱动每拍末的存活集合
+    /// 计算(建 `alive_post` BTreeSet)是纯浪费,整段跳过。
+    pub fn has_tickets(&self) -> bool {
+        !self.tickets.is_empty()
+    }
+
     /// 主体没了就撤它的启动票(B03d;每拍末紧跟 `host.retain_alive` 之后)。
     /// `alive` 与 `retain_alive` 用同一个判断(`is_agent` || 迁移在途)。
     /// 每撤一张:日志追加 RemoveAreaTicket,`tickets_released += 1`,条目
@@ -1044,6 +1050,32 @@ mod tests {
         startup.release_dead(&mut session, &mut log, |_| false);
         assert_eq!(log.entries().len(), n_after, "表空再调零动作");
         assert_eq!(startup.counters.tickets_released, 1);
+        session.shutdown();
+    }
+
+    /// S14(B04 第 0 节):`has_tickets` 三态——生成前(无票条目)false;
+    /// 生成后(票在表)true;按 S12 同款 `release_dead` 撤票后 false。
+    #[test]
+    fn s14_has_tickets_tracks_ticket_table() {
+        let bodies = quad_registry();
+        let mut startup = StartupAgents::new(
+            &[quad_cfg([8.5, 1.45, 8.5], StartupController::None)],
+            &bodies,
+        )
+        .expect("构造");
+        assert!(!startup.has_tickets(), "生成前:无票条目 = false");
+        let mut session = Session::new(cfg());
+        load_ground(&mut session);
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 1, "已生成(布景前提)");
+        assert!(startup.has_tickets(), "生成后:票在表 = true");
+        // 撤票(S12 同款:主体没了 → 恰撤一次,条目出表)。
+        startup.release_dead(&mut session, &mut log, |_| false);
+        assert_eq!(startup.counters.tickets_released, 1, "已撤票(布景前提)");
+        assert!(!startup.has_tickets(), "撤票后:条目出表 = false");
         session.shutdown();
     }
 

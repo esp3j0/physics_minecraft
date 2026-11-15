@@ -2620,15 +2620,18 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 // entity_owners 表里——信封在 Router,必须并集才与
                 // retain_alive 的谓词同语义;漏并集 = 迁移那一拍误撤票,
                 // 目的区域不再装载,主体卡死分片边界)。无票条目时零动作
-                // (不调 Session)。
-                let alive_post: std::collections::BTreeSet<types::EntityId> = session
-                    .entity_owners()
-                    .into_iter()
-                    .filter(|(id, _, _)| session.is_agent(*id))
-                    .map(|(id, _, _)| id)
-                    .chain(in_transit_post.iter().copied())
-                    .collect();
-                startup.release_dead(&mut session, &mut log, |id| alive_post.contains(&id));
+                // (不调 Session)。B04 第 0 节:无票时建 alive_post 也是
+                // 纯浪费,连同 release_dead 一起跳过(has_tickets false)。
+                if startup.has_tickets() {
+                    let alive_post: std::collections::BTreeSet<types::EntityId> = session
+                        .entity_owners()
+                        .into_iter()
+                        .filter(|(id, _, _)| session.is_agent(*id))
+                        .map(|(id, _, _)| id)
+                        .chain(in_transit_post.iter().copied())
+                        .collect();
+                    startup.release_dead(&mut session, &mut log, |id| alive_post.contains(&id));
+                }
                 // tick 末端编排(REQ-002 §4.4/§4.5,顺序固定 ①②③④):
                 // ensure 观察者分片 → 激活请求取数回填/卸载 → despawn 候选 +
                 // 持久化屏障 → chunk 流请求取数回执。无观察者且无挂起流请求时
