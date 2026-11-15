@@ -1,0 +1,24 @@
+[package]
+name = "body-import"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# REQ-012 C01a:URDF → BodyDef 导入工具(转换核心)。纯函数库:同样的
+# URDF 文本与选项,输出逐字节相同(toml 文本、哈希)。副作用只限调用方
+# 的文件读写(xtask 子命令 `import-body`)。
+
+[dependencies]
+types = { path = "../types" }
+# URDF XML 解析(C01a 新增的唯一第三方依赖;数据结构见其 deserialize.rs)。
+urdf-rs = "0.10"
+thiserror = "2"
+toml = "1"
+
+[dev-dependencies]
+physics-sim = { path = "../physics-sim" }
+voxel = { path = "../voxel" }
+tempfile = "3"
+
+[lints]
+workspace = true
