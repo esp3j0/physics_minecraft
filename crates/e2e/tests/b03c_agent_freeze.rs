@@ -546,21 +546,29 @@ async fn y2_player_body_freezes_and_wakes() {
 /// 单帧帧预算(在线采样循环;Y2b/Y3b 的等待循环都有墙钟 + 帧数双上限)。
 const FRAME_BUDGET: usize = 6000;
 
-/// 在线采一帧主体根位姿(b03a `agent_pose` 同款):推 1 拍、排干下行,
-/// 返回 (帧拍号, 根 translation, 根姿态)。视距内才收得到;增量模式下
-/// 无变化不发包(调用方按"帧拍差"计稳定窗口)。
+/// 在线采一帧主体根位姿(b03a `agent_pose` 同款):推 1 拍、排干下行。
+/// `id` = None 时取帧内第一只主体(首次发现用),并把它写回 `*id_out`
+/// (已发现则仍按它过滤)。返回 (帧拍号, 根 translation, 根姿态)。
 async fn watch_agent_root(
     rx: &mut mpsc::UnboundedReceiver<S2C>,
-    id: EntityId,
+    id: Option<EntityId>,
+    id_out: &mut Option<EntityId>,
 ) -> Option<(Tick, Vec3, types::EntityState)> {
     let mut got: Option<(Tick, Vec3, types::EntityState)> = None;
     for _ in 0..4 {
         real_yield().await;
         match next_frame(rx).await {
             Some(S2C::AgentStates { tick, states, .. }) => {
-                if let Some((_, _, links)) = states.iter().find(|(e, ..)| *e == id)
+                let hit = match id {
+                    Some(e) => states.iter().find(|(eid, ..)| *eid == e),
+                    None => states.first(),
+                };
+                if let Some((eid, _, links)) = hit
                     && let Some(root) = links.first()
                 {
+                    if id_out.is_none() {
+                        *id_out = Some(*eid);
+                    }
                     got = Some((tick, root.translation, *root));
                 }
             }
@@ -673,10 +681,12 @@ async fn y2b_player_body_online_freeze_wake_walk() {
     let mut frozen_observed: Option<u32> = None;
     let mut leave_pose: Option<Vec3> = None;
     let deadline = Deadline::with_secs(300, "冻结等待(AgentStates 位姿 60 拍不变)");
+    let mut body_seen = Some(body);
     while frozen_observed.is_none() {
         deadline.check();
         advance_ticks(1).await;
-        let Some((ftick, pos, pose)) = watch_agent_root(&mut rx, body).await else {
+        let Some((ftick, pos, pose)) = watch_agent_root(&mut rx, Some(body), &mut body_seen).await
+        else {
             continue;
         };
         leave_pose = Some(pos);
@@ -714,7 +724,9 @@ async fn y2b_player_body_online_freeze_wake_walk() {
     for tick in 0..1200u32 {
         deadline.check();
         advance_ticks(1).await;
-        if let Some((_ftick, pos, pose)) = watch_agent_root(&mut rx, body).await {
+        if let Some((_ftick, pos, pose)) =
+            watch_agent_root(&mut rx, Some(body), &mut body_seen).await
+        {
             let changed = anchor.as_ref().is_some_and(|(_, p)| *p != pose);
             if post.is_none() {
                 post = Some(pos);
@@ -770,7 +782,8 @@ async fn y2b_player_body_online_freeze_wake_walk() {
             panic!("Y2b:行走采样超帧预算");
         }
         advance_ticks(1).await;
-        if let Some((_ftick, pos, _pose)) = watch_agent_root(&mut rx, body).await
+        if let Some((_ftick, pos, _pose)) =
+            watch_agent_root(&mut rx, Some(body), &mut body_seen).await
             && pos.x > post.x + 0.5
         {
             walked = Some(pos);
@@ -1062,6 +1075,177 @@ async fn y6_restart_frozen_then_walk() {
     println!("Y6: 恢复+唤醒后 300 拍位移 {d:.3} m");
     assert!(d >= 0.3, "Y6:续走位移 {d:.3} m < 0.3 m");
     session.shutdown();
+}
+
+/// Y3b 四足**全程在线**行走中冻结与续走(B03c 返修 R1 第 1 节):配置
+/// quad_trot → 客户端连上采样 120 拍(拿 EntityId 与已走位置)→ Goodbye
+/// 断开(观察者票撤)→ `DriverCommand::RemoveAreaTicket` 撤启动票 →
+/// 推拍 900 拍(不连客户端,上限口径;无观察者、无唤醒中心)→ 客户端
+/// 重连,MoveObserver 到**冻结前最后一次 AgentStates 采样位姿**旁 →
+/// 推拍 ≤600:先复核位姿 60 拍逐位不变(仍冻结),再等位姿重新变化
+/// (唤醒)→ 唤醒后采样 300 拍:沿航向平均速度 ≥ 0.1 m/s、全程
+/// up·y ≥ 0.7、EntityId 不变(b03a `sample_quad_root_watch` 口径)→
+/// 关服。断言:DriverOutcome agent_frozen == 1、agent_woken == 1;
+/// skipped_frozen > 0、actions_emitted > 0(分段计数在线不可读,
+/// DriverOutcome 只在关服交付;"唤醒后 actions 继续增长/skipped 不再
+/// 增长"由行为证据闭环:主体持续行走 300 拍 = 这些控制拍既没被跳过
+/// 也不是零目标)。
+#[tokio::test(start_paused = true)]
+async fn y3b_quad_online_freeze_wake_resume_walk() {
+    let config = base_config(vec![quad_trot_agent()], 6000);
+    let h = bootstrap_harness(config).await;
+    // 采样段:客户端 join → 观察者到出生点旁(四足出生即在此)→ 采 120 拍,
+    // 拿 EntityId 与已走位置(冻结前最后一次 AgentStates,任务书口径)。
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    a.send(&C2S::MoveObserver {
+        position: Vec3::new(QUAD_XZ[0], GROUND_TOP_Y + 2.0, QUAD_XZ[1]),
+    })
+    .await
+    .expect("MoveObserver 写入");
+    let mut entity: Option<EntityId> = None;
+    let mut last_pos: Option<Vec3> = None;
+    let deadline = Deadline::with_secs(120, "采样段(AgentStates 四足帧)");
+    let mut sampled = 0u32;
+    while sampled < 120 {
+        deadline.check();
+        advance_ticks(1).await;
+        sampled += 1;
+        if let Some((_ftick, pos, _pose)) = watch_agent_root(&mut rx, entity, &mut entity).await {
+            last_pos = Some(pos);
+        }
+    }
+    let quad = entity.expect("布景自检:四足出现在 AgentStates");
+    let pre = last_pos.expect("布景自检:冻结前位姿已采样");
+    println!("Y3b: 四足 EntityId = {quad:?},120 拍后位置 {pre:?}");
+    // 断开:Goodbye → Left → 观察者票撤(handle_left ③)。此后无观察者。
+    a.send(&C2S::Goodbye).await.ok();
+    drop(a);
+    drop(rx);
+    // 撤启动票 → 主体出全部唤醒范围 → 冻结(首见翻转不受冷却;Y3 实证
+    // 撤票后 ~450 控制拍全跳过 = 冻结起点很早)。推 900 拍(任务书上限)。
+    h.tx.send(DriverCommand::RemoveAreaTicket {
+        id: STARTUP_TICKET_BASE,
+    })
+    .await
+    .expect("驱动仍存活");
+    advance_ticks(900).await;
+
+    // 重连:MoveObserver 到冻结前最后采样位姿旁 → 复核仍冻结(位姿 60 拍
+    // 逐位不变,锚 = 断开前最后姿态)→ 等位姿重新变化(唤醒)。
+    let (mut a2, mut rx2) = client(h.addr).await;
+    let _player2 = join(&mut a2, &mut rx2, 8).await;
+    a2.send(&C2S::MoveObserver {
+        position: Vec3::new(pre.x, GROUND_TOP_Y + 2.0, pre.z),
+    })
+    .await
+    .expect("MoveObserver 写入(冻结位姿旁)");
+    // 复核仍冻结 + 等唤醒:锚 = 重连后第一帧(那才是冻结位姿——采样末
+    // 位姿之后主体又走了几拍才冻,不等于冻结位姿);位姿逐位不变持续
+    // (冻结复核),第一帧变化 = 唤醒。
+    let mut anchor: Option<types::EntityState> = None;
+    let mut still_frozen_ticks = 0u32;
+    let mut woken_observed: Option<u32> = None;
+    let mut wake_pos: Option<Vec3> = None;
+    let deadline = Deadline::with_secs(300, "重连复核冻结 + 唤醒");
+    let mut frames = 0usize;
+    let mut seen_entity: Option<EntityId> = None;
+    for tick in 0..1200u32 {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET * 2 {
+            panic!("Y3b:重连段超帧预算(位姿未变/未唤醒?)");
+        }
+        advance_ticks(1).await;
+        if let Some((_ftick, pos, pose)) =
+            watch_agent_root(&mut rx2, Some(quad), &mut seen_entity).await
+        {
+            match anchor {
+                None => {
+                    anchor = Some(pose);
+                    still_frozen_ticks = 1;
+                }
+                Some(p0) if pose == p0 => {
+                    still_frozen_ticks += 1;
+                }
+                Some(_) => {
+                    // 位姿与锚不同 → 已唤醒(从未冻结由 outcome 计数把关:
+                    // agent_frozen == 1 / skipped_frozen > 0)。唤醒前至少
+                    // 见过一次冻结位姿帧。
+                    assert!(
+                        still_frozen_ticks >= 1,
+                        "Y3b:第一帧即变化——没观测到冻结位姿"
+                    );
+                    woken_observed = Some(tick);
+                    wake_pos = Some(pos);
+                    break;
+                }
+            }
+        }
+    }
+    let woken_observed = woken_observed.expect("Y3b:1200 拍内未见位姿变化(未唤醒)");
+    let wake_pos = wake_pos.expect("布景自检:唤醒帧位置已采样");
+    println!(
+        "Y3b: 冻结复核 {still_frozen_ticks} 拍逐位不变,唤醒拍(重连起)= {woken_observed},唤醒位置 {wake_pos:?}"
+    );
+
+    // 唤醒后 300 拍采样:沿航向(yaw = 0 → +x)平均速度 ≥ 0.1 m/s、全程
+    // up·y ≥ 0.7、EntityId 不变(b03a sample_quad_root_watch 口径)。
+    let yaw = 0.0_f32;
+    let (dx, dz) = (yaw.cos(), -yaw.sin());
+    let start = wake_pos;
+    let mut up_min = f32::INFINITY;
+    let mut end_pos = start;
+    let mut id_changes = 0usize;
+    let deadline = Deadline::with_secs(180, "唤醒后续走 300 拍采样");
+    let mut frames = 0usize;
+    for _ in 0..300u32 {
+        deadline.check();
+        frames += 1;
+        if frames >= FRAME_BUDGET * 2 {
+            panic!("Y3b:续走段超帧预算");
+        }
+        advance_ticks(1).await;
+        if let Some((_ftick, pos, pose)) =
+            watch_agent_root(&mut rx2, Some(quad), &mut seen_entity).await
+        {
+            if seen_entity != Some(quad) {
+                id_changes += 1;
+                seen_entity = Some(quad);
+            }
+            up_min = up_min.min((pose.rotation * Vec3::new(0.0, 1.0, 0.0)).y);
+            end_pos = pos;
+        }
+    }
+    assert_eq!(id_changes, 0, "Y3b:续走段 EntityId 变了");
+    let dist = ((end_pos.x - start.x) * dx + (end_pos.z - start.z) * dz).abs();
+    let speed = dist / (300.0 / 60.0);
+    println!("Y3b: 续走 300 拍沿航向 {dist:.3} m(平均 {speed:.3} m/s),up·y 最小 {up_min:.4}");
+    assert!(
+        speed >= 0.1,
+        "Y3b:唤醒后沿航向平均速度 {speed:.3} m/s < 0.1"
+    );
+    assert!(up_min >= 0.7, "Y3b:全程 up·y 最小 {up_min} < 0.7");
+
+    // 关服:DriverOutcome 硬判据。
+    let outcome = shutdown(h).await;
+    println!(
+        "Y3b: agent_frozen {}, agent_woken {}, actions_emitted {}, skipped_frozen {}",
+        outcome.agent.agent_frozen,
+        outcome.agent.agent_woken,
+        outcome.controller_counters.actions_emitted,
+        outcome.controller_counters.skipped_frozen
+    );
+    assert_eq!(outcome.agent.agent_frozen, 1, "Y3b:agent_frozen 应恰 1");
+    assert_eq!(outcome.agent.agent_woken, 1, "Y3b:agent_woken 应恰 1");
+    assert!(
+        outcome.controller_counters.skipped_frozen > 0,
+        "Y3b:skipped_frozen 未增长(冻结跳过分支没走到)"
+    );
+    assert!(
+        outcome.controller_counters.actions_emitted > 0,
+        "Y3b:actions_emitted 为 0(唤醒后控制者没发目标)"
+    );
 }
 
 /// Y7:无主体路径不变——无 `[[agents]]`、不连客户端,120 拍日志窗口
