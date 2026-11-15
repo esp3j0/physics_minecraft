@@ -1,6 +1,7 @@
 //! 启动主体(REQ-012 B02b §2.2):配置 `[[agents]]` 的待生成簿记与每拍
-//! 轮询。**只在全新启动**(没有恢复检查点)带配置;恢复启动传空表——
-//! 世界快照里已有这些主体(§2.2 契约),重新生成会造出第二只(E2)。
+//! 轮询。全新启动经 [`StartupAgents::new`] 带全量配置;恢复启动
+//! (B03d)经 [`StartupAgents::resume`] 只为检查点 `StartupRecord.pending`
+//! 列出的序号建待生成项——世界快照里已生成的主体不再重复生成(E2)。
 //!
 //! 每拍在 `session.tick()` 之前(§2.3 顺序第 ① 步)对每条待生成项:
 //! 1. 第一次见到时放一张区域票据(中心 = position,半径 =
@@ -11,9 +12,14 @@
 //!    条目进日志;复用 A06 重生等装载的同一组判定缝:
 //!    `shard_ids().contains && is_chunk_loaded && has_collider &&
 //!    block_solid_at` 可读),挂控制者(host.attach,leash 圆心 =
-//!    position),从 pending 移除,`spawned += 1`;
+//!    position),从 pending 移除,`spawned += 1`,票进票表;
 //! 3. 等待超过 [`STARTUP_SPAWN_TIMEOUT_TICKS`] → 放弃这一条,
 //!    `spawn_timeouts += 1`,写一条错误日志(eprintln),不 panic。
+//!
+//! 已生成主体的票进票表(B03d):每拍末驱动调 [`StartupAgents::release_dead`]
+//! (紧跟 `host.retain_alive` 之后,同一个存活判断)——主体没了就撤票,
+//! 那片区域不再常驻装载/唤醒。持久状态经 [`StartupAgents::to_record`]
+//! 随检查点走(v15)。
 //!
 //! 实体 ID 用驱动现有的服务端序号分配(`spawn_next_seq` 那一套,#12 语义,
 //! 经 `alloc_id` 闭包注入);票据 ID 取保留区间 [`STARTUP_TICKET_BASE`,
@@ -60,6 +66,15 @@ struct PendingStartup {
     waited: u32,
 }
 
+/// 启动主体的持久状态(随检查点走,B03d v15)。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct StartupRecord {
+    /// 还没生成也没放弃的配置条目序号(0 起,对应 config.agents 的下标)。
+    pub pending: Vec<u32>,
+    /// 已生成主体与它的启动区域票:(主体, 票号)。
+    pub tickets: Vec<(EntityId, u64)>,
+}
+
 /// 启动主体计数(遥测;DriverOutcome.startup_counters)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StartupCounters {
@@ -67,6 +82,10 @@ pub struct StartupCounters {
     pub spawned: u64,
     /// 等装载超时放弃的条数。
     pub spawn_timeouts: u64,
+    /// 主体没了之后撤掉的启动票数(B03d)。
+    pub tickets_released: u64,
+    /// 恢复时丢弃的待生成项(序号越界或身体不在注册表;B03d)。
+    pub resume_dropped: u64,
 }
 
 /// 构造失败(类型化;校验前置在 `Config::validate*`,`new` 只对"配置有
@@ -79,6 +98,8 @@ pub struct StartupAgentsError(pub String);
 #[derive(Debug, Default)]
 pub struct StartupAgents {
     pending: Vec<PendingStartup>,
+    /// 已生成主体与它的启动区域票(主体没了就撤票;B03d)。
+    tickets: Vec<(EntityId, u64)>,
     pub counters: StartupCounters,
 }
 
@@ -114,8 +135,109 @@ impl StartupAgents {
         }
         Ok(Self {
             pending,
+            tickets: Vec::new(),
             counters: StartupCounters::default(),
         })
+    }
+
+    /// 恢复启动(B03d):只为 `record.pending` 列出的序号建待生成项。
+    /// 序号 ≥ cfgs.len(),或该条的身体不在注册表 → 丢弃
+    /// (`resume_dropped += 1`,打一行日志,不报错);票号仍是
+    /// `STARTUP_TICKET_BASE + 序号`,`ticket_placed = false`(重放一次票,
+    /// 同号覆盖即续期);`waited = 0`;`tickets = record.tickets`。
+    pub fn resume(
+        cfgs: &[StartupAgentConfig],
+        bodies: &physics_sim::BodyRegistry,
+        record: &StartupRecord,
+    ) -> Self {
+        let mut pending = Vec::new();
+        let mut dropped = 0u64;
+        for &i in &record.pending {
+            let Some(cfg) = cfgs.get(i as usize) else {
+                eprintln!(
+                    "[startup-agents] 恢复:待生成序号 {i} 越界(配置 {} 条),丢弃",
+                    cfgs.len()
+                );
+                dropped += 1;
+                continue;
+            };
+            let Some(hash) = bodies.hash_of(&cfg.body) else {
+                eprintln!(
+                    "[startup-agents] 恢复:第 {} 条身体 \"{}\" 不在注册表里,丢弃",
+                    i + 1,
+                    cfg.body
+                );
+                dropped += 1;
+                continue;
+            };
+            let dof = bodies.get(&hash).map(|def| def.dof_count()).unwrap_or(0);
+            pending.push(PendingStartup {
+                index: i as usize + 1,
+                cfg: cfg.clone(),
+                hash,
+                dof,
+                // 票号 = BASE + 0 起下标(与 new 同式;PendingStartup.index
+                // 是 1 起,这里用 record 的 0 起下标)。
+                ticket_id: STARTUP_TICKET_BASE + i as u64,
+                ticket_placed: false,
+                waited: 0,
+            });
+        }
+        Self {
+            pending,
+            tickets: record.tickets.clone(),
+            counters: StartupCounters {
+                resume_dropped: dropped,
+                ..StartupCounters::default()
+            },
+        }
+    }
+
+    /// 当前持久状态(写检查点时取;pending 按序号升序——保持条目表顺序,
+    /// 生成/放弃只整条出表,顺序天然稳定)。
+    pub fn to_record(&self) -> StartupRecord {
+        StartupRecord {
+            // PendingStartup.index 是 1 起,record 要 0 起下标。
+            pending: self.pending.iter().map(|p| (p.index - 1) as u32).collect(),
+            tickets: self.tickets.clone(),
+        }
+    }
+
+    /// 主体没了就撤它的启动票(B03d;每拍末紧跟 `host.retain_alive` 之后)。
+    /// `alive` 与 `retain_alive` 用同一个判断(`is_agent` || 迁移在途)。
+    /// 每撤一张:日志追加 RemoveAreaTicket,`tickets_released += 1`,条目
+    /// 出表;撤票被拒 → 打日志,条目保留,下一拍重试。没有票条目时零动作
+    /// (不调 Session)。
+    pub fn release_dead(
+        &mut self,
+        session: &mut Session,
+        log: &mut CommandLog,
+        alive: impl Fn(EntityId) -> bool,
+    ) {
+        if self.tickets.is_empty() {
+            return;
+        }
+        // 一次性出表(retain):撤成功的条目出表,被拒的保留到下一拍。
+        let mut released = 0u64;
+        self.tickets.retain(|&(entity, ticket_id)| {
+            if alive(entity) {
+                return true;
+            }
+            match session.remove_area_ticket(ticket_id) {
+                Ok(entry) => {
+                    log.append(entry);
+                    released += 1;
+                    false
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[startup-agents] 主体 {entity:?} 没了但撤票 {ticket_id} 被拒,下一拍重试:{err:?}"
+                    );
+                    true
+                }
+            }
+        });
+        self.counters.tickets_released += released;
     }
 
     /// 预置已等待拍数(仅测试:构造"同拍一条生成、另一条到点放弃"的布景)。
@@ -276,6 +398,9 @@ impl StartupAgents {
                     );
                 }
                 self.counters.spawned += 1;
+                // 票跟主体走(B03d):进票表,主体没了由 release_dead 撤。
+                // 放弃的两支(超时/放票被拒)不进——出表时已撤票。
+                self.tickets.push((entity, item.ticket_id));
                 outcomes.push(Outcome::Spawned);
             } else {
                 // ③ 等装载;超时放弃(§2.2:写错误日志,不 panic)。
@@ -761,5 +886,239 @@ mod tests {
         assert_eq!(startup.counters.spawned, 1, "碰撞体建好后生成");
         assert!(startup.pending.is_empty(), "出表");
         session.shutdown();
+    }
+
+    // ---- B03d:S10–S13 ------------------------------------------------------
+
+    /// S10 往返:三条配置——第 1 条已生成(装载好的位置)、第 2 条在等
+    /// (出世界列,永不装载)、第 3 条已放弃(同款出世界列,预置超时临界)。
+    /// `to_record()`:`pending == [1]`(0 起下标;第 2 条在等、第 3 条已
+    /// 放弃出表)、`tickets == [(第 1 条的主体, BASE + 0)]`;`resume` 之后
+    /// 待生成项恰一条(第 2 条),序号、票号(BASE + 1)对。
+    #[test]
+    fn s10_record_roundtrip_pending_and_tickets() {
+        let bodies = quad_registry();
+        let cfgs = vec![
+            quad_cfg([8.5, 1.45, 8.5], StartupController::None), // 生成
+            quad_cfg([8.5, -200.0, 8.5], StartupController::None), // 在等
+            quad_cfg([14.5, -200.0, 8.5], StartupController::None), // 放弃
+        ];
+        let mut startup = StartupAgents::new(&cfgs, &bodies).expect("构造");
+        let mut session = Session::new(cfg());
+        load_ground(&mut session);
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        // 第 1 条当拍生成;第 3 条预置超时临界同拍放弃;第 2 条 waited=0 在等。
+        startup.set_waited(3, STARTUP_SPAWN_TIMEOUT_TICKS);
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 1);
+        assert_eq!(startup.counters.spawn_timeouts, 1);
+        assert_eq!(startup.pending.len(), 1, "第 2 条仍在等");
+        session.shutdown();
+
+        let spawned_entity = match log.entries()[0].command {
+            _ => log
+                .entries()
+                .iter()
+                .find_map(|e| match e.command {
+                    messaging::SimCommand::SpawnAgent { entity, .. } => Some(entity),
+                    _ => None,
+                })
+                .expect("布景自检:第 1 条已生成"),
+        };
+        let record = startup.to_record();
+        assert_eq!(record.pending, vec![1], "在等的是 0 起下标 1(第 2 条)");
+        assert_eq!(
+            record.tickets,
+            vec![(spawned_entity, STARTUP_TICKET_BASE)],
+            "已生成主体与它的票(BASE + 0)"
+        );
+
+        // resume:只第 2 条进待生成表;序号(1 起 = 2)、票号(BASE + 1)。
+        let mut resumed = StartupAgents::resume(&cfgs, &bodies, &record);
+        assert_eq!(resumed.counters.resume_dropped, 0, "两条都合法");
+        assert_eq!(resumed.pending.len(), 1);
+        // PendingStartup 私有;经 to_record 往返核对序号,经 poll 首拍放票
+        // 核对票号(S13 同款)。
+        assert_eq!(resumed.to_record().pending, vec![1]);
+        assert_eq!(resumed.to_record().tickets, record.tickets, "票表原样带回");
+    }
+
+    /// S11 恢复时丢弃:`pending = [1, 7]` 但配置只有 2 条 → 留 1 条
+    /// (序号 1),`resume_dropped == 1`;身体不在注册表的那种情况同样丢弃
+    /// (构造一个注册表只有 quad、pending 指向会用到未知身体的序号——
+    /// 直接把 record.pending 指到合法序号但换空注册表)。
+    #[test]
+    fn s11_resume_drops_out_of_range_and_unknown_body() {
+        let bodies = quad_registry();
+        let cfgs = vec![
+            quad_cfg([8.5, 1.45, 8.5], StartupController::None),
+            quad_cfg([14.5, 1.45, 8.5], StartupController::None),
+        ];
+        // 序号越界:7 ≥ 2 条。
+        let record = StartupRecord {
+            pending: vec![1, 7],
+            tickets: Vec::new(),
+        };
+        let mut resumed = StartupAgents::resume(&cfgs, &bodies, &record);
+        assert_eq!(resumed.counters.resume_dropped, 1, "越界 1 条丢弃");
+        assert_eq!(resumed.to_record().pending, vec![1], "留序号 1");
+        // 身体不在注册表:空注册表,任何序号都查不到身体。
+        let empty_bodies = physics_sim::BodyRegistry::new();
+        let record2 = StartupRecord {
+            pending: vec![0],
+            tickets: Vec::new(),
+        };
+        let resumed2 = StartupAgents::resume(&cfgs, &empty_bodies, &record2);
+        assert_eq!(resumed2.counters.resume_dropped, 1, "身体未知 1 条丢弃");
+        assert!(resumed2.pending.is_empty(), "全丢弃");
+        assert!(resumed2.to_record().pending.is_empty());
+    }
+
+    /// S12 撤票:先造出一张已生成主体的票(装载好的位置当拍生成),然后
+    /// 按三种存活判定调 release_dead——
+    /// - 主体活着(alive = true)→ 不撤(票表不动、零日志);
+    /// - 迁移在途(alive 闭包对在途 ID 返回 true 同口径)→ 不撤;
+    /// - 主体没了(alive = false)→ 恰撤一次:日志一条 RemoveAreaTicket
+    ///   (同一票号)、票表没有这张票、`tickets_released == 1`;再调一次
+    ///   零动作(表已空,连 Session 都不碰——表空早退)。
+    #[test]
+    fn s12_release_dead_releases_only_dead() {
+        let bodies = quad_registry();
+        let mut startup = StartupAgents::new(
+            &[quad_cfg([8.5, 1.45, 8.5], StartupController::None)],
+            &bodies,
+        )
+        .expect("构造");
+        let mut session = Session::new(cfg());
+        load_ground(&mut session);
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(startup.counters.spawned, 1);
+        let (entity, ticket_id) = startup.to_record().tickets[0];
+
+        // 活着 → 不撤。
+        let n_before = log.entries().len();
+        startup.release_dead(&mut session, &mut log, |_| true);
+        assert_eq!(
+            startup.to_record().tickets,
+            vec![(entity, ticket_id)],
+            "活着不撤"
+        );
+        assert_eq!(
+            log.entries().len(),
+            n_before,
+            "活着:零日志条目(不调 Session)"
+        );
+        assert_eq!(startup.counters.tickets_released, 0);
+        // 在途(alive 对该 ID 返回 true,与 retain_alive 的 is_agent || 在途
+        // 同口径)→ 不撤。
+        let in_transit = std::collections::BTreeSet::from([entity]);
+        startup.release_dead(&mut session, &mut log, |id| in_transit.contains(&id));
+        assert_eq!(
+            startup.to_record().tickets,
+            vec![(entity, ticket_id)],
+            "在途不撤"
+        );
+        assert_eq!(startup.counters.tickets_released, 0);
+        // 没了 → 恰撤一次。
+        startup.release_dead(&mut session, &mut log, |_| false);
+        assert!(startup.to_record().tickets.is_empty(), "死了:条目出表");
+        assert_eq!(startup.counters.tickets_released, 1);
+        let removed: Vec<u64> = log
+            .entries()
+            .iter()
+            .filter_map(|e| match e.command {
+                messaging::SimCommand::RemoveAreaTicket { id } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            removed,
+            vec![ticket_id],
+            "日志恰一条 RemoveAreaTicket(同一票号)"
+        );
+        // 再调一次零动作(表空早退,不产生新日志)。
+        let n_after = log.entries().len();
+        startup.release_dead(&mut session, &mut log, |_| false);
+        assert_eq!(log.entries().len(), n_after, "表空再调零动作");
+        assert_eq!(startup.counters.tickets_released, 1);
+        session.shutdown();
+    }
+
+    /// S13 恢复后重放票:`resume` 出来的待生成项第一拍放票(日志里一条
+    /// SetAreaTicket,票号与恢复前相同——同号覆盖即续期),装载好后生成
+    /// 并挂控制者(QuadTrot → 槽位在)。
+    #[test]
+    fn s13_resume_replays_ticket_then_spawns() {
+        let bodies = quad_registry();
+        let cfgs = vec![quad_cfg([8.5, 1.45, 8.5], StartupController::QuadTrot)];
+        // 恢复前:只放票不生成(布景无地面,poll 只放票、等待)。
+        let mut first = StartupAgents::new(&cfgs, &bodies).expect("构造");
+        let mut session = Session::new(cfg());
+        let mut log = CommandLog::new();
+        let mut host = crate::controller::ControllerHost::default();
+        first.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        session.tick();
+        assert_eq!(first.counters.spawned, 0, "布景:没装载不生成");
+        let ticket_before = first.to_record().tickets.first().map(|t| t.1);
+        assert_eq!(ticket_before, None, "未生成:票表空;票在待生成项上");
+        session.shutdown();
+        let placed: Vec<u64> = log
+            .entries()
+            .iter()
+            .filter_map(|e| match e.command {
+                messaging::SimCommand::SetAreaTicket { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            placed,
+            vec![STARTUP_TICKET_BASE],
+            "布景自检:第一段放票 1 张"
+        );
+
+        // 恢复:pending = [0](0 起下标),票号仍 BASE + 0。
+        let record = first.to_record();
+        let mut resumed = StartupAgents::resume(&cfgs, &bodies, &record);
+        // 换有地面的会话:恢复后第一拍放票(重放,同号覆盖),下一拍生成。
+        let mut session2 = Session::new(cfg());
+        load_ground(&mut session2);
+        let mut log2 = CommandLog::new();
+        let mut host2 = crate::controller::ControllerHost::default();
+        resumed.poll(&mut session2, &mut log2, &mut host2, &mut alloc, Tick(0));
+        session2.tick();
+        assert_eq!(
+            resumed.counters.spawned, 1,
+            "布景直载(chunk 已在)首拍即生成,S1 同口径"
+        );
+        assert!(resumed.pending.is_empty(), "出表");
+        let replayed: Vec<u64> = log2
+            .entries()
+            .iter()
+            .filter_map(|e| match e.command {
+                messaging::SimCommand::SetAreaTicket { id, .. } => Some(id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![STARTUP_TICKET_BASE],
+            "恢复后第一拍重放票:同号(实得 {replayed:?})"
+        );
+        // 挂控制者:QuadTrot 槽位在。
+        let recs = host2.to_records();
+        assert_eq!(recs.len(), 1, "挂了控制者");
+        assert_eq!(
+            host2.kind_of(recs[0].entity),
+            Some(ControllerKind::Script(
+                crate::controller::ScriptKind::QuadTrot
+            ))
+        );
+        assert_eq!(resumed.to_record().tickets.len(), 1, "生成后票进票表");
+        session2.shutdown();
     }
 }
