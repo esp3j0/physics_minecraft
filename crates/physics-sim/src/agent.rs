@@ -7169,6 +7169,123 @@ anchor = [0.0, 0.0, 0.0]
         assert_eq!(snap_a, snap_b, "冻结段末关节态逐位相同");
     }
 
+    /// T9 撤票(B03c 返修 R1 第 2 节):主体被计划冻结的那一拍,
+    /// `outbox.ticket_ops` 里恰一条该主体的 `TicketOp::End`(常驻体被冻结
+    /// 时的簿记:撤常驻运动票;主体恒 actor,照 `freeze_with_closure` 的
+    /// 单实体语义无条件 End)。变异(落实段去掉 End 推送)→ 红。
+    #[test]
+    fn t9_freeze_emits_single_ticket_end() {
+        let (mut s, _hash, a) = t_quad_joints_moving(10);
+        let far = [Vec3::new(500.0, 3.0, 500.0)];
+        let mut frozen_tick: Option<u32> = None;
+        let mut end_ops_at_freeze: Vec<u32> = Vec::new();
+        for tick in 0..400u32 {
+            s.apply_activation(&far);
+            s.step();
+            let outbox = s.take_outbox();
+            // 冻结拍之后不再有该主体的任何票操作(簿记恰一次)。
+            if frozen_tick.is_some() {
+                assert!(
+                    outbox
+                        .ticket_ops
+                        .iter()
+                        .all(|rec| !(rec.entity == a && rec.op == crate::sim::TicketOp::End)),
+                    "T9:冻结后第 {tick} 拍又出现该主体的 TicketOp::End"
+                );
+            }
+            if frozen_tick.is_none() && s.is_agent_frozen(a) {
+                frozen_tick = Some(tick);
+                let ends = outbox
+                    .ticket_ops
+                    .iter()
+                    .filter(|rec| rec.entity == a && rec.op == crate::sim::TicketOp::End)
+                    .count();
+                end_ops_at_freeze.push(ends as u32);
+            }
+        }
+        let frozen_tick = frozen_tick.expect("T9:400 拍内主体未冻结(触发未接线)");
+        assert_eq!(
+            end_ops_at_freeze,
+            vec![1],
+            "T9:冻结拍(第 {frozen_tick} 拍)该主体的 TicketOp::End 恰一条(实得 {end_ops_at_freeze:?})"
+        );
+        println!("T9: 冻结拍 {frozen_tick},冻结拍 End 条数 = 1");
+    }
+
+    /// T10 翻转冷却(B03c 返修 R1 第 2 节):主体被冻结后,下一拍就把观察
+    /// 者放回 load 半径内——冷却(`cooldown_ticks`,从配置读,不写死)未满
+    /// 期间主体保持冻结(`agent_woken == 0`,plan 的 `entity_cooled` 挡下
+    /// 唤醒条目);冷却满后的第一拍被唤醒。变异(冻结落实段去掉
+    /// `note_flip`)→ 冷却簿记缺失,回场立即唤醒 → 红。
+    #[test]
+    fn t10_flip_cooldown_gates_online_wake() {
+        let (mut s, _hash, a) = t_quad_joints_moving(10);
+        let center = Vec3::new(24.0, 3.45, 24.0);
+        let cooldown = s.cfg.activation.cooldown_ticks;
+        // 阶段 1:出 unload → 冻结(首见翻转不受冷却约束,T1 同证:冻结拍 0)
+        // → 冻结拍立即 break(冻结拍的 `note_flip` 起算冷却;多跑会把窗耗完)。
+        let far =
+            [center + Vec3::new(1.0, 0.0, 0.0) * (s.cfg.activation.awake_unload_radius + 10.0)];
+        let mut frozen_tick: Option<u32> = None;
+        let mut woken_total: u64 = 0;
+        for tick in 0..300u32 {
+            s.apply_activation(&far);
+            s.step();
+            let woken_now = s.take_outbox().agent_woken;
+            assert_eq!(woken_now, 0, "T10:冻结前不该有唤醒(第 {tick} 拍)");
+            if s.is_agent_frozen(a) {
+                frozen_tick = Some(tick);
+                break;
+            }
+        }
+        let frozen_tick = frozen_tick.expect("T10:出 unload 后 300 拍未冻结");
+        // 阶段 2:观察者回 load 内。冷却未满期间保持冻结(plan 的
+        // `entity_cooled` 挡下唤醒条目):回场第 t 拍 now − last = t + 1,
+        // t ≥ cooldown − 1 才放行 → 唤醒拍恰 = cooldown − 1。
+        let inside = [center];
+        let mut woken_tick: Option<u32> = None;
+        for tick in 0..(cooldown as u32 + 10) {
+            s.apply_activation(&inside);
+            s.step();
+            let woken_now = s.take_outbox().agent_woken;
+            if woken_tick.is_none() && !s.is_agent_frozen(a) {
+                woken_tick = Some(tick);
+                woken_total += woken_now;
+                assert_eq!(
+                    woken_now, 1,
+                    "T10:唤醒拍 agent_woken 应恰 +1(实得 {woken_now},第 {tick} 拍)"
+                );
+                assert_eq!(
+                    woken_tick,
+                    Some(cooldown as u32 - 1),
+                    "T10:唤醒拍(回场起)应 = cooldown − 1 = {}(实得 {tick};冷却没按配置挡)",
+                    cooldown - 1
+                );
+            } else if woken_tick.is_some() {
+                assert_eq!(woken_now, 0, "T10:唤醒后不该再有 agent_woken(第 {tick} 拍)");
+                assert!(!s.is_agent_frozen(a), "T10:唤醒后又回到冻结");
+            } else {
+                assert!(
+                    s.is_agent_frozen(a),
+                    "T10:冷却未满(第 {tick} 拍 < cooldown {cooldown})主体被唤醒(note_flip 簿记缺失?)"
+                );
+                assert_eq!(
+                    woken_now, 0,
+                    "T10:冷却未满期间出现 agent_woken(第 {tick} 拍)"
+                );
+            }
+        }
+        let woken_tick = woken_tick
+            .unwrap_or_else(|| panic!("T10:冷却满(cooldown {cooldown} 拍)+ 10 拍内未唤醒"));
+        println!(
+            "T10: 冻结拍 {frozen_tick},冷却 {cooldown} 拍,唤醒拍(回场起)= {woken_tick},agent_woken = {woken_total}"
+        );
+        assert_eq!(
+            woken_total, 1,
+            "T10:全程 agent_woken 恰 1(实得 {woken_total})"
+        );
+    }
+
     /// 两连杆身体(返修 M5 专用):根连杆名 `z_base` 排在子连杆 `a_arm`
     /// 之后(BTreeMap 名字序 = a_arm 第一项),一个 revolute 关节(z 轴)。
     /// 专杀 `restore_agent_joint_state` 旧实现"根 = links 表第一项"的取法
