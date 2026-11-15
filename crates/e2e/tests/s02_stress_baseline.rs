@@ -73,3 +73,34 @@ fn quick_scenarios_actually_happen() {
         "quick 必须覆盖全部 6 场景"
     );
 }
+
+/// C1(B04 第 2 节):`run_agents(true, None)` → 返回 2 档(0 和 2);
+/// 2 只那一档的场景自证全部成立(函数内已断言,不 panic 即过);
+/// 0 只那一档 `actions_emitted == 0`、`peak_awake` 小于 2 只那一档。
+/// 不对耗时做任何断言(CI 是 debug 构建,机器也不固定)。
+#[test]
+fn agents_quick_scene_happens() {
+    let tiers = stress::run_agents(true, None);
+    assert_eq!(tiers.len(), 2, "quick = 2 档(0 和 2)");
+    assert_eq!(tiers[0].quads, 0);
+    assert_eq!(tiers[1].quads, 2);
+    let base = &tiers[0].runs[0];
+    let heavy = &tiers[1].runs[0];
+    assert_eq!(base.actions_emitted, 0, "对照档零动作");
+    assert!(
+        base.peak_awake < heavy.peak_awake,
+        "对照醒体峰值 {} < 2 只档 {}",
+        base.peak_awake,
+        heavy.peak_awake
+    );
+    assert_eq!(
+        heavy.alive_at_end, 2,
+        "2 只都在(run_agents_once 自证已覆盖)"
+    );
+    assert_eq!(heavy.send_rejected, 0, "零 send_rejected");
+    assert!(
+        heavy.forward_speed_mps >= 0.05,
+        "2 只档确实在走({} m/s)",
+        heavy.forward_speed_mps
+    );
+}

@@ -30,6 +30,7 @@ use physics_sim::ShardSim;
 use physics_sim::cohesion::compound_origin;
 use physics_sim::destruction::DEBRIS_HALF_SIZE;
 use serde::Serialize;
+use sim_api::log::CommandLog;
 use sim_api::proto::S2C;
 use sim_api::session::Session;
 use storage::mem::{MemCheckpointStore, MemChunkStore};
@@ -96,7 +97,14 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
-        let config = Config::default();
+        // B04:身体注册表目录指到仓库根(Config::default 是 CWD 相对路径
+        // "assets/bodies",cargo test 下 CWD = crate 目录,读不到 → 内核
+        // 空注册表 → 生成主体被静默拒;现有破坏场景不用主体,不受影响)。
+        let config = Config {
+            bodies_dir: std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../assets/bodies"),
+            ..Config::default()
+        };
         let store = StoreWorker::new(
             Box::new(MemChunkStore::new()),
             Box::new(MemCheckpointStore::new()),
@@ -1516,5 +1524,415 @@ fn run_idle() -> Run {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let quick = args.iter().any(|a| a == "--quick");
+    if args.iter().any(|a| a == "--agents") {
+        let tiers = run_agents(quick, Some(Path::new("target/stress/agents")));
+        print!("{}", render_agents_md(&tiers));
+        return;
+    }
     run_all(quick, Some(Path::new("target/stress")));
+}
+
+// ============================================================ 主体容量(B04 第 2 节,AC-B7)
+
+/// 主体容量的一档。
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct AgentTier {
+    /// 四足数量(0 = 对照)。
+    pub(crate) quads: usize,
+    /// 每次重复的原始结果。
+    pub(crate) runs: Vec<AgentRun>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub(crate) struct AgentRun {
+    /// 测量窗口内逐拍耗时(ms),一拍 = 控制者 drive + session.tick()。
+    pub(crate) tick_ms: Vec<f64>,
+    pub(crate) p50_ms: f64,
+    pub(crate) p95_ms: f64,
+    pub(crate) max_ms: f64,
+    /// 超 16.67 ms 的拍数、最长连续超预算拍数。
+    pub(crate) over_budget_ticks: u32,
+    pub(crate) max_over_budget_streak: u32,
+    /// 场景自证:每只四足沿航向的位移(m)、窗口内最小 up·y。
+    pub(crate) forward_m: Vec<f32>,
+    pub(crate) min_up_y: f32,
+    /// 平均前进速度(m/s;全部四足位移均值 ÷ 窗口秒数,自证与报告列共用)。
+    pub(crate) forward_speed_mps: f32,
+    /// 窗口末仍在主体表里的四足数、窗口内冻结/压垮/失控/掉出世界的累计。
+    pub(crate) alive_at_end: usize,
+    pub(crate) frozen_total: u64,
+    pub(crate) removed_total: u64,
+    /// 控制者计数(窗口末快照)。
+    pub(crate) actions_emitted: u64,
+    pub(crate) send_rejected: u64,
+    /// 窗口内醒着的实体峰值(TickSummary.telemetry.entities_awake)。
+    pub(crate) peak_awake: usize,
+}
+
+/// agents 档位阶梯(quick = [0, 2] 各 1 次、窗口 120 拍;完整 =
+/// [0, 1, 2, 4, 8, 16] 各 3 次、窗口 600 拍)。
+fn agents_ladder(quick: bool) -> Vec<(usize, usize)> {
+    let tiers: Vec<usize> = if quick {
+        vec![0, 2]
+    } else {
+        vec![0, 1, 2, 4, 8, 16]
+    };
+    let (repeats, window) = if quick { (1, 120) } else { (3, 600) };
+    tiers
+        .into_iter()
+        .flat_map(|q| vec![(q, window); repeats])
+        .collect()
+}
+
+/// 四足出生点排布(`quads` 只;整个队形以观察者 `center` 为中心):2 只
+/// = 2 排各 1 只;4/8 = 2 排各 2/4 只;16 = 4 排各 4 只。排内间距 3 m、
+/// 排间距 4 m,航向都朝 +x。返回世界坐标(地面顶面 + 0.45,B02a 同口径)。
+fn agent_spawn_positions(quads: usize, center: Vec3) -> Vec<Vec3> {
+    let per_row = if quads <= 8 {
+        quads.div_ceil(2).max(1)
+    } else {
+        4
+    };
+    let rows = quads.div_ceil(per_row).max(1);
+    let x0 = center.x - (per_row as f32 - 1.0) * 3.0 / 2.0;
+    let z0 = center.z - (rows as f32 - 1.0) * 4.0 / 2.0;
+    (0..quads)
+        .map(|i| {
+            let row = i / per_row;
+            let col = i % per_row;
+            Vec3::new(
+                x0 + col as f32 * 3.0,
+                SURFACE as f32 + 0.45,
+                z0 + row as f32 * 4.0,
+            )
+        })
+        .collect()
+}
+
+/// 跑一档一次。对照档 `quads == 0` 走完全相同的代码,只是不生成。
+fn run_agents_once(quads: usize, measure_ticks: u64) -> AgentRun {
+    let mut run = AgentRun {
+        min_up_y: f32::INFINITY,
+        ..AgentRun::default()
+    };
+    let mut rig = Rig::new();
+    let center = Vec3::new(64.5, (SURFACE + 5) as f32 + 0.5, 64.5);
+    rig.ensure_registered([shard(0, 0)]);
+    rig.session.move_observer(center).expect("观察者设置");
+    warmup(&mut rig, 90);
+
+    // 生成四足(与 StartupAgents::poll 生成那一支同一调用):观察者分片
+    // 中心队形;出生前自检——每个出生点都在观察者所在分片 (0,0) 内且离
+    // 分片边界 ≥ 24 m。
+    // 身体注册表:显式加载 assets/bodies(Rig::new 用 Config::default 的
+    // bodies_dir 相对路径,cargo test 下 CWD = crate 目录,解析不到仓库根;
+    // 与 b02b quad_registry 同款 include_str,单一来源 = 同一 toml)。
+    let mut bodies = physics_sim::BodyRegistry::new();
+    bodies
+        .insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+        .expect("quad.body.toml 合法");
+    let hash = bodies.hash_of("quad").expect("quad 在注册表");
+    let dof = bodies.get(&hash).map(|def| def.dof_count()).unwrap_or(0);
+    let mut host = app::controller::ControllerHost::default();
+    let mut ids: Vec<EntityId> = Vec::new();
+    let mut seq = 0u32;
+    let positions = agent_spawn_positions(quads, center);
+    for pos in &positions {
+        // 自检:出生点分片 == 观察者分片,且离边界 ≥ 24 m。
+        let border = pos.x.min(pos.z).min(128.0 - pos.x).min(128.0 - pos.z);
+        assert!(
+            shard_of_world(*pos) == shard(0, 0) && border >= 24.0,
+            "出生点 {pos:?} 布景违规(shard/border {border})"
+        );
+    }
+    for pos in positions {
+        let entity = loop {
+            let e = EntityId::from_parts(0, seq);
+            seq += 1;
+            if rig.session.entity_owner(e).is_none() {
+                break e;
+            }
+        };
+        let state = types::EntityState {
+            translation: pos,
+            rotation: types::glam::Quat::IDENTITY,
+            ..types::EntityState::default()
+        };
+        rig.session
+            .spawn_agent_from(
+                messaging::InputSource::SCHEDULER,
+                shard(0, 0),
+                entity,
+                hash,
+                state,
+            )
+            .expect("生成四足");
+        // 挂 QuadTrot(leash = None;周期与 dof 照驱动配置生成那一支:
+        // DEFAULT_CONTROL_PERIOD_TICKS = 2,QUAD_DOF = 12)。
+        host.attach(
+            entity,
+            app::controller::ControllerKind::Script(app::controller::ScriptKind::QuadTrot),
+            dof,
+            app::controller::DEFAULT_CONTROL_PERIOD_TICKS,
+            rig.session.tick_now().next(),
+            None,
+        )
+        .expect("挂 QuadTrot");
+        ids.push(entity);
+    }
+    // 站稳与起步 120 拍(不计时)。
+    for _ in 0..120 {
+        let in_transit = rig.session.in_transit_entities();
+        let frozen = rig.session.frozen_agents();
+        let now = rig.session.tick_now();
+        let mut log = CommandLog::new();
+        host.drive(&mut rig.session, &mut log, now, &in_transit, &frozen);
+        let _ = rig.session.tick();
+        let _ = rig.session.take_solidified();
+        let _ = rig.session.take_block_updates();
+        rig.orchestrate();
+    }
+
+    // 测量窗口:每拍顺序与驱动一致(drive 在 tick 前;计时段只含 drive
+    // + tick;对照档同样取集合、调 drive(空表)——差只来自四足本身)。
+    let mut root_start: Vec<Vec3> = Vec::new();
+    for i in 0..measure_ticks {
+        #[allow(clippy::disallowed_methods)]
+        let t0 = std::time::Instant::now();
+        let in_transit = rig.session.in_transit_entities();
+        let frozen = rig.session.frozen_agents();
+        let now = rig.session.tick_now();
+        let mut log = CommandLog::new();
+        host.drive(&mut rig.session, &mut log, now, &in_transit, &frozen);
+        let summary = rig.session.tick();
+        #[allow(clippy::disallowed_methods)]
+        {
+            run.tick_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        run.peak_awake = run.peak_awake.max(summary.telemetry.entities_awake);
+        run.frozen_total += summary.agent_frozen;
+        // 压垮/失控/掉出世界随 Outbox 走,TickSummary 无直接字段——收尾
+        // 用 alive_at_end 差值核对(removed_total 在窗口后按差值回填)。
+        let _ = rig.session.take_solidified();
+        let _ = rig.session.take_block_updates();
+        // 采样四足根位姿(窗口首拍记起点,末拍记终点与 up·y)。
+        let states = rig.session.agent_states();
+        if i == 0 {
+            root_start = ids
+                .iter()
+                .map(|id| {
+                    states
+                        .iter()
+                        .find(|(e, _, _)| e == id)
+                        .and_then(|(_, _, links)| links.first())
+                        .map(|s| s.translation)
+                        .expect("四足在主体表")
+                })
+                .collect();
+        }
+        if i + 1 == measure_ticks {
+            for (k, id) in ids.iter().enumerate() {
+                let (_, _, links) = states
+                    .iter()
+                    .find(|(e, _, _)| e == id)
+                    .expect("窗口末四足在主体表");
+                let root = links.first().expect("根连杆");
+                let start = root_start[k];
+                // 沿航向(+x)的位移。
+                run.forward_m.push(root.translation.x - start.x);
+                run.min_up_y = run
+                    .min_up_y
+                    .min((root.rotation * Vec3::new(0.0, 1.0, 0.0)).y);
+            }
+        }
+        rig.orchestrate();
+    }
+    run.alive_at_end = rig.session.agent_states().len();
+    run.actions_emitted = host.counters.actions_emitted;
+    run.send_rejected = host.counters.send_rejected;
+    // 失控/压垮/虚空移除的累计:驱动侧无逐拍字段——用移除检测(窗口内
+    // 任一四足消失即自证失败,alive_at_end 覆盖)+ 冻结合计覆盖。
+    run.removed_total = (quads.saturating_sub(rig.session.agent_states().len())) as u64;
+    rig.shutdown();
+
+    // 场景自证(不成立直接 panic,不产出数字)。
+    if quads > 0 {
+        assert!(
+            run.alive_at_end == quads,
+            "自证失败:窗口末存活 {}/{}(移除即 fail)",
+            run.alive_at_end,
+            quads
+        );
+        assert_eq!(
+            run.frozen_total, 0,
+            "自证失败:冻结 {} != 0",
+            run.frozen_total
+        );
+        assert_eq!(
+            run.removed_total, 0,
+            "自证失败:移除 {} != 0",
+            run.removed_total
+        );
+        let window_s = measure_ticks as f32 / 60.0;
+        for (k, f) in run.forward_m.iter().enumerate() {
+            assert!(
+                *f >= 0.05 * window_s,
+                "自证失败:四足 {k} 前进 {f} m < 0.05×{window_s:.1} s(没在走)"
+            );
+        }
+        assert!(
+            run.min_up_y >= 0.7,
+            "自证失败:最小 up·y {} < 0.7",
+            run.min_up_y
+        );
+        let expect_min = (quads as u64) * measure_ticks / 2 * 9 / 10;
+        assert!(
+            run.actions_emitted >= expect_min,
+            "自证失败:actions_emitted {} < 90%×{}",
+            run.actions_emitted,
+            expect_min
+        );
+        assert_eq!(run.send_rejected, 0, "自证失败:send_rejected != 0");
+        // peak_awake 判据(任务书 2.1:peak_awake ≥ quads×13)停报待裁:
+        // 实测 TickSummary.telemetry.entities_awake **按实体计**(调度器
+        // 遍历 `sim.entity_owners()`,一只四足 = 1 个实体),不按连杆。
+        // 2 只档实测峰值 = 2。照任务书"停下报告它实际怎么算,不要改断言
+        // 去凑",本条断言不执行,实测值照实进 #25 报告。
+        println!(
+            "agents quads={quads}: peak_awake = {}(按实体计;13×{quads} = {})",
+            run.peak_awake,
+            quads * 13
+        );
+    }
+    // 统计列。
+    run.forward_speed_mps = if run.forward_m.is_empty() {
+        0.0
+    } else {
+        let window_s = measure_ticks as f32 / 60.0;
+        run.forward_m.iter().sum::<f32>() / run.forward_m.len() as f32 / window_s
+    };
+    run.p50_ms = percentile(&run.tick_ms, 0.5);
+    run.p95_ms = percentile(&run.tick_ms, 0.95);
+    run.max_ms = run.tick_ms.iter().cloned().fold(0.0, f64::max);
+    run.over_budget_ticks = run.tick_ms.iter().filter(|t| **t > BUDGET_MS).count() as u32;
+    run.max_over_budget_streak = {
+        let mut best = 0u32;
+        let mut cur = 0u32;
+        for t in &run.tick_ms {
+            if *t > BUDGET_MS {
+                cur += 1;
+                best = best.max(cur);
+            } else {
+                cur = 0;
+            }
+        }
+        best
+    };
+    run
+}
+
+/// 全部档位。quick = [0, 2] 各 1 次、窗口 120 拍;完整 = [0, 1, 2, 4, 8, 16]
+/// 各 3 次、窗口 600 拍。报告写 `out_root`(report.json + report.md)。
+pub(crate) fn run_agents(quick: bool, out_root: Option<&Path>) -> Vec<AgentTier> {
+    let ladder = agents_ladder(quick);
+    // 按 quads 分组,保持阶梯顺序。
+    let mut groups: Vec<(usize, Vec<usize>)> = Vec::new();
+    for (q, w) in &ladder {
+        match groups.last_mut() {
+            Some((gq, ws)) if *gq == *q => ws.push(*w),
+            _ => groups.push((*q, vec![*w])),
+        }
+    }
+    let mut tiers: Vec<AgentTier> = Vec::new();
+    for (quads, windows) in &groups {
+        println!("agents 档 quads={quads}:{} 次", windows.len());
+        let mut runs = Vec::new();
+        for w in windows {
+            runs.push(run_agents_once(*quads, *w as u64));
+        }
+        tiers.push(AgentTier {
+            quads: *quads,
+            runs,
+        });
+    }
+    if let Some(root) = out_root {
+        let dir = root.join("report");
+        std::fs::create_dir_all(&dir).expect("创建 agents 报告目录");
+        let json = serde_json::to_string_pretty(&tiers).expect("agents report.json 序列化");
+        std::fs::write(dir.join("report.json"), &json).expect("写 agents report.json");
+        let md = render_agents_md(&tiers);
+        std::fs::write(dir.join("report.md"), &md).expect("写 agents report.md");
+        println!("agents 报告:{}", dir.join("report.md").display());
+    }
+    tiers
+}
+
+/// agents 报告 md:每档一行(P50/P95/最大取各次中位),表下给 Δ 值与
+/// 8 只档中位那次运行的最慢 10 拍。
+fn render_agents_md(tiers: &[AgentTier]) -> String {
+    let med = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).expect("非 NaN"));
+        if v.is_empty() { 0.0 } else { v[v.len() / 2] }
+    };
+    let p95_med = |t: &AgentTier| med(t.runs.iter().map(|r| r.p95_ms).collect());
+    let p50_med = |t: &AgentTier| med(t.runs.iter().map(|r| r.p50_ms).collect());
+    let max_med = |t: &AgentTier| med(t.runs.iter().map(|r| r.max_ms).collect());
+    let p95_range = |t: &AgentTier| {
+        let v: Vec<f64> = t.runs.iter().map(|r| r.p95_ms).collect();
+        let lo = v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let hi = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        hi - lo
+    };
+    let mut md = String::new();
+    md.push_str("| 四足 | P50(ms) | P95(ms) | 最大(ms) | P95 极差 | 超预算拍 | 最长连续 | 醒体峰值 | 平均前进(m/s) |\n");
+    md.push_str("|---|---|---|---|---|---|---|---|---|\n");
+    for t in tiers {
+        let fwd: f32 = if t.runs.is_empty() {
+            0.0
+        } else {
+            t.runs.iter().map(|r| r.forward_speed_mps).sum::<f32>() / t.runs.len() as f32
+        };
+        md.push_str(&format!(
+            "| {} | {:.2} | {:.2} | {:.2} | {:.2} | {} | {} | {} | {:.3} |\n",
+            t.quads,
+            p50_med(t),
+            p95_med(t),
+            max_med(t),
+            p95_range(t),
+            t.runs.iter().map(|r| r.over_budget_ticks).sum::<u32>(),
+            t.runs
+                .iter()
+                .map(|r| r.max_over_budget_streak)
+                .max()
+                .unwrap_or(0),
+            t.runs.iter().map(|r| r.peak_awake).max().unwrap_or(0),
+            fwd,
+        ));
+    }
+    let at = |q: usize| tiers.iter().find(|t| t.quads == q);
+    if let (Some(base), Some(heavy)) = (at(0), at(8)) {
+        let dp95 = p95_med(heavy) - p95_med(base);
+        let dp50 = p50_med(heavy) - p50_med(base);
+        let dmax = max_med(heavy) - max_med(base);
+        md.push_str(&format!(
+            "\n判据值:ΔP95 = {dp95:.2} ms(判据 ≤ 5 ms)、ΔP50 = {dp50:.2} ms、\
+             Δ最大 = {dmax:.2} ms\n"
+        ));
+        // 8 只档中位那次运行的最慢 10 拍(拍序号 + 耗时)。
+        let mut ranked: Vec<&AgentRun> = heavy.runs.iter().collect();
+        ranked.sort_by(|a, b| a.p95_ms.partial_cmp(&b.p95_ms).expect("非 NaN"));
+        if let Some(mid) = ranked.get(ranked.len() / 2) {
+            let mut idx: Vec<usize> = (0..mid.tick_ms.len()).collect();
+            idx.sort_by(|a, b| {
+                mid.tick_ms[*a]
+                    .partial_cmp(&mid.tick_ms[*b])
+                    .expect("非 NaN")
+            });
+            md.push_str("\n8 只档(中位次)最慢 10 拍:\n\n| 拍 | 耗时(ms) |\n|---|---|\n");
+            for &i in idx.iter().rev().take(10) {
+                md.push_str(&format!("| {} | {:.2} |\n", i, mid.tick_ms[i]));
+            }
+        }
+    }
+    md
 }
