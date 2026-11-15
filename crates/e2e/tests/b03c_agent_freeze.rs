@@ -664,6 +664,31 @@ async fn y2b_player_body_online_freeze_wake_walk() {
     }
     assert!(unpossessed, "布景自检:Unpossess 回执未到");
 
+    // 站稳等待:位姿连续 60 拍逐位不变(上限 600 拍)。零意图下控制律收敛
+    // 到不动点——冻结瞬间的根速度快照≈0,唤醒恢复后不带滑行(CI 首跑实
+    // 测:刚落稳即冻结时残余振荡速度唤醒后滑 ~1 cm,擦过位置差 1 cm 线;
+    // 站稳后冻结,滑行消失)。等待窗口有界。
+    let mut stand_anchor: Option<types::EntityState> = None;
+    let mut stand_run = 0u32;
+    let deadline = Deadline::with_secs(120, "站稳(位姿 60 拍不变)");
+    let mut stand_seen = Some(body);
+    while stand_run < 60 {
+        deadline.check();
+        advance_ticks(1).await;
+        let Some((_ftick, _pos, pose)) =
+            watch_agent_root(&mut rx, Some(body), &mut stand_seen).await
+        else {
+            continue;
+        };
+        if stand_anchor.as_ref().is_some_and(|p| *p == pose) {
+            stand_run += 1;
+        } else {
+            stand_anchor = Some(pose);
+            stand_run = 1;
+        }
+    }
+    println!("Y2b: 站稳(位姿 60 拍逐位不变),Unpossess 后进入冻结布景");
+
     // 离开:观察者到 40 m(出 ③ unload、在 ① unload/视距内),等冻结。
     const AWAY_M: f32 = 40.0;
     a.send(&C2S::MoveObserver {
