@@ -203,8 +203,10 @@ struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
-    /// 数据目录(checkpoints.redb 所在;关服后读检查点用)。
-    data_dir: std::path::PathBuf,
+    /// 数据目录的持有者(checkpoints.redb 所在;最后一个持有者 drop 时
+    /// 目录被删除,测试 panic 时也会)。重启段裸调 `app::driver::bootstrap`
+    /// 时用 `h.data.clone()` 克隆 Arc 把目录续命到第二次起服。
+    data: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// 关服后从 data_dir 读出全部检查点(ID 1..=latest)。
@@ -228,16 +230,23 @@ fn read_all_checkpoints(data_dir: &std::path::Path) -> Vec<(Tick, Vec<u8>)> {
 }
 
 /// 起服辅助(b02b R1-1:**经真实 `bootstrap`**装配,第 6 项原样填进
-/// `DriverArgs`;存储用 bootstrap 打开的 redb 文件,temp 下唯一目录)。
+/// `DriverArgs`;存储用 bootstrap 打开的 redb 文件,TempDir 持有的唯一目录)。
 async fn bootstrap_harness(config: Config) -> Harness {
-    // 目录唯一性:原子计数(并行测试同纳秒会撞 redb 文件锁)。
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let data_dir = std::env::temp_dir().join(format!("b03d_{}_{}", std::process::id(), unique));
+    let data = std::sync::Arc::new(
+        tempfile::Builder::new()
+            .prefix("b03d_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    bootstrap_harness_in(config, data).await
+}
+
+/// 在给定的数据目录上起服(重启类测试用:同一目录可再次起服)。
+async fn bootstrap_harness_in(config: Config, data: std::sync::Arc<tempfile::TempDir>) -> Harness {
     // data_dir 必须指到 temp:bootstrap 从 config 读目录(默认 "data" = 仓库
     // 本地库,测试绝不碰)。
     let mut config = config;
-    config.data_dir = data_dir.clone();
+    config.data_dir = data.path().to_path_buf();
     let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
@@ -286,7 +295,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         tx,
         driver: Some(driver),
         addr,
-        data_dir,
+        data,
     }
 }
 
@@ -343,7 +352,7 @@ async fn z1_restart_with_pending_entry_still_spawns() {
     let h = bootstrap_harness(config.clone()).await;
     // 只推 1 拍就关服:首拍只放票,出生列不可读 → 未生成。
     advance_ticks(1).await;
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome1 = shutdown(h).await;
     assert_eq!(
         outcome1.startup_counters.spawned, 0,
@@ -354,7 +363,7 @@ async fn z1_restart_with_pending_entry_still_spawns() {
     // 重启:同一 data_dir 再走一次**真实 bootstrap**(恢复分支;E2 同款,
     // 先读库再 bootstrap:redb 单写锁)。
     {
-        let cps = read_all_checkpoints(&data_dir);
+        let cps = read_all_checkpoints(data_dir.path());
         let (_, blob) = cps.last().expect("终末检查点存在").clone();
         let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
         assert_eq!(
@@ -364,7 +373,7 @@ async fn z1_restart_with_pending_entry_still_spawns() {
         );
     }
     let mut restart_config = config.clone();
-    restart_config.data_dir = data_dir.clone();
+    restart_config.data_dir = data_dir.path().to_path_buf();
     let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
@@ -489,7 +498,7 @@ async fn z2_remove_entity_releases_startup_ticket() {
     // 之后 60 拍内撤票(等 release_dead 的 RemoveAreaTicket 进日志窗口;
     // 终末检查点在 shutdown 时写,直接关服后从检查点读)。
     advance_ticks(60).await;
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.startup_counters.tickets_released, 1,
@@ -497,7 +506,7 @@ async fn z2_remove_entity_releases_startup_ticket() {
         outcome.startup_counters.tickets_released
     );
     // 日志:RemoveAreaTicket 恰一条、同一保留区间票号;SetAreaTicket 恰 1 条。
-    let log = stitched_log(&read_all_checkpoints(&cps_dir));
+    let log = stitched_log(&read_all_checkpoints(cps_dir.path()));
     let mut set_ids: Vec<u64> = Vec::new();
     let mut removed_ids: Vec<u64> = Vec::new();
     for e in log.entries() {
@@ -537,12 +546,12 @@ async fn z3_spawn_restart_then_remove_releases() {
     .expect("MoveObserver 写入");
     let (entity0, _n) = wait_quad_13_links(&mut rx, "Z3 首段主体帧(生成)").await;
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     shutdown(h).await;
 
     // 重启段:真实 bootstrap(恢复分支)。
     {
-        let cps = read_all_checkpoints(&data_dir);
+        let cps = read_all_checkpoints(data_dir.path());
         let (_, blob) = cps.last().expect("终末检查点存在").clone();
         let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
         assert_eq!(
@@ -552,7 +561,7 @@ async fn z3_spawn_restart_then_remove_releases() {
         );
     }
     let mut restart_config = config.clone();
-    restart_config.data_dir = data_dir.clone();
+    restart_config.data_dir = data_dir.path().to_path_buf();
     let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
@@ -671,14 +680,14 @@ async fn z4_two_entries_resume_waits_and_timeouts() {
     .expect("MoveObserver 写入");
     let (entity0, _n) = wait_quad_13_links(&mut rx, "Z4 第 1 条生成").await;
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome1 = shutdown(h).await;
     assert_eq!(outcome1.startup_counters.spawned, 1, "首段只生成第 1 条");
     assert_eq!(outcome1.startup_counters.spawn_timeouts, 0, "第 2 条未超时");
 
     // 重启段:恢复分支——pending 只剩第 2 条(下标 1)。
     {
-        let cps = read_all_checkpoints(&data_dir);
+        let cps = read_all_checkpoints(data_dir.path());
         let (_, blob) = cps.last().expect("终末检查点存在").clone();
         let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
         assert_eq!(
@@ -689,7 +698,7 @@ async fn z4_two_entries_resume_waits_and_timeouts() {
         assert_eq!(bundle.startup.tickets.len(), 1, "第 1 条的票在检查点");
     }
     let mut restart_config = config.clone();
-    restart_config.data_dir = data_dir.clone();
+    restart_config.data_dir = data_dir.path().to_path_buf();
     let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
@@ -760,13 +769,13 @@ async fn z5_no_agents_startup_record_empty() {
     config.checkpoint_interval_ticks = 6000;
     let h = bootstrap_harness(config).await;
     advance_ticks(120).await;
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.startup_counters,
         app::startup_agents::StartupCounters::default()
     );
-    let cps = read_all_checkpoints(&cps_dir);
+    let cps = read_all_checkpoints(cps_dir.path());
     let (_, blob) = cps.last().expect("终末检查点").clone();
     let bundle = app::driver::decode_checkpoint(&blob).expect("可解");
     assert_eq!(
@@ -780,5 +789,60 @@ async fn z5_no_agents_startup_record_empty() {
         0,
         "无 [[agents]] 的 120 拍日志窗口为空(实得 {} 条)",
         window.entries().len()
+    );
+}
+
+// ---- 夹具自证:数据目录用完即删 ------------------------------------------------
+
+/// 起服 → 推 10 拍 → 关服 → 记下路径 → drop 全部持有者 → 目录必须不存在。
+/// `TempDir` drop 删除失败不报错(如 redb 句柄未关,Windows 删不掉);
+/// 这条测试就是用来抓这种泄漏的。
+#[tokio::test(start_paused = true)]
+async fn harness_data_dir_removed_after_use() {
+    let path;
+    {
+        let h = bootstrap_harness(quad_config(vec![quad_agent(
+            StartupController::QuadTrot,
+            16.0,
+        )]))
+        .await;
+        path = h.data.path().to_path_buf();
+        advance_ticks(10).await;
+        let _ = shutdown(h).await;
+    }
+    assert!(
+        !path.exists(),
+        "数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
+    );
+}
+
+/// 重启流程同款:起服 → 关服 → 同目录裸调 `bootstrap`(恢复分支,断言
+/// `resume_from.is_some()`)→ 六元组全部 drop → 目录必须不存在(redb 单写
+/// 锁:第二次 `bootstrap` 的 store 隐含关掉了首段的文件句柄)。
+#[tokio::test(start_paused = true)]
+async fn restart_data_dir_removed_after_use() {
+    let path;
+    {
+        let config = quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]);
+        let h = bootstrap_harness(config.clone()).await;
+        let data = h.data.clone();
+        // 推 1 拍再关服(z1 口径:终末检查点要写到库,重启才有恢复分支)。
+        advance_ticks(1).await;
+        shutdown(h).await;
+        let mut restart_config = config.clone();
+        restart_config.data_dir = data.path().to_path_buf();
+        let (_resumed, _log2, store2, resume_from, _seq, _resume) =
+            app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+                .expect("重启 bootstrap 装配成功");
+        assert!(resume_from.is_some(), "重启段走恢复分支");
+        path = data.path().to_path_buf();
+        drop(store2);
+        drop(data);
+    }
+    assert!(
+        !path.exists(),
+        "重启后的数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
     );
 }
