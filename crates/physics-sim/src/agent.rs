@@ -165,6 +165,29 @@ pub struct AgentRecord {
     /// `AGENT_CRUSH_DEPTH` 时每拍 +1(saturating),脱困清零,数满
     /// `AGENT_CRUSH_TICKS` 按"掉出世界"移除。随快照走(检查点 v12)。
     pub embedded_ticks: u16,
+    /// Some = 已冻结(B03b 1.1:快照 + 障碍物)。随快照走(检查点 v14)。
+    pub frozen: Option<FrozenAgent>,
+}
+
+/// 冻结快照(REQ-012 §3:快照 + 障碍物;B03b 1.1)。字段与 MigrateAgent
+/// 信封同源。随 `AgentRecord` 走(检查点 v14)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FrozenAgent {
+    /// 冻结那一拍的根连杆状态(位姿 + 线/角速度)。
+    pub root: types::EntityState,
+    /// 关节坐标(自由度顺序;单连杆为空)。
+    pub joint_q: Vec<f32>,
+    /// 关节速度(自由度顺序;单连杆为空)。
+    pub joint_qd: Vec<f32>,
+    /// 全部连杆冻结那一拍的位姿(`BodyDef.links` 顺序;线/角速度写 0)。
+    /// 冻结期间 `agent_states` 的读数源。
+    pub link_poses: Vec<types::EntityState>,
+    /// 单连杆行走控制器的保持状态(`WalkerHold` 的两个字段平铺:`WalkerHold`
+    /// 是 `pub(crate)`,pub 结构体字段不能引用它,也不为可见性改它的定义;
+    /// B03b 回报里说明)。多连杆 = None。
+    pub hold_held_force: Option<(f32, f32)>,
+    /// 单连杆保持朝向(同上平铺;多连杆 = None)。
+    pub hold_last_yaw: Option<f32>,
 }
 
 /// 压垮判定深度(m)(B01c,REQ-012 §6"压垮"):连杆原点及其六个轴向 ± 此
@@ -172,6 +195,37 @@ pub struct AgentRecord {
 pub const AGENT_CRUSH_DEPTH: f32 = 0.05;
 /// 连续陷入多少拍后按"掉出世界"处理(REQ-012 §6"压垮")。常量,不进配置。
 pub const AGENT_CRUSH_TICKS: u16 = 60;
+
+/// 连杆碰撞体规格(B03b 1.2 障碍物逐个重建的输入;冻结拍现场收集)。
+#[allow(dead_code)] // B03b 步骤 2 接线(freeze_agent),先随 build 提取入库
+#[derive(Debug, Clone)]
+pub(crate) struct FrozenColliderSpec {
+    /// 世界位姿 = 冻结拍连杆位姿 × 碰撞体相对连杆的局部位姿。
+    pub world_pose: rapier3d::prelude::Pose,
+    /// 形状(共享句柄,原样复用)。
+    pub shape: rapier3d::prelude::SharedShape,
+    pub friction: f32,
+    pub restitution: f32,
+    /// 摩擦/恢复系数合成规则(A02a 第 4 节:照抄生成值)。
+    pub friction_combine_rule: rapier3d::prelude::CoefficientCombineRule,
+    pub restitution_combine_rule: rapier3d::prelude::CoefficientCombineRule,
+    pub collision_groups: rapier3d::prelude::InteractionGroups,
+    pub solver_groups: rapier3d::prelude::InteractionGroups,
+    pub active_events: rapier3d::prelude::ActiveEvents,
+}
+
+/// 只建物理体、不登记记录的产物(B03b 1.3:`build_agent_bodies` 返回;
+/// 生成路径与唤醒共用)。
+pub(crate) struct BuiltAgent {
+    /// 根连杆刚体句柄(= `EntityRecord.handle` 的取值)。
+    pub root_handle: rapier3d::prelude::RigidBodyHandle,
+    /// 连杆名 → 刚体句柄(键序与 `AgentRecord.links` 同口径:名字序)。
+    pub links: BTreeMap<String, rapier3d::prelude::RigidBodyHandle>,
+    /// 连杆碰撞体句柄(`BodyDef.links` 顺序,与 `AgentRecord.colliders` 同序)。
+    pub colliders: Vec<rapier3d::prelude::ColliderHandle>,
+    /// 关节目标初值(多连杆 = `default_angle` 缺省序列;单连杆为空)。
+    pub joint_targets: Vec<f32>,
+}
 
 /// 主体生成失败原因(类型化拒绝;不 panic)。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -413,29 +467,8 @@ impl ShardSim {
             "主体重复 spawn(fail-stop):{entity:?}"
         );
         let link = def.links.first().expect("单连杆(上面已判)");
-        let k = self.cfg.agent_mass_scale;
-        let mass = link.mass * k;
-        // 单连杆生成:动态刚体 + 形状 collider(质量显式给定 = 真实单位 × k,
-        // 不用密度)。锁定转动按定义(capsule demo)。
-        let mut body_builder = rapier3d::prelude::RigidBodyBuilder::dynamic()
-            .pose(crate::conv::pose_to_rapier(
-                state.translation,
-                state.rotation,
-            ))
-            .linvel(crate::conv::vec3_to_rapier(state.linvel))
-            .angvel(crate::conv::vec3_to_rapier(state.angvel));
-        if def.lock_rotations {
-            body_builder = body_builder.lock_rotations();
-        }
-        let mut collider_builder = agent_collider_builder(&link.shapes, mass);
-        collider_builder = collider_builder
-            .friction(link.friction)
-            .restitution(link.restitution)
-            // A02a 第 4 节:接触钩子只挂在主体碰撞体上(摩擦清零 + 接缝
-            // 修正;钩子本身见 walker.rs——世界里没有主体时无碰撞体挂钩,
-            // 钩子不触发,AC-A8)。
-            .active_hooks(rapier3d::prelude::ActiveHooks::MODIFY_SOLVER_CONTACTS);
-        let (handle, collider) = self.phys.insert(body_builder, collider_builder);
+        let built = self.build_agent_bodies(entity, def, state);
+        let (handle, collider) = (built.root_handle, built.colliders[0]);
 
         // 主体描述:凝固路径按 actor 豁免永不使用 `desc.block`;`half_size`
         // 取形状包络半高(唤醒/预算几何的足迹外扩用,保守取胶囊总半高)。
@@ -472,6 +505,7 @@ impl ShardSim {
                 intent_jump: false,
                 joint_targets: Vec::new(),
                 embedded_ticks: 0,
+                frozen: None,
             },
         );
         // 调度器据此 claim 全局 ownership(REQ-006 任务 00;恰好一次)。
@@ -503,7 +537,6 @@ impl ShardSim {
         state: types::EntityState,
         source: Option<messaging::InputSource>,
     ) -> Result<(), AgentSpawnError> {
-        use rapier3d::prelude::*;
         if let Err(e) = def.validate() {
             self.outbox.agent_spawn_rejected += 1;
             return Err(AgentSpawnError::InvalidBody(e.to_string()));
@@ -512,6 +545,100 @@ impl ShardSim {
             !self.entities.contains_key(&entity) && !self.agents.contains_key(&entity),
             "主体重复 spawn(fail-stop):{entity:?}"
         );
+        let built = self.build_agent_bodies(entity, def, state);
+        let root_handle = built.root_handle;
+        let links = built.links;
+        let colliders = built.colliders;
+        let joint_targets = built.joint_targets;
+
+        // ---- 关节/电机/阻尼/自碰撞已由 build_agent_bodies 完成(步骤 3–5)----
+
+        // ---- 步骤 6:登记(同单连杆)----
+        let desc = types::EntityDesc {
+            half_size: agent_half_size(def),
+            block: types::BlockId(1),
+            shape: None,
+        };
+        self.entities.insert(
+            entity,
+            crate::sim::EntityRecord {
+                handle: root_handle,
+                collider: colliders[0],
+                desc,
+                slow_ticks: 0,
+                actor: true,
+                source,
+                window: std::collections::VecDeque::new(),
+                carried: false,
+                at_rest: false,
+                actor_motion_ticks: None,
+            },
+        );
+        self.agents.insert(
+            entity,
+            AgentRecord {
+                body_hash: body,
+                links,
+                colliders,
+                intent_move: None,
+                intent_yaw: None,
+                intent_jump: false,
+                joint_targets,
+                embedded_ticks: 0,
+                frozen: None,
+            },
+        );
+        self.outbox.spawned.push(entity);
+        Ok(())
+    }
+
+    /// 只建物理体,不登记记录、不动 outbox(B03b 1.3:生成路径与唤醒共用
+    /// ;生成行为逐位不变——K 组、回放、双跑测试是判据)。单连杆 = 动态
+    /// 刚体 + 形状 collider(挂 MODIFY_SOLVER_CONTACTS 钩子,capsule 路径
+    /// 原样);多连杆 = B01a 生成步骤 1–5 原样(正运动学摆位、碰撞体、
+    /// 关节电机、阻尼 × k、自碰撞全关)。
+    fn build_agent_bodies(
+        &mut self,
+        entity: EntityId,
+        def: &BodyDef,
+        state: types::EntityState,
+    ) -> BuiltAgent {
+        let _ = entity; // 调试定位用参数(与 spawn_agent_* 同签名口径)
+        if def.links.len() == 1 {
+            let link = def.links.first().expect("单连杆(上面已判)");
+            let k = self.cfg.agent_mass_scale;
+            let mass = link.mass * k;
+            // 单连杆生成:动态刚体 + 形状 collider(质量显式给定 = 真实单位
+            // × k,不用密度)。锁定转动按定义(capsule demo)。
+            let mut body_builder = rapier3d::prelude::RigidBodyBuilder::dynamic()
+                .pose(crate::conv::pose_to_rapier(
+                    state.translation,
+                    state.rotation,
+                ))
+                .linvel(crate::conv::vec3_to_rapier(state.linvel))
+                .angvel(crate::conv::vec3_to_rapier(state.angvel));
+            if def.lock_rotations {
+                body_builder = body_builder.lock_rotations();
+            }
+            let mut collider_builder = agent_collider_builder(&link.shapes, mass);
+            collider_builder = collider_builder
+                .friction(link.friction)
+                .restitution(link.restitution)
+                // A02a 第 4 节:接触钩子只挂在主体碰撞体上(摩擦清零 + 接缝
+                // 修正;钩子本身见 walker.rs——世界里没有主体时无碰撞体挂钩,
+                // 钩子不触发,AC-A8)。
+                .active_hooks(rapier3d::prelude::ActiveHooks::MODIFY_SOLVER_CONTACTS);
+            let (handle, collider) = self.phys.insert(body_builder, collider_builder);
+            let mut links = std::collections::BTreeMap::new();
+            links.insert(link.name.clone(), handle);
+            return BuiltAgent {
+                root_handle: handle,
+                links,
+                colliders: vec![collider],
+                joint_targets: Vec::new(),
+            };
+        }
+        use rapier3d::prelude::*;
         let k = self.cfg.agent_mass_scale;
         // 名字 → (生成序, 欲填的 handle 槽)。父先于子在 validate/这里强制。
         let mut order: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
@@ -699,46 +826,16 @@ impl ShardSim {
             mb.set_self_contacts_enabled(false);
         }
 
-        // ---- 步骤 6:登记(同单连杆)----
-        let desc = types::EntityDesc {
-            half_size: agent_half_size(def),
-            block: types::BlockId(1),
-            shape: None,
-        };
         let mut links = std::collections::BTreeMap::new();
         for (i, link) in def.links.iter().enumerate() {
             links.insert(link.name.clone(), handles[i].expect("全部连杆已建"));
         }
-        self.entities.insert(
-            entity,
-            crate::sim::EntityRecord {
-                handle: root_handle,
-                collider: colliders[0],
-                desc,
-                slow_ticks: 0,
-                actor: true,
-                source,
-                window: std::collections::VecDeque::new(),
-                carried: false,
-                at_rest: false,
-                actor_motion_ticks: None,
-            },
-        );
-        self.agents.insert(
-            entity,
-            AgentRecord {
-                body_hash: body,
-                links,
-                colliders,
-                intent_move: None,
-                intent_yaw: None,
-                intent_jump: false,
-                joint_targets,
-                embedded_ticks: 0,
-            },
-        );
-        self.outbox.spawned.push(entity);
-        Ok(())
+        BuiltAgent {
+            root_handle,
+            links,
+            colliders,
+            joint_targets,
+        }
     }
 
     /// 迁移重建入口(REQ-012 A04 放行第 2 节 / B03a 1.3):按身体哈希走
