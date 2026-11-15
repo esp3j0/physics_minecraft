@@ -336,8 +336,10 @@ struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
-    /// 数据目录(checkpoints.redb 所在;关服后读检查点用)。
-    data_dir: std::path::PathBuf,
+    /// 数据目录的持有者(checkpoints.redb 所在;最后一个持有者 drop 时
+    /// 目录被删除,测试 panic 时也会)。重启段裸调 `app::driver::bootstrap`
+    /// 时用 `h.data.clone()` 克隆 Arc 把目录续命到第二次起服。
+    data: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// 关服后从 data_dir 读出全部检查点(ID 1..=latest)。
@@ -362,13 +364,21 @@ fn read_all_checkpoints(data_dir: &std::path::Path) -> Vec<(Tick, Vec<u8>)> {
 }
 
 /// 起服辅助(唯一写法)——经真实 `bootstrap` 装配(全新启动分支),存储用
-/// bootstrap 打开的 redb 文件(temp 下唯一目录,不碰本地 data/)。
+/// bootstrap 打开的 redb 文件(TempDir 持有的唯一目录,不碰本地 data/)。
 async fn bootstrap_harness(config: Config) -> Harness {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let data_dir = std::env::temp_dir().join(format!("b03a_{}_{}", std::process::id(), unique));
+    let data = std::sync::Arc::new(
+        tempfile::Builder::new()
+            .prefix("b03a_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    bootstrap_harness_in(config, data).await
+}
+
+/// 在给定的数据目录上起服(重启类测试用:同一目录可再次起服)。
+async fn bootstrap_harness_in(config: Config, data: std::sync::Arc<tempfile::TempDir>) -> Harness {
     let mut config = config;
-    config.data_dir = data_dir.clone();
+    config.data_dir = data.path().to_path_buf();
     let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
@@ -417,7 +427,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         tx,
         driver: Some(driver),
         addr,
-        data_dir,
+        data,
     }
 }
 
@@ -571,7 +581,7 @@ async fn x2_replay_through_migration_bitwise() {
     let (_entity, _n, samples, _, _, _, _) = sample_quad_root_watch(&mut rx, 2200).await;
     let online_last = *samples.last().expect("非空");
     drop(a);
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert!(
         outcome.controller_counters.actions_emitted > 0,
@@ -580,7 +590,7 @@ async fn x2_replay_through_migration_bitwise() {
 
     // 最早检查点(240 拍,主体起步 ~3 拍/settle 120 拍 → 仍在出生分片起步
     // 段)+ 其后拼接日志。
-    let checkpoints = read_all_checkpoints(&cps_dir);
+    let checkpoints = read_all_checkpoints(cps_dir.path());
     assert!(
         checkpoints.len() >= 2,
         "期中 + 终末都有(实得 {})",
@@ -711,7 +721,7 @@ async fn x4_restart_after_migration_preserves_agent() {
     let config = x1_config(6000);
     let h = bootstrap_harness(config.clone()).await;
     let mut restart_config = config.clone();
-    restart_config.data_dir = h.data_dir.clone();
+    restart_config.data_dir = h.data.path().to_path_buf();
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -726,12 +736,12 @@ async fn x4_restart_after_migration_preserves_agent() {
     assert!(crossed, "布景自检:关服前未发生迁移(根从未过界)");
     let pre_last = *samples.last().expect("非空");
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome1 = shutdown(h).await;
     assert_eq!(outcome1.startup_counters.spawned, 1, "首段生成恰 1 只");
 
     // 重启:同一 data_dir 再走一次真实 bootstrap(读终末 bundle)。
-    let cps = read_all_checkpoints(&data_dir);
+    let cps = read_all_checkpoints(data_dir.path());
     let (_, blob) = cps.last().expect("终末检查点存在").clone();
     let bundle = app::driver::decode_checkpoint(&blob).expect("v13 档可解");
     assert_eq!(
@@ -933,7 +943,7 @@ async fn x6_no_agents_world_unchanged() {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/bodies");
     let h = bootstrap_harness(config).await;
     advance_ticks(120).await;
-    let cps_dir = h.data_dir.clone();
+    let cps_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(
         outcome.controller_counters.actions_emitted, 0,
@@ -945,7 +955,7 @@ async fn x6_no_agents_world_unchanged() {
     assert_eq!(outcome.startup_counters.spawned, 0);
     assert_eq!(outcome.startup_counters.spawn_timeouts, 0);
     // 日志窗口 0 条(终末检查点的日志段)。
-    let cps = read_all_checkpoints(&cps_dir);
+    let cps = read_all_checkpoints(cps_dir.path());
     let (_, blob) = cps.last().expect("终末检查点存在").clone();
     let bundle = app::driver::decode_checkpoint(&blob).expect("可解");
     let window = CommandLog::from_bytes(&bundle.log_bytes).expect("日志窗口可解");
@@ -954,5 +964,57 @@ async fn x6_no_agents_world_unchanged() {
         0,
         "无主体:日志窗口 0 条(实得 {})",
         window.entries().len()
+    );
+}
+
+// ---- 夹具自证:数据目录用完即删 ------------------------------------------------
+
+/// 起服 → 推 10 拍 → 关服 → 记下路径 → drop 全部持有者 → 目录必须不存在。
+/// `TempDir` drop 删除失败不报错(如 redb 句柄未关,Windows 删不掉);
+/// 这条测试就是用来抓这种泄漏的。
+#[tokio::test(start_paused = true)]
+async fn harness_data_dir_removed_after_use() {
+    let path;
+    {
+        let h = bootstrap_harness(x1_config(6000)).await;
+        path = h.data.path().to_path_buf();
+        advance_ticks(10).await;
+        let _ = shutdown(h).await;
+    }
+    assert!(
+        !path.exists(),
+        "数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
+    );
+}
+
+/// 重启流程同款(x4 口径:迁移前推几拍即可,这里只验目录生命周期):起服 →
+/// 关服 → 同目录裸调 `bootstrap`(恢复分支,断言 `resume_from.is_some()`)
+/// → 六元组全部 drop → 目录必须不存在(redb 单写锁:第二次 `bootstrap` 的
+/// store 隐含关掉了首段的文件句柄)。
+#[tokio::test(start_paused = true)]
+async fn restart_data_dir_removed_after_use() {
+    let path;
+    {
+        let config = x1_config(6000);
+        let h = bootstrap_harness(config.clone()).await;
+        let data = h.data.clone();
+        // 推 1 拍再关服:终末检查点写到库,重启才有恢复分支(z1/b03d 同口径)。
+        advance_ticks(1).await;
+        shutdown(h).await;
+        let mut restart_config = config.clone();
+        restart_config.data_dir = data.path().to_path_buf();
+        let (_resumed, _log2, store2, resume_from, _seq, _resume) =
+            app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
+                .expect("重启 bootstrap 装配成功");
+        assert!(resume_from.is_some(), "重启段走恢复分支");
+        path = data.path().to_path_buf();
+        drop(store2);
+        drop(data);
+    }
+    assert!(
+        !path.exists(),
+        "重启后的数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
     );
 }
