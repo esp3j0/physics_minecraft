@@ -302,9 +302,7 @@ async fn collect_snaps(
 /// 逐位相等(f32 按 to_bits;含 −0/+0 区分,不含 NaN——位姿应有限)。
 fn bits_eq(a: &types::EntityState, b: &types::EntityState) -> bool {
     let v = |x: &Vec3| [x.x.to_bits(), x.y.to_bits(), x.z.to_bits()];
-    let q = |r: &types::glam::Quat| {
-        [r.x.to_bits(), r.y.to_bits(), r.z.to_bits(), r.w.to_bits()]
-    };
+    let q = |r: &types::glam::Quat| [r.x.to_bits(), r.y.to_bits(), r.z.to_bits(), r.w.to_bits()];
     v(&a.translation) == v(&b.translation)
         && q(&a.rotation) == q(&b.rotation)
         && v(&a.linvel) == v(&b.linvel)
@@ -347,8 +345,11 @@ fn up_y(state: &types::EntityState) -> f32 {
 #[tokio::test(start_paused = true)]
 async fn v1_illegal_joint_targets_rejected_and_clamped() {
     // ---- 主运行:发 5 条(前 4 条非法)----
-    let h = bootstrap_harness(quad_config(vec![quad_agent(StartupController::QuadStand, 16.0)]))
-        .await;
+    let h = bootstrap_harness(quad_config(vec![quad_agent(
+        StartupController::QuadStand,
+        16.0,
+    )]))
+    .await;
     let (mut a, mut rx) = client(h.addr).await;
     let _player = join(&mut a, &mut rx, 8).await;
     a.send(&C2S::MoveObserver {
@@ -412,9 +413,11 @@ async fn v1_illegal_joint_targets_rejected_and_clamped() {
     let outcome = shutdown(h).await;
 
     // ---- 对照运行:同配置同拍数,不发非法目标 ----
-    let hc =
-        bootstrap_harness(quad_config(vec![quad_agent(StartupController::QuadStand, 16.0)]))
-            .await;
+    let hc = bootstrap_harness(quad_config(vec![quad_agent(
+        StartupController::QuadStand,
+        16.0,
+    )]))
+    .await;
     let (mut ac, mut rxc) = client(hc.addr).await;
     let _ = join(&mut ac, &mut rxc, 8).await;
     ac.send(&C2S::MoveObserver {
@@ -497,8 +500,11 @@ async fn v1_illegal_joint_targets_rejected_and_clamped() {
 /// 不改断言——那说明小跑步态在撞限位,是要记下来的发现。
 #[tokio::test(start_paused = true)]
 async fn v2_trot_no_illegal_actions_zero_counters() {
-    let h = bootstrap_harness(quad_config(vec![quad_agent(StartupController::QuadTrot, 16.0)]))
-        .await;
+    let h = bootstrap_harness(quad_config(vec![quad_agent(
+        StartupController::QuadTrot,
+        16.0,
+    )]))
+    .await;
     advance_ticks(600).await;
     let outcome = shutdown(h).await;
     println!(

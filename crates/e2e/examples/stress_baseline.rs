@@ -1711,11 +1711,17 @@ fn run_agents_once(quads: usize, measure_ticks: u64) -> AgentRun {
         }
         run.peak_awake = run.peak_awake.max(summary.telemetry.entities_awake);
         run.frozen_total += summary.agent_frozen;
+        // 拍末摘失活主体的控制者(返修 R1 §4:与驱动同一谓词 `is_agent ||
+        // 迁移在途`,同一时点——tick 后现取在途集合,否则迁移那一拍误摘;
+        // 计时段之外,不影响耗时数字)。
+        let in_transit_post = rig.session.in_transit_entities();
+        host.retain_alive(|id| rig.session.is_agent(id) || in_transit_post.contains(&id));
         // 压垮/失控/掉出世界随 Outbox 走,TickSummary 无直接字段——收尾
         // 用 alive_at_end 差值核对(removed_total 在窗口后按差值回填)。
         let _ = rig.session.take_solidified();
         let _ = rig.session.take_block_updates();
-        // 采样四足根位姿(窗口首拍记起点,末拍记终点与 up·y)。
+        // 采样四足根位姿(窗口首拍记起点;每拍采 up·y 取全窗口最小——
+        // 返修 R1 §3:中途翻倒又翻回来的也要抓到;末拍记沿航向位移)。
         let states = rig.session.agent_states();
         if i == 0 {
             root_start = ids
@@ -1730,19 +1736,19 @@ fn run_agents_once(quads: usize, measure_ticks: u64) -> AgentRun {
                 })
                 .collect();
         }
-        if i + 1 == measure_ticks {
-            for (k, id) in ids.iter().enumerate() {
-                let (_, _, links) = states
-                    .iter()
-                    .find(|(e, _, _)| e == id)
-                    .expect("窗口末四足在主体表");
-                let root = links.first().expect("根连杆");
+        for (k, id) in ids.iter().enumerate() {
+            let Some((_, _, links)) = states.iter().find(|(e, _, _)| e == id) else {
+                // 中途被移除的四足跳过采样(alive_at_end 自证兜底移除即 fail)。
+                continue;
+            };
+            let root = links.first().expect("根连杆");
+            run.min_up_y = run
+                .min_up_y
+                .min((root.rotation * Vec3::new(0.0, 1.0, 0.0)).y);
+            if i + 1 == measure_ticks {
                 let start = root_start[k];
                 // 沿航向(+x)的位移。
                 run.forward_m.push(root.translation.x - start.x);
-                run.min_up_y = run
-                    .min_up_y
-                    .min((root.rotation * Vec3::new(0.0, 1.0, 0.0)).y);
             }
         }
         rig.orchestrate();
@@ -1793,15 +1799,14 @@ fn run_agents_once(quads: usize, measure_ticks: u64) -> AgentRun {
             expect_min
         );
         assert_eq!(run.send_rejected, 0, "自证失败:send_rejected != 0");
-        // peak_awake 判据(任务书 2.1:peak_awake ≥ quads×13)停报待裁:
-        // 实测 TickSummary.telemetry.entities_awake **按实体计**(调度器
-        // 遍历 `sim.entity_owners()`,一只四足 = 1 个实体),不按连杆。
-        // 2 只档实测峰值 = 2。照任务书"停下报告它实际怎么算,不要改断言
-        // 去凑",本条断言不执行,实测值照实进 #25 报告。
-        println!(
-            "agents quads={quads}: peak_awake = {}(按实体计;13×{quads} = {})",
-            run.peak_awake,
-            quads * 13
+        // peak_awake 按实体计(B04 返修 R1 §0 裁决:TickSummary.telemetry
+        // .entities_awake 遍历 entity_owners,一只四足 = 1 个实体,不按连杆;
+        // 任务书 2.1 的"≥ quads×13"按裁决改实体口径)。quads > 0 时每拍
+        // 全体醒着,峰值不得小于只数。
+        assert!(
+            run.peak_awake >= quads,
+            "自证失败:peak_awake {} < quads {quads}(按实体计)",
+            run.peak_awake
         );
     }
     // 统计列。
