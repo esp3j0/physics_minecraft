@@ -184,8 +184,11 @@ struct Harness {
     tx: mpsc::Sender<DriverCommand>,
     driver: Option<tokio::task::JoinHandle<DriverOutcome>>,
     addr: SocketAddr,
-    /// 数据目录(checkpoints.redb 所在;关服后读检查点用)。
-    data_dir: std::path::PathBuf,
+    /// 数据目录的持有者(checkpoints.redb 所在;最后一个持有者 drop 时
+    /// 目录被删除,测试 panic 时也会)。恢复线(`resume_session`/Y4 回放)
+    /// 在测试体内继续用它:`y3_online_stage()` 返回 Arc,或调用点传
+    /// `h.data.path()`。
+    data: std::sync::Arc<tempfile::TempDir>,
 }
 
 /// 关服后从 data_dir 读出全部检查点(ID 1..=latest)。
@@ -231,11 +234,19 @@ fn stitched_log(checkpoints: &[(Tick, Vec<u8>)]) -> CommandLog {
 
 /// 起服辅助(唯一写法;b03a 同款)。
 async fn bootstrap_harness(config: Config) -> Harness {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let unique = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let data_dir = std::env::temp_dir().join(format!("b03c_{}_{}", std::process::id(), unique));
+    let data = std::sync::Arc::new(
+        tempfile::Builder::new()
+            .prefix("b03c_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    bootstrap_harness_in(config, data).await
+}
+
+/// 在给定的数据目录上起服(恢复类测试用:同一目录可再次恢复)。
+async fn bootstrap_harness_in(config: Config, data: std::sync::Arc<tempfile::TempDir>) -> Harness {
     let mut config = config;
-    config.data_dir = data_dir.clone();
+    config.data_dir = data.path().to_path_buf();
     let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
@@ -284,7 +295,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         tx,
         driver: Some(driver),
         addr,
-        data_dir,
+        data,
     }
 }
 
@@ -310,8 +321,9 @@ fn resume_session(
             .expect("重启 bootstrap 装配成功");
     assert!(resume_from.is_some(), "恢复分支真实走到");
     assert!(resume.is_some(), "恢复分支回填控制者条目");
-    // store2 保持存活(redb 文件句柄;恢复后的会话不再写它也持有读口径)。
-    std::mem::forget(store2);
+    // store2 直接落在这里 drop:redb `Database` 的 Drop 会关闭文件句柄(B04b
+    // 裁定);恢复后的会话已自持分片快照,不再经它读写。
+    drop(store2);
     let _ = last_tick;
     (resumed, host, bundle.world.shards.tick)
 }
@@ -473,7 +485,7 @@ async fn y2_player_body_freezes_and_wakes() {
     // 冻结计数在 DriverOutcome 里核验)。
     advance_ticks(700).await;
     drop(a);
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome = shutdown(h).await;
     println!(
         "Y2: 在线段 agent_frozen {}, agent_woken {}",
@@ -484,7 +496,7 @@ async fn y2_player_body_freezes_and_wakes() {
 
     // 恢复线:恢复(观察者表空——无人在线)→ 主体仍冻结;冻结期间
     // `agent_states` 逐拍逐位不变;观察者回到身体旁 → 唤醒,位置差 < 1 cm。
-    let (mut session, _host, _snap_tick) = resume_session(&config, &data_dir);
+    let (mut session, _host, _snap_tick) = resume_session(&config, data_dir.path());
     let frozen_set = session.frozen_agents();
     assert!(
         frozen_set.contains(&body),
@@ -837,8 +849,13 @@ async fn y2b_player_body_online_freeze_wake_walk() {
 
 /// Y3 布景助手:在线段跑 quad_trot,撤启动票(③ 档),等冻结,关服。
 /// 检查点间隔 240(Y4 要一个冻结之前的期中票)。返回
-/// (DriverOutcome, data_dir, config)。
-async fn y3_online_stage() -> (DriverOutcome, std::path::PathBuf, Config) {
+/// (DriverOutcome, 数据目录持有者, config);目录由 Arc<TempDir> 持有,
+/// 调用方 drop 掉最后一个持有者后目录被删。
+async fn y3_online_stage() -> (
+    DriverOutcome,
+    std::sync::Arc<tempfile::TempDir>,
+    Config,
+) {
     let config = base_config(vec![quad_trot_agent()], 240);
     let h = bootstrap_harness(config.clone()).await;
     // 先跑 120 拍(settle 起步),再撤启动票(票号 = STARTUP_TICKET_BASE)。
@@ -851,7 +868,7 @@ async fn y3_online_stage() -> (DriverOutcome, std::path::PathBuf, Config) {
     // 撤票 → 主体出全部唤醒范围(无观察者)→ 冷却后冻结(上限 600 拍;
     // 等待窗口 900 拍,有界)。
     advance_ticks(900).await;
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome = shutdown(h).await;
     (outcome, data_dir, config)
 }
@@ -880,7 +897,7 @@ async fn y3_ticket_removed_walking_freeze_and_resume() {
 
     // 恢复线:主体仍冻结、同一 EntityId;观察者移到旁边 → 唤醒;300 拍
     // drive+tick 循环(与驱动同序,控制器从检查点继续)。
-    let (mut session, mut host, snap_tick) = resume_session(&config, &data_dir);
+    let (mut session, mut host, snap_tick) = resume_session(&config, data_dir.path());
     let frozen_set = session.frozen_agents();
     let entity = *frozen_set.iter().next().expect("恢复线恰一只冻结主体");
     println!("Y3: 恢复线冻结主体 {entity:?} @ 快照拍 {}", snap_tick.0);
@@ -931,7 +948,7 @@ async fn y3_ticket_removed_walking_freeze_and_resume() {
 #[tokio::test(start_paused = true)]
 async fn y4_replay_bitwise_matches_online() {
     let (_outcome, data_dir, config) = y3_online_stage().await;
-    let cps = read_all_checkpoints(&data_dir);
+    let cps = read_all_checkpoints(data_dir.path());
     assert!(
         cps.len() >= 2,
         "布景自检:须有期中检查点(冻结之前)+ 终末,实得 {}",
@@ -1012,7 +1029,7 @@ async fn y4_replay_bitwise_matches_online() {
 async fn y5_double_run_bitwise_identical() {
     let run = || async {
         let (outcome, data_dir, config) = y3_online_stage().await;
-        let (mut session, mut host, _snap_tick) = resume_session(&config, &data_dir);
+        let (mut session, mut host, _snap_tick) = resume_session(&config, data_dir.path());
         let entity = *session.frozen_agents().iter().next().expect("冻结主体");
         let mut now = session.tick_now();
         let pos0 = session.agent_root_position(entity).expect("在场");
@@ -1063,7 +1080,7 @@ async fn y5_double_run_bitwise_identical() {
 async fn y6_restart_frozen_then_walk() {
     let (outcome, data_dir, config) = y3_online_stage().await;
     assert_eq!(outcome.agent.agent_frozen, 1, "布景自检:在线段已冻结");
-    let (mut session, mut host, _snap_tick) = resume_session(&config, &data_dir);
+    let (mut session, mut host, _snap_tick) = resume_session(&config, data_dir.path());
     let frozen_set = session.frozen_agents();
     let entity = *frozen_set.iter().next().expect("恢复线恰一只冻结主体");
     assert!(frozen_set.contains(&entity), "Y6:恢复后主体不在冻结集合");
@@ -1279,7 +1296,7 @@ async fn y3b_quad_online_freeze_wake_resume_walk() {
 async fn y7_no_agents_path_unchanged() {
     let h = bootstrap_harness(base_config(Vec::new(), 6000)).await;
     advance_ticks(120).await;
-    let data_dir = h.data_dir.clone();
+    let data_dir = h.data.clone();
     let outcome = shutdown(h).await;
     assert_eq!(outcome.agent.agent_frozen, 0, "Y7:agent_frozen 全 0");
     assert_eq!(outcome.agent.agent_woken, 0, "Y7:agent_woken 全 0");
@@ -1292,9 +1309,54 @@ async fn y7_no_agents_path_unchanged() {
         "Y7:无主体无动作"
     );
     // 日志窗口 0 条(终末检查点的日志窗口)。
-    let cps = read_all_checkpoints(&data_dir);
+    let cps = read_all_checkpoints(data_dir.path());
     let (_, blob) = cps.last().expect("终末检查点存在");
     let bundle = app::driver::decode_checkpoint(blob).expect("可解");
     let window = CommandLog::from_bytes(&bundle.log_bytes).expect("日志窗口可解");
     assert_eq!(window.entries().len(), 0, "Y7:120 拍日志窗口 0 条");
+}
+
+// ---- 夹具自证:数据目录用完即删 ------------------------------------------------
+
+/// 起服 → 推 10 拍 → 关服 → 记下路径 → drop 全部持有者 → 目录必须不存在。
+/// `TempDir` drop 删除失败不报错(如 redb 句柄未关,Windows 删不掉);
+/// 这条测试就是用来抓这种泄漏的。
+#[tokio::test(start_paused = true)]
+async fn harness_data_dir_removed_after_use() {
+    let path;
+    {
+        let h = bootstrap_harness(base_config(Vec::new(), 6000)).await;
+        path = h.data.path().to_path_buf();
+        advance_ticks(10).await;
+        let _ = shutdown(h).await;
+    }
+    assert!(
+        !path.exists(),
+        "数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
+    );
+}
+
+/// 恢复流程同款(Y6 口径,`resume_session` 那条路径):在线段起服 → 关服 →
+/// `resume_session`(裸调 `bootstrap` 恢复分支,store2 正常 drop)→ 恢复线
+/// `session.shutdown()` → 全部持有者 drop → 目录必须不存在。
+#[tokio::test(start_paused = true)]
+async fn restart_data_dir_removed_after_use() {
+    let path;
+    {
+        let (outcome, data_dir, config) = y3_online_stage().await;
+        assert_eq!(outcome.agent.agent_frozen, 1, "布景自检:在线段已冻结");
+        let (mut session, mut host, _snap_tick) = resume_session(&config, data_dir.path());
+        assert!(!session.frozen_agents().is_empty(), "恢复线恰有冻结主体");
+        // 恢复线收尾(drive_tick 同款循环的结束路径:shutdown 释放会话)。
+        session.shutdown();
+        drop(host);
+        path = data_dir.path().to_path_buf();
+        drop(data_dir);
+    }
+    assert!(
+        !path.exists(),
+        "恢复线之后的数据目录 {} 用完必须被删(有人还占着文件)",
+        path.display()
+    );
 }
