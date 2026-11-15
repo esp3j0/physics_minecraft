@@ -133,6 +133,7 @@ fn bundle(format_version: u32, log_bytes: Vec<u8>) -> CheckpointBundle {
         log_bytes,
         spawn_next_seq: 42,
         controllers: Vec::new(),
+        startup: Default::default(),
     }
 }
 
@@ -238,7 +239,7 @@ async fn acc_k4_z1_production_path_retention_and_compression() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: None,
+        resume: None,
     }));
     tx.send(DriverCommand::MoveObserver {
         position: Vec3::new(8.0, types::WORLD_Y_MIN as f32 + 6.0, 8.0),

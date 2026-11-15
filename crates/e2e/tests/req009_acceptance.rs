@@ -1795,6 +1795,7 @@ mod unit05 {
             log_bytes: log.to_bytes(),
             spawn_next_seq: 0,
             controllers: Vec::new(),
+            startup: Default::default(),
         };
         let back = decode_checkpoint(&encode_checkpoint(&bundle)).expect("v6 往返");
         let replay_log = CommandLog::from_bytes(&back.log_bytes).expect("日志");

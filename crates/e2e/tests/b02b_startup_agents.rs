@@ -5,7 +5,7 @@
 //! `startup.poll → host.apply_leash → host.drive → session.tick →
 //! retain_alive`。检查点用 `RecordingCheckpointStore`(a03_session_determinism
 //! 同款),重启 = 读 bundle → `replay_world_with_bodies` 恢复 Session +
-//! `startup_controllers` 回填。
+//! 恢复状态(`resume`)回填。
 //!
 //! **等待循环一律有界**(a06 R1 §4):墙钟 60 s 上限 + 帧数预算,超限
 //! panic 并写明在等什么——挂死不算红。
@@ -288,7 +288,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
     // 本地库,测试绝不碰;E1 首轮踩过——残留检查点让 bootstrap 走恢复分支)。
     let mut config = config;
     config.data_dir = data_dir.clone();
-    let (session, log, store, _resume_from, spawn_next_seq, startup_controllers) =
+    let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
 
@@ -330,7 +330,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         }),
         spawn_next_seq,
         bodies: loaded,
-        startup_controllers,
+        resume,
     }));
     Harness {
         tx,
@@ -528,11 +528,11 @@ async fn e2_restart_preserves_agent_and_controllers() {
     {
         let cps = read_all_checkpoints(&data_dir);
         let (_, blob) = cps.last().expect("终末检查点存在").clone();
-        let bundle = app::driver::decode_checkpoint(&blob).expect("v13 档可解");
+        let bundle = app::driver::decode_checkpoint(&blob).expect("检查点可解");
         assert_eq!(
             bundle.format_version,
             app::driver::CHECKPOINT_FORMAT_VERSION,
-            "bundle 版本 = 13"
+            "bundle 版本 = 当前"
         );
         assert_eq!(
             bundle.controllers.len(),
@@ -541,7 +541,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
             bundle.controllers.len()
         );
     }
-    let (resumed, _log2, store2, resume_from, spawn_next_seq, startup_controllers) =
+    let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
     assert!(
@@ -549,7 +549,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
         "重启段 bootstrap 走恢复分支(续跑自拍)"
     );
     assert!(
-        startup_controllers.is_some() && startup_controllers.as_ref().expect("Some").len() == 1,
+        resume.is_some() && resume.as_ref().expect("Some").controllers.len() == 1,
         "bootstrap 第 6 项 = Some(恰 1 条)"
     );
     assert!(
@@ -595,7 +595,7 @@ async fn e2_restart_preserves_agent_and_controllers() {
         }),
         spawn_next_seq,
         bodies: loaded,
-        startup_controllers,
+        resume,
     }));
 
     // 重启段:客户端重连采样(观察者回出生点),采 200 拍主体帧,再走够
@@ -1112,11 +1112,11 @@ async fn e10_bootstrap_roundtrip_startup_controllers() {
     // 同一 data_dir 重启 bootstrap:第 6 项 = Some 恰 1 条,entity 对得上。
     let mut restart_config = config;
     restart_config.data_dir = data_dir.clone();
-    let (_session, _log, _store, resume_from, _seq, controllers) =
+    let (_session, _log, _store, resume_from, _seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 成功");
     assert!(resume_from.is_some(), "重启走恢复分支");
-    let records = controllers.expect("第 6 项 = Some(恢复启动)");
+    let records = resume.expect("第 6 项 = Some(恢复启动)").controllers;
     assert_eq!(
         records.len(),
         1,

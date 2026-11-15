@@ -1229,7 +1229,7 @@ async fn acc6_network_observer_replay() {
         }),
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: None,
+        resume: None,
     }));
 
     // A 进区 (8,·,8),B 进区 (200,·,8);A 中途断开。
@@ -1769,7 +1769,7 @@ async fn acc8_workspace_regression_and_viewer_smoke() {
         }),
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: None,
+        resume: None,
     }));
 
     let (events, _control) = ViewerClient::spawn(addr, 2).expect("spawn 连真服务器");
@@ -1961,6 +1961,7 @@ fn acc9_no_duplicate_loads_or_fanout() {
         log_bytes: CommandLog::new().to_bytes(),
         spawn_next_seq: 0,
         controllers: Vec::new(),
+        startup: Default::default(),
     };
     // #17:对拍生产编码(v5 = 版本前缀 + lz4 压缩体),压缩也必须确定。
     let bytes_a = app::driver::encode_checkpoint(&bundle);
@@ -2037,7 +2038,7 @@ async fn pending_blockwrite_cells_defer_window() {
         observe: None,
         spawn_next_seq: 0,
         bodies: physics_sim::BodyRegistry::new(),
-        startup_controllers: None,
+        resume: None,
     }));
 
     // ① 观察者贴边界 (120,-58,8):(0,0) 本体 + (1,0) 邻片(8m < 32m)双 ensure,

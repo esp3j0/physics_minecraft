@@ -369,7 +369,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
     let data_dir = std::env::temp_dir().join(format!("b03a_{}_{}", std::process::id(), unique));
     let mut config = config;
     config.data_dir = data_dir.clone();
-    let (session, log, store, _resume_from, spawn_next_seq, startup_controllers) =
+    let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
 
@@ -411,7 +411,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         }),
         spawn_next_seq,
         bodies: loaded,
-        startup_controllers,
+        resume,
     }));
     Harness {
         tx,
@@ -739,7 +739,7 @@ async fn x4_restart_after_migration_preserves_agent() {
         1,
         "检查点恰 1 条 ControllerRecord"
     );
-    let (resumed, _log2, store2, resume_from, spawn_next_seq, startup_controllers) =
+    let (resumed, _log2, store2, resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
     assert!(resume_from.is_some(), "重启段走恢复分支");
@@ -786,7 +786,7 @@ async fn x4_restart_after_migration_preserves_agent() {
         }),
         spawn_next_seq,
         bodies: loaded,
-        startup_controllers,
+        resume,
     }));
 
     // 重启段采样:主体 13 连杆、控制者继续走 ≥ 0.3 m。

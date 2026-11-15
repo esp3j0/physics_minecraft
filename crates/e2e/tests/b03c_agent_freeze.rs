@@ -4,7 +4,7 @@
 //! 网络栈(TCP 客户端、驱动与 Session,bootstrap 装配);`[[agents]]` 配置
 //! 走 `Config.agents`,启动区域票 ③ 档(B03c 3.1)。在线段的断言经
 //! `DriverOutcome` 计数;恢复段用 `bootstrap` 恢复的 Session + 检查点里的
-//! `startup_controllers` 手动 drive 循环(与驱动同序:drive → tick),
+//! 恢复状态(`resume`)手动 drive 循环(与驱动同序:drive → tick),
 //! `Session::agent_states` 不裁视野,冻结期间与续走的位姿逐拍可读。
 //!
 //! **等待循环一律有界**:墙钟上限 + 帧数预算,超限 panic 并写明在等什么
@@ -236,7 +236,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
     let data_dir = std::env::temp_dir().join(format!("b03c_{}_{}", std::process::id(), unique));
     let mut config = config;
     config.data_dir = data_dir.clone();
-    let (session, log, store, _resume_from, spawn_next_seq, startup_controllers) =
+    let (session, log, store, _resume_from, spawn_next_seq, resume) =
         app::driver::bootstrap(&config, || Box::new(SimpleRegistry::builtin()))
             .expect("bootstrap 装配成功");
 
@@ -278,7 +278,7 @@ async fn bootstrap_harness(config: Config) -> Harness {
         }),
         spawn_next_seq,
         bodies: loaded,
-        startup_controllers,
+        resume,
     }));
     Harness {
         tx,
@@ -300,16 +300,16 @@ fn resume_session(
 ) {
     let cps = read_all_checkpoints(data_dir);
     let (last_tick, blob) = cps.last().expect("终末检查点存在").clone();
-    let bundle = app::driver::decode_checkpoint(&blob).expect("v14 档可解");
+    let bundle = app::driver::decode_checkpoint(&blob).expect("当前档可解");
     let records = bundle.controllers;
     let host = app::controller::ControllerHost::from_records(records);
     let mut restart_config = config.clone();
     restart_config.data_dir = data_dir.to_path_buf();
-    let (resumed, _log2, store2, resume_from, _spawn_next_seq, startup_controllers) =
+    let (resumed, _log2, store2, resume_from, _spawn_next_seq, resume) =
         app::driver::bootstrap(&restart_config, || Box::new(SimpleRegistry::builtin()))
             .expect("重启 bootstrap 装配成功");
     assert!(resume_from.is_some(), "恢复分支真实走到");
-    assert!(startup_controllers.is_some(), "恢复分支回填控制者条目");
+    assert!(resume.is_some(), "恢复分支回填控制者条目");
     // store2 保持存活(redb 文件句柄;恢复后的会话不再写它也持有读口径)。
     std::mem::forget(store2);
     let _ = last_tick;

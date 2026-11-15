@@ -480,7 +480,7 @@ async fn harness(config: Config) -> Harness {
         }),
         spawn_next_seq: 0,
         bodies,
-        startup_controllers: None,
+        resume: None,
     }));
     Harness {
         tx,
@@ -669,7 +669,7 @@ async fn a06_4_ai_agent_void_removed_no_respawn() {
         }),
         spawn_next_seq: 0,
         bodies,
-        startup_controllers: None,
+        resume: None,
     }));
 
     // 布景:AI 主体在 (8.5, 顶面+1.2, 8.5) 生成(SCHEDULER 盖章 = source
@@ -838,6 +838,7 @@ async fn a06_5_recovery_sweep_no_respawn() {
             log_bytes: log.to_bytes(),
             spawn_next_seq: 2,
             controllers: Vec::new(),
+            startup: Default::default(),
         };
         let mut store = checkpoints_store.clone();
         storage::traits::CheckpointStore::append(
@@ -897,7 +898,7 @@ async fn a06_5_recovery_sweep_no_respawn() {
         observe: None,
         spawn_next_seq: 2,
         bodies: bodies2,
-        startup_controllers: None,
+        resume: None,
     }));
     // 再跑 60 拍(清扫在第一拍)。
     advance_ticks(60).await;
