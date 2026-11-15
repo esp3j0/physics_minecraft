@@ -34,8 +34,6 @@ use voxel::{SimpleRegistry, WorldGenerator};
 const GROUND_TOP_Y: f32 = types::WORLD_Y_MIN as f32 + 4.0;
 /// 软窗(a03 同款)。
 const SOFT: Duration = Duration::from_millis(50);
-/// 收帧上限(条)。
-const FRAME_BUDGET: usize = 6000;
 /// 四足出生点(分片 (0,0) 中心,同 b02b)。
 const QUAD_XZ: [f32; 2] = [64.0, 64.0];
 const QUAD_Y: f32 = GROUND_TOP_Y + 0.45;
@@ -178,76 +176,6 @@ async fn join(c: &mut TestClient, rx: &mut mpsc::UnboundedReceiver<S2C>, view: u
         }
     }
     panic!("64 软窗内未收到 Welcome")
-}
-
-/// 单主体根采样(逐拍一条;AgentStates 视距内才发)。
-#[derive(Debug, Clone, Copy)]
-struct RootSample {
-    tick: Tick,
-    pos: Vec3,
-    up_y: f32,
-}
-
-async fn sample_root_watch(
-    rx: &mut mpsc::UnboundedReceiver<S2C>,
-    want_ticks: u32,
-    what: &'static str,
-) -> (EntityId, usize, Vec<RootSample>) {
-    let deadline = Deadline::with_secs(300, what);
-    let mut frames = 0usize;
-    let mut entity: Option<EntityId> = None;
-    let mut nlinks = 0usize;
-    let mut samples: Vec<RootSample> = Vec::new();
-    loop {
-        deadline.check();
-        frames += 1;
-        if frames >= FRAME_BUDGET * 4 {
-            panic!(
-                "等 AgentStates 超预算:{frames} 帧内主体帧不足 \
-                 ({}/{want_ticks})(在等:{what})",
-                samples.len()
-            );
-        }
-        advance_ticks(1).await;
-        let mut this_frame: Option<(Tick, EntityId, usize, RootSample)> = None;
-        for _ in 0..4 {
-            real_yield().await;
-            match next_frame(rx).await {
-                Some(S2C::AgentStates { tick, states, .. }) => {
-                    for (id, _, links) in states {
-                        let root = links.first().expect("连杆非空");
-                        if this_frame.is_none() {
-                            this_frame = Some((
-                                tick,
-                                id,
-                                links.len(),
-                                RootSample {
-                                    tick,
-                                    pos: root.translation,
-                                    up_y: (root.rotation * Vec3::new(0.0, 1.0, 0.0)).y,
-                                },
-                            ));
-                        }
-                    }
-                }
-                Some(_) => {}
-                None => break,
-            }
-        }
-        if let Some((tick, id, n, root)) = this_frame {
-            if entity.is_none() {
-                entity = Some(id);
-                nlinks = n;
-            }
-            if samples.last().map(|s| s.tick.0) != Some(tick.0) {
-                samples.push(root);
-            }
-        }
-        if samples.len() >= want_ticks as usize {
-            break;
-        }
-    }
-    (entity.expect("至少见过一次主体帧"), nlinks, samples)
 }
 
 // ---- harness(真实 bootstrap 起服 + 真实存储;b03a 同款唯一写法) --------
@@ -462,7 +390,7 @@ async fn y1_tier3_ticket_agent_never_freezes() {
 /// 前相差 < 1 cm。
 #[tokio::test(start_paused = true)]
 async fn y2_player_body_freezes_and_wakes() {
-    let mut config = base_config(Vec::new(), 6000);
+    let config = base_config(Vec::new(), 6000);
     let h = bootstrap_harness(config.clone()).await;
     let (mut a, mut rx) = client(h.addr).await;
     let player = join(&mut a, &mut rx, 8).await;
