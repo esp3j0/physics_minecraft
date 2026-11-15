@@ -4,7 +4,8 @@
 //!
 //! 每拍在 `session.tick()` 之前(§2.3 顺序第 ① 步)对每条待生成项:
 //! 1. 第一次见到时放一张区域票据(中心 = position,半径 =
-//!    `leash_m + STARTUP_TICKET_EXTRA_M`,常驻,①② 档)——出生点区块靠它
+//!    `leash_m + STARTUP_TICKET_EXTRA_M`,常驻,①②③ 档——B03c 3.1 起
+//!    唤醒档照常生效:配置生成的主体无人观察时不被冻结)——出生点区块靠它
 //!    装载(E8 的"不会被装载"布景就是不放观察者、只靠这张票也够不着);
 //! 2. 出生列方块可读且该处碰撞体已建好 → 生成(InputSource::SCHEDULER,
 //!    条目进日志;复用 A06 重生等装载的同一组判定缝:
@@ -152,9 +153,10 @@ impl StartupAgents {
         let mut outcomes: Vec<Outcome> = Vec::with_capacity(self.pending.len());
         let mut ticket_ids_to_remove: Vec<u64> = Vec::new();
         for item in self.pending.iter_mut() {
-            // ① 首次见到:放区域票(常驻;①② 档 = 数据 + 碰撞体;票计费
-            // 不用条目自己——生成完不移除,主体常驻其活动区)。R1-4:只放
-            // 一次,重试拍不再重复放票。
+            // ① 首次见到:放区域票(常驻;①②③ 档 = 数据 + 碰撞体 + 唤醒;
+            // B03c §3 规则 2/3.1:配置生成的主体的启动区域票升到 ③ 档,
+            // 无人观察时照常活动、不被冻结)。票计费不用条目自己——生成完
+            // 不移除,主体常驻其活动区。R1-4:只放一次,重试拍不再重复放票。
             if !item.ticket_placed {
                 let center = types::glam::Vec3::new(
                     item.cfg.position[0],
@@ -162,7 +164,7 @@ impl StartupAgents {
                     item.cfg.position[2],
                 );
                 let radius = item.cfg.leash_m + STARTUP_TICKET_EXTRA_M;
-                match session.set_area_ticket(item.ticket_id, center, radius, 0b011, None) {
+                match session.set_area_ticket(item.ticket_id, center, radius, 0b111, None) {
                     Ok(entry) => {
                         log.append(entry);
                         item.ticket_placed = true;
@@ -404,6 +406,36 @@ mod tests {
         session.tick();
         assert_eq!(startup.counters.spawned, 1, "装载好的出生点当拍生成");
         assert!(startup.pending.is_empty(), "出表");
+        // S9(B03c 3.3):启动票档位 = 0b111(③ 唤醒档,B03c 3.1)——
+        // shutdown 前从票据表读 wake 覆盖核验。
+        {
+            let id = log
+                .entries()
+                .iter()
+                .find_map(|e| match &e.command {
+                    messaging::SimCommand::SetAreaTicket { id, .. } => Some(*id),
+                    _ => None,
+                })
+                .expect("布景自检:日志含 SetAreaTicket");
+            let tier_wake = session
+                .ticket_table()
+                .get((
+                    physics_sim::tickets::TicketHolder::Area(id),
+                    physics_sim::tickets::TicketKind::Area,
+                ))
+                .expect("票已在表")
+                .wake
+                .clone();
+            assert!(
+                matches!(
+                    tier_wake,
+                    physics_sim::tickets::WakeSpec::Radius { load_m, unload_m }
+                        if (load_m - (16.0 + STARTUP_TICKET_EXTRA_M)).abs() < 1e-4
+                            && (unload_m - (16.0 + STARTUP_TICKET_EXTRA_M)).abs() < 1e-4
+                ),
+                "S9:启动票的 ③ 唤醒档 = Radius(leash + extra),实得 {tier_wake:?}"
+            );
+        }
         session.shutdown();
 
         // 日志:SetAreaTicket 1(保留区间 ID)+ SpawnAgent 1(SCHEDULER)。

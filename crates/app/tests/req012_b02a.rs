@@ -333,7 +333,13 @@ fn run_quad(
     for tick in 0..total_ticks {
         let now = Tick(u64::from(tick) + 1); // 已走过 spawn 后那一拍
         if let Some(host) = host.as_deref_mut() {
-            host.drive(&mut session, log, now, &std::collections::BTreeSet::new());
+            host.drive(
+                &mut session,
+                log,
+                now,
+                &std::collections::BTreeSet::new(),
+                &std::collections::BTreeSet::new(),
+            );
         }
         let summary = session.tick();
         void_removed_total += summary.telemetry.void_removals;
@@ -570,6 +576,7 @@ fn b6_trot_600_replay_bitwise() {
             &mut log,
             now,
             &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
         );
         session.tick();
         assert!(
@@ -693,6 +700,7 @@ fn b1b_stand_script_3600() {
             &mut session,
             &mut log,
             now,
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
         );
         session.tick();
@@ -937,6 +945,7 @@ fn b2b_trot_3600_shuffled_order() {
             &mut session,
             &mut log,
             now,
+            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
         );
         let summary = session.tick();

@@ -85,6 +85,8 @@ pub struct ControllerCounters {
     pub leash_stops: u64,
     /// 主体迁移在途,本拍跳过发目标的次数(B03a 2.1;只增不减)。
     pub skipped_in_transit: u64,
+    /// 主体已冻结,本拍跳过发目标的次数(B03c 3.2;只增不减)。
+    pub skipped_frozen: u64,
 }
 
 /// 挂载失败原因(类型化,不 panic)。
@@ -211,8 +213,11 @@ impl ControllerHost {
     /// `session.send_agent_joint_targets_to(InputSource::SCHEDULER, ..)`。
     /// `skip` = 本拍迁移在途的主体集合(B03a 2.1:在途投递会被内核静默
     /// 拒绝,提前跳过,不算 `send_rejected`、不进日志;驱动在 `drive` 之前
-    /// 取一次 `in_transit_entities()` 传入)。成功:条目 append 进 `log`,
-    /// `actions_emitted += 1`;在途跳过:`skipped_in_transit += 1`;被拒
+    /// 取一次 `in_transit_entities()` 传入)。`frozen` = 本拍已冻结的主体
+    /// 集合(B03c 3.2:冻结期间控制者不发目标,跳过记 `skipped_frozen`,
+    /// 不进日志;驱动在 `drive` 之前取一次 `frozen_agents()` 传入)。
+    /// 成功:条目 append 进 `log`,`actions_emitted += 1`;在途跳过:
+    /// `skipped_in_transit += 1`;冻结跳过:`skipped_frozen += 1`;被拒
     /// (其他原因):`send_rejected += 1`,`log` 不动,继续下一条,不 panic。
     pub fn drive(
         &mut self,
@@ -220,10 +225,15 @@ impl ControllerHost {
         log: &mut CommandLog,
         now: Tick,
         skip: &std::collections::BTreeSet<EntityId>,
+        frozen: &std::collections::BTreeSet<EntityId>,
     ) {
         for (entity, targets) in self.actions_for_tick(now) {
             if skip.contains(&entity) {
                 self.counters.skipped_in_transit += 1;
+                continue;
+            }
+            if frozen.contains(&entity) {
+                self.counters.skipped_frozen += 1;
                 continue;
             }
             match session.send_agent_joint_targets_to(InputSource::SCHEDULER, entity, targets) {

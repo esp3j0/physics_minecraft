@@ -2560,13 +2560,19 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 );
                 // B03a 2.1:本拍迁移在途的主体集合(无挂载时不调 Session;
                 // 有挂载时取一次传给 drive 与拍末 retain_alive 共用)。
+                // B03c 3.2:同口径取已冻结的主体集合,drive 跳过不发目标。
                 let in_transit_default = std::collections::BTreeSet::new();
-                let in_transit = if host.first_slot().is_some() {
-                    Some(session.in_transit_entities())
+                let frozen_default = std::collections::BTreeSet::new();
+                let (in_transit, frozen) = if host.first_slot().is_some() {
+                    (
+                        Some(session.in_transit_entities()),
+                        Some(session.frozen_agents()),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 let in_transit = in_transit.as_ref().unwrap_or(&in_transit_default);
+                let frozen = frozen.as_ref().unwrap_or(&frozen_default);
                 if host.first_slot().is_some() {
                     let root_xz = |id| {
                         session
@@ -2574,7 +2580,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                             .map(|p| [p.x, p.z])
                     };
                     host.apply_leash(root_xz);
-                    host.drive(&mut session, &mut log, now, in_transit);
+                    host.drive(&mut session, &mut log, now, in_transit, frozen);
                 }
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。

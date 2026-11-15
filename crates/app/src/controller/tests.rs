@@ -385,6 +385,7 @@ fn h5_drive_rejected_counted() {
         &mut log,
         Tick(0),
         &std::collections::BTreeSet::new(),
+        &std::collections::BTreeSet::new(),
     );
     session.shutdown();
     assert_eq!(host.counters.send_rejected, 1, "被拒恰计 1 次");
@@ -668,9 +669,38 @@ fn h6_drive_skips_in_transit() {
     let mut log = sim_api::log::CommandLog::new();
     let mut skip = std::collections::BTreeSet::new();
     skip.insert(e(1));
-    host.drive(&mut session, &mut log, Tick(10), &skip);
+    let frozen = std::collections::BTreeSet::new();
+    host.drive(&mut session, &mut log, Tick(10), &skip, &frozen);
     session.shutdown();
     assert_eq!(host.counters.skipped_in_transit, 1, "在途跳过恰计 1 次");
+    assert_eq!(host.counters.send_rejected, 0, "跳过不走被拒路径");
+    assert_eq!(host.counters.actions_emitted, 0, "跳过不算发出");
+    assert!(log.entries().is_empty(), "跳过时 log 不追加");
+}
+
+/// H8(B03c 3.3):冻结跳过——`frozen` 含该实体的控制拍 →
+/// `skipped_frozen == 1`、`send_rejected == 0`、`actions_emitted == 0`、
+/// 日志为空(冻结期间控制者不发目标,§0 规则 5)。
+/// 变异 6(drive 不跳过冻结)注入后本测试红。
+#[test]
+fn h8_drive_skips_frozen() {
+    let mut host = host_with(
+        e(1),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        1,
+        0,
+    );
+    // 空会话:实体不存在 → 若不跳过,send 必被拒(H6 同路径)。frozen 含
+    // 该实体 → 冻结分支接管。
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    let mut log = sim_api::log::CommandLog::new();
+    let skip = std::collections::BTreeSet::new();
+    let mut frozen = std::collections::BTreeSet::new();
+    frozen.insert(e(1));
+    host.drive(&mut session, &mut log, Tick(10), &skip, &frozen);
+    session.shutdown();
+    assert_eq!(host.counters.skipped_frozen, 1, "冻结跳过恰计 1 次");
     assert_eq!(host.counters.send_rejected, 0, "跳过不走被拒路径");
     assert_eq!(host.counters.actions_emitted, 0, "跳过不算发出");
     assert!(log.entries().is_empty(), "跳过时 log 不追加");
