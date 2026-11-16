@@ -146,6 +146,12 @@ pub fn import_urdf(
     tree::import_impl(urdf_xml, opts)
 }
 
+/// URDF 的 robot name(xtask `--name` 缺省值)。
+pub fn robot_name(urdf_xml: &str) -> Result<String, ImportError> {
+    let robot = urdf_rs::read_from_string(urdf_xml).map_err(|e| ImportError::Xml(e.to_string()))?;
+    Ok(robot.name)
+}
+
 /// BodyDef → body.toml 文本(任务书 1.7)。
 pub fn body_to_toml(def: &types::BodyDef) -> String {
     emit::body_to_toml(def)

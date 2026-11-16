@@ -1384,6 +1384,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "app",
+ "body-import",
  "serde_json",
  "tempfile",
  "toml",

@@ -17,6 +17,8 @@
 //! 计时/取时间用 `std::time`,逐处局部 `#[allow(clippy::disallowed_methods)]`。
 //! 面向用户的进度/汇总输出用 `println!`/`eprintln!` 是编排器的正当输出。
 
+/// REQ-012 C01a:`import-body` 子命令(URDF → body.toml)。
+pub mod import_body;
 /// REQ-008 单元 04:冒烟报告。
 pub mod report;
 /// REQ-008 单元 04:AI 审图与校准。
@@ -51,23 +53,26 @@ const VIEWER_GRACE: Duration = Duration::from_secs(30);
 
 /// 命令行入口(不含程序名),返回进程退出码。
 pub fn run(args: Vec<String>) -> i32 {
-    match parse_args(&args) {
-        Ok(Command::Smoke {
-            selectors,
-            out,
-            no_ai,
-            selftest,
-        }) => {
-            if selftest {
-                cmd_selftest(no_ai, out.as_deref())
-            } else {
-                cmd_smoke(&selectors, out.as_deref(), no_ai)
+    match args.first().map(String::as_str) {
+        Some("import-body") => import_body::cmd_import_body(&args[1..]),
+        _ => match parse_args(&args) {
+            Ok(Command::Smoke {
+                selectors,
+                out,
+                no_ai,
+                selftest,
+            }) => {
+                if selftest {
+                    cmd_selftest(no_ai, out.as_deref())
+                } else {
+                    cmd_smoke(&selectors, out.as_deref(), no_ai)
+                }
             }
-        }
-        Err(usage) => {
-            eprintln!("{usage}");
-            2
-        }
+            Err(usage) => {
+                eprintln!("{usage}");
+                2
+            }
+        },
     }
 }
 

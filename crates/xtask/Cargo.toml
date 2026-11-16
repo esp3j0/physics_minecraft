@@ -8,12 +8,13 @@ publish = false
 [dependencies]
 app = { path = "../app" }
 viewer = { path = "../viewer" }
+body-import = { path = "../body-import" }
+types = { path = "../types" }
 toml = "1"
 serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
-types = { path = "../types" }
 
 [lints]
 workspace = true
