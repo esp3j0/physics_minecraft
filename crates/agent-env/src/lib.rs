@@ -389,6 +389,19 @@ impl AgentEnv {
         self.entity
     }
 
+    /// 当前 12 个关节角(自由度顺序;只读,E02a 姿态转储用)。
+    pub fn joint_positions(&self) -> Vec<f32> {
+        self.session
+            .agent_joint_state(self.entity)
+            .map(|j| j.positions)
+            .unwrap_or_default()
+    }
+
+    /// 地面顶面 world y(E02a 姿态转储/站立高度基准用)。
+    pub fn ground_top_y(&self) -> f32 {
+        GROUND_TOP_Y
+    }
+
     pub fn intent(&self) -> [f32; 3] {
         self.intent
     }
