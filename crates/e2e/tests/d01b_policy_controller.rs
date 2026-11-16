@@ -468,6 +468,14 @@ fn broken_toml(hash_hex: &str) -> String {
     )
 }
 
+/// Q9:与 `wobble` 同 manifest,只把 `action_scale` 改成 100.0(大幅越限)。
+fn wobble_big_toml(hash_hex: &str) -> String {
+    format!(
+        "name = \"wobble_big\"\nbody_hash = \"{hash_hex}\"\ncontrol_period_ticks = 2\naction_scale = 100.0\naction_clip = 1.0\n{}",
+        obs_terms(&["base_ang_vel", "intent"])
+    )
+}
+
 fn write_pack(dir: &std::path::Path, name: &str, onnx: &[u8], toml: &str) {
     let p = dir.join(name);
     std::fs::create_dir_all(&p).expect("策略包目录可建");
@@ -693,6 +701,10 @@ async fn q2_policy_stand() {
     assert_eq!(
         c.actions_emitted, c.policy_inferences,
         "actions_emitted = policy_inferences"
+    );
+    assert_eq!(
+        c.policy_targets_clamped, 0,
+        "stand 目标即默认站姿,不可能越限(clamped 应为 0)"
     );
 }
 
@@ -1010,4 +1022,93 @@ async fn q7_checkpoint_resume() {
         Ok(_) => panic!("无对应策略配置应拒绝恢复"),
     };
     assert!(msg.contains("策略"), "错误文本含“策略”:{msg}");
+}
+
+// ---- Q9:越限计数(policy_targets_clamped) ----------------------------------
+
+/// Q9:`wobble_big`(lin6x12,action_scale=100)+ intent [1,0,-1] 推 300 拍。
+/// 关节 3/9 必夹上限、5/11 必夹下限、4/10 必不夹(乘 intent[1]=0);设
+/// N = policy_inferences,要求 N ≥ 145 且 4·N ≤ policy_targets_clamped ≤ 10·N;
+/// 日志末条目标里 3/9 = 各自上限、5/11 = 各自下限(从身体定义读,逐位相等),
+/// 4/10 = 默认角(差 < 1e-6)。主体是否还站着不作要求。
+#[tokio::test(start_paused = true)]
+async fn q9_clamped_counted() {
+    let dir = Arc::new(
+        tempfile::Builder::new()
+            .prefix("d01b_q9_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    write_pack(
+        dir.path(),
+        "wobble_big",
+        WOBBLE_ONNX,
+        &wobble_big_toml(&quad_hash_hex()),
+    );
+    let config = config_with_policies(vec![policy_agent("wobble_big", [1.0, 0.0, -1.0])], &dir);
+    let h = bootstrap_harness(config).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    observe_at_quad(&mut a).await;
+    let (entity, _n, _samples) = sample_quad_root(&mut rx, 300).await;
+    drop(a);
+    let data = h.data.clone();
+    let outcome = shutdown(h).await;
+    let c = outcome.controller_counters;
+    let n = c.policy_inferences;
+    let clamped = c.policy_targets_clamped;
+    let t = last_joint_targets(&read_all_checkpoints(data.path()), entity)
+        .expect("日志里有该主体的 AgentJointTargets");
+
+    // 上下限 / 默认角从身体定义读(dof 顺序与目标向量一致)。
+    let bodies = quad_registry();
+    let hash = bodies.hash_of("quad").expect("quad 哈希");
+    let quad = bodies.get(&hash).expect("quad 定义");
+    let params: Vec<_> = quad.dof_joints().map(|j| j.kind.params()).collect();
+    let upper = |i: usize| params[i].limits.expect("关节有限位").upper;
+    let lower = |i: usize| params[i].limits.expect("关节有限位").lower;
+    let default = |i: usize| params[i].default_angle.unwrap_or(0.0);
+
+    println!(
+        "Q9 实测:N={n} clamped={clamped}(4N={} 10N={})",
+        4 * n,
+        10 * n
+    );
+    println!(
+        "Q9 末条目标:关节3 {:.8}(上限 {:.8})关节9 {:.8}(上限 {:.8})\
+         关节5 {:.8}(下限 {:.8})关节11 {:.8}(下限 {:.8})关节4 {:.8} 关节10 {:.8}",
+        t[3],
+        upper(3),
+        t[9],
+        upper(9),
+        t[5],
+        lower(5),
+        t[11],
+        lower(11),
+        t[4],
+        t[10]
+    );
+    assert!(n >= 145, "policy_inferences {n} < 145(主体可能中途被移除)");
+    assert!(
+        4 * n <= clamped && clamped <= 10 * n,
+        "policy_targets_clamped {clamped} 不在 [4N={},10N={}]",
+        4 * n,
+        10 * n
+    );
+    assert_eq!(t[3], upper(3), "关节3 目标应逐位等于上限");
+    assert_eq!(t[9], upper(9), "关节9 目标应逐位等于上限");
+    assert_eq!(t[5], lower(5), "关节5 目标应逐位等于下限");
+    assert_eq!(t[11], lower(11), "关节11 目标应逐位等于下限");
+    assert!(
+        (t[4] - default(4)).abs() < 1e-6,
+        "关节4 目标 {} 与默认角 {} 差 ≥ 1e-6",
+        t[4],
+        default(4)
+    );
+    assert!(
+        (t[10] - default(10)).abs() < 1e-6,
+        "关节10 目标 {} 与默认角 {} 差 ≥ 1e-6",
+        t[10],
+        default(10)
+    );
 }

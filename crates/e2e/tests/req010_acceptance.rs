@@ -1613,11 +1613,12 @@ mod unit02 {
     /// embedded_ticks + Outbox 追加 agent_crush_removed;REQ-012 B02b(#25)
     /// 升 v13:CheckpointBundle 追加 controllers;REQ-012 B03b(#25)升 v14:
     /// AgentRecord 追加 frozen。版本断言按放行允许的例外改为 15(B03d 升 v15)。
+    /// D01b-1 升 v16(ControllerSlot 追加 intent)。
     ///
     /// 会变红的实现:信封、出站写入与待转换集合的格式变了却没升版本。
     #[test]
     fn acc_c12_checkpoint_version_is_v8() {
-        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 15);
+        assert_eq!(app::driver::CHECKPOINT_FORMAT_VERSION, 16);
     }
 }
 
