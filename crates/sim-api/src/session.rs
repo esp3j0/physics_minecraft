@@ -54,6 +54,13 @@ pub enum AreaTicketError {
     TooManyTickets { max: usize },
 }
 
+/// 主体关节状态(REQ-012 D01b-1 §1.1):自由度顺序的关节角与角速度。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentJointState {
+    pub positions: Vec<f32>,
+    pub velocities: Vec<f32>,
+}
+
 /// headless 会话:命令进/快照出(蓝图 §3 session;网络形状后置 REQ-003)。
 ///
 /// 盖章规则(README 决策 5):`send` 盖 `apply_at = tick_now()`(下一次 `tick()`
@@ -854,6 +861,22 @@ impl Session {
     /// 不存在 → None。
     pub fn agent_root_position(&self, entity: EntityId) -> Option<Vec3> {
         self.scheduler.agent_root_position(entity)
+    }
+
+    /// 主体的关节角与关节角速度(自由度顺序;REQ-012 D01b-1 §1.1)。
+    /// 主体不存在、迁移在途、已冻结 → None。
+    pub fn agent_joint_state(&self, entity: EntityId) -> Option<AgentJointState> {
+        let (positions, velocities) = self.scheduler.agent_joint_state(entity)?;
+        Some(AgentJointState {
+            positions,
+            velocities,
+        })
+    }
+
+    /// 主体根连杆的状态(位置、朝向、世界系线速度与角速度;D01b-1 §1.1)。
+    /// 条件同 [`Session::agent_joint_state`]。
+    pub fn agent_root_state(&self, entity: EntityId) -> Option<EntityState> {
+        self.scheduler.agent_root_state(entity)
     }
 
     /// SetBlock 暂缓队列长度按全部分片求和(A05 遥测;测试观测口)。

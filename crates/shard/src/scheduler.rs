@@ -1413,6 +1413,32 @@ impl Scheduler {
             .find_map(|sim| sim.agent_root_position(entity))
     }
 
+    /// 主体关节角与关节角速度(自由度顺序;REQ-012 D01b-1 §1.1 只读透传):
+    /// 找到主体所在分片再问内核(写法照 `agent_root_position`)。不存在 /
+    /// 迁移在途 / 已冻结 → None(控制者不该给冻结主体算动作,口径统一)。
+    pub fn agent_joint_state(&self, entity: EntityId) -> Option<(Vec<f32>, Vec<f32>)> {
+        let sim = self.sims.values().find(|sim| sim.is_agent(entity))?;
+        if sim.is_agent_frozen(entity) {
+            return None;
+        }
+        let positions = sim.agent_joint_positions(entity)?;
+        let velocities = sim.agent_joint_velocities(entity)?;
+        Some((positions, velocities))
+    }
+
+    /// 主体根连杆状态(位置、朝向、世界系线速度/角速度;D01b-1 §1.1):
+    /// 根连杆 = `agent_states` 连杆列表第 0 条。条件同 `agent_joint_state`。
+    pub fn agent_root_state(&self, entity: EntityId) -> Option<types::EntityState> {
+        let sim = self.sims.values().find(|sim| sim.is_agent(entity))?;
+        if sim.is_agent_frozen(entity) {
+            return None;
+        }
+        sim.agent_states()
+            .into_iter()
+            .find(|(id, _, _)| *id == entity)
+            .and_then(|(_, _, states)| states.into_iter().next())
+    }
+
     /// Router 待投递迁移信封(REQ-012 A03;驱动侧附身清理的"在途不算
     /// 移除"判定):委托 [`shard::router::Router::in_transit_migrations`]。
     pub fn in_transit_migrations(&self) -> Vec<messaging::Envelope> {
