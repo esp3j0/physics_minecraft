@@ -29,7 +29,10 @@ mod solidify;
 mod walker;
 
 pub use activation::{ActivationConfig, ActivationController, ActivationDecisions};
-pub use agent::{AgentRecord, AgentSpawnError, BodyRegistry, BodyRegistryError};
+pub use agent::{
+    AgentRecord, AgentSpawnError, BodyRegistry, BodyRegistryError, LinkMassProps,
+    agent_link_mass_properties,
+};
 pub use agent_shape::AgentShapeTable;
 pub use sim::{
     ActivationEvents, BlockWrite, BlockWriteKind, FlowEventInfo, FlowKind, ForcedLandingReason,

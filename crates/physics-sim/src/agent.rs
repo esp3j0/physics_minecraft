@@ -1951,6 +1951,40 @@ pub(crate) fn agent_collider_builder(
     ColliderBuilder::compound(parts).mass(mass)
 }
 
+/// 一个连杆在连杆局部系里的质量属性(真实单位,k = 1)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkMassProps {
+    pub mass: f32,
+    pub com: [f32; 3],
+    /// 关于质心、沿连杆局部系坐标轴的惯量张量(对称 3×3,行主序)。
+    pub inertia: [[f32; 3]; 3],
+}
+
+/// 按生成主体时同一个 [`agent_collider_builder`] 构造碰撞体,取它的质量属性。
+/// 顺序同 `def.links`。质量直接用 `link.mass`(真实单位,k = 1)。
+pub fn agent_link_mass_properties(def: &types::BodyDef) -> Vec<LinkMassProps> {
+    def.links
+        .iter()
+        .map(|link| {
+            let collider = agent_collider_builder(&link.shapes, link.mass).build();
+            let mp = collider.mass_properties();
+            let com = mp.local_com;
+            let cols = mp.reconstruct_inertia_matrix().to_cols_array();
+            let mut inertia = [[0.0f32; 3]; 3];
+            for (i, row) in inertia.iter_mut().enumerate() {
+                for (j, slot) in row.iter_mut().enumerate() {
+                    *slot = cols[j * 3 + i];
+                }
+            }
+            LinkMassProps {
+                mass: link.mass,
+                com: [com.x, com.y, com.z],
+                inertia,
+            }
+        })
+        .collect()
+}
+
 /// 形状偏移 `[f32;3]` → parry `Pose`(纯平移;形状 offset 挂在连杆局部系)。
 fn shape_offset_pose(offset: [f32; 3]) -> rapier3d::prelude::Pose {
     rapier3d::prelude::Pose {
