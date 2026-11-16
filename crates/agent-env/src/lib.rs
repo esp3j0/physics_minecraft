@@ -473,6 +473,27 @@ impl AgentEnv {
         &self.bodies
     }
 
+    /// 当前会话状态的快照(`last_action` 全 0、`intent` 取当前值;check-policy 用)。
+    pub fn snapshot(&self) -> Result<AgentSnapshot, EnvError> {
+        let root = self
+            .session
+            .agent_root_state(self.entity)
+            .ok_or_else(|| EnvError::Spawn("取不到根状态".to_owned()))?;
+        let joints = self
+            .session
+            .agent_joint_state(self.entity)
+            .ok_or_else(|| EnvError::Spawn("取不到关节状态".to_owned()))?;
+        Ok(AgentSnapshot {
+            root_rotation: root.rotation,
+            root_linvel: root.linvel,
+            root_angvel: root.angvel,
+            joint_pos: joints.positions,
+            joint_vel: joints.velocities,
+            last_action: vec![0.0; self.act_dim()],
+            intent: self.intent,
+        })
+    }
+
     /// 从当前会话状态拼观测(last_action / intent 由调用方给)。
     fn observation(&self, last_action: &[f32], intent: [f32; 3]) -> Result<Vec<f32>, EnvError> {
         let root = self

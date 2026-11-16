@@ -11,6 +11,8 @@ viewer = { path = "../viewer" }
 body-import = { path = "../body-import" }
 physics-sim = { path = "../physics-sim" }
 types = { path = "../types" }
+policy = { path = "../policy" }
+agent-env = { path = "../agent-env" }
 toml = "1"
 serde_json = "1"
 

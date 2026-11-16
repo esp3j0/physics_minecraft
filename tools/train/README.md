@@ -172,3 +172,46 @@ cd tools/train
 
 逐项打印 PASS/FAIL,有 FAIL 非零退出。环境常量全部由 Rust 侧 `VecEnv.spec()`
 从身体定义与 manifest 取,`quad/spec.py` 是独立核对侧(第 1 项逐键比对)。
+
+## 四足奖励 / PPO / 导出 / 评估(E02b-2)
+
+```
+quad/
+  task.py       奖励:command(intent) 与 reward(reward_inputs);常量见文件头
+  selftest.py   奖励手算对照(R-A/R-B/R-C),python -m quad.selftest
+  ppo.py        CleanRL 底本 PPO(改 spec_dict/curve.csv/--init-from 比 spec)
+  export.py     actor 均值网络 → policy.onnx + policy.toml(含 normalization)
+                + probe.json(reset 首帧观测与动作)
+  eval.py       均值动作评估,写 eval_<intent>.json
+```
+
+奖励只读 `reward_inputs`(键序/宽度由 Rust `reward_columns` 给),`task.reward`
+返回 float32[n]。`selftest` 的期望值由架构师手算,照抄不改。
+
+五步管线(前台;Python 用本 venv):
+
+```bash
+cd tools/train
+# 1 奖励自检
+.venv/Scripts/python.exe -m quad.selftest
+# 2 冒烟训练(只证管线能跑,不要求学会走路;正式训练由架构师跑)
+.venv/Scripts/python.exe -m quad.ppo --backend rapier \
+    --body ../../assets/bodies/quad.body.toml \
+    --manifest quad/manifests/quad_train.toml --out out/quad_smoke --max-minutes 3
+# 3 导出 ONNX + policy.toml + probe.json
+.venv/Scripts/python.exe -m quad.export --ckpt out/quad_smoke/ckpt_final.pt \
+    --manifest quad/manifests/quad_train.toml --name quad_smoke --out out/quad_smoke
+# 4 游戏推理路径核对(观测逐位一致、动作差 < 1e-4)
+cargo xtask check-policy tools/train/out/quad_smoke \
+    --body assets/bodies/quad.body.toml --probe tools/train/out/quad_smoke/probe.json
+# 5 评估
+.venv/Scripts/python.exe -m quad.eval --ckpt out/quad_smoke/ckpt_final.pt \
+    --body ../../assets/bodies/quad.body.toml \
+    --manifest quad/manifests/quad_train.toml --intent 1 0 0 --seconds 10
+```
+
+`--init-from <ckpt>` 续训:用 `quad.spec.spec_matches` 比 spec(忽略
+`episode_controls`、`fall_up_y_min`),不一致拒绝并列出差异键。
+`check-policy` 不带 `--probe` 只验证策略包能加载;带 `--probe` 还要求
+环境 reset 观测与 probe.obs 逐位相同、`policy.act` 的 raw 与 probe.action
+每分量差 < 1e-4。MuJoCo 后端是下一单。

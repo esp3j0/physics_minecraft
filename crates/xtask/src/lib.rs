@@ -17,6 +17,8 @@
 //! 计时/取时间用 `std::time`,逐处局部 `#[allow(clippy::disallowed_methods)]`。
 //! 面向用户的进度/汇总输出用 `println!`/`eprintln!` 是编排器的正当输出。
 
+/// REQ-012 E02b-2:`check-policy` 子命令(策略包加载 + probe 动作核对)。
+pub mod check_policy;
 /// REQ-012 E02a:`export-mjcf` 子命令(BodyDef → MJCF)。
 pub mod export_mjcf;
 /// REQ-012 C01a:`import-body` 子命令(URDF → body.toml)。
@@ -58,6 +60,7 @@ pub fn run(args: Vec<String>) -> i32 {
     match args.first().map(String::as_str) {
         Some("import-body") => import_body::cmd_import_body(&args[1..]),
         Some("export-mjcf") => export_mjcf::cmd_export_mjcf(&args[1..]),
+        Some("check-policy") => check_policy::cmd_check_policy(&args[1..]),
         _ => match parse_args(&args) {
             Ok(Command::Smoke {
                 selectors,
