@@ -212,6 +212,60 @@ fn i3b_rpy_order() {
     assert_vec3(p2.anchor, [1.0, 0.0, 0.0]);
 }
 
+/// I3c(返修 R1 存活 1):累计旋转的乘法顺序。I3b 里只有一个带旋转的关节,
+/// `A_P · R` 与 `R · A_P` 结果相同;这条让 j1、j2 都带 rpy——j2 的累计
+/// 位姿 `A_C = A_P · R(rpy_J)` 才有区分度。期望值架构师手算,照抄。
+#[test]
+fn i3c_two_rotated_joints() {
+    let link = |name: &str| {
+        format!(
+            r#"<link name="{n}">
+    <inertial><mass value="1"/><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial>
+    <collision><geometry><sphere radius="0.1"/></geometry></collision>
+  </link>"#,
+            n = name
+        )
+    };
+    let xml = format!(
+        r#"<robot name="rot_chain">
+  {a}
+  {b}
+  {c}
+  {d}
+  <joint name="j1" type="revolute">
+    <parent link="a"/><child link="b"/>
+    <origin xyz="0 0 0" rpy="0 0 1.5707963267948966"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1" upper="1" effort="10" velocity="5"/>
+  </joint>
+  <joint name="j2" type="revolute">
+    <parent link="b"/><child link="c"/>
+    <origin xyz="0 0 0" rpy="1.5707963267948966 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1" upper="1" effort="10" velocity="5"/>
+  </joint>
+  <joint name="j3" type="revolute">
+    <parent link="c"/><child link="d"/>
+    <origin xyz="0 0 1" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1" upper="1" effort="10" velocity="5"/>
+  </joint>
+</robot>"#,
+        a = link("a"),
+        b = link("b"),
+        c = link("c"),
+        d = link("d")
+    );
+    let (def, _) = import(&xml, &default_opts());
+    assert_eq!(def.links.len(), 4);
+    assert_eq!(def.joints.len(), 3);
+    let types::JointKind::Revolute(p2) = &def.joints[2].kind else {
+        panic!("j3 should be revolute")
+    };
+    assert_vec3(p2.anchor, [1.0, 0.0, 0.0]);
+    assert_vec3(p2.axis, [0.0, 0.0, -1.0]);
+}
+
 #[test]
 fn i4_fixed_merge() {
     let (def, report) = import(&testbot_xml(), &default_opts());

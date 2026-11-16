@@ -272,7 +272,9 @@ mod tests {
     }
 
     /// x2:闭环 URDF → Err,out/report 上没有文件;out 预置 `old` → Err 且
-    /// 内容不变。
+    /// 内容不变。六个惯量属性写全,保证 URDF 能解析、失败发生在**导入阶段**
+    /// (闭环检查),断言错误文本含"闭环"确认原因(返修 R1 存活 2:原 URDF
+    /// 缺 ixy 等在解析阶段就报错,没走到导入)。
     #[test]
     fn x2_failure_leaves_nothing() {
         let tmp = tempfile::TempDir::new().expect("临时目录");
@@ -281,8 +283,8 @@ mod tests {
             &urdf,
             r#"<?xml version="1.0"?>
 <robot name="loop">
-  <link name="a"><inertial><mass value="1"/><inertia ixx="0.01" iyy="0.01" izz="0.01"/></inertial><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
-  <link name="b"><inertial><mass value="1"/><inertia ixx="0.01" iyy="0.01" izz="0.01"/></inertial><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
+  <link name="a"><inertial><mass value="1"/><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
+  <link name="b"><inertial><mass value="1"/><inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/></inertial><collision><geometry><box size="0.1 0.1 0.1"/></geometry></collision></link>
   <joint name="ab" type="fixed"><parent link="a"/><child link="b"/><origin xyz="0 0 1"/></joint>
   <joint name="ba" type="fixed"><parent link="b"/><child link="a"/><origin xyz="0 0 -1"/></joint>
 </robot>
@@ -292,7 +294,8 @@ mod tests {
         let out = tmp.path().join("loop.body.toml");
         let report = tmp.path().join("report.md");
         let result = run(&args(&urdf, &out, Some(&report)));
-        assert!(result.is_err(), "闭环应导入失败");
+        let err = result.expect_err("闭环应导入失败");
+        assert!(err.contains("闭环"), "失败原因应是 Cycle(闭环),实为:{err}");
         assert!(!out.exists(), "失败时不创建 out");
         assert!(!report.exists(), "失败时不创建 report");
 
@@ -306,6 +309,21 @@ mod tests {
             "失败时不改写 out"
         );
         assert!(!report.exists());
+    }
+
+    /// x2b(返修 R1):非法 XML(`<robot`)→ Err,out、report 都不存在
+    /// (解析阶段失败同样零副作用)。
+    #[test]
+    fn x2b_bad_xml_leaves_nothing() {
+        let tmp = tempfile::TempDir::new().expect("临时目录");
+        let urdf = tmp.path().join("bad.urdf");
+        std::fs::write(&urdf, "<robot").expect("写非法 XML");
+        let out = tmp.path().join("bad.body.toml");
+        let report = tmp.path().join("report.md");
+        let result = run(&args(&urdf, &out, Some(&report)));
+        assert!(result.is_err(), "非法 XML 应失败");
+        assert!(!out.exists(), "失败时不创建 out");
+        assert!(!report.exists(), "失败时不创建 report");
     }
 
     /// x3:参数解析各字段;缺 --out、--up 非法、--pose 无 =、未知参数都报 Err。
