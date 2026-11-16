@@ -269,6 +269,23 @@ fn tris_volume(points: &[[f32; 3]], tris: &[[u32; 3]], origin: [f64; 3]) -> f32 
     sum.abs() as f32
 }
 
+/// 点集轴对齐包围盒的对角线长度(f64)。
+fn bbox_diag(points: &[[f32; 3]]) -> f64 {
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for p in points {
+        for (axis, &c) in p.iter().enumerate() {
+            let v = f64::from(c);
+            lo[axis] = lo[axis].min(v);
+            hi[axis] = hi[axis].max(v);
+        }
+    }
+    let dx = hi[0] - lo[0];
+    let dy = hi[1] - lo[1];
+    let dz = hi[2] - lo[2];
+    (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
 fn to_vectors(points: &[[f32; 3]]) -> Vec<parry3d::math::Vector3> {
     points
         .iter()
@@ -373,6 +390,14 @@ pub(crate) fn hull_from_mesh(
     let mut sorted = hull_verts;
     sorted.sort_by(point_cmp);
     let hull_full = sorted.len();
+    // 退化判定(架构师裁定):parry3d 对共面/共线点集返回 Ok 的扁平网格,
+    // 用相对阈值拦截。d 取完整凸包 AABB 对角线;d == 0 也落入此判据。
+    let d = bbox_diag(&sorted);
+    if f64::from(hull_volume) <= 1e-9 * d * d * d {
+        return Err(format!(
+            "完整凸包体积 {hull_volume:e} ≤ 1e-9 × d³(d = {d:e}),点集退化"
+        ));
+    }
     // 5/6. 不超上限直接输出;否则最远点采样精简后再建一次凸包。
     let (points, out_volume) = if hull_full <= max_points as usize {
         (sorted, hull_volume)
@@ -383,6 +408,11 @@ pub(crate) fn hull_from_mesh(
             .map_err(|e| format!("精简后 try_convex_hull 失败:{e}"))?;
         let origin = out_pts[0].map(f64::from);
         let vol = tris_volume(&out_pts, &tris, origin);
+        if f64::from(vol) <= 1e-9 * d * d * d {
+            return Err(format!(
+                "精简后凸包体积 {vol:e} ≤ 1e-9 × d³(d = {d:e}),点集退化"
+            ));
+        }
         (out_pts, vol)
     };
     // 7. 少于 4 个点建不出碰撞体。
@@ -520,7 +550,7 @@ mod tests {
         let tried = resolve("package://pkg/none.stl", &base, &pkgs).expect_err("只试包目录");
         assert_eq!(tried.len(), 1);
         // 相对路径 / file:// / 绝对路径。
-        let p = resolve("meshes/box.obj", &meshes.parent().expect("父目录"), &empty)
+        let p = resolve("meshes/box.obj", meshes.parent().expect("父目录"), &empty)
             .expect("相对 base_dir");
         assert_eq!(p, meshes.join("box.obj"));
         let abs = meshes.join("box.obj");

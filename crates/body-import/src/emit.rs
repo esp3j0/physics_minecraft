@@ -205,6 +205,37 @@ pub fn report_to_markdown(report: &crate::ImportReport) -> String {
             n.link, n.from, n.to, n.volume_src, n.volume_out, ratio, n.hull_points
         ));
     }
+    if !report.meshes.is_empty() {
+        s.push_str(
+            "\n## 网格\n\n| 连杆 | 文件 | 顶点 | 三角形 | 完整凸包顶点 | 输出顶点 | 网格体积 | 凸包体积 | 输出体积 | 凸包/网格 | 输出/凸包 |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        );
+        for m in &report.meshes {
+            let hull_over_mesh = if m.mesh_volume > 0.0 {
+                m.hull_volume / m.mesh_volume
+            } else {
+                0.0
+            };
+            let out_over_hull = if m.hull_volume > 0.0 {
+                m.out_volume / m.hull_volume
+            } else {
+                0.0
+            };
+            s.push_str(&format!(
+                "| {} | {} | {} | {} | {} | {} | {:.6} | {:.6} | {:.6} | {:.6} | {:.6} |\n",
+                m.link,
+                m.file,
+                m.vertices,
+                m.triangles,
+                m.hull_full,
+                m.hull_out,
+                m.mesh_volume,
+                m.hull_volume,
+                m.out_volume,
+                hull_over_mesh,
+                out_over_hull
+            ));
+        }
+    }
     s.push_str("\n## 惯量\n\n| 连杆 | offdiag_ratio |\n|---|---|\n");
     for n in &report.inertia {
         s.push_str(&format!("| {} | {:.6} |\n", n.link, n.offdiag_ratio));

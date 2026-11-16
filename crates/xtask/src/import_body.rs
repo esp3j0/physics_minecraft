@@ -21,6 +21,8 @@ pub struct ImportBodyArgs {
     pub friction: f32,
     pub pose: Vec<(String, f32)>,
     pub cylinder_segments: u32,
+    pub max_hull_points: u32,
+    pub packages: std::collections::BTreeMap<String, PathBuf>,
     pub report: Option<PathBuf>,
 }
 
@@ -36,6 +38,8 @@ impl Default for ImportBodyArgs {
             friction: 0.6,
             pose: Vec::new(),
             cylinder_segments: 16,
+            max_hull_points: 32,
+            packages: std::collections::BTreeMap::new(),
             report: None,
         }
     }
@@ -90,6 +94,29 @@ pub fn parse_args(args: &[String]) -> Result<ImportBodyArgs, String> {
                 parsed.cylinder_segments = value
                     .parse::<u32>()
                     .map_err(|e| format!("--cylinder-segments 解析失败 `{value}`:{e}"))?;
+            }
+            "--max-hull-points" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--max-hull-points 缺少参数值".to_owned())?;
+                parsed.max_hull_points = value
+                    .parse::<u32>()
+                    .map_err(|e| format!("--max-hull-points 解析失败 `{value}`:{e}"))?;
+            }
+            "--package" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--package 缺少参数值".to_owned())?;
+                let (name, dir) = value
+                    .split_once('=')
+                    .ok_or_else(|| format!("--package 须为 <名>=<目录>,实为 `{value}`"))?;
+                if parsed
+                    .packages
+                    .insert(name.to_owned(), PathBuf::from(dir))
+                    .is_some()
+                {
+                    return Err(format!("--package 包名 `{name}` 重复给出"));
+                }
             }
             "--report" => {
                 if parsed.report.is_some() {
@@ -158,8 +185,8 @@ pub fn run(args: &ImportBodyArgs) -> Result<String, String> {
         friction: args.friction,
         default_angles,
         cylinder_segments: args.cylinder_segments,
-        max_hull_points: 32,
-        package_dirs: std::collections::BTreeMap::new(),
+        max_hull_points: args.max_hull_points,
+        package_dirs: args.packages.clone(),
     };
     let (def, report) = body_import::import_urdf(&urdf_xml, &base_dir, &opts)
         .map_err(|e| format!("导入失败:{e}"))?;
@@ -184,8 +211,8 @@ pub fn run(args: &ImportBodyArgs) -> Result<String, String> {
         UpAxis::Y => "y",
     };
     let header = format!(
-        "# 来源:{source_name}\n# 选项:up={up_text} kp={} kd={} friction={} cylinder_segments={} pose={pose_text}\n# 由 cargo xtask import-body 生成,不要手改\n",
-        args.kp, args.kd, args.friction, args.cylinder_segments,
+        "# 来源:{source_name}\n# 选项:up={up_text} kp={} kd={} friction={} cylinder_segments={} max_hull_points={} pose={pose_text}\n# 由 cargo xtask import-body 生成,不要手改\n",
+        args.kp, args.kd, args.friction, args.cylinder_segments, args.max_hull_points,
     );
     let full_toml = format!("{header}{toml_text}");
     // 注释是 toml 行注释,加完仍须可解析(这里先验,再写盘)。
@@ -367,6 +394,40 @@ mod tests {
             vec!["a.urdf", "--out", "b.toml", "--up", "w"],
             vec!["a.urdf", "--out", "b.toml", "--pose", "bad"],
             vec!["a.urdf", "--out", "b.toml", "--zzz", "1"],
+        ] {
+            let args: Vec<String> = bad.iter().map(|s| (*s).to_owned()).collect();
+            assert!(parse_args(&args).is_err(), "应报错:{bad:?}");
+        }
+    }
+
+    /// x4(C01b):--max-hull-points 与可重复的 --package 解析;
+    /// --package 无 `=`、--max-hull-points 非数字都报 Err。
+    #[test]
+    fn x4_parse_mesh_args() {
+        let a = parse_args(&[
+            "a.urdf".to_owned(),
+            "--out".to_owned(),
+            "b.toml".to_owned(),
+            "--max-hull-points".to_owned(),
+            "16".to_owned(),
+            "--package".to_owned(),
+            "a=dirA".to_owned(),
+            "--package".to_owned(),
+            "b=dirB".to_owned(),
+        ])
+        .expect("合法参数");
+        assert_eq!(a.max_hull_points, 16);
+        assert_eq!(a.packages.len(), 2);
+        assert_eq!(a.packages["a"], PathBuf::from("dirA"));
+        assert_eq!(a.packages["b"], PathBuf::from("dirB"));
+        // 默认值。
+        let d = parse_args(&["a.urdf".to_owned(), "--out".to_owned(), "b.toml".to_owned()])
+            .expect("默认参数");
+        assert_eq!(d.max_hull_points, 32);
+        assert!(d.packages.is_empty());
+        for bad in [
+            vec!["a.urdf", "--out", "b.toml", "--package", "bad"],
+            vec!["a.urdf", "--out", "b.toml", "--max-hull-points", "x"],
         ] {
             let args: Vec<String> = bad.iter().map(|s| (*s).to_owned()).collect();
             assert!(parse_args(&args).is_err(), "应报错:{bad:?}");
