@@ -644,6 +644,7 @@ fn l3_records_roundtrip() {
         period_ticks: 1,
         attached_at: Tick(0),
         leash: None,
+        intent: [0.0; 3],
     };
 }
 
@@ -738,4 +739,253 @@ fn h7_future_attached_at_not_emitted() {
     );
     let at7 = host.actions_for_tick(Tick(7));
     assert_eq!(at7.len(), 1, "Tick(7):n = 2 控制拍,发 1 条");
+}
+// ---- D01b-1(§1.2/§1.3):U1–U4、build_snapshot、策略驱动 ----
+
+use super::policy_table::PolicyTable;
+use super::{PolicyKey, build_snapshot};
+
+/// U1:`PolicyKey::of` = 名字 UTF-8 字节的 FNV-1a(与 BodyHash 同算法)。
+#[test]
+fn u1_policy_key_fnv1a_of_name() {
+    assert_eq!(
+        PolicyKey::of("stand"),
+        PolicyKey::of("stand"),
+        "同名两次相同"
+    );
+    assert_ne!(PolicyKey::of("stand"), PolicyKey::of("wobble"));
+    assert_eq!(
+        PolicyKey::of("stand").0,
+        types::BodyHash::fnv1a(b"stand").0,
+        "与 BodyHash::fnv1a 同值"
+    );
+}
+
+/// U2:策略槽位在 skip 里 → skipped_in_transit += 1、不推理;在 frozen
+/// 里 → skipped_frozen += 1、不推理(空会话:若不跳过会走 policy_no_state,
+/// 计数对不上即红;变异 9 注入后本测试红)。
+#[test]
+fn u2_policy_drive_skips_in_transit_and_frozen() {
+    let mut host = host_with(
+        e(1),
+        ControllerKind::Policy(PolicyKey::of("stand")),
+        QUAD_DOF,
+        2,
+        0,
+    );
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    let mut log = sim_api::log::CommandLog::new();
+    let mut table = PolicyTable::default();
+    let mut skip = std::collections::BTreeSet::new();
+    skip.insert(e(1));
+    let frozen = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut table, Tick(10), &skip, &frozen);
+    assert_eq!(host.counters.skipped_in_transit, 1, "在途跳过恰计 1 次");
+    assert_eq!(host.counters.policy_inferences, 0, "跳过不推理");
+    assert_eq!(host.counters.policy_no_state, 0, "跳过不走取状态分支");
+    assert!(log.entries().is_empty(), "跳过时 log 不追加");
+    let skip = std::collections::BTreeSet::new();
+    let mut frozen = std::collections::BTreeSet::new();
+    frozen.insert(e(1));
+    host.drive_policies(&mut session, &mut log, &mut table, Tick(12), &skip, &frozen);
+    assert_eq!(host.counters.skipped_frozen, 1, "冻结跳过恰计 1 次");
+    assert_eq!(host.counters.policy_inferences, 0, "跳过不推理");
+    assert_eq!(host.counters.policy_no_state, 0, "跳过不走取状态分支");
+    assert!(log.entries().is_empty());
+    session.shutdown();
+}
+
+/// U3:`ControllerRecord` 带 Policy 槽位 bincode 往返逐字段相等(intent
+/// 在内);from_records 重建后 last_action 从全 0 开始。
+#[test]
+fn u3_policy_record_roundtrip() {
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(1),
+        ControllerKind::Policy(PolicyKey::of("stand")),
+        QUAD_DOF,
+        2,
+        Tick(7),
+        leash([3.0, 4.0], 16.0),
+    )
+    .expect("挂载合法");
+    host.set_intent(e(1), [1.0, 0.0, -1.0]);
+    let records = host.to_records();
+    let bytes = bincode::serde::encode_to_vec(&records, bincode::config::standard())
+        .expect("records 可编码");
+    let (back, _): (Vec<ControllerRecord>, usize) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .expect("records 可解码");
+    assert_eq!(back, records, "序列化往返相等");
+    assert_eq!(
+        back[0].slot.kind,
+        ControllerKind::Policy(PolicyKey::of("stand"))
+    );
+    assert_eq!(back[0].slot.intent, [1.0, 0.0, -1.0], "intent 随档走");
+    let rebuilt = ControllerHost::from_records(back);
+    assert_eq!(rebuilt.to_records(), records, "重建往返相等");
+    assert_eq!(
+        rebuilt.policy_state[&e(1)].last_action,
+        vec![0.0; QUAD_DOF],
+        "恢复后 last_action 从全 0 开始"
+    );
+}
+
+/// U4:retain_alive / on_removed / detach 摘掉策略槽位后 policy_state
+/// 无残留;同一 EntityId 重新挂上,last_action 从全 0 开始。
+#[test]
+fn u4_policy_state_cleared_on_removal() {
+    let kind = ControllerKind::Policy(PolicyKey::of("wobble"));
+    let mut host = host_with(e(1), kind, QUAD_DOF, 2, 0);
+    assert!(host.policy_state.contains_key(&e(1)), "挂载即建运行态");
+    assert_eq!(host.retain_alive(|_| false), 1);
+    assert!(host.policy_state.is_empty(), "retain_alive 后无残留");
+    host.attach(e(1), kind, QUAD_DOF, 2, Tick(0), None)
+        .expect("重新挂载");
+    assert_eq!(
+        host.policy_state[&e(1)].last_action,
+        vec![0.0; QUAD_DOF],
+        "重挂后从全 0 开始"
+    );
+    host.on_removed(e(1));
+    assert!(host.policy_state.is_empty(), "on_removed 后无残留");
+    host.attach(e(1), kind, QUAD_DOF, 2, Tick(0), None)
+        .expect("重新挂载");
+    assert!(host.detach(e(1)));
+    assert!(host.policy_state.is_empty(), "detach 后无残留");
+}
+
+/// Q8(单测版):空宿主调 drive_policies → 计数全 0、日志为空
+/// (没有策略槽位时零动作,不调 Session 的状态方法)。
+#[test]
+fn q8_empty_host_drive_policies_no_change() {
+    let mut host = ControllerHost::default();
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    let mut log = sim_api::log::CommandLog::new();
+    let mut table = PolicyTable::default();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut table, Tick(10), &empty, &empty);
+    session.shutdown();
+    assert_eq!(host.counters, ControllerCounters::default(), "计数全 0");
+    assert!(log.entries().is_empty(), "日志为空");
+}
+
+/// build_snapshot 逐字段透传(钉住变异 3:joint_pos 传成全 0)。
+#[test]
+fn build_snapshot_passes_fields_through() {
+    let root = types::EntityState {
+        translation: types::glam::Vec3::new(1.0, 2.0, 3.0),
+        rotation: types::glam::Quat::from_rotation_y(0.3),
+        linvel: types::glam::Vec3::new(0.4, 0.5, 0.6),
+        angvel: types::glam::Vec3::new(0.7, 0.8, 0.9),
+    };
+    let joints = sim_api::session::AgentJointState {
+        positions: vec![0.11, 0.22, 0.33],
+        velocities: vec![0.44, 0.55, 0.66],
+    };
+    let snap = build_snapshot(&root, &joints, [1.0, 0.0, -1.0], &[0.77, 0.88, 0.99]);
+    assert_eq!(snap.root_rotation, root.rotation);
+    assert_eq!(snap.root_linvel, root.linvel);
+    assert_eq!(snap.root_angvel, root.angvel);
+    assert_eq!(snap.joint_pos, joints.positions, "关节角原样透传");
+    assert_eq!(snap.joint_vel, joints.velocities, "关节角速度原样透传");
+    assert_eq!(snap.intent, [1.0, 0.0, -1.0], "intent 原样带入");
+    assert_eq!(snap.last_action, vec![0.77, 0.88, 0.99]);
+}
+
+/// 推理成功后运行态 last_action = action.raw(钉住变异 4:不更新)。
+/// 真实会话(单分片 + 平地 + 生成四足),wobble 布局(lin6x12:
+/// base_ang_vel + intent),intent [1,0,-1] → raw[3] = 0.4、raw[5] = −0.6
+/// (任务书 Q3 手算同源:输出只接 intent[0]、intent[2])。
+/// 变异 2(intent 恒 0)注入后本测试也红。
+#[test]
+fn policy_drive_updates_last_action() {
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let hash = bodies.insert_toml(quad_asset()).expect("quad 合法");
+    let def = bodies.get(&hash).expect("哈希必在").clone();
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    let mut cfg = physics_sim::ShardSimConfig::new(shard);
+    cfg.solidify.enabled = false;
+    cfg.cohesion.enabled = false;
+    let sim = physics_sim::ShardSim::new_with_bodies(
+        cfg,
+        Box::new(voxel::SimpleRegistry::builtin()),
+        bodies.clone(),
+    );
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    session.register(sim);
+    for cx in 0..8i32 {
+        for cz in 0..8i32 {
+            let mut chunk = voxel::Chunk::air();
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    chunk.set(x, 64, z, types::BlockId(1));
+                }
+            }
+            session.apply_chunk_load(shard, types::ChunkPos::new(cx, cz), chunk);
+        }
+    }
+    let a = e(1);
+    session
+        .spawn_agent(
+            shard,
+            a,
+            hash,
+            types::EntityState {
+                translation: types::glam::Vec3::new(8.0, 66.0, 8.0),
+                rotation: types::glam::Quat::IDENTITY,
+                linvel: types::glam::Vec3::ZERO,
+                angvel: types::glam::Vec3::ZERO,
+            },
+        )
+        .expect("生成四足");
+    session.tick();
+    // 策略包:临时目录现拼(toml 字符串 + 夹具 ONNX)。
+    let dir = tempfile::TempDir::new().expect("临时目录");
+    let pkg = dir.path().join("wobble");
+    std::fs::create_dir(&pkg).expect("建策略包目录");
+    std::fs::write(
+        pkg.join("policy.toml"),
+        format!(
+            "name = \"wobble\"\nbody_hash = \"{}\"\ncontrol_period_ticks = 2\naction_scale = 0.1\naction_clip = 1.0\nobs = [{{ term = \"base_ang_vel\" }}, {{ term = \"intent\" }}]\n",
+            hash.hex()
+        ),
+    )
+    .expect("写 policy.toml");
+    std::fs::write(
+        pkg.join("policy.onnx"),
+        include_bytes!("../../../../assets/policies/test_fixtures/lin6x12.onnx"),
+    )
+    .expect("写 policy.onnx");
+    let mut table = PolicyTable::default();
+    let key = table.load(dir.path(), "wobble", &def).expect("策略包合法");
+    assert_eq!(key, PolicyKey::of("wobble"));
+    let mut host = ControllerHost::default();
+    host.attach(a, ControllerKind::Policy(key), QUAD_DOF, 1, Tick(0), None)
+        .expect("挂载合法");
+    host.set_intent(a, [1.0, 0.0, -1.0]);
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut table, Tick(1), &empty, &empty);
+    assert_eq!(host.counters.policy_inferences, 1, "成功推理恰 1 次");
+    assert_eq!(host.counters.policy_errors, 0);
+    assert_eq!(host.counters.actions_emitted, 1);
+    assert_eq!(log.entries().len(), 1, "动作进日志");
+    let last = &host.policy_state[&a].last_action;
+    assert_eq!(last.len(), QUAD_DOF);
+    assert!(
+        (last[3] - 0.4).abs() < 1e-5,
+        "last_action[3] = raw 0.4,实得 {}",
+        last[3]
+    );
+    assert!(
+        (last[5] + 0.6).abs() < 1e-5,
+        "last_action[5] = raw −0.6,实得 {}",
+        last[5]
+    );
+    session.shutdown();
 }

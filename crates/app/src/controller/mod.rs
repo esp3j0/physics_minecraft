@@ -5,12 +5,17 @@
 //! 本单只做 `Script`(`QuadStand` / `QuadTrot`)和 `None`,脚本是开环的:
 //! 输出只取决于"挂上去之后过了多少拍",不读任何观测。
 //!
+//! D01b-1(REQ-012 §2.3):追加 `Policy(PolicyKey)`——同步推理,观测经
+//! `Session::agent_joint_state` / `agent_root_state` 取出,动作同样经
+//! `send_agent_joint_targets_to` 进命令日志(回放不加载模型)。
+//!
 //! B02b(§2.3/§2.4):槽位追加活动范围(`leash`,检查点随
 //! `ControllerRecord` 走);`apply_leash` 对超出活动圆的 `QuadTrot` 永久
 //! 改挂 `QuadStand`——B03a 起是普通配置项:脚本主体的活动半径(迁移
 //! 已落地,走出分片边界不再停机)。
 
 pub mod gait;
+pub mod policy_table;
 
 #[cfg(test)]
 mod tests;
@@ -18,12 +23,25 @@ mod tests;
 use std::collections::BTreeMap;
 
 use messaging::InputSource;
+use policy::AgentSnapshot;
 use serde::{Deserialize, Serialize};
 use sim_api::log::CommandLog;
-use sim_api::session::Session;
-use types::{EntityId, Tick};
+use sim_api::session::{AgentJointState, Session};
+use types::{EntityId, EntityState, Tick};
 
 use gait::{Gait, QUAD_DOF, SIM_DT, stand_targets, trot_targets};
+use policy_table::PolicyTable;
+
+/// 策略名的 FNV-1a 64 位(REQ-012 D01b-1 §1.2;算法与 `BodyHash::fnv1a`
+/// 相同,对名字的 UTF-8 字节算)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PolicyKey(pub [u8; 8]);
+
+impl PolicyKey {
+    pub fn of(name: &str) -> Self {
+        Self(types::BodyHash::fnv1a(name.as_bytes()).0)
+    }
+}
 
 /// 脚本种类(§2.2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +59,8 @@ pub enum ControllerKind {
     None,
     /// 固定函数脚本。
     Script(ScriptKind),
+    /// 策略控制(§2.3;D01b-1)。放在枚举最后。
+    Policy(PolicyKey),
 }
 
 /// 活动范围(§2.4;配置项:脚本主体的活动半径):水平距离根连杆超出
@@ -66,6 +86,9 @@ pub struct ControllerSlot {
     pub attached_at: Tick,
     /// 活动范围(§2.4;配置生成带,`attach` 传入;无 = 不约束)。
     pub leash: Option<Leash>,
+    /// 给策略的意图观测 [move_x, move_z, yaw](D01b-1 §1.2)。脚本和
+    /// None 不用,恒为 0。
+    pub intent: [f32; 3],
 }
 
 /// 检查点里的控制者条目(§2.5):EntityId + 槽位,恢复时 `from_records`
@@ -87,6 +110,14 @@ pub struct ControllerCounters {
     pub skipped_in_transit: u64,
     /// 主体已冻结,本拍跳过发目标的次数(B03c 3.2;只增不减)。
     pub skipped_frozen: u64,
+    /// 成功推理并发出目标的次数(D01b-1 §1.2;只增不减)。
+    pub policy_inferences: u64,
+    /// act 返回 Err 的次数(本拍不发目标,电机保持上次目标;只增不减)。
+    pub policy_errors: u64,
+    /// 累计被关节限位夹住的自由度个数(只增不减)。
+    pub policy_targets_clamped: u64,
+    /// 到了控制拍但取不到状态而跳过的次数(只增不减)。
+    pub policy_no_state: u64,
 }
 
 /// 挂载失败原因(类型化,不 panic)。
@@ -96,6 +127,8 @@ pub enum AttachError {
     DofMismatch { expected: usize, got: usize },
     #[error("period_ticks 为 0")]
     ZeroPeriod,
+    #[error("dof 为 0")]
+    ZeroDof,
     #[error("该实体已挂控制者")]
     AlreadyAttached,
 }
@@ -107,16 +140,25 @@ pub const DEFAULT_CONTROL_PERIOD_TICKS: u32 = 2;
 /// 站立目标,渐入本身在 `foot_target` 里还有 1 s)。
 pub const TROT_SETTLE_TICKS: u64 = 120;
 
+/// 一只策略主体的运行态(D01b-1 §1.2;不进检查点,恢复后也从全 0 开始)。
+#[derive(Debug)]
+struct PolicyRunState {
+    last_action: Vec<f32>,
+}
+
 /// 控制者宿主:EntityId → 槽位;动作按 EntityId 升序产出。
 #[derive(Debug, Default)]
 pub struct ControllerHost {
     slots: BTreeMap<EntityId, ControllerSlot>,
     pub counters: ControllerCounters,
+    policy_state: BTreeMap<EntityId, PolicyRunState>,
 }
 
 impl ControllerHost {
     /// 挂载控制者。已挂 → `AlreadyAttached`;脚本身体 dof 不符 →
-    /// `DofMismatch`(`None` 不限 dof);周期 0 → `ZeroPeriod`。
+    /// `DofMismatch`(`None` 不限 dof);策略 dof 0 → `ZeroDof`(dof 与
+    /// 周期由调用方从 `PolicyTable` 取出传入,D01b-1 §1.3);周期 0 →
+    /// `ZeroPeriod`。
     /// `leash` = 活动范围(§2.4;配置生成的调用方传 `Some`,旧调用传 `None`)。
     pub fn attach(
         &mut self,
@@ -136,8 +178,19 @@ impl ControllerHost {
                 got: dof,
             });
         }
+        if matches!(kind, ControllerKind::Policy(_)) && dof == 0 {
+            return Err(AttachError::ZeroDof);
+        }
         if period_ticks == 0 {
             return Err(AttachError::ZeroPeriod);
+        }
+        if matches!(kind, ControllerKind::Policy(_)) {
+            self.policy_state.insert(
+                entity,
+                PolicyRunState {
+                    last_action: vec![0.0; dof],
+                },
+            );
         }
         self.slots.insert(
             entity,
@@ -147,18 +200,28 @@ impl ControllerHost {
                 period_ticks,
                 attached_at: now,
                 leash,
+                intent: [0.0; 3],
             },
         );
         Ok(())
     }
 
+    /// 设置策略意图观测(D01b-1 §1.4:启动逻辑 attach 后取配置值写入)。
+    pub fn set_intent(&mut self, entity: EntityId, intent: [f32; 3]) {
+        if let Some(slot) = self.slots.get_mut(&entity) {
+            slot.intent = intent;
+        }
+    }
+
     /// 摘除控制者。存在并摘除 → true;不存在 → false。
     pub fn detach(&mut self, entity: EntityId) -> bool {
+        self.policy_state.remove(&entity);
         self.slots.remove(&entity).is_some()
     }
 
     /// 主体被移除(despawned / void_removed)时调用;不存在也不报错。
     pub fn on_removed(&mut self, entity: EntityId) {
+        self.policy_state.remove(&entity);
         self.slots.remove(&entity);
     }
 
@@ -283,6 +346,7 @@ impl ControllerHost {
         let dead: Vec<EntityId> = self.slots.keys().copied().filter(|&e| !alive(e)).collect();
         for e in &dead {
             self.slots.remove(e);
+            self.policy_state.remove(e);
         }
         dead.len()
     }
@@ -298,12 +362,126 @@ impl ControllerHost {
             .collect()
     }
 
-    /// 从检查点条目重建宿主(计数清零——遥测不进检查点)。
+    /// 从检查点条目重建宿主(计数清零——遥测不进检查点;策略运行态
+    /// `last_action` 也从全 0 开始,D01b-1 §1.2)。
     pub fn from_records(records: Vec<ControllerRecord>) -> Self {
         let mut host = Self::default();
         for record in records {
+            if matches!(record.slot.kind, ControllerKind::Policy(_)) {
+                host.policy_state.insert(
+                    record.entity,
+                    PolicyRunState {
+                        last_action: vec![0.0; record.slot.dof],
+                    },
+                );
+            }
             host.slots.insert(record.entity, record.slot);
         }
         host
+    }
+
+    /// 策略主体本拍的动作(D01b-1 §1.3)。到控制拍的条件与脚本相同
+    /// (`now ≥ attached_at` 且 `(now − attached_at) % period_ticks == 0`)。
+    /// 对每只到拍的策略主体(EntityId 升序):
+    ///   在 skip 里 → skipped_in_transit += 1;在 frozen 里 → skipped_frozen += 1;
+    ///   取不到关节状态或根状态 → policy_no_state += 1;
+    ///   否则拼 AgentSnapshot(intent 取槽位的,last_action 取运行态的)→ policy.act:
+    ///     Ok(action)  → 发 targets(同 drive:成功则进日志、actions_emitted += 1、
+    ///                   policy_inferences += 1、policy_targets_clamped += action.clamped,
+    ///                   运行态 last_action = action.raw;被 session 拒绝则
+    ///                   send_rejected += 1,last_action 不更新);
+    ///     Err(_)      → policy_errors += 1,不发目标,last_action 不更新。
+    /// 没有策略槽位时零动作(不调 Session 的状态方法)。
+    pub fn drive_policies(
+        &mut self,
+        session: &mut Session,
+        log: &mut CommandLog,
+        table: &mut PolicyTable,
+        now: Tick,
+        skip: &std::collections::BTreeSet<EntityId>,
+        frozen: &std::collections::BTreeSet<EntityId>,
+    ) {
+        let due: Vec<EntityId> = self
+            .slots
+            .iter()
+            .filter(|(_, slot)| {
+                matches!(slot.kind, ControllerKind::Policy(_))
+                    && now.0 >= slot.attached_at.0
+                    && now.0.saturating_sub(slot.attached_at.0) % u64::from(slot.period_ticks) == 0
+            })
+            .map(|(&entity, _)| entity)
+            .collect();
+        for entity in due {
+            if skip.contains(&entity) {
+                self.counters.skipped_in_transit += 1;
+                continue;
+            }
+            if frozen.contains(&entity) {
+                self.counters.skipped_frozen += 1;
+                continue;
+            }
+            let ControllerKind::Policy(key) = self.slots[&entity].kind else {
+                continue;
+            };
+            let intent = self.slots[&entity].intent;
+            let Some(joints) = session.agent_joint_state(entity) else {
+                self.counters.policy_no_state += 1;
+                continue;
+            };
+            let Some(root) = session.agent_root_state(entity) else {
+                self.counters.policy_no_state += 1;
+                continue;
+            };
+            let last_action = self
+                .policy_state
+                .get(&entity)
+                .map(|state| state.last_action.clone())
+                .unwrap_or_default();
+            let snapshot = build_snapshot(&root, &joints, intent, &last_action);
+            let entry = table
+                .get_mut(key)
+                .expect("策略键必在表中(启动/恢复已校验,fail-stop)");
+            match entry.policy.act(&snapshot) {
+                Ok(action) => {
+                    match session.send_agent_joint_targets_to(
+                        InputSource::SCHEDULER,
+                        entity,
+                        action.targets,
+                    ) {
+                        Ok(log_entry) => {
+                            log.append(log_entry);
+                            self.counters.actions_emitted += 1;
+                            self.counters.policy_inferences += 1;
+                            self.counters.policy_targets_clamped += action.clamped as u64;
+                            if let Some(state) = self.policy_state.get_mut(&entity) {
+                                state.last_action = action.raw;
+                            }
+                        }
+                        Err(_) => self.counters.send_rejected += 1,
+                    }
+                }
+                Err(_) => self.counters.policy_errors += 1,
+            }
+        }
+    }
+}
+
+/// 拼策略观测快照(D01b-1 §1.3;纯函数,可单测):根状态取世界系速度,
+/// 关节角/角速度按自由度顺序透传(`observe` 内部再减 default_pose),
+/// intent 与 last_action 原样带入。
+pub fn build_snapshot(
+    root: &EntityState,
+    joints: &AgentJointState,
+    intent: [f32; 3],
+    last_action: &[f32],
+) -> AgentSnapshot {
+    AgentSnapshot {
+        root_rotation: root.rotation,
+        root_linvel: root.linvel,
+        root_angvel: root.angvel,
+        joint_pos: joints.positions.clone(),
+        joint_vel: joints.velocities.clone(),
+        last_action: last_action.to_vec(),
+        intent,
     }
 }

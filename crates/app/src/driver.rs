@@ -645,7 +645,11 @@ pub struct DriverOutcome {
 /// (`crate::startup_agents::StartupRecord` = 启动主体的持久状态:待生成
 /// 序号表 + 已生成主体的启动票表)——bundle 布局变化,v14 及更早档解码
 /// 失败/版本拒绝,必须清 `data_dir`(不做迁移)。
-pub const CHECKPOINT_FORMAT_VERSION: u32 = 15;
+///
+/// **v16**(REQ-012 D01b-1,#25):`ControllerSlot` 追加 `intent`、
+/// `ControllerKind` 追加 `Policy(PolicyKey)`——控制者条目布局变化,v15
+/// 及更早档解码失败/版本拒绝,必须清 `data_dir`(不做迁移)。
+pub const CHECKPOINT_FORMAT_VERSION: u32 = 16;
 
 /// 检查点捆绑:格式版本 + 世界快照(分片 + 调度器状态)+ 此后命令日志,
 /// 原子一体(README 决策 4;REQ-005 D7 世界快照,D8 版本字段)。
@@ -5090,7 +5094,7 @@ mod tests {
     /// 一个锚行为,一个锚常量。
     #[test]
     fn checkpoint_v4_rejects_v3() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 15, "REQ-012 B03d 起 = v15");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 16, "REQ-012 D01b-1 起 = v16");
         let v3 = CheckpointBundle {
             format_version: 3,
             world: sim_api::snapshot::WorldSnapshot {
@@ -5111,15 +5115,15 @@ mod tests {
         }
     }
 
-    /// B03d(#25):检查点版本 15(v15 = bundle 追加尾字段 `startup`,启动
-    /// 主体持久状态随档走);v14 档被显式版本拒绝(不做迁移,清 `data_dir`)。
-    /// 锚点与 `d2_checkpoint_version_11_rejects_v10` 相互独立:一个锚行为,
-    /// 一个锚常量。
+    /// D01b-1(#25):检查点版本 16(v16 = `ControllerSlot` 追加 `intent`、
+    /// `ControllerKind` 追加 `Policy`);v15 档被显式版本拒绝(不做迁移,
+    /// 清 `data_dir`)。锚点与 `d2_checkpoint_version_11_rejects_v10` 相互
+    /// 独立:一个锚行为,一个锚常量。
     #[test]
-    fn checkpoint_v15_rejects_v14() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 15, "REQ-012 B03d 起 = v15");
-        let v14 = CheckpointBundle {
-            format_version: 14,
+    fn checkpoint_v16_rejects_v15() {
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 16, "REQ-012 D01b-1 起 = v16");
+        let v15 = CheckpointBundle {
+            format_version: 15,
             world: sim_api::snapshot::WorldSnapshot {
                 shards: sim_api::snapshot::GlobalSnapshot::new(types::Tick(7)),
                 scheduler: empty_scheduler_snapshot(types::Tick(7)),
@@ -5129,12 +5133,12 @@ mod tests {
             controllers: Vec::new(),
             startup: Default::default(),
         };
-        match decode_checkpoint(&encode_checkpoint(&v14)) {
+        match decode_checkpoint(&encode_checkpoint(&v15)) {
             Err(AppError::Decode(msg)) => assert!(
-                msg.contains("unsupported checkpoint format version 14"),
-                "v14 拒绝信息必须带版本说明:{msg}"
+                msg.contains("unsupported checkpoint format version 15"),
+                "v15 拒绝信息必须带版本说明:{msg}"
             ),
-            other => panic!("v14 旧档必须 Err(Decode),实为 {:?}", other.is_err()),
+            other => panic!("v15 旧档必须 Err(Decode),实为 {:?}", other.is_err()),
         }
     }
 
@@ -7716,7 +7720,7 @@ mod tests {
     /// frozen);旧版本档被显式拒绝(解码不兼容;不做迁移)。
     #[test]
     fn d2_checkpoint_version_11_rejects_v10() {
-        assert_eq!(CHECKPOINT_FORMAT_VERSION, 15, "B03d 起 = v15");
+        assert_eq!(CHECKPOINT_FORMAT_VERSION, 16, "D01b-1 起 = v16");
         let bundle = CheckpointBundle {
             format_version: 10,
             world: sim_api::snapshot::WorldSnapshot {

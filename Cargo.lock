@@ -49,6 +49,7 @@ dependencies = [
  "lz4_flex",
  "messaging",
  "physics-sim",
+ "policy",
  "serde",
  "shard",
  "sim-api",
