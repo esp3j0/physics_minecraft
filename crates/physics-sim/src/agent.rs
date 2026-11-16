@@ -1171,7 +1171,8 @@ impl ShardSim {
     }
 
     /// 主体关节速度(自由度顺序;rad/s 或 m/s)。非主体 / 无关节 → None。
-    /// 冻结期间 = 快照 `joint_qd`(B03b 1.4)。
+    /// 冻结期间 = 快照 `joint_qd`(B03b 1.4)。休眠期间返回全 0,与根刚体
+    /// 速度口径一致(D01b-1 裁定:multibody 广义速度在入睡后残留旧值)。
     pub fn agent_joint_velocities(&self, id: EntityId) -> Option<Vec<f32>> {
         let record = self.agents.get(&id)?;
         let def = self
@@ -1184,6 +1185,20 @@ impl ShardSim {
         // 冻结期间读快照(同 agent_joint_positions)。
         if let Some(frozen) = &record.frozen {
             return Some(frozen.joint_qd.clone());
+        }
+        let root_handle = self
+            .entities
+            .get(&id)
+            .map(|rec| rec.handle)
+            .expect("主体 EntityRecord 存在(fail-stop)");
+        if self
+            .phys
+            .bodies
+            .get(root_handle)
+            .map(|rb| rb.is_sleeping())
+            .unwrap_or(false)
+        {
+            return Some(vec![0.0; def.dof_count()]);
         }
         let mb_index = self.agent_multibody_index(record)?;
         let mb = self
@@ -4329,6 +4344,66 @@ anchor = [0.0, 0.0, 0.0]
             q_before[1],
             q_after[1]
         );
+    }
+
+    /// D01b-1 裁定:四足入睡后 `agent_joint_velocities` 返回全 0(与根刚体
+    /// 速度口径一致);醒着时读真值。布景与"等根刚体 is_sleeping,上限 600
+    /// 拍"的写法照 K5。
+    #[test]
+    fn d01b_sleeping_joint_velocities_are_zero() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        assert_quad_above_ground(&s, a);
+        let observers = [Vec3::new(24.0, 3.45, 24.0)];
+        let targets = s.agent_joint_targets(a).expect("目标表").to_vec();
+        let mut asleep_at: Option<usize> = None;
+        let mut q_asleep: Option<Vec<f32>> = None;
+        for tick in 0..600usize {
+            s.apply_agent_joint_targets(a, &targets).expect("站立目标");
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+            if tick == 5 {
+                let qd = s.agent_joint_velocities(a).expect("关节速");
+                let max = qd.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                assert!(
+                    max > 1e-3,
+                    "第 5 拍醒着:max |qd| {max} 须 > 1e-3(读的是真值,不是恒 0)"
+                );
+            }
+            let rec = s.entities.get(&a).expect("root");
+            let sleeping = s
+                .phys
+                .bodies
+                .get(rec.handle)
+                .map(|rb| rb.is_sleeping())
+                .unwrap_or(false);
+            if sleeping {
+                asleep_at = Some(tick);
+                let qd = s.agent_joint_velocities(a).expect("关节速");
+                assert_eq!(qd, vec![0.0; 12], "入睡后 12 个关节速度逐位 0.0");
+                let q = s.agent_joint_positions(a).expect("q");
+                assert_eq!(q.len(), 12);
+                assert!(q.iter().all(|v| v.is_finite()), "关节角 12 个全部有限");
+                q_asleep = Some(q);
+                break;
+            }
+        }
+        let asleep_at = asleep_at
+            .expect("前置失败:站了 600 拍仍未自然入睡(在等根刚体 is_sleeping;布景或睡眠参数问题)");
+        println!("D01b:第 {asleep_at} 拍自然入睡");
+        let q_before = q_asleep.expect("入睡时关节角");
+        for _ in 0..10 {
+            s.apply_agent_joint_targets(a, &targets).expect("站立目标");
+            s.apply_activation(&observers);
+            s.step();
+            let _ = s.take_outbox();
+        }
+        let q_after = s.agent_joint_positions(a).expect("q");
+        assert_eq!(q_after, q_before, "入睡后 10 拍关节角逐位相同");
     }
 
     /// capsule 的哈希(从注册表查名字)。
