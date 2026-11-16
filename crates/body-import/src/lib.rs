@@ -18,6 +18,7 @@
 pub mod emit;
 pub mod frames;
 pub mod inertia;
+mod mesh;
 pub mod shapes;
 pub mod tree;
 

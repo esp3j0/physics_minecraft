@@ -1,0 +1,344 @@
+//! REQ-012 C01b:网格文件查找、STL / OBJ 解析、凸包与精简(任务书 1.3–1.5)。
+//! 不引入网格解析库:STL / OBJ 只取顶点和面。
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// 路径文本里是否含 `..` 段(任务书 1.3:含 `..` 不解析)。
+fn has_parent_seg(s: &str) -> bool {
+    s.split(['/', '\\']).any(|seg| seg == "..")
+}
+
+/// 按规则列出候选路径(有先后),返回第一个存在的;都不存在则返回
+/// Err(全部候选的文本)。任务书 1.3。
+pub(crate) fn resolve(
+    filename: &str,
+    base_dir: &Path,
+    packages: &BTreeMap<String, PathBuf>,
+) -> Result<PathBuf, Vec<String>> {
+    let blocked = || Err(vec![format!("{filename}(含 `..` 路径段,不解析)")]);
+    let candidates: Vec<PathBuf> = if let Some(uri) = filename.strip_prefix("package://") {
+        let Some((pkg, rest)) = uri.split_once('/') else {
+            return Err(vec![format!("{filename}(package:// 后须为 <包名>/<路径>)")]);
+        };
+        if has_parent_seg(rest) {
+            return blocked();
+        }
+        match packages.get(pkg) {
+            Some(dir) => vec![dir.join(rest)],
+            None => vec![
+                base_dir.join(rest),
+                base_dir.join("..").join(rest),
+                base_dir.join("..").join("..").join(rest),
+            ],
+        }
+    } else if let Some(abs) = filename.strip_prefix("file://") {
+        if has_parent_seg(abs) {
+            return blocked();
+        }
+        vec![PathBuf::from(abs)]
+    } else {
+        if has_parent_seg(filename) {
+            return blocked();
+        }
+        let p = Path::new(filename);
+        if p.is_absolute() {
+            vec![p.to_path_buf()]
+        } else {
+            vec![base_dir.join(filename)]
+        }
+    };
+    for c in &candidates {
+        if c.exists() {
+            return Ok(c.clone());
+        }
+    }
+    Err(candidates.iter().map(|p| p.display().to_string()).collect())
+}
+
+/// 文件里的原始网格:顶点 + 三角形下标(任务书 1.4)。
+pub(crate) struct RawMesh {
+    pub vertices: Vec<[f64; 3]>,
+    pub triangles: Vec<[usize; 3]>,
+}
+
+/// OBJ:只认 `v x y z`(第 4 个分量忽略)和 `f …`;其它行忽略。
+/// 面下标取 `/` 之前;正下标从 1 起,负下标相对当前顶点数;多边形按扇形拆。
+pub(crate) fn parse_obj(text: &str) -> Result<RawMesh, String> {
+    let mut vertices: Vec<[f64; 3]> = Vec::new();
+    let mut triangles: Vec<[usize; 3]> = Vec::new();
+    for (lineno, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut tok = line.split_whitespace();
+        match tok.next() {
+            Some("v") => {
+                let mut c = [0.0f64; 3];
+                for slot in c.iter_mut() {
+                    let t = tok
+                        .next()
+                        .ok_or_else(|| format!("第 {} 行:v 不足 3 个分量", lineno + 1))?;
+                    *slot = t
+                        .parse::<f64>()
+                        .map_err(|e| format!("第 {} 行:v 分量 `{t}` 解析失败:{e}", lineno + 1))?;
+                    if !slot.is_finite() {
+                        return Err(format!("第 {} 行:v 分量非有限", lineno + 1));
+                    }
+                }
+                vertices.push(c);
+            }
+            Some("f") => {
+                let mut idx: Vec<usize> = Vec::new();
+                for t in tok {
+                    let head = t.split('/').next().unwrap_or("");
+                    let i: isize = head
+                        .parse()
+                        .map_err(|e| format!("第 {} 行:面下标 `{t}` 解析失败:{e}", lineno + 1))?;
+                    let n = vertices.len() as isize;
+                    let zero = if i > 0 { i - 1 } else { n + i };
+                    if zero < 0 || zero >= n {
+                        return Err(format!(
+                            "第 {} 行:面下标 {i} 越界(当前 {n} 个顶点)",
+                            lineno + 1
+                        ));
+                    }
+                    idx.push(zero as usize);
+                }
+                if idx.len() < 3 {
+                    return Err(format!(
+                        "第 {} 行:面只有 {} 个顶点(< 3)",
+                        lineno + 1,
+                        idx.len()
+                    ));
+                }
+                for k in 1..idx.len() - 1 {
+                    triangles.push([idx[0], idx[k], idx[k + 1]]);
+                }
+            }
+            _ => {}
+        }
+    }
+    if vertices.is_empty() {
+        return Err("OBJ 没有任何顶点".to_owned());
+    }
+    Ok(RawMesh {
+        vertices,
+        triangles,
+    })
+}
+
+/// STL:去空白后以 `solid` 起头且全文含 `facet` → ASCII,否则二进制。
+pub(crate) fn parse_stl(bytes: &[u8]) -> Result<RawMesh, String> {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let ascii = bytes[start..].starts_with(b"solid") && bytes.windows(5).any(|w| w == b"facet");
+    let vertices: Vec<[f64; 3]> = if ascii {
+        let text = std::str::from_utf8(bytes).map_err(|e| format!("ASCII STL 非 UTF-8:{e}"))?;
+        let mut vertices = Vec::new();
+        for (lineno, line) in text.lines().enumerate() {
+            let mut tok = line.split_whitespace();
+            if tok.next() != Some("vertex") {
+                continue;
+            }
+            let mut c = [0.0f64; 3];
+            for slot in c.iter_mut() {
+                let t = tok
+                    .next()
+                    .ok_or_else(|| format!("第 {} 行:vertex 不足 3 个分量", lineno + 1))?;
+                *slot = t
+                    .parse::<f64>()
+                    .map_err(|e| format!("第 {} 行:vertex 分量 `{t}` 解析失败:{e}", lineno + 1))?;
+                if !slot.is_finite() {
+                    return Err(format!("第 {} 行:vertex 分量非有限", lineno + 1));
+                }
+            }
+            vertices.push(c);
+        }
+        if vertices.len() % 3 != 0 {
+            return Err(format!("ASCII STL 顶点数 {} 不是 3 的倍数", vertices.len()));
+        }
+        vertices
+    } else {
+        if bytes.len() < 84 {
+            return Err(format!("二进制 STL 长度 {} < 84", bytes.len()));
+        }
+        let n = u32::from_le_bytes([bytes[80], bytes[81], bytes[82], bytes[83]]) as u64;
+        let expect = 84 + 50 * n;
+        if bytes.len() as u64 != expect {
+            return Err(format!(
+                "二进制 STL 长度 {} ≠ 84 + 50 × {n} = {expect}",
+                bytes.len()
+            ));
+        }
+        let mut vertices = Vec::with_capacity(3 * n as usize);
+        for t in 0..n as usize {
+            let base = 84 + 50 * t + 12; // 跳过法线,取 3 个顶点
+            for k in 0..3 {
+                let o = base + 12 * k;
+                let mut c = [0.0f64; 3];
+                for (j, slot) in c.iter_mut().enumerate() {
+                    let v = f32::from_le_bytes([
+                        bytes[o + 4 * j],
+                        bytes[o + 4 * j + 1],
+                        bytes[o + 4 * j + 2],
+                        bytes[o + 4 * j + 3],
+                    ]);
+                    if !v.is_finite() {
+                        return Err(format!("二进制 STL 第 {t} 个三角形顶点非有限"));
+                    }
+                    *slot = f64::from(v);
+                }
+                vertices.push(c);
+            }
+        }
+        vertices
+    };
+    if vertices.is_empty() {
+        return Err("STL 没有任何顶点".to_owned());
+    }
+    let triangles = (0..vertices.len() / 3)
+        .map(|t| [3 * t, 3 * t + 1, 3 * t + 2])
+        .collect();
+    Ok(RawMesh {
+        vertices,
+        triangles,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn obj_vertices_faces_and_fan() {
+        let text = "# c\nv 0 0 0\nv 1 0 0\nv 1 1 0\nv 0 1 0 9\nvn 0 0 1\nf 1 2 3 4\n";
+        let m = parse_obj(text).expect("解析成功");
+        assert_eq!(m.vertices.len(), 4);
+        assert_eq!(m.vertices[3], [0.0, 1.0, 0.0], "第 4 分量忽略");
+        assert_eq!(m.triangles, vec![[0, 1, 2], [0, 2, 3]], "四边形扇形拆");
+    }
+
+    #[test]
+    fn obj_negative_and_slash_indices() {
+        let text = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3/1/1 -2/2/1 -1/3/1\n";
+        let m = parse_obj(text).expect("解析成功");
+        assert_eq!(m.triangles, vec![[0, 1, 2]]);
+    }
+
+    #[test]
+    fn obj_no_faces_ok() {
+        let m = parse_obj("v 0 0 0\nv 1 0 0\n").expect("只有 v 行也合法");
+        assert!(m.triangles.is_empty());
+        assert_eq!(m.vertices.len(), 2);
+    }
+
+    #[test]
+    fn obj_errors() {
+        for bad in [
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n", // 越界
+            "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 0\n", // 0 下标
+            "v 0 0 x\n",                            // 数字解析失败
+            "v 0 0 0\nv 1 0 0\nf 1 2\n",            // 面 < 3 顶点
+            "v nan 0 0\n",                          // 非有限
+            "# 只有注释\n",                         // 无顶点
+            "v 0 0\n",                              // v 分量不足
+        ] {
+            assert!(parse_obj(bad).is_err(), "应报错:{bad:?}");
+        }
+    }
+
+    #[test]
+    fn stl_ascii_one_facet() {
+        let text = "solid t\nfacet normal 0 0 0\nouter loop\nvertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\nendloop\nendfacet\nendsolid t\n";
+        let m = parse_stl(text.as_bytes()).expect("ASCII 解析成功");
+        assert_eq!(m.vertices.len(), 3);
+        assert_eq!(m.triangles, vec![[0, 1, 2]]);
+    }
+
+    #[test]
+    fn stl_ascii_bad_vertex_count() {
+        let text = "solid t\nfacet normal 0 0 0\nvertex 0 0 0\nvertex 1 0 0\n";
+        assert!(
+            parse_stl(text.as_bytes()).is_err(),
+            "顶点数 2 不是 3 的倍数"
+        );
+    }
+
+    /// 手工拼一个二进制 STL(1 个三角形)。
+    fn binary_one_tri() -> Vec<u8> {
+        let mut b = vec![0u8; 80];
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&[0.0f32; 3].map(f32::to_le_bytes).concat());
+        for v in [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]] {
+            b.extend_from_slice(&v.map(f32::to_le_bytes).concat());
+        }
+        b.extend_from_slice(&[0u8; 2]);
+        b
+    }
+
+    #[test]
+    fn stl_binary_roundtrip_and_length() {
+        let b = binary_one_tri();
+        assert_eq!(b.len(), 134);
+        let m = parse_stl(&b).expect("二进制解析成功");
+        assert_eq!(m.vertices.len(), 3);
+        assert_eq!(m.vertices[1], [1.0, 0.0, 0.0]);
+        assert_eq!(m.triangles, vec![[0, 1, 2]]);
+        assert!(parse_stl(&b[..133]).is_err(), "长度不对应报错");
+        assert!(parse_stl(&b[..40]).is_err(), "不足 84 应报错");
+    }
+
+    #[test]
+    fn stl_solid_header_without_facet_is_binary() {
+        // 头 5 字节恰为 "solid" 的二进制文件:无 "facet" → 走二进制。
+        let mut b = binary_one_tri();
+        b[..5].copy_from_slice(b"solid");
+        let m = parse_stl(&b).expect("按二进制解析");
+        assert_eq!(m.triangles.len(), 1);
+    }
+
+    #[test]
+    fn resolve_rules() {
+        let tmp = tempfile::TempDir::new().expect("临时目录");
+        let base = tmp.path().join("pkg").join("urdf");
+        let meshes = tmp.path().join("pkg").join("meshes");
+        std::fs::create_dir_all(&base).expect("建 urdf 目录");
+        std::fs::create_dir_all(&meshes).expect("建 meshes 目录");
+        std::fs::write(meshes.join("box.obj"), "v 0 0 0\n").expect("写网格");
+        let empty = BTreeMap::new();
+
+        // 回退第二候选 base_dir/../meshes/box.obj。
+        let p = resolve("package://pkg/meshes/box.obj", &base, &empty).expect("回退找到");
+        assert!(p.ends_with("meshes/box.obj") || p.ends_with("meshes\\box.obj"));
+        // 都不存在 → 3 条候选。
+        let tried = resolve("package://pkg/meshes/none.stl", &base, &empty).expect_err("找不到");
+        assert_eq!(tried.len(), 3);
+        // 显式包目录:只试 1 条。
+        let mut pkgs = BTreeMap::new();
+        pkgs.insert("pkg".to_owned(), tmp.path().join("pkg"));
+        let p = resolve("package://pkg/meshes/box.obj", &base, &pkgs).expect("显式包目录");
+        assert_eq!(p, meshes.join("box.obj"));
+        let tried = resolve("package://pkg/none.stl", &base, &pkgs).expect_err("只试包目录");
+        assert_eq!(tried.len(), 1);
+        // 相对路径 / file:// / 绝对路径。
+        let p = resolve("meshes/box.obj", &meshes.parent().expect("父目录"), &empty)
+            .expect("相对 base_dir");
+        assert_eq!(p, meshes.join("box.obj"));
+        let abs = meshes.join("box.obj");
+        let uri = format!("file://{}", abs.display());
+        assert_eq!(resolve(&uri, &base, &empty).expect("file://"), abs);
+        assert_eq!(
+            resolve(&abs.display().to_string(), &base, &empty).expect("绝对路径"),
+            abs
+        );
+        // `..` 拦截:目标真实存在也不解析。
+        std::fs::write(tmp.path().join("pkg").join("secret.obj"), "v 0 0 0\n").expect("写");
+        let tried = resolve("../secret.obj", &base, &empty).expect_err("`..` 应拦截");
+        assert!(tried[0].contains(".."), "候选文本写明含 ..:{tried:?}");
+        assert!(resolve("package://pkg/../secret.obj", &base, &empty).is_err());
+    }
+}
