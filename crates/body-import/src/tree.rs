@@ -690,7 +690,11 @@ fn make_joint_def(
 /// 块数;material 按原文里 `<material` 子串出现次数(顶层和 visual 里的都算);
 /// 关节 dynamics、mimic、safety_controller、calibration 各按出现次数;
 /// transmission、gazebo 这两类 urdf-rs 不解析的元素在原文里按子串计数。
-fn collect_ignored(urdf_xml: &str, robot: &urdf_rs::Robot, visual_count: usize) -> Vec<(String, usize)> {
+fn collect_ignored(
+    urdf_xml: &str,
+    robot: &urdf_rs::Robot,
+    visual_count: usize,
+) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = Vec::new();
     let mut push = |k: &str, n: usize| {
         if n > 0 {

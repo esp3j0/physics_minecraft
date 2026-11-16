@@ -29,8 +29,13 @@ fn repo_root() -> PathBuf {
 }
 
 fn go2_toml() -> String {
-    std::fs::read_to_string(repo_root().join("assets").join("bodies").join("go2.body.toml"))
-        .expect("读 go2.body.toml")
+    std::fs::read_to_string(
+        repo_root()
+            .join("assets")
+            .join("bodies")
+            .join("go2.body.toml"),
+    )
+    .expect("读 go2.body.toml")
 }
 
 /// 布景:注册身体、3×3 平板地面、生成主体;自检全部连杆原点 y ≥ 1。
@@ -90,7 +95,7 @@ fn root_pose(sim: &ShardSim) -> Option<types::EntityState> {
     sim.agent_states()
         .into_iter()
         .find(|(id, ..)| *id == a())
-        .map(|(.., poses)| poses[0].clone())
+        .map(|(.., poses)| poses[0])
 }
 
 /// 一组站立统计(S1 判据 + 回报要打印的数字)。
@@ -176,7 +181,12 @@ fn run_stand(sim: &mut ShardSim, n: usize) -> StandStats {
     if !late_heights.is_empty() {
         let m = late_heights.len() as f32;
         st.mean_h = late_heights.iter().sum::<f32>() / m;
-        st.std_h = (late_heights.iter().map(|h| (h - st.mean_h).powi(2)).sum::<f32>() / m).sqrt();
+        st.std_h = (late_heights
+            .iter()
+            .map(|h| (h - st.mean_h).powi(2))
+            .sum::<f32>()
+            / m)
+            .sqrt();
     }
     let dx = end.x - start.x;
     let dz = end.z - start.z;
@@ -211,9 +221,17 @@ fn s1_go2_stands_3600_ticks() {
     print_stats("s1", &st);
     assert!(!st.removed, "主体被移除");
     assert!(!st.non_finite, "位姿出现非有限数");
-    assert!(st.min_up_after_120 >= 0.95, "第 120 拍后最小 up·y = {}", st.min_up_after_120);
+    assert!(
+        st.min_up_after_120 >= 0.95,
+        "第 120 拍后最小 up·y = {}",
+        st.min_up_after_120
+    );
     assert!(st.std_h <= 0.01, "第 600 拍后高度标准差 = {}", st.std_h);
-    assert!(st.max_rms <= 0.15, "第 600 拍后最大关节 RMS = {}", st.max_rms);
+    assert!(
+        st.max_rms <= 0.15,
+        "第 600 拍后最大关节 RMS = {}",
+        st.max_rms
+    );
     let clearance = st.mean_h - GROUND_TOP;
     assert!(
         (0.25..=0.40).contains(&clearance),
@@ -233,8 +251,11 @@ fn s2_spawn_transient() {
         sim.step();
         sim.run_transient_lifecycle();
         let _ = sim.take_outbox();
-        let root = root_pose(&mut sim).expect("主体未被移除");
-        assert!(root.translation.is_finite() && root.rotation.is_finite(), "第 {tick} 拍位姿非有限");
+        let root = root_pose(&sim).expect("主体未被移除");
+        assert!(
+            root.translation.is_finite() && root.rotation.is_finite(),
+            "第 {tick} 拍位姿非有限"
+        );
         let q = sim.agent_joint_positions(a()).expect("关节角可读");
         println!(
             "s2: {tick}, {:.6}, {:.6}, {:.6}",

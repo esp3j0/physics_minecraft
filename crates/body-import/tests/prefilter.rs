@@ -52,8 +52,18 @@ fn p4_duplicate_material_in_visual() {
         .iter()
         .map(|(k, n)| (k.as_str(), *n))
         .collect();
-    assert_eq!(ignored.get("visual"), Some(&1), "ignored = {:?}", report.ignored);
-    assert_eq!(ignored.get("material"), Some(&2), "ignored = {:?}", report.ignored);
+    assert_eq!(
+        ignored.get("visual"),
+        Some(&1),
+        "ignored = {:?}",
+        report.ignored
+    );
+    assert_eq!(
+        ignored.get("material"),
+        Some(&2),
+        "ignored = {:?}",
+        report.ignored
+    );
     assert!(
         report.notes.iter().any(|n| n.contains("视觉元素")),
         "notes 应含视觉元素提示:{:?}",

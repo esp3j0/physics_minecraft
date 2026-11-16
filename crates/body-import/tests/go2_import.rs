@@ -75,15 +75,26 @@ fn g1_structure() {
     let mut dropped = report.dropped_frames.clone();
     dropped.sort();
     assert_eq!(dropped, ["front_camera", "imu", "radar"]);
-    assert_eq!(report.merged_fixed.len(), 26, "merged_fixed = {:?}", report.merged_fixed);
+    assert_eq!(
+        report.merged_fixed.len(),
+        26,
+        "merged_fixed = {:?}",
+        report.merged_fixed
+    );
     assert!(report.meshes.is_empty(), "Go2 碰撞没有网格");
 }
 
 /// G2:字段抽查(架构师对照 URDF 手算)。对不上先打印实际值。
+// 期望值是任务书照抄的字面量(如 1.0472),不改写成 π/3 常量。
+#[allow(clippy::approx_constant)]
 #[test]
 fn g2_field_spot_checks() {
     let (def, _) = import_go2();
-    let base = def.links.iter().find(|l| l.name == "base").expect("base 连杆");
+    let base = def
+        .links
+        .iter()
+        .find(|l| l.name == "base")
+        .expect("base 连杆");
     match &base.shapes[0] {
         types::ShapeDef::Box { half, offset } => {
             println!("g2: base.shapes[0] = Box half {half:?} offset {offset:?}");
@@ -103,35 +114,100 @@ fn g2_field_spot_checks() {
     assert_eq!(def.joints[0].child, "FL_hip");
     assert_eq!(p0.axis, [1.0, 0.0, 0.0], "FL_hip axis 实测 {:?}", p0.axis);
     let l0 = p0.limits.expect("FL_hip 限位");
-    assert!((l0.lower - (-1.0472)).abs() <= TOL, "FL_hip lower = {}", l0.lower);
-    assert!((l0.upper - 1.0472).abs() <= TOL, "FL_hip upper = {}", l0.upper);
-    assert_eq!(p0.max_torque, Some(23.7), "FL_hip max_torque 实测 {:?}", p0.max_torque);
-    assert_eq!(p0.max_velocity, Some(30.1), "FL_hip max_velocity 实测 {:?}", p0.max_velocity);
-    assert_eq!(p0.default_angle, Some(0.0), "FL_hip default_angle 实测 {:?}", p0.default_angle);
+    assert!(
+        (l0.lower - (-1.0472)).abs() <= TOL,
+        "FL_hip lower = {}",
+        l0.lower
+    );
+    assert!(
+        (l0.upper - 1.0472).abs() <= TOL,
+        "FL_hip upper = {}",
+        l0.upper
+    );
+    assert_eq!(
+        p0.max_torque,
+        Some(23.7),
+        "FL_hip max_torque 实测 {:?}",
+        p0.max_torque
+    );
+    assert_eq!(
+        p0.max_velocity,
+        Some(30.1),
+        "FL_hip max_velocity 实测 {:?}",
+        p0.max_velocity
+    );
+    assert_eq!(
+        p0.default_angle,
+        Some(0.0),
+        "FL_hip default_angle 实测 {:?}",
+        p0.default_angle
+    );
 
     let p2 = def.joints[2].kind.params();
     println!("g2: joint2({}) = {p2:?}", def.joints[2].child);
     let l2 = p2.limits.expect("FL_calf 限位");
-    assert!((l2.lower - (-2.7227)).abs() <= TOL, "FL_calf lower = {}", l2.lower);
-    assert!((l2.upper - (-0.83776)).abs() <= TOL, "FL_calf upper = {}", l2.upper);
-    assert_eq!(p2.max_torque, Some(45.43), "FL_calf max_torque 实测 {:?}", p2.max_torque);
-    assert_eq!(p2.max_velocity, Some(15.7), "FL_calf max_velocity 实测 {:?}", p2.max_velocity);
-    assert_eq!(p2.default_angle, Some(-1.5), "FL_calf default_angle 实测 {:?}", p2.default_angle);
+    assert!(
+        (l2.lower - (-2.7227)).abs() <= TOL,
+        "FL_calf lower = {}",
+        l2.lower
+    );
+    assert!(
+        (l2.upper - (-0.83776)).abs() <= TOL,
+        "FL_calf upper = {}",
+        l2.upper
+    );
+    assert_eq!(
+        p2.max_torque,
+        Some(45.43),
+        "FL_calf max_torque 实测 {:?}",
+        p2.max_torque
+    );
+    assert_eq!(
+        p2.max_velocity,
+        Some(15.7),
+        "FL_calf max_velocity 实测 {:?}",
+        p2.max_velocity
+    );
+    assert_eq!(
+        p2.default_angle,
+        Some(-1.5),
+        "FL_calf default_angle 实测 {:?}",
+        p2.default_angle
+    );
 
     let p1 = def.joints[1].kind.params();
     println!("g2: joint1({}) = {p1:?}", def.joints[1].child);
-    assert_eq!(p1.default_angle, Some(0.8), "FL_thigh default_angle 实测 {:?}", p1.default_angle);
-    assert_eq!(p1.axis, [0.0, 0.0, -1.0], "FL_thigh axis 实测 {:?}", p1.axis);
+    assert_eq!(
+        p1.default_angle,
+        Some(0.8),
+        "FL_thigh default_angle 实测 {:?}",
+        p1.default_angle
+    );
+    assert_eq!(
+        p1.axis,
+        [0.0, 0.0, -1.0],
+        "FL_thigh axis 实测 {:?}",
+        p1.axis
+    );
 }
 
 /// G3:入库文件是最新的——重新导入的 hash 等于文件读入的 hash。
 #[test]
 fn g3_asset_up_to_date() {
     let (def, _) = import_go2();
-    let text = std::fs::read_to_string(repo_root().join("assets").join("bodies").join("go2.body.toml"))
-        .expect("读 go2.body.toml");
+    let text = std::fs::read_to_string(
+        repo_root()
+            .join("assets")
+            .join("bodies")
+            .join("go2.body.toml"),
+    )
+    .expect("读 go2.body.toml");
     let from_file = types::BodyDef::from_toml_str(&text).expect("文件应能解析");
-    assert_eq!(def.hash(), from_file.hash(), "入库文件与当前导入逻辑输出不一致");
+    assert_eq!(
+        def.hash(),
+        from_file.hash(),
+        "入库文件与当前导入逻辑输出不一致"
+    );
 }
 
 /// G4:确定性——导入两次,body_to_toml 逐字节相同。
@@ -150,16 +226,17 @@ fn n1_inertia_table() {
     use parry3d::math::Vector;
     use parry3d::shape::SharedShape;
     let (def, _) = import_go2();
-    println!("n1: | 连杆 | 质量 | 形状数 | Ixx_shape | Iyy_shape | Izz_shape | Ixx_urdf | Iyy_urdf | Izz_urdf | rx | ry | rz |");
+    println!(
+        "n1: | 连杆 | 质量 | 形状数 | Ixx_shape | Iyy_shape | Izz_shape | Ixx_urdf | Iyy_urdf | Izz_urdf | rx | ry | rz |"
+    );
     println!("n1: |---|---|---|---|---|---|---|---|---|---|---|---|");
     for link in &def.links {
         let mut parts: Vec<(f64, [f64; 3], [[f64; 3]; 3])> = Vec::new();
         for s in &link.shapes {
             let (shape, offset) = match s {
-                types::ShapeDef::Box { half, offset } => (
-                    SharedShape::cuboid(half[0], half[1], half[2]),
-                    *offset,
-                ),
+                types::ShapeDef::Box { half, offset } => {
+                    (SharedShape::cuboid(half[0], half[1], half[2]), *offset)
+                }
                 types::ShapeDef::Sphere { radius, offset } => (SharedShape::ball(*radius), *offset),
                 types::ShapeDef::CapsuleY {
                     half_height,
@@ -167,8 +244,10 @@ fn n1_inertia_table() {
                     offset,
                 } => (SharedShape::capsule_y(*half_height, *radius), *offset),
                 types::ShapeDef::ConvexHull { points, offset } => {
-                    let pts: Vec<Vector> =
-                        points.iter().map(|p| Vector::new(p[0], p[1], p[2])).collect();
+                    let pts: Vec<Vector> = points
+                        .iter()
+                        .map(|p| Vector::new(p[0], p[1], p[2]))
+                        .collect();
                     (SharedShape::convex_hull(&pts).expect("凸包可建"), *offset)
                 }
             };
