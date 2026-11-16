@@ -59,7 +59,7 @@ pub(crate) fn convert(
                         * 0.5,
                 ];
                 let half = clean_vec(half);
-                let volume = (half[0] * half[1] * half[2] * 8.0) as f32;
+                let volume = half[0] * half[1] * half[2] * 8.0;
                 Ok(ConvertedShape {
                     shape: types::ShapeDef::Box { half, offset },
                     note: crate::ShapeNote {

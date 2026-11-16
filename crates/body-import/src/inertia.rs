@@ -57,13 +57,9 @@ mod tests {
         let r = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         let out = rotate(&i, &r);
         let e = [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 3.0]];
-        for oi in 0..3 {
-            for oj in 0..3 {
-                assert!(
-                    (out.0[oi][oj] - e[oi][oj]).abs() < 1e-12,
-                    "out[{oi}][{oj}] = {}",
-                    out.0[oi][oj]
-                );
+        for (oi, row) in out.0.iter().enumerate() {
+            for (oj, v) in row.iter().enumerate() {
+                assert!((v - e[oi][oj]).abs() < 1e-12, "out[{oi}][{oj}] = {v}");
             }
         }
     }
@@ -110,13 +106,9 @@ mod tests {
         let r = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
         let out = rotate(&i, &r);
         let e = [[2.0, -0.5, 0.0], [-0.5, 1.0, 0.0], [0.0, 0.0, 3.0]];
-        for oi in 0..3 {
-            for oj in 0..3 {
-                assert!(
-                    (out.0[oi][oj] - e[oi][oj]).abs() < 1e-12,
-                    "out[{oi}][{oj}] = {}",
-                    out.0[oi][oj]
-                );
+        for (oi, row) in out.0.iter().enumerate() {
+            for (oj, v) in row.iter().enumerate() {
+                assert!((v - e[oi][oj]).abs() < 1e-12, "out[{oi}][{oj}] = {v}");
             }
         }
     }
@@ -140,13 +132,9 @@ mod tests {
         let i = Tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0], [0.0, 0.0, 3.0]]);
         let out = shift(&i, 4.0, [0.5, 0.5, 0.0]);
         let e = [[2.0, -1.0, 0.0], [-1.0, 3.0, 0.0], [0.0, 0.0, 5.0]];
-        for oi in 0..3 {
-            for oj in 0..3 {
-                assert!(
-                    (out.0[oi][oj] - e[oi][oj]).abs() < 1e-12,
-                    "out[{oi}][{oj}] = {}",
-                    out.0[oi][oj]
-                );
+        for (oi, row) in out.0.iter().enumerate() {
+            for (oj, v) in row.iter().enumerate() {
+                assert!((v - e[oi][oj]).abs() < 1e-12, "out[{oi}][{oj}] = {v}");
             }
         }
     }
