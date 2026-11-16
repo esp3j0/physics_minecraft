@@ -122,6 +122,23 @@ fn m1_box_obj() {
     assert_vol(sn.volume_out, 0.048);
 }
 
+/// M1b(变异 11 补):box.obj 所有面反向,体积仍应取绝对值 0.048。
+#[test]
+fn m1b_reversed_faces() {
+    let tmp = tempfile::TempDir::new().expect("临时目录");
+    let obj = "# 面全部反向的盒\nv -0.1 -0.2 -0.3\nv 0.1 -0.2 -0.3\nv 0.1 0.2 -0.3\nv -0.1 0.2 -0.3\nv -0.1 -0.2 0.3\nv 0.1 -0.2 0.3\nv 0.1 0.2 0.3\nv -0.1 0.2 0.3\nv 0 0 0\nv 0.1 0.2 0.3\nf 1 2 3 4\nf 8 7 6 5\nf 5 6 2 1\nf 6 7 3 2\nf 7 8 4 3\nf 8 5 1 4\n";
+    std::fs::write(tmp.path().join("rbox.obj"), obj).expect("写反向 OBJ");
+    let (def, report) = import(&mesh_urdf("rbox.obj", None, None), tmp.path(), &opts());
+    assert_point_set(&hull_points(&def), &corners(0.1, 0.3, 0.2));
+    let m = &report.meshes[0];
+    assert_eq!(m.vertices, 10);
+    assert_eq!(m.triangles, 12);
+    assert_eq!(m.hull_full, 8);
+    assert_vol(m.mesh_volume, 0.048);
+    assert_vol(m.hull_volume, 0.048);
+    assert_vol(m.out_volume, 0.048);
+}
+
 /// M2:scale="2 1 0.5" → (±0.2, ±0.15, ±0.2),三个体积都是 0.048。
 #[test]
 fn m2_scale() {
