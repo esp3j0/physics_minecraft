@@ -392,8 +392,8 @@ pub(crate) fn import_impl(
             }
             let r_full = mat_mul(&nodes[*mi].w_l, &rpy_to_mat(inertial.origin.rpy.0));
             let rotated = rotate(&raw, &r_full);
-            for dg in 0..3 {
-                if !rotated.0[dg][dg].is_finite() || rotated.0[dg][dg] <= 0.0 {
+            for (dg, row) in rotated.0.iter().enumerate() {
+                if !row[dg].is_finite() || row[dg] <= 0.0 {
                     return Err(crate::ImportError::BadInertia {
                         link: group.head.clone(),
                     });
