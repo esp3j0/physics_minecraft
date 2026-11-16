@@ -2,10 +2,19 @@
 
 use crate::frames::{Mat3, clean_vec, mat_vec, normalize};
 
+/// 网格转换上下文(C01b 任务书 1.5)。
+pub(crate) struct MeshCtx<'a> {
+    pub base_dir: &'a std::path::Path,
+    pub packages: &'a std::collections::BTreeMap<String, std::path::PathBuf>,
+    pub max_points: u32,
+}
+
 /// 一个形状的换算结果:ShapeDef 本体 + 报告记录。
 pub(crate) struct ConvertedShape {
     pub shape: types::ShapeDef,
     pub note: crate::ShapeNote,
+    /// 网格形状才有(C01b)。
+    pub mesh: Option<crate::MeshNote>,
 }
 
 /// URDF 几何 → ShapeDef(任务书 1.5 表格)。
@@ -16,13 +25,15 @@ pub(crate) struct ConvertedShape {
 /// - `r_s`:`R_s = W_L · R(rpy_collision)`(形状坐标系 → BodyDef 连杆系);
 /// - `segments`:圆柱转凸包每圈点数(调用方已校验 8..=64)。
 ///
-/// `Err` 时的变体:`UnsupportedShape` / `MeshNotYetSupported`。
+/// `Err` 时的变体:`UnsupportedShape` / `MeshFileMissing` / `MeshParse` /
+/// `MeshDegenerate`。
 pub(crate) fn convert(
     link: &str,
     geometry: &urdf_rs::Geometry,
     offset: [f32; 3],
     r_s: &Mat3,
     segments: u32,
+    mesh_ctx: &MeshCtx,
 ) -> Result<ConvertedShape, crate::ImportError> {
     match geometry {
         urdf_rs::Geometry::Sphere { radius } => {
@@ -40,6 +51,7 @@ pub(crate) fn convert(
                     volume_out: sphere_volume(f64::from(radius)) as f32,
                     hull_points: 0,
                 },
+                mesh: None,
             })
         }
         urdf_rs::Geometry::Box { size } => {
@@ -70,6 +82,7 @@ pub(crate) fn convert(
                         volume_out: volume,
                         hull_points: 0,
                     },
+                    mesh: None,
                 })
             } else {
                 // 其它朝向 → 8 点凸包:R_s · (±h),按生成顺序写,不排序不去重。
@@ -94,6 +107,7 @@ pub(crate) fn convert(
                         volume_out: volume,
                         hull_points: 8,
                     },
+                    mesh: None,
                 })
             }
         }
@@ -115,6 +129,7 @@ pub(crate) fn convert(
                     volume_out: volume_out as f32,
                     hull_points: (2 * segments) as usize,
                 },
+                mesh: None,
             })
         }
         urdf_rs::Geometry::Capsule { radius, length } => {
@@ -153,13 +168,95 @@ pub(crate) fn convert(
                     volume_out: volume,
                     hull_points: 0,
                 },
+                mesh: None,
             })
         }
-        urdf_rs::Geometry::Mesh { filename, .. } => Err(crate::ImportError::MeshNotYetSupported {
-            link: link.to_owned(),
-            file: filename.clone(),
-        }),
+        urdf_rs::Geometry::Mesh { filename, scale } => {
+            convert_mesh(link, filename, scale.as_ref(), offset, r_s, mesh_ctx)
+        }
     }
+}
+
+/// Mesh 分支(C01b 任务书 1.5):resolve → 读文件 → 按扩展名解析 →
+/// hull_from_mesh → ConvexHull。
+fn convert_mesh(
+    link: &str,
+    filename: &str,
+    scale: Option<&urdf_rs::Vec3>,
+    offset: [f32; 3],
+    r_s: &Mat3,
+    ctx: &MeshCtx,
+) -> Result<ConvertedShape, crate::ImportError> {
+    let ext = std::path::Path::new(filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_stl = ext.as_deref() == Some("stl");
+    let is_obj = ext.as_deref() == Some("obj");
+    if !is_stl && !is_obj {
+        return Err(bad_shape(link, format!("网格 {filename}:只支持 STL、OBJ")));
+    }
+    let path = crate::mesh::resolve(filename, ctx.base_dir, ctx.packages).map_err(|tried| {
+        crate::ImportError::MeshFileMissing {
+            link: link.to_owned(),
+            file: filename.to_owned(),
+            tried,
+        }
+    })?;
+    let parse_err = |reason: String| crate::ImportError::MeshParse {
+        link: link.to_owned(),
+        file: filename.to_owned(),
+        reason,
+    };
+    let meta = std::fs::metadata(&path).map_err(|e| parse_err(format!("读元数据失败:{e}")))?;
+    if meta.len() > 64 * 1024 * 1024 {
+        return Err(parse_err(format!(
+            "文件 {} 字节,超过 64 MB 上限",
+            meta.len()
+        )));
+    }
+    let bytes = std::fs::read(&path).map_err(|e| parse_err(format!("读取失败:{e}")))?;
+    let raw = if is_stl {
+        crate::mesh::parse_stl(&bytes)
+    } else {
+        let text = String::from_utf8(bytes).map_err(|e| parse_err(format!("OBJ 非 UTF-8:{e}")))?;
+        crate::mesh::parse_obj(&text)
+    }
+    .map_err(parse_err)?;
+    let scale = scale.map(|s| s.0).unwrap_or([1.0, 1.0, 1.0]);
+    let hull = crate::mesh::hull_from_mesh(&raw, scale, r_s, ctx.max_points).map_err(|reason| {
+        crate::ImportError::MeshDegenerate {
+            link: link.to_owned(),
+            file: filename.to_owned(),
+            reason,
+        }
+    })?;
+    let st = hull.note;
+    Ok(ConvertedShape {
+        shape: types::ShapeDef::ConvexHull {
+            points: hull.points,
+            offset,
+        },
+        note: crate::ShapeNote {
+            link: link.to_owned(),
+            from: "mesh".into(),
+            to: "convex_hull".into(),
+            volume_src: st.mesh_volume,
+            volume_out: st.out_volume,
+            hull_points: st.hull_out,
+        },
+        mesh: Some(crate::MeshNote {
+            link: link.to_owned(),
+            file: filename.to_owned(),
+            vertices: st.vertices,
+            triangles: st.triangles,
+            hull_full: st.hull_full,
+            hull_out: st.hull_out,
+            mesh_volume: st.mesh_volume,
+            hull_volume: st.hull_volume,
+            out_volume: st.out_volume,
+        }),
+    })
 }
 
 /// 圆柱凸包顶点(任务书 1.5):两圈各 `segments` 个点,圆周均分;
@@ -334,7 +431,14 @@ mod tests {
         let geometry = urdf_rs::Geometry::Box {
             size: urdf_rs::Vec3([1.0, 1.0, 2.0]),
         };
-        let out = convert("testlink", &geometry, [0.1, 0.2, 0.3], &r_s, 16).expect("45° 盒转凸包");
+        let pkgs = std::collections::BTreeMap::new();
+        let ctx = MeshCtx {
+            base_dir: std::path::Path::new("."),
+            packages: &pkgs,
+            max_points: 32,
+        };
+        let out =
+            convert("testlink", &geometry, [0.1, 0.2, 0.3], &r_s, 16, &ctx).expect("45° 盒转凸包");
         assert_eq!(out.note.from, "box");
         assert_eq!(out.note.to, "convex_hull");
         assert_eq!(out.note.hull_points, 8);

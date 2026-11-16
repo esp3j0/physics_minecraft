@@ -158,6 +158,8 @@ pub fn run(args: &ImportBodyArgs) -> Result<String, String> {
         friction: args.friction,
         default_angles,
         cylinder_segments: args.cylinder_segments,
+        max_hull_points: 32,
+        package_dirs: std::collections::BTreeMap::new(),
     };
     let (def, report) = body_import::import_urdf(&urdf_xml, &base_dir, &opts)
         .map_err(|e| format!("导入失败:{e}"))?;
@@ -263,6 +265,8 @@ mod tests {
             friction: 0.6,
             default_angles: std::collections::BTreeMap::new(),
             cylinder_segments: 16,
+            max_hull_points: 32,
+            package_dirs: std::collections::BTreeMap::new(),
         };
         let xml = std::fs::read_to_string(testbot()).expect("读 testbot");
         let (direct, _) = body_import::import_urdf(&xml, &data_dir(), &opts).expect("直接导入");

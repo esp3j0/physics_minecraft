@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 
 use crate::frames::{clean, clean_vec, mat_mul, mat_vec, normalize, rpy_to_mat, up_axis_matrix};
 use crate::inertia::{Tensor, rotate, shift};
-use crate::report::{ImportOptions, ImportReport, InertiaNote, ShapeNote};
+use crate::report::{ImportOptions, ImportReport, InertiaNote, MeshNote, ShapeNote};
 use crate::shapes;
 
 /// 树中每个 URDF 连杆的换算结果。
@@ -27,7 +27,7 @@ struct Node {
     /// mass=0 + 张量全零;真实模型质量不为 0,据此判"缺失"。
     inertial: Option<urdf_rs::Inertial>,
     /// 碰撞形状(已换算到 BodyDef 系;offset 尚未加合并平移)。
-    shapes: Vec<(types::ShapeDef, ShapeNote)>,
+    shapes: Vec<(types::ShapeDef, ShapeNote, Option<MeshNote>)>,
 }
 
 /// 合并组(一个输出连杆)。
@@ -37,7 +37,7 @@ struct Group {
     /// (成员连杆下标, 质心在 BodyDef 系里的位置)。
     members: Vec<(usize, [f64; 3])>,
     /// 形状(offset 已平移)。
-    shapes: Vec<(types::ShapeDef, ShapeNote)>,
+    shapes: Vec<(types::ShapeDef, ShapeNote, Option<MeshNote>)>,
     any_inertial: bool,
 }
 
@@ -91,6 +91,7 @@ fn inertial_missing(inertial: &urdf_rs::Inertial) -> bool {
 
 pub(crate) fn import_impl(
     urdf_xml: &str,
+    base_dir: &std::path::Path,
     opts: &ImportOptions,
 ) -> Result<(types::BodyDef, ImportReport), crate::ImportError> {
     // ---- 解析(未知关节类型字符串在这一层被 urdf-rs 拒绝 → Xml)----
@@ -105,6 +106,12 @@ pub(crate) fn import_impl(
         return Err(crate::ImportError::BadOption(format!(
             "cylinder_segments = {} 超出范围 8..=64",
             opts.cylinder_segments
+        )));
+    }
+    if !(4..=255).contains(&opts.max_hull_points) {
+        return Err(crate::ImportError::BadOption(format!(
+            "max_hull_points = {} 超出范围 4..=255",
+            opts.max_hull_points
         )));
     }
     for (k, v) in [
@@ -244,6 +251,11 @@ pub(crate) fn import_impl(
             // 质量与张量的有限性在组合成段校验(BadMass / BadInertia)。
             node.inertial = Some(raw.clone());
         }
+        let mesh_ctx = shapes::MeshCtx {
+            base_dir,
+            packages: &opts.package_dirs,
+            max_points: opts.max_hull_points,
+        };
         for col in &link.collision {
             let r_s = mat_mul(&w, &rpy_to_mat(col.origin.rpy.0));
             let offset = clean_vec(mat_vec(&w, col.origin.xyz.0));
@@ -253,8 +265,10 @@ pub(crate) fn import_impl(
                 offset,
                 &r_s,
                 opts.cylinder_segments,
+                &mesh_ctx,
             )?;
-            node.shapes.push((converted.shape, converted.note));
+            node.shapes
+                .push((converted.shape, converted.note, converted.mesh));
         }
     }
 
@@ -326,16 +340,17 @@ pub(crate) fn import_impl(
                 });
             }
         }
-        for (s, n) in &node.shapes {
+        for (s, n, m) in &node.shapes {
             let mut s = s.clone();
             translate_shape(&mut s, d);
-            group.shapes.push((s, n.clone()));
+            group.shapes.push((s, n.clone(), m.clone()));
         }
     }
 
     // ---- 每组:质量/质心/惯量合并、校验、LinkDef ----
     let mut out_links: Vec<types::LinkDef> = Vec::new();
     let mut shape_notes: Vec<ShapeNote> = Vec::new();
+    let mut mesh_notes: Vec<MeshNote> = Vec::new();
     let mut inertia_notes: Vec<InertiaNote> = Vec::new();
     let mut total_mass = 0.0f32;
     for group in &groups {
@@ -431,8 +446,11 @@ pub(crate) fn import_impl(
                 count: group.shapes.len(),
             });
         }
-        for (_, n) in &group.shapes {
+        for (_, n, m) in &group.shapes {
             shape_notes.push(n.clone());
+            if let Some(mn) = m {
+                mesh_notes.push(mn.clone());
+            }
         }
         out_links.push(types::LinkDef {
             name: group.head.clone(),
@@ -445,7 +463,7 @@ pub(crate) fn import_impl(
             ]),
             friction: opts.friction,
             restitution: 0.0,
-            shapes: group.shapes.iter().map(|(s, _)| s.clone()).collect(),
+            shapes: group.shapes.iter().map(|(s, ..)| s.clone()).collect(),
         });
         total_mass += m as f32;
     }
@@ -513,6 +531,24 @@ pub(crate) fn import_impl(
     };
     def.validate().map_err(crate::ImportError::Validate)?;
 
+    // 网格提示(C01b 任务书 1.6):明显非凸 / 体积为 0。
+    let mut notes = vec!["当前内核生成主体时不使用 com 和 inertia,惯量由碰撞形状推出。".to_owned()];
+    for m in &mesh_notes {
+        if m.mesh_volume > 0.0 && m.hull_volume / m.mesh_volume > 1.1 {
+            notes.push(format!(
+                "连杆 {} 的网格 {} 明显非凸,凸包体积是网格的 {:.2} 倍;不做凸分解。",
+                m.link,
+                m.file,
+                m.hull_volume / m.mesh_volume
+            ));
+        }
+        if m.mesh_volume == 0.0 {
+            notes.push(format!(
+                "连杆 {} 的网格 {} 体积为 0(没有面,或面不闭合恰好抵消),体积偏差无法给出。",
+                m.link, m.file
+            ));
+        }
+    }
     let report = ImportReport {
         total_mass,
         links: def.links.len(),
@@ -522,8 +558,9 @@ pub(crate) fn import_impl(
         dropped_frames,
         ignored: collect_ignored(urdf_xml, &robot),
         shapes: shape_notes,
+        meshes: mesh_notes,
         inertia: inertia_notes,
-        notes: vec!["当前内核生成主体时不使用 com 和 inertia,惯量由碰撞形状推出。".to_owned()],
+        notes,
     };
     Ok((def, report))
 }

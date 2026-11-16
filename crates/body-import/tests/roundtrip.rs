@@ -29,6 +29,8 @@ fn testbot() -> (types::BodyDef, body_import::ImportReport) {
         friction: 0.6,
         default_angles: BTreeMap::new(),
         cylinder_segments: 16,
+        max_hull_points: 32,
+        package_dirs: BTreeMap::new(),
     };
     import_urdf(&xml, &data_dir(), &opts).expect("import testbot")
 }

@@ -14,6 +14,8 @@ types = { path = "../types" }
 urdf-rs = "0.10"
 thiserror = "2"
 toml = "1"
+# C01b:网格转凸包(与内核建碰撞体同一套算法;rapier3d 已带进依赖树)。
+parry3d = "0.31.1"
 
 [dev-dependencies]
 physics-sim = { path = "../physics-sim" }

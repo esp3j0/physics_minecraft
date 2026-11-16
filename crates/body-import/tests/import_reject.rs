@@ -14,6 +14,8 @@ fn opts() -> ImportOptions {
         friction: 0.6,
         default_angles: BTreeMap::new(),
         cylinder_segments: 16,
+        max_hull_points: 32,
+        package_dirs: BTreeMap::new(),
     }
 }
 
@@ -268,11 +270,11 @@ fn j10_mesh() {
         &joint("j1", "revolute", "a", "b", &revolute_extra("-1", "1")),
     );
     match err(&xml) {
-        ImportError::MeshNotYetSupported { link, file } => {
+        ImportError::MeshFileMissing { link, file, .. } => {
             assert_eq!(link, "b");
             assert!(file.contains("leg.stl"), "file {file:?}");
         }
-        other => panic!("want MeshNotYetSupported, got {other:?}"),
+        other => panic!("want MeshFileMissing, got {other:?}"),
     }
 }
 

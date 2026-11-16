@@ -27,6 +27,8 @@ fn default_opts() -> ImportOptions {
         friction: 0.6,
         default_angles: BTreeMap::new(),
         cylinder_segments: 16,
+        max_hull_points: 32,
+        package_dirs: BTreeMap::new(),
     }
 }
 

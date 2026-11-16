@@ -47,6 +47,10 @@ pub mod report {
         pub default_angles: std::collections::BTreeMap<String, f32>,
         /// 圆柱转凸包时每圈的点数。默认 16,范围 8..=64。
         pub cylinder_segments: u32,
+        /// 网格凸包最多保留的顶点数。默认 32,范围 4..=255。
+        pub max_hull_points: u32,
+        /// `package://<包名>/…` 的包名 → 目录。没列出的包名按回退规则找。
+        pub package_dirs: std::collections::BTreeMap<String, std::path::PathBuf>,
     }
 
     /// 形状换算记录(任务书 1.2)。
@@ -72,6 +76,29 @@ pub mod report {
         pub offdiag_ratio: f32,
     }
 
+    /// 网格碰撞形状记录(C01b 任务书 1.2)。
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct MeshNote {
+        pub link: String,
+        /// URDF 里写的 filename 原文。
+        pub file: String,
+        /// 文件里的顶点数(去重前;STL 是三角形数 × 3)。
+        pub vertices: usize,
+        /// 文件里的三角形数(OBJ 的多边形面按扇形拆成三角形后计)。
+        pub triangles: usize,
+        /// 完整凸包的顶点数。
+        pub hull_full: usize,
+        /// 写进 BodyDef 的顶点数(≤ max_hull_points)。
+        pub hull_out: usize,
+        /// 网格自身的体积:带符号四面体体积之和取绝对值(m³,缩放后)。
+        /// 没有面时为 0。
+        pub mesh_volume: f32,
+        /// 完整凸包的体积。
+        pub hull_volume: f32,
+        /// 输出凸包(精简后)的体积。
+        pub out_volume: f32,
+    }
+
     /// 导入报告(任务书 1.2)。
     #[derive(Debug, Clone, PartialEq)]
     pub struct ImportReport {
@@ -88,6 +115,8 @@ pub mod report {
         pub ignored: Vec<(String, usize)>,
         /// 形状换算记录。
         pub shapes: Vec<ShapeNote>,
+        /// 每个网格碰撞形状一条。
+        pub meshes: Vec<MeshNote>,
         /// 每个输出连杆的惯量记录。
         pub inertia: Vec<InertiaNote>,
         /// 其它提示。
@@ -95,7 +124,7 @@ pub mod report {
     }
 }
 
-pub use report::{ImportOptions, ImportReport, InertiaNote, ShapeNote, UpAxis};
+pub use report::{ImportOptions, ImportReport, InertiaNote, MeshNote, ShapeNote, UpAxis};
 
 /// 导入失败原因(任务书 1.2)。
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -126,8 +155,24 @@ pub enum ImportError {
     NoCollision { link: String },
     #[error("连杆 {link} 的形状不支持:{what}")]
     UnsupportedShape { link: String, what: String },
-    #[error("连杆 {link} 用了网格 {file}:网格导入在 C01b,本版本不支持")]
-    MeshNotYetSupported { link: String, file: String },
+    #[error("连杆 {link} 的网格文件 {file} 找不到(试过:{tried:?})")]
+    MeshFileMissing {
+        link: String,
+        file: String,
+        tried: Vec<String>,
+    },
+    #[error("连杆 {link} 的网格文件 {file} 读取或解析失败:{reason}")]
+    MeshParse {
+        link: String,
+        file: String,
+        reason: String,
+    },
+    #[error("连杆 {link} 的网格 {file} 建不出凸包(顶点太少、共线或共面):{reason}")]
+    MeshDegenerate {
+        link: String,
+        file: String,
+        reason: String,
+    },
     #[error("连杆 {link} 合并后有 {count} 个碰撞形状,超过上限 8")]
     TooManyShapes { link: String, count: usize },
     #[error("选项非法:{0}")]
@@ -136,15 +181,14 @@ pub enum ImportError {
     Validate(types::BodyDefError),
 }
 
-/// URDF 文本 → BodyDef + 导入报告。纯函数:同样的输入,输出逐字节相同。
-/// `base_dir` 是 URDF 所在目录(C01b 找网格文件用,本单只透传)。
+/// URDF 文本 → BodyDef + 导入报告。纯函数:同样的输入文件和选项,输出
+/// 逐字节相同。`base_dir` 是 URDF 所在目录(网格文件查找的基点)。
 pub fn import_urdf(
     urdf_xml: &str,
     base_dir: &std::path::Path,
     opts: &ImportOptions,
 ) -> Result<(types::BodyDef, ImportReport), ImportError> {
-    let _ = base_dir; // C01b:网格文件查找
-    tree::import_impl(urdf_xml, opts)
+    tree::import_impl(urdf_xml, base_dir, opts)
 }
 
 /// URDF 的 robot name(xtask `--name` 缺省值)。

@@ -1,8 +1,11 @@
 //! REQ-012 C01b:网格文件查找、STL / OBJ 解析、凸包与精简(任务书 1.3–1.5)。
 //! 不引入网格解析库:STL / OBJ 只取顶点和面。
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use crate::frames::{Mat3, clean_vec, mat_vec};
 
 /// 路径文本里是否含 `..` 段(任务书 1.3:含 `..` 不解析)。
 fn has_parent_seg(s: &str) -> bool {
@@ -206,6 +209,198 @@ pub(crate) fn parse_stl(bytes: &[u8]) -> Result<RawMesh, String> {
     Ok(RawMesh {
         vertices,
         triangles,
+    })
+}
+
+/// 网格统计(MeshNote 去掉 link/file 的部分,任务书 1.5)。
+pub(crate) struct MeshStats {
+    pub vertices: usize,
+    pub triangles: usize,
+    pub hull_full: usize,
+    pub hull_out: usize,
+    pub mesh_volume: f32,
+    pub hull_volume: f32,
+    pub out_volume: f32,
+}
+
+/// 凸包转换结果:写进 ShapeDef 的点 + 统计。
+pub(crate) struct HullResult {
+    pub points: Vec<[f32; 3]>,
+    pub note: MeshStats,
+}
+
+/// 按 (x, y, z) 的 f32::total_cmp 字典序(任务书 1.5 第 3 步)。
+fn point_cmp(a: &[f32; 3], b: &[f32; 3]) -> Ordering {
+    a[0].total_cmp(&b[0])
+        .then(a[1].total_cmp(&b[1]))
+        .then(a[2].total_cmp(&b[2]))
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn sub(a: [f32; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        f64::from(a[0]) - b[0],
+        f64::from(a[1]) - b[1],
+        f64::from(a[2]) - b[2],
+    ]
+}
+
+/// 三角形集的带符号四面体体积之和取绝对值(f64 算)。
+/// `origin` 先减掉(凸包体积与原点无关,任务书 1.5 第 4 步)。
+fn tris_volume(points: &[[f32; 3]], tris: &[[u32; 3]], origin: [f64; 3]) -> f32 {
+    let mut sum = 0.0f64;
+    for t in tris {
+        let a = sub(points[t[0] as usize], origin);
+        let b = sub(points[t[1] as usize], origin);
+        let c = sub(points[t[2] as usize], origin);
+        sum += dot(a, cross(b, c)) / 6.0;
+    }
+    sum.abs() as f32
+}
+
+fn to_vectors(points: &[[f32; 3]]) -> Vec<parry3d::math::Vector3> {
+    points
+        .iter()
+        .map(|p| parry3d::math::Vector3::new(p[0], p[1], p[2]))
+        .collect()
+}
+
+/// 最远点采样(任务书 1.5 第 6 步):起始 = x/y/z 各轴最小、最大顶点
+/// (并列取排序靠前的,重复只留一次);之后每轮取"到已选集合最小距离"
+/// 最大的未选顶点(并列取排序靠前的)。返回选入顺序的下标。
+fn farthest_sample(sorted: &[[f32; 3]], max_points: usize) -> Vec<usize> {
+    let mut selected: Vec<usize> = Vec::new();
+    let mut chosen = vec![false; sorted.len()];
+    for axis in 0..3 {
+        for want_max in [false, true] {
+            let mut best = 0;
+            for (i, p) in sorted.iter().enumerate() {
+                let better = if want_max {
+                    p[axis] > sorted[best][axis]
+                } else {
+                    p[axis] < sorted[best][axis]
+                };
+                if better {
+                    best = i;
+                }
+            }
+            if !chosen[best] {
+                chosen[best] = true;
+                selected.push(best);
+            }
+        }
+    }
+    while selected.len() < max_points {
+        let mut best_i = None;
+        let mut best_d = -1.0f64;
+        for (i, p) in sorted.iter().enumerate() {
+            if chosen[i] {
+                continue;
+            }
+            let mut d = f64::INFINITY;
+            for &j in &selected {
+                let q = sorted[j];
+                let dx = f64::from(p[0]) - f64::from(q[0]);
+                let dy = f64::from(p[1]) - f64::from(q[1]);
+                let dz = f64::from(p[2]) - f64::from(q[2]);
+                d = d.min(dx * dx + dy * dy + dz * dz);
+            }
+            if d > best_d {
+                best_d = d;
+                best_i = Some(i);
+            }
+        }
+        match best_i {
+            Some(i) => {
+                chosen[i] = true;
+                selected.push(i);
+            }
+            None => break,
+        }
+    }
+    selected
+}
+
+/// 网格 → 凸包(任务书 1.5,步骤顺序固定保证确定)。
+/// `scale`:URDF mesh 的 scale;`r_s`:形状系 → 连杆系旋转。
+pub(crate) fn hull_from_mesh(
+    raw: &RawMesh,
+    scale: [f64; 3],
+    r_s: &Mat3,
+    max_points: u32,
+) -> Result<HullResult, String> {
+    // 1. 逐分量乘 scale,再乘 r_s,clean 成 f32。
+    if scale.iter().any(|s| !s.is_finite() || *s == 0.0) {
+        return Err(format!("scale {scale:?} 含非有限或 0 分量"));
+    }
+    let mut pts: Vec<[f32; 3]> = raw
+        .vertices
+        .iter()
+        .map(|v| {
+            let scaled = [v[0] * scale[0], v[1] * scale[1], v[2] * scale[2]];
+            clean_vec(mat_vec(r_s, scaled))
+        })
+        .collect();
+    // 2. mesh_volume:Σ a·(b×c)/6 取绝对值(f64)。没有面时为 0。
+    let mut sum = 0.0f64;
+    for t in &raw.triangles {
+        let a = pts[t[0]].map(f64::from);
+        let b = pts[t[1]].map(f64::from);
+        let c = pts[t[2]].map(f64::from);
+        sum += dot(a, cross(b, c)) / 6.0;
+    }
+    let mesh_volume = sum.abs() as f32;
+    // 3. 排序去重。
+    pts.sort_by(point_cmp);
+    pts.dedup();
+    // 4. 完整凸包;顶点排序,hull_volume 先减第一个顶点再算。
+    let (hull_pts, hull_tris) = parry3d::transformation::try_convex_hull(&to_vectors(&pts))
+        .map_err(|e| format!("try_convex_hull 失败:{e}"))?;
+    let hull_verts: Vec<[f32; 3]> = hull_pts.iter().map(|v| [v.x, v.y, v.z]).collect();
+    let origin = hull_verts[0].map(f64::from);
+    let hull_volume = tris_volume(&hull_verts, &hull_tris, origin);
+    let mut sorted = hull_verts;
+    sorted.sort_by(point_cmp);
+    let hull_full = sorted.len();
+    // 5/6. 不超上限直接输出;否则最远点采样精简后再建一次凸包。
+    let (points, out_volume) = if hull_full <= max_points as usize {
+        (sorted, hull_volume)
+    } else {
+        let sel = farthest_sample(&sorted, max_points as usize);
+        let out_pts: Vec<[f32; 3]> = sel.iter().map(|&i| sorted[i]).collect();
+        let (_, tris) = parry3d::transformation::try_convex_hull(&to_vectors(&out_pts))
+            .map_err(|e| format!("精简后 try_convex_hull 失败:{e}"))?;
+        let origin = out_pts[0].map(f64::from);
+        let vol = tris_volume(&out_pts, &tris, origin);
+        (out_pts, vol)
+    };
+    // 7. 少于 4 个点建不出碰撞体。
+    if points.len() < 4 {
+        return Err(format!("输出点数 {} < 4", points.len()));
+    }
+    let hull_out = points.len();
+    Ok(HullResult {
+        points,
+        note: MeshStats {
+            vertices: raw.vertices.len(),
+            triangles: raw.triangles.len(),
+            hull_full,
+            hull_out,
+            mesh_volume,
+            hull_volume,
+            out_volume,
+        },
     })
 }
 
