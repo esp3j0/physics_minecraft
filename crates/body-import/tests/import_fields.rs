@@ -43,14 +43,6 @@ fn assert_vec3(actual: [f32; 3], expected: [f32; 3]) {
     }
 }
 
-/// I7 用:对 Debug 文本做确定性哈希(DefaultHasher::new 固定密钥)。
-fn debug_hash<T: std::fmt::Debug>(v: &T) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{v:?}").hash(&mut h);
-    h.finish()
-}
-
 #[test]
 fn i1_links() {
     let (def, _) = import(&testbot_xml(), &default_opts());
@@ -420,8 +412,7 @@ fn i7_deterministic() {
     let (b, rb) = import(&xml, &opts);
     assert_eq!(a, b, "BodyDef 应相等");
     assert_eq!(ra, rb, "ImportReport 应相等");
-    assert_eq!(debug_hash(&a), debug_hash(&b), "BodyDef hash 应相等");
-    assert_eq!(debug_hash(&ra), debug_hash(&rb), "ImportReport hash 应相等");
+    assert_eq!(a.hash(), b.hash(), "BodyDef::hash 应相等");
 }
 
 #[test]
