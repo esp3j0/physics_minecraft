@@ -76,15 +76,15 @@ impl PolicyManifest {
         if !self.action_scale.is_finite() || self.action_scale <= 0.0 {
             return Err(bad("action_scale 须有限且 > 0"));
         }
-        if let Some(c) = self.action_clip {
-            if !c.is_finite() || c <= 0.0 {
-                return Err(bad("action_clip 须有限且 > 0"));
-            }
+        if let Some(c) = self.action_clip
+            && (!c.is_finite() || c <= 0.0)
+        {
+            return Err(bad("action_clip 须有限且 > 0"));
         }
-        if let Some(c) = self.obs_clip {
-            if !c.is_finite() || c <= 0.0 {
-                return Err(bad("obs_clip 须有限且 > 0"));
-            }
+        if let Some(c) = self.obs_clip
+            && (!c.is_finite() || c <= 0.0)
+        {
+            return Err(bad("obs_clip 须有限且 > 0"));
         }
         if self.obs.is_empty() {
             return Err(bad("obs 不能为空"));

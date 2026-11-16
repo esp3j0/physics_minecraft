@@ -14,8 +14,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn body(name: &str) -> BodyDef {
-    let text = std::fs::read_to_string(repo_root().join("assets/bodies").join(name))
-        .expect("读身体文件");
+    let text =
+        std::fs::read_to_string(repo_root().join("assets/bodies").join(name)).expect("读身体文件");
     BodyDef::from_toml_str(&text).expect("身体合法")
 }
 
@@ -24,12 +24,8 @@ fn quad() -> BodyDef {
 }
 
 fn fixture(name: &str) -> Vec<u8> {
-    std::fs::read(
-        repo_root()
-            .join("assets/policies/test_fixtures")
-            .join(name),
-    )
-    .expect("读夹具 ONNX")
+    std::fs::read(repo_root().join("assets/policies/test_fixtures").join(name))
+        .expect("读夹具 ONNX")
 }
 
 /// manifest 文本:extra 是 [[obs]] 之前的附加字段/表。
@@ -87,7 +83,10 @@ fn l2_body_hash() {
         }
     );
     let msg = err.to_string();
-    assert!(msg.contains("0000000000000000"), "错误文本含策略包哈希:{msg}");
+    assert!(
+        msg.contains("0000000000000000"),
+        "错误文本含策略包哈希:{msg}"
+    );
     assert!(msg.contains(&got), "错误文本含身体哈希:{msg}");
 }
 
@@ -155,10 +154,7 @@ default_angle = 0.0
     let text = manifest_text(&tiny.hash().hex(), &["base_ang_vel", "intent"], "");
     let m = PolicyManifest::from_toml_str(&text).expect("manifest 合法");
     let err = Policy::from_parts(m, &fixture("lin6x12.onnx"), &tiny).expect_err("动作维度不符");
-    assert_eq!(
-        err,
-        PolicyError::ActionDimMismatch { body: 1, model: 12 }
-    );
+    assert_eq!(err, PolicyError::ActionDimMismatch { body: 1, model: 12 });
 }
 
 /// L5 manifest 自身校验。
@@ -170,7 +166,8 @@ fn l5_manifest() {
     let cases: Vec<(String, &str)> = vec![
         (manifest_text("XYZ", &TERMS45, ""), "body_hash 非十六进制"),
         (
-            manifest_text(&hash, &TERMS45, "").replace("control_period_ticks = 2", "control_period_ticks = 0"),
+            manifest_text(&hash, &TERMS45, "")
+                .replace("control_period_ticks = 2", "control_period_ticks = 0"),
             "control_period_ticks = 0",
         ),
         (
@@ -178,10 +175,7 @@ fn l5_manifest() {
             "action_scale = 0",
         ),
         (manifest_text(&hash, &[], ""), "obs 为空"),
-        (
-            manifest_text(&hash, &["height_scan"], ""),
-            "不认识的 term",
-        ),
+        (manifest_text(&hash, &["height_scan"], ""), "不认识的 term"),
         (
             manifest_text(&hash, &TERMS45, "bogus_field = 1\n"),
             "未知字段",
@@ -192,7 +186,10 @@ fn l5_manifest() {
             Err(e) => e,
             Ok(m) => Policy::from_parts(m, &onnx, &q).expect_err(tag),
         };
-        assert!(matches!(err, PolicyError::Manifest(_)), "{tag}:实际 {err:?}");
+        assert!(
+            matches!(err, PolicyError::Manifest(_)),
+            "{tag}:实际 {err:?}"
+        );
         if tag == "不认识的 term" {
             assert!(err.to_string().contains("height_scan"), "文本含名字:{err}");
         }
@@ -206,7 +203,7 @@ fn l6_lengths() {
     let hash = q.hash().hex();
     let onnx = fixture("zero45x12.onnx");
 
-    let pose11 = format!("[{}]", vec!["0.0"; 11].join(", "));
+    let pose11 = format!("[{}]", ["0.0"; 11].join(", "));
     let text = manifest_text(&hash, &TERMS45, &format!("default_pose = {pose11}\n"));
     let m = PolicyManifest::from_toml_str(&text).expect("manifest 合法");
     let err = Policy::from_parts(m, &onnx, &q).expect_err("default_pose 长度");
@@ -218,8 +215,8 @@ fn l6_lengths() {
         }
     );
 
-    let mean44 = format!("[{}]", vec!["0.0"; 44].join(", "));
-    let std45 = format!("[{}]", vec!["1.0"; 45].join(", "));
+    let mean44 = format!("[{}]", ["0.0"; 44].join(", "));
+    let std45 = format!("[{}]", ["1.0"; 45].join(", "));
     let text = manifest_text(
         &hash,
         &TERMS45,
@@ -235,13 +232,16 @@ fn l6_lengths() {
         }
     );
 
-    let mean45 = format!("[{}]", vec!["0.0"; 45].join(", "));
+    let mean45 = format!("[{}]", ["0.0"; 45].join(", "));
     let mut stds = vec!["1.0".to_string(); 45];
     stds[7] = "0.0".to_string();
     let text = manifest_text(
         &hash,
         &TERMS45,
-        &format!("[normalization]\nmean = {mean45}\nstd = [{}]\n", stds.join(", ")),
+        &format!(
+            "[normalization]\nmean = {mean45}\nstd = [{}]\n",
+            stds.join(", ")
+        ),
     );
     let err = match PolicyManifest::from_toml_str(&text) {
         Err(e) => e,

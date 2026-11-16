@@ -67,7 +67,11 @@ pub fn observe(
     out: &mut Vec<f32>,
 ) -> Result<(), PolicyError> {
     let dof = default_pose.len();
-    for arr in [&snapshot.joint_pos, &snapshot.joint_vel, &snapshot.last_action] {
+    for arr in [
+        &snapshot.joint_pos,
+        &snapshot.joint_vel,
+        &snapshot.last_action,
+    ] {
         if arr.len() != dof {
             return Err(PolicyError::SnapshotDof {
                 expected: dof,

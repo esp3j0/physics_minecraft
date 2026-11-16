@@ -1,6 +1,10 @@
 //! REQ-012 D01a A 组:推理(任务书第 2 节)。
 //! 期望值由架构师手算给出(issue #25),照抄,不改数字。浮点容差 1e-5。
 
+// 期望值/姿态字面量照抄任务书(0.70710678、−0.853596389、1.70719278 等),
+// 不改写成常量、不降低精度。
+#![allow(clippy::approx_constant, clippy::excessive_precision)]
+
 use std::path::{Path, PathBuf};
 
 use policy::{AgentSnapshot, Policy, PolicyError, PolicyManifest};
@@ -17,18 +21,14 @@ fn repo_root() -> PathBuf {
 }
 
 fn quad() -> BodyDef {
-    let text = std::fs::read_to_string(repo_root().join("assets/bodies/quad.body.toml"))
-        .expect("读 quad");
+    let text =
+        std::fs::read_to_string(repo_root().join("assets/bodies/quad.body.toml")).expect("读 quad");
     BodyDef::from_toml_str(&text).expect("quad 合法")
 }
 
 fn fixture(name: &str) -> Vec<u8> {
-    std::fs::read(
-        repo_root()
-            .join("assets/policies/test_fixtures")
-            .join(name),
-    )
-    .expect("读夹具 ONNX")
+    std::fs::read(repo_root().join("assets/policies/test_fixtures").join(name))
+        .expect("读夹具 ONNX")
 }
 
 fn manifest_text(body_hash: &str, scale: f32, terms: &[&str], extra: &str) -> String {
@@ -133,7 +133,9 @@ fn a2_linear_model() {
     let a = p.act(&snap6()).expect("推理成功");
     assert_vec(
         &a.raw,
-        &[-0.03, 0.04, 0.03, 0.4, 0.0, -0.6, -0.21, 0.16, 0.09, 1.0, 0.0, -1.0],
+        &[
+            -0.03, 0.04, 0.03, 0.4, 0.0, -0.6, -0.21, 0.16, 0.09, 1.0, 0.0, -1.0,
+        ],
         "A2 raw",
     );
     assert_vec(
@@ -163,9 +165,21 @@ fn a2_linear_model() {
 fn a3_joint_limits() {
     let mut p = policy("lin6x12.onnx", 2.0, &TERMS6, "action_clip = 1.0\n");
     let a = p.act(&snap6()).expect("推理成功");
-    assert!((a.targets[9] - 0.8).abs() <= TOL, "targets[9] = {}", a.targets[9]);
-    assert!((a.targets[11] - 0.0).abs() <= TOL, "targets[11] = {}", a.targets[11]);
-    assert!((a.targets[3] - 0.8).abs() <= TOL, "targets[3] = {}", a.targets[3]);
+    assert!(
+        (a.targets[9] - 0.8).abs() <= TOL,
+        "targets[9] = {}",
+        a.targets[9]
+    );
+    assert!(
+        (a.targets[11] - 0.0).abs() <= TOL,
+        "targets[11] = {}",
+        a.targets[11]
+    );
+    assert!(
+        (a.targets[3] - 0.8).abs() <= TOL,
+        "targets[3] = {}",
+        a.targets[3]
+    );
     assert_eq!(a.clamped, 2);
 }
 
@@ -209,7 +223,9 @@ fn a10_clip_after_normalization() {
     let a = p.act(&snap6()).expect("推理成功");
     assert_vec(
         &a.raw,
-        &[0.0, 0.0, 0.0, 0.1, 0.0, -0.15, 0.0, 0.0, 0.0, 0.25, 0.0, -0.3],
+        &[
+            0.0, 0.0, 0.0, 0.1, 0.0, -0.15, 0.0, 0.0, 0.0, 0.25, 0.0, -0.3,
+        ],
         "A10 raw",
     );
 }

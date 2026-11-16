@@ -1,6 +1,9 @@
 //! REQ-012 D01a O 组:观测函数(任务书第 2 节)。
 //! 期望值由架构师手算给出(issue #25),照抄,不改数字。浮点容差 1e-5。
 
+// 姿态字面量照抄任务书(0.70710678),不改写成 FRAC_1_SQRT_2 常量。
+#![allow(clippy::approx_constant)]
+
 use policy::{AgentSnapshot, ObsEntry, ObsTerm, PolicyError, PolicyManifest, observe};
 use types::glam::{Quat, Vec3};
 
@@ -90,7 +93,9 @@ fn o3_joint_terms() {
     observe(&entries, &[0.1, 0.2, 0.3], &o3_snapshot(), &mut out).expect("观测成功");
     assert_vec(
         &out,
-        &[0.4, 0.0, -0.6, 0.05, 0.1, 0.15, 0.5, -0.5, 0.0, 1.0, 0.0, -1.0],
+        &[
+            0.4, 0.0, -0.6, 0.05, 0.1, 0.15, 0.5, -0.5, 0.0, 1.0, 0.0, -1.0,
+        ],
         "O3",
     );
 }
@@ -108,7 +113,9 @@ fn o4_order() {
     observe(&entries, &[0.1, 0.2, 0.3], &o3_snapshot(), &mut out).expect("观测成功");
     assert_vec(
         &out,
-        &[1.0, 0.0, -1.0, 0.5, -0.5, 0.0, 0.05, 0.1, 0.15, 0.4, 0.0, -0.6],
+        &[
+            1.0, 0.0, -1.0, 0.5, -0.5, 0.0, 0.05, 0.1, 0.15, 0.4, 0.0, -0.6,
+        ],
         "O4",
     );
 }

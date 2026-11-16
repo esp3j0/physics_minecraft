@@ -115,13 +115,13 @@ impl Policy {
             return Err(PolicyError::NoDof);
         }
         // 4. default_pose 长度;缺省取身体各关节 default_angle(没有就 0)。
-        if let Some(p) = &manifest.default_pose {
-            if p.len() != dof {
-                return Err(PolicyError::DefaultPoseLen {
-                    expected: dof,
-                    got: p.len(),
-                });
-            }
+        if let Some(p) = &manifest.default_pose
+            && p.len() != dof
+        {
+            return Err(PolicyError::DefaultPoseLen {
+                expected: dof,
+                got: p.len(),
+            });
         }
         let default_pose = manifest.default_pose.clone().unwrap_or_else(|| {
             body.dof_joints()
