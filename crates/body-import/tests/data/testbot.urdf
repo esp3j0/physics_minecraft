@@ -1,0 +1,124 @@
+<?xml version="1.0"?>
+<robot name="testbot">
+  <material name="grey"><color rgba="0.5 0.5 0.5 1"/></material>
+
+  <link name="base"/>
+
+  <link name="trunk">
+    <inertial>
+      <origin xyz="0.1 0 0" rpy="0 0 1.5707963267948966"/>
+      <mass value="10"/>
+      <inertia ixx="1" ixy="0.5" ixz="0" iyy="2" iyz="0" izz="3"/>
+    </inertial>
+    <visual>
+      <geometry><box size="1 0.6 0.4"/></geometry>
+      <material name="grey"/>
+    </visual>
+    <collision>
+      <geometry><box size="1 0.6 0.4"/></geometry>
+    </collision>
+  </link>
+
+  <link name="hip">
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0.01" ixy="0" ixz="0" iyy="0.01" iyz="0" izz="0.01"/>
+    </inertial>
+    <collision>
+      <geometry><sphere radius="0.1"/></geometry>
+    </collision>
+  </link>
+
+  <link name="thigh">
+    <inertial>
+      <origin xyz="0 0 -0.2" rpy="0 0 0"/>
+      <mass value="2"/>
+      <inertia ixx="0.02" ixy="0" ixz="0" iyy="0.02" iyz="0" izz="0.01"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 -0.2" rpy="1.5707963267948966 0 0"/>
+      <geometry><cylinder radius="0.05" length="0.4"/></geometry>
+    </collision>
+  </link>
+
+  <link name="foot">
+    <inertial>
+      <mass value="1"/>
+      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
+    </inertial>
+    <collision>
+      <geometry><sphere radius="0.05"/></geometry>
+    </collision>
+  </link>
+
+  <link name="slider">
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 1.5707963267948966"/>
+      <geometry><box size="0.2 0.4 0.1"/></geometry>
+    </collision>
+  </link>
+
+  <link name="wheel">
+    <inertial>
+      <mass value="0.5"/>
+      <inertia ixx="0.005" ixy="0" ixz="0" iyy="0.005" iyz="0" izz="0.005"/>
+    </inertial>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0.7853981633974483"/>
+      <geometry><box size="0.2 0.2 0.2"/></geometry>
+    </collision>
+  </link>
+
+  <link name="imu"/>
+
+  <joint name="base_to_trunk" type="fixed">
+    <parent link="base"/><child link="trunk"/>
+    <origin xyz="0 0 0.5" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="hip_joint" type="revolute">
+    <parent link="trunk"/><child link="hip"/>
+    <origin xyz="0.4 0.2 0" rpy="0 0 1.5707963267948966"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="-1" upper="1" effort="20" velocity="10"/>
+    <dynamics damping="0.1" friction="0"/>
+  </joint>
+
+  <joint name="thigh_joint" type="revolute">
+    <parent link="hip"/><child link="thigh"/>
+    <origin xyz="1 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-2" upper="2" effort="30" velocity="15"/>
+  </joint>
+
+  <joint name="foot_joint" type="fixed">
+    <parent link="thigh"/><child link="foot"/>
+    <origin xyz="0 0 -0.4" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="slide_joint" type="prismatic">
+    <parent link="trunk"/><child link="slider"/>
+    <origin xyz="-0.4 0 0.3" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="0.5" effort="50" velocity="2"/>
+  </joint>
+
+  <joint name="spin_joint" type="continuous">
+    <parent link="trunk"/><child link="wheel"/>
+    <origin xyz="0 -0.4 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit effort="5" velocity="0"/>
+  </joint>
+
+  <joint name="imu_joint" type="fixed">
+    <parent link="trunk"/><child link="imu"/>
+    <origin xyz="0.1 0 0.1" rpy="0 0 0"/>
+  </joint>
+
+  <transmission name="hip_trans"><type>transmission_interface/SimpleTransmission</type></transmission>
+  <gazebo reference="trunk"><selfCollide>false</selfCollide></gazebo>
+</robot>
