@@ -129,3 +129,46 @@ R2 的 align(+max(0, v·u) 无上限)、tier 阶梯(0.3/0.1/0.03 三级)、
   微调 10 分钟(21.38M 步,无 NaN)→ 变动物理 185/200、主口径 187/200;
 - 导出:观测归一化参数(mean/inv_std)写进 `policy.toml`(§5.2),
   `learn eval` 在 Rust 侧读 policy.toml 做归一化再喂 tract。
+
+## 四足(quad)(E02b-1)
+
+四足训练代码在新包 `quad/`(摆臂 demo `train/` 不动):
+
+```
+quad/
+  spec.py              独立解析身体+manifest(tomllib),算出与 VecEnv.spec()
+                       同键的字典;spec_matches 逐键核对(浮点 abs ≤ 1e-6)
+  backends/
+    base.py            VecBackend 接口(同 train,去掉 probe_env)
+    rapier.py          rapier 适配器:包装 agent_env.VecEnv(PyO3)
+    check.py           契约检查:常量单一来源/形状类型/线程无关/到时约定/
+                       动作裁剪/错误
+  manifests/
+    quad_train.toml    训练 manifest(48 维观测,无 normalization)
+```
+
+### 装 agent_env
+
+`agent_env` 由 `crates/agent-env` 的 cdylib(`python` 特性)经 maturin 装进
+本 venv(只装这一个模块,不动 venv 里别的包):
+
+```bash
+# 在仓库根,venv 激活的环境变量下(VIRTUAL_ENV 指向 tools/train/.venv):
+tools/train/.venv/Scripts/python.exe -m maturin develop --release \
+    -m crates/agent-env/Cargo.toml
+```
+
+pyproject 在 `crates/agent-env/pyproject.toml`(`module-name = "agent_env"`,
+`features = ["python"]`)。默认工作区门禁不带 `python` 特性,不链接 Python。
+
+### 跑契约检查
+
+```bash
+cd tools/train
+.venv/Scripts/python.exe -m quad.backends.check \
+    --body ../../assets/bodies/quad.body.toml \
+    --manifest quad/manifests/quad_train.toml
+```
+
+逐项打印 PASS/FAIL,有 FAIL 非零退出。环境常量全部由 Rust 侧 `VecEnv.spec()`
+从身体定义与 manifest 取,`quad/spec.py` 是独立核对侧(第 1 项逐键比对)。

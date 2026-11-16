@@ -8,6 +8,16 @@ publish = false
 # 与服务器驱动层同一套入口(send_agent_joint_targets_to + tick);观测拼装与
 # 动作 → 关节目标复用 policy::PolicyCodec。并行多实例/地形随机化/PyO3 后置。
 
+[lib]
+name = "agent_env"
+# rlib 给工作区测试/示例用;cdylib 给 maturin(--features python)装进 venv 用。
+crate-type = ["rlib", "cdylib"]
+
+[features]
+# PyO3 Python 模块(E02b-1;maturin develop --release 经 pyproject.toml 启用)。
+# 默认不启用:不链接 Python,工作区门禁不受影响。
+python = ["dep:pyo3", "dep:numpy"]
+
 [dependencies]
 types = { path = "../types" }
 sim-api = { path = "../sim-api" }
@@ -18,6 +28,8 @@ voxel = { path = "../voxel" }
 policy = { path = "../policy" }
 thiserror = "2"
 glam = { version = "0.33", features = ["serde"] }
+pyo3 = { version = "0.24", optional = true, features = ["extension-module"] }
+numpy = { version = "0.24", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

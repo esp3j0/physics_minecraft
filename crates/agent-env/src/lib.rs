@@ -14,6 +14,9 @@
 pub mod vec_env;
 pub use vec_env::{VecEnv, VecStep, episode_seed};
 
+#[cfg(feature = "python")]
+mod py;
+
 use messaging::InputSource;
 use physics_sim::{BodyRegistry, ShardSim, ShardSimConfig};
 use policy::{AgentSnapshot, PolicyCodec, PolicyError, PolicyManifest};
@@ -82,6 +85,56 @@ pub struct RewardInputs {
     pub prev_action: Vec<f32>,
     pub targets_clamped: u32,
     pub intent: [f32; 3],
+}
+
+/// 奖励原料各键的固定顺序与宽度(E02b-1;`reward_columns` 与 `spec()` 共用)。
+/// dof 为自由度数;`joint_pos`/`joint_vel`/`action`/`prev_action` 宽 dof,其余定宽。
+pub fn reward_key_widths(dof: usize) -> Vec<(&'static str, usize)> {
+    vec![
+        ("base_linvel_body", 3),
+        ("base_angvel_body", 3),
+        ("projected_gravity", 3),
+        ("root_height", 1),
+        ("up_y", 1),
+        ("joint_pos", dof),
+        ("joint_vel", dof),
+        ("action", dof),
+        ("prev_action", dof),
+        ("targets_clamped", 1),
+        ("intent", 3),
+    ]
+}
+
+/// 把一批 [`RewardInputs`] 摊平成各键的列数组(E02b-1;PyO3 `step` 与契约检查共用)。
+///
+/// 返回固定顺序的 `(键, 宽度 k, 数据)`:数据按环境下标拼接,长度 `n_envs × k`。
+/// 键序与宽度见 [`reward_key_widths`]。dof 取自首个奖励的 `joint_pos` 长度;
+/// 空切片返回各键空列(dof = 0)。
+pub fn reward_columns(rewards: &[RewardInputs]) -> Vec<(&'static str, usize, Vec<f32>)> {
+    let dof = rewards.first().map(|r| r.joint_pos.len()).unwrap_or(0);
+    let specs = reward_key_widths(dof);
+    let mut cols: Vec<Vec<f32>> = specs
+        .iter()
+        .map(|(_, k)| Vec::with_capacity(rewards.len() * k))
+        .collect();
+    for r in rewards {
+        cols[0].extend_from_slice(&r.base_linvel_body);
+        cols[1].extend_from_slice(&r.base_angvel_body);
+        cols[2].extend_from_slice(&r.projected_gravity);
+        cols[3].push(r.root_height);
+        cols[4].push(r.up_y);
+        cols[5].extend_from_slice(&r.joint_pos);
+        cols[6].extend_from_slice(&r.joint_vel);
+        cols[7].extend_from_slice(&r.action);
+        cols[8].extend_from_slice(&r.prev_action);
+        cols[9].push(r.targets_clamped as f32);
+        cols[10].extend_from_slice(&r.intent);
+    }
+    specs
+        .into_iter()
+        .zip(cols)
+        .map(|((name, k), col)| (name, k, col))
+        .collect()
 }
 
 /// 环境错误(任务书 §2.1)。

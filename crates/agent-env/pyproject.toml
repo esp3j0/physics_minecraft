@@ -1,0 +1,15 @@
+# agent_env PyO3 模块(E02b-1;maturin 装 tools/train/.venv)。
+# crate 就在本目录;python 特性挂 PyO3 封装(src/py.rs)。
+[build-system]
+requires = ["maturin>=1.7"]
+build-backend = "maturin"
+
+[project]
+name = "agent_env"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+features = ["python"]
+module-name = "agent_env"

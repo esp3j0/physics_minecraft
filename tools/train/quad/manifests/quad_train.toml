@@ -1,0 +1,36 @@
+# REQ-012 E02b-1:四足训练 manifest(无 normalization;训练环境输出未归一化观测)。
+# body_hash = quad.body.toml 的 BodyHash::hex();obs 共 48 维
+# (3+3+3+12+12+12+3),scale 全 1。default_pose 缺省取身体各关节 default_angle。
+name = "quad_train"
+body_hash = "b48ebc84674927da"
+control_period_ticks = 2
+action_scale = 0.25
+action_clip = 1.0
+
+[[obs]]
+term = "base_lin_vel"
+scale = 1.0
+
+[[obs]]
+term = "base_ang_vel"
+scale = 1.0
+
+[[obs]]
+term = "projected_gravity"
+scale = 1.0
+
+[[obs]]
+term = "joint_pos"
+scale = 1.0
+
+[[obs]]
+term = "joint_vel"
+scale = 1.0
+
+[[obs]]
+term = "last_action"
+scale = 1.0
+
+[[obs]]
+term = "intent"
+scale = 1.0
