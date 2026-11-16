@@ -743,7 +743,19 @@ fn h7_future_attached_at_not_emitted() {
 // ---- D01b-1(§1.2/§1.3):U1–U4、build_snapshot、策略驱动 ----
 
 use super::policy_table::PolicyTable;
+use super::policy_worker::{PolicyWorker, WorkerOptions};
 use super::{PolicyKey, build_snapshot};
+
+/// 测试用工作线程:等待预算 5 s(余量充足)、无调试延迟。
+fn worker5s(table: PolicyTable) -> PolicyWorker {
+    PolicyWorker::spawn(
+        table,
+        WorkerOptions {
+            wait_budget: std::time::Duration::from_secs(5),
+            debug_delay: std::time::Duration::ZERO,
+        },
+    )
+}
 
 /// U1:`PolicyKey::of` = 名字 UTF-8 字节的 FNV-1a(与 BodyHash 同算法)。
 #[test]
@@ -775,11 +787,18 @@ fn u2_policy_drive_skips_in_transit_and_frozen() {
     );
     let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
     let mut log = sim_api::log::CommandLog::new();
-    let mut table = PolicyTable::default();
+    let mut worker = worker5s(PolicyTable::default());
     let mut skip = std::collections::BTreeSet::new();
     skip.insert(e(1));
     let frozen = std::collections::BTreeSet::new();
-    host.drive_policies(&mut session, &mut log, &mut table, Tick(10), &skip, &frozen);
+    host.drive_policies(
+        &mut session,
+        &mut log,
+        &mut worker,
+        Tick(10),
+        &skip,
+        &frozen,
+    );
     assert_eq!(host.counters.skipped_in_transit, 1, "在途跳过恰计 1 次");
     assert_eq!(host.counters.policy_inferences, 0, "跳过不推理");
     assert_eq!(host.counters.policy_no_state, 0, "跳过不走取状态分支");
@@ -787,7 +806,14 @@ fn u2_policy_drive_skips_in_transit_and_frozen() {
     let skip = std::collections::BTreeSet::new();
     let mut frozen = std::collections::BTreeSet::new();
     frozen.insert(e(1));
-    host.drive_policies(&mut session, &mut log, &mut table, Tick(12), &skip, &frozen);
+    host.drive_policies(
+        &mut session,
+        &mut log,
+        &mut worker,
+        Tick(12),
+        &skip,
+        &frozen,
+    );
     assert_eq!(host.counters.skipped_frozen, 1, "冻结跳过恰计 1 次");
     assert_eq!(host.counters.policy_inferences, 0, "跳过不推理");
     assert_eq!(host.counters.policy_no_state, 0, "跳过不走取状态分支");
@@ -862,9 +888,16 @@ fn q8_empty_host_drive_policies_no_change() {
     let mut host = ControllerHost::default();
     let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
     let mut log = sim_api::log::CommandLog::new();
-    let mut table = PolicyTable::default();
+    let mut worker = worker5s(PolicyTable::default());
     let empty = std::collections::BTreeSet::new();
-    host.drive_policies(&mut session, &mut log, &mut table, Tick(10), &empty, &empty);
+    host.drive_policies(
+        &mut session,
+        &mut log,
+        &mut worker,
+        Tick(10),
+        &empty,
+        &empty,
+    );
     session.shutdown();
     assert_eq!(host.counters, ControllerCounters::default(), "计数全 0");
     assert!(log.entries().is_empty(), "日志为空");
@@ -964,13 +997,14 @@ fn policy_drive_updates_last_action() {
     let mut table = PolicyTable::default();
     let key = table.load(dir.path(), "wobble", &def).expect("策略包合法");
     assert_eq!(key, PolicyKey::of("wobble"));
+    let mut worker = worker5s(table);
     let mut host = ControllerHost::default();
     host.attach(a, ControllerKind::Policy(key), QUAD_DOF, 1, Tick(0), None)
         .expect("挂载合法");
     host.set_intent(a, [1.0, 0.0, -1.0]);
     let mut log = sim_api::log::CommandLog::new();
     let empty = std::collections::BTreeSet::new();
-    host.drive_policies(&mut session, &mut log, &mut table, Tick(1), &empty, &empty);
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(1), &empty, &empty);
     assert_eq!(host.counters.policy_inferences, 1, "成功推理恰 1 次");
     assert_eq!(host.counters.policy_errors, 0);
     assert_eq!(host.counters.actions_emitted, 1);
@@ -987,5 +1021,247 @@ fn policy_drive_updates_last_action() {
         "last_action[5] = raw −0.6,实得 {}",
         last[5]
     );
+    session.shutdown();
+}
+
+// ---- D01b-2(§1.3/§2.1):工作线程 W1–W5、meta -------------------------------
+
+const STAND_ONNX: &[u8] =
+    include_bytes!("../../../../assets/policies/test_fixtures/zero45x12.onnx");
+const BROKEN_ONNX: &[u8] = include_bytes!("../../../../assets/policies/test_fixtures/nan6x12.onnx");
+const STAND_OBS: &str = "obs = [{ term = \"base_lin_vel\" }, { term = \"base_ang_vel\" }, { term = \"projected_gravity\" }, { term = \"joint_pos\" }, { term = \"joint_vel\" }, { term = \"last_action\" }]\n";
+const BROKEN_OBS: &str = "obs = [{ term = \"base_ang_vel\" }, { term = \"intent\" }]\n";
+
+/// W 组布景(复用 `policy_drive_updates_last_action` 的真实会话):单分片 +
+/// 平地 + 生成四足,再加载一个策略包。返回 (Session, 主体, 已加载策略表)。
+/// 控制周期由调用方 attach(任务书:周期 2,t0 = 第一个控制拍 Tick(0))。
+fn policy_session(
+    name: &str,
+    onnx: &[u8],
+    obs: &str,
+    scale: f32,
+    clip: Option<f32>,
+) -> (sim_api::session::Session, EntityId, PolicyTable) {
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let hash = bodies.insert_toml(quad_asset()).expect("quad 合法");
+    let def = bodies.get(&hash).expect("哈希必在").clone();
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    let mut cfg = physics_sim::ShardSimConfig::new(shard);
+    cfg.solidify.enabled = false;
+    cfg.cohesion.enabled = false;
+    let sim = physics_sim::ShardSim::new_with_bodies(
+        cfg,
+        Box::new(voxel::SimpleRegistry::builtin()),
+        bodies.clone(),
+    );
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    session.register(sim);
+    for cx in 0..8i32 {
+        for cz in 0..8i32 {
+            let mut chunk = voxel::Chunk::air();
+            for x in 0..voxel::CHUNK_X {
+                for z in 0..voxel::CHUNK_Z {
+                    chunk.set(x, 64, z, types::BlockId(1));
+                }
+            }
+            session.apply_chunk_load(shard, types::ChunkPos::new(cx, cz), chunk);
+        }
+    }
+    let a = e(1);
+    session
+        .spawn_agent(
+            shard,
+            a,
+            hash,
+            types::EntityState {
+                translation: types::glam::Vec3::new(8.0, 66.0, 8.0),
+                rotation: types::glam::Quat::IDENTITY,
+                linvel: types::glam::Vec3::ZERO,
+                angvel: types::glam::Vec3::ZERO,
+            },
+        )
+        .expect("生成四足");
+    session.tick();
+    let dir = tempfile::TempDir::new().expect("临时目录");
+    let pkg = dir.path().join(name);
+    std::fs::create_dir(&pkg).expect("建策略包目录");
+    let clip_line = clip
+        .map(|c| format!("action_clip = {c}\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        pkg.join("policy.toml"),
+        format!(
+            "name = \"{name}\"\nbody_hash = \"{}\"\ncontrol_period_ticks = 2\naction_scale = {scale}\n{clip_line}{obs}",
+            hash.hex()
+        ),
+    )
+    .expect("写 policy.toml");
+    std::fs::write(pkg.join("policy.onnx"), onnx).expect("写 policy.onnx");
+    let mut table = PolicyTable::default();
+    table.load(dir.path(), name, &def).expect("策略包合法");
+    (session, a, table)
+}
+
+/// 挂一个周期 2、attached_at = Tick(0) 的策略槽位(t0 = Tick(0))。
+fn attach_policy(host: &mut ControllerHost, a: EntityId, name: &str) {
+    host.attach(
+        a,
+        ControllerKind::Policy(PolicyKey::of(name)),
+        QUAD_DOF,
+        2,
+        Tick(0),
+        None,
+    )
+    .expect("挂载合法");
+}
+
+/// W1 当拍收到:wait_budget 5 s、debug_delay 0。drive(t0) 后推理 1、晚到 0、
+/// 超时 0、requests_sent 1、日志 1 条。
+#[test]
+fn w1_reply_within_tick() {
+    let (mut session, a, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut worker = worker5s(table);
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "stand");
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(0), &empty, &empty);
+    assert_eq!(host.counters.policy_inferences, 1, "当拍推理 1 次");
+    assert_eq!(host.counters.policy_late, 0, "当拍收到不算晚到");
+    assert_eq!(host.counters.policy_timeouts, 0);
+    assert_eq!(worker.requests_sent(), 1);
+    assert_eq!(log.entries().len(), 1, "动作进日志");
+    session.shutdown();
+}
+
+/// W2 超时与作废:wait_budget 1 ms、debug_delay 300 ms。
+#[test]
+fn w2_timeout_and_abandon() {
+    let (mut session, a, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut worker = PolicyWorker::spawn(
+        table,
+        WorkerOptions {
+            wait_budget: std::time::Duration::from_millis(1),
+            debug_delay: std::time::Duration::from_millis(300),
+        },
+    );
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "stand");
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    // 1. drive(t0):发出请求,1 ms 内没回。
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(0), &empty, &empty);
+    assert_eq!(host.counters.policy_inferences, 0);
+    assert_eq!(worker.requests_sent(), 1);
+    // 2. drive(t0+1)(非控制拍):计数不变。
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(1), &empty, &empty);
+    assert_eq!(worker.requests_sent(), 1);
+    assert_eq!(host.counters.policy_timeouts, 0);
+    // 3. drive(t0+2)(控制拍):上一个还没回 → 超时 1、不发新请求。
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(2), &empty, &empty);
+    assert_eq!(host.counters.policy_timeouts, 1);
+    assert_eq!(worker.requests_sent(), 1, "在途时不发新请求");
+    // 4. sleep(600 ms) 让作废的回复回来;drive(t0+3):丢弃 1、推理 0、日志 0。
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(3), &empty, &empty);
+    assert_eq!(host.counters.policy_discarded, 1, "作废回复被丢弃");
+    assert_eq!(host.counters.policy_inferences, 0);
+    assert_eq!(log.entries().len(), 0);
+    // 5. drive(t0+4)(控制拍):再下一个控制拍才发新请求 → requests_sent 2、超时仍 1。
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(4), &empty, &empty);
+    assert_eq!(worker.requests_sent(), 2);
+    assert_eq!(host.counters.policy_timeouts, 1);
+    session.shutdown();
+}
+
+/// W3 晚到但在周期内:wait_budget 1 ms、debug_delay 50 ms。drive(t0) 推理 0;
+/// sleep(300 ms);drive(t0+1) 推理 1、晚到 1、发出 1、日志 1、超时 0。
+#[test]
+fn w3_late_within_period() {
+    let (mut session, a, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut worker = PolicyWorker::spawn(
+        table,
+        WorkerOptions {
+            wait_budget: std::time::Duration::from_millis(1),
+            debug_delay: std::time::Duration::from_millis(50),
+        },
+    );
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "stand");
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(0), &empty, &empty);
+    assert_eq!(host.counters.policy_inferences, 0);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(1), &empty, &empty);
+    assert_eq!(host.counters.policy_inferences, 1, "晚到回复被采用");
+    assert_eq!(host.counters.policy_late, 1);
+    assert_eq!(host.counters.actions_emitted, 1);
+    assert_eq!(log.entries().len(), 1);
+    assert_eq!(host.counters.policy_timeouts, 0);
+    session.shutdown();
+}
+
+/// W4 在途时主体被移除:wait_budget 1 ms、debug_delay 100 ms。drive(t0);
+/// on_removed;sleep(400 ms);drive(t0+1) → 丢弃 1、推理 0、不 panic。
+#[test]
+fn w4_removed_while_pending() {
+    let (mut session, a, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut worker = PolicyWorker::spawn(
+        table,
+        WorkerOptions {
+            wait_budget: std::time::Duration::from_millis(1),
+            debug_delay: std::time::Duration::from_millis(100),
+        },
+    );
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "stand");
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(0), &empty, &empty);
+    host.on_removed(a);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(1), &empty, &empty);
+    assert_eq!(host.counters.policy_discarded, 1, "主体已无槽位 → 丢弃");
+    assert_eq!(host.counters.policy_inferences, 0);
+    session.shutdown();
+}
+
+/// W5 坏策略:broken、wait_budget 5 s。drive(t0) 错误 1、推理 0、pending 已清;
+/// 再 drive(t0+2) 错误 2、超时 0。
+#[test]
+fn w5_broken_policy_clears_pending() {
+    let (mut session, a, table) = policy_session("broken", BROKEN_ONNX, BROKEN_OBS, 0.25, None);
+    let mut worker = worker5s(table);
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "broken");
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(0), &empty, &empty);
+    assert_eq!(host.counters.policy_errors, 1);
+    assert_eq!(host.counters.policy_inferences, 0);
+    host.drive_policies(&mut session, &mut log, &mut worker, Tick(2), &empty, &empty);
+    assert_eq!(
+        host.counters.policy_errors, 2,
+        "Err 清 pending,下个控制拍再发"
+    );
+    assert_eq!(host.counters.policy_timeouts, 0);
+    session.shutdown();
+}
+
+/// meta()(D01b-2 裁定):stand 的周期 = manifest 写的值、dof = 身体自由度、
+/// 条目数 = 已加载策略数。
+#[test]
+fn policy_meta_matches_manifest() {
+    let (session, _a, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let meta = table.meta();
+    assert_eq!(meta.len(), 1, "条目数 = 已加载策略数");
+    let m = meta[&PolicyKey::of("stand")];
+    assert_eq!(m.control_period_ticks, 2, "周期 = manifest 里写的值");
+    assert_eq!(m.dof, QUAD_DOF, "dof = 身体自由度数");
     session.shutdown();
 }

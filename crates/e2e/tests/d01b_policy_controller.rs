@@ -518,6 +518,8 @@ fn policy_agent(name: &str, intent: [f32; 3]) -> StartupAgentConfig {
 fn config_with_policies(agents: Vec<StartupAgentConfig>, dir: &tempfile::TempDir) -> Config {
     let mut c = quad_config(agents);
     c.policies_dir = dir.path().to_path_buf();
+    // D01b-2:正常推理几十微秒,等待预算放宽到 1 s,Q2–Q7/Q9 期望值不变。
+    c.policy_wait_budget_us = 1_000_000;
     c
 }
 
@@ -1110,5 +1112,103 @@ async fn q9_clamped_counted() {
         "关节10 目标 {} 与默认角 {} 差 ≥ 1e-6",
         t[10],
         default(10)
+    );
+}
+
+// ---- Q10:慢推理不阻塞 tick(AC-D3) -----------------------------------------
+
+/// Q10:stand 策略 + `policy_debug_delay_ms = 200`、`policy_wait_budget_us =
+/// 1000`,推 300 拍,用 `std::time::Instant` 量真实耗时。同步等的话是
+/// 150 × 0.2 s = 30 s;工作线程 + 超时沿用上次目标 → 真实耗时 < 6 s。
+/// timeouts ≥ 100、inferences ≤ 5、emitted == inferences、errors == 0、
+/// discarded ≥ 1;主体还在(13 连杆)、根高度与脚本站立 300 拍差 < 0.02。
+#[tokio::test(start_paused = true)]
+async fn q10_slow_inference_does_not_block() {
+    let y_ref = script_stand_height(300).await;
+    let dir = policy_dir();
+    // 基线 T0:正常 stand(debug_delay=0,wait_budget=1s),同布景推 300 拍。
+    // 采样布景每拍约 31ms 真实时间(real_yield),T0 即布景自身开销;慢推理
+    // 若不阻塞 tick,T1 应只比 T0 多一点点(同步等会多约 150s)。
+    let base_config = config_with_policies(vec![policy_agent("stand", [0.0; 3])], &dir);
+    let h0 = bootstrap_harness(base_config).await;
+    let (mut a0, mut rx0) = client(h0.addr).await;
+    let _p0 = join(&mut a0, &mut rx0, 8).await;
+    observe_at_quad(&mut a0).await;
+    // 墙钟量真实耗时(AC-D3 非确定性面;tokio 时间暂停不影响 std Instant)。
+    #[allow(clippy::disallowed_methods)]
+    let t0_start = std::time::Instant::now();
+    let (_e0, _n0, _s0) = sample_quad_root(&mut rx0, 300).await;
+    #[allow(clippy::disallowed_methods)]
+    let t0 = t0_start.elapsed();
+    drop(a0);
+    let _out0 = shutdown(h0).await;
+
+    // 慢推理 T1:debug_delay=1000ms(配置上限,每次推理至少 1s),wait_budget=1000us。
+    let mut config = config_with_policies(vec![policy_agent("stand", [0.0; 3])], &dir);
+    config.policy_wait_budget_us = 1000;
+    config.policy_debug_delay_ms = 1000;
+    let h = bootstrap_harness(config).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    observe_at_quad(&mut a).await;
+    #[allow(clippy::disallowed_methods)]
+    let t_start = std::time::Instant::now();
+    let (entity, nlinks, samples) = sample_quad_root(&mut rx, 300).await;
+    #[allow(clippy::disallowed_methods)]
+    let t1 = t_start.elapsed();
+    assert_eq!(nlinks, 13, "四足 13 连杆(主体还在)");
+    let y = samples.last().expect("非空").pos.y;
+    drop(a);
+    let outcome = shutdown(h).await;
+    let c = outcome.controller_counters;
+    println!(
+        "Q10 实测:T0 {:.3}s T1 {:.3}s;timeouts {} inferences {} emitted {} errors {} discarded {};\
+         参考高度 {y_ref:.6} 策略高度 {y:.6}(差 {:.6})entity {entity:?}",
+        t0.as_secs_f32(),
+        t1.as_secs_f32(),
+        c.policy_timeouts,
+        c.policy_inferences,
+        c.actions_emitted,
+        c.policy_errors,
+        c.policy_discarded,
+        (y - y_ref).abs()
+    );
+    assert!(
+        t1 < t0 + Duration::from_secs(5),
+        "T1 {t1:?} ≥ T0 {t0:?} + 5s(同步等会多约 150s,推理阻塞了 tick)"
+    );
+    assert!(
+        c.policy_timeouts >= 100,
+        "policy_timeouts {} < 100",
+        c.policy_timeouts
+    );
+    assert!(
+        c.policy_inferences <= 5,
+        "policy_inferences {} > 5",
+        c.policy_inferences
+    );
+    assert_eq!(
+        c.actions_emitted, c.policy_inferences,
+        "emitted == inferences"
+    );
+    assert_eq!(c.policy_errors, 0, "policy_errors 应为 0");
+    assert!(
+        c.policy_discarded >= 1,
+        "policy_discarded {} < 1",
+        c.policy_discarded
+    );
+    // 工作线程吞吐上限:每次推理至少 1s,T1 内最多 floor(T1 秒)+1 条回复被处理
+    // (采用记 inferences、丢弃记 discarded,二者之和不超过完成数)。
+    let throughput_cap = t1.as_secs() + 1;
+    assert!(
+        c.policy_inferences + c.policy_discarded <= throughput_cap,
+        "inferences {} + discarded {} > 吞吐上限 {throughput_cap}(T1 {:.3}s)",
+        c.policy_inferences,
+        c.policy_discarded,
+        t1.as_secs_f32()
+    );
+    assert!(
+        (y - y_ref).abs() < 0.02,
+        "根高度与脚本站立差 ≥ 0.02:策略 {y} vs 脚本 {y_ref}"
     );
 }

@@ -11,7 +11,19 @@ use super::PolicyKey;
 pub struct PolicyEntry {
     pub name: String,
     pub policy: policy::Policy,
+    /// 校验时对着的身体的自由度数(D01b-2 裁定:startup 挂载用)。
+    pub dof: usize,
 }
+
+/// 策略元数据(D01b-2 裁定方案 2):startup 挂载只读这份,不借整张表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyMeta {
+    pub dof: usize,
+    pub control_period_ticks: u32,
+}
+
+/// PolicyKey → 元数据。`PolicyTable::meta()` 产出,交给 `startup.poll`。
+pub type PolicyMetaTable = BTreeMap<PolicyKey, PolicyMeta>;
 
 /// 策略加载失败原因(驱动层再补"第几条"信息;PolicyError 原文保留)。
 #[derive(Debug, thiserror::Error)]
@@ -63,9 +75,27 @@ impl PolicyTable {
             PolicyEntry {
                 name: name.to_owned(),
                 policy,
+                dof: body.dof_count(),
             },
         );
         Ok(key)
+    }
+
+    /// 只读元数据快照(D01b-2 裁定方案 2):交出表所有权给工作线程前,
+    /// startup 挂载需要的 dof / 控制周期先抽出来。
+    pub fn meta(&self) -> PolicyMetaTable {
+        self.entries
+            .iter()
+            .map(|(&key, entry)| {
+                (
+                    key,
+                    PolicyMeta {
+                        dof: entry.dof,
+                        control_period_ticks: entry.policy.manifest().control_period_ticks,
+                    },
+                )
+            })
+            .collect()
     }
 
     /// 只读取条目(启动逻辑取 dof / 控制周期用)。

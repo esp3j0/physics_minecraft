@@ -16,6 +16,7 @@
 
 pub mod gait;
 pub mod policy_table;
+pub mod policy_worker;
 
 #[cfg(test)]
 mod tests;
@@ -30,7 +31,7 @@ use sim_api::session::{AgentJointState, Session};
 use types::{EntityId, EntityState, Tick};
 
 use gait::{Gait, QUAD_DOF, SIM_DT, stand_targets, trot_targets};
-use policy_table::PolicyTable;
+use policy_worker::{InferReply, InferRequest, PolicyWorker};
 
 /// 策略名的 FNV-1a 64 位(REQ-012 D01b-1 §1.2;算法与 `BodyHash::fnv1a`
 /// 相同,对名字的 UTF-8 字节算)。
@@ -118,6 +119,14 @@ pub struct ControllerCounters {
     pub policy_targets_clamped: u64,
     /// 到了控制拍但取不到状态而跳过的次数(只增不减)。
     pub policy_no_state: u64,
+    /// 到了控制拍,上一个请求还没回来的次数(D01b-2 §1.2;只增不减)。
+    pub policy_timeouts: u64,
+    /// 回复不是在发出请求的那一拍收到、但在下一个控制拍之前收到并被采用的
+    /// 次数(D01b-2 §1.2;只增不减)。
+    pub policy_late: u64,
+    /// 回复被丢弃的次数(已作废、seq 对不上、主体已没有策略槽位;D01b-2
+    /// §1.2;只增不减)。
+    pub policy_discarded: u64,
 }
 
 /// 挂载失败原因(类型化,不 panic)。
@@ -146,12 +155,24 @@ struct PolicyRunState {
     last_action: Vec<f32>,
 }
 
+/// 一只主体的在途推理请求(D01b-2 §1.2;不进检查点)。`abandoned` = 到了
+/// 下一个控制拍还没回来,已作废:回复回来时丢弃,再下一个控制拍才发新请求。
+#[derive(Debug)]
+struct Pending {
+    seq: u64,
+    abandoned: bool,
+}
+
 /// 控制者宿主:EntityId → 槽位;动作按 EntityId 升序产出。
 #[derive(Debug, Default)]
 pub struct ControllerHost {
     slots: BTreeMap<EntityId, ControllerSlot>,
     pub counters: ControllerCounters,
     policy_state: BTreeMap<EntityId, PolicyRunState>,
+    /// 每只主体最多一个在途请求(D01b-2 §1.2;不进检查点)。
+    pending: BTreeMap<EntityId, Pending>,
+    /// 推理请求序号发生器(D01b-2 §1.2)。
+    next_seq: u64,
 }
 
 impl ControllerHost {
@@ -216,12 +237,14 @@ impl ControllerHost {
     /// 摘除控制者。存在并摘除 → true;不存在 → false。
     pub fn detach(&mut self, entity: EntityId) -> bool {
         self.policy_state.remove(&entity);
+        self.pending.remove(&entity);
         self.slots.remove(&entity).is_some()
     }
 
     /// 主体被移除(despawned / void_removed)时调用;不存在也不报错。
     pub fn on_removed(&mut self, entity: EntityId) {
         self.policy_state.remove(&entity);
+        self.pending.remove(&entity);
         self.slots.remove(&entity);
     }
 
@@ -347,6 +370,7 @@ impl ControllerHost {
         for e in &dead {
             self.slots.remove(e);
             self.policy_state.remove(e);
+            self.pending.remove(e);
         }
         dead.len()
     }
@@ -380,27 +404,33 @@ impl ControllerHost {
         host
     }
 
-    /// 策略主体本拍的动作(D01b-1 §1.3)。到控制拍的条件与脚本相同
-    /// (`now ≥ attached_at` 且 `(now − attached_at) % period_ticks == 0`)。
-    /// 对每只到拍的策略主体(EntityId 升序):
-    ///   在 skip 里 → skipped_in_transit += 1;在 frozen 里 → skipped_frozen += 1;
-    ///   取不到关节状态或根状态 → policy_no_state += 1;
-    ///   否则拼 AgentSnapshot(intent 取槽位的,last_action 取运行态的)→ policy.act:
-    ///     Ok(action)  → 发 targets(同 drive:成功则进日志、actions_emitted += 1、
-    ///                   policy_inferences += 1、policy_targets_clamped += action.clamped,
-    ///                   运行态 last_action = action.raw;被 session 拒绝则
-    ///                   send_rejected += 1,last_action 不更新);
-    ///     Err(_)      → policy_errors += 1,不发目标,last_action 不更新。
+    /// 策略主体本拍的动作(D01b-2 §1.3,AC-D3:推理在工作线程,不阻塞 tick)。
+    /// 到控制拍的条件与脚本相同(`now ≥ attached_at` 且
+    /// `(now − attached_at) % period_ticks == 0`)。每拍三步:
+    ///   A. 收尾上几拍的回复:循环 `worker.try_recv()`,每条
+    ///      `handle_reply(issued_this_tick = false)`。
+    ///   B. 对每只到拍的策略主体(EntityId 升序;skip/frozen/取不到状态的处理
+    ///      与 D01b-1 相同):pending 里有它 → `policy_timeouts += 1`、`abandoned`
+    ///      置 true、不发新请求;否则拼快照、`seq = next_seq`、`next_seq += 1`、
+    ///      `worker.submit`、pending 插入 `{seq, abandoned:false}`、seq 记进本拍发出集合。
+    ///   C. 本拍发出集合非空:`deadline = now() + wait_budget`;循环
+    ///      `worker.recv_until(deadline)`,`handle_reply(issued_this_tick = 该 seq
+    ///      在本拍发出集合里)`;本拍发出的全部回来或到 deadline 就停。
     /// 没有策略槽位时零动作(不调 Session 的状态方法)。
     pub fn drive_policies(
         &mut self,
         session: &mut Session,
         log: &mut CommandLog,
-        table: &mut PolicyTable,
+        worker: &mut PolicyWorker,
         now: Tick,
         skip: &std::collections::BTreeSet<EntityId>,
         frozen: &std::collections::BTreeSet<EntityId>,
     ) {
+        // A. 收尾上几拍的回复(晚到但在周期内 → 采用并记 policy_late)。
+        while let Some(reply) = worker.try_recv() {
+            self.handle_reply(session, log, reply, false);
+        }
+        // B. 到控制拍的策略主体发请求。
         let due: Vec<EntityId> = self
             .slots
             .iter()
@@ -411,6 +441,8 @@ impl ControllerHost {
             })
             .map(|(&entity, _)| entity)
             .collect();
+        let mut issued_this_tick: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
         for entity in due {
             if skip.contains(&entity) {
                 self.counters.skipped_in_transit += 1;
@@ -423,6 +455,11 @@ impl ControllerHost {
             let ControllerKind::Policy(key) = self.slots[&entity].kind else {
                 continue;
             };
+            if let Some(pending) = self.pending.get_mut(&entity) {
+                self.counters.policy_timeouts += 1;
+                pending.abandoned = true;
+                continue;
+            }
             let intent = self.slots[&entity].intent;
             let Some(joints) = session.agent_joint_state(entity) else {
                 self.counters.policy_no_state += 1;
@@ -438,30 +475,91 @@ impl ControllerHost {
                 .map(|state| state.last_action.clone())
                 .unwrap_or_default();
             let snapshot = build_snapshot(&root, &joints, intent, &last_action);
-            let entry = table
-                .get_mut(key)
-                .expect("策略键必在表中(启动/恢复已校验,fail-stop)");
-            match entry.policy.act(&snapshot) {
-                Ok(action) => {
-                    match session.send_agent_joint_targets_to(
-                        InputSource::SCHEDULER,
-                        entity,
-                        action.targets,
-                    ) {
-                        Ok(log_entry) => {
-                            log.append(log_entry);
-                            self.counters.actions_emitted += 1;
-                            self.counters.policy_inferences += 1;
-                            self.counters.policy_targets_clamped += action.clamped as u64;
-                            if let Some(state) = self.policy_state.get_mut(&entity) {
-                                state.last_action = action.raw;
-                            }
-                        }
-                        Err(_) => self.counters.send_rejected += 1,
-                    }
-                }
-                Err(_) => self.counters.policy_errors += 1,
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            worker.submit(InferRequest {
+                seq,
+                entity,
+                key,
+                snapshot,
+            });
+            self.pending.insert(
+                entity,
+                Pending {
+                    seq,
+                    abandoned: false,
+                },
+            );
+            issued_this_tick.insert(seq);
+        }
+        // C. 在预算内收本拍发出的回复(正常推理几十微秒,当拍即回)。
+        if !issued_this_tick.is_empty() {
+            // 墙钟只用于驱动侧等待预算(AC-D3 非确定性遥测面),与 telemetry 同口径。
+            #[allow(clippy::disallowed_methods)]
+            let deadline = std::time::Instant::now() + worker.wait_budget();
+            while !issued_this_tick.is_empty() {
+                let Some(reply) = worker.recv_until(deadline) else {
+                    break;
+                };
+                let issued = issued_this_tick.remove(&reply.seq);
+                self.handle_reply(session, log, reply, issued);
             }
+        }
+    }
+
+    /// 处理一条推理回复(D01b-2 §1.3)。`issued_this_tick` = 该请求是本拍发出的
+    /// (C 步当拍收到 = 正常;A 步收到 = 晚到,成功采用时记 `policy_late`)。
+    fn handle_reply(
+        &mut self,
+        session: &mut Session,
+        log: &mut CommandLog,
+        reply: InferReply,
+        issued_this_tick: bool,
+    ) {
+        let Some(pending) = self.pending.get(&reply.entity) else {
+            self.counters.policy_discarded += 1;
+            return;
+        };
+        if pending.seq != reply.seq {
+            self.counters.policy_discarded += 1;
+            return;
+        }
+        let abandoned = pending.abandoned;
+        self.pending.remove(&reply.entity);
+        if abandoned {
+            self.counters.policy_discarded += 1;
+            return;
+        }
+        if !matches!(
+            self.slots.get(&reply.entity).map(|slot| slot.kind),
+            Some(ControllerKind::Policy(_))
+        ) {
+            self.counters.policy_discarded += 1;
+            return;
+        }
+        match reply.result {
+            Ok(action) => {
+                match session.send_agent_joint_targets_to(
+                    InputSource::SCHEDULER,
+                    reply.entity,
+                    action.targets,
+                ) {
+                    Ok(log_entry) => {
+                        log.append(log_entry);
+                        self.counters.actions_emitted += 1;
+                        self.counters.policy_inferences += 1;
+                        self.counters.policy_targets_clamped += action.clamped as u64;
+                        if let Some(state) = self.policy_state.get_mut(&reply.entity) {
+                            state.last_action = action.raw;
+                        }
+                        if !issued_this_tick {
+                            self.counters.policy_late += 1;
+                        }
+                    }
+                    Err(_) => self.counters.send_rejected += 1,
+                }
+            }
+            Err(_) => self.counters.policy_errors += 1,
         }
     }
 }

@@ -294,6 +294,13 @@ pub struct Config {
     /// `[[agents]]` 的 policy 名加载 `<policies_dir>/<名>`。相对路径的
     /// 基准与 `bodies_dir` 相同。
     pub policies_dir: PathBuf,
+    /// 策略推理每拍等待预算(微秒;REQ-012 D01b-2 §1.4,AC-D3):到了控制拍
+    /// 发出推理请求后,最多等回复这么久;超时沿用上次目标并记遥测。默认
+    /// 2000,范围 `0..=1_000_000`,越界 = 配置错误。
+    pub policy_wait_budget_us: u64,
+    /// 只给测试用:每次推理前人为睡这么久(毫秒;REQ-012 D01b-2 §1.4)。
+    /// 默认 0,范围 `0..=1000`,越界 = 配置错误。生产恒 0。
+    pub policy_debug_delay_ms: u64,
     /// 服务器监听地址(REQ-004A 决策 4;main 网络装配 `assemble_network`
     /// 的 listen 输入;端口 0 = OS 分配,测试用)。
     pub listen_addr: String,
@@ -325,6 +332,8 @@ impl Default for Config {
             world_kind: WorldKind::Superflat,
             bodies_dir: PathBuf::from("assets/bodies"),
             policies_dir: PathBuf::from("assets/policies"),
+            policy_wait_budget_us: 2000,
+            policy_debug_delay_ms: 0,
             listen_addr: "127.0.0.1:25565".to_string(),
             agents: Vec::new(),
         }
@@ -594,6 +603,19 @@ impl Config {
                     a.intent
                 )));
             }
+        }
+        // 策略工作线程(D01b-2 §1.4):等待预算与调试延迟的范围。
+        if self.policy_wait_budget_us > 1_000_000 {
+            return Err(ConfigError::Validate(format!(
+                "policy_wait_budget_us ({}) 须在 0..=1000000",
+                self.policy_wait_budget_us
+            )));
+        }
+        if self.policy_debug_delay_ms > 1000 {
+            return Err(ConfigError::Validate(format!(
+                "policy_debug_delay_ms ({}) 须在 0..=1000",
+                self.policy_debug_delay_ms
+            )));
         }
         Ok(())
     }
@@ -1901,5 +1923,29 @@ unload_radius = 64
             "{head}controller = \"policy\"\npolicy = \"A_z-9\"\n"
         ))
         .expect("合法字符集通过");
+    }
+
+    /// D01b-2 §1.4:policy_wait_budget_us / policy_debug_delay_ms 的默认值、
+    /// 覆写、越界拒绝(1000001 / 1001)。
+    #[test]
+    fn g4_policy_worker_config_fields() {
+        let c = Config::from_toml_str("").expect("空串全默认");
+        assert_eq!(c.policy_wait_budget_us, 2000, "默认等待预算 2000 us");
+        assert_eq!(c.policy_debug_delay_ms, 0, "默认调试延迟 0");
+        let c = Config::from_toml_str(
+            "policy_wait_budget_us = 1000000\npolicy_debug_delay_ms = 1000\n",
+        )
+        .expect("上界值通过");
+        assert_eq!(c.policy_wait_budget_us, 1_000_000);
+        assert_eq!(c.policy_debug_delay_ms, 1000);
+        let c = Config::from_toml_str("policy_wait_budget_us = 0\npolicy_debug_delay_ms = 0\n")
+            .expect("下界 0 通过");
+        assert_eq!(c.policy_wait_budget_us, 0);
+        let err = Config::from_toml_str("policy_wait_budget_us = 1000001\n").expect_err("越界拒绝");
+        assert!(matches!(err, ConfigError::Validate(_)), "{err:?}");
+        assert!(format!("{err}").contains("policy_wait_budget_us"), "{err}");
+        let err = Config::from_toml_str("policy_debug_delay_ms = 1001\n").expect_err("越界拒绝");
+        assert!(matches!(err, ConfigError::Validate(_)), "{err:?}");
+        assert!(format!("{err}").contains("policy_debug_delay_ms"), "{err}");
     }
 }

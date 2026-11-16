@@ -2511,7 +2511,16 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     };
     let mut host = host;
     let mut startup = startup;
-    let mut policy_table = policy_table;
+    // D01b-2(AC-D3):整张策略表交给工作线程;startup 挂载只读 meta 快照
+    // (裁定方案 2)。键校验已在 load_policy_table(交出所有权前)做完。
+    let policy_meta = policy_table.meta();
+    let mut policy_worker = crate::controller::policy_worker::PolicyWorker::spawn(
+        policy_table,
+        crate::controller::policy_worker::WorkerOptions {
+            wait_budget: Duration::from_micros(config.policy_wait_budget_us),
+            debug_delay: Duration::from_millis(config.policy_debug_delay_ms),
+        },
+    );
     // startup 的服务端序号分配器(spawn_next_seq 那一套,#12 语义):与
     // observe 编排器的分配器同一起点、同"跳过现存 ID"策略,不会重复;
     // checkpoint 的高水位 max 把它计入(见下方 checkpoint 分支)。
@@ -2624,7 +2633,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     &mut session,
                     &mut log,
                     &mut host,
-                    &policy_table,
+                    &policy_meta,
                     &mut |sess| {
                         loop {
                             let seq = startup_next_seq;
@@ -2662,8 +2671,9 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     };
                     host.apply_leash(root_xz);
                     host.drive(&mut session, &mut log, now, in_transit, frozen);
-                    // ③b 策略控制者(D01b-1 §1.3):紧跟 drive,同步推理。
-                    host.drive_policies(&mut session, &mut log, &mut policy_table, now, in_transit, frozen);
+                    // ③b 策略控制者(D01b-2 §1.3,AC-D3):紧跟 drive,推理在工作
+                    // 线程,每拍在 wait_budget 内收回复,超时沿用上次目标。
+                    host.drive_policies(&mut session, &mut log, &mut policy_worker, now, in_transit, frozen);
                 }
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。

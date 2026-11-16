@@ -35,7 +35,7 @@ use types::{BlockPos, EntityId, Tick};
 use crate::config::{
     STARTUP_AGENTS_MAX, STARTUP_TICKET_EXTRA_M, StartupAgentConfig, StartupController,
 };
-use crate::controller::policy_table::PolicyTable;
+use crate::controller::policy_table::PolicyMetaTable;
 use crate::controller::{
     ControllerHost, ControllerKind, DEFAULT_CONTROL_PERIOD_TICKS, Leash, PolicyKey, ScriptKind,
 };
@@ -256,14 +256,15 @@ impl StartupAgents {
     /// 每拍在 `session.tick()` 之前调(§2.3 顺序)。对每条待生成项:
     /// 放票(首次)→ 出生列可读且碰撞体已建 → 生成 + 挂载;超时放弃。
     /// `alloc_id` = 驱动的服务端序号分配器(`spawn_next_seq` 那一套;
-    /// 跳过现存 ID)。`policies` = 已加载策略表(D01b-1:Policy 条目的
-    /// dof/周期从表里取,启动加载已校验键必在)。
+    /// 跳过现存 ID)。`policies` = 策略元数据表(D01b-2 裁定方案 2:整张
+    /// `PolicyTable` 交给工作线程,挂载只读这份 meta 的 dof/周期;启动加载
+    /// 已校验键必在)。
     pub fn poll(
         &mut self,
         session: &mut Session,
         log: &mut CommandLog,
         host: &mut ControllerHost,
-        policies: &PolicyTable,
+        policies: &PolicyMetaTable,
         alloc_id: &mut impl FnMut(&Session) -> EntityId,
         now: Tick,
     ) {
@@ -402,10 +403,8 @@ impl StartupAgents {
                 let period = match kind {
                     ControllerKind::Policy(key) => {
                         policies
-                            .get(key)
+                            .get(&key)
                             .expect("策略键必在表中(启动加载已校验,fail-stop)")
-                            .policy
-                            .manifest()
                             .control_period_ticks
                     }
                     _ => DEFAULT_CONTROL_PERIOD_TICKS,
@@ -565,7 +564,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -659,7 +658,7 @@ mod tests {
                 &mut session,
                 &mut log,
                 &mut host,
-                &PolicyTable::default(),
+                &PolicyMetaTable::new(),
                 &mut alloc,
                 Tick(now),
             );
@@ -674,7 +673,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(600),
         );
@@ -721,7 +720,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -783,7 +782,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -830,7 +829,7 @@ mod tests {
                 &mut session,
                 &mut log,
                 &mut host,
-                &PolicyTable::default(),
+                &PolicyMetaTable::new(),
                 &mut alloc,
                 Tick(0),
             );
@@ -877,7 +876,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -956,7 +955,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -975,7 +974,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(1),
         );
@@ -1011,7 +1010,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -1101,7 +1100,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -1177,7 +1176,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -1207,7 +1206,7 @@ mod tests {
             &mut session,
             &mut log,
             &mut host,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
@@ -1242,7 +1241,7 @@ mod tests {
             &mut session2,
             &mut log2,
             &mut host2,
-            &PolicyTable::default(),
+            &PolicyMetaTable::new(),
             &mut alloc,
             Tick(0),
         );
