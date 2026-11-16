@@ -19,6 +19,7 @@ pub mod emit;
 pub mod frames;
 pub mod inertia;
 mod mesh;
+mod prefilter;
 pub mod shapes;
 pub mod tree;
 
@@ -193,7 +194,8 @@ pub fn import_urdf(
 
 /// URDF 的 robot name(xtask `--name` 缺省值)。
 pub fn robot_name(urdf_xml: &str) -> Result<String, ImportError> {
-    let robot = urdf_rs::read_from_string(urdf_xml).map_err(|e| ImportError::Xml(e.to_string()))?;
+    let (stripped, _) = prefilter::strip_visuals(urdf_xml).map_err(ImportError::Xml)?;
+    let robot = urdf_rs::read_from_string(&stripped).map_err(|e| ImportError::Xml(e.to_string()))?;
     Ok(robot.name)
 }
 

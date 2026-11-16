@@ -94,9 +94,11 @@ pub(crate) fn import_impl(
     base_dir: &std::path::Path,
     opts: &ImportOptions,
 ) -> Result<(types::BodyDef, ImportReport), crate::ImportError> {
-    // ---- 解析(未知关节类型字符串在这一层被 urdf-rs 拒绝 → Xml)----
+    // ---- 解析前去掉 <visual>(C02 任务书 1.1;未知关节类型字符串在 urdf-rs 层被拒绝 → Xml)----
+    let (stripped, visual_count) =
+        crate::prefilter::strip_visuals(urdf_xml).map_err(crate::ImportError::Xml)?;
     let robot =
-        urdf_rs::read_from_string(urdf_xml).map_err(|e| crate::ImportError::Xml(e.to_string()))?;
+        urdf_rs::read_from_string(&stripped).map_err(|e| crate::ImportError::Xml(e.to_string()))?;
     if robot.links.is_empty() {
         return Err(crate::ImportError::NoLinks);
     }
@@ -533,6 +535,9 @@ pub(crate) fn import_impl(
 
     // 网格提示(C01b 任务书 1.6):明显非凸 / 体积为 0。
     let mut notes = vec!["当前内核生成主体时不使用 com 和 inertia,惯量由碰撞形状推出。".to_owned()];
+    if visual_count > 0 {
+        notes.push("视觉元素(visual)在解析前已去掉,不参与导入。".to_owned());
+    }
     for m in &mesh_notes {
         if m.mesh_volume > 0.0 && m.hull_volume / m.mesh_volume > 1.1 {
             notes.push(format!(
@@ -556,7 +561,7 @@ pub(crate) fn import_impl(
         dof_order,
         merged_fixed,
         dropped_frames,
-        ignored: collect_ignored(urdf_xml, &robot),
+        ignored: collect_ignored(urdf_xml, &robot, visual_count),
         shapes: shape_notes,
         meshes: mesh_notes,
         inertia: inertia_notes,
@@ -681,24 +686,19 @@ fn make_joint_def(
     })
 }
 
-/// ignored 字段统计(任务书 1.7):visual、material、关节 dynamics、mimic、
-/// safety_controller、calibration 各按出现次数;transmission、gazebo 这两类
-/// urdf-rs 不解析的元素在原文里按子串计数。
-fn collect_ignored(urdf_xml: &str, robot: &urdf_rs::Robot) -> Vec<(String, usize)> {
+/// ignored 字段统计(任务书 1.7,C02 1.1 改口径):visual 按预处理去掉的
+/// 块数;material 按原文里 `<material` 子串出现次数(顶层和 visual 里的都算);
+/// 关节 dynamics、mimic、safety_controller、calibration 各按出现次数;
+/// transmission、gazebo 这两类 urdf-rs 不解析的元素在原文里按子串计数。
+fn collect_ignored(urdf_xml: &str, robot: &urdf_rs::Robot, visual_count: usize) -> Vec<(String, usize)> {
     let mut out: Vec<(String, usize)> = Vec::new();
     let mut push = |k: &str, n: usize| {
         if n > 0 {
             out.push((k.to_owned(), n));
         }
     };
-    let visuals: usize = robot.links.iter().map(|l| l.visual.len()).sum();
-    push("visual", visuals);
-    let visual_materials: usize = robot
-        .links
-        .iter()
-        .map(|l| l.visual.iter().filter(|v| v.material.is_some()).count())
-        .sum();
-    push("material", robot.materials.len() + visual_materials);
+    push("visual", visual_count);
+    push("material", urdf_xml.matches("<material").count());
     let mut dynamics = 0;
     let mut mimic = 0;
     let mut safety = 0;
