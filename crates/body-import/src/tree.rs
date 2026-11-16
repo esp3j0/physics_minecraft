@@ -301,18 +301,17 @@ pub(crate) fn import_impl(
             });
         } else {
             gi = group_of_head[&head];
-            // 纯坐标系连杆不记 merged_fixed(三路分类互斥:dropped_frames /
-            // merged_fixed / 无记录的组头)。
-            if !(node.inertial.is_none() && node.shapes.is_empty()) {
-                merged_fixed.push((node.name.clone(), groups[gi].head.clone()));
+            // 非组头的固定子连杆三路分类(任务书 1.4,互斥):纯坐标系
+            // (无 inertial 无碰撞)→ dropped_frames;其余 → merged_fixed。
+            // 组头本身是输出连杆(名字保留),不进任何清单;空组头稍后由
+            // MissingInertial 兜住。
+            if node.inertial.is_none() && node.shapes.is_empty() {
+                dropped_frames.push(node.name.clone());
+                continue;
             }
+            merged_fixed.push((node.name.clone(), groups[gi].head.clone()));
         }
         let d = d_of[i];
-        // 纯坐标系(无 inertial 无碰撞)→ 丢弃(任务书 1.4)。
-        if node.inertial.is_none() && node.shapes.is_empty() {
-            dropped_frames.push(node.name.clone());
-            continue;
-        }
         let group = &mut groups[gi];
         if let Some(inertial) = &node.inertial {
             // 质心(任务书 1.3):com = W_L · xyz_inertial + d。
