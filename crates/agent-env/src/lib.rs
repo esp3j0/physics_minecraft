@@ -11,6 +11,9 @@
 //! 平地、主体生成分片中心、同 `SessionConfig`),写成 crate 内函数,不依赖 app
 //! 测试代码。并行多实例、地形随机化、PyO3 都是后面的单元。
 
+pub mod vec_env;
+pub use vec_env::{VecEnv, VecStep, episode_seed};
+
 use messaging::InputSource;
 use physics_sim::{BodyRegistry, ShardSim, ShardSimConfig};
 use policy::{AgentSnapshot, PolicyCodec, PolicyError, PolicyManifest};
@@ -32,6 +35,7 @@ const SPAWN: Vec3 = Vec3::new(64.0, 1.45, 64.0);
 const GROUND_CHUNKS: i32 = 8;
 
 /// 环境配置(任务书 §2.1)。
+#[derive(Clone)]
 pub struct EnvConfig {
     /// 身体定义文本(如 `assets/bodies/quad.body.toml` 的内容)。
     pub body_toml: String,
