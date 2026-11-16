@@ -19,7 +19,7 @@ fn quad() -> BodyDef {
     BodyDef::from_toml_str(&text).expect("quad 合法")
 }
 
-fn rel_err(got: f32, want: f32) -> f32 {
+fn rel_err(got: f64, want: f64) -> f64 {
     (got - want).abs() / want.abs()
 }
 
@@ -34,12 +34,12 @@ fn k1_body_box() {
         assert!(c.abs() < 1e-7, "机身 com 分量 {c} 应 ≈ 0");
     }
     let diag = [p.inertia[0][0], p.inertia[1][1], p.inertia[2][2]];
-    let want = [0.012591606f32, 0.088378863, 0.090778143];
+    let want = [0.012591606f64, 0.088378863, 0.090778143];
     for (i, (&g, &w)) in diag.iter().zip(&want).enumerate() {
         assert!(
-            rel_err(g, w) < 1e-4,
+            rel_err(f64::from(g), w) < 1e-4,
             "机身惯量对角[{i}] = {g} 期望 {w} 相对误差 {}",
-            rel_err(g, w)
+            rel_err(f64::from(g), w)
         );
     }
     for (i, row) in p.inertia.iter().enumerate() {
@@ -58,15 +58,15 @@ fn k2_hip_sphere() {
     let props = agent_link_mass_properties(&def);
     let p = &props[1];
     assert_eq!(p.mass, 0.678, "髋 mass");
-    let want = 0.00033222f32;
+    let want = 0.00033222f64;
     for (i, &g) in [p.inertia[0][0], p.inertia[1][1], p.inertia[2][2]]
         .iter()
         .enumerate()
     {
         assert!(
-            rel_err(g, want) < 1e-4,
+            rel_err(f64::from(g), want) < 1e-4,
             "髋惯量对角[{i}] = {g} 期望 {want} 相对误差 {}",
-            rel_err(g, want)
+            rel_err(f64::from(g), want)
         );
     }
 }

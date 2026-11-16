@@ -157,11 +157,11 @@ kd = 2.0
 fn m5_report() {
     let def = body("quad");
     let (_xml, rep) = body_to_mjcf(&def, &MjcfOptions::default());
-    let want = [0.012591606f32, 0.088378863, 0.090778143];
+    let want = [0.012591606f64, 0.088378863, 0.090778143];
     let inertia = rep.links[0].inertia;
     let diag = [inertia[0][0], inertia[1][1], inertia[2][2]];
     for (i, (&g, &w)) in diag.iter().zip(&want).enumerate() {
-        let rel = (g - w).abs() / w.abs();
+        let rel = (f64::from(g) - w).abs() / w.abs();
         assert!(
             rel < 1e-4,
             "报告连杆 0 惯量对角[{i}] = {g} 期望 {w} 相对误差 {rel}"
