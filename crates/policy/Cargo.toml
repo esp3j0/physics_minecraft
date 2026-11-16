@@ -1,0 +1,23 @@
+[package]
+name = "policy"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# REQ-012 D01a:策略包库(观测函数、policy.toml、加载校验、tract 推理、
+# 动作 → 关节目标)。纯库,不碰内核/驱动/协议;非确定性核,但禁墙钟
+# (只有 AC-D4 计时测试局部豁免)。
+
+[dependencies]
+types = { path = "../types" }
+# D7:推理用 tract,只跑 CPU。本单唯一新增第三方依赖(版本同 demo infer)。
+tract-onnx = "0.23.10"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
