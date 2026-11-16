@@ -404,7 +404,8 @@ assets/policies/<名>/
 | E01b | `agent-env` 并行多实例 `VecEnv`(到时那一步的约定、种子与线程数无关) | **已验收**(0881d8b,实施方 qodercli)。实测(release,四足,会动的动作):单环境 0.42 ms/控制步;16 环境 16 线程 21500 控制步/秒。全 0 动作时四足休眠,0.06 ms/步,不代表训练速度 |
 | E01c | 地形与物理参数随机化(范围在 MuJoCo 主训练之后按迁移差距定) | — |
 | E02a | `cargo xtask export-mjcf`:`BodyDef` 导出成 MJCF(真实单位、坐标不转、质量属性取自内核同一段代码)+ 核对脚本 `tools/train/check_mjcf.py` | E1b。**已验收**(8e0f075,实施方 qodercli) |
-| E02b | PyO3 封装、四足的 `BackendSpec`、rapier 后端适配器、契约检查、奖励 | — |
+| E02b-1 | `agent_env` Python 模块(PyO3)、四足的 `BackendSpec`、rapier 后端适配器、契约检查(`tools/train/quad/`) | **已验收**(7d07142,实施方 qodercli)。新增可选依赖 `pyo3` 0.24、`numpy` 0.24,只在 `python` 特性下启用 |
+| E02b-2 | 四足的奖励、PPO、策略导出、评估、`cargo xtask check-policy` | — |
 | E02c | MuJoCo 后端适配器(同一份 `BackendSpec`),域随机化 | — |
 | E02d | 在 vm-ai 上主训练,回到本项目物理零样本评估与微调,导出策略包 | E2 |
 | E03 | 端到端部署与冒烟。**阶段 E 人工验收** | E3 |
