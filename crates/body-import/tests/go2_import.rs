@@ -141,3 +141,105 @@ fn g4_deterministic() {
     let (b, _) = import_go2();
     assert_eq!(body_import::body_to_toml(&a), body_import::body_to_toml(&b));
 }
+
+/// N1(只报数):由碰撞形状推出的惯量对角元 vs LinkDef.inertia(URDF)。
+/// 照内核的建形状口(cuboid/ball/capsule_y/convex_hull),parry3d 密度 1
+/// 算质量属性,按体积比例分连杆质量,平行轴定理合成到连杆质心。
+#[test]
+fn n1_inertia_table() {
+    use parry3d::math::Vector;
+    use parry3d::shape::SharedShape;
+    let (def, _) = import_go2();
+    println!("n1: | 连杆 | 质量 | 形状数 | Ixx_shape | Iyy_shape | Izz_shape | Ixx_urdf | Iyy_urdf | Izz_urdf | rx | ry | rz |");
+    println!("n1: |---|---|---|---|---|---|---|---|---|---|---|---|");
+    for link in &def.links {
+        let mut parts: Vec<(f64, [f64; 3], [[f64; 3]; 3])> = Vec::new();
+        for s in &link.shapes {
+            let (shape, offset) = match s {
+                types::ShapeDef::Box { half, offset } => (
+                    SharedShape::cuboid(half[0], half[1], half[2]),
+                    *offset,
+                ),
+                types::ShapeDef::Sphere { radius, offset } => (SharedShape::ball(*radius), *offset),
+                types::ShapeDef::CapsuleY {
+                    half_height,
+                    radius,
+                    offset,
+                } => (SharedShape::capsule_y(*half_height, *radius), *offset),
+                types::ShapeDef::ConvexHull { points, offset } => {
+                    let pts: Vec<Vector> =
+                        points.iter().map(|p| Vector::new(p[0], p[1], p[2])).collect();
+                    (SharedShape::convex_hull(&pts).expect("凸包可建"), *offset)
+                }
+            };
+            let mp = shape.mass_properties(1.0);
+            let v = f64::from(mp.mass());
+            let com = [
+                f64::from(offset[0]) + f64::from(mp.local_com.x),
+                f64::from(offset[1]) + f64::from(mp.local_com.y),
+                f64::from(offset[2]) + f64::from(mp.local_com.z),
+            ];
+            let m = mp.reconstruct_inertia_matrix();
+            let cols = m.to_cols_array();
+            let mut tensor = [[0.0f64; 3]; 3];
+            for (i, row) in tensor.iter_mut().enumerate() {
+                for (j, slot) in row.iter_mut().enumerate() {
+                    *slot = f64::from(cols[j * 3 + i]);
+                }
+            }
+            parts.push((v, com, tensor));
+        }
+        let vol: f64 = parts.iter().map(|p| p.0).sum();
+        let mass = f64::from(link.mass);
+        let mut com = [0.0f64; 3];
+        for (v, c, _) in &parts {
+            let mi = mass * v / vol;
+            for (k, slot) in com.iter_mut().enumerate() {
+                *slot += mi * c[k];
+            }
+        }
+        for slot in com.iter_mut() {
+            *slot /= mass;
+        }
+        let mut diag = [0.0f64; 3];
+        for (v, c, t) in &parts {
+            let mi = mass * v / vol;
+            let scale = mi / v;
+            let d = [c[0] - com[0], c[1] - com[1], c[2] - com[2]];
+            let d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+            for (k, slot) in diag.iter_mut().enumerate() {
+                let parallel = mi * (d2 - d[k] * d[k]);
+                *slot += scale * t[k][k] + parallel;
+            }
+        }
+        let urdf = link.inertia.unwrap_or([0.0, 0.0, 0.0]);
+        let ratio: Vec<String> = (0..3)
+            .map(|k| {
+                if urdf[k] > 0.0 {
+                    format!("{:.3}", diag[k] / f64::from(urdf[k]))
+                } else {
+                    "-".to_owned()
+                }
+            })
+            .collect();
+        println!(
+            "n1: | {} | {:.4} | {} | {:.6e} | {:.6e} | {:.6e} | {:.6e} | {:.6e} | {:.6e} | {} | {} | {} |",
+            link.name,
+            link.mass,
+            parts.len(),
+            diag[0],
+            diag[1],
+            diag[2],
+            urdf[0],
+            urdf[1],
+            urdf[2],
+            ratio[0],
+            ratio[1],
+            ratio[2]
+        );
+        println!(
+            "n1-com: {} com_shape = [{:.5}, {:.5}, {:.5}] com_urdf = {:?} vol = {:.6e}",
+            link.name, com[0], com[1], com[2], link.com, vol
+        );
+    }
+}
