@@ -2152,6 +2152,7 @@ version = "0.1.0"
 dependencies = [
  "app",
  "body-import",
+ "physics-sim",
  "serde_json",
  "tempfile",
  "toml",
