@@ -708,6 +708,11 @@ async fn q2_policy_stand() {
         c.policy_targets_clamped, 0,
         "stand 目标即默认站姿,不可能越限(clamped 应为 0)"
     );
+    // D01b-2 遗留补强(E01a 第 0 步):预算 1 s 时回复必在当拍收到——
+    // 晚到与超时都应为 0。`run` 把 policy_wait_budget_us 乘 0 的变异在此变红
+    // (预算成 0 → 回复都晚一拍 → policy_late > 0)。
+    assert_eq!(c.policy_late, 0, "预算 1 s 回复当拍收到,不应有晚到");
+    assert_eq!(c.policy_timeouts, 0, "预算 1 s 不应有超时");
 }
 
 // ---- Q3:观测进模型(intent 驱动关节) ---------------------------------------

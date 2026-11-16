@@ -15,6 +15,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agent-env"
+version = "0.1.0"
+dependencies = [
+ "glam 0.33.12",
+ "messaging",
+ "physics-sim",
+ "policy",
+ "shard",
+ "sim-api",
+ "tempfile",
+ "thiserror 2.0.21",
+ "types",
+ "voxel",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

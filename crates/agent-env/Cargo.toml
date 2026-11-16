@@ -1,0 +1,26 @@
+[package]
+name = "agent-env"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+# REQ-012 E01a:训练环境(单环境 Rust API,AC-E1)。建在 sim_api::Session 上,
+# 与服务器驱动层同一套入口(send_agent_joint_targets_to + tick);观测拼装与
+# 动作 → 关节目标复用 policy::PolicyCodec。并行多实例/地形随机化/PyO3 后置。
+
+[dependencies]
+types = { path = "../types" }
+sim-api = { path = "../sim-api" }
+physics-sim = { path = "../physics-sim" }
+shard = { path = "../shard" }
+messaging = { path = "../messaging" }
+voxel = { path = "../voxel" }
+policy = { path = "../policy" }
+thiserror = "2"
+glam = { version = "0.33", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

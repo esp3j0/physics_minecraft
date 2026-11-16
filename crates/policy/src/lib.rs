@@ -6,11 +6,13 @@
 //!
 //! 非确定性核,但禁墙钟(工作区 clippy.toml);只有 AC-D4 计时测试局部豁免。
 
+pub mod codec;
 pub mod error;
 pub mod manifest;
 pub mod observe;
 pub mod runtime;
 
+pub use codec::PolicyCodec;
 pub use error::PolicyError;
 pub use manifest::{Normalization, ObsEntry, PolicyManifest};
 pub use observe::{AgentSnapshot, ObsTerm, observe};

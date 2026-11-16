@@ -6,9 +6,10 @@ use std::path::Path;
 
 use tract_onnx::prelude::*;
 
+use crate::codec::PolicyCodec;
 use crate::error::PolicyError;
 use crate::manifest::PolicyManifest;
-use crate::observe::{AgentSnapshot, observe};
+use crate::observe::AgentSnapshot;
 
 type RunnableModel = tract_onnx::tract_core::model::RunnableModel<
     tract_onnx::prelude::TypedFact,
@@ -17,13 +18,8 @@ type RunnableModel = tract_onnx::tract_core::model::RunnableModel<
 
 /// 加载并校验好的策略包。
 pub struct Policy {
-    manifest: PolicyManifest,
+    codec: PolicyCodec,
     model: std::sync::Arc<RunnableModel>,
-    default_pose: Vec<f32>,
-    /// 自由度顺序的关节限位(没有限位为 None)。
-    limits: Vec<Option<types::JointLimits>>,
-    dof: usize,
-    obs_dim: usize,
     /// 复用的观测缓冲区。
     obs_buf: Vec<f32>,
 }
@@ -42,9 +38,9 @@ pub struct Action {
 impl std::fmt::Debug for Policy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Policy")
-            .field("manifest", &self.manifest)
-            .field("dof", &self.dof)
-            .field("obs_dim", &self.obs_dim)
+            .field("manifest", self.manifest())
+            .field("dof", &self.dof())
+            .field("obs_dim", &self.obs_dim())
             .finish_non_exhaustive()
     }
 }
@@ -90,60 +86,10 @@ impl Policy {
         onnx_bytes: &[u8],
         body: &types::BodyDef,
     ) -> Result<Self, PolicyError> {
-        // 1. 自身校验(load 路径在解析时已做;内存路径在这里做)。
-        manifest.validate()?;
-        // 2. body_hash:16 位小写十六进制,且与身体一致。
-        let h = &manifest.body_hash;
-        let is_hex = h.len() == 16
-            && h.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-        if !is_hex {
-            return Err(PolicyError::Manifest(format!(
-                "body_hash 须为 16 位小写十六进制:{h:?}"
-            )));
-        }
-        let got = body.hash().hex();
-        if *h != got {
-            return Err(PolicyError::BodyHashMismatch {
-                expected: h.clone(),
-                got,
-            });
-        }
-        // 3. 自由度。
-        let dof = body.dof_count();
-        if dof == 0 {
-            return Err(PolicyError::NoDof);
-        }
-        // 4. default_pose 长度;缺省取身体各关节 default_angle(没有就 0)。
-        if let Some(p) = &manifest.default_pose
-            && p.len() != dof
-        {
-            return Err(PolicyError::DefaultPoseLen {
-                expected: dof,
-                got: p.len(),
-            });
-        }
-        let default_pose = manifest.default_pose.clone().unwrap_or_else(|| {
-            body.dof_joints()
-                .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
-                .collect()
-        });
-        // 5. normalization 长度。
-        let obs_dim = manifest.obs_dim(dof);
-        if let Some(n) = &manifest.normalization {
-            if n.mean.len() != obs_dim {
-                return Err(PolicyError::NormalizationLen {
-                    expected: obs_dim,
-                    got: n.mean.len(),
-                });
-            }
-            if n.std.len() != obs_dim {
-                return Err(PolicyError::NormalizationLen {
-                    expected: obs_dim,
-                    got: n.std.len(),
-                });
-            }
-        }
+        // 1–5. 与模型无关的校验与编解码器(顺序与报错类型保持现状)。
+        let codec = PolicyCodec::new(manifest, body)?;
+        let obs_dim = codec.obs_dim();
+        let dof = codec.dof();
         // 6. ONNX 解析。
         let model = tract_onnx::onnx()
             .model_for_read(&mut &onnx_bytes[..])
@@ -207,59 +153,33 @@ impl Policy {
         let model = typed
             .into_runnable()
             .map_err(|e| PolicyError::Onnx(e.to_string()))?;
-        let limits = body.dof_joints().map(|j| j.kind.params().limits).collect();
         Ok(Self {
-            manifest,
+            codec,
             model,
-            default_pose,
-            limits,
-            dof,
-            obs_dim,
             obs_buf: Vec::with_capacity(obs_dim),
         })
     }
 
     pub fn manifest(&self) -> &PolicyManifest {
-        &self.manifest
+        self.codec.manifest()
     }
 
     pub fn dof(&self) -> usize {
-        self.dof
+        self.codec.dof()
     }
 
     pub fn obs_dim(&self) -> usize {
-        self.obs_dim
+        self.codec.obs_dim()
     }
 
     /// 观测 → 归一化 → 裁剪 → 推理 → 动作。
     /// 同一个 Policy、同样的 snapshot,结果逐位相同。
     pub fn act(&mut self, snapshot: &AgentSnapshot) -> Result<Action, PolicyError> {
-        // 1. 观测。
-        observe(
-            &self.manifest.obs,
-            &self.default_pose,
-            snapshot,
-            &mut self.obs_buf,
-        )?;
-        // 2. 归一化。
-        if let Some(n) = &self.manifest.normalization {
-            for (x, (m, s)) in self.obs_buf.iter_mut().zip(n.mean.iter().zip(&n.std)) {
-                *x = (*x - m) / s;
-            }
-        }
-        // 3. 观测裁剪。
-        if let Some(c) = self.manifest.obs_clip {
-            for x in &mut self.obs_buf {
-                *x = x.clamp(-c, c);
-            }
-        }
-        // 4. 非有限观测不推理。
-        if self.obs_buf.iter().any(|x| !x.is_finite()) {
-            return Err(PolicyError::NonFiniteObservation);
-        }
+        // 1–4. 观测 → 归一化 → 裁剪 → 非有限检查(与训练环境共用 codec)。
+        self.codec.encode(snapshot, &mut self.obs_buf)?;
         // 5. 推理。
         let arr = tract_onnx::tract_core::ndarray::Array2::<f32>::from_shape_vec(
-            (1, self.obs_dim),
+            (1, self.obs_dim()),
             self.obs_buf.clone(),
         )
         .map_err(|e| PolicyError::Inference(e.to_string()))?;
@@ -276,35 +196,7 @@ impl Policy {
             .map_err(|e| PolicyError::Inference(e.to_string()))?
             .into_raw_vec_and_offset()
             .0;
-        // 6. 非有限输出。
-        if out.iter().any(|x| !x.is_finite()) {
-            return Err(PolicyError::NonFiniteOutput);
-        }
-        // 7. 动作裁剪 → raw。
-        let raw: Vec<f32> = match self.manifest.action_clip {
-            Some(c) => out.iter().map(|a| a.clamp(-c, c)).collect(),
-            None => out.to_vec(),
-        };
-        // 8. 目标 = default_pose + action_scale × raw,夹进关节限位。
-        let mut targets = Vec::with_capacity(self.dof);
-        let mut clamped = 0;
-        for (i, (&r, &d)) in raw.iter().zip(&self.default_pose).enumerate() {
-            let t = d + self.manifest.action_scale * r;
-            let t = match self.limits[i] {
-                Some(l) => {
-                    if t < l.lower || t > l.upper {
-                        clamped += 1;
-                    }
-                    t.clamp(l.lower, l.upper)
-                }
-                None => t,
-            };
-            targets.push(t);
-        }
-        Ok(Action {
-            raw,
-            targets,
-            clamped,
-        })
+        // 6–8. 非有限检查 → 动作裁剪 → 目标(与训练环境共用 codec)。
+        self.codec.decode(&out)
     }
 }
