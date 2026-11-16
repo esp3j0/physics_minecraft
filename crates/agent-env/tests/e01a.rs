@@ -69,6 +69,18 @@ fn manifest() -> PolicyManifest {
     PolicyManifest::from_toml_str(&manifest_text(&hash, "")).expect("manifest 合法")
 }
 
+/// 自定义 obs 项与 action_scale 的 manifest(control_period_ticks=2、action_clip=1.0)。
+fn manifest_terms(scale: f32, terms: &[&str]) -> PolicyManifest {
+    let hash = quad_def().hash().hex();
+    let mut s = format!(
+        "name = \"e01a\"\nbody_hash = \"{hash}\"\ncontrol_period_ticks = 2\naction_scale = {scale}\naction_clip = 1.0\n"
+    );
+    for t in terms {
+        s.push_str(&format!("[[obs]]\nterm = \"{t}\"\n"));
+    }
+    PolicyManifest::from_toml_str(&s).expect("manifest 合法")
+}
+
 fn cfg(episode_controls: u32, fall_up_y_min: f32, intent_range: [[f32; 2]; 3]) -> EnvConfig {
     EnvConfig {
         body_toml: quad_text(),
@@ -429,6 +441,102 @@ fn e7_reward_inputs() {
     );
 }
 
+/// E7b 机身系(E01b §0 补测):obs 取 base_lin_vel/base_ang_vel/projected_gravity
+/// (9 维),走 20 步,每步 reward 三段与 obs 三段逐位相同。自检:第 20 步根旋转
+/// 不逐位等于单位四元数,且 base_linvel_body 不逐位等于世界系线速度。
+#[test]
+fn e7b_body_frame() {
+    let m = manifest_terms(0.25, &["base_lin_vel", "base_ang_vel", "projected_gravity"]);
+    let mut env = AgentEnv::new(EnvConfig {
+        body_toml: quad_text(),
+        manifest: m,
+        episode_controls: 200,
+        settle_ticks: 120,
+        fall_up_y_min: 0.5,
+        intent_range: zero_range(),
+    })
+    .expect("环境");
+    env.reset(7).expect("reset");
+    let mut last = None;
+    for k in 0..20 {
+        let out = env.step(&action_seq(k)).expect("step");
+        assert_eq!(out.obs.len(), 9);
+        assert_eq!(
+            bits(&out.reward.base_linvel_body),
+            bits(&out.obs[0..3]),
+            "第 {k} 步 base_linvel_body"
+        );
+        assert_eq!(
+            bits(&out.reward.base_angvel_body),
+            bits(&out.obs[3..6]),
+            "第 {k} 步 base_angvel_body"
+        );
+        assert_eq!(
+            bits(&out.reward.projected_gravity),
+            bits(&out.obs[6..9]),
+            "第 {k} 步 projected_gravity"
+        );
+        last = Some(out);
+    }
+    let out = last.expect("有末步");
+    let root = env.link_states()[0];
+    let id = types::glam::Quat::IDENTITY;
+    assert_ne!(
+        [
+            root.rotation.x.to_bits(),
+            root.rotation.y.to_bits(),
+            root.rotation.z.to_bits(),
+            root.rotation.w.to_bits()
+        ],
+        [
+            id.x.to_bits(),
+            id.y.to_bits(),
+            id.z.to_bits(),
+            id.w.to_bits()
+        ],
+        "自检:第 20 步根旋转应非单位四元数"
+    );
+    assert_ne!(
+        bits(&out.reward.base_linvel_body),
+        bits(&[root.linvel.x, root.linvel.y, root.linvel.z]),
+        "自检:机身系线速度应不同于世界系"
+    );
+}
+
+/// E7c 夹取计数(E01b §0 补测):action_scale=100、clip=1;全 1 动作一步 →
+/// targets_clamped==12;全 0 动作一步 → ==0。
+#[test]
+fn e7c_clamped_count() {
+    let m = manifest_terms(
+        100.0,
+        &[
+            "base_ang_vel",
+            "projected_gravity",
+            "joint_pos",
+            "joint_vel",
+            "last_action",
+            "intent",
+        ],
+    );
+    let mut env = AgentEnv::new(EnvConfig {
+        body_toml: quad_text(),
+        manifest: m,
+        episode_controls: 200,
+        settle_ticks: 120,
+        fall_up_y_min: 0.5,
+        intent_range: zero_range(),
+    })
+    .expect("环境");
+    env.reset(7).expect("reset");
+    let ones = vec![1.0; DOF];
+    let out = env.step(&ones).expect("全 1 步");
+    assert_eq!(out.reward.targets_clamped, 12, "全 1 动作应夹 12 个");
+    env.reset(7).expect("再 reset");
+    let zero = vec![0.0; DOF];
+    let out0 = env.step(&zero).expect("全 0 步");
+    assert_eq!(out0.reward.targets_clamped, 0, "全 0 动作应夹 0 个");
+}
+
 /// E8 采样:seed=0 第一个输出参考值;intent_range 全 [0,0] 恒为 0。
 #[test]
 fn e8_sampling() {
@@ -449,25 +557,50 @@ fn e8_sampling() {
     assert_eq!(z.intent(), [0.0, 0.0, 0.0], "全 [0,0] intent 恒为 0");
 }
 
-/// E9 速度(release 跑一次报数,不设阈值)。
+/// E9 速度(release 跑一次报数,不设阈值;E01b §0 重测:报两组数)。
+/// 组1 全 0 动作;组2 E1 固定动作序列(摔倒就 reset 后继续,报 reset 次数)。
 #[test]
 #[ignore]
 #[allow(clippy::disallowed_methods)]
 fn e9_speed() {
     use std::time::Instant;
 
-    let mut env = make_env(2000);
-    env.reset(7).expect("reset");
     let zero = vec![0.0; DOF];
+
+    // 组1:全 0 动作 2000 步。
+    let mut env = make_env(3000);
+    env.reset(7).expect("reset");
     let t0 = Instant::now();
     for _ in 0..2000 {
         env.step(&zero).expect("step");
     }
     let elapsed = t0.elapsed().as_secs_f64();
-    let steps_per_sec = 2000.0 / elapsed;
-    let ms_per_step = elapsed * 1000.0 / 2000.0;
-    println!("e9: {steps_per_sec:.1} 控制步/秒, {ms_per_step:.3} ms/步(2000 步,全 0 动作)");
+    println!(
+        "e9 组1(全0): {:.1} 控制步/秒, {:.3} ms/步(2000 步)",
+        2000.0 / elapsed,
+        elapsed * 1000.0 / 2000.0
+    );
 
+    // 组2:E1 固定动作序列 2000 步,摔倒/截断就 reset 后继续。
+    let mut env2 = make_env(3000);
+    env2.reset(7).expect("reset");
+    let mut resets = 0u32;
+    let t0 = Instant::now();
+    for k in 0..2000 {
+        let out = env2.step(&action_seq(k)).expect("step");
+        if out.terminated || out.truncated {
+            env2.reset(7).expect("reset");
+            resets += 1;
+        }
+    }
+    let elapsed2 = t0.elapsed().as_secs_f64();
+    println!(
+        "e9 组2(固定序列): {:.1} 控制步/秒, {:.3} ms/步(2000 步,reset {resets} 次)",
+        2000.0 / elapsed2,
+        elapsed2 * 1000.0 / 2000.0
+    );
+
+    // reset 耗时(20 次平均)。
     let mut reset_us = Vec::with_capacity(20);
     for _ in 0..20 {
         let t = Instant::now();
