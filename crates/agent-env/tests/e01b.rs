@@ -103,10 +103,10 @@ fn v1_thread_count_invariant() {
         assert_eq!(bits(&s1.obs), bits(&s4.obs), "第 {k} 步 obs");
         assert_eq!(s1.terminated, s4.terminated, "第 {k} 步 terminated");
         assert_eq!(s1.truncated, s4.truncated, "第 {k} 步 truncated");
-        for i in 0..4 {
+        for (i, (r1, r4)) in s1.reward.iter().zip(&s4.reward).enumerate() {
             assert_eq!(
-                bits(&s1.reward[i].joint_pos),
-                bits(&s4.reward[i].joint_pos),
+                bits(&r1.joint_pos),
+                bits(&r4.joint_pos),
                 "第 {k} 步 env{i} joint_pos"
             );
         }
@@ -147,9 +147,9 @@ fn v2_matches_single() {
             );
         }
     }
-    for i in 0..3 {
-        if fell[i] {
-            println!("v2: env{i} 在第 {} 步摔倒,比到摔倒前", fall_step[i]);
+    for (i, (&f, &fs)) in fell.iter().zip(&fall_step).enumerate() {
+        if f {
+            println!("v2: env{i} 在第 {fs} 步摔倒,比到摔倒前");
         }
     }
 }
@@ -192,9 +192,9 @@ fn v3_auto_reset() {
     let out6 = vec.step(&actions(5, 2)).expect("第 6 步");
     assert_eq!(out6.terminated, vec![false; 2]);
     assert_eq!(out6.truncated, vec![false; 2]);
-    for i in 0..2 {
+    for (i, r) in out6.reward.iter().enumerate() {
         assert_eq!(
-            bits(&out6.reward[i].prev_action),
+            bits(&r.prev_action),
             bits(&[0.0; DOF]),
             "第 6 步 env{i} prev_action 全 0"
         );
