@@ -284,7 +284,7 @@ assets/policies/<名>/
 ### 阶段 E:训练与端到端
 
 - [x] **AC-E1 同一物理**:同样的初态和动作序列,`agent-env` 与生产路径的轨迹逐位相同。(E01a:150 步固定动作,与日志回放、与独立驱动的 `Session` 逐步逐位相同。)
-- [ ] **AC-E1b MJCF 同构**:导出的 MJCF 在 MuJoCo 里加载后,逐连杆的质量、惯量、关节轴、限位、力矩上限与 `BodyDef` 一致;同一组固定关节目标下站立的机身高度,两边相差不超过 demo `transfer` 的定值。
+- [x] **AC-E1b MJCF 同构**:导出的 MJCF 在 MuJoCo 里加载后,逐连杆的质量、惯量、关节轴、限位、力矩上限与 `BodyDef` 一致;同一组固定关节目标下站立的机身高度,两边相差不超过 demo `transfer` 的定值。(E02a:逐连杆质量、质心、惯量,逐关节轴、限位、力矩上限、增益全部一致;把游戏里实测的 4 帧姿态搬进 MuJoCo,连杆位置差不超过 0.013 mm。站立高度定值取 **2 cm**:实测 MuJoCo 比游戏高 1.11 cm(手写四足)和 1.03 cm(Go2),原因未归因。)
 - [ ] **AC-E2 训练**:MuJoCo 主训练、`agent-env` 微调后的策略,部署后在平地按意图行走 60 秒不摔倒,速度跟随误差在定值内。报告零样本迁移(微调前)的同一组指标和微调用的步数。
 - [ ] **AC-E3 端到端**:训练好的狗走在有弹坑和散落方块的地形上;玩家附身后 WASD 能改变它的方向;解除附身后它继续执行原意图。
 
@@ -403,7 +403,10 @@ assets/policies/<名>/
 | E01a | `agent-env` 单环境 Rust API:建在 `Session` 上,动作进命令日志;观测与动作映射复用 `policy::PolicyCodec`(从 `Policy::act` 拆出) | E1。**已验收**(a6304b0,实施方 qodercli) |
 | E01b | `agent-env` 并行多实例 `VecEnv`(到时那一步的约定、种子与线程数无关) | **已验收**(0881d8b,实施方 qodercli)。实测(release,四足,会动的动作):单环境 0.42 ms/控制步;16 环境 16 线程 21500 控制步/秒。全 0 动作时四足休眠,0.06 ms/步,不代表训练速度 |
 | E01c | 地形与物理参数随机化(范围在 MuJoCo 主训练之后按迁移差距定) | — |
-| E02 | MJCF 导出、`tools/train/` MuJoCo 训练脚本、PyO3 封装与微调脚本 | E1b、E2 |
+| E02a | `cargo xtask export-mjcf`:`BodyDef` 导出成 MJCF(真实单位、坐标不转、质量属性取自内核同一段代码)+ 核对脚本 `tools/train/check_mjcf.py` | E1b。**已验收**(8e0f075,实施方 qodercli) |
+| E02b | PyO3 封装、四足的 `BackendSpec`、rapier 后端适配器、契约检查、奖励 | — |
+| E02c | MuJoCo 后端适配器(同一份 `BackendSpec`),域随机化 | — |
+| E02d | 在 vm-ai 上主训练,回到本项目物理零样本评估与微调,导出策略包 | E2 |
 | E03 | 端到端部署与冒烟。**阶段 E 人工验收** | E3 |
 
 ## 13. demo 记录
