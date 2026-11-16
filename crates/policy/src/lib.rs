@@ -9,7 +9,9 @@
 pub mod error;
 pub mod manifest;
 pub mod observe;
+pub mod runtime;
 
 pub use error::PolicyError;
 pub use manifest::{Normalization, ObsEntry, PolicyManifest};
 pub use observe::{AgentSnapshot, ObsTerm, observe};
+pub use runtime::{Action, Policy};
