@@ -2486,21 +2486,32 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // (Some)= 检查点条目重建宿主、startup 只续等 record.pending 列出的
     // 那几条(世界快照里已生成的主体不重复生成);全新启动(None)= 宿主
     // 空、全量配置由 startup 逐条生成并挂载。计数是遥测,不随检查点恢复。
-    let (host, startup) = match resume {
+    let (host, startup, policy_table) = match resume {
         Some(r) => {
+            // 策略表重加载(bodies 双加载先例;bootstrap 已前置校验,
+            // 这里 fail-stop 防御)。
+            let policy_table = load_policy_table(&config, &bodies, Some(&r.controllers))
+                .expect("策略加载/恢复校验失败(bootstrap 已前置,fail-stop 防御)");
             let host = crate::controller::ControllerHost::from_records(r.controllers);
             let startup =
                 crate::startup_agents::StartupAgents::resume(&config.agents, &bodies, &r.startup);
-            (host, startup)
+            (host, startup, policy_table)
         }
         None => {
+            let policy_table = load_policy_table(&config, &bodies, None)
+                .expect("策略加载失败(bootstrap 已前置,fail-stop 防御)");
             let startup = crate::startup_agents::StartupAgents::new(&config.agents, &bodies)
                 .expect("启动主体构造失败(校验已在 load_body_registry 前置,fail-stop 防御)");
-            (crate::controller::ControllerHost::default(), startup)
+            (
+                crate::controller::ControllerHost::default(),
+                startup,
+                policy_table,
+            )
         }
     };
     let mut host = host;
     let mut startup = startup;
+    let mut policy_table = policy_table;
     // startup 的服务端序号分配器(spawn_next_seq 那一套,#12 语义):与
     // observe 编排器的分配器同一起点、同"跳过现存 ID"策略,不会重复;
     // checkpoint 的高水位 max 把它计入(见下方 checkpoint 分支)。
@@ -2613,6 +2624,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     &mut session,
                     &mut log,
                     &mut host,
+                    &policy_table,
                     &mut |sess| {
                         loop {
                             let seq = startup_next_seq;
@@ -2650,6 +2662,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     };
                     host.apply_leash(root_xz);
                     host.drive(&mut session, &mut log, now, in_transit, frozen);
+                    // ③b 策略控制者(D01b-1 §1.3):紧跟 drive,同步推理。
+                    host.drive_policies(&mut session, &mut log, &mut policy_table, now, in_transit, frozen);
                 }
                 // session.tick() 为阻塞调用,直接在 async loop 内执行(毫秒级、
                 // 单装配单驱动;REQ-003 网络落地时再 spawn_blocking 化,README 决策 3)。
@@ -3028,6 +3042,8 @@ pub fn bootstrap(
             // 逐分片注入(不进快照,做法与 BlockRegistry 一致)。
             // A04 第 4 节:加载即校验 MARGIN(类型化拒绝)。
             let bodies = load_body_registry(config)?;
+            // 策略表前置校验(D01b-1 §1.4:恢复启动查检查点 Policy 键)。
+            load_policy_table(config, &bodies, Some(&bundle.controllers))?;
             let session = sim_api::replay::replay_world_with_bodies(
                 &bundle.world,
                 &log,
@@ -3062,7 +3078,9 @@ pub fn bootstrap(
             // 全新启动也加载身体注册表(B02b:启动校验第 2/4/5 条需要它;
             // MARGIN 校验同口径,恢复路径早已有)。校验失败 = 类型化错误
             // 拒绝启动(注册表本身由 wire_provider_and_new_sim 另交驱动)。
-            let _bodies = load_body_registry(config)?;
+            let bodies = load_body_registry(config)?;
+            // 策略表前置校验(D01b-1 §1.4:任何一条策略包不合格拒绝启动)。
+            load_policy_table(config, &bodies, None)?;
             (session, sim_api::log::CommandLog::new(), None, 0, None)
         }
     };
@@ -3131,6 +3149,61 @@ pub fn load_body_registry(config: &Config) -> Result<physics_sim::BodyRegistry, 
     // 类型化配置错误,拒绝启动。
     config.validate_startup_agents(&bodies)?;
     Ok(bodies)
+}
+
+/// 加载策略表(REQ-012 D01b-1 §1.4):对 `[[agents]]` 里每条
+/// `controller = "policy"` 用它的身体定义 `PolicyTable::load`,任何一条
+/// 失败 = 类型化配置错误拒绝启动(信息带第几条、策略名、PolicyError
+/// 原文——哈希不符时两个哈希都在里面)。恢复启动另查:检查点里的
+/// `Policy(key)` 槽位 key 必须在表里,不在 → 拒绝启动。
+/// 全新启动与恢复启动都做,在生成任何主体之前(bootstrap 两分支前置;
+/// run 装配时照 bodies 双加载先例重加载一次供驱动使用)。
+pub fn load_policy_table(
+    config: &Config,
+    bodies: &physics_sim::BodyRegistry,
+    resume_controllers: Option<&[crate::controller::ControllerRecord]>,
+) -> Result<crate::controller::policy_table::PolicyTable, AppError> {
+    use crate::controller::{ControllerKind, policy_table::PolicyTable};
+    let mut table = PolicyTable::default();
+    for (i, a) in config.agents.iter().enumerate() {
+        if a.controller != crate::config::StartupController::Policy {
+            continue;
+        }
+        let idx = i + 1;
+        let name = a
+            .policy
+            .as_deref()
+            .expect("配置校验已保证 controller = policy 必写 policy 名(fail-stop)");
+        let hash = bodies.hash_of(&a.body).ok_or_else(|| {
+            ConfigError::StartupAgent(format!(
+                "第 {idx} 条 [[agents]]:身体 \"{}\" 不在注册表里",
+                a.body
+            ))
+        })?;
+        let def = bodies.get(&hash).ok_or_else(|| {
+            ConfigError::StartupAgent(format!(
+                "第 {idx} 条 [[agents]]:身体 \"{}\" 的哈希在注册表里缺失(内部错误)",
+                a.body
+            ))
+        })?;
+        table
+            .load(&config.policies_dir, name, def)
+            .map_err(|e| ConfigError::StartupAgent(format!("第 {idx} 条 [[agents]]:{e}")))?;
+    }
+    if let Some(records) = resume_controllers {
+        for record in records {
+            if let ControllerKind::Policy(key) = record.slot.kind
+                && !table.contains(key)
+            {
+                return Err(ConfigError::StartupAgent(format!(
+                    "检查点里有策略控制的主体({:?}),但配置里没有对应的策略",
+                    record.entity
+                ))
+                .into());
+            }
+        }
+    }
+    Ok(table)
 }
 
 /// bootstrap 之外的第二步装配(REQ-002 §4.3/§4.4):按 world_kind 造生成器,

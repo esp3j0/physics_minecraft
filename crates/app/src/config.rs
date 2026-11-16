@@ -203,9 +203,18 @@ pub struct StartupAgentConfig {
     /// 活动半径 m(配置项:脚本主体的活动半径;默认 16,范围见校验)。
     #[serde(default = "default_leash_m")]
     pub leash_m: f32,
+    /// 策略名(D01b-1 §1.4):`controller = "policy"` 时必填,其它
+    /// controller 时不许出现;名字只许 `[A-Za-z0-9_-]`,长度 1–64。
+    #[serde(default)]
+    pub policy: Option<String>,
+    /// 给策略的意图观测 [move_x, move_z, yaw](D01b-1 §1.4;默认全 0,
+    /// 每项有限、绝对值 ≤ 1)。
+    #[serde(default)]
+    pub intent: [f32; 3],
 }
 
-/// 启动主体的控制者种类(§2.1;snake_case:`"none" | "quad_stand" | "quad_trot"`)。
+/// 启动主体的控制者种类(§2.1;snake_case:
+/// `"none" | "quad_stand" | "quad_trot" | "policy"`)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupController {
@@ -216,6 +225,8 @@ pub enum StartupController {
     QuadStand,
     /// 先站 2 s,之后对角小跑。
     QuadTrot,
+    /// 策略控制(D01b-1 §1.4;策略名见 `StartupAgentConfig::policy`)。
+    Policy,
 }
 
 fn default_leash_m() -> f32 {
@@ -279,6 +290,10 @@ pub struct Config {
     /// `*.body.toml` 进 `BodyRegistry` 注入每个 `ShardSim`(不进快照,
     /// restore 重新注入,做法与 BlockRegistry 一致)。目录不存在 = 空注册表。
     pub bodies_dir: PathBuf,
+    /// 策略包目录(REQ-012 D01b-1 §1.4;装配参数):启动/恢复时按
+    /// `[[agents]]` 的 policy 名加载 `<policies_dir>/<名>`。相对路径的
+    /// 基准与 `bodies_dir` 相同。
+    pub policies_dir: PathBuf,
     /// 服务器监听地址(REQ-004A 决策 4;main 网络装配 `assemble_network`
     /// 的 listen 输入;端口 0 = OS 分配,测试用)。
     pub listen_addr: String,
@@ -309,6 +324,7 @@ impl Default for Config {
             world_seed: WorldSeed(0),
             world_kind: WorldKind::Superflat,
             bodies_dir: PathBuf::from("assets/bodies"),
+            policies_dir: PathBuf::from("assets/policies"),
             listen_addr: "127.0.0.1:25565".to_string(),
             agents: Vec::new(),
         }
@@ -543,6 +559,39 @@ impl Config {
                     "第 {idx} 条 [[agents]](body = {}):leash_m ({}) 须为有限值且在 \
                      [{LEASH_MIN_M}, {LEASH_MAX_M}] m",
                     a.body, a.leash_m
+                )));
+            }
+            // 策略配置(D01b-1 §1.4):policy 名必填/禁填、字符集与长度
+            // (防路径穿越)、intent 有限且绝对值 ≤ 1。
+            match (a.controller, &a.policy) {
+                (StartupController::Policy, None) => {
+                    return Err(ConfigError::StartupAgent(format!(
+                        "第 {idx} 条 [[agents]]:controller = policy 必须写 policy 名"
+                    )));
+                }
+                (controller, Some(_)) if controller != StartupController::Policy => {
+                    return Err(ConfigError::StartupAgent(format!(
+                        "第 {idx} 条 [[agents]]:controller 非 policy 不许写 policy"
+                    )));
+                }
+                _ => {}
+            }
+            if let Some(name) = &a.policy {
+                let ok = !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+                if !ok {
+                    return Err(ConfigError::StartupAgent(format!(
+                        "第 {idx} 条 [[agents]]:policy 名 {name:?} 只许 [A-Za-z0-9_-]、长度 1–64"
+                    )));
+                }
+            }
+            if a.intent.iter().any(|v| !v.is_finite() || v.abs() > 1.0) {
+                return Err(ConfigError::StartupAgent(format!(
+                    "第 {idx} 条 [[agents]]:intent {:?} 每项须有限且绝对值 ≤ 1",
+                    a.intent
                 )));
             }
         }
@@ -1773,5 +1822,84 @@ unload_radius = 64
         single
             .validate_startup_agents(&bodies)
             .expect("单连杆贴边通过(行为不变)");
+    }
+
+    /// G3(D01b-1 §1.4):policy 配置项解析与校验——controller = "policy"
+    /// 可解析、policies_dir 默认 "assets/policies"、policy/intent 缺省;
+    /// Q6 里那几条配置错误各一个拒绝用例 + 通过对照。
+    #[test]
+    fn g3_policy_config_parse_and_validation() {
+        // 解析:controller = policy + policy 名 + intent。
+        let c = Config::from_toml_str(
+            "[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\ncontroller = \"policy\"\npolicy = \"stand\"\nintent = [1.0, 0.0, -1.0]\n",
+        )
+        .expect("policy 条目可解析");
+        assert_eq!(c.agents[0].controller, StartupController::Policy);
+        assert_eq!(c.agents[0].policy.as_deref(), Some("stand"));
+        assert_eq!(c.agents[0].intent, [1.0, 0.0, -1.0]);
+        assert_eq!(
+            c.policies_dir,
+            std::path::PathBuf::from("assets/policies"),
+            "默认 policies_dir"
+        );
+        // 缺省:非 policy 条目 policy = None、intent 全 0。
+        let c =
+            Config::from_toml_str("[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\n")
+                .expect("最小条目");
+        assert_eq!(c.agents[0].policy, None);
+        assert_eq!(c.agents[0].intent, [0.0; 3]);
+        // policies_dir 覆写可解析。
+        let c = Config::from_toml_str("policies_dir = \"elsewhere\"\n").expect("覆写");
+        assert_eq!(c.policies_dir, std::path::PathBuf::from("elsewhere"));
+
+        let reject = |toml: &str, needle: &str| {
+            let err = Config::from_toml_str(toml).expect_err("应拒绝");
+            assert!(
+                matches!(err, ConfigError::StartupAgent(_)),
+                "错误类型:{err:?}"
+            );
+            let msg = format!("{err}");
+            assert!(msg.contains(needle), "错误文本含 {needle:?}:{msg}");
+            assert!(msg.contains("第 1 条"), "错误写明第几条:{msg}");
+        };
+        let head = "[[agents]]\nbody = \"quad\"\nposition = [64.0, -59.5, 64.0]\n";
+        // controller = policy 没写 policy。
+        reject(&format!("{head}controller = \"policy\"\n"), "policy");
+        // controller = quad_stand 却写了 policy。
+        reject(
+            &format!("{head}controller = \"quad_stand\"\npolicy = \"stand\"\n"),
+            "policy",
+        );
+        // 路径穿越 / 非法字符 / 空名 / 超长。
+        reject(
+            &format!("{head}controller = \"policy\"\npolicy = \"../x\"\n"),
+            "policy",
+        );
+        reject(
+            &format!("{head}controller = \"policy\"\npolicy = \"a b\"\n"),
+            "policy",
+        );
+        reject(
+            &format!("{head}controller = \"policy\"\npolicy = \"\"\n"),
+            "policy",
+        );
+        let long = "a".repeat(65);
+        reject(
+            &format!("{head}controller = \"policy\"\npolicy = \"{long}\"\n"),
+            "policy",
+        );
+        // intent 绝对值 > 1 / 非有限。
+        reject(&format!("{head}intent = [2.0, 0.0, 0.0]\n"), "intent");
+        reject(&format!("{head}intent = [nan, 0.0, 0.0]\n"), "intent");
+        // 通过对照:合法名(含大小写、数字、_、-;64 字符边界)、intent ±1。
+        let ok64 = "a".repeat(64);
+        Config::from_toml_str(&format!(
+            "{head}controller = \"policy\"\npolicy = \"{ok64}\"\nintent = [1.0, -1.0, 0.0]\n"
+        ))
+        .expect("64 字符名与边界 intent 通过");
+        Config::from_toml_str(&format!(
+            "{head}controller = \"policy\"\npolicy = \"A_z-9\"\n"
+        ))
+        .expect("合法字符集通过");
     }
 }

@@ -46,6 +46,8 @@ fn quad_agent(controller: StartupController, leash_m: f32) -> StartupAgentConfig
         yaw_deg: 0.0,
         controller,
         leash_m,
+        policy: None,
+        intent: [0.0; 3],
     }
 }
 

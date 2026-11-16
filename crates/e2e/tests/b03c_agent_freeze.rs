@@ -59,6 +59,8 @@ fn quad_trot_agent() -> StartupAgentConfig {
         yaw_deg: 0.0,
         controller: StartupController::QuadTrot,
         leash_m: 16.0,
+        policy: None,
+        intent: [0.0; 3],
     }
 }
 

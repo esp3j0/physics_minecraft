@@ -35,8 +35,9 @@ use types::{BlockPos, EntityId, Tick};
 use crate::config::{
     STARTUP_AGENTS_MAX, STARTUP_TICKET_EXTRA_M, StartupAgentConfig, StartupController,
 };
+use crate::controller::policy_table::PolicyTable;
 use crate::controller::{
-    ControllerHost, ControllerKind, DEFAULT_CONTROL_PERIOD_TICKS, Leash, ScriptKind,
+    ControllerHost, ControllerKind, DEFAULT_CONTROL_PERIOD_TICKS, Leash, PolicyKey, ScriptKind,
 };
 
 /// 出生点等待超时(拍;§2.2 = 600 拍 = 10 s @ 60 Hz)。
@@ -255,12 +256,14 @@ impl StartupAgents {
     /// 每拍在 `session.tick()` 之前调(§2.3 顺序)。对每条待生成项:
     /// 放票(首次)→ 出生列可读且碰撞体已建 → 生成 + 挂载;超时放弃。
     /// `alloc_id` = 驱动的服务端序号分配器(`spawn_next_seq` 那一套;
-    /// 跳过现存 ID)。
+    /// 跳过现存 ID)。`policies` = 已加载策略表(D01b-1:Policy 条目的
+    /// dof/周期从表里取,启动加载已校验键必在)。
     pub fn poll(
         &mut self,
         session: &mut Session,
         log: &mut CommandLog,
         host: &mut ControllerHost,
+        policies: &PolicyTable,
         alloc_id: &mut impl FnMut(&Session) -> EntityId,
         now: Tick,
     ) {
@@ -386,12 +389,32 @@ impl StartupAgents {
                     StartupController::None => ControllerKind::None,
                     StartupController::QuadStand => ControllerKind::Script(ScriptKind::QuadStand),
                     StartupController::QuadTrot => ControllerKind::Script(ScriptKind::QuadTrot),
+                    StartupController::Policy => {
+                        let name = item
+                            .cfg
+                            .policy
+                            .as_deref()
+                            .expect("配置校验已保证 policy 必填(fail-stop)");
+                        ControllerKind::Policy(PolicyKey::of(name))
+                    }
+                };
+                // 策略周期取 manifest(D01b-1 §1.3);脚本照旧 30 Hz。
+                let period = match kind {
+                    ControllerKind::Policy(key) => {
+                        policies
+                            .get(key)
+                            .expect("策略键必在表中(启动加载已校验,fail-stop)")
+                            .policy
+                            .manifest()
+                            .control_period_ticks
+                    }
+                    _ => DEFAULT_CONTROL_PERIOD_TICKS,
                 };
                 if let Err(err) = host.attach(
                     entity,
                     kind,
                     item.dof,
-                    DEFAULT_CONTROL_PERIOD_TICKS,
+                    period,
                     now.next(),
                     Some(Leash {
                         center_xz: [item.cfg.position[0], item.cfg.position[2]],
@@ -402,6 +425,9 @@ impl StartupAgents {
                         "[startup-agents] 第 {} 条控制者挂载失败(配置校验应已挡,fail-stop):{err:?}",
                         item.index
                     );
+                }
+                if matches!(kind, ControllerKind::Policy(_)) {
+                    host.set_intent(entity, item.cfg.intent);
                 }
                 self.counters.spawned += 1;
                 // 票跟主体走(B03d):进票表,主体没了由 release_dead 撤。
@@ -476,6 +502,8 @@ mod tests {
             yaw_deg: 0.0,
             controller,
             leash_m: 16.0,
+            policy: None,
+            intent: [0.0; 3],
         }
     }
 
@@ -533,7 +561,14 @@ mod tests {
 
         // 第 1 拍前:票当拍生效(调度器票据收件箱),chunk 装载判定已过
         // (布景直载)→ 当拍即生成。
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1, "装载好的出生点当拍生成");
         assert!(startup.pending.is_empty(), "出表");
@@ -620,7 +655,14 @@ mod tests {
         // 不引用常量(变异把阈值改小时断言不跟着走,R1-3)。第 600 拍整
         // 不放弃(waited == 600 不 > 600),第 601 拍(waited 601)才超。
         for now in 0..600u64 {
-            startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(now));
+            startup.poll(
+                &mut session,
+                &mut log,
+                &mut host,
+                &PolicyTable::default(),
+                &mut alloc,
+                Tick(now),
+            );
         }
         assert_eq!(
             startup.counters.spawn_timeouts, 0,
@@ -628,7 +670,14 @@ mod tests {
         );
         assert_eq!(startup.pending.len(), 1, "仍在等");
         // 第 601 次 poll:waited 超限 → 放弃。
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(600));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(600),
+        );
         assert_eq!(startup.counters.spawn_timeouts, 1, "第 601 次 poll 后超时");
         assert_eq!(startup.counters.spawned, 0, "从未生成");
         assert!(startup.pending.is_empty(), "出表");
@@ -668,7 +717,14 @@ mod tests {
         load_ground(&mut session);
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 2);
         session.shutdown();
@@ -723,7 +779,14 @@ mod tests {
         let mut session = Session::new(cfg());
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         assert_eq!(startup.counters, StartupCounters::default());
         assert!(log.entries().is_empty(), "空配置零日志条目");
         session.shutdown();
@@ -763,7 +826,14 @@ mod tests {
             load_ground(&mut session);
             let mut log = CommandLog::new();
             let mut host = crate::controller::ControllerHost::default();
-            startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+            startup.poll(
+                &mut session,
+                &mut log,
+                &mut host,
+                &PolicyTable::default(),
+                &mut alloc,
+                Tick(0),
+            );
             session.tick();
             assert_eq!(startup.counters.spawned, 1, "顺序 {order}:当拍生成 1 条");
             assert_eq!(
@@ -803,7 +873,14 @@ mod tests {
         load_ground(&mut session);
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1);
         session.shutdown();
@@ -875,7 +952,14 @@ mod tests {
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
         // 第 0 拍 poll:startup 自己的票照放;出生列可读但 ② 未建 → 不生成。
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         assert_eq!(
             startup.counters.spawned, 0,
             "碰撞体未建不生成(实得生成 {})",
@@ -887,7 +971,14 @@ mod tests {
             session.has_collider(shard, types::ChunkPos::new(0, 0)),
             "tick 后激活决策已建 ②"
         );
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(1));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(1),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1, "碰撞体建好后生成");
         assert!(startup.pending.is_empty(), "出表");
@@ -916,7 +1007,14 @@ mod tests {
         let mut host = crate::controller::ControllerHost::default();
         // 第 1 条当拍生成;第 3 条预置超时临界同拍放弃;第 2 条 waited=0 在等。
         startup.set_waited(3, STARTUP_SPAWN_TIMEOUT_TICKS);
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1);
         assert_eq!(startup.counters.spawn_timeouts, 1);
@@ -999,7 +1097,14 @@ mod tests {
         load_ground(&mut session);
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1);
         let (entity, ticket_id) = startup.to_record().tickets[0];
@@ -1068,7 +1173,14 @@ mod tests {
         load_ground(&mut session);
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        startup.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        startup.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(startup.counters.spawned, 1, "已生成(布景前提)");
         assert!(startup.has_tickets(), "生成后:票在表 = true");
@@ -1091,7 +1203,14 @@ mod tests {
         let mut session = Session::new(cfg());
         let mut log = CommandLog::new();
         let mut host = crate::controller::ControllerHost::default();
-        first.poll(&mut session, &mut log, &mut host, &mut alloc, Tick(0));
+        first.poll(
+            &mut session,
+            &mut log,
+            &mut host,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session.tick();
         assert_eq!(first.counters.spawned, 0, "布景:没装载不生成");
         let ticket_before = first.to_record().tickets.first().map(|t| t.1);
@@ -1119,7 +1238,14 @@ mod tests {
         load_ground(&mut session2);
         let mut log2 = CommandLog::new();
         let mut host2 = crate::controller::ControllerHost::default();
-        resumed.poll(&mut session2, &mut log2, &mut host2, &mut alloc, Tick(0));
+        resumed.poll(
+            &mut session2,
+            &mut log2,
+            &mut host2,
+            &PolicyTable::default(),
+            &mut alloc,
+            Tick(0),
+        );
         session2.tick();
         assert_eq!(
             resumed.counters.spawned, 1,

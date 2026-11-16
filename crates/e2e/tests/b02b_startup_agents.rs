@@ -61,6 +61,8 @@ fn quad_agent(controller: StartupController, leash_m: f32) -> StartupAgentConfig
         yaw_deg: 0.0,
         controller,
         leash_m,
+        policy: None,
+        intent: [0.0; 3],
     }
 }
 
@@ -800,6 +802,8 @@ fn e5_config_errors_reject_startup() {
         yaw_deg: 0.0,
         controller: StartupController::None,
         leash_m: 16.0,
+        policy: None,
+        intent: [0.0; 3],
     }];
     let msg = match app::driver::wire_provider_and_new_sim(c.clone(), &store, || {
         Box::new(SimpleRegistry::builtin())
@@ -835,6 +839,8 @@ fn e5_config_errors_reject_startup() {
         yaw_deg: 0.0,
         controller: StartupController::QuadTrot,
         leash_m: 16.0,
+        policy: None,
+        intent: [0.0; 3],
     }]);
     let msg = match app::driver::wire_provider_and_new_sim(c, &store, || {
         Box::new(SimpleRegistry::builtin())
