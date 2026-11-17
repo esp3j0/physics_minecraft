@@ -178,6 +178,10 @@ assets/policies/<名>/
 
 **训练代码与后端无关**(用户 2026-11-08 要求):PPO、奖励、导出放在 `tools/train/`,通过统一的后端接口驱动环境。rapier 和 MuJoCo 各写一个适配器,共用一份 `BackendSpec`(观测布局、动作映射、控制频率、`reward_inputs` 的键、身体标识)。检查点带 `spec`,`--init-from` 可以换后端继续训练,`spec` 不一致就拒绝。三步路线:demo `learn` 先在 rapier 上跑通;`transfer` 接 MuJoCo 主训练;最后回到 rapier 微调。
 
+**分两期(用户 2026-11-16 定)**:架构师本机实测(AMD Ryzen 7 255,16 线程,无 NVIDIA 卡),MuJoCo 4.0.1 CPU 跑导出的 quad/go2 单线程约 3980 控制步/s、16 进程约 3.66 万控制步/s;本项目 rapier 环境单线程约 2400、16 线程约 2.15 万。CPU 上只快约 1.7 倍,且 rapier 试验里整条训练管线只有约 6100 步/s(CPU 上的 PPO 占了大半)。数量级的提升只来自 GPU 版(MJX / MuJoCo Warp)几千环境并行,前提是观测、奖励、重置、PPO 全部搬上 GPU。所以:
+- **第一期**:CPU 版 MuJoCo 后端接进现有 Python 管线(E02c),做迁移对照(MuJoCo 训 → rapier 评、rapier 训 → MuJoCo 评、rapier 微调能补回多少、域随机化能缩小多少)。CPU 后端同时是 GPU 版的参照答案。
+- **第二期(可选)**:先在 vm-ai(2×2080Ti,11 GB)做 GPU 可行性探针(能否装上、4096 环境的吞吐和显存),数字好看再立正式单元。
+
 后端接口有两条约定,MuJoCo 适配器也必须遵守(demo `learn` 的契约检查 `tools/train/train/backends/check.py` 会查):
 
 - **到时那一步**:`obs` 给新回合的第一帧,`reward_inputs` 给 reset 之前最后一次转移的值。训练端按 CleanRL 的约定处理 done;
@@ -406,7 +410,9 @@ assets/policies/<名>/
 | E02a | `cargo xtask export-mjcf`:`BodyDef` 导出成 MJCF(真实单位、坐标不转、质量属性取自内核同一段代码)+ 核对脚本 `tools/train/check_mjcf.py` | E1b。**已验收**(8e0f075,实施方 qodercli) |
 | E02b-1 | `agent_env` Python 模块(PyO3)、四足的 `BackendSpec`、rapier 后端适配器、契约检查(`tools/train/quad/`) | **已验收**(7d07142,实施方 qodercli)。新增可选依赖 `pyo3` 0.24、`numpy` 0.24,只在 `python` 特性下启用 |
 | E02b-2 | 四足的奖励、PPO、策略导出、评估、`cargo xtask check-policy` | **已验收**(5e49a42,实施方 qodercli)。3 分钟冒烟训练的策略导出后,Python 网络与游戏推理路径的动作差最大 1.6e-6 |
-| E02c | MuJoCo 后端适配器(同一份 `BackendSpec`),域随机化 | — |
+| E02c-1 | MuJoCo CPU 后端适配器(同一份 `BackendSpec`)。架构师定的口径:物理状态从 MuJoCo 取,**观测编码、动作解码、机身系换算、意图采样、回合种子全部调 Rust 同一份代码**(PyO3 暴露),Python 只做状态提取;步长 1/600 s(每拍 10 子步,控制周期 20 子步);出生高度 0.45 m、先站 121 拍再取初态,与 `agent-env` 一致;根线速度取质心速度(rapier `linvel` 口径) | — |
+| E02c-2 | 域随机化(摩擦、质量、PD 增益、动作延迟、推扰),两个后端共用同一份随机化参数 | — |
+| E02e | (可选,第二期)vm-ai 上 GPU 版 MuJoCo 可行性探针 | — |
 | E02d | 在 vm-ai 上主训练,回到本项目物理零样本评估与微调,导出策略包 | E2。**试验记录(2026-11-16,架构师在本机跑,只用本项目物理,未用 MuJoCo)**:512 环境 12 线程,每秒约 5000–6000 步;累计 5240 万步(约 2 小时 45 分)后,手写四足在前进意图 0–1(目标 0–0.6 m/s)和中速转向下 60 秒不摔 16/16,前进速度误差 0.06–0.13 m/s;全速加转向仍摔;零意图时有约 0.12 m/s 的漂移;机身 up·y 约 0.88(偏斜)。策略包导出后 `check-policy` 通过(最大差 3.9e-7)。AC-E2 未达成,待调奖励并定速度误差定值。已知问题:`quad.export` 在输出被重定向且控制台是 GBK 时崩溃,需设 `PYTHONIOENCODING=utf-8` |
 | E03 | 端到端部署与冒烟。**阶段 E 人工验收** | E3 |
 
