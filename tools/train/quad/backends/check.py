@@ -1,4 +1,4 @@
-"""四足后端契约检查(E02b-1 项1–6;E02c-1 加 --backend/--mjcf 与 MuJoCo 项7–12)。
+"""四足后端契约检查(E02b-1 项1–6;E02c-1 加 --backend/--mjcf 与 MuJoCo 项7–14)。
 
 命令行:
   python -m quad.backends.check --backend rapier --body <body.toml> --manifest <m.toml>
@@ -7,6 +7,7 @@
 项1–6(两后端):常量单一来源 / 形状类型 / 线程无关 / 到时那一步 / 动作裁剪 / 错误。
 项7–12(仅 mujoco,§5 手算期望):时间 / 偏航速度 / 横滚 / 关节映射 / 质心速度 /
   解码同一份 / 初态 / 意图同源 / 跨后端初态(只报数)。
+项13–14(仅 mujoco,R1):动作驱动物理 / autoreset 回初态(逐位判据)。
 """
 
 from __future__ import annotations
@@ -346,6 +347,45 @@ def item12(args) -> None:
           f"mujoco {float(np.mean(rm['root_height'])):.6f}")
 
 
+def item13(args) -> None:
+    print("项13:动作驱动物理(全0 vs 全1 一步,joint_pos/joint_vel 段逐位不同)")
+    b0 = make_backend("mujoco", args.body, args.manifest, 4, 4,
+                      args.episode_controls, args.fall_up_y_min, args.mjcf)
+    b1 = make_backend("mujoco", args.body, args.manifest, 4, 4,
+                      args.episode_controls, args.fall_up_y_min, args.mjcf)
+    b0.reset(0)
+    b1.reset(0)
+    off = obs_offsets(b0.spec_dict["obs_terms"], b0.spec_dict["dof"])
+    o0, _, _, _ = b0.step(np.zeros((4, b0.act_dim), dtype=np.float32))
+    o1, _, _, _ = b1.step(np.ones((4, b1.act_dim), dtype=np.float32))
+    for term in ("joint_pos", "joint_vel"):
+        lo, hi = off[term]
+        check(
+            not np.array_equal(bits(o0[:, lo:hi]), bits(o1[:, lo:hi])),
+            f"全0 vs 全1 一步 obs[{term}] 段逐位不同(动作真的驱动物理)",
+        )
+
+
+def item14(args) -> None:
+    print("项14:autoreset 回初态(ep=5,第5步新回合首帧物理段 == reset 首帧)")
+    b = make_backend("mujoco", args.body, args.manifest, 4, 4, 5,
+                     args.fall_up_y_min, args.mjcf)
+    first = b.reset(0)
+    off = obs_offsets(b.spec_dict["obs_terms"], b.spec_dict["dof"])
+    a = np.ones((4, b.act_dim), dtype=np.float32)
+    for _ in range(4):
+        b.step(a)
+    o5, _, te5, tr5 = b.step(a)  # 第 5 步 truncated → 自动 reset
+    check(bool(np.all(tr5)) and not bool(np.any(te5)), "第 5 步 truncated 全 True、未摔倒")
+    for term in ("base_lin_vel", "base_ang_vel", "projected_gravity",
+                 "joint_pos", "joint_vel", "last_action"):
+        lo, hi = off[term]
+        check(
+            np.array_equal(bits(o5[:, lo:hi]), bits(first[:, lo:hi])),
+            f"新回合首帧 obs[{term}] 段与 reset 首帧逐位相同(intent 段除外)",
+        )
+
+
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
@@ -380,11 +420,13 @@ def main() -> int:
         item10(args)
         item11(args)
         item12(args)
+        item13(args)
+        item14(args)
 
     if FAILED:
         print(f"==== 结论: 有 FAIL({len(FAILED)} 项)====")
         return 1
-    last = 12 if args.backend == "mujoco" else 6
+    last = 14 if args.backend == "mujoco" else 6
     print(f"==== 结论: 项1–{last} 全部 PASS ====")
     return 0
 
