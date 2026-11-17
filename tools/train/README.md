@@ -214,4 +214,37 @@ cargo xtask check-policy tools/train/out/quad_smoke \
 `episode_controls`、`fall_up_y_min`),不一致拒绝并列出差异键。
 `check-policy` 不带 `--probe` 只验证策略包能加载;带 `--probe` 还要求
 环境 reset 观测与 probe.obs 逐位相同、`policy.act` 的 raw 与 probe.action
-每分量差 < 1e-4。MuJoCo 后端是下一单。
+每分量差 < 1e-4。
+
+## 四足 MuJoCo CPU 后端(E02c-1)
+
+MuJoCo 只负责物理;观测编码、动作解码、机身系换算、意图采样、回合种子全部
+调 Rust 同一份代码(`agent_env.Codec` / `body_frame_batch` / `episode_seed` /
+`sample_intent` / `spec_for`,经 PyO3 暴露)。Python 侧只从 MuJoCo 取状态。
+`quad/backends/mujoco.py` 用 `mujoco.rollout` 批量推进,控制步 =
+`control_period_ticks × substeps` 个 `mj_step`(`substeps = round(1/(tick_hz·timestep))`)。
+warmstart 不跨控制步保存(与连续 `mj_step` 的已知差异)。
+
+```bash
+# 在仓库根导出 MJCF(不改导出代码;timestep = 1/600)
+cargo xtask export-mjcf assets/bodies/quad.body.toml --out target/e02c/quad.xml --timestep 0.0016666666666666668
+cargo xtask export-mjcf assets/bodies/go2.body.toml  --out target/e02c/go2.xml  --timestep 0.0016666666666666668
+
+# 在 tools/train 下:契约检查(项1–6 两后端;项7–12 仅 mujoco,手算期望)
+.venv/Scripts/python.exe -m quad.backends.check --backend rapier \
+    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml
+.venv/Scripts/python.exe -m quad.backends.check --backend mujoco \
+    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
+    --mjcf ../../target/e02c/quad.xml
+
+# 训练 / 评估:--backend mujoco 时 --mjcf 必填
+.venv/Scripts/python.exe -m quad.ppo --backend mujoco \
+    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
+    --mjcf ../../target/e02c/quad.xml --n-envs 64 --threads 8 --max-minutes 3 --out out/quad_mj_smoke
+.venv/Scripts/python.exe -m quad.eval --backend mujoco --ckpt out/quad_mj_smoke/ckpt_final.pt \
+    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
+    --mjcf ../../target/e02c/quad.xml --intent 1 0 0 --episodes 8 --seconds 10
+```
+
+`--init-from` 跨后端照常比 spec(两边 spec 相同,rapier 检查点可接 mujoco 续训,反之亦然)。
+go2 用 `quad/manifests/go2_train.toml` + `target/e02c/go2.xml`。域随机化是 E02c-2,不在本单。

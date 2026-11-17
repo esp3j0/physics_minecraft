@@ -28,6 +28,7 @@ def main() -> None:
     cli.add_argument("--backend", default="rapier")
     cli.add_argument("--body", required=True)
     cli.add_argument("--manifest", required=True)
+    cli.add_argument("--mjcf", default=None, help="mujoco 后端必填")
     cli.add_argument("--intent", type=float, nargs=3, required=True, metavar=("a", "b", "c"))
     cli.add_argument("--episodes", type=int, required=True)
     cli.add_argument("--seconds", type=float, required=True)
@@ -35,11 +36,10 @@ def main() -> None:
     cli.add_argument("--threads", type=int, default=8)
     args = cli.parse_args()
 
-    if args.backend == "mujoco":
-        raise SystemExit("mujoco 后端未实现(下一单)")
-    if args.backend != "rapier":
+    if args.backend not in ("rapier", "mujoco"):
         raise SystemExit(f"未知后端 `{args.backend}`")
-    from quad.backends.rapier import RapierBackend
+    if args.backend == "mujoco" and args.mjcf is None:
+        raise SystemExit("--backend mujoco 需要 --mjcf")
 
     device = torch.device("cpu")
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -58,14 +58,21 @@ def main() -> None:
     n = args.episodes
     steps = int(round(args.seconds * control_hz))
     a, b, c = args.intent
-    backend = RapierBackend(
-        args.body,
-        args.manifest,
-        n_envs=n,
-        threads=args.threads,
-        episode_controls=steps,
-        intent_range=[[a, a], [b, b], [c, c]],
-    )
+    intent_range = [[a, a], [b, b], [c, c]]
+    if args.backend == "mujoco":
+        from quad.backends.mujoco import MujocoBackend
+
+        backend = MujocoBackend(
+            args.body, args.manifest, n_envs=n, threads=args.threads,
+            episode_controls=steps, intent_range=intent_range, mjcf_path=args.mjcf,
+        )
+    else:
+        from quad.backends.rapier import RapierBackend
+
+        backend = RapierBackend(
+            args.body, args.manifest, n_envs=n, threads=args.threads,
+            episode_controls=steps, intent_range=intent_range,
+        )
     cx, cz, cyaw = a * task.V_FWD_MAX, b * task.V_LAT_MAX, c * task.YAW_MAX
 
     obs = backend.reset(args.seed)

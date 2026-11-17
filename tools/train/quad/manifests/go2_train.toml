@@ -1,0 +1,36 @@
+# REQ-012 E02c-1:go2 训练 manifest(观测与动作设置同 quad_train.toml)。
+# body_hash = go2.body.toml 的 BodyHash::hex()(用 Rust BodyDef::hash() 取)。
+# obs 共 48 维(3+3+3+12+12+12+3),scale 全 1。default_pose 缺省取身体各关节 default_angle。
+name = "go2_train"
+body_hash = "0e1de10395e2d6aa"
+control_period_ticks = 2
+action_scale = 0.25
+action_clip = 1.0
+
+[[obs]]
+term = "base_lin_vel"
+scale = 1.0
+
+[[obs]]
+term = "base_ang_vel"
+scale = 1.0
+
+[[obs]]
+term = "projected_gravity"
+scale = 1.0
+
+[[obs]]
+term = "joint_pos"
+scale = 1.0
+
+[[obs]]
+term = "joint_vel"
+scale = 1.0
+
+[[obs]]
+term = "last_action"
+scale = 1.0
+
+[[obs]]
+term = "intent"
+scale = 1.0

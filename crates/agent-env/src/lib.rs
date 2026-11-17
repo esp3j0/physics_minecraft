@@ -19,14 +19,16 @@ mod py;
 
 use messaging::InputSource;
 use physics_sim::{BodyRegistry, ShardSim, ShardSimConfig};
-use policy::{AgentSnapshot, PolicyCodec, PolicyError, PolicyManifest};
+use policy::{AgentSnapshot, ObsTerm, PolicyCodec, PolicyError, PolicyManifest};
 use shard::SchedulerConfig;
 use sim_api::log::CommandLog;
 use sim_api::replay::replay_world_with_bodies;
 use sim_api::session::{Session, SessionConfig};
 use sim_api::snapshot::WorldSnapshot;
-use types::glam::Vec3;
-use types::{BlockId, ChunkPos, DimensionId, EntityId, EntityState, ShardId, ShardPos, WorldId};
+use types::glam::{Quat, Vec3};
+use types::{
+    BlockId, BodyDef, ChunkPos, DimensionId, EntityId, EntityState, ShardId, ShardPos, WorldId,
+};
 use voxel::{Chunk, SimpleRegistry};
 
 const STONE: BlockId = BlockId(1);
@@ -34,6 +36,8 @@ const STONE: BlockId = BlockId(1);
 const GROUND_TOP_Y: f32 = 1.0;
 /// 出生点(分片中心,顶面 + 0.45)。
 const SPAWN: Vec3 = Vec3::new(64.0, 1.45, 64.0);
+/// 出生根高度相对地面顶面(E02c-1:MuJoCo 初态用;从常量算,不写字面量)。
+pub const SPAWN_HEIGHT: f32 = SPAWN.y - GROUND_TOP_Y;
 /// 铺满整个分片:8×8 chunk = 128×128 m。
 const GROUND_CHUNKS: i32 = 8;
 
@@ -227,7 +231,7 @@ fn splitmix64_next(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn sample_intent(seed: u64, range: &[[f32; 2]; 3]) -> [f32; 3] {
+pub fn sample_intent(seed: u64, range: &[[f32; 2]; 3]) -> [f32; 3] {
     let mut state = seed;
     let mut intent = [0.0f32; 3];
     for (i, &[lo, hi]) in range.iter().enumerate() {
@@ -235,6 +239,209 @@ fn sample_intent(seed: u64, range: &[[f32; 2]; 3]) -> [f32; 3] {
         intent[i] = lo + u * (hi - lo);
     }
     intent
+}
+
+/// 机身系量(AgentEnv::step 与 PyO3 共用)。rotation 为根连杆世界旋转;
+/// linvel / angvel 为世界系根刚体速度(rapier `linvel` 是质心速度)。
+pub struct BodyFrame {
+    pub linvel: [f32; 3],
+    pub angvel: [f32; 3],
+    pub projected_gravity: [f32; 3],
+    pub up_y: f32,
+}
+
+/// 世界系根状态 → 机身系(E02c-1 §1.1;公式照 AgentEnv::step 原四行)。
+pub fn body_frame(rotation: Quat, linvel: Vec3, angvel: Vec3) -> BodyFrame {
+    let inv = rotation.inverse();
+    let lin = inv * linvel;
+    let ang = inv * angvel;
+    let grav = inv * Vec3::new(0.0, -1.0, 0.0);
+    let up_y = (rotation * Vec3::new(0.0, 1.0, 0.0)).y;
+    BodyFrame {
+        linvel: [lin.x, lin.y, lin.z],
+        angvel: [ang.x, ang.y, ang.z],
+        projected_gravity: [grav.x, grav.y, grav.z],
+        up_y,
+    }
+}
+
+/// 观测项名(manifest 里的 snake_case 写法;PyO3 spec 与核对侧共用)。
+pub fn term_name(t: ObsTerm) -> &'static str {
+    match t {
+        ObsTerm::BaseLinVel => "base_lin_vel",
+        ObsTerm::BaseAngVel => "base_ang_vel",
+        ObsTerm::ProjectedGravity => "projected_gravity",
+        ObsTerm::JointPos => "joint_pos",
+        ObsTerm::JointVel => "joint_vel",
+        ObsTerm::LastAction => "last_action",
+        ObsTerm::Intent => "intent",
+    }
+}
+
+/// 环境规格数据(E02c-1 §1.2;`VecEnv.spec()` 与 PyO3 `spec_for` 共用同一份)。
+pub struct SpecData {
+    pub body_name: String,
+    pub body_hash: String,
+    pub dof: usize,
+    pub obs_dim: usize,
+    pub act_dim: usize,
+    pub tick_hz: u32,
+    pub control_period_ticks: u32,
+    pub episode_controls: u32,
+    pub fall_up_y_min: f32,
+    pub action_scale: f32,
+    pub action_clip: Option<f32>,
+    pub obs_clip: Option<f32>,
+    pub obs_terms: Vec<(&'static str, f32)>,
+    pub default_pose: Vec<f32>,
+    pub joint_lower: Vec<Option<f32>>,
+    pub joint_upper: Vec<Option<f32>>,
+    pub kp: Vec<Option<f32>>,
+    pub kd: Vec<Option<f32>>,
+    pub max_torque: Vec<Option<f32>>,
+    pub reward_keys: Vec<(&'static str, usize)>,
+}
+
+/// 从身体定义与 manifest 算环境规格(键值与 E02b-1 `VecEnv.spec()` 不变)。
+pub fn spec_data(
+    def: &BodyDef,
+    manifest: &PolicyManifest,
+    episode_controls: u32,
+    fall_up_y_min: f32,
+) -> Result<SpecData, PolicyError> {
+    let codec = PolicyCodec::new(manifest.clone(), def)?;
+    let dof = codec.dof();
+    let obs_dim = codec.obs_dim();
+    let dof_joints: Vec<&types::JointDef> = def.dof_joints().collect();
+    let default_pose: Vec<f32> = manifest.default_pose.clone().unwrap_or_else(|| {
+        dof_joints
+            .iter()
+            .map(|j| j.kind.params().default_angle.unwrap_or(0.0))
+            .collect()
+    });
+    let lower = dof_joints
+        .iter()
+        .map(|j| j.kind.params().limits.map(|l| l.lower))
+        .collect();
+    let upper = dof_joints
+        .iter()
+        .map(|j| j.kind.params().limits.map(|l| l.upper))
+        .collect();
+    let kp = dof_joints.iter().map(|j| j.kind.params().kp).collect();
+    let kd = dof_joints.iter().map(|j| j.kind.params().kd).collect();
+    let max_torque = dof_joints
+        .iter()
+        .map(|j| j.kind.params().max_torque)
+        .collect();
+    let obs_terms = manifest
+        .obs
+        .iter()
+        .map(|e| (term_name(e.term), e.scale))
+        .collect();
+    Ok(SpecData {
+        body_name: def.name.clone(),
+        body_hash: def.hash().hex(),
+        dof,
+        obs_dim,
+        act_dim: dof,
+        tick_hz: 60,
+        control_period_ticks: manifest.control_period_ticks,
+        episode_controls,
+        fall_up_y_min,
+        action_scale: manifest.action_scale,
+        action_clip: manifest.action_clip,
+        obs_clip: manifest.obs_clip,
+        obs_terms,
+        default_pose,
+        joint_lower: lower,
+        joint_upper: upper,
+        kp,
+        kd,
+        max_torque,
+        reward_keys: reward_key_widths(dof),
+    })
+}
+
+/// 批量编码:逐条调 [`PolicyCodec::encode`] 拼接(E02c-1 §1.2;不另写公式)。
+pub fn encode_snapshots(
+    codec: &PolicyCodec,
+    snaps: &[AgentSnapshot],
+) -> Result<Vec<f32>, PolicyError> {
+    let mut out = Vec::with_capacity(snaps.len() * codec.obs_dim());
+    for s in snaps {
+        let mut row = Vec::new();
+        codec.encode(s, &mut row)?;
+        out.extend_from_slice(&row);
+    }
+    Ok(out)
+}
+
+/// 批量解码结果(摊平,按行拼接)。
+pub struct DecodedBatch {
+    pub raw: Vec<f32>,
+    pub targets: Vec<f32>,
+    pub clamped: Vec<u32>,
+}
+
+/// 批量解码:`actions` 长 n × dof,逐行调 [`PolicyCodec::decode`]。
+pub fn decode_actions(
+    codec: &PolicyCodec,
+    actions: &[f32],
+    n: usize,
+) -> Result<DecodedBatch, PolicyError> {
+    let dof = codec.dof();
+    let mut raw = Vec::with_capacity(n * dof);
+    let mut targets = Vec::with_capacity(n * dof);
+    let mut clamped = Vec::with_capacity(n);
+    for row in actions.chunks(dof) {
+        let a = codec.decode(row)?;
+        raw.extend_from_slice(&a.raw);
+        targets.extend_from_slice(&a.targets);
+        clamped.push(a.clamped as u32);
+    }
+    Ok(DecodedBatch {
+        raw,
+        targets,
+        clamped,
+    })
+}
+
+/// 批量机身系换算结果(摊平:前三项 n × 3,up_y n)。
+pub struct BodyFrameBatch {
+    pub linvel: Vec<f32>,
+    pub angvel: Vec<f32>,
+    pub projected_gravity: Vec<f32>,
+    pub up_y: Vec<f32>,
+}
+
+/// 批量机身系:四元数分量顺序 x y z w;逐行调 [`body_frame`]。
+pub fn body_frame_batch(
+    quat_xyzw: &[f32],
+    linvel: &[f32],
+    angvel: &[f32],
+    n: usize,
+) -> BodyFrameBatch {
+    let mut lin = Vec::with_capacity(n * 3);
+    let mut ang = Vec::with_capacity(n * 3);
+    let mut grav = Vec::with_capacity(n * 3);
+    let mut up = Vec::with_capacity(n);
+    for i in 0..n {
+        let q = &quat_xyzw[i * 4..i * 4 + 4];
+        let rotation = Quat::from_xyzw(q[0], q[1], q[2], q[3]);
+        let lv = Vec3::new(linvel[i * 3], linvel[i * 3 + 1], linvel[i * 3 + 2]);
+        let av = Vec3::new(angvel[i * 3], angvel[i * 3 + 1], angvel[i * 3 + 2]);
+        let bf = body_frame(rotation, lv, av);
+        lin.extend_from_slice(&bf.linvel);
+        ang.extend_from_slice(&bf.angvel);
+        grav.extend_from_slice(&bf.projected_gravity);
+        up.push(bf.up_y);
+    }
+    BodyFrameBatch {
+        linvel: lin,
+        angvel: ang,
+        projected_gravity: grav,
+        up_y: up,
+    }
 }
 
 impl AgentEnv {
@@ -390,16 +597,12 @@ impl AgentEnv {
                 .session
                 .agent_joint_state(self.entity)
                 .ok_or_else(|| EnvError::Spawn("取不到关节状态".to_owned()))?;
-            let inv = root.rotation.inverse();
-            let lin = inv * root.linvel;
-            let ang = inv * root.angvel;
-            let grav = inv * Vec3::new(0.0, -1.0, 0.0);
-            let up_y = (root.rotation * Vec3::new(0.0, 1.0, 0.0)).y;
-            reward.base_linvel_body = [lin.x, lin.y, lin.z];
-            reward.base_angvel_body = [ang.x, ang.y, ang.z];
-            reward.projected_gravity = [grav.x, grav.y, grav.z];
+            let bf = body_frame(root.rotation, root.linvel, root.angvel);
+            reward.base_linvel_body = bf.linvel;
+            reward.base_angvel_body = bf.angvel;
+            reward.projected_gravity = bf.projected_gravity;
             reward.root_height = root.translation.y - GROUND_TOP_Y;
-            reward.up_y = up_y;
+            reward.up_y = bf.up_y;
             reward.joint_pos = joints.positions.clone();
             reward.joint_vel = joints.velocities.clone();
             let snapshot = AgentSnapshot {
@@ -414,7 +617,7 @@ impl AgentEnv {
             let mut out = Vec::new();
             self.codec.encode(&snapshot, &mut out)?;
             obs = out;
-            terminated = up_y < self.cfg.fall_up_y_min;
+            terminated = bf.up_y < self.cfg.fall_up_y_min;
         }
         self.steps += 1;
         let truncated = !terminated && self.steps == self.cfg.episode_controls;

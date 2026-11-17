@@ -1,27 +1,45 @@
-"""四足 rapier 后端契约检查(E02b-1)。
+"""四足后端契约检查(E02b-1 项1–6;E02c-1 加 --backend/--mjcf 与 MuJoCo 项7–12)。
 
-命令行:python -m quad.backends.check --body <body.toml> --manifest <manifest.toml>
-逐项打印 PASS/FAIL,有 FAIL 非零退出。六项:
-  1 常量单一来源(spec_matches 为空)
-  2 形状与类型(reset/step dtype/shape;reward 键集合与宽度)
-  3 与线程数无关(4 环境,线程 1 vs 4,reset(11) 同随机动作 40 步逐位相同)
-  4 到时那一步(episode_controls=5:第 5 步 truncated 全 True、action=裁剪值、
-    obs last_action 段全 0;第 6 步 prev_action 全 0)
-  5 动作裁剪(全 5.0 一步,action 全等于 action_clip)
-  6 错误(shape 错 → ValueError;没 reset 就 step → RuntimeError)
+命令行:
+  python -m quad.backends.check --backend rapier --body <body.toml> --manifest <m.toml>
+  python -m quad.backends.check --backend mujoco --body <body.toml> --manifest <m.toml> --mjcf <model.xml>
+逐项打印 PASS/FAIL,有 FAIL 非零退出。
+项1–6(两后端):常量单一来源 / 形状类型 / 线程无关 / 到时那一步 / 动作裁剪 / 错误。
+项7–12(仅 mujoco,§5 手算期望):时间 / 偏航速度 / 横滚 / 关节映射 / 质心速度 /
+  解码同一份 / 初态 / 意图同源 / 跨后端初态(只报数)。
 """
 
 from __future__ import annotations
 
 import argparse
+import math
+import re
 import sys
+import tempfile
+from pathlib import Path
 
 import numpy as np
 
 from quad import spec
 from quad.backends.rapier import RapierBackend
+from quad.backends.mujoco import MujocoBackend
 
 FAILED: list[str] = []
+TOL = 1e-6
+
+
+def repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def make_backend(name, body, manifest, n, threads, ep, fall, mjcf=None, intent_range=None):
+    if name == "rapier":
+        return RapierBackend(body, manifest, n, threads, ep, intent_range=intent_range,
+                             fall_up_y_min=fall)
+    if name == "mujoco":
+        return MujocoBackend(body, manifest, n, threads, ep, intent_range=intent_range,
+                             fall_up_y_min=fall, mjcf_path=mjcf)
+    raise ValueError(f"未知后端 {name}")
 
 
 def check(ok: bool, msg: str) -> None:
@@ -34,24 +52,29 @@ def bits(a: np.ndarray) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).view(np.uint32)
 
 
-def last_action_slice(obs_terms: list, dof: int) -> tuple[int, int]:
+def obs_offsets(obs_terms: list, dof: int) -> dict:
+    off = {}
     start = 0
     for term, _scale in obs_terms:
         dim = dof if term in ("joint_pos", "joint_vel", "last_action") else 3
-        if term == "last_action":
-            return start, start + dim
+        off[term] = (start, start + dim)
         start += dim
-    raise ValueError("obs_terms 没有 last_action")
+    return off
 
 
-def item1(body: str, manifest: str, backend: RapierBackend, ep: int, fall: float) -> None:
+def last_action_slice(obs_terms: list, dof: int) -> tuple[int, int]:
+    return obs_offsets(obs_terms, dof)["last_action"]
+
+
+def item1(make, body: str, manifest: str, ep: int, fall: float) -> None:
     print("项1:常量单一来源")
+    backend = make(4, 4, ep, fall)
     independent = spec.load_spec(body, manifest, ep, fall)
     bad = spec.spec_matches(independent, backend.spec_dict)
     check(not bad, f"spec_matches(load_spec, env.spec()) 为空(不一致键:{bad})")
 
 
-def item2(backend: RapierBackend) -> None:
+def item2(backend) -> None:
     print("项2:形状与类型")
     s = backend.spec_dict
     n = backend.n_envs
@@ -74,11 +97,11 @@ def item2(backend: RapierBackend) -> None:
         )
 
 
-def item3(body: str, manifest: str, ep: int, fall: float) -> None:
+def item3(make, ep: int, fall: float) -> None:
     print("项3:与线程数无关(4 环境,线程 1 vs 4,40 步)")
     n = 4
-    b1 = RapierBackend(body, manifest, n, 1, ep, fall_up_y_min=fall)
-    b4 = RapierBackend(body, manifest, n, 4, ep, fall_up_y_min=fall)
+    b1 = make(n, 1, ep, fall)
+    b4 = make(n, 4, ep, fall)
     act_dim = b1.spec_dict["act_dim"]
     o1 = b1.reset(11)
     o4 = b4.reset(11)
@@ -102,11 +125,11 @@ def item3(body: str, manifest: str, ep: int, fall: float) -> None:
     check(all_eq, "40 步 obs/terminated/truncated 每步逐位相同(线程 1 == 线程 4)")
 
 
-def item4(body: str, manifest: str, fall: float) -> None:
+def item4(make, fall: float) -> None:
     print("项4:到时那一步(episode_controls=5)")
     n = 4
     ep = 5
-    b = RapierBackend(body, manifest, n, 4, ep, fall_up_y_min=fall)
+    b = make(n, 4, ep, fall)
     s = b.spec_dict
     act_dim = s["act_dim"]
     clip = s["action_clip"]
@@ -131,7 +154,7 @@ def item4(body: str, manifest: str, fall: float) -> None:
     check(bool(np.all(rew6["prev_action"] == 0.0)), "第 6 步 reward[prev_action] 全 0")
 
 
-def item5(backend: RapierBackend) -> None:
+def item5(backend) -> None:
     print("项5:动作裁剪")
     s = backend.spec_dict
     n = backend.n_envs
@@ -145,9 +168,9 @@ def item5(backend: RapierBackend) -> None:
     )
 
 
-def item6(body: str, manifest: str, ep: int, fall: float) -> None:
+def item6(make, ep: int, fall: float) -> None:
     print("项6:错误")
-    b = RapierBackend(body, manifest, 1, 1, ep, fall_up_y_min=fall)
+    b = make(1, 1, ep, fall)
     act_dim = b.spec_dict["act_dim"]
     try:
         b.step(np.zeros((1, act_dim), dtype=np.float32))
@@ -166,28 +189,203 @@ def item6(body: str, manifest: str, ep: int, fall: float) -> None:
         check(False, f"动作 shape 错抛了 {type(e).__name__}(应 ValueError)")
 
 
+# ── MuJoCo 专项(§5)──
+
+
+def _mj_state(b, root_pos, quat_wxyz, joint_delta=None, joint_vel=None,
+              linvel=(0, 0, 0), angvel=(0, 0, 0)):
+    m = b._model
+    qpos = m.key_qpos[0].copy()
+    qpos[0:3] = root_pos
+    qpos[3:7] = quat_wxyz
+    qvel = np.zeros(m.nv)
+    qvel[0:3] = linvel
+    qvel[3:6] = angvel
+    if joint_delta is not None:
+        for k in range(b.dof):
+            qpos[b._qadr[k]] += joint_delta[k]
+    if joint_vel is not None:
+        for k in range(b.dof):
+            qvel[b._dadr[k]] = joint_vel[k]
+    return qpos, qvel
+
+
+def item7(args) -> None:
+    print("项7:时间(quad,reset 后 3 步)")
+    b = make_backend("mujoco", args.body, args.manifest, 4, 4,
+                     args.episode_controls, args.fall_up_y_min, args.mjcf)
+    check(b.substeps == 10, f"substeps == 10(得 {b.substeps})")
+    b.reset(0)
+    a = np.zeros((4, b.act_dim), dtype=np.float32)
+    for _ in range(3):
+        b.step(a)
+    t = b.sim_time(0)
+    check(abs(t - 0.1) <= 1e-9, f"sim_time(0) == 0.1(得 {t},容差 1e-9)")
+
+
+def item8(args) -> None:
+    print("项8:机身系换算与关节映射(手算)")
+    b = make_backend("mujoco", args.body, args.manifest, 1, 1,
+                     args.episode_controls, args.fall_up_y_min, args.mjcf)
+    off = obs_offsets(b.spec_dict["obs_terms"], b.dof)
+    c45, s45 = math.cos(math.pi / 4), math.sin(math.pi / 4)
+    zero_la = np.zeros(b.dof)
+    zero_it = np.zeros(3)
+
+    # 8a 偏航 +90°(绕 y)+ 速度
+    qpos, qvel = _mj_state(b, (0, 0.3, 0), (c45, 0, s45, 0),
+                           linvel=(1, 0, 0), angvel=(1, 0, 0))
+    obs, ex = b.obs_from_state(qpos, qvel, zero_la, zero_it)
+    lo, hi = off["base_lin_vel"]
+    check(np.allclose(obs[lo:hi], [0, 0, 1], atol=TOL), f"8a base_lin_vel=(0,0,1)(得 {obs[lo:hi]})")
+    lo, hi = off["base_ang_vel"]
+    check(np.allclose(obs[lo:hi], [1, 0, 0], atol=TOL), f"8a base_ang_vel=(1,0,0)(得 {obs[lo:hi]})")
+    lo, hi = off["projected_gravity"]
+    check(np.allclose(obs[lo:hi], [0, -1, 0], atol=TOL), f"8a projected_gravity=(0,-1,0)(得 {obs[lo:hi]})")
+    lo, hi = off["joint_pos"]
+    check(np.allclose(obs[lo:hi], 0, atol=TOL), "8a joint_pos 段全 0")
+
+    # 8b 横滚 +90°(绕 x),速度 0
+    qpos, qvel = _mj_state(b, (0, 0.3, 0), (c45, s45, 0, 0))
+    obs, ex = b.obs_from_state(qpos, qvel, zero_la, zero_it)
+    check(np.allclose(ex["projected_gravity"], [0, 0, 1], atol=TOL),
+          f"8b projected_gravity=(0,0,1)(得 {ex['projected_gravity']})")
+    check(abs(ex["up_y"]) <= TOL, f"8b up_y=0(得 {ex['up_y']})")
+    check(abs(ex["root_height"] - 0.3) <= TOL, f"8b root_height=0.3(得 {ex['root_height']})")
+
+    # 8c 关节映射
+    jd = [0.01 * (k + 1) for k in range(b.dof)]
+    jv = [0.1 * (k + 1) for k in range(b.dof)]
+    qpos, qvel = _mj_state(b, (0, 0.3, 0), (1, 0, 0, 0), joint_delta=jd, joint_vel=jv)
+    obs, ex = b.obs_from_state(qpos, qvel, zero_la, zero_it)
+    lo, hi = off["joint_pos"]
+    check(np.allclose(obs[lo:hi], jd, atol=TOL), "8c joint_pos[k]=0.01·(k+1)")
+    lo, hi = off["joint_vel"]
+    check(np.allclose(obs[lo:hi], jv, atol=TOL), "8c joint_vel[k]=0.1·(k+1)")
+
+    # 8d 质心速度(go2)
+    root = repo_root()
+    go2_body = str(root / "assets/bodies/go2.body.toml")
+    go2_manifest = str(root / "tools/train/quad/manifests/go2_train.toml")
+    go2_mjcf = str(root / "target/e02c/go2.xml")
+    g = make_backend("mujoco", go2_body, go2_manifest, 1, 1,
+                     args.episode_controls, args.fall_up_y_min, go2_mjcf)
+    qpos, qvel = _mj_state(g, (0, 0.3, 0), (1, 0, 0, 0), angvel=(0, 1, 0))
+    obs, ex = g.obs_from_state(qpos, qvel, np.zeros(g.dof), zero_it)
+    check(np.allclose(ex["base_linvel_body"], [0, 0, -0.0630625], atol=TOL),
+          f"8d base_lin_vel=(0,0,-0.0630625)(得 {ex['base_linvel_body']})")
+
+
+def item9(args) -> None:
+    print("项9:解码同一份(action_scale=100)")
+    text = Path(args.manifest).read_text(encoding="utf-8")
+    text = re.sub(r"action_scale\s*=\s*[-0-9.eE]+", "action_scale = 100.0", text)
+    with tempfile.TemporaryDirectory() as td:
+        mp = str(Path(td) / "manifest_scale100.toml")
+        Path(mp).write_text(text, encoding="utf-8")
+        b = make_backend("mujoco", args.body, mp, 4, 4,
+                         args.episode_controls, args.fall_up_y_min, args.mjcf)
+        b.reset(0)
+        _, rew, _, _ = b.step(np.ones((4, b.act_dim), dtype=np.float32))
+        check(bool(np.all(rew["targets_clamped"] == 12)), "全 1.0 动作 targets_clamped 全 12")
+        b.reset(0)
+        _, rew0, _, _ = b.step(np.zeros((4, b.act_dim), dtype=np.float32))
+        check(bool(np.all(rew0["targets_clamped"] == 0)), "全 0 动作 targets_clamped 全 0")
+
+
+def item10(args) -> None:
+    print("项10:初态")
+    b = make_backend("mujoco", args.body, args.manifest, 4, 4,
+                     args.episode_controls, args.fall_up_y_min, args.mjcf)
+    o1 = b.reset(0)
+    o2 = b.reset(0)
+    check(np.array_equal(bits(o1), bits(o2)), "reset(0) 两次 obs 逐位相同")
+    b.reset(0)
+    _, rew, _, _ = b.step(np.zeros((4, b.act_dim), dtype=np.float32))
+    rh = rew["root_height"][:, 0]
+    check(bool(np.all((rh > 0.20) & (rh < 0.35))), f"全 0 一步 root_height ∈ (0.20,0.35)(得 {rh})")
+
+
+def item11(args) -> None:
+    print("项11:意图同源(rapier vs mujoco,4 环境,intent_range[-1,1],ep=3)")
+    ir = [[-1.0, 1.0]] * 3
+    rp = make_backend("rapier", args.body, args.manifest, 4, 4, 3,
+                      args.fall_up_y_min, intent_range=ir)
+    mj = make_backend("mujoco", args.body, args.manifest, 4, 4, 3,
+                      args.fall_up_y_min, args.mjcf, intent_range=ir)
+    rp.reset(7)
+    mj.reset(7)
+    a = np.zeros((4, rp.spec_dict["act_dim"]), dtype=np.float32)
+    snap = {}
+    for k in range(1, 5):
+        _, ri_r, _, _ = rp.step(a)
+        _, ri_m, _, _ = mj.step(a)
+        if k in (1, 4):
+            snap[k] = (ri_r["intent"].copy(), ri_m["intent"].copy())
+    for k in (1, 4):
+        r, m = snap[k]
+        check(np.array_equal(bits(r), bits(m)), f"第 {k} 步 intent 两后端逐位相同")
+
+
+def item12(args) -> None:
+    print("项12:跨后端初态(只报数,不设阈值)")
+    rp = make_backend("rapier", args.body, args.manifest, 4, 4,
+                      args.episode_controls, args.fall_up_y_min)
+    mj = make_backend("mujoco", args.body, args.manifest, 4, 4,
+                      args.episode_controls, args.fall_up_y_min, args.mjcf)
+    orp = rp.reset(0)
+    omj = mj.reset(0)
+    off = obs_offsets(rp.spec_dict["obs_terms"], rp.spec_dict["dof"])
+    for term, (lo, hi) in off.items():
+        d = float(np.max(np.abs(orp[:, lo:hi] - omj[:, lo:hi])))
+        print(f"    reset obs[{term}] 最大绝对差 {d:.6e}")
+    a = np.zeros((4, rp.spec_dict["act_dim"]), dtype=np.float32)
+    _, rr, _, _ = rp.step(a)
+    _, rm, _, _ = mj.step(a)
+    print(f"    全 0 一步 root_height:rapier {float(np.mean(rr['root_height'])):.6f} "
+          f"mujoco {float(np.mean(rm['root_height'])):.6f}")
+
+
 def main() -> int:
     sys.stdout.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser()
     ap.add_argument("--body", required=True)
     ap.add_argument("--manifest", required=True)
+    ap.add_argument("--backend", default="rapier", choices=["rapier", "mujoco"])
+    ap.add_argument("--mjcf", default=None)
     ap.add_argument("--episode-controls", type=int, default=15)
     ap.add_argument("--fall-up-y-min", type=float, default=0.5)
     args = ap.parse_args()
+    if args.backend == "mujoco" and args.mjcf is None:
+        print("--backend mujoco 需要 --mjcf")
+        return 2
     ep, fall = args.episode_controls, args.fall_up_y_min
 
-    b15 = RapierBackend(args.body, args.manifest, 4, 4, ep, fall_up_y_min=fall)
-    item1(args.body, args.manifest, b15, ep, fall)
+    def make(n, threads, e, f, intent_range=None):
+        return make_backend(args.backend, args.body, args.manifest, n, threads, e, f,
+                            args.mjcf, intent_range)
+
+    b15 = make(4, 4, ep, fall)
+    item1(make, args.body, args.manifest, ep, fall)
     item2(b15)
-    item3(args.body, args.manifest, ep, fall)
-    item4(args.body, args.manifest, fall)
+    item3(make, ep, fall)
+    item4(make, fall)
     item5(b15)
-    item6(args.body, args.manifest, ep, fall)
+    item6(make, ep, fall)
+
+    if args.backend == "mujoco":
+        item7(args)
+        item8(args)
+        item9(args)
+        item10(args)
+        item11(args)
+        item12(args)
 
     if FAILED:
         print(f"==== 结论: 有 FAIL({len(FAILED)} 项)====")
         return 1
-    print("==== 结论: 项1–6 全部 PASS ====")
+    last = 12 if args.backend == "mujoco" else 6
+    print(f"==== 结论: 项1–{last} 全部 PASS ====")
     return 0
 
 

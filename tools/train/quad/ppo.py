@@ -154,14 +154,26 @@ def load_checkpoint(path, device, spec_dict):
 
 
 def make_backend(args):
-    if args.backend == "mujoco":
-        raise SystemExit("mujoco 后端未实现(下一单)")
-    if args.backend != "rapier":
+    if args.backend not in ("rapier", "mujoco"):
         raise SystemExit(f"未知后端 `{args.backend}`(只支持 rapier|mujoco)")
-    from quad.backends.rapier import RapierBackend
-
     lo = args.intent_range
     intent_range = [[lo[0], lo[1]], [lo[2], lo[3]], [lo[4], lo[5]]]
+    if args.backend == "mujoco":
+        if args.mjcf is None:
+            raise SystemExit("--backend mujoco 需要 --mjcf")
+        from quad.backends.mujoco import MujocoBackend
+
+        return MujocoBackend(
+            args.body,
+            args.manifest,
+            n_envs=args.n_envs,
+            threads=args.threads,
+            episode_controls=args.episode_controls,
+            intent_range=intent_range,
+            mjcf_path=args.mjcf,
+        )
+    from quad.backends.rapier import RapierBackend
+
     return RapierBackend(
         args.body,
         args.manifest,
@@ -174,9 +186,10 @@ def make_backend(args):
 
 def main() -> None:
     cli = argparse.ArgumentParser()
-    cli.add_argument("--backend", default="rapier", help="rapier|mujoco(mujoco 未实现)")
+    cli.add_argument("--backend", default="rapier", help="rapier|mujoco")
     cli.add_argument("--body", required=True)
     cli.add_argument("--manifest", required=True)
+    cli.add_argument("--mjcf", default=None, help="mujoco 后端必填")
     cli.add_argument("--seed", type=int, default=0)
     cli.add_argument("--out", default="out/quad")
     cli.add_argument("--n-envs", type=int, default=64)
