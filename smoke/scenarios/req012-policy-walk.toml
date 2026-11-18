@@ -1,0 +1,130 @@
+name = "req012-policy-walk"
+req = "REQ-012"
+description = "策略狗(quad_mj1_ft)进真实服务器:startup intent [0.5,0,0] 平地走,穿过前方弹坑旁散块地带(坑心 z+6 m,坑内穿越属效果优化暂缓);再附身改向、转回、解除附身恢复附身前意图(REQ-012 §2.2/§2.3、§8 AC-E3、§11)。位置容差为架构师按探针速度估的初值。"
+timeout_secs = 300
+
+[server]
+world_seed = 3
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = false
+
+[[server.agents]]
+body = "quad"
+position = [24.5, -59.5, 24.5]
+controller = "policy"
+policy = "quad_mj1_ft"
+intent = [0.5, 0.0, 0.0]
+
+[[step]]
+label = "相机就位(拉近看狗)"
+camera = { pos = [28.5, -53.5, 32.5], yaw = -90.0, pitch = -35.0 }
+
+[[step]]
+look_at = { target = [31.0, -59.7, 25.0] }
+
+[[step]]
+wait_until = { block = { pos = [24, -61, 24], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 1200 }
+
+[[step]]
+label = "认领狗"
+adopt_agent = { label = "dog", near = [24.5, -59.5, 24.5], within = 7.0, timeout_ticks = 1200 }
+
+[[step]]
+mark_agent = { label = "dog", at = [24.5, -59.72, 24.5] }
+
+[[step]]
+label = "路径旁引爆(坑心 z+6 m,狗走坑旁散块地带)"
+detonate = { at = [31.5, -59.5, 30.5], power = 8.0, radius = 5.0 }
+
+[[step]]
+wait_until = { live_entities = { ge = 1 }, timeout_ticks = 300 }
+
+[[step]]
+label = "平地走 2.5 m"
+wait_until = { agent_moved = { label = "dog", ge = 2.5 }, hold_ticks = 60, timeout_ticks = 1800 }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+screenshot = { name = "flat-walk", expect = "棕色平地,一只品红色四足朝 +x 方向行走,前方地面有一个浅坑;四足躯干水平,四条腿在身体下方。" }
+
+[[step]]
+label = "等散块落定"
+wait_until = { live_entities = { eq = 0 }, hold_ticks = 30, timeout_ticks = 1200 }
+
+[[step]]
+label = "过坑旁散块地带(离出生点 ≥ 9 m)"
+wait_until = { agent_moved = { label = "dog", ge = 9.0 }, hold_ticks = 60, timeout_ticks = 3600 }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "过坑后仍站着(根高度在站立带)"
+check = { agent_in = { label = "dog", from = [30.0, -59.95, 20.0], to = [40.0, -59.55, 28.5] } }
+
+[[step]]
+screenshot = { name = "crater-crossed", expect = "品红色四足站在弹坑旁的散块地面上,身后是浅坑和散落的棕色方块;躯干水平,没有侧翻。" }
+
+[[step]]
+label = "附身转向(相机跟上狗)"
+camera = { pos = [37.0, -53.5, 33.0], yaw = -90.0, pitch = -35.0 }
+
+[[step]]
+look_at = { target = [37.0, -59.7, 27.0] }
+
+[[step]]
+possess = { label = "dog", follow = false }
+
+[[step]]
+mark_agent = { label = "dog" }
+
+[[step]]
+label = "转向意图(航向差 ≈ 0.44 rad,c 在训练分布内)"
+intent = { move = [0.3, 0.0], yaw = 25.0, jump = false }
+
+[[step]]
+wait_ticks = { n = 720 }
+
+[[step]]
+label = "已侧移(z 进 [25,29])"
+check = { agent_in = { label = "dog", from = [33.0, -59.95, 25.0], to = [40.0, -59.55, 29.0] } }
+
+[[step]]
+screenshot = { name = "possessed-turn", expect = "品红色四足在棕色地面上,躯干朝向相对之前发生了偏转(不再正对 +x),四条腿在身体下方,没有侧翻。" }
+
+[[step]]
+label = "转回"
+intent = { move = [0.3, 0.0], yaw = 0.0, jump = false }
+
+[[step]]
+wait_ticks = { n = 720 }
+
+[[step]]
+screenshot = { name = "turned-back", expect = "品红色四足在棕色地面上,躯干朝向转回接近 +x 方向,四条腿在身体下方,没有侧翻。" }
+
+[[step]]
+label = "解除附身(恢复附身前意图)"
+unpossess = {}
+
+[[step]]
+mark_agent = { label = "dog" }
+
+[[step]]
+label = "恢复后继续走 2 m"
+wait_until = { agent_moved = { label = "dog", ge = 2.0 }, hold_ticks = 60, timeout_ticks = 1800 }
+
+[[step]]
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "不再持续侧移(z 带 [24.9,26.8])+ 站立高度带"
+check = { agent_in = { label = "dog", from = [33.0, -59.95, 24.9], to = [46.0, -59.55, 26.8] } }
+
+[[step]]
+screenshot = { name = "resumed", expect = "品红色四足在棕色平地上朝 +x 方向行走,躯干水平,四条腿在身体下方,没有侧翻。" }

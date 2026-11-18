@@ -836,6 +836,8 @@ impl EngineInner {
                 // mark_agent:记下主体根位置(主体表无该主体 = 失败)。
                 // B02c §2.3:带 `at` 时不读主体当前位置,基准点 = `at`
                 // (标签必须已登记;用途 = 配置生成的四足连上前已走远)。
+                // E03 R2-a:无 `at` 时基准点 = 标签登记主体的当前根位置,
+                // 与是否附身无关(标签表 agent_labels 是正源,possess 只是旧代理)。
                 Action::MarkAgent { label, at } => {
                     let pos = match at {
                         Some(p) => {
@@ -846,7 +848,9 @@ impl EngineInner {
                             }
                         }
                         None => self
-                            .possessed
+                            .agent_labels
+                            .get(&label)
+                            .copied()
                             .and_then(|id| Self::agent_root(input.world, id)),
                     };
                     match pos {

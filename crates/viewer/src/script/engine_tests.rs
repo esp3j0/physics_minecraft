@@ -1434,3 +1434,79 @@ fn mark_agent_with_at_requires_registered_label() {
 fn actions_of(out: &crate::script::FrameOutput) -> Vec<&str> {
     out.finished.iter().map(|r| r.action.as_str()).collect()
 }
+
+/// E03 R2-c①:从未 possess,adopt 登记后无 at mark_agent 基准 = 标签主体
+/// 当前根位置 (11,0,0);主体走到 (15,0,0) 位移手算 4.0 ≥ 4 → wait_until 成立。
+#[test]
+fn mark_agent_no_at_measures_from_label_root() {
+    let mut e = engine(
+        "[[step]]
+adopt_agent = { label = \"a\", near = [10.0, 0.0, 0.0], within = 2.0, timeout_ticks = 100 }
+[[step]]
+mark_agent = { label = \"a\" }
+[[step]]
+wait_until = { agent_moved = { label = \"a\", ge = 4.0 }, timeout_ticks = 50 }",
+    );
+    // 主体在 (11,0,0):无 at mark 基准 = 标签主体根位置,位移 0 < 4。
+    let w = FlatWorld::with_agents(&[(eid(1), Vec3::new(11.0, 0.0, 0.0))]);
+    let out = frame(&mut e, 0.016, 1, &w, &[]);
+    assert_eq!(actions_of(&out), vec!["adopt_agent", "mark_agent"]);
+    assert_eq!(out.finished[1].outcome, StepOutcome::Ok, "无 at mark 成功");
+    assert_eq!(out.possess, None, "从未附身");
+    // 主体走到 (15,0,0):距基准 (11,0,0) 位移 4.0 ≥ 4 → 那帧成立结束。
+    let mut w2 = w.clone_shallow();
+    w2.agents = vec![(eid(1), Vec3::new(15.0, 0.0, 0.0))];
+    let out = frame(&mut e, 0.016, 2, &w2, &[]);
+    assert_eq!(out.finished.len(), 1, "wait_until(位移 ≥ 4)成立");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+}
+
+/// E03 R2-c②:spawn → possess → unpossess → 无 at mark,基准 = 解除时根位置
+/// (8,-57,24),与附身无关;主体走到 (11,-57,24) 位移手算 3.0 ≥ 3 → 成立。
+#[test]
+fn mark_agent_no_at_after_unpossess_measures_from_current_root() {
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 0.0, label = \"p\" }
+[[step]]
+possess = { label = \"p\" }
+[[step]]
+unpossess = {}
+[[step]]
+mark_agent = { label = \"p\" }
+[[step]]
+wait_until = { agent_moved = { label = \"p\", ge = 3.0 }, timeout_ticks = 50 }",
+    );
+    // 帧 0:spawn_agent 发命令(世界无主体)。
+    let w0 = FlatWorld::default();
+    let _ = frame(&mut e, 0.016, 0, &w0, &[]);
+    // 帧 1:回执 → spawn 结束;possess/unpossess/mark 即时同帧。根 (8,-57,24)。
+    // possess 读 live_agent()(单数),故布景设 agent;live_agents 回退到它。
+    let mut w = FlatWorld::with_entities(&[]);
+    w.agent = Some((eid(7), Vec3::new(8.0, -57.0, 24.0)));
+    let out = frame(&mut e, 0.016, 1, &w, &[eid(7)]);
+    let acts = actions_of(&out);
+    assert!(
+        acts.contains(&"spawn_agent")
+            && acts.contains(&"possess")
+            && acts.contains(&"unpossess")
+            && acts.contains(&"mark_agent"),
+        "{acts:?}"
+    );
+    assert_eq!(out.possess, None, "已解除附身");
+    assert_eq!(
+        out.finished.last().map(|r| &r.outcome),
+        Some(&StepOutcome::Ok),
+        "解除后无 at mark 成功"
+    );
+    assert!(
+        !acts.contains(&"wait_until"),
+        "位移 0 < 3,wait_until 不结束"
+    );
+    // 主体走到 (11,-57,24):距基准 (8,-57,24) 位移 3.0 ≥ 3 → 成立。
+    let mut w2 = w.clone_shallow();
+    w2.agent = Some((eid(7), Vec3::new(11.0, -57.0, 24.0)));
+    let out = frame(&mut e, 0.016, 2, &w2, &[]);
+    assert_eq!(out.finished.len(), 1, "wait_until(位移 ≥ 3)成立");
+    assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+}

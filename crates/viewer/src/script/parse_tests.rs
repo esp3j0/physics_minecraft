@@ -719,3 +719,34 @@ fn possess_spawn_agent_no_regression() {
         e.message
     );
 }
+
+/// R2-b①:adopt 登记后不 possess 直接无 at mark_agent → 解析通过;
+/// 从未登记的标签 → 错误点名该标签。
+#[test]
+fn mark_agent_no_at_without_possess() {
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nadopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n[[step]]\nmark_agent = {{ label = \"dog\" }}\n[[step]]\nwait_until = {{ agent_moved = {{ label = \"dog\", ge = 2.0 }}, timeout_ticks = 10 }}\n"
+    ))
+    .expect("认领标签不附身可直接无 at mark_agent(E03 R2-b)");
+    assert_eq!(s.steps.len(), 3);
+    match &s.steps[1].action {
+        Action::MarkAgent { label, at } => {
+            assert_eq!(label, "dog");
+            assert_eq!(*at, None);
+        }
+        other => panic!("应为 MarkAgent,实为 {other:?}"),
+    }
+    // 从未登记的标签 → 错误点名该标签。
+    let e = err(&one_step("mark_agent = { label = \"ghost\" }"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("mark_agent 引用标签 \"ghost\""),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("spawn_agent/adopt_agent 登记"),
+        "{}",
+        e.message
+    );
+}

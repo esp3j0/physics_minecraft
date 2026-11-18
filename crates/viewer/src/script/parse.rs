@@ -977,9 +977,9 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
     //    agent_in/agent_alive 的 label 必须已由 spawn_agent/adopt_agent 定义。
     // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4);adopt_agent
     //    条数不限,但标签不许与 spawn_agent/其他 adopt_agent 重复(B02c §2.2)。
-    // ③ intent/unpossess/mark_agent 前必须有 possess(没有身体可操作 =
-    //    解析错误);mark_agent 带 `at` 时操作认领标签,不需要 possess
-    //    (B02c §2.3,标签仍必须已登记)。
+    // ③ intent/unpossess 前必须有 possess(没有身体可操作 = 解析错误);
+    //    mark_agent 不论带 `at` 与否都只需标签已登记(spawn/adopt),不需要
+    //    possess(E03 R2-b:无 at 基准点 = 标签主体当前根位置,与附身无关)。
     {
         let mut spawned: Option<(usize, String)> = None; // (步骤, 标签)
         let mut adopted: std::collections::BTreeMap<String, usize> =
@@ -1079,10 +1079,9 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                                 ));
                             }
                         }
+                        // 无 `at`(E03 R2-b):基准点 = 标签登记主体当前根位置,
+                        // 与附身无关;只需标签已登记,旧 possess 前置作废。
                         None => {
-                            if possessed.is_none() {
-                                return Err(step_err(step_no, "mark_agent 前没有 possess"));
-                            }
                             refer_registered(label, "mark_agent")?;
                         }
                     }
