@@ -652,3 +652,70 @@ fn mark_agent_parse_with_and_without_at() {
     .expect("认领标签可 mark_agent(at)");
     assert_eq!(s.steps.len(), 3);
 }
+
+// ---- E03 R1-a:possess / 无 at mark_agent 标签校验放宽(spawn 或 adopt)----
+
+/// R1-a①:adopt_agent 登记的标签可 possess,亦可无 at mark_agent(旧口径作废)。
+#[test]
+fn possess_accepts_adopted_label() {
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nadopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n[[step]]\npossess = {{ label = \"dog\" }}\n[[step]]\nmark_agent = {{ label = \"dog\" }}\n"
+    ))
+    .expect("认领标签可附身(E03 R1-a)");
+    assert_eq!(s.steps.len(), 3);
+    match &s.steps[1].action {
+        Action::Possess { label, .. } => assert_eq!(label, "dog"),
+        other => panic!("应为 Possess,实为 {other:?}"),
+    }
+}
+
+/// R1-a②:possess 引用未登记标签仍报错(点名该标签)。
+#[test]
+fn possess_rejects_unregistered_label() {
+    let e = err(&format!(
+        "{HEADER}[[step]]\nadopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n[[step]]\npossess = {{ label = \"cat\" }}\n"
+    ));
+    assert_eq!(e.step, Some(2));
+    assert!(
+        e.message.contains("possess 引用标签 \"cat\""),
+        "{}",
+        e.message
+    );
+    assert!(
+        e.message.contains("spawn_agent/adopt_agent 登记"),
+        "{}",
+        e.message
+    );
+    // 无任何登记时 possess 也报错。
+    let e = err(&one_step("possess = { label = \"dog\" }"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("此前没有 spawn_agent/adopt_agent 登记"),
+        "{}",
+        e.message
+    );
+}
+
+/// R1-a③:spawn_agent→possess 不回归;一场景一身体限制不变。
+#[test]
+fn possess_spawn_agent_no_regression() {
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"p\" }}\n[[step]]\nmark_agent = {{ label = \"p\" }}\n"
+    ))
+    .expect("spawn_agent→possess 不回归");
+    assert_eq!(s.steps.len(), 3);
+    // 第二次 spawn_agent 仍拒(一场景一身体不变)。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\nspawn_agent = {{ at = [1, 0, 0], label = \"q\" }}\n"
+    ));
+    assert!(e.message.contains("一场景最多一个身体"), "{}", e.message);
+    // possess 引用与 spawn 不同的未登记标签仍拒。
+    let e = err(&format!(
+        "{HEADER}[[step]]\nspawn_agent = {{ at = [0, 0, 0], label = \"p\" }}\n[[step]]\npossess = {{ label = \"q\" }}\n"
+    ));
+    assert!(
+        e.message.contains("possess 引用标签 \"q\""),
+        "{}",
+        e.message
+    );
+}

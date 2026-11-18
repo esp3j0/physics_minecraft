@@ -1305,6 +1305,17 @@ fn policy_intent_heading_zero() {
         [0.0, 0.0, 0.0],
         "M-a move None",
     );
+    // R1-b:区分 V_FWD_MAX(0.3/0.6=0.5)与 V_LAT_MAX(0.15/0.3=0.5)。
+    assert_intent(
+        policy_intent(id, Some((0.3, 0.0)), None),
+        [0.5, 0.0, 0.0],
+        "M-a (0.3,0)→0.5",
+    );
+    assert_intent(
+        policy_intent(id, Some((0.0, 0.15)), None),
+        [0.0, 0.5, 0.0],
+        "M-a (0,0.15)→0.5",
+    );
 }
 
 /// M-b:h=−π/2(绕 y +90°)。

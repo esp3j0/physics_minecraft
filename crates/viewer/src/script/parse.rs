@@ -972,8 +972,8 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
     }
 
     // A06 §4 校验(解析期,跨步骤):错误各指名步骤(从 1 起)。
-    // ① 主体动作的引用链:possess 的 label 必须先有 spawn_agent 登记(同
-    //    标签);agent_moved 的 label 必须先有同标签的 mark_agent;
+    // ① 主体动作的引用链:possess 的 label 必须先有 spawn_agent/adopt_agent
+    //    登记(E03 R1-a);agent_moved 的 label 必须先有同标签的 mark_agent;
     //    agent_in/agent_alive 的 label 必须已由 spawn_agent/adopt_agent 定义。
     // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4);adopt_agent
     //    条数不限,但标签不许与 spawn_agent/其他 adopt_agent 重复(B02c §2.2)。
@@ -999,22 +999,20 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
         }
         for (i, step) in steps.iter().enumerate() {
             let step_no = i + 1;
-            let refer_spawned = |label: &str, what: &str| -> Result<(), ScriptError> {
-                match &spawned {
-                    Some((_, name)) if name == label => Ok(()),
-                    Some((_, name)) => Err(step_err(
+            let refer_registered = |label: &str, what: &str| -> Result<(), ScriptError> {
+                if is_registered(label, &spawned, &adopted) {
+                    Ok(())
+                } else {
+                    Err(step_err(
                         step_no,
                         format!(
-                            "{what} 引用标签 \"{label}\",但 spawn_agent 登记的是 \"{name}\"(一场景一身体)"
+                            "{what} 引用标签 \"{label}\",但此前没有 spawn_agent/adopt_agent 登记"
                         ),
-                    )),
-                    None => Err(step_err(
-                        step_no,
-                        format!("{what} 引用标签 \"{label}\",但此前没有 spawn_agent"),
-                    )),
+                    ))
                 }
             };
-            // 附身/意图类:只能引用 spawn_agent 登记的标签(认领主体不附身)。
+            // 附身/意图类:引用 spawn_agent 或 adopt_agent 登记的标签
+            // (E03 R1-a:AC-E3 要求附身配置生成的策略狗,A06"认领主体不附身"旧口径作废)。
             match &step.action {
                 Action::SpawnAgent { label, .. } => {
                     if spawned.is_some() {
@@ -1053,7 +1051,7 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                     adopted.insert(label.clone(), step_no);
                 }
                 Action::Possess { label, .. } => {
-                    refer_spawned(label, "possess")?;
+                    refer_registered(label, "possess")?;
                     possessed = Some(step_no);
                 }
                 Action::Unpossess => {
@@ -1085,7 +1083,7 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                             if possessed.is_none() {
                                 return Err(step_err(step_no, "mark_agent 前没有 possess"));
                             }
-                            refer_spawned(label, "mark_agent")?;
+                            refer_registered(label, "mark_agent")?;
                         }
                     }
                     marks.insert(label.clone(), step_no);
