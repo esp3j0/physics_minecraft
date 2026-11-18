@@ -186,7 +186,8 @@ def make_backend(args):
 
 def main() -> None:
     cli = argparse.ArgumentParser()
-    cli.add_argument("--backend", default="rapier", help="rapier|mujoco")
+    cli.add_argument("--backend", default="rapier", help="rapier|mujoco|mujoco_warp")
+    cli.add_argument("--device", default="cpu", help="mujoco_warp 后端用 cuda")
     cli.add_argument("--body", required=True)
     cli.add_argument("--manifest", required=True)
     cli.add_argument("--mjcf", default=None, help="mujoco 后端必填")
@@ -219,6 +220,12 @@ def main() -> None:
     cli.add_argument("--reward-scale", type=float, default=0.1)
     cli.add_argument("--report-every", type=int, default=10)
     args = cli.parse_args()
+
+    if args.backend == "mujoco_warp":
+        from quad.ppo_gpu import train_gpu
+
+        train_gpu(args)
+        return
 
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed)
