@@ -1285,10 +1285,26 @@ fn policy_intent_heading_zero() {
     use super::policy_intent;
     use types::glam::Quat;
     let id = Quat::IDENTITY;
-    assert_intent(policy_intent(id, Some((0.6, 0.0)), None), [1.0, 0.0, 0.0], "M-a (0.6,0)");
-    assert_intent(policy_intent(id, Some((0.0, 0.3)), None), [0.0, 1.0, 0.0], "M-a (0,0.3)");
-    assert_intent(policy_intent(id, Some((1.2, 0.0)), None), [1.0, 0.0, 0.0], "M-a a 钳 1");
-    assert_intent(policy_intent(id, None, None), [0.0, 0.0, 0.0], "M-a move None");
+    assert_intent(
+        policy_intent(id, Some((0.6, 0.0)), None),
+        [1.0, 0.0, 0.0],
+        "M-a (0.6,0)",
+    );
+    assert_intent(
+        policy_intent(id, Some((0.0, 0.3)), None),
+        [0.0, 1.0, 0.0],
+        "M-a (0,0.3)",
+    );
+    assert_intent(
+        policy_intent(id, Some((1.2, 0.0)), None),
+        [1.0, 0.0, 0.0],
+        "M-a a 钳 1",
+    );
+    assert_intent(
+        policy_intent(id, None, None),
+        [0.0, 0.0, 0.0],
+        "M-a move None",
+    );
 }
 
 /// M-b:h=−π/2(绕 y +90°)。
@@ -1297,8 +1313,16 @@ fn policy_intent_heading_neg_pi_2() {
     use super::policy_intent;
     use types::glam::Quat;
     let rot = Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
-    assert_intent(policy_intent(rot, Some((0.6, 0.0)), None), [0.0, 1.0, 0.0], "M-b (0.6,0)");
-    assert_intent(policy_intent(rot, Some((0.0, 0.6)), None), [-1.0, 0.0, 0.0], "M-b (0,0.6)");
+    assert_intent(
+        policy_intent(rot, Some((0.6, 0.0)), None),
+        [0.0, 1.0, 0.0],
+        "M-b (0.6,0)",
+    );
+    assert_intent(
+        policy_intent(rot, Some((0.0, 0.6)), None),
+        [-1.0, 0.0, 0.0],
+        "M-b (0,0.6)",
+    );
 }
 
 /// M-c:偏航速率占比 c(wrap 差,不是绝对航向)。
@@ -1307,11 +1331,27 @@ fn policy_intent_yaw_rate() {
     use super::policy_intent;
     use types::glam::Quat;
     let id = Quat::IDENTITY;
-    assert_intent(policy_intent(id, None, Some(0.4)), [0.0, 0.0, 0.4], "M-c yaw 0.4");
-    assert_intent(policy_intent(id, None, Some(3.0)), [0.0, 0.0, 1.0], "M-c yaw 3.0 钳 1");
-    assert_intent(policy_intent(id, None, None), [0.0, 0.0, 0.0], "M-c yaw None");
+    assert_intent(
+        policy_intent(id, None, Some(0.4)),
+        [0.0, 0.0, 0.4],
+        "M-c yaw 0.4",
+    );
+    assert_intent(
+        policy_intent(id, None, Some(3.0)),
+        [0.0, 0.0, 1.0],
+        "M-c yaw 3.0 钳 1",
+    );
+    assert_intent(
+        policy_intent(id, None, None),
+        [0.0, 0.0, 0.0],
+        "M-c yaw None",
+    );
     // h=3.0(绕 y −3.0),yaw=−3.0 → c = wrap_pi(−6) = 2π−6 ≈ 0.283185。
     let rot = Quat::from_rotation_y(-3.0);
     let want_c = std::f32::consts::TAU - 6.0;
-    assert_intent(policy_intent(rot, None, Some(-3.0)), [0.0, 0.0, want_c], "M-c wrap 差");
+    assert_intent(
+        policy_intent(rot, None, Some(-3.0)),
+        [0.0, 0.0, want_c],
+        "M-c wrap 差",
+    );
 }

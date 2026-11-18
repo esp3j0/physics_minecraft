@@ -1217,3 +1217,216 @@ async fn q10_slow_inference_does_not_block() {
         "根高度与脚本站立差 ≥ 0.02:策略 {y} vs 脚本 {y_ref}"
     );
 }
+
+// ---- E03 §6:附身策略主体意图通路(真资产 quad_mj1_ft) ----------------------
+
+/// 把真资产 quad_mj1_ft 拷进临时策略目录(用真包内容,但目录可删——E3 回放
+/// 前删它证明回放不读 .onnx;不碰共享的 assets/policies)。
+fn real_policy_tempdir() -> Arc<tempfile::TempDir> {
+    let dir = Arc::new(
+        tempfile::Builder::new()
+            .prefix("e03_policies_")
+            .tempdir()
+            .expect("临时目录"),
+    );
+    let src =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/policies/quad_mj1_ft");
+    let dst = dir.path().join("quad_mj1_ft");
+    std::fs::create_dir_all(&dst).expect("策略包目录可建");
+    for f in ["policy.onnx", "policy.toml", "probe.json"] {
+        std::fs::copy(src.join(f), dst.join(f)).expect("真资产可拷");
+    }
+    dir
+}
+
+fn real_policy_config(agents: Vec<StartupAgentConfig>, dir: &tempfile::TempDir) -> Config {
+    let mut c = quad_config(agents);
+    c.policies_dir = dir.path().to_path_buf();
+    c.policy_wait_budget_us = 1_000_000;
+    c.checkpoint_interval_ticks = 10;
+    c
+}
+
+/// 各检查点里该主体的归一化策略意图(slot.intent,v16 已序列化)随拍轨迹。
+fn slot_intents(cps: &[(Tick, Vec<u8>)], entity: EntityId) -> Vec<(Tick, [f32; 3])> {
+    let mut out = Vec::new();
+    for (tick, blob) in cps {
+        let bundle = app::driver::decode_checkpoint(blob).expect("checkpoint 可解");
+        if let Some(rec) = bundle.controllers.iter().find(|r| r.entity == entity) {
+            out.push((*tick, rec.slot.intent));
+        }
+    }
+    out
+}
+
+fn intent_approx(i: [f32; 3], want: [f32; 3], tol: f32) -> bool {
+    i.iter().zip(want).all(|(a, b)| (a - b).abs() < tol)
+}
+
+/// 跑一只真资产策略狗(startup intent [0.5,0,0]);`possess_script` 时在走一段后
+/// 附身 + 改向意图(move 0.3,yaw 25°)+ 解除;`repeat_possess` 时在解除前再附身
+/// 一次(同连接幂等)。返回(实体, slot.intent 轨迹, 末条关节目标, 在线末态主体表,
+/// 末拍, 数据目录, 策略临时目录)。
+#[allow(clippy::type_complexity)]
+async fn run_real_dog(
+    possess_script: bool,
+    repeat_possess: bool,
+) -> (
+    EntityId,
+    Vec<(Tick, [f32; 3])>,
+    Vec<f32>,
+    AgentFrame,
+    Tick,
+    Arc<tempfile::TempDir>,
+    Arc<tempfile::TempDir>,
+) {
+    let policies = real_policy_tempdir();
+    let config = real_policy_config(
+        vec![policy_agent("quad_mj1_ft", [0.5, 0.0, 0.0])],
+        &policies,
+    );
+    let h = bootstrap_harness(config).await;
+    let (mut a, mut rx) = client(h.addr).await;
+    let _player = join(&mut a, &mut rx, 8).await;
+    observe_at_quad(&mut a).await;
+    let (entity, _n, _s) = sample_quad_root(&mut rx, 120).await;
+    if possess_script {
+        a.send(&C2S::Possess { entity })
+            .await
+            .expect("Possess 写入");
+        sample_quad_root(&mut rx, 10).await;
+        let yaw = 25.0f32.to_radians();
+        a.send(&C2S::AgentIntent {
+            entity,
+            move_xz: (0.3, 0.0),
+            yaw,
+            jump: false,
+        })
+        .await
+        .expect("AgentIntent 写入");
+        sample_quad_root(&mut rx, 80).await;
+        if repeat_possess {
+            a.send(&C2S::Possess { entity })
+                .await
+                .expect("重复 Possess 写入");
+            sample_quad_root(&mut rx, 10).await;
+        }
+        a.send(&C2S::Unpossess).await.expect("Unpossess 写入");
+        sample_quad_root(&mut rx, 60).await;
+    } else {
+        sample_quad_root(&mut rx, 120).await;
+    }
+    let (end_tick, online_states) = sample_last_agent_states(&mut rx, 1).await;
+    drop(a);
+    let data = h.data.clone();
+    let _outcome = shutdown(h).await;
+    let cps = read_all_checkpoints(data.path());
+    let traj = slot_intents(&cps, entity);
+    let last = last_joint_targets(&cps, entity).expect("日志里有该主体的 AgentJointTargets");
+    (entity, traj, last, online_states, end_tick, data, policies)
+}
+
+/// E1 附身改向:附身 + AgentIntent 后 slot.intent 偏离附身前 [0.5,0,0],关节目标
+/// 序列与无附身对照不同;解除附身后 slot.intent 逐位恢复 [0.5,0,0](§4.1 手算值)。
+#[tokio::test(start_paused = true)]
+async fn e1_possess_changes_intent_and_restores() {
+    let (_e, traj, last_possess, _states, _tick, _data, _policies) =
+        run_real_dog(true, false).await;
+    let (_e2, _traj2, last_control, _s2, _t2, _d2, _p2) = run_real_dog(false, false).await;
+
+    let last_intent = traj.last().expect("有控制者检查点").1;
+    assert!(
+        intent_approx(last_intent, [0.5, 0.0, 0.0], 1e-6),
+        "解除附身后 slot.intent 应恢复 [0.5,0,0],实得 {last_intent:?}"
+    );
+    assert!(
+        traj.iter()
+            .any(|(_, i)| !intent_approx(*i, [0.5, 0.0, 0.0], 1e-3)),
+        "附身段 slot.intent 应偏离附身前 [0.5,0,0](意图通路生效),轨迹 {traj:?}"
+    );
+    assert_ne!(
+        last_possess, last_control,
+        "附身改向后关节目标序列应与无附身对照不同"
+    );
+}
+
+/// E2 幂等:同连接重复附身同一只狗,存档不被覆盖——解除后恢复值仍是附身前
+/// [0.5,0,0](若重复附身覆盖了已存意图,恢复值会变成附身中的改向意图)。
+#[tokio::test(start_paused = true)]
+async fn e2_repeat_possess_keeps_saved_intent() {
+    let (_e, traj, _last, _states, _tick, _data, _policies) = run_real_dog(true, true).await;
+    let last_intent = traj.last().expect("有控制者检查点").1;
+    assert!(
+        intent_approx(last_intent, [0.5, 0.0, 0.0], 1e-6),
+        "重复附身后解除,slot.intent 仍应恢复附身前 [0.5,0,0],实得 {last_intent:?}"
+    );
+    assert!(
+        traj.iter()
+            .any(|(_, i)| !intent_approx(*i, [0.5, 0.0, 0.0], 1e-3)),
+        "附身段确曾改向(否则覆盖与否无从区分),轨迹 {traj:?}"
+    );
+}
+
+/// E3 回放:录含附身 + 意图 + 解除的日志,删掉策略包临时目录回放,主体轨迹逐位
+/// 相同(AC-D2 口径扩展到附身段);回放后内核意图 getter 读数与录制末态一致。
+#[tokio::test(start_paused = true)]
+async fn e3_replay_possess_segment_without_model() {
+    let (entity, _traj, _last, online_states, end_tick, data, policies) =
+        run_real_dog(true, false).await;
+
+    // 录制末态内核意图 getter(恢复启动取回末态 Session;策略目录此时仍在)。
+    // 整段作用域结束即释放 redb 锁,随后 read_all_checkpoints 才能再开库。
+    let online_intent = {
+        let mut resume_config = real_policy_config(
+            vec![policy_agent("quad_mj1_ft", [0.5, 0.0, 0.0])],
+            &policies,
+        );
+        resume_config.data_dir = data.path().to_path_buf();
+        let (session, _log, _store, _at, _seq, _resume) =
+            app::driver::bootstrap(&resume_config, || Box::new(SimpleRegistry::builtin()))
+                .expect("恢复装配成功");
+        session.agent_intent_state(entity)
+    };
+
+    let cps = read_all_checkpoints(data.path());
+    assert!(cps.len() >= 2, "期中 + 终末检查点都有(实得 {})", cps.len());
+    let (first_tick, first_blob) = &cps[0];
+    let bundle = app::driver::decode_checkpoint(first_blob).expect("可解");
+    let log = stitched_log(&cps);
+
+    // 回放前删掉策略包临时目录:证明回放侧不读任何 .onnx(真资产副本,非共享目录)。
+    let policies_path = policies.path().to_path_buf();
+    drop(policies);
+    assert!(!policies_path.exists(), "策略包临时目录应已删除");
+
+    let mut replay = sim_api::replay::replay_world_with_bodies(
+        &bundle.world,
+        &log,
+        {
+            let mut c = quad_config(Vec::new()).session_config();
+            c.scheduler.start_tick = *first_tick;
+            c
+        },
+        || Box::new(SimpleRegistry::builtin()),
+        quad_registry,
+    )
+    .expect("回放装配(无策略表)");
+    for _ in (first_tick.0 + 1)..=end_tick.0 {
+        replay.tick();
+    }
+    let mut online = online_states.clone();
+    let mut replay_states = replay.agent_states();
+    online.sort_by_key(|(id, _, _)| *id);
+    replay_states.sort_by_key(|(id, _, _)| *id);
+    assert_eq!(
+        online, replay_states,
+        "含附身段回放末态全部主体各连杆与在线逐位不同(拍 {})",
+        end_tick.0
+    );
+    let replay_intent = replay.agent_intent_state(entity);
+    assert_eq!(
+        online_intent, replay_intent,
+        "回放后内核意图 getter 读数与录制末态不一致"
+    );
+    replay.shutdown();
+}

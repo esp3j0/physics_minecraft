@@ -1428,6 +1428,7 @@ impl Scheduler {
 
     /// 主体意图保持状态(E03 §3 只读透传):找到主体所在分片再问内核
     /// (写法照 `agent_root_position`)。不存在 / 迁移在途 / 非主体 → None。
+    #[allow(clippy::type_complexity)] // (move_xz, yaw) 两分量各可空
     pub fn agent_intent_state(
         &self,
         entity: EntityId,

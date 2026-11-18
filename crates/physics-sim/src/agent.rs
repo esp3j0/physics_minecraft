@@ -1229,6 +1229,7 @@ impl ShardSim {
 
     /// 主体意图保持状态(E03 §3 只读 getter):`(move_xz, yaw)`。非主体 →
     /// None;未设过意图的分量为 None。冻结期间仍可读(保持状态不随冻结清)。
+    #[allow(clippy::type_complexity)] // (move_xz, yaw) 两分量各可空
     pub fn agent_intent_state(&self, id: EntityId) -> Option<(Option<(f32, f32)>, Option<f32>)> {
         let record = self.agents.get(&id)?;
         Some((record.intent_move, record.intent_yaw))
