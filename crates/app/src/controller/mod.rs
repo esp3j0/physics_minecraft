@@ -607,7 +607,10 @@ fn wrap_pi(y: f32) -> f32 {
 
 /// 世界系意图 + 根旋转 → 归一化机身系策略意图 `[a,b,c]`(各 clamp 到 ±1;
 /// E03 §4.1 纯函数)。a/b 是机身系速度目标占比,c 是偏航**速率**占比(不是
-/// 绝对航向)。`move_xz = None` 按 (0,0);`yaw = None` 按 c = 0。
+/// 绝对航向),`c = clamp(wrap_pi(h − yaw)/1.0)`。符号约定:训练侧 c>0 →
+/// ω.y>0,而游戏 y 向上、ω.y>0 使航向 h 减小,故闭环取 h−yaw 才是负反馈
+/// (E03 R3-a;旧式 yaw−h 为正反馈致航向发散)。`move_xz = None` 按 (0,0);
+/// `yaw = None` 按 c = 0。
 pub fn policy_intent(
     root_rot: types::glam::Quat,
     move_xz: Option<(f32, f32)>,
@@ -622,7 +625,7 @@ pub fn policy_intent(
     let a = (fwd / INTENT_V_FWD_MAX).clamp(-1.0, 1.0);
     let b = (lat / INTENT_V_LAT_MAX).clamp(-1.0, 1.0);
     let c = match yaw {
-        Some(y) => (wrap_pi(y - h) / INTENT_YAW_MAX).clamp(-1.0, 1.0),
+        Some(y) => (wrap_pi(h - y) / INTENT_YAW_MAX).clamp(-1.0, 1.0),
         None => 0.0,
     };
     [a, b, c]

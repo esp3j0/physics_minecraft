@@ -1344,22 +1344,22 @@ fn policy_intent_yaw_rate() {
     let id = Quat::IDENTITY;
     assert_intent(
         policy_intent(id, None, Some(0.4)),
-        [0.0, 0.0, 0.4],
+        [0.0, 0.0, -0.4],
         "M-c yaw 0.4",
     );
     assert_intent(
         policy_intent(id, None, Some(3.0)),
-        [0.0, 0.0, 1.0],
-        "M-c yaw 3.0 钳 1",
+        [0.0, 0.0, -1.0],
+        "M-c yaw 3.0 钳 -1",
     );
     assert_intent(
         policy_intent(id, None, None),
         [0.0, 0.0, 0.0],
         "M-c yaw None",
     );
-    // h=3.0(绕 y −3.0),yaw=−3.0 → c = wrap_pi(−6) = 2π−6 ≈ 0.283185。
+    // h=3.0(绕 y −3.0),yaw=−3.0 → c = wrap_pi(3−(−3)) = wrap_pi(6) = 6−2π ≈ −0.283185。
     let rot = Quat::from_rotation_y(-3.0);
-    let want_c = std::f32::consts::TAU - 6.0;
+    let want_c = 6.0 - std::f32::consts::TAU;
     assert_intent(
         policy_intent(rot, None, Some(-3.0)),
         [0.0, 0.0, want_c],
