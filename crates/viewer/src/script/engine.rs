@@ -796,6 +796,9 @@ impl EngineInner {
                 Action::Unpossess => {
                     self.possessed = None;
                     self.possess_pending = None;
+                    // 通知服务器解除附身(E03 §4.3:发送层转 C2S::Unpossess,
+                    // 服务端据此恢复策略主体附身前意图)。
+                    out.commands.push(EngineCommand::Unpossess);
                     self.finish_step(
                         &mut out,
                         step_no,

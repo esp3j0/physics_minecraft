@@ -1016,6 +1016,12 @@ unpossess = {}",
         "{actions:?}"
     );
     assert_eq!(out.possess, None, "解除后 possess 输出清空(同帧终态)");
+    assert!(
+        out.commands
+            .iter()
+            .any(|c| matches!(c, crate::script::EngineCommand::Unpossess)),
+        "unpossess 步骤须发 EngineCommand::Unpossess(E03 §4.3)"
+    );
     // follow = true 的透传单独验:新引擎只到 possess 为止。
     let mut e2 = engine(
         "[[step]]

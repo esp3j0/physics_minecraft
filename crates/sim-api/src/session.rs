@@ -61,6 +61,13 @@ pub struct AgentJointState {
     pub velocities: Vec<f32>,
 }
 
+/// 主体意图保持状态(REQ-012 E03 §3):世界系移动意图与航向意图,只读。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentIntentState {
+    pub move_xz: Option<(f32, f32)>,
+    pub yaw: Option<f32>,
+}
+
 /// headless 会话:命令进/快照出(蓝图 §3 session;网络形状后置 REQ-003)。
 ///
 /// 盖章规则(README 决策 5):`send` 盖 `apply_at = tick_now()`(下一次 `tick()`
@@ -871,6 +878,13 @@ impl Session {
             positions,
             velocities,
         })
+    }
+
+    /// 主体意图保持状态(REQ-012 E03 §3,只读)。主体不存在、迁移在途、
+    /// 非主体 → None;不进日志、不改检查点。
+    pub fn agent_intent_state(&self, entity: EntityId) -> Option<AgentIntentState> {
+        let (move_xz, yaw) = self.scheduler.agent_intent_state(entity)?;
+        Some(AgentIntentState { move_xz, yaw })
     }
 
     /// 主体根连杆的状态(位置、朝向、世界系线速度与角速度;D01b-1 §1.1)。

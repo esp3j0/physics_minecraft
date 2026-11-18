@@ -877,6 +877,11 @@ pub struct ObserveOrchestrator {
     /// 迁移在途窗口的意图暂存(主体 → 最后一条):owner 查不到时存下,下一
     /// 拍 owner 出现再投递;同窗口多条只留最后一条(§4;被覆盖的计数)。
     pending_intents: PendingIntents,
+    /// 附身策略主体前的归一化意图存档(REQ-012 E03 §4.2;主体 → [a,b,c]):
+    /// `handle_possess` 成功登记 Policy 控制者时存当前 `slot.intent`(已有
+    /// 条目不覆盖,同连接重复附身幂等);`unpossess_entity` 恢复并移除。
+    /// 驱动内存,不进检查点(附身表本就不进快照)。
+    saved_intent: BTreeMap<types::EntityId, [f32; 3]>,
     /// 主体遥测计数(A03 §6;驱动内存,放 DriverOutcome,不改 DebugCounters
     /// ——bincode 协议结构,加字段破坏兼容)。
     agent_counters: AgentCounters,
@@ -1043,6 +1048,7 @@ impl ObserveOrchestrator {
             observer_follow: BTreeMap::new(),
             respawn: crate::respawn::RespawnBook::default(),
             pending_intents: BTreeMap::new(),
+            saved_intent: BTreeMap::new(),
             agent_counters: AgentCounters::default(),
             _cadence: cadence,
         }
@@ -1325,8 +1331,56 @@ impl ObserveOrchestrator {
         self.possessor_of.remove(&entity);
         self.observer_follow.remove(&player);
         self.pending_intents.remove(&entity);
-        // 零意图(主体停下):按实体当前 owner 投递(经日志)。
+        // 零意图(主体停下):按实体当前 owner 投递(经日志)。策略主体的
+        // `slot.intent` 恢复在下一拍 `sync_policy_intents` 做(附身表已摘,
+        // 存档仍在 → 还原附身前意图);内核保持状态,策略侧不用这条零意图。
         self.send_intent(player, entity, (0.0, 0.0), 0.0, false, session, log);
+    }
+
+    /// 附身策略主体的意图同步与存档恢复(REQ-012 E03 §4.2;每拍在
+    /// `drive_policies` 之前跑)。两段:
+    /// - 恢复:有存档但已不再被附身的策略主体(解除/切换/断线后)→
+    ///   `set_intent` 还原附身前意图并移除存档(主体已移除时 set_intent 空操作)。
+    /// - 同步:正被附身的策略主体 → 首次见时存当前 `slot.intent`(已有不覆盖,
+    ///   重复附身幂等),再取内核意图保持状态 + 根旋转,经 `policy_intent` 换算
+    ///   写回 `slot.intent`;getter 任一 None(在途等)→ 本拍跳过保持原值。
+    ///
+    /// 未被附身的策略主体不同步;非策略主体不碰。存档不进检查点。
+    fn sync_policy_intents(
+        &mut self,
+        host: &mut crate::controller::ControllerHost,
+        session: &sim_api::session::Session,
+    ) {
+        use crate::controller::{ControllerKind, policy_intent};
+        // 恢复段:存档里已不再被附身的条目(附身表摘除即触发,各解除路径同口径)。
+        let restore: Vec<types::EntityId> = self
+            .saved_intent
+            .keys()
+            .filter(|e| !self.possessor_of.contains_key(e))
+            .copied()
+            .collect();
+        for entity in restore {
+            if let Some(saved) = self.saved_intent.remove(&entity) {
+                host.set_intent(entity, saved);
+            }
+        }
+        // 同步段:正被附身的策略主体。
+        let possessed: Vec<types::EntityId> = self.possessor_of.keys().copied().collect();
+        for entity in possessed {
+            if !matches!(host.kind_of(entity), Some(ControllerKind::Policy(_))) {
+                continue;
+            }
+            // 首次附身存档(已有条目不覆盖 → 同连接重复附身幂等)。
+            if let Some(cur) = host.intent_of(entity) {
+                self.saved_intent.entry(entity).or_insert(cur);
+            }
+            let intent = session.agent_intent_state(entity);
+            let root = session.agent_root_state(entity);
+            if let (Some(intent), Some(root)) = (intent, root) {
+                let normalized = policy_intent(root.rotation, intent.move_xz, intent.yaw);
+                host.set_intent(entity, normalized);
+            }
+        }
     }
 
     /// 意图投递(按实体当前 owner;owner 查不到 = 迁移在途 → 暂存到
@@ -1564,6 +1618,8 @@ impl ObserveOrchestrator {
             self.possessed_by.remove(&player);
             self.observer_follow.remove(&player);
             self.pending_intents.remove(&entity);
+            // 主体已移除:存档一并清(控制者 slot 由 retain_alive 摘,无需恢复)。
+            self.saved_intent.remove(&entity);
             hub.push_critical(player, S2C::Possessed { entity: None });
         }
     }
@@ -2671,6 +2727,13 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     };
                     host.apply_leash(root_xz);
                     host.drive(&mut session, &mut log, now, in_transit, frozen);
+                    // ③a' 附身策略主体意图同步(E03 §4.2):drive_policies 之前,
+                    // 正被附身的策略主体把内核意图保持状态 + 根旋转换算成归一化
+                    // 策略意图写回 slot;已解除附身的策略主体在此恢复附身前意图。
+                    // observe 关闭时无附身表,整段跳过(既有行为不变)。
+                    if let Some((orchestrator, ..)) = observe_state.as_mut() {
+                        orchestrator.sync_policy_intents(&mut host, &session);
+                    }
                     // ③b 策略控制者(D01b-2 §1.3,AC-D3):紧跟 drive,推理在工作
                     // 线程,每拍在 wait_budget 内收回复,超时沿用上次目标。
                     host.drive_policies(&mut session, &mut log, &mut policy_worker, now, in_transit, frozen);

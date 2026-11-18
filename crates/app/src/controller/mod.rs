@@ -234,6 +234,11 @@ impl ControllerHost {
         }
     }
 
+    /// 读当前策略意图观测(E03 §4.2:附身存档用);未挂 → None。
+    pub fn intent_of(&self, entity: EntityId) -> Option<[f32; 3]> {
+        self.slots.get(&entity).map(|s| s.intent)
+    }
+
     /// 摘除控制者。存在并摘除 → true;不存在 → false。
     pub fn detach(&mut self, entity: EntityId) -> bool {
         self.policy_state.remove(&entity);
@@ -582,4 +587,43 @@ pub fn build_snapshot(
         last_action: last_action.to_vec(),
         intent,
     }
+}
+
+/// 归一化意图的速度/偏航速率上限(E03 §4.1;与 `tools/train/quad/task.py`
+/// 一致)。playground 阶段硬编码在驱动,不进 policy.toml(架构师裁定)。
+pub const INTENT_V_FWD_MAX: f32 = 0.6; // m/s
+pub const INTENT_V_LAT_MAX: f32 = 0.3; // m/s
+pub const INTENT_YAW_MAX: f32 = 1.0; // rad/s
+
+/// 角度规范化到 (−π, π](与内核 `apply_agent_intent` 同域)。
+fn wrap_pi(y: f32) -> f32 {
+    let two_pi = std::f32::consts::TAU;
+    let mut y = y.rem_euclid(two_pi);
+    if y > std::f32::consts::PI {
+        y -= two_pi;
+    }
+    y
+}
+
+/// 世界系意图 + 根旋转 → 归一化机身系策略意图 `[a,b,c]`(各 clamp 到 ±1;
+/// E03 §4.1 纯函数)。a/b 是机身系速度目标占比,c 是偏航**速率**占比(不是
+/// 绝对航向)。`move_xz = None` 按 (0,0);`yaw = None` 按 c = 0。
+pub fn policy_intent(
+    root_rot: types::glam::Quat,
+    move_xz: Option<(f32, f32)>,
+    yaw: Option<f32>,
+) -> [f32; 3] {
+    let f = root_rot * types::glam::Vec3::new(1.0, 0.0, 0.0);
+    let h = f.z.atan2(f.x);
+    let (mx, mz) = move_xz.unwrap_or((0.0, 0.0));
+    let (sin_h, cos_h) = h.sin_cos();
+    let fwd = mx * cos_h + mz * sin_h;
+    let lat = -mx * sin_h + mz * cos_h;
+    let a = (fwd / INTENT_V_FWD_MAX).clamp(-1.0, 1.0);
+    let b = (lat / INTENT_V_LAT_MAX).clamp(-1.0, 1.0);
+    let c = match yaw {
+        Some(y) => (wrap_pi(y - h) / INTENT_YAW_MAX).clamp(-1.0, 1.0),
+        None => 0.0,
+    };
+    [a, b, c]
 }

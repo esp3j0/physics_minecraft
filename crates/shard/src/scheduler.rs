@@ -1426,6 +1426,16 @@ impl Scheduler {
         Some((positions, velocities))
     }
 
+    /// 主体意图保持状态(E03 §3 只读透传):找到主体所在分片再问内核
+    /// (写法照 `agent_root_position`)。不存在 / 迁移在途 / 非主体 → None。
+    pub fn agent_intent_state(
+        &self,
+        entity: EntityId,
+    ) -> Option<(Option<(f32, f32)>, Option<f32>)> {
+        let sim = self.sims.values().find(|sim| sim.is_agent(entity))?;
+        sim.agent_intent_state(entity)
+    }
+
     /// 主体根连杆状态(位置、朝向、世界系线速度/角速度;D01b-1 §1.1):
     /// 根连杆 = `agent_states` 连杆列表第 0 条。条件同 `agent_joint_state`。
     pub fn agent_root_state(&self, entity: EntityId) -> Option<types::EntityState> {

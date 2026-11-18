@@ -243,8 +243,6 @@ pub enum AgentSpawnError {
 pub(crate) enum AgentIntentError {
     /// 实体不存在或不是主体。
     NotAgent,
-    /// 身体没有 `[walker]` 段(多连杆身体或未配行走的单连杆)。
-    NoWalker,
     /// move_xz/yaw 非有限(NaN/inf)。
     NonFinite,
 }
@@ -951,18 +949,18 @@ impl ShardSim {
         self.outbox.despawned.push(id);
     }
 
-    /// 主体意图的内核侧接受(A02a 第 2 节):命令可能来自日志回放,内核
-    /// **不信任它、不 panic**。检查(任一失败即 `Err`,类型见
-    /// [`AgentIntentError`]):
+    /// 主体意图的内核侧接受(A02a 第 2 节;E03 §2 无 walker 也接受):命令
+    /// 可能来自日志回放,内核**不信任它、不 panic**。检查(任一失败即
+    /// `Err`,类型见 [`AgentIntentError`]):
     /// - 实体不存在/不是主体;
-    /// - 无 `[walker]` 段;
     /// - 非有限值(NaN/inf;保持状态不写入)。
     ///
-    /// 通过后:`move_xz` 长度超过 `[walker].max_speed` 按比例钳(遥测
-    /// `agent_intent_clamped` +1)、`yaw` 规范化到 (−π, π],合法意图写入
-    /// `AgentRecord` 保持状态(`intent_move`/`intent_yaw`);`jump` 置一次性
-    /// 标志,由控制器在下一个控制拍消费。遥测拒绝计数在 `apply_command`
-    /// 分支统一 +1(本函数只报类型)。
+    /// 通过后:**有 `[walker]` 段才钳**——`move_xz` 长度超过
+    /// `[walker].max_speed` 按比例钳(遥测 `agent_intent_clamped` +1);无
+    /// walker 原样记录(不钳、不计遥测)。`yaw` 规范化到 (−π, π],合法意图
+    /// 写入 `AgentRecord` 保持状态(`intent_move`/`intent_yaw`);`jump` 置
+    /// 一次性标志,由控制器在下一个控制拍消费。遥测拒绝计数在
+    /// `apply_command` 分支统一 +1(本函数只报类型)。
     pub(crate) fn apply_agent_intent(
         &mut self,
         entity: EntityId,
@@ -974,21 +972,21 @@ impl ShardSim {
             Some(record) => record.body_hash,
             None => return Err(AgentIntentError::NotAgent),
         };
-        let Some(walker) = self.bodies.get(&body_hash).and_then(|def| def.walker) else {
-            return Err(AgentIntentError::NoWalker);
-        };
+        let walker = self.bodies.get(&body_hash).and_then(|def| def.walker);
         let (mx, mz) = move_xz;
         if !mx.is_finite() || !mz.is_finite() || !yaw.is_finite() {
             return Err(AgentIntentError::NonFinite);
         }
-        // 钳制:长度超过 max_speed 按比例缩(方向不变)。
+        // 钳制:有 walker 且长度超过 max_speed 按比例缩(方向不变);
+        // 无 walker 原样记录(E03 §2:策略主体意图由策略侧解释)。
         let len = (mx * mx + mz * mz).sqrt();
-        let (mx, mz) = if len > walker.max_speed {
-            let s = walker.max_speed / len;
-            self.outbox.agent_intent_clamped += 1;
-            (mx * s, mz * s)
-        } else {
-            (mx, mz)
+        let (mx, mz) = match walker {
+            Some(w) if len > w.max_speed => {
+                let s = w.max_speed / len;
+                self.outbox.agent_intent_clamped += 1;
+                (mx * s, mz * s)
+            }
+            _ => (mx, mz),
         };
         // yaw 规范化到 (−π, π](§13:与 capsule demo 的 heading_rad 同域;
         // rem_euclid 到 [0, 2π) 再折回)。
@@ -1227,6 +1225,13 @@ impl ShardSim {
     /// 主体当前关节目标(自由度顺序;命令保持状态)。非主体 → None。
     pub fn agent_joint_targets(&self, id: EntityId) -> Option<&[f32]> {
         self.agents.get(&id).map(|r| r.joint_targets.as_slice())
+    }
+
+    /// 主体意图保持状态(E03 §3 只读 getter):`(move_xz, yaw)`。非主体 →
+    /// None;未设过意图的分量为 None。冻结期间仍可读(保持状态不随冻结清)。
+    pub fn agent_intent_state(&self, id: EntityId) -> Option<(Option<(f32, f32)>, Option<f32>)> {
+        let record = self.agents.get(&id)?;
+        Some((record.intent_move, record.intent_yaw))
     }
 
     /// 主体的关节坐标与关节速度(自由度顺序,与 `agent_joint_positions` /
@@ -3094,41 +3099,66 @@ anchor = [0.0, 0.0, 0.0]
         assert_eq!(record.intent_move, Some((1.0, 0.0)), "合法意图写入保持状态");
     }
 
-    /// 判据 A02-10(无 `[walker]` 段):单连杆身体但 toml 无 walker 段 →
-    /// 意图类型化拒绝 + 遥测。
+    /// E03 §2 K1:无 walker 主体(quad)意图接受且原样记录(不钳、不计
+    /// 钳制遥测);yaw 规范化照旧(4.0 → 4.0 − 2π)。
     #[test]
-    fn intent_rejects_body_without_walker() {
-        let cfg = crate::sim::ShardSimConfig::new(shard_id(0, 0));
-        let mut bodies = BodyRegistry::new();
-        // 与 capsule 同形但去掉 [walker] 段(头部 + 连杆段拼回,无 walker)。
-        let head = capsule_toml().split("[walker]").next().expect("段存在");
-        let links = format!(
-            "[[links]]{}",
-            capsule_toml().split("[[links]]").nth(1).expect("段存在")
-        );
-        let no_walker = format!("{head}{links}");
-        let h = bodies.insert_toml(&no_walker).expect("无 walker 段合法");
-        let mut s =
-            crate::sim::ShardSim::new_with_bodies(cfg, Box::new(SimpleRegistry::builtin()), bodies);
+    fn intent_accepts_body_without_walker_raw() {
+        let (mut s, hash) = quad_sim_with(0.01);
         load_flat_ground(&mut s);
         let a = types::EntityId::from_parts(1, 1);
         s.spawn_agent(
             a,
-            h,
+            hash,
             types::EntityState {
-                translation: Vec3::new(24.0, 1.95, 24.0),
+                translation: quad_origin(24.0, 24.0),
                 ..types::EntityState::default()
             },
             None,
         )
-        .expect("无 walker 身体可生成");
-        s.apply_prefix(&[intent_input(a, 0, (1.0, 0.0), 0.0, false)]);
-        assert_eq!(
-            s.outbox.agent_intent_rejected, 1,
-            "无 [walker] 段:类型化拒绝 + 遥测"
-        );
+        .expect("quad 可生成");
+        s.apply_prefix(&[intent_input(a, 0, (5.0, 0.0), 4.0, false)]);
+        assert_eq!(s.outbox.agent_intent_rejected, 0, "无 walker 意图被接受");
+        assert_eq!(s.outbox.agent_intent_clamped, 0, "无 walker 不钳、不计遥测");
         let record = s.agents.get(&a).expect("主体在表");
-        assert_eq!(record.intent_move, None, "保持状态未被写入");
+        assert_eq!(record.intent_move, Some((5.0, 0.0)), "move 原样记录(不钳)");
+        assert_eq!(
+            record.intent_yaw,
+            Some(4.0f32 - std::f32::consts::TAU),
+            "yaw 规范化到 (−π,π]"
+        );
+    }
+
+    /// E03 §2 K2:无 walker 主体非有限 move/yaw 仍 NonFinite 拒绝,保持
+    /// 状态不污染。
+    #[test]
+    fn intent_rejects_non_finite_without_walker() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(
+            a,
+            hash,
+            types::EntityState {
+                translation: quad_origin(24.0, 24.0),
+                ..types::EntityState::default()
+            },
+            None,
+        )
+        .expect("quad 可生成");
+        for (i, (mx, mz, y)) in [
+            (f32::NAN, 0.0, 0.0),
+            (0.0, f32::INFINITY, 0.0),
+            (0.0, 0.0, f32::NAN),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            s.apply_prefix(&[intent_input(a, i as u64, (mx, mz), y, false)]);
+        }
+        assert_eq!(s.outbox.agent_intent_rejected, 3, "三个非有限组合全拒绝");
+        let record = s.agents.get(&a).expect("主体在表");
+        assert_eq!(record.intent_move, None, "保持状态未被污染");
+        assert_eq!(record.intent_yaw, None, "yaw 保持状态未被污染");
     }
 
     /// 判据 A02-10(非有限值):move_xz/yaw 带 NaN/inf → 拒绝 + 遥测,
