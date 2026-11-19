@@ -3,7 +3,7 @@
 torchrun --nproc_per_node=2 -m quad.ppo_ddp …(--n-envs 为总 N)。
 探针坑:单进程交替步进两个 warp 设备会 CUDA error 700,故每 rank 进程
 启动时把 CUDA_VISIBLE_DEVICES 重设为仅其本卡并 re-exec(进程内只见一张卡,
-backend 用 cuda:0)。PPO 数学与 ppo_gpu.train_gpu 逐字一致;policy 用
+backend 用 cuda:0)。PPO 数学与 ppo_gpu.train_tensor 逐字一致;policy 用
 DistributedDataParallel 包裹,backward 自动 allreduce 梯度;obs-norm 每步
 all_gather 各 rank 批统计后按 rank 序 Chan 合并,各 rank 逐位一致。
 有效 batch = world_size × local。rank0 写 curve.csv/ckpt(聚合口径),
@@ -77,9 +77,12 @@ def _run(args) -> None:
     import torch.optim as optimizer
     from torch.nn.parallel import DistributedDataParallel
 
+    from types import SimpleNamespace
+
     from quad.ppo import Agent, load_checkpoint, save_checkpoint
     from quad.ppo_gpu import TorchRunningMeanStd, _plain_spec
-    from quad.backends.mujoco_warp import MujocoWarpBackend, reward_gpu
+    from quad.backends.tensor import make_tensor_backend
+    from quad.reward import reward_gpu
 
     rank = int(os.environ.get("RANK", "0"))
     ws = int(os.environ.get("WORLD_SIZE", "1"))
@@ -96,17 +99,11 @@ def _run(args) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    lo = args.intent_range
-    intent_range = [[lo[0], lo[1]], [lo[2], lo[3]], [lo[4], lo[5]]]
-    backend = MujocoWarpBackend(
-        args.body,
-        args.manifest,
-        n_envs=local_n,
-        episode_controls=args.episode_controls,
-        intent_range=intent_range,
-        mjcf_path=args.mjcf,
-        device="cuda:0",
-    )
+    # 统一后端工厂(E02h D3);DDP 是 GPU 路径,每 rank 隔离后只见 cuda:0。
+    local_args = SimpleNamespace(**vars(args))
+    local_args.n_envs = local_n
+    local_args.device = "cuda:0"
+    backend = make_tensor_backend(local_args)
     spec_dict = _plain_spec(backend.spec_dict)
     obs_dim = spec_dict["obs_dim"]
     act_dim = spec_dict["act_dim"]

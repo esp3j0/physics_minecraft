@@ -1,8 +1,9 @@
-"""四足 PPO 的 GPU 路径(E02f D4):--backend mujoco_warp --device cuda。
+"""四足唯一张量训练循环(E02f D4;E02h D2 统一所有后端)。
 
-与 ppo.py 的 CPU 路径同一套 PPO 数学(GAE/clip/minibatch/观测归一化冻结),
-但 rollout 缓冲、奖励、GAE、minibatch、归一化统计全部是 GPU 张量,观测/奖励
-不做逐步 host 往返。CPU numpy 路径(ppo.py)不改。检查点结构与 CPU 一致
+--backend {rapier|mujoco|mujoco_warp} --device {cpu|cuda:0|cuda:1} 全路由到此:
+rapier/mujoco 经 NumpyToTensorAdapter(零拷贝,CPU,rollout 仍 mujoco.rollout),
+mujoco_warp 原生张量。rollout 缓冲、奖励、GAE、minibatch、归一化统计全部是
+torch 张量(设备无关);reward 统一 reward_gpu。检查点结构与 legacy 一致
 (obs_mean/var 存 numpy float64,spec 不带 torch 张量),export.py 原样可用。
 """
 
@@ -18,7 +19,8 @@ import torch.nn as nn
 import torch.optim as optimizer
 
 from quad.ppo import Agent, load_checkpoint, save_checkpoint
-from quad.backends.mujoco_warp import MujocoWarpBackend, reward_gpu
+from quad.backends.tensor import make_tensor_backend
+from quad.reward import reward_gpu
 
 
 class TorchRunningMeanStd:
@@ -61,24 +63,14 @@ def _plain_spec(spec: dict) -> dict:
     return {k: v for k, v in spec.items() if not k.startswith("_")}
 
 
-def train_gpu(args) -> None:
+def train_tensor(args) -> None:
     torch.set_num_threads(args.torch_threads)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     np.random.seed(args.seed)
     device = torch.device(args.device)
 
-    lo = args.intent_range
-    intent_range = [[lo[0], lo[1]], [lo[2], lo[3]], [lo[4], lo[5]]]
-    backend = MujocoWarpBackend(
-        args.body,
-        args.manifest,
-        n_envs=args.n_envs,
-        episode_controls=args.episode_controls,
-        intent_range=intent_range,
-        mjcf_path=args.mjcf,
-        device=args.device,
-    )
+    backend = make_tensor_backend(args)
     spec_dict = _plain_spec(backend.spec_dict)
     obs_dim = spec_dict["obs_dim"]
     act_dim = spec_dict["act_dim"]

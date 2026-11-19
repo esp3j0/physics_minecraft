@@ -252,8 +252,8 @@ def _train_cmd(args, backend: str, n: int, total: int, outdir: str) -> list[str]
            "--num-steps", str(args.num_steps),
            "--total-timesteps", str(total), "--max-minutes", str(args.train_minutes),
            "--intent-range", *[str(x) for x in args.intent_range], "--out", outdir]
-    if backend == "mujoco":
-        cmd += ["--threads", str(args.threads)]
+    if backend in ("mujoco", "rapier"):
+        cmd += ["--threads", str(args.threads), "--device", "cpu"]
     else:
         cmd += ["--device", args.device]
     return cmd
@@ -262,7 +262,9 @@ def _train_cmd(args, backend: str, n: int, total: int, outdir: str) -> list[str]
 def _run_train(args, backend: str, n: int, total: int) -> dict:
     outdir = os.path.join(args.out, f"train_{backend}_{n}")
     os.makedirs(outdir, exist_ok=True)
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", CUDA_VISIBLE_DEVICES="0",
+    # warp-cpu × CUDA 可见会堆损坏(E02g 上游坑):CPU warp 跑一律 CVD=""。
+    cvd = "" if backend == "mujoco_warp" and args.device == "cpu" else "0"
+    env = dict(os.environ, PYTHONIOENCODING="utf-8", CUDA_VISIBLE_DEVICES=cvd,
                PYTHONPATH=str(ROOT / "tools" / "train"))
     t0 = time.perf_counter()
     peak = None

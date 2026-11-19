@@ -12,6 +12,7 @@ from quad import task
 from quad.backends import mujoco_warp as mwbe
 from quad.backends.mujoco import MujocoBackend
 from quad.backends.mujoco_warp import MujocoWarpBackend
+from quad.reward import reward_gpu
 
 from test_parity import N, SEED, _max_abs, _rand_state
 
@@ -64,7 +65,7 @@ def test_encode_decode_reward_parity(dev, spec, body_path, manifest_path):
         "intent": torch.rand(N, 3, generator=g3) * 2.0 - 1.0,
     }
     ri = {k: v.to(device=dev, dtype=torch.float32) for k, v in ri.items()}
-    r_gpu = mwbe.reward_gpu(ri)
+    r_gpu = reward_gpu(ri)
     r_ref = task.reward({k: v.cpu().numpy() for k, v in ri.items()})
     assert _max_abs(r_gpu, r_ref) <= 1e-5
 

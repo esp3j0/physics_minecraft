@@ -13,6 +13,7 @@ import torch
 import agent_env
 from quad import task
 from quad.backends import mujoco_warp as mwbe
+from quad.reward import reward_gpu
 
 N = 256
 SEED = 20261118
@@ -140,7 +141,7 @@ def test_reward_parity(device):
         "intent": torch.rand(N, 3, generator=g) * 2.0 - 1.0,
     }
     ri_t = {k: v.to(device=device, dtype=torch.float32) for k, v in ri_t.items()}
-    r_gpu = mwbe.reward_gpu(ri_t)
+    r_gpu = reward_gpu(ri_t)
     ri_np = {k: v.cpu().numpy() for k, v in ri_t.items()}
     r_ref = task.reward(ri_np)
     assert _max_abs(r_gpu, r_ref) <= 1e-5
