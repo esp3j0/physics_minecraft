@@ -204,9 +204,11 @@ class MujocoWarpBackend:
         self._initial = self._build_initial(settle_ticks)
         self.initial_root_height = float(self._initial["qpos"][1])
 
-        self._m = mw.put_model(self._host_model)
-        # 坑:make_data 必须传 host model(传 warp model 触发上游 bug)。
-        self._d = mw.make_data(self._host_model, nworld=n_envs)
+        # put_model/make_data 无 device 参数,靠 warp 当前设备作用域(E02g 探针)。
+        with wp.ScopedDevice(str(self.device)):
+            self._m = mw.put_model(self._host_model)
+            # 坑:make_data 必须传 host model(传 warp model 触发上游 bug)。
+            self._d = mw.make_data(self._host_model, nworld=n_envs)
 
         self._base_seed = None
         self._intent = torch.zeros((n_envs, 3), device=self.device, dtype=torch.float32)

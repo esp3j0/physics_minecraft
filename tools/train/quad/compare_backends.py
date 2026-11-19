@@ -1,4 +1,6 @@
 """E02f D5 双后端对照:CPU mujoco(threads=10)vs GPU mujoco-warp。
+E02g D2 扩展:--ns 支持到 65536,bp/bt 报峰值显存(torch 峰值 + nvidia-smi
+轮询峰值),bp 按 --bench-sim-steps 自适应控制步数,大 N bt 限迭代预算。
 
 阶段(--phases,逗号分隔):
   a   行为 parity:同策略(新初始化 Agent 的均值动作)同种子前 K 控制步,
@@ -47,6 +49,58 @@ def _save(out: str, name: str, obj) -> None:
 def _load(out: str, name: str):
     with open(os.path.join(out, name), encoding="utf-8") as f:
         return json.load(f)
+
+
+def _smi_used_mib(idx: int):
+    try:
+        p = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits",
+             "-i", str(idx)],
+            capture_output=True, text=True, timeout=10,
+        )
+        return float(p.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+class _SmiPeak:
+    """后台轮询 nvidia-smi 显存占用峰值(warp 分配不在 torch  allocator 内)。"""
+
+    def __init__(self, idx: int, interval: float = 0.2):
+        self.idx = idx
+        self.interval = interval
+        self.peak = None
+        self._stop = False
+        self._thread = None
+
+    def __enter__(self):
+        import threading
+
+        def loop():
+            while not self._stop:
+                v = _smi_used_mib(self.idx)
+                if v is not None:
+                    self.peak = v if self.peak is None else max(self.peak, v)
+                time.sleep(self.interval)
+
+        self._thread = threading.Thread(target=loop, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return False
+
+
+def _dev_idx(device: str) -> int:
+    return int(device.split(":")[-1]) if ":" in device else 0
+
+
+def _bench_controls(args, n: int, nstep: int) -> int:
+    target = args.bench_sim_steps
+    return max(5, min(args.bench_controls, round(target / (n * nstep))))
 
 
 def phase_a(args) -> None:
@@ -100,7 +154,7 @@ def phase_a(args) -> None:
     print(f"(a) n={n} K={args.k} obs max diff {max_diff['obs']:.6g}(首步 {first_diff['obs']:.6g})")
 
 
-def _gpu_pure_physics(args, n: int, reps: int = 3) -> float:
+def _gpu_pure_physics(args, n: int, reps: int = 3) -> dict:
     import warp as wp
     from quad.backends.mujoco_warp import MujocoWarpBackend
     import mujoco_warp as mw
@@ -113,20 +167,30 @@ def _gpu_pure_physics(args, n: int, reps: int = 3) -> float:
                            mjcf_path=args.mjcf, device=args.device)
     be.reset(args.seed)
     nstep = be.control_period_ticks * be.substeps
-    total = n * args.bench_controls * nstep
+    bc = _bench_controls(args, n, nstep)
+    total = n * bc * nstep
     rates = []
-    for _ in range(reps):
-        for _ in range(5 * nstep):
-            mw.step(be._m, be._d)
-        wp.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(args.bench_controls * nstep):
-            mw.step(be._m, be._d)
-        wp.synchronize()
-        rates.append(total / (time.perf_counter() - t0))
+    torch.cuda.reset_peak_memory_stats()
+    with _SmiPeak(_dev_idx(args.device)) as smi:
+        for _ in range(reps):
+            for _ in range(5 * nstep):
+                mw.step(be._m, be._d)
+            wp.synchronize()
+            t0 = time.perf_counter()
+            for _ in range(bc * nstep):
+                mw.step(be._m, be._d)
+            wp.synchronize()
+            rates.append(total / (time.perf_counter() - t0))
+    res = {
+        "rate": float(np.median(rates)),
+        "bench_controls": bc,
+        "torch_peak_alloc_mib": torch.cuda.max_memory_allocated() / 2**20,
+        "torch_peak_reserved_mib": torch.cuda.max_memory_reserved() / 2**20,
+        "smi_peak_mib": smi.peak,
+    }
     del be
     torch.cuda.empty_cache()
-    return float(np.median(rates))
+    return res
 
 
 def _cpu_pure_physics(args, n: int, reps: int = 3) -> float:
@@ -140,9 +204,10 @@ def _cpu_pure_physics(args, n: int, reps: int = 3) -> float:
                        mjcf_path=args.mjcf)
     m = be._model
     nstep = be.control_period_ticks * be.substeps
+    bc = _bench_controls(args, n, nstep)
     chunk = math.ceil(n / args.threads)
-    total = args.threads * chunk * args.bench_controls * nstep
-    loops = chunk * args.bench_controls * nstep
+    total = args.threads * chunk * bc * nstep
+    loops = chunk * bc * nstep
 
     def worker(_):
         d = mujoco.MjData(m)
@@ -162,13 +227,20 @@ def _cpu_pure_physics(args, n: int, reps: int = 3) -> float:
 
 def phase_bp(args) -> None:
     res = {}
+    if os.path.exists(os.path.join(args.out, "results_bp.json")):
+        res = _load(args.out, "results_bp.json")
     for n in args.ns:
         g = _gpu_pure_physics(args, n)
         c = _cpu_pure_physics(args, n)
-        res[str(n)] = {"gpu_sim_steps_per_sec": g, "cpu_sim_steps_per_sec": c,
-                       "ratio": g / c, "threads": args.threads,
-                       "bench_controls": args.bench_controls}
-        print(f"(bp) N={n} GPU {g:.3e} CPU({args.threads}t) {c:.3e} sim-steps/s ratio {g / c:.2f}")
+        res[str(n)] = {"gpu_sim_steps_per_sec": g["rate"], "cpu_sim_steps_per_sec": c,
+                       "ratio": g["rate"] / c, "threads": args.threads,
+                       "bench_controls": g["bench_controls"],
+                       "torch_peak_alloc_mib": g["torch_peak_alloc_mib"],
+                       "torch_peak_reserved_mib": g["torch_peak_reserved_mib"],
+                       "smi_peak_mib": g["smi_peak_mib"]}
+        print(f"(bp) N={n} GPU {g['rate']:.3e} CPU({args.threads}t) {c:.3e} sim-steps/s "
+              f"ratio {g['rate'] / c:.2f} VRAM(smi峰值) {g['smi_peak_mib']}MiB "
+              f"bc={g['bench_controls']}")
     _save(args.out, "results_bp.json", res)
 
 
@@ -193,9 +265,18 @@ def _run_train(args, backend: str, n: int, total: int) -> dict:
     env = dict(os.environ, PYTHONIOENCODING="utf-8", CUDA_VISIBLE_DEVICES="0",
                PYTHONPATH=str(ROOT / "tools" / "train"))
     t0 = time.perf_counter()
+    peak = None
     with open(os.path.join(outdir, "train.log"), "w", encoding="utf-8") as log:
-        p = subprocess.run(_train_cmd(args, backend, n, total, outdir),
-                           cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT)
+        if backend == "mujoco_warp":
+            with _SmiPeak(0) as smi:
+                p = subprocess.run(_train_cmd(args, backend, n, total, outdir),
+                                   cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                   timeout=900)
+            peak = smi.peak
+        else:
+            p = subprocess.run(_train_cmd(args, backend, n, total, outdir),
+                               cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT,
+                               timeout=900)
     elapsed = time.perf_counter() - t0
     if p.returncode != 0:
         raise RuntimeError(f"{backend} N={n} 训练退出码 {p.returncode},见 {outdir}/train.log")
@@ -209,18 +290,28 @@ def _run_train(args, backend: str, n: int, total: int) -> dict:
             "iters": len(rows), "elapsed_sec": elapsed,
             "sps_iter1": sps_all[0] if sps_all else None,
             "sps_steady_mean": float(np.mean(steady)) if steady else (sps_all[0] if sps_all else None),
-            "sps_all": sps_all, "outdir": outdir}
+            "sps_all": sps_all, "peak_vram_mib": peak, "outdir": outdir}
 
 
 def phase_bt(args) -> None:
     res = {}
     for n in args.ns:
-        total = max(200_000, 4 * n * args.num_steps)
-        for backend in ("mujoco", "mujoco_warp"):
-            r = _run_train(args, backend, n, total)
+        p = os.path.join(args.out, f"results_bt_{n}.json")
+        if os.path.exists(p):
+            res.update(_load(args.out, f"results_bt_{n}.json"))
+        # 大 N 控制迭代预算:GPU 2 迭代(iter2 为稳态),CPU 1 迭代(防超 10 分钟)。
+        for backend in args.bt_backends.split(","):
+            backend = backend.strip()
+            if n <= 4096:
+                total_n = max(200_000, 4 * n * args.num_steps)
+            elif backend == "mujoco_warp":
+                total_n = 2 * n * args.num_steps
+            else:
+                total_n = n * args.num_steps
+            r = _run_train(args, backend, n, total_n)
             res[f"{backend}_{n}"] = r
             print(f"(bt) {backend} N={n} steady {r['sps_steady_mean']:.0f} control-steps/s "
-                  f"({r['iters']} iters, {r['elapsed_sec']:.0f}s)")
+                  f"({r['iters']} iters, {r['elapsed_sec']:.0f}s) VRAM峰值 {r['peak_vram_mib']}MiB")
             _save(args.out, f"results_bt_{n}.json", res)
     if all(f"mujoco_{n}" in res and f"mujoco_warp_{n}" in res for n in args.ns):
         n = 4096 if 4096 in args.ns else args.ns[-1]
@@ -279,13 +370,22 @@ def phase_report(args) -> None:
         lines.append("")
     if os.path.exists(os.path.join(args.out, "results_bp.json")):
         bp = _load(args.out, "results_bp.json")
-        lines.append("## (b-1) 纯物理吞吐(sim-steps/s,3 次中位)")
+        lines.append("## (b-1) 纯物理吞吐(sim-steps/s,3 次中位)+ 峰值显存")
         lines.append("")
-        lines.append("| N | GPU | CPU(%dt) | GPU/CPU |" % args.threads)
-        lines.append("|---|---|---|---|")
+        lines.append("| N | GPU | CPU(%dt) | GPU/CPU | bench控制步 | torch峰值分配MiB | smi峰值MiB |" % args.threads)
+        lines.append("|---|---|---|---|---|---|---|")
         for n, r in bp.items():
+            smi = r.get("smi_peak_mib")
+            ta = r.get("torch_peak_alloc_mib")
+            ta_s = f"{ta:.0f}" if ta is not None else "-"
+            smi_s = f"{smi:.0f}" if smi is not None else "-"
             lines.append(f"| {n} | {r['gpu_sim_steps_per_sec']:.3e} | "
-                         f"{r['cpu_sim_steps_per_sec']:.3e} | {r['ratio']:.2f} |")
+                         f"{r['cpu_sim_steps_per_sec']:.3e} | {r['ratio']:.2f} | "
+                         f"{r.get('bench_controls', '-')} | {ta_s} | {smi_s} |")
+        lines.append("")
+        gn = max(bp, key=lambda k: bp[k]["gpu_sim_steps_per_sec"])
+        lines.append(f"**纯物理饱和点**:N={gn} 峰值 {bp[gn]['gpu_sim_steps_per_sec']:.3e} sim-steps/s"
+                     f"(只报实测,不设硬阈值)")
         lines.append("")
     bt = {}
     for n in args.ns:
@@ -295,13 +395,21 @@ def phase_report(args) -> None:
     if bt:
         lines.append("## (b-2) 端到端训练吞吐(control-steps/s,含 obs/reward/PPO)")
         lines.append("")
-        lines.append("| N | 后端 | iters | iter1 | 稳态均值(iter≥2) | 耗时 s |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| N | 后端 | iters | iter1 | 稳态均值(iter≥2) | 耗时 s | VRAM峰值MiB |")
+        lines.append("|---|---|---|---|---|---|---|")
         for key, r in bt.items():
+            pv = r.get("peak_vram_mib")
+            pv_s = f"{pv:.0f}" if pv is not None else "-"
             lines.append(f"| {r['n_envs']} | {r['backend']} | {r['iters']} | "
                          f"{r['sps_iter1']:.0f} | {r['sps_steady_mean']:.0f} | "
-                         f"{r['elapsed_sec']:.0f} |")
+                         f"{r['elapsed_sec']:.0f} | {pv_s} |")
         lines.append("")
+        gpu_rows = {r["n_envs"]: r for r in bt.values() if r["backend"] == "mujoco_warp"}
+        if gpu_rows:
+            gn = max(gpu_rows, key=lambda k: gpu_rows[k]["sps_steady_mean"])
+            lines.append(f"**端到端饱和点(GPU)**:N={gn} 稳态 {gpu_rows[gn]['sps_steady_mean']:.0f} "
+                         f"control-steps/s(只报实测,不设硬阈值)")
+            lines.append("")
         if "mujoco_4096" in bt and "mujoco_warp_4096" in bt:
             g = bt["mujoco_warp_4096"]["sps_steady_mean"]
             c = bt["mujoco_4096"]["sps_steady_mean"]
@@ -341,9 +449,13 @@ def main() -> None:
     cli.add_argument("--ns", default="1024,4096")
     cli.add_argument("--k", type=int, default=200)
     cli.add_argument("--bench-controls", type=int, default=200)
+    cli.add_argument("--bench-sim-steps", type=float, default=10_000_000,
+                     help="bp 每 rep 目标 sim-step 总量(大 N 自动减控制步,防 CPU 超 10 分钟)")
     cli.add_argument("--num-steps", type=int, default=48)
     cli.add_argument("--train-minutes", type=float, default=5.0)
     cli.add_argument("--phases", default="a,bp,bt,c,report")
+    cli.add_argument("--bt-backends", default="mujoco,mujoco_warp",
+                     help="bt 阶段跑哪些后端(逗号分隔,大 N 可分次跑)")
     args = cli.parse_args()
     args.body = _p(args.body)
     args.manifest = _p(args.manifest)
