@@ -1,250 +1,220 @@
-# tools/train — 后端无关训练(R2 补充;R3 修订 2026-11-08)
+# tools/train — 四足统一训练管线(使用指南)
 
-PPO、奖励、导出与后端解耦(R2 补充;REQ-012 §5.3 的三步路线):
-1. **rapier 跑通训练**(本单元,任务 = 双关节摆臂指到目标点,R2 再补充);
-2. 同一套 PyTorch 代码直接接 MuJoCo 做主训练(`transfer`,未开始);
-3. 把 MuJoCo 训好的模型放回 rapier 微调(未开始)。
+REQ-012 阶段 E(E02f/g/h)已把训练代码完全统一:**一份张量 PPO 循环插所有后端/设备**。
+本指南面向使用者,固化"改模型 → 训练 → 导出 → 进游戏"全链,并给出"怎么改"的修改指引。
+每条命令都可复制跑通(架构师会抽跑复核)。一键样例见 [`examples/`](examples/)(quad/go2 短训证通路)。
 
-## 目录
+> 摆臂 demo(`train/` 包,双关节摆臂指目标点)是早期 R2/R3 单元,已精简为附录;主线是四足 `quad/` 包。
 
+## 1. 架构总览
+
+- **一份循环**:`quad/ppo_gpu.py::train_tensor` 是唯一训练循环;`quad/ppo.py` 的 `main()` 全路由到它。
+  legacy numpy 训练循环已退役(E02h,git 历史可追溯)。
+- **三个后端,同一接口**(`reset(seed)->torch.float32[n,obs_dim]`、`step(torch actions)->(obs, reward_inputs dict[str,torch], terminated, truncated)`):
+  - `rapier`(CPU):Rust 物理 `agent_env.VecEnv`(PyO3),经 `NumpyToTensorAdapter` 零拷贝接入。
+  - `mujoco`(CPU):MuJoCo 物理,**仍用 `mujoco.rollout` 批量推进**(不退化成逐步 mj_step/warp-cpu),经同一适配器零拷贝接入。
+  - `mujoco_warp`(cpu/cuda:0/cuda:1):原生张量后端(GPU 批量物理)。
+  - 适配器在 `quad/backends/tensor.py`:`torch.from_numpy` 共享内存(obs/reward_inputs/flags),actions `detach().cpu().numpy()` 转回;`make_tensor_backend(args)` 工厂统一返回张量接口。rapier/mujoco 仅 cpu,给 cuda 直接拒绝。
+- **奖励双份同步**:`quad/task.py`(numpy oracle,常量 `W/SIGMA/H0/V_*_MAX`)+ `quad/reward.py`(torch `reward_gpu`,设备无关)。两者逐键加权一致,parity 测试强制 ≤1e-5。**改奖励须两处同步**(见 §4)。
+- **双卡 DDP**:`quad/ppo_ddp.py`(torchrun)。每 rank 进程启动时把 `CUDA_VISIBLE_DEVICES` 重设为仅本卡并 re-exec(进程内只见一张卡),DDP allreduce 梯度、obs-norm 每步 all_gather 后按 rank 序 Chan 合并。
+- **观测/解码单一事实来源在 Rust**:MuJoCo/warp 只取物理状态,观测编码、动作解码、机身系换算、意图采样、回合种子全调 `agent_env.Codec / body_frame_batch / episode_seed / sample_intent / spec_for`(PyO3)。
+
+## 2. 环境
+
+| | Windows(本机,CPU) | vm-ai(GPU) |
+|---|---|---|
+| venv | `tools/train/.venv` | `~/req012-gpu/.venv` |
+| 内容 | torch-cpu / mujoco 4.0.1 / agent_env / numpy / onnx / onnxscript | torch-cuda / mujoco-warp / mujoco / agent_env / onnx(overlay) |
+| Python | `.venv/Scripts/python.exe` | `~/req012-gpu/.venv/bin/python` |
+| 跑法 | CPU 一律 `CUDA_VISIBLE_DEVICES=""` | `--device cuda:0`/`cuda:1`;双卡 torchrun |
+
+- **装/重装 agent_env**(只装这一个模块进 venv,不动别的包;在仓库根):
+  ```bash
+  tools/train/.venv/Scripts/python.exe -m maturin develop --release -m crates/agent-env/Cargo.toml
+  ```
+  pyproject 在 `crates/agent-env/pyproject.toml`(`module-name="agent_env"`,`features=["python"]`)。默认工作区门禁不带 python 特性,不链接 Python。
+- **零下载纪律**:pytest/onnx 等用 `uv run --no-project --python <venv-python> --offline --with <包> …` 缓存 overlay;清单外不装。**`--no-project` 必需**:`tools/train/pyproject.toml` 会让在该目录跑的 `uv run` 改用项目 `.venv`(忽略 `--python`,丢掉 agent_env)。
+- **Windows 控制台编码**:torch.onnx 导出会打印 ✅ 等字符,GBK 控制台会 `UnicodeEncodeError`。**所有 Python 命令前置 `PYTHONIOENCODING=utf-8`**(样例脚本已内置)。
+- 下文命令默认在 `tools/train` 下用本 venv 跑(`cd tools/train`);`cargo xtask` 在仓库根跑。vm-ai 把 `.venv/Scripts/python.exe` 换成 `~/req012-gpu/.venv/bin/python` 并按需加 `--device`。
+
+## 3. 全链九步(改模型 → 训练 → 导出 → 进游戏)
+
+以 quad 为例;go2 把 body/manifest 换成 go2 即可(§5 差异)。`<…>` 为占位。
+
+### 步1 导入/改模型(URDF → body.toml)
+```bash
+cargo xtask import-body <model.urdf> --out <body.toml> \
+    [--name <名>] [--up z|y] [--kp 100] [--kd 3] [--friction 0.6] \
+    [--pose <关节>=<角> …(可重复)] [--cylinder-segments 16] [--max-hull-points 32] \
+    [--package <名>=<目录> …] [--report <json>]
 ```
-train/
-  spec.py              BackendSpec:观测布局、动作映射、控制频率、
-                       reward_inputs 键、身体标识(两后端必须一致;单一
-                       事实来源 = learn_env 导出常量,check.py 核对)
-  rewards.py           奖励:只读 reward_inputs(+ 动作、步号)
-  ppo.py               CleanRL ppo_continuous_action.py(MIT)底本改写;
-                       检查点/ --init-from / --freeze-obs-norm / reward 缩放
-  export_onnx.py       torch.onnx.export 导出 actor 均值网络 + policy.toml(§5.2)
-  torch_export_obs.py  L3 数据:导出归一化观测 + torch 输出(learn torchtract 对照用)
-  backends/
-    base.py            VecBackend 接口(下一步接 MuJoCo 只需实现它)
-    rapier.py          rapier 适配器:包装 learn_env.VecEnv(PyO3)
-    check.py           契约检查:常量逐项/形状/dtype/键集合/reset 确定性/
-                       越界钳位/到时约定/线程无关
-pyproject.toml         maturin(cdylib = demos/agents/learn 的 PyO3 feature)
-requirements.txt       锁定版本(torch CPU 等)
-.venv/                 虚拟环境(gitignore;只装这里)
+- 默认 `up=z kp=100 kd=3 friction=0.6 cylinder-segments=16 max-hull-points=32`。
+- **坐标折算**:URDF z-up → 游戏 y-up,`(x,y,z)→(x,z,−y)`;URDF 旋转导入时全部折算进数据(`BodyDef` 连杆坐标系无旋转,形状只有平移 offset)。
+- `--package` 映射 URDF 的 `package://` 网格路径到本地目录(网格须在 `assets/third_party/`,不下载)。
+- **body_hash 是 manifest 联动键**:`body.toml` 的 `BodyHash::hex()` 必须等于 manifest 的 `body_hash`。
+- quad 是手写身体(`assets/bodies/quad.body.toml`,非 URDF 导入);go2 由 `assets/third_party/unitree_go2/go2_description.urdf` 导入(选项见 `go2.body.toml` 头注释)。
+- 产物:`<body.toml>`(+ 可选 report)。
+
+### 步2 导出 MJCF(body.toml → xml)
+```bash
+cargo xtask export-mjcf <body.toml> --out <xml> --timestep 0.0016666666666666668 \
+    [--floor-friction 0.6] [--spawn-height 0.35] [--joint-damping 0.1] [--report <json>]
 ```
+- **timestep 必须 = 1/600 ≈ 0.0016666666666666668**:默认 0.002 不能整除 tick_hz 60,mujoco 后端会报错。
+- 产物:`<xml>`(mujoco/mujoco_warp 后端的 `--mjcf`)。
 
-接 MuJoCo 时预计只需新增 `train/backends/mujoco.py`(实现 `VecBackend`,
-MJCF 由 `cargo xtask export-mjcf` 导出)——`ppo.py`/`rewards.py`/`export_onnx.py`
-一行不改(它们只 import `spec` 和接口;`spec_matches` 会在 `--init-from`
-时核对两边的 spec 字典)。
+### 步3 写 manifest
+`quad/manifests/<名>_train.toml`:
+- `body_hash` 须匹配身体(步1 的 hash);`name`;`control_period_ticks`(控制周期 = ticks × 物理 tick);
+- `action_scale`/`action_clip`(动作 → 关节目标:`target = default_pose + action_scale × raw`,raw 钳 ±action_clip);
+- `[[obs]]` 逐项 `term`/`scale`(顺序与维度决定 obs_dim;`default_pose` 缺省取身体各关节 default_angle)。
+- quad/go2 现成 manifest:`quad_train.toml`/`go2_train.toml`(48 维,scale 全 1,action_scale 0.25,control_period_ticks 2)。
 
-## 环境(用户已同意的安装范围)
-
-系统 Python 3.12 → `tools/train/.venv`;只装:
-`torch==2.15.0+cpu`(index-url https://download.pytorch.org/whl/cpu)、
-`numpy==2.5.4`、`gymnasium==1.4.0`、`maturin==1.16.0`、
-`onnx==1.23.2` + `onnxscript`(导出 ONNX 需要)。
-`learn_env` 由 `maturin develop --release` 从 demos/agents/learn 编出;
-模块导出 17 个环境常量(P3),`python -m train.backends.check rapier`
-逐项与 spec.py 核对。
-
-## BackendSpec 摘要(全表见 train/spec.py)
-
-- 身体 `arm-demo`:双关节摆臂,根 fixed,两 revolute(世界 z 轴),
-  连杆 2×(0.5 m、1 kg),末端标记球 0.01 kg,限位 ±170°,无地面。
-- 观测 14 维:`q1_sin, q1_cos, q2_sin, q2_cos, q1_vel, q2_vel,
-  target_x, target_y, tip_x, tip_y, target_minus_tip_x, target_minus_tip_y,
-  last_act1, last_act2`(相对向量 dx,dy 是策略的"待消误差")。
-- 动作 2 维,取值 [−1,1](Env 内钳位,P5),**增量式**:
-  目标角 += **0.1**×动作,钳限位(P3 统一;R2 的 0.05 与事实不符,删)。
-- 控制:60 Hz 物理、30 Hz 控制(2 拍),回合 90 控制步 = 3 s;
-  目标采样 r∈[0.3,0.9] 面积均匀、角全圆;出生角 ±0.5 rad(关节坐标
-  注入,P4);无提前终止。
-- PD 电机 kp 2000 / kd 60 / τ 25 N·m(选定依据见 learn README;
-  L0 实证 100/100×3 种子)。
-
-## 奖励(R3/P1 简单基线;总架构师探针第三行)
-
-```python
-REWARD_W = {"dist": 1.0, "act_rate": 0.01, "reach": 1.0, "align": 0.0, "tip_speed": 0.0}
-# 每控制步:
-#   r = −dist − 0.01·‖a_t − a_{t−1}‖² + 1·[dist ≤ 0.03]
-# reward_scale 0.1(进 buffer 前;探针口径)。
+### 步4 契约检查
+```bash
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m quad.backends.check \
+    --backend rapier --body <body.toml> --manifest <man.toml>
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m quad.backends.check \
+    --backend mujoco --body <body.toml> --manifest <man.toml> --mjcf <xml>
 ```
+- rapier 项1–6; mujoco 项1–14(项7–14 含手算期望)。逐项 PASS/FAIL,有 FAIL 非零退出。
+- 项1 逐键比对 `quad/spec.py`(独立解析)与 Rust `VecEnv.spec()`,**body_hash 不符即 FAIL**。
+- **go2 mujoco 项8a base_lin_vel 是既有 backlog**(手算期望按 quad 根框钉,go2 根框取向不同;生产提取正确),仅该项 FAIL,本单不修。
 
-R2 的 align(+max(0, v·u) 无上限)、tier 阶梯(0.3/0.1/0.03 三级)、
-保持窗口 ×3、线性+tanh 叠加全部撤除(P1 主因:甩臂刷分)。R3 纪律:
-在基线上每加一项都要在 README 写理由 + 加前/加后 L1 对照;
-**本轮未加任何项**(s1 达标,基线够用)。权重初值 = 最终值。
-
-## PPO(CleanRL 底本;改动都写明)
-
-保持原样:GAE(γ λ)、clip 目标、value clip、minibatch 循环、obs Welford
-归一化、正交初始化、actor/critic 双塔、**done 约定(dones[step] = obs[step]
-是新回合首帧)**。
-改动(全部写明):
-- 环境接口:直接用 `VecBackend`(不走 gymnasium 向量包装);
-- 奖励:`rewards.reward()`(如上);
-- `actor_logstd` 初始 −0.5(σ≈0.6;CleanRL 默认 0 的 σ=1 在 [−1,1] 动作
-  空间过半饱和,梯度 dead);
-- `--reward-scale 0.1`(R3/P1 探针口径;R2 用 0.01 配旧奖励);
-- `--freeze-norm-after 10`(预热 10 迭代后冻结 obs 归一化统计;
-  统计滚动 → V 目标漂移 → vf_mse 失控,冻结后稳);
-- 其余超参(R3/P2)= **CleanRL 默认**:num-minibatches **32**、
-  update-epochs **10**(R2 的 4×4=16 梯度步/迭代太少)、gamma **0.99**、
-  anneal-lr **开**、target-kl **不设**(R2 的 0.995/不开/0.05 早停全部
-  偏离,已改回;λ 0.95、clip 0.2、lr 3e-4、vf_coef 0.5、ent_coef 0)。
-
-### bug 记录(对复现有用;R2 起)
-
-- **b_obs 未归一化**(R2 首轮发散根因):rollout 策略吃归一化 obs、更新
-  minibatch 喂原始 obs → 重算 logp 全错位 → clip 0.7、KL 上百。修法 =
-  `obs_buf[step] = o_norm`(CleanRL 原样本来就存归一化后的 obs)。
-- **GAE done 错位**(R3/P6):R2 的 `done_buf[step]` 存"这一步之后的
-  done"、`next_done` 恒 0 → 第 88 步不从第 89 步自举、第 89 步反而从
-  下一回合初始状态自举。R3 改 CleanRL 原样(`dones[step] = next_done`),
-  配套后端到时步返回 reset 前转移的 reward_inputs,奖励不再置 0。
-
-## 正式训练(R2 再补充:全部报)
-
-| 训练 | 命令(共通:`--n-envs 128 --threads 12 --torch-threads 4 --num-steps 90`;60 Hz 加 `--num-steps 180 --hz60`) | 预算内停点 |
-| --- | --- | --- |
-| 30 Hz 种子 0 | `--seed 0 --out out/arm_s0` | 1e7 步 / 484 s |
-| 30 Hz 种子 1 | `--seed 1 --out out/arm_s1` | 1e7 步 / 486 s |
-| 60 Hz 对照种子 2 | `--seed 2 --hz60 --out out/arm_s2_hz60` | 1e7 步 / 330 s |
-
-预算 = 1e7 控制步或 30 分钟,先到为准(实际 1e7 步先到;32×10 更新下
-端到端 ~20.6k 步/s,30 Hz 两跑 8 分钟出头)。R2 的试训/smoke 数据不提交。
-
-吞吐:
-- Rust 物理(纯环境,`learn throughput`):1 线程 59.0k 控制步/s
-  (0.016 ms/控制周期),16 线程 453.0k(0.035 ms/控制周期);
-- Python 训练端到端(收集+PPO 更新):30 Hz ~20.6k、60 Hz ~30.4k
-  控制步/s(32×10 = 320 梯度步/迭代,R2 的 4×4 时是 ~37k——更新
-  加重后吞吐降一半,换 s1 达标)。
-
-## 微调路径(第 3 步的底座;R3 实测达标)
-
-- 检查点 = actor + critic + log σ + obs 归一化统计 + 优化器状态 + spec + 超参;
-- `--init-from <ckpt>`:恢复训练;`spec_matches()` 核对检查点里的 spec,
-  不一致拒绝(逐字段报差异);可换后端(同 spec);
-- `--freeze-obs-norm`:微调时冻结归一化统计;
-- **L4 实测**(s1 → 5 分钟):末 20 迭代均值 44.69 vs 首迭代 39.12,
-  差 12.46% ≤ 20%,无 NaN;
-- **L5 实测**(质量 ×1.5、kp ×0.7,只改物理):零样本 185/200 →
-  微调 10 分钟(21.38M 步,无 NaN)→ 变动物理 185/200、主口径 187/200;
-- 导出:观测归一化参数(mean/inv_std)写进 `policy.toml`(§5.2),
-  `learn eval` 在 Rust 侧读 policy.toml 做归一化再喂 tract。
-
-## 四足(quad)(E02b-1)
-
-四足训练代码在新包 `quad/`(摆臂 demo `train/` 不动):
-
+### 步5 训练
+```bash
+# CPU(rapier 或 mujoco;一律 CVD=""):
+CUDA_VISIBLE_DEVICES="" PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m quad.ppo \
+    --backend rapier --device cpu --body <body.toml> --manifest <man.toml> \
+    --n-envs 1024 --threads 8 --out <dir> --max-minutes 30
+# mujoco-CPU 加 --mjcf <xml>;mujoco_warp GPU:
+PYTHONIOENCODING=utf-8 ~/req012-gpu/.venv/bin/python -m quad.ppo \
+    --backend mujoco_warp --device cuda:0 --body <body.toml> --manifest <man.toml> --mjcf <xml> \
+    --n-envs 4096 --out <dir> --max-minutes 30
+# 双卡 DDP(--n-envs 为总 N,各 rank 均分;每 rank 自动隔离单卡):
+# 在 tools/train 下跑;PYTHONPATH="$PWD" 必需——每 rank re-exec 后靠它找到 quad 包。
+PYTHONPATH="$PWD" torchrun --nproc_per_node=2 -m quad.ppo_ddp \
+    --backend mujoco_warp --body <body.toml> --manifest <man.toml> --mjcf <xml> \
+    --n-envs 4096 --out <dir> --max-minutes 30
 ```
-quad/
-  spec.py              独立解析身体+manifest(tomllib),算出与 VecEnv.spec()
-                       同键的字典;spec_matches 逐键核对(浮点 abs ≤ 1e-6)
-  backends/
-    base.py            VecBackend 接口(同 train,去掉 probe_env)
-    rapier.py          rapier 适配器:包装 agent_env.VecEnv(PyO3)
-    check.py           契约检查:常量单一来源/形状类型/线程无关/到时约定/
-                       动作裁剪/错误
-  manifests/
-    quad_train.toml    训练 manifest(48 维观测,无 normalization)
+- 关键选项:`--n-envs N --threads T --torch-threads --num-steps 48 --total-timesteps --max-minutes`
+  `--num-minibatches 32 --update-epochs 10 --lr 3e-4 --gamma 0.99 --gae-lambda 0.95 --clip-coef 0.2`
+  `--intent-range lo0 hi0 lo1 hi1 lo2 hi2 --reward-scale 0.1 --episode-controls 600 --seed`
+  `--init-from <ckpt>`(续训,`spec_matches` 核对,忽略 episode_controls/fall_up_y_min)`--freeze-obs-norm`。
+- **CPU 跑一律 `CUDA_VISIBLE_DEVICES=""`**(warp-cpu × CUDA 可见 → 堆损坏 abort;启动层环境变量,代码零改动)。
+- 产物:`<dir>/ckpt_final.pt`(+ `ckpt_last.pt`)、`curve.csv`(iter,total_steps,ep_rew_mean,ep_len_mean,fall_frac,steps_per_sec)。
+- 吞吐参考(vm-ai,稳态):mujoco-CPU@1024 ~6.8k、warp-cuda:0@1024 ~13.9k、@4096 ~48k ctrl/s;rapier-CPU 大 N 见 §6 OOM。
+
+### 步6 导出(ckpt → 策略包)
+```bash
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m quad.export \
+    --ckpt <dir>/ckpt_final.pt --manifest <man.toml> --name <策略名> --out <export_dir> --body <body.toml>
 ```
+- 产物:`policy.onnx`(actor 均值网络,obs float32[1,obs_dim]→action[1,act_dim],不含归一化)、
+  `policy.toml`(训练 manifest 原样 + name 换 `--name` + `[normalization]` obs mean/inv_std)、
+  `probe.json`(RapierBackend 1-env、intent 全 0、reset seed 0/1/2 首帧观测与动作)。
+- venv 缺 onnx 时用 `uv run --no-project --python <venv> --offline --with onnx --with onnxscript python -m quad.export …`(`--no-project` 避开 `tools/train/pyproject.toml` 劫持环境)。
 
-### 装 agent_env
+### 步7 游戏推理核对
+```bash
+cargo xtask check-policy <export_dir> --body <body.toml> --probe <export_dir>/probe.json
+```
+- **须在 probe 生成机跑**:跨机 obs 差 ~3.4e-5(浮点/平台),同机要求 reset 观测与 probe.obs 逐位相同、`policy.act` raw 与 probe.action 每分量差 <1e-4。
+- 不带 `--probe` 只验证策略包能加载。产物:stdout 逐 probe 最大差 + OK/FAIL。
 
-`agent_env` 由 `crates/agent-env` 的 cdylib(`python` 特性)经 maturin 装进
-本 venv(只装这一个模块,不动 venv 里别的包):
+### 步8 评估
+```bash
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe -m quad.eval \
+    --ckpt <dir>/ckpt_final.pt --backend rapier --body <body.toml> --manifest <man.toml> \
+    --intent 1 0 0 --episodes 8 --seconds 10 --seed 0
+```
+- `--backend mujoco` 加 `--mjcf <xml>`;跨后端 spec 相同,rapier 检查点可接 mujoco 评估。
+- 产物:`<ckpt 同目录>/eval_<intent>.json`(摔倒回合数/N、存活均值、|vx_err|/|vz_err|/|yaw_err|、高度、up_y)+ stdout 摘要。
+
+### 步9 进游戏
+1. 策略包放 `assets/policies/<名>/`(`policy.toml` + `policy.onnx`;`probe.json` 可选):
+   ```bash
+   mkdir -p assets/policies/<名>
+   cp <export_dir>/policy.toml <export_dir>/policy.onnx assets/policies/<名>/
+   ```
+   `policies_dir` 默认 `assets/policies`(config 可改);**body 哈希须与训练一致**。
+2. 配置 `config.toml`:
+   ```toml
+   [[agents]]
+   body = "quad"                 # go2 换 "go2"
+   controller = "policy"
+   policy = "<名>"
+   position = [64.0, -59.5, 64.0]
+   intent = [0.5, 0.0, 0.0]
+   ```
+   启动:`cargo run -p app -- config.toml`。
+   **意图归一化上限是硬编码常量**(`crates/app/src/controller/mod.rs`:`INTENT_V_FWD_MAX=0.6` m/s、`INTENT_V_LAT_MAX=0.3` m/s、`INTENT_YAW_MAX=1.0` rad/s),不进 policy.toml。
+3. 或用既有 smoke 场景(策略狗 `quad_mj1_ft` 进真实服务器 + 附身改向/转回/解除):
+   ```bash
+   cargo xtask smoke req012-policy-walk
+   ```
+
+## 4. 修改指引("怎么改"在哪、代价多大)
+
+| 改什么 | 在哪 | 代价/注意 |
+|---|---|---|
+| **超参** | `quad/ppo.py` CLI(lr/gamma/clip/num-steps/minibatches/epochs/reward-scale…) | 零代码,命令行即可;DDP 同参 |
+| **奖励** | `quad/task.py`(numpy oracle,常量 `W/SIGMA/H0/V_*_MAX`)**+** `quad/reward.py`(torch `reward_gpu`) | **两处须同步**;改后跑 `python -m quad.selftest`(手算期望 R-A/B/C)+ parity 测试(tests/test_adapter、tests_gpu/test_parity,≤1e-5) |
+| **模型** | import-body → body.toml → export-mjcf → xml | manifest `body_hash` 联动;obs 维随 dof 变;重跑步1–4 |
+| **obs/传感器项** | Rust `crates/agent-env`(numpy oracle Codec)**+** `quad/backends/mujoco_warp.py` `encode_gpu`/`decode_gpu`(torch)**+** 各后端状态提取 **+** manifest `[[obs]]` **+** parity 测试 | **跨 Rust/全后端**,代价大;须同步所有后端与 parity |
+
+**当前 obs = 48 维纯本体感觉**:`base_lin_vel(3) + base_ang_vel(3) + projected_gravity(3) + joint_pos(12) + joint_vel(12) + last_action(12) + intent(3)`。
+**从运动学状态推算,非 mujoco `<sensor>`**。
+
+- **脚底力反馈:不存在**。加它中等可行——mujoco/rapier 都能算接触力,但要动 Rust Codec + 全后端提取 + manifest + parity,跨 Rust/全后端。
+- **摄像头:不存在,难**。mujoco-warp 无批量渲染器,须另起渲染管线,属独立单元(本管线不含)。
+- 力反馈/摄像头均**另议**,不在当前统一管线内。
+
+## 5. go2 与 quad 差异(换实体轻易)
+
+| | quad | go2 |
+|---|---|---|
+| 来源 | 手写 body.toml(demo 定值) | URDF 导入(`unitree_go2/go2_description.urdf`) |
+| body_hash | `b48ebc84674927da` | `0e1de10395e2d6aa` |
+| dof / obs 维 | 12 / 48 | 12 / 48(同布局) |
+| action_scale / control_period_ticks | 0.25 / 2 | 0.25 / 2 |
+| manifest | `quad_train.toml` | `go2_train.toml` |
+| 站立根高度(eval) | ~0.277 m | ~0.314 m(真实几何更高) |
+| mujoco 契约检查 | 项1–14 全 PASS | 项8a base_lin_vel backlog(仅该项 FAIL,生产正确) |
+
+换实体只需:步1 导入(go2 用现成 URDF)→ 步2 导出 xml → 用对应 manifest → 步4–8 照常。
+一键样例:`bash tools/train/examples/walkthrough_go2.sh`(Windows CPU 前置 `CUDA_VISIBLE_DEVICES=""`)。
+
+## 6. 已知坑(照实列)
+
+- **warp-cpu × CUDA 可见 → 堆损坏 abort**:CPU 跑一律 `CUDA_VISIBLE_DEVICES=""`(启动层环境变量,代码零改动)。
+- **check-policy 跨机 probe obs 差 ~3.4e-5**:须在 probe 生成机跑(同机逐位)。
+- **rapier-CPU 大 N OOM**:VecEnv ≈14.9 MiB/env;16 GB VM n=1024 RSS ~15.2 GiB,n≥2048 SIGKILL。对照用 N=1024。
+- **mujoco 4.0 无 mjx**;`make_data` 传 host `MjModel`;`put_model`/`make_data` 无 device 参数,须 `with wp.ScopedDevice(dev)` 包构造。
+- **双卡同进程交替步进 cuda:0/cuda:1 → CUDA error 700**:双卡必须多进程 DDP,每进程 `CUDA_VISIBLE_DEVICES=<rank>` 隔离单卡。
+- **DDP 每 rank re-exec 丢 cwd 导入**:`torchrun -m quad.ppo_ddp` 须前置 `PYTHONPATH="$PWD"`(在 tools/train 下),否则 worker 报 `No module named 'quad'`。
+- **内核惯量由碰撞形状推出**(不用 `LinkDef.com`/`LinkDef.inertia`);质量生成时乘 `agent_mass_scale`(默认 0.01)。
+- **go2 mujoco 项8a base_lin_vel 手算期望 backlog**(生产提取正确,本单不修)。
+- **Windows GBK 控制台**:torch.onnx 打印 emoji → `UnicodeEncodeError`,前置 `PYTHONIOENCODING=utf-8`。
+- **export-mjcf 默认 timestep 0.002** 不整除 tick_hz 60 → 用 `--timestep 0.0016666666666666668`(1/600)。
+- **uv run 在 tools/train 下被 pyproject 劫持**:`tools/train/pyproject.toml` 使 `uv run` 改用项目 `.venv`(忽略 `--python`,丢 agent_env)→ overlay 命令一律加 `--no-project`。
+
+## 7. 一键样例(examples/)
 
 ```bash
-# 在仓库根,venv 激活的环境变量下(VIRTUAL_ENV 指向 tools/train/.venv):
-tools/train/.venv/Scripts/python.exe -m maturin develop --release \
-    -m crates/agent-env/Cargo.toml
+# Windows CPU(无 GPU):
+CUDA_VISIBLE_DEVICES="" bash tools/train/examples/walkthrough_quad.sh
+CUDA_VISIBLE_DEVICES="" bash tools/train/examples/walkthrough_go2.sh
+# vm-ai GPU:
+PY=~/req012-gpu/.venv/bin/python BACKEND=mujoco_warp DEVICE=cuda:0 bash tools/train/examples/walkthrough_quad.sh
 ```
+串起 import(go2)→ export-mjcf → check → 短训(`--total-timesteps 50000 --max-minutes 2 --n-envs 64`)→ export → check-policy → eval。
+**每步断言退出码 0 + 关键产物存在**,漏步/错路径非零退出。go2 把"仅项8a FAIL"作为受控断言。
+"进游戏"步在脚本末尾以注释给出(不强制跑重型游戏构建)。
 
-pyproject 在 `crates/agent-env/pyproject.toml`(`module-name = "agent_env"`,
-`features = ["python"]`)。默认工作区门禁不带 `python` 特性,不链接 Python。
+## 附录:摆臂 demo(train/ 包,早期 R2/R3)
 
-### 跑契约检查
-
-```bash
-cd tools/train
-.venv/Scripts/python.exe -m quad.backends.check \
-    --body ../../assets/bodies/quad.body.toml \
-    --manifest quad/manifests/quad_train.toml
-```
-
-逐项打印 PASS/FAIL,有 FAIL 非零退出。环境常量全部由 Rust 侧 `VecEnv.spec()`
-从身体定义与 manifest 取,`quad/spec.py` 是独立核对侧(第 1 项逐键比对)。
-
-## 四足奖励 / PPO / 导出 / 评估(E02b-2)
-
-```
-quad/
-  task.py       奖励:command(intent) 与 reward(reward_inputs);常量见文件头
-  selftest.py   奖励手算对照(R-A/R-B/R-C),python -m quad.selftest
-  ppo.py        CleanRL 底本 PPO(改 spec_dict/curve.csv/--init-from 比 spec)
-  export.py     actor 均值网络 → policy.onnx + policy.toml(含 normalization)
-                + probe.json(reset 首帧观测与动作)
-  eval.py       均值动作评估,写 eval_<intent>.json
-```
-
-奖励只读 `reward_inputs`(键序/宽度由 Rust `reward_columns` 给),`task.reward`
-返回 float32[n]。`selftest` 的期望值由架构师手算,照抄不改。
-
-五步管线(前台;Python 用本 venv):
-
-```bash
-cd tools/train
-# 1 奖励自检
-.venv/Scripts/python.exe -m quad.selftest
-# 2 冒烟训练(只证管线能跑,不要求学会走路;正式训练由架构师跑)
-.venv/Scripts/python.exe -m quad.ppo --backend rapier \
-    --body ../../assets/bodies/quad.body.toml \
-    --manifest quad/manifests/quad_train.toml --out out/quad_smoke --max-minutes 3
-# 3 导出 ONNX + policy.toml + probe.json
-.venv/Scripts/python.exe -m quad.export --ckpt out/quad_smoke/ckpt_final.pt \
-    --manifest quad/manifests/quad_train.toml --name quad_smoke --out out/quad_smoke
-# 4 游戏推理路径核对(观测逐位一致、动作差 < 1e-4)
-cargo xtask check-policy tools/train/out/quad_smoke \
-    --body assets/bodies/quad.body.toml --probe tools/train/out/quad_smoke/probe.json
-# 5 评估
-.venv/Scripts/python.exe -m quad.eval --ckpt out/quad_smoke/ckpt_final.pt \
-    --body ../../assets/bodies/quad.body.toml \
-    --manifest quad/manifests/quad_train.toml --intent 1 0 0 --seconds 10
-```
-
-`--init-from <ckpt>` 续训:用 `quad.spec.spec_matches` 比 spec(忽略
-`episode_controls`、`fall_up_y_min`),不一致拒绝并列出差异键。
-`check-policy` 不带 `--probe` 只验证策略包能加载;带 `--probe` 还要求
-环境 reset 观测与 probe.obs 逐位相同、`policy.act` 的 raw 与 probe.action
-每分量差 < 1e-4。
-
-## 四足 MuJoCo CPU 后端(E02c-1)
-
-MuJoCo 只负责物理;观测编码、动作解码、机身系换算、意图采样、回合种子全部
-调 Rust 同一份代码(`agent_env.Codec` / `body_frame_batch` / `episode_seed` /
-`sample_intent` / `spec_for`,经 PyO3 暴露)。Python 侧只从 MuJoCo 取状态。
-`quad/backends/mujoco.py` 用 `mujoco.rollout` 批量推进,控制步 =
-`control_period_ticks × substeps` 个 `mj_step`(`substeps = round(1/(tick_hz·timestep))`)。
-warmstart 不跨控制步保存(与连续 `mj_step` 的已知差异)。
-
-```bash
-# 在仓库根导出 MJCF(不改导出代码;timestep = 1/600)
-cargo xtask export-mjcf assets/bodies/quad.body.toml --out target/e02c/quad.xml --timestep 0.0016666666666666668
-cargo xtask export-mjcf assets/bodies/go2.body.toml  --out target/e02c/go2.xml  --timestep 0.0016666666666666668
-
-# 在 tools/train 下:契约检查(项1–6 两后端;项7–12 仅 mujoco,手算期望)
-.venv/Scripts/python.exe -m quad.backends.check --backend rapier \
-    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml
-.venv/Scripts/python.exe -m quad.backends.check --backend mujoco \
-    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
-    --mjcf ../../target/e02c/quad.xml
-
-# 训练 / 评估:--backend mujoco 时 --mjcf 必填
-.venv/Scripts/python.exe -m quad.ppo --backend mujoco \
-    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
-    --mjcf ../../target/e02c/quad.xml --n-envs 64 --threads 8 --max-minutes 3 --out out/quad_mj_smoke
-.venv/Scripts/python.exe -m quad.eval --backend mujoco --ckpt out/quad_mj_smoke/ckpt_final.pt \
-    --body ../../assets/bodies/quad.body.toml --manifest quad/manifests/quad_train.toml \
-    --mjcf ../../target/e02c/quad.xml --intent 1 0 0 --episodes 8 --seconds 10
-```
-
-`--init-from` 跨后端照常比 spec(两边 spec 相同,rapier 检查点可接 mujoco 续训,反之亦然)。
-go2 用 `quad/manifests/go2_train.toml` + `target/e02c/go2.xml`。域随机化是 E02c-2,不在本单。
+双关节摆臂指目标点(`arm-demo`,根 fixed,两 revolute,obs 14 维,动作 2 维增量式 ±0.1)。
+`train/ppo.py`(CleanRL 底本)、`train/rewards.py`、`train/export_onnx.py`、`train/backends/{rapier,check}.py`。
+奖励基线 `r = −dist − 0.01·‖a_t−a_{t−1}‖² + [dist≤0.03]`,reward_scale 0.1。
+契约检查:`python -m train.backends.check rapier`。该 demo 与四足统一管线独立,仅作历史参考。
