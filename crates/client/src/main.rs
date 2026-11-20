@@ -1037,3 +1037,240 @@ fn screenshot_system(
         .observe(save_to_disk(path));
     println!("截图已触发: {display_path}");
 }
+
+#[cfg(test)]
+mod tests {
+    use types::BlockId;
+    use voxel::Chunk;
+
+    use super::*;
+
+    const STONE: BlockId = BlockId(1);
+    const DIRT: BlockId = BlockId(2);
+
+    /// 构造无头 Bevy App(`MinimalPlugins + AssetPlugin`,不装 `RenderPlugin`,无窗口)。
+    fn headless_app(mirror: ChunkMirror, add_collect: bool, add_spawn: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+
+        let terrain_material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+
+        app.insert_resource(FrameCounter(0))
+            .insert_resource(EditFrameTracker::default())
+            .insert_resource(MeshStats::default())
+            .insert_resource(PendingMeshesRes::default())
+            .insert_resource(WorldRenderRes {
+                mirror,
+                entities: BTreeMap::new(),
+                terrain_material,
+            });
+
+        if add_collect {
+            app.add_systems(Update, collect_mesh_tasks_system);
+        }
+        if add_spawn {
+            app.add_systems(Update, spawn_mesh_tasks_system);
+        }
+        app
+    }
+
+    /// 经 `AsyncComputeTaskPool` 构造已就绪的轻量网格任务,保证单次 `app.update()` 确定性命中。
+    fn ready_task(submesh: SubchunkMesh) -> Task<SubchunkMesh> {
+        let task = AsyncComputeTaskPool::get().spawn(async move { submesh });
+        for _ in 0..10_000 {
+            if task.is_finished() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(task.is_finished(), "轻量异步网格任务应在有界让出内完成");
+        task
+    }
+
+    /// 构造 `chunk(0,0)` 已装载、排空初始 24 Load 并对 `(0,-60,0)` 写入 STONE(`epoch(s0)==2`)
+    /// 且弹出该 Edit 脏条目的镜像。
+    fn mirror_at_epoch_2() -> (ChunkMirror, SubchunkPos) {
+        let s0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        assert_eq!(mirror.epoch(s0), 1);
+        for _ in 0..24 {
+            assert!(matches!(mirror.pop_dirty(), Some((_, DirtyKind::Load))));
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        mirror.apply_updates(&[(BlockPos::new(0, -60, 0), STONE)]);
+        assert_eq!(mirror.epoch(s0), 2);
+        assert_eq!(mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
+        assert_eq!(mirror.dirty_len(), 0);
+        (mirror, s0)
+    }
+
+    /// MS5-1:过期任务(epoch=1 < mirror epoch=2)在 `collect_mesh_tasks_system` 中被丢弃并回队。
+    #[test]
+    fn ms5_stale_discard_requeue() {
+        let (mirror, s0) = mirror_at_epoch_2();
+        let mut app = headless_app(mirror, true, false);
+
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                s0,
+                PendingMesh {
+                    kind: DirtyKind::Edit,
+                    epoch: 1,
+                    task: ready_task(SubchunkMesh::default()),
+                },
+            );
+
+        app.update();
+
+        let stats = *app.world().resource::<MeshStats>();
+        assert_eq!(stats.discards, 1);
+        assert_eq!(stats.uploads, 0);
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 0);
+
+        let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+        assert!(world_res.entities.is_empty());
+        assert_eq!(world_res.mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
+    }
+
+    /// MS5-2:世代匹配任务(epoch=2 == mirror epoch=2)在 `collect_mesh_tasks_system` 中正常上传。
+    #[test]
+    fn ms5_fresh_upload() {
+        let (mirror, s0) = mirror_at_epoch_2();
+        let snap = snapshot(&mirror, s0).expect("chunk(0,0) 已装载");
+        let submesh = mesh_subchunk_snapshot(&snap, s0);
+        assert!(!submesh.indices.is_empty(), "STONE 单块网格非空");
+
+        let mut app = headless_app(mirror, true, false);
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                s0,
+                PendingMesh {
+                    kind: DirtyKind::Edit,
+                    epoch: 2,
+                    task: ready_task(submesh),
+                },
+            );
+
+        app.update();
+
+        let stats = *app.world().resource::<MeshStats>();
+        assert_eq!(stats.uploads, 1);
+        assert_eq!(stats.discards, 0);
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
+
+        let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+        assert!(world_res.entities.contains_key(&s0));
+        assert_eq!(world_res.mirror.pop_dirty(), None);
+    }
+
+    /// MS5-3:同段二次编辑替换网格后,旧 Mesh 资产句柄立即被回收(`Assets<Mesh>.len()==1`)。
+    #[test]
+    fn ms5_replace_no_leak() {
+        let (mirror, s0) = mirror_at_epoch_2();
+        let snap1 = snapshot(&mirror, s0).expect("chunk(0,0) 已装载");
+        let mesh1 = mesh_subchunk_snapshot(&snap1, s0);
+        assert!(!mesh1.indices.is_empty());
+
+        let mut app = headless_app(mirror, true, false);
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                s0,
+                PendingMesh {
+                    kind: DirtyKind::Edit,
+                    epoch: 2,
+                    task: ready_task(mesh1),
+                },
+            );
+        app.update();
+
+        assert_eq!(app.world().resource::<MeshStats>().uploads, 1);
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
+
+        // 再编辑为 DIRT → epoch=3,准备新网格替换旧 Mesh3d。
+        let mesh2 = {
+            let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+            world_res
+                .mirror
+                .apply_updates(&[(BlockPos::new(0, -60, 0), DIRT)]);
+            assert_eq!(world_res.mirror.epoch(s0), 3);
+            assert_eq!(world_res.mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
+            let snap2 = snapshot(&world_res.mirror, s0).expect("chunk(0,0) 已装载");
+            let m = mesh_subchunk_snapshot(&snap2, s0);
+            assert!(!m.indices.is_empty());
+            m
+        };
+
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                s0,
+                PendingMesh {
+                    kind: DirtyKind::Edit,
+                    epoch: 3,
+                    task: ready_task(mesh2),
+                },
+            );
+        app.update();
+
+        assert_eq!(app.world().resource::<MeshStats>().uploads, 2);
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 1);
+        assert_eq!(app.world().resource::<WorldRenderRes>().entities.len(), 1);
+    }
+
+    /// MS5-4:同段已有在途任务时,`spawn_mesh_tasks_system` 跳过该段不顶替、继续 spawn 其余 8 段,
+    /// 并将跳过的 `s0` 回队(`dirty_len==16`,首条 pop 为 `(s0, Load)`)。
+    #[test]
+    fn ms5_pending_skip_requeue() {
+        let s0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        assert_eq!(mirror.dirty_len(), 24);
+        assert_eq!(mirror.epoch(s0), 1);
+
+        let mut app = headless_app(mirror, false, true);
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                s0,
+                PendingMesh {
+                    kind: DirtyKind::Load,
+                    epoch: 1,
+                    task: ready_task(SubchunkMesh::default()),
+                },
+            );
+
+        app.update();
+
+        {
+            let pending = app.world().resource::<PendingMeshesRes>();
+            let entry = pending.tasks.get(&s0).expect("s0 仍应在途");
+            assert_eq!(entry.epoch, 1, "s0 在途任务不得被顶替");
+            assert_eq!(pending.tasks.len(), 9, "原 s0 + 新 spawn 8 段 = 9");
+        }
+
+        let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+        assert_eq!(world_res.mirror.dirty_len(), 16, "24 - 9 + 1 = 16");
+        assert_eq!(world_res.mirror.pop_dirty(), Some((s0, DirtyKind::Load)));
+    }
+}
