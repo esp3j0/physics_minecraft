@@ -1,7 +1,11 @@
 //! # client-core —— 客户端纯逻辑核心(REQ-013 §3.1)
 //!
 //! 零渲染依赖(零 bevy、零 macroquad),严格遵守确定性核 lint。
-//! C01a 建立传输边界 [`Transport`] 与进程内单机实现 [`LocalTransport`]。
+//! C01a 建立传输边界 [`Transport`] 与进程内单机实现 [`LocalTransport`];
+//! C01b-1 建立世界镜像 [`mirror`] 与 subchunk 网格生成 [`mesh`]。
+
+pub mod mesh;
+pub mod mirror;
 
 use app::driver::AppError;
 use app::local::{LocalConfig, LocalHandle, LocalHost};
@@ -114,5 +118,61 @@ mod tests {
 
         assert!(got_welcome, "5 s 内必须收到 Welcome(player_id=1, tick=0)");
         assert!(got_pong, "5 s 内必须收到 Ping 对应的 Pong");
+    }
+
+    /// AC4-t:真实线程宿主自主步进 — 启动后 500 ms 不 drain,再发 MoveObserver + SetBlock,
+    /// 有界 ≤ 5 s 轮询 drain 必须收到含 `(0,-60,0) -> STONE` 的 `BlockUpdates`。
+    #[test]
+    fn t_ac4_host_ticks_without_drain() {
+        use messaging::SimCommand;
+        use types::BlockPos;
+        use types::glam::Vec3;
+
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let cfg = LocalConfig {
+            config: Config {
+                data_dir: tmp.path().to_path_buf(),
+                bodies_dir: tmp.path().join("bodies"),
+                policies_dir: tmp.path().join("policies"),
+                ..Config::default()
+            },
+            view_distance: 2,
+        };
+
+        let mut transport = LocalTransport::new(cfg).expect("LocalTransport::new");
+        // 不 drain 静置 500 ms:验证宿主在独立线程自主推进。
+        std::thread::sleep(Duration::from_millis(500));
+
+        transport.send(C2S::MoveObserver {
+            position: Vec3::new(8.0, -60.0, 8.0),
+        });
+        std::thread::sleep(Duration::from_millis(300));
+
+        let target = BlockPos::new(0, -60, 0);
+        transport.send(C2S::Command(SimCommand::SetBlock {
+            pos: target,
+            block: voxel::builtin::STONE,
+        }));
+
+        let mut got_update = false;
+        for _ in 0..500 {
+            for msg in transport.drain() {
+                if let S2C::BlockUpdates { updates } = msg
+                    && updates.contains(&(target, voxel::builtin::STONE))
+                {
+                    got_update = true;
+                    break;
+                }
+            }
+            if got_update {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            got_update,
+            "5 s 内必须收到含 (0,-60,0)->STONE 的 BlockUpdates"
+        );
     }
 }

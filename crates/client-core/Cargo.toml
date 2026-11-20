@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 app = { path = "../app" }
+messaging = { path = "../messaging" }
 sim-api = { path = "../sim-api" }
 types = { path = "../types" }
 voxel = { path = "../voxel" }

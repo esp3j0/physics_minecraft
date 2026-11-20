@@ -1,0 +1,337 @@
+//! 世界镜像与 subchunk 脏队列(REQ-013 C01b-1 §2.1)。
+//!
+//! 纯逻辑、零渲染依赖、零墙钟、BTree 系容器保证确定性顺序。
+//! 每个 chunk 高度 384(世界 y ∈ [-64, 319])按 16 格切为 24 段(section 0..=23)。
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use types::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
+use voxel::Chunk;
+
+/// 每个 chunk 的纵向 subchunk 段数(384 / 16 = 24)。
+pub const SECTIONS_PER_CHUNK: u8 = 24;
+
+/// 单个 subchunk 的纵向高度(格)。
+pub const SECTION_HEIGHT: usize = 16;
+
+/// 四水平邻 chunk 偏移(x, z)。
+const HORIZONTAL_NEIGHBORS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+
+/// Subchunk 坐标:chunk 网格坐标 + 纵向段号(0..=23)。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct SubchunkPos {
+    pub chunk: ChunkPos,
+    pub section: u8,
+}
+
+/// 脏标记优先级:`Edit` 优先于 `Load`。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DirtyKind {
+    Edit,
+    Load,
+}
+
+/// 客户端侧世界体素镜像与确定性脏队列。
+///
+/// 内部使用 `Arc<Chunk>` 支持写时复制(`Arc::make_mut`),便于后续异步网格任务共享快照;
+/// 脏表拆分为互斥的 `dirty_edit` / `dirty_load` 两个 `BTreeSet`,确保 `Edit` 不被 `Load`
+/// 覆盖且弹出顺序严格确定。
+pub struct ChunkMirror {
+    chunks: BTreeMap<ChunkPos, Arc<Chunk>>,
+    dirty_edit: BTreeSet<SubchunkPos>,
+    dirty_load: BTreeSet<SubchunkPos>,
+}
+
+impl Default for ChunkMirror {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ChunkMirror {
+    /// 构造空镜像。
+    pub fn new() -> Self {
+        Self {
+            chunks: BTreeMap::new(),
+            dirty_edit: BTreeSet::new(),
+            dirty_load: BTreeSet::new(),
+        }
+    }
+
+    /// 装载(或替换)一个 chunk:本 chunk 全 24 段标 `Load`,已装载的四水平邻 chunk
+    /// 全 24 段亦标 `Load`(已有 `Edit` 标记不被降级)。
+    pub fn insert_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
+        self.chunks.insert(pos, Arc::new(chunk));
+        self.mark_chunk_load(pos);
+        for (dx, dz) in HORIZONTAL_NEIGHBORS {
+            let neighbor = ChunkPos::new(pos.x + dx, pos.z + dz);
+            if self.chunks.contains_key(&neighbor) {
+                self.mark_chunk_load(neighbor);
+            }
+        }
+    }
+
+    /// 卸载一个 chunk:移除本体、清除其全部脏条目,并将已装载的四水平邻 chunk 全 24 段标 `Load`。
+    pub fn remove_chunk(&mut self, pos: ChunkPos) {
+        self.chunks.remove(&pos);
+        for section in 0..SECTIONS_PER_CHUNK {
+            let sc = SubchunkPos {
+                chunk: pos,
+                section,
+            };
+            self.dirty_edit.remove(&sc);
+            self.dirty_load.remove(&sc);
+        }
+        for (dx, dz) in HORIZONTAL_NEIGHBORS {
+            let neighbor = ChunkPos::new(pos.x + dx, pos.z + dz);
+            if self.chunks.contains_key(&neighbor) {
+                self.mark_chunk_load(neighbor);
+            }
+        }
+    }
+
+    /// 批量应用世界坐标方块更新(写时复制 `Arc::make_mut`),并标脏本格所在段及存在的边界邻段。
+    /// 世界高度外或未装载 chunk 的更新静默忽略。
+    pub fn apply_updates(&mut self, updates: &[(BlockPos, BlockId)]) {
+        for &(world, block) in updates {
+            if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&world.y) {
+                continue;
+            }
+            let chunk_pos = world.chunk_of();
+            let local_x = world.x.rem_euclid(CHUNK_SIZE) as usize;
+            let local_y = (world.y - WORLD_Y_MIN) as usize;
+            let local_z = world.z.rem_euclid(CHUNK_SIZE) as usize;
+
+            let Some(arc) = self.chunks.get_mut(&chunk_pos) else {
+                continue;
+            };
+            Arc::make_mut(arc).set(local_x, local_y, local_z, block);
+
+            let section = (local_y / SECTION_HEIGHT) as u8;
+            self.mark_dirty(
+                SubchunkPos {
+                    chunk: chunk_pos,
+                    section,
+                },
+                DirtyKind::Edit,
+            );
+
+            if local_x == 0 {
+                let n = ChunkPos::new(chunk_pos.x - 1, chunk_pos.z);
+                if self.chunks.contains_key(&n) {
+                    self.mark_dirty(SubchunkPos { chunk: n, section }, DirtyKind::Edit);
+                }
+            } else if local_x == 15 {
+                let n = ChunkPos::new(chunk_pos.x + 1, chunk_pos.z);
+                if self.chunks.contains_key(&n) {
+                    self.mark_dirty(SubchunkPos { chunk: n, section }, DirtyKind::Edit);
+                }
+            }
+
+            if local_z == 0 {
+                let n = ChunkPos::new(chunk_pos.x, chunk_pos.z - 1);
+                if self.chunks.contains_key(&n) {
+                    self.mark_dirty(SubchunkPos { chunk: n, section }, DirtyKind::Edit);
+                }
+            } else if local_z == 15 {
+                let n = ChunkPos::new(chunk_pos.x, chunk_pos.z + 1);
+                if self.chunks.contains_key(&n) {
+                    self.mark_dirty(SubchunkPos { chunk: n, section }, DirtyKind::Edit);
+                }
+            }
+
+            let y_in_sec = local_y % SECTION_HEIGHT;
+            if y_in_sec == 0 && section > 0 {
+                self.mark_dirty(
+                    SubchunkPos {
+                        chunk: chunk_pos,
+                        section: section - 1,
+                    },
+                    DirtyKind::Edit,
+                );
+            } else if y_in_sec == 15 && section + 1 < SECTIONS_PER_CHUNK {
+                self.mark_dirty(
+                    SubchunkPos {
+                        chunk: chunk_pos,
+                        section: section + 1,
+                    },
+                    DirtyKind::Edit,
+                );
+            }
+        }
+    }
+
+    /// 世界坐标取格;未装载 chunk 或世界高度外返回 `None`。
+    pub fn get_block(&self, world: BlockPos) -> Option<BlockId> {
+        if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&world.y) {
+            return None;
+        }
+        let chunk_pos = world.chunk_of();
+        let chunk = self.chunks.get(&chunk_pos)?;
+        let local_x = world.x.rem_euclid(CHUNK_SIZE) as usize;
+        let local_y = (world.y - WORLD_Y_MIN) as usize;
+        let local_z = world.z.rem_euclid(CHUNK_SIZE) as usize;
+        Some(chunk.get(local_x, local_y, local_z))
+    }
+
+    /// 当前已装载 chunk 数量。
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    /// 弹出优先级最高的脏段:`Edit` 先于 `Load`;同级按 [`SubchunkPos`] `Ord` 升序(确定性)。
+    pub fn pop_dirty(&mut self) -> Option<(SubchunkPos, DirtyKind)> {
+        if let Some(sc) = self.dirty_edit.pop_first() {
+            return Some((sc, DirtyKind::Edit));
+        }
+        self.dirty_load.pop_first().map(|sc| (sc, DirtyKind::Load))
+    }
+
+    /// 当前待处理脏段总数。
+    pub fn dirty_len(&self) -> usize {
+        self.dirty_edit.len() + self.dirty_load.len()
+    }
+
+    /// 供同 crate 网格生成器只读访问已装载 chunk。
+    pub(crate) fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
+        self.chunks.get(&pos).map(Arc::as_ref)
+    }
+
+    fn mark_chunk_load(&mut self, pos: ChunkPos) {
+        for section in 0..SECTIONS_PER_CHUNK {
+            self.mark_dirty(
+                SubchunkPos {
+                    chunk: pos,
+                    section,
+                },
+                DirtyKind::Load,
+            );
+        }
+    }
+
+    fn mark_dirty(&mut self, sc: SubchunkPos, kind: DirtyKind) {
+        match kind {
+            DirtyKind::Edit => {
+                self.dirty_load.remove(&sc);
+                self.dirty_edit.insert(sc);
+            }
+            DirtyKind::Load => {
+                if !self.dirty_edit.contains(&sc) {
+                    self.dirty_load.insert(sc);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STONE: BlockId = BlockId(1);
+    const DIRT: BlockId = BlockId(2);
+
+    /// MB1:insert chunk(0,0) 含 STONE@(0,-60,0) → get_block/chunk_count/越界/remove 行为。
+    #[test]
+    fn mb1_insert_get_oob_remove() {
+        let mut mirror = ChunkMirror::new();
+        let mut chunk = Chunk::air();
+        // 世界 y = -60 → 局部 y = -60 + 64 = 4
+        chunk.set(0, 4, 0, STONE);
+        mirror.insert_chunk(ChunkPos::new(0, 0), chunk);
+
+        assert_eq!(mirror.get_block(BlockPos::new(0, -60, 0)), Some(STONE));
+        assert_eq!(mirror.chunk_count(), 1);
+        assert_eq!(mirror.get_block(BlockPos::new(0, -65, 0)), None);
+
+        mirror.remove_chunk(ChunkPos::new(0, 0));
+        assert_eq!(mirror.get_block(BlockPos::new(0, -60, 0)), None);
+        assert_eq!(mirror.chunk_count(), 0);
+    }
+
+    /// MB2(裁定 §2):insert air chunk(0,0),(1,0) → 清空 48 条初始 Load →
+    /// apply_updates([(15,-60,0,STONE),(0,-49,0,DIRT)]) → 脏表恰 3 条 Edit 且按 Ord 升序弹出。
+    #[test]
+    fn mb2_apply_updates_boundary_edit_dirty() {
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+
+        for _ in 0..48 {
+            let popped = mirror.pop_dirty();
+            assert!(matches!(popped, Some((_, DirtyKind::Load))));
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        mirror.apply_updates(&[
+            (BlockPos::new(15, -60, 0), STONE),
+            (BlockPos::new(0, -49, 0), DIRT),
+        ]);
+
+        assert_eq!(mirror.dirty_len(), 3);
+        assert_eq!(
+            mirror.pop_dirty(),
+            Some((
+                SubchunkPos {
+                    chunk: ChunkPos::new(0, 0),
+                    section: 0,
+                },
+                DirtyKind::Edit
+            ))
+        );
+        assert_eq!(
+            mirror.pop_dirty(),
+            Some((
+                SubchunkPos {
+                    chunk: ChunkPos::new(0, 0),
+                    section: 1,
+                },
+                DirtyKind::Edit
+            ))
+        );
+        assert_eq!(
+            mirror.pop_dirty(),
+            Some((
+                SubchunkPos {
+                    chunk: ChunkPos::new(1, 0),
+                    section: 0,
+                },
+                DirtyKind::Edit
+            ))
+        );
+        assert_eq!(mirror.pop_dirty(), None);
+        assert_eq!(mirror.get_block(BlockPos::new(15, -60, 0)), Some(STONE));
+    }
+
+    /// MB3:insert air chunk(2,0)(24 段 Load) + apply_updates([(32,-60,0,STONE)]) →
+    /// 首 pop 为 ((2,0), 0, Edit),其后 23 条全为 Load。
+    #[test]
+    fn mb3_edit_priority_before_load() {
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(2, 0), Chunk::air());
+        assert_eq!(mirror.dirty_len(), 24);
+
+        mirror.apply_updates(&[(BlockPos::new(32, -60, 0), STONE)]);
+        assert_eq!(mirror.dirty_len(), 24);
+
+        assert_eq!(
+            mirror.pop_dirty(),
+            Some((
+                SubchunkPos {
+                    chunk: ChunkPos::new(2, 0),
+                    section: 0,
+                },
+                DirtyKind::Edit
+            ))
+        );
+
+        let mut load_count = 0;
+        while let Some((sc, kind)) = mirror.pop_dirty() {
+            assert_eq!(sc.chunk, ChunkPos::new(2, 0));
+            assert_eq!(kind, DirtyKind::Load);
+            load_count += 1;
+        }
+        assert_eq!(load_count, 23);
+    }
+}

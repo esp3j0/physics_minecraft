@@ -1,0 +1,30 @@
+[package]
+name = "client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bevy = { version = "0.20.1", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_render",
+    "bevy_scene",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_gizmos",
+    "tonemapping_luts",
+    "zstd_rust",
+    "multi_threaded",
+    "png",
+] }
+client-core = { path = "../client-core" }
+app = { path = "../app" }
+sim-api = { path = "../sim-api" }
+types = { path = "../types" }
+voxel = { path = "../voxel" }
+
+[lints]
+workspace = true
