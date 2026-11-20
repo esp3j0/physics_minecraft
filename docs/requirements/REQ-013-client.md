@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:已确认(2026-11-20 定稿;Q1–Q4 拍板见 §10)
+- 状态:开发中(2026-11-20 定稿;C01a 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -291,6 +291,14 @@ bevy 客户端的冒烟接线(截图 + 机器检查通道)随 C01b 建立;机器
 | C04 | Sequenced ack 语义(驱动回 InputAck)+ loopback 传输对账(AC2 收尾) | C01a |
 
 V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
+
+**进度**:
+
+- C01a ✅ 验收通过(2026-11-20,含 R1 返修):提交 ebc740f(实施)+
+  e022f1f(R1 补 T9 双队列竞争排序锚点)。T1–T9 全绿;架构师自注变异
+  N1/N2/N3 击杀,M3(try_pop 先 world 后 critical)R1 后被 T9 击杀;
+  门禁(sim-api/app/client-core/viewer 测试 + clippy + fmt + e2e 编译)
+  架构师复跑全过。验收与 R1 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
