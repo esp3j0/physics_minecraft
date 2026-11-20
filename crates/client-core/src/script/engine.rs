@@ -230,6 +230,7 @@ impl EngineInner {
             screenshot: None,
             finished: Vec::new(),
             possess: None,
+            perf_reset: false,
         };
         if !matches!(self.status, EngineStatus::Running { .. }) {
             return (out, self.status.clone()); // 细则 11:结束后不再推进
@@ -810,6 +811,20 @@ impl EngineInner {
                         tick,
                     );
                 }
+                // C01b-3 R1 §2.1:瞬时重置性能采样窗口,不阻塞引擎。
+                Action::PerfReset => {
+                    out.perf_reset = true;
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "perf_reset",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
                 // intent:持续生效直到下一条——登记保持意图,每帧若主体
                 // 存活重发(连接断开/主体移除即停;发一条即可,保持状态在
                 // 服务端)。jump 一次性:只在本帧命令带 true。
@@ -1102,22 +1117,27 @@ impl EngineInner {
     fn run_checks(&self, checks: &[Check], input: &FrameInput<'_>) -> Vec<String> {
         let mut msgs = Vec::new();
         let live = input.world.live_entities();
+        let live_agents = input.world.live_agents();
         for check in checks {
             match check {
                 Check::LiveEntities(cmp) => {
+                    // 仅计 entities 表(非主体动态刚体);主体走 AgentStates,不在其中。
                     let n = live.len() as u64;
                     if !cmp_holds(*cmp, n) {
                         msgs.push(format!("活实体数 {n} 不满足 {cmp:?}"));
                     }
                 }
                 Check::LabeledAlive { label, cmp } => {
-                    // 未知标签按 0 个(细则 8)。
+                    // 未知标签按 0 个(细则 8);存活 ID 取 entities 表 ∪ agents 表并集(C01b-3 R1b F5)。
                     let n = self
                         .labels
                         .get(label)
                         .map(|ids| {
                             ids.iter()
-                                .filter(|id| live.iter().any(|(lid, _)| lid == *id))
+                                .filter(|id| {
+                                    live.iter().any(|(lid, _)| lid == *id)
+                                        || live_agents.iter().any(|(lid, _)| lid == *id)
+                                })
                                 .count()
                         })
                         .unwrap_or(0) as u64;

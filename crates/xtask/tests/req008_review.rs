@@ -325,6 +325,7 @@ fn fixture(calibration: Option<CalibrationOutcome>) -> RunReport {
             reason: None,
         }),
         mesh_stats: None,
+        perf: None,
     };
     RunReport {
         scenarios: vec![

@@ -25,8 +25,8 @@ const TOP_KEYS: [&str; 7] = [
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
 /// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作,B02c
-/// 追加 `adopt_agent`)。
-const ACTION_KEYS: [&str; 18] = [
+/// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`)。
+const ACTION_KEYS: [&str; 19] = [
     "camera",
     "look_at",
     "fly",
@@ -45,6 +45,7 @@ const ACTION_KEYS: [&str; 18] = [
     "intent",
     "mark_agent",
     "adopt_agent",
+    "perf_reset",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -341,6 +342,8 @@ fn parse_action(
         "mark_agent" => &["label", "at"],
         // B02c §2.2:timeout_ticks 可省(默认 600)。
         "adopt_agent" => &["label", "near", "within", "timeout_ticks"],
+        // C01b-3 R1 §2.1:重置客户端性能采样窗口(空表,多余键报错)。
+        "perf_reset" => &[],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -594,6 +597,7 @@ fn parse_action(
             })
         }
         "unpossess" => Ok(Action::Unpossess),
+        "perf_reset" => Ok(Action::PerfReset),
         "intent" => {
             let mv = t
                 .get("move")

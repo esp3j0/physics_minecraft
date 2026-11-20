@@ -129,6 +129,21 @@ pub struct ControllerCounters {
     pub policy_discarded: u64,
 }
 
+/// 策略推理耗时累计遥测(REQ-013 C01b-3 §1.2;只度量不决策,不进检查点)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PolicyPerf {
+    pub count: u64,
+    pub total_us: u64,
+    pub max_us: u64,
+}
+
+/// 纯累加器:将单次推理耗时(微秒)并入 [`PolicyPerf`]。
+pub fn acc_policy_perf(p: &mut PolicyPerf, infer_us: u64) {
+    p.count += 1;
+    p.total_us += infer_us;
+    p.max_us = p.max_us.max(infer_us);
+}
+
 /// 挂载失败原因(类型化,不 panic)。
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum AttachError {
@@ -168,6 +183,8 @@ struct Pending {
 pub struct ControllerHost {
     slots: BTreeMap<EntityId, ControllerSlot>,
     pub counters: ControllerCounters,
+    /// 策略推理耗时累计遥测(REQ-013 C01b-3 §1.2;不进检查点)。
+    policy_perf: PolicyPerf,
     policy_state: BTreeMap<EntityId, PolicyRunState>,
     /// 每只主体最多一个在途请求(D01b-2 §1.2;不进检查点)。
     pending: BTreeMap<EntityId, Pending>,
@@ -512,9 +529,26 @@ impl ControllerHost {
         }
     }
 
+    /// 读取当前累计策略推理耗时遥测(REQ-013 C01b-3 §1.2)。
+    pub fn policy_perf(&self) -> PolicyPerf {
+        self.policy_perf
+    }
+
+    /// 仅供同 crate 单元测试注入在途请求以直测 `handle_reply`(REQ-013 C01b-3 §1.6)。
+    #[cfg(test)]
+    pub(crate) fn insert_pending_for_test(&mut self, entity: EntityId, seq: u64) {
+        self.pending.insert(
+            entity,
+            Pending {
+                seq,
+                abandoned: false,
+            },
+        );
+    }
+
     /// 处理一条推理回复(D01b-2 §1.3)。`issued_this_tick` = 该请求是本拍发出的
     /// (C 步当拍收到 = 正常;A 步收到 = 晚到,成功采用时记 `policy_late`)。
-    fn handle_reply(
+    pub(crate) fn handle_reply(
         &mut self,
         session: &mut Session,
         log: &mut CommandLog,
@@ -553,6 +587,7 @@ impl ControllerHost {
                         log.append(log_entry);
                         self.counters.actions_emitted += 1;
                         self.counters.policy_inferences += 1;
+                        acc_policy_perf(&mut self.policy_perf, reply.infer_us);
                         self.counters.policy_targets_clamped += action.clamped as u64;
                         if let Some(state) = self.policy_state.get_mut(&reply.entity) {
                             state.last_action = action.raw;

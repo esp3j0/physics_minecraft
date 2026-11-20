@@ -167,6 +167,21 @@ pub enum S2C {
         state: EntityState,
         tick: Tick,
     },
+    /// 性能遥测(REQ-013 C01b-3 §1.1;枚举末尾追加,判别值 14):与 [`S2C::DebugStats`]
+    /// 共用 [`C2S::SubscribeDebug`] 订阅集合与 10 拍下发周期;未订阅连接收不到。
+    PerfStats {
+        tick: Tick,
+        /// `TickTelemetry` 60 拍窗 P95(ms)。
+        sim_p95_ms: f32,
+        /// `telemetry.samples()`。
+        sim_samples: u64,
+        /// 启动以来累计策略推理次数。
+        policy_infer_count: u64,
+        /// 启动以来累计策略推理耗时(微秒)。
+        policy_total_us: u64,
+        /// 单次策略推理最大耗时(微秒)。
+        policy_max_us: u64,
+    },
 }
 
 /// 调试遥测累计计数(REQ-011 §3.5.2;W03):sim-api 内定义的协议结构,
@@ -331,6 +346,14 @@ mod tests {
             },
             S2C::Spawned {
                 entity: EntityId::from_parts(0, 7),
+            },
+            S2C::PerfStats {
+                tick: Tick(120),
+                sim_p95_ms: 3.25,
+                sim_samples: 60,
+                policy_infer_count: 15,
+                policy_total_us: 12_345,
+                policy_max_us: 2_500,
             },
         ]
     }
@@ -693,6 +716,36 @@ mod tests {
             encode_frame(&S2C::Pong),
             vec![1, 0, 0, 0, 5],
             "S2C::Pong 编码字节必须不变"
+        );
+    }
+
+    /// REQ-013 C01b-3 §1.1:`S2C::PerfStats` 单帧编解码往返 + 声明序判别值钉死(= 14)。
+    #[test]
+    fn t3_c01b3_perfstats_roundtrip() {
+        let perf = S2C::PerfStats {
+            tick: Tick(120),
+            sim_p95_ms: 3.25,
+            sim_samples: 60,
+            policy_infer_count: 15,
+            policy_total_us: 12_345,
+            policy_max_us: 2_500,
+        };
+        let frame = encode_frame(&perf);
+        assert_eq!(frame[4], 14, "PerfStats 判别值 = 14(声明序追加)");
+        assert_eq!(decode_frame(&frame), Some(perf), "PerfStats 帧往返相等");
+
+        let zero = S2C::PerfStats {
+            tick: Tick(0),
+            sim_p95_ms: 0.0,
+            sim_samples: 0,
+            policy_infer_count: 0,
+            policy_total_us: 0,
+            policy_max_us: 0,
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&zero)),
+            Some(zero),
+            "零值 PerfStats 往返相等"
         );
     }
 }

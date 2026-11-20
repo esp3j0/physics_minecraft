@@ -1366,3 +1366,39 @@ fn policy_intent_yaw_rate() {
         "M-c wrap 差",
     );
 }
+
+/// REQ-013 C01b-3 MS7:`acc_policy_perf` 依次喂入 1500 / 2500 / 0 →
+/// `(1,1500,1500)` → `(2,4000,2500)` → `(3,4000,2500)`。
+#[test]
+fn ms7_acc_policy_perf() {
+    use super::{PolicyPerf, acc_policy_perf};
+
+    let mut p = PolicyPerf::default();
+    acc_policy_perf(&mut p, 1500);
+    assert_eq!(
+        p,
+        PolicyPerf {
+            count: 1,
+            total_us: 1500,
+            max_us: 1500,
+        }
+    );
+    acc_policy_perf(&mut p, 2500);
+    assert_eq!(
+        p,
+        PolicyPerf {
+            count: 2,
+            total_us: 4000,
+            max_us: 2500,
+        }
+    );
+    acc_policy_perf(&mut p, 0);
+    assert_eq!(
+        p,
+        PolicyPerf {
+            count: 3,
+            total_us: 4000,
+            max_us: 2500,
+        }
+    );
+}

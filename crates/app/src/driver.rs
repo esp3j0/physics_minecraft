@@ -2274,10 +2274,16 @@ impl ObserveOrchestrator {
         }
     }
 
-    /// 调试遥测下发(REQ-011 §3.5.2;W03):订阅集合非空且距上次下发满 10 拍
-    /// → 对每个订阅者入 Critical 队列(满 → CriticalFull → 连接侧断连收口,
+    /// 调试遥测下发(REQ-011 §3.5.2;W03 + REQ-013 C01b-3 §1.2):订阅集合非空且距上次下发满 10 拍
+    /// → 对每个订阅者入 Critical 队列发送 `DebugStats` 与 `PerfStats`(满 → CriticalFull → 连接侧断连收口,
     /// 驱动侧注册消失后自然弃,无阻塞)。无订阅者时不组装任何帧。
-    fn maybe_emit_debug_stats(&mut self, hub: &OutboundHub, tick: types::Tick) {
+    fn maybe_emit_debug_stats(
+        &mut self,
+        hub: &OutboundHub,
+        tick: types::Tick,
+        telemetry: &crate::telemetry::TickTelemetry,
+        policy_perf: crate::controller::PolicyPerf,
+    ) {
         if self.debug_subscribers.is_empty() {
             return;
         }
@@ -2291,8 +2297,17 @@ impl ObserveOrchestrator {
             counters: self.debug_counters,
             recent: self.debug_recent.iter().copied().collect(),
         };
+        let perf = S2C::PerfStats {
+            tick,
+            sim_p95_ms: telemetry.p95_ms(),
+            sim_samples: telemetry.samples() as u64,
+            policy_infer_count: policy_perf.count,
+            policy_total_us: policy_perf.total_us,
+            policy_max_us: policy_perf.max_us,
+        };
         for player in self.debug_subscribers.clone() {
             hub.push_critical(player, msg.clone());
+            hub.push_critical(player, perf.clone());
         }
     }
 }
@@ -2842,7 +2857,12 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     // 调试遥测(REQ-011 §3.5.2;W03):先累计(读本拍 TickSummary),
                     // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
                     orchestrator.record_debug_telemetry(&summary, session.tick_now());
-                    orchestrator.maybe_emit_debug_stats(hub, session.tick_now());
+                    orchestrator.maybe_emit_debug_stats(
+                        hub,
+                        session.tick_now(),
+                        &telemetry,
+                        host.policy_perf(),
+                    );
                     // 主体冻结/唤醒计数(B03c 第 2 节):逐拍累加自本拍
                     // TickSummary 的全分片合计,随 DriverOutcome 上报。
                     agent_counters.agent_frozen += summary.agent_frozen;
@@ -7538,6 +7558,18 @@ mod tests {
         let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
         let hub = OutboundHub::new();
         let p = messaging::InputSource(3);
+        let plain = messaging::InputSource(4);
+        let mut out_sub = crate::net::Outbound::new();
+        let mut out_plain = crate::net::Outbound::new();
+        hub.register(p, out_sub.world_writer());
+        hub.register(plain, out_plain.world_writer());
+        let mut telemetry = crate::telemetry::TickTelemetry::new(5.0, 60);
+        telemetry.record(std::time::Duration::from_millis(4));
+        let policy_perf = crate::controller::PolicyPerf {
+            count: 2,
+            total_us: 4000,
+            max_us: 2500,
+        };
 
         // ① 订阅登记 + 幂等。
         o.consume_net_up(
@@ -7556,7 +7588,7 @@ mod tests {
         );
         assert_eq!(o.debug_subscribers.len(), 1, "重复订阅幂等(集合语义)");
 
-        // ③ 无订阅者(清空后)不组装且不走钟。
+        // ③ 无订阅者(清空后)不组装且不走钟,未订阅连接收不到 DebugStats/PerfStats。
         o.debug_subscribers.clear();
         let ev = physics_sim::FlowEventInfo {
             kind: physics_sim::FlowKind::Impact,
@@ -7582,8 +7614,9 @@ mod tests {
             ),
             Tick(1),
         );
-        o.maybe_emit_debug_stats(&hub, Tick(1));
+        o.maybe_emit_debug_stats(&hub, Tick(1), &telemetry, policy_perf);
         assert_eq!(o.ticks_since_debug, 0, "无订阅者:节拍不走");
+        assert!(out_plain.try_pop().is_none(), "未订阅连接不收任何遥测帧");
         // 重新订阅(继续累计验证)。
         o.consume_net_up(
             NetUp::SubscribeDebug { player: p },
@@ -7655,15 +7688,43 @@ mod tests {
         );
         assert_eq!(o.debug_recent[0].0, Tick(1), "recent 带拍号");
 
-        // ④ 10 拍门:订阅在场时,前 9 拍不发、第 10 拍发并清零。
+        // ④ 10 拍门:订阅在场时,前 9 拍不发、第 10 拍发 DebugStats+PerfStats 并清零;
+        // 未订阅连接 plain 全程收不到 DebugStats 或 PerfStats。
         for i in 1..=9u64 {
-            o.maybe_emit_debug_stats(&hub, Tick(2 + i));
+            o.maybe_emit_debug_stats(&hub, Tick(2 + i), &telemetry, policy_perf);
             assert_eq!(o.ticks_since_debug, i, "第 {i} 拍未满 10,不发(节拍 = {i})");
         }
-        o.maybe_emit_debug_stats(&hub, Tick(11));
+        o.maybe_emit_debug_stats(&hub, Tick(11), &telemetry, policy_perf);
         assert_eq!(o.ticks_since_debug, 0, "第 10 拍下发并清零");
+        let sub_msgs: Vec<S2C> = std::iter::from_fn(|| out_sub.try_pop()).collect();
+        assert_eq!(
+            sub_msgs.len(),
+            2,
+            "订阅者收到 DebugStats + PerfStats 各 1 帧"
+        );
+        assert!(matches!(
+            sub_msgs[0],
+            S2C::DebugStats { tick: Tick(11), .. }
+        ));
+        assert_eq!(
+            sub_msgs[1],
+            S2C::PerfStats {
+                tick: Tick(11),
+                sim_p95_ms: telemetry.p95_ms(),
+                sim_samples: 1,
+                policy_infer_count: 2,
+                policy_total_us: 4000,
+                policy_max_us: 2500,
+            },
+            "PerfStats 载荷与遥测/策略性能一致"
+        );
+        let plain_msgs: Vec<S2C> = std::iter::from_fn(|| out_plain.try_pop()).collect();
+        assert!(
+            plain_msgs.is_empty(),
+            "未订阅连接不得收到 DebugStats 或 PerfStats,实得 {plain_msgs:?}"
+        );
 
-        // ① 断连失效:Left 移除订阅;之后又不走钟。
+        // ① 断连失效:Left 移除订阅;之后又不走钟,且未订阅连接仍收不到 PerfStats。
         o.consume_net_up(
             NetUp::Left {
                 player: p,
@@ -7675,8 +7736,12 @@ mod tests {
             &hub,
         );
         assert!(o.debug_subscribers.is_empty(), "断连后订阅失效");
-        o.maybe_emit_debug_stats(&hub, Tick(12));
+        o.maybe_emit_debug_stats(&hub, Tick(12), &telemetry, policy_perf);
         assert_eq!(o.ticks_since_debug, 0, "无订阅者不走钟");
+        assert!(
+            out_plain.try_pop().is_none(),
+            "无订阅者时未订阅连接仍收不到任何帧"
+        );
     }
 
     /// ② 的环形缓冲上限:灌 12 条非空事件 → recent 恒 8(旧→新;最旧的 4
@@ -8345,5 +8410,87 @@ mod tests {
             Some(&original),
             "落点不覆盖出生点(restore_spawn_point 生效)"
         );
+    }
+
+    /// REQ-013 C01b-3 §1.6(PM15 靶点):直调 `ControllerHost::handle_reply`,
+    /// 传入 `InferReply { infer_us: 1500, .. }` 必须通过 `acc_policy_perf`
+    /// 累加至 `PolicyPerf { count: 1, total_us: 1500, max_us: 1500 }`。
+    #[test]
+    fn c01b3_handle_reply_accumulates_policy_perf() {
+        use crate::controller::policy_worker::InferReply;
+        use crate::controller::{ControllerHost, ControllerKind, PolicyKey, PolicyPerf};
+
+        let config = test_config(600);
+        let mut bodies = physics_sim::BodyRegistry::new();
+        let body_hash = bodies
+            .insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad.body.toml 合法");
+        let mut session = sim_api::session::Session::new(config.session_config());
+        let shard = shard_id(0, 0);
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            config.shard_sim_config(shard),
+            Box::new(voxel::SimpleRegistry::builtin()),
+            bodies,
+        ));
+        let mut chunk = voxel::Chunk::air();
+        for x in 0..16 {
+            for z in 0..16 {
+                chunk.set(x, 0, z, voxel::builtin::BEDROCK);
+            }
+        }
+        session.apply_chunk_load(shard, types::ChunkPos::new(0, 0), chunk);
+        let entity = EntityId::from_parts(0, 1);
+        session
+            .spawn_agent(
+                shard,
+                entity,
+                body_hash,
+                EntityState {
+                    translation: types::glam::Vec3::new(8.0, -58.0, 8.0),
+                    ..EntityState::default()
+                },
+            )
+            .expect("生成四足主体");
+        session.tick();
+        assert!(session.is_agent(entity), "四足主体必须已真实生成");
+
+        let mut host = ControllerHost::default();
+        host.attach(
+            entity,
+            ControllerKind::Policy(PolicyKey::of("stand")),
+            12,
+            2,
+            Tick(0),
+            None,
+        )
+        .expect("挂载策略槽位");
+        host.insert_pending_for_test(entity, 1);
+
+        let mut log = sim_api::log::CommandLog::new();
+        host.handle_reply(
+            &mut session,
+            &mut log,
+            InferReply {
+                seq: 1,
+                entity,
+                result: Ok(policy::Action {
+                    raw: vec![0.0; 12],
+                    targets: vec![0.0; 12],
+                    clamped: 0,
+                }),
+                infer_us: 1500,
+            },
+            true,
+        );
+        assert_eq!(
+            host.policy_perf(),
+            PolicyPerf {
+                count: 1,
+                total_us: 1500,
+                max_us: 1500,
+            },
+            "handle_reply 必须调用 acc_policy_perf 累加 infer_us"
+        );
+        session.shutdown();
     }
 }

@@ -22,6 +22,21 @@ pub struct ManifestMeshStats {
     pub discards: u64,
 }
 
+/// 客户端与服务端性能测量汇总(REQ-013 C01b-3 §1.4;本地 manifest 字段,非协议)。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ManifestPerf {
+    pub fps_mean: f64,
+    pub fps_min: f64,
+    pub fps_storm_min: Option<f64>,
+    pub storm_frames: u64,
+    pub mesh_max_ms: f64,
+    pub mesh_count: u64,
+    pub sim_p95_ms: Option<f32>,
+    pub sim_samples: u64,
+    pub policy_infer_count: u64,
+    pub policy_ms_per_body: Option<f64>,
+}
+
 /// 场景运行记录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -33,6 +48,9 @@ pub struct Manifest {
     /// 客户端异步网格上传测量统计(缺省为 `None`,保证旧 manifest JSON 可读)。
     #[serde(default)]
     pub mesh_stats: Option<ManifestMeshStats>,
+    /// 性能测量汇总(REQ-013 C01b-3 §1.4;缺省为 `None`,保证旧 manifest JSON 可读)。
+    #[serde(default)]
+    pub perf: Option<ManifestPerf>,
 }
 
 /// 一步的记录。
@@ -98,6 +116,7 @@ impl Manifest {
             steps: Vec::new(),
             result: None,
             mesh_stats: None,
+            perf: None,
         }
     }
 
@@ -352,6 +371,7 @@ mod tests {
         assert_eq!(v["steps"].as_array().map(|s| s.len()), Some(2));
         assert_eq!(v["result"]["status"], "done");
         assert_eq!(v["result"]["exit_code"], 1);
+        assert!(v["perf"].is_null(), "缺省 perf 序列化为 null");
         assert_eq!(Manifest::from_json(&json), Ok(m), "from_json 读回相等的值");
         assert!(Manifest::from_json("{}").is_err(), "残缺 JSON 报错");
     }
@@ -384,22 +404,36 @@ mod tests {
         assert_eq!(result.failed_checks, 0, "error 步骤不计 check_failed");
     }
 
-    /// REQ-013 C01b-2:无 `mesh_stats` 字段的旧 manifest JSON 可读(`None`),
-    /// 带 `mesh_stats` 的新 manifest 往返逐字段一致。
+    /// REQ-013 C01b-2/C01b-3:无 `mesh_stats`/`perf` 字段的旧 manifest JSON 可读(`None`),
+    /// 带 `mesh_stats`/`perf` 的新 manifest 往返逐字段一致。
     #[test]
     fn manifest_mesh_stats_backcompat_and_roundtrip() {
         let mut m = sample();
         let legacy_json =
             r#"{"scenario":"t","req":"REQ-008","description":"d","steps":[],"result":null}"#;
-        let parsed = Manifest::from_json(legacy_json).expect("旧 manifest 无 mesh_stats 可读");
+        let parsed = Manifest::from_json(legacy_json).expect("旧 manifest 无 mesh_stats/perf 可读");
         assert_eq!(parsed.mesh_stats, None);
+        assert_eq!(parsed.perf, None);
 
         m.mesh_stats = Some(ManifestMeshStats {
             max_edit_upload_frames: 2,
             uploads: 42,
             discards: 3,
         });
+        m.perf = Some(ManifestPerf {
+            fps_mean: 60.0,
+            fps_min: 31.25,
+            fps_storm_min: Some(46.875),
+            storm_frames: 15,
+            mesh_max_ms: 2.5,
+            mesh_count: 100,
+            sim_p95_ms: Some(3.25),
+            sim_samples: 60,
+            policy_infer_count: 20,
+            policy_ms_per_body: Some(0.45),
+        });
         let back = Manifest::from_json(&m.to_json()).expect("新 manifest 可读");
         assert_eq!(back.mesh_stats, m.mesh_stats);
+        assert_eq!(back.perf, m.perf);
     }
 }

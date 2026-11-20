@@ -304,17 +304,17 @@ async fn w10_debug_stats_delivery_and_recent() {
     assert_eq!(counters_vec(&c0), [0u64; 13], "起点全 0(尚无破坏/事件)");
     assert!(r0.is_empty(), "尚无事件,recent 空");
 
-    // 未订阅连接同窗收不到 DebugStats(其余观察帧照常,不判帧序)。
+    // 未订阅连接同窗收不到 DebugStats/PerfStats(其余观察帧照常,不判帧序)。
     let mut plain_got_debug = false;
     for _ in 0..120 {
         if let Some(s2c) = try_frame(&mut rx_plain)
-            && matches!(s2c, S2C::DebugStats { .. })
+            && matches!(s2c, S2C::DebugStats { .. } | S2C::PerfStats { .. })
         {
             plain_got_debug = true;
         }
         advance_ticks(1).await;
     }
-    assert!(!plain_got_debug, "未订阅连接收不到 DebugStats");
+    assert!(!plain_got_debug, "未订阅连接收不到 DebugStats/PerfStats");
 
     // 制造撞击断开(req010-impact-punch 冒烟同款工况):1 格厚土墙
     // (x=10,y=−60..−56,z=17..23;墙脚 bedrock 防整面剪断),6 格石条
@@ -424,7 +424,7 @@ async fn w10_debug_stats_delivery_and_recent() {
     let mut sub2_got = false;
     for _ in 0..120 {
         if let Some(s2c) = try_frame(&mut rx_sub2)
-            && matches!(s2c, S2C::DebugStats { .. })
+            && matches!(s2c, S2C::DebugStats { .. } | S2C::PerfStats { .. })
         {
             sub2_got = true;
         }

@@ -768,6 +768,7 @@ spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
             screenshot: None,
             finished: Vec::new(),
             possess: None,
+            perf_reset: false,
         };
         let _ = &mut o;
         e.frame(&FrameInput {
@@ -1509,4 +1510,86 @@ wait_until = { agent_moved = { label = \"p\", ge = 3.0 }, timeout_ticks = 50 }",
     let out = frame(&mut e, 0.016, 2, &w2, &[]);
     assert_eq!(out.finished.len(), 1, "wait_until(位移 ≥ 3)成立");
     assert_eq!(out.finished[0].outcome, StepOutcome::Ok);
+}
+
+/// MS13(REQ-013 C01b-3 R1b F5 / PM21 靶点):`LabeledAlive` 存活过滤取
+/// `entities ∪ agents` ID 并集;`LiveEntities` 语义不变(仅 `entities`,主体不在其中)。
+#[test]
+fn ms13_labeled_alive_counts_entities_and_agents_union() {
+    use crate::client::ViewEvent;
+    use crate::world::WorldState;
+    use types::{BodyHash, EntityState, Tick};
+
+    let mut world = WorldState::new();
+    let id1 = eid(101);
+    let id2 = eid(102);
+    // 预置 id1 为 agent(ViewEvent::Agents),id2 为普通 entity(ViewEvent::Entities)。
+    world.apply(ViewEvent::Agents {
+        tick: Tick(1),
+        states: vec![(
+            id1,
+            BodyHash::fnv1a(b"quad"),
+            vec![EntityState {
+                translation: Vec3::new(0.0, -58.0, 0.0),
+                ..EntityState::default()
+            }],
+        )],
+        removed: vec![],
+        full: true,
+    });
+    world.apply(ViewEvent::Entities {
+        tick: Tick(1),
+        states: vec![(
+            id2,
+            EntityState {
+                translation: Vec3::new(4.0, -58.0, 0.0),
+                ..EntityState::default()
+            },
+        )],
+        removed: vec![],
+        full: true,
+    });
+
+    let mut e = engine(
+        "[[step]]\nspawn = { at = [0, -58, 0], count = 1, label = \"a\" }\n\
+         [[step]]\nspawn = { at = [4, -58, 0], count = 1, label = \"b\" }\n\
+         [[step]]\ncheck = { labeled_alive = { label = \"a\", eq = 1 }, live_entities = { eq = 1 } }\n\
+         [[step]]\ncheck = { labeled_alive = { label = \"b\", eq = 1 } }",
+    );
+
+    // 帧 0:spawn a 发出请求。
+    let _ = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 0,
+        world: &world,
+        spawned: &[],
+    });
+    // 帧 1:id1 回执登记到标签 a,随即 spawn b 发出请求。
+    let _ = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 1,
+        world: &world,
+        spawned: &[id1],
+    });
+    // 帧 2:id2 回执登记到标签 b,随即两步 check 同帧求值并收尾。
+    let out = e.frame(&FrameInput {
+        dt: 0.016,
+        server_tick: 2,
+        world: &world,
+        spawned: &[id2],
+    });
+
+    assert_eq!(
+        e.status(),
+        &EngineStatus::Done { failed_checks: 0 },
+        "三项检查(a=1, b=1, live_entities=1)必须全过,实得 {:?}",
+        out.finished
+    );
+    let check_outcomes: Vec<&StepOutcome> = out
+        .finished
+        .iter()
+        .filter(|r| r.action == "check")
+        .map(|r| &r.outcome)
+        .collect();
+    assert_eq!(check_outcomes, vec![&StepOutcome::Ok, &StepOutcome::Ok]);
 }

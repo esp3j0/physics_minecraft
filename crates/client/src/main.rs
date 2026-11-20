@@ -23,11 +23,12 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_dis
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
 use client_core::client::{ViewEvent, s2c_to_event};
-use client_core::mesh::{SubchunkMesh, mesh_subchunk_snapshot, snapshot};
+use client_core::mesh::{ChunkSnapshot, SubchunkMesh, mesh_subchunk_snapshot, snapshot};
 use client_core::mirror::{
     ChunkMirror, DirtyKind, SECTION_HEIGHT, SECTIONS_PER_CHUNK, SubchunkPos, is_stale,
 };
-use client_core::script::manifest::{Manifest, ManifestMeshStats};
+use client_core::perf::{MeshPerf, acc_mesh_perf, fps_summary, storm_window};
+use client_core::script::manifest::{Manifest, ManifestMeshStats, ManifestPerf};
 use client_core::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, parse_scenario,
 };
@@ -49,6 +50,8 @@ const START_CAMERA_POS: Vec3 = Vec3::new(8.0, -48.0, 24.0);
 const START_CAMERA_LOOK_AT: Vec3 = Vec3::new(8.0, -61.0, 0.0);
 /// 脚本模式观察者位移立即上报阈值(m,同 viewer `OBSERVER_JUMP_METERS`)。
 const OBSERVER_JUMP_METERS: f32 = 1.0;
+/// FPS 帧耗时环形历史上限(REQ-013 C01b-3 §1.4:7200 帧 ≈ 60 Hz 下 120 s)。
+const FPS_HISTORY_CAP: usize = 7200;
 
 /// 运行模式:交互飞行或脚本冒烟。
 enum RunMode {
@@ -142,11 +145,11 @@ struct WorldRenderRes {
 #[derive(Resource, Default)]
 struct FrameCounter(u64);
 
-/// 单个正在后台 `AsyncComputeTaskPool` 中执行的网格任务。
+/// 单个正在后台 `AsyncComputeTaskPool` 中执行的网格任务(返回网格与构建微秒耗时)。
 struct PendingMesh {
     kind: DirtyKind,
     epoch: u64,
-    task: Task<SubchunkMesh>,
+    task: Task<(SubchunkMesh, u64)>,
 }
 
 /// 在途异步网格任务表。
@@ -176,6 +179,129 @@ impl MeshStats {
             uploads: self.uploads,
             discards: self.discards,
         }
+    }
+}
+
+/// 异步网格构建耗时累计遥测(REQ-013 C01b-3 §1.4)。
+#[derive(Resource, Default, Debug, Clone, Copy)]
+struct MeshPerfRes(MeshPerf);
+
+/// 帧耗时历史与编辑风暴窗口追踪(REQ-013 C01b-3 §1.4;脚本与交互模式均记录)。
+#[derive(Resource, Default)]
+struct FpsHistoryRes {
+    dts_ms: Vec<f64>,
+    dropped_prefix: u64,
+    first_dig_frame: Option<u64>,
+    last_edit_upload_frame: Option<u64>,
+}
+
+impl FpsHistoryRes {
+    fn push_dt_ms(&mut self, dt_ms: f64) {
+        if dt_ms <= 0.0 || !dt_ms.is_finite() {
+            return;
+        }
+        if self.dts_ms.len() >= FPS_HISTORY_CAP {
+            self.dts_ms.remove(0);
+            self.dropped_prefix = self.dropped_prefix.saturating_add(1);
+        }
+        self.dts_ms.push(dt_ms);
+    }
+
+    fn current_index(&self) -> u64 {
+        self.dropped_prefix
+            .saturating_add(self.dts_ms.len().saturating_sub(1) as u64)
+    }
+
+    fn record_first_dig(&mut self) {
+        if self.first_dig_frame.is_none() {
+            self.first_dig_frame = Some(self.current_index());
+        }
+    }
+
+    fn record_edit_upload(&mut self) {
+        self.last_edit_upload_frame = Some(self.current_index());
+    }
+
+    /// 清空 FPS 历史与风暴窗口标记(REQ-013 C01b-3 R1 §2.1):
+    /// `dropped_prefix` 与两 marker 同清保证绝对下标自洽。
+    fn reset(&mut self) {
+        self.dts_ms.clear();
+        self.dropped_prefix = 0;
+        self.first_dig_frame = None;
+        self.last_edit_upload_frame = None;
+    }
+}
+
+/// 脚本 `perf_reset` 步执行分支(REQ-013 C01b-3 R1 §2.1):遇瞬时步即重置采样窗口。
+fn apply_perf_reset_step(perf_reset: bool, fps_history: &mut FpsHistoryRes) {
+    if perf_reset {
+        fps_history.reset();
+    }
+}
+
+/// 最近一次从服务端收到的 `S2C::PerfStats` 采样。
+#[derive(Debug, Clone, Copy)]
+struct ServerPerfSample {
+    sim_p95_ms: f32,
+    sim_samples: u64,
+    policy_infer_count: u64,
+    policy_total_us: u64,
+}
+
+/// 服务端性能遥测缓存(REQ-013 C01b-3 §1.4)。
+#[derive(Resource, Default)]
+struct ServerPerfRes {
+    latest: Option<ServerPerfSample>,
+}
+
+/// 将客户端 FPS/网格遥测与最新服务端 `PerfStats` 汇总为 [`ManifestPerf`]。
+fn build_manifest_perf(
+    fps: &FpsHistoryRes,
+    mesh: &MeshPerfRes,
+    server: &ServerPerfRes,
+) -> ManifestPerf {
+    let (fps_mean, fps_min) = fps_summary(&fps.dts_ms);
+    let first_dig = fps
+        .first_dig_frame
+        .map(|f| f.saturating_sub(fps.dropped_prefix));
+    let last_edit = fps
+        .last_edit_upload_frame
+        .map(|f| f.saturating_sub(fps.dropped_prefix));
+    let (fps_storm_min, storm_frames) =
+        match storm_window(first_dig, last_edit, fps.dts_ms.len() as u64) {
+            Some((start, end)) => {
+                let (_, min_fps) = fps_summary(&fps.dts_ms[start..=end]);
+                (Some(min_fps), (end - start + 1) as u64)
+            }
+            None => (None, 0),
+        };
+    let (sim_p95_ms, sim_samples, policy_infer_count, policy_ms_per_body) = match server.latest {
+        Some(s) => {
+            let ms_per_body = if s.policy_infer_count > 0 {
+                Some(s.policy_total_us as f64 / 1000.0 / s.policy_infer_count as f64)
+            } else {
+                None
+            };
+            (
+                Some(s.sim_p95_ms),
+                s.sim_samples,
+                s.policy_infer_count,
+                ms_per_body,
+            )
+        }
+        None => (None, 0, 0, None),
+    };
+    ManifestPerf {
+        fps_mean,
+        fps_min,
+        fps_storm_min,
+        storm_frames,
+        mesh_max_ms: mesh.0.max_us as f64 / 1000.0,
+        mesh_count: mesh.0.count,
+        sim_p95_ms,
+        sim_samples,
+        policy_infer_count,
+        policy_ms_per_body,
     }
 }
 
@@ -321,7 +447,7 @@ fn main() {
         view_distance,
     };
 
-    let transport = match LocalTransport::new(local_cfg) {
+    let mut transport = match LocalTransport::new(local_cfg) {
         Ok(t) => t,
         Err(err) => {
             eprintln!(
@@ -331,6 +457,10 @@ fn main() {
             std::process::exit(1);
         }
     };
+    if script_res.is_some() {
+        // 脚本模式启动即订阅服务端性能/调试遥测(REQ-013 C01b-3 §1.4;交互模式行为不变)。
+        transport.send(C2S::SubscribeDebug);
+    }
 
     let screenshot_dir = cli.world_dir.join("screenshots");
 
@@ -355,6 +485,9 @@ fn main() {
     .insert_resource(PendingMeshesRes::default())
     .insert_resource(EditFrameTracker::default())
     .insert_resource(MeshStats::default())
+    .insert_resource(MeshPerfRes::default())
+    .insert_resource(FpsHistoryRes::default())
+    .insert_resource(ServerPerfRes::default())
     .insert_resource(ObserverTracker::default())
     .insert_resource(ScreenshotState {
         dir: screenshot_dir,
@@ -446,9 +579,14 @@ fn setup_scene(
     }
 }
 
-/// 每帧推进渲染帧计数器。
-fn advance_frame_counter_system(mut frame_counter: ResMut<FrameCounter>) {
+/// 每帧推进渲染帧计数器并记录帧耗时(脚本与交互模式均记录,上限 7200 帧)。
+fn advance_frame_counter_system(
+    time: Res<Time>,
+    mut frame_counter: ResMut<FrameCounter>,
+    mut fps_history: ResMut<FpsHistoryRes>,
+) {
     frame_counter.0 = frame_counter.0.saturating_add(1);
+    fps_history.push_dt_ms(time.delta_secs_f64() * 1000.0);
 }
 
 /// 飞行相机控制(交互模式):鼠标转视角、WASD 水平移动、Shift/Ctrl 升降、M 切换鼠标锁定、Esc 退出。
@@ -636,6 +774,7 @@ fn drain_transport_system(
     mut world_res: ResMut<WorldRenderRes>,
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
+    mut server_perf: ResMut<ServerPerfRes>,
     mut script_mode: Option<ResMut<ScriptModeRes>>,
 ) {
     let Some(transport) = transport_res.transport.as_mut() else {
@@ -679,12 +818,27 @@ fn drain_transport_system(
                     }
                 }
             }
+            S2C::PerfStats {
+                sim_p95_ms,
+                sim_samples,
+                policy_infer_count,
+                policy_total_us,
+                ..
+            } => {
+                server_perf.latest = Some(ServerPerfSample {
+                    sim_p95_ms,
+                    sim_samples,
+                    policy_infer_count,
+                    policy_total_us,
+                });
+            }
             _ => {}
         }
     }
 }
 
-/// 轮询在途异步网格任务:世代匹配则上传/替换/回收空段并更新 `MeshStats`;过期则丢弃并回队。
+/// 轮询在途异步网格任务:世代匹配则上传/替换/回收空段并更新 `MeshStats`/`MeshPerfRes`;过期则丢弃并回队。
+#[allow(clippy::too_many_arguments)]
 fn collect_mesh_tasks_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -693,20 +847,23 @@ fn collect_mesh_tasks_system(
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut stats: ResMut<MeshStats>,
+    mut mesh_perf: ResMut<MeshPerfRes>,
+    mut fps_history: ResMut<FpsHistoryRes>,
 ) {
     let material = world_res.terrain_material.clone();
-    let mut completed: Vec<(SubchunkPos, DirtyKind, u64, SubchunkMesh)> = Vec::new();
+    let mut completed: Vec<(SubchunkPos, DirtyKind, u64, SubchunkMesh, u64)> = Vec::new();
 
     pending.tasks.retain(|&sc, entry| {
-        if let Some(submesh) = check_ready(&mut entry.task) {
-            completed.push((sc, entry.kind, entry.epoch, submesh));
+        if let Some((submesh, us)) = check_ready(&mut entry.task) {
+            completed.push((sc, entry.kind, entry.epoch, submesh, us));
             false
         } else {
             true
         }
     });
 
-    for (sc, kind, pending_epoch, submesh) in completed {
+    for (sc, kind, pending_epoch, submesh, us) in completed {
+        acc_mesh_perf(&mut mesh_perf.0, us);
         let current_epoch = world_res.mirror.epoch(sc);
         if is_stale(pending_epoch, current_epoch) {
             stats.discards += 1;
@@ -744,11 +901,12 @@ fn collect_mesh_tasks_system(
         }
 
         stats.uploads += 1;
-        if kind == DirtyKind::Edit
-            && let Some(arrived_frame) = edit_frames.frames.remove(&sc)
-        {
-            let diff = frame_counter.0.saturating_sub(arrived_frame) as u32;
-            stats.max_edit_upload_frames = stats.max_edit_upload_frames.max(diff);
+        if kind == DirtyKind::Edit {
+            fps_history.record_edit_upload();
+            if let Some(arrived_frame) = edit_frames.frames.remove(&sc) {
+                let diff = frame_counter.0.saturating_sub(arrived_frame) as u32;
+                stats.max_edit_upload_frames = stats.max_edit_upload_frames.max(diff);
+            }
         }
     }
 }
@@ -825,6 +983,9 @@ fn script_driver_system(
     mut commands: Commands,
     time: Res<Time>,
     stats: Res<MeshStats>,
+    mesh_perf: Res<MeshPerfRes>,
+    mut fps_history: ResMut<FpsHistoryRes>,
+    server_perf: Res<ServerPerfRes>,
     mut transport_res: ResMut<TransportRes>,
     mut script: ResMut<ScriptModeRes>,
     mut cam_q: Query<(&mut Transform, &mut FlyCamera)>,
@@ -835,6 +996,7 @@ fn script_driver_system(
             return;
         }
         script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         // 显式 drop LocalTransport → 发送 Goodbye 并 join 宿主线程,确保 redb 收口。
         let _ = transport_res.transport.take();
@@ -882,6 +1044,7 @@ fn script_driver_system(
         };
         script.manifest.finish(&status);
         script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(2);
         return;
@@ -918,6 +1081,14 @@ fn script_driver_system(
     transform.look_at(look_target, Vec3::Y);
 
     script.coupled = output.coupled;
+    apply_perf_reset_step(output.perf_reset, &mut fps_history);
+    if output
+        .commands
+        .iter()
+        .any(|cmd| matches!(cmd, EngineCommand::SetBlock { .. }))
+    {
+        fps_history.record_first_dig();
+    }
     if let Some(transport) = transport_res.transport.as_mut() {
         forward_engine_commands(&output.commands, transport);
         if script.coupled {
@@ -945,6 +1116,7 @@ fn script_driver_system(
             manifest.push(record, world);
         }
         manifest.mesh_stats = Some(stats.to_manifest());
+        manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(manifest, out_dir);
     }
 
@@ -963,9 +1135,20 @@ fn script_driver_system(
     if !matches!(final_status, EngineStatus::Running { .. }) {
         script.manifest.finish(&final_status);
         script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(exit_code.unwrap_or(2));
     }
+}
+
+/// 测量单段异步网格构建耗时(微秒,REQ-013 C01b-3 §1.4):墙钟仅用于异步网格遥测面,
+/// 与 `app::telemetry` 同口径,不参与确定性模拟决策。
+#[allow(clippy::disallowed_methods)]
+fn timed_mesh_subchunk(snap: &ChunkSnapshot, sc: SubchunkPos) -> (SubchunkMesh, u64) {
+    let t0 = std::time::Instant::now();
+    let mesh = mesh_subchunk_snapshot(snap, sc);
+    let us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+    (mesh, us)
 }
 
 /// 每帧最多从脏队弹出 8 段提交到 `AsyncComputeTaskPool`;已有在途任务时跳过并回队防堆积。
@@ -989,7 +1172,7 @@ fn spawn_mesh_tasks_system(
             continue;
         };
         let epoch = world_res.mirror.epoch(sc);
-        let task = pool.spawn(async move { mesh_subchunk_snapshot(&snap, sc) });
+        let task = pool.spawn(async move { timed_mesh_subchunk(&snap, sc) });
         pending.tasks.insert(sc, PendingMesh { kind, epoch, task });
         spawned += 1;
     }
@@ -1063,6 +1246,8 @@ mod tests {
         app.insert_resource(FrameCounter(0))
             .insert_resource(EditFrameTracker::default())
             .insert_resource(MeshStats::default())
+            .insert_resource(MeshPerfRes::default())
+            .insert_resource(FpsHistoryRes::default())
             .insert_resource(PendingMeshesRes::default())
             .insert_resource(WorldRenderRes {
                 mirror,
@@ -1080,8 +1265,8 @@ mod tests {
     }
 
     /// 经 `AsyncComputeTaskPool` 构造已就绪的轻量网格任务,保证单次 `app.update()` 确定性命中。
-    fn ready_task(submesh: SubchunkMesh) -> Task<SubchunkMesh> {
-        let task = AsyncComputeTaskPool::get().spawn(async move { submesh });
+    fn ready_task(submesh: SubchunkMesh) -> Task<(SubchunkMesh, u64)> {
+        let task = AsyncComputeTaskPool::get().spawn(async move { (submesh, 0) });
         for _ in 0..10_000 {
             if task.is_finished() {
                 break;
@@ -1272,5 +1457,73 @@ mod tests {
         let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
         assert_eq!(world_res.mirror.dirty_len(), 16, "24 - 9 + 1 = 16");
         assert_eq!(world_res.mirror.pop_dirty(), Some((s0, DirtyKind::Load)));
+    }
+
+    /// MS12(REQ-013 C01b-3 R1 §2.1):无头验证 `FpsHistoryRes::reset()` 与 `perf_reset`
+    /// 脚本步执行分支(PM18/PM19/PM20 靶点,期望值照裁定手算)。
+    #[test]
+    fn ms12_perf_reset_clears_history_and_markers() {
+        let mut fps = FpsHistoryRes::default();
+        // 1. push [16,16,16,16,16] → marker 均 Some(4), storm_window(4,4,5) == Some((4,4))。
+        for dt in [16.0, 16.0, 16.0, 16.0, 16.0] {
+            fps.push_dt_ms(dt);
+        }
+        fps.record_first_dig();
+        fps.record_edit_upload();
+        assert_eq!(fps.first_dig_frame, Some(4));
+        assert_eq!(fps.last_edit_upload_frame, Some(4));
+        assert_eq!(
+            storm_window(
+                fps.first_dig_frame,
+                fps.last_edit_upload_frame,
+                fps.dts_ms.len() as u64
+            ),
+            Some((4, 4))
+        );
+
+        // 2. 经脚本 Engine 执行 perf_reset = {} 步并调用步执行分支 → 清空历史、dropped_prefix 与两 marker。
+        let scenario =
+            parse_scenario("name = \"ms12\"\ndescription = \"d\"\n\n[[step]]\nperf_reset = {}\n")
+                .expect("perf_reset 场景合法");
+        let start_pose = CameraPose {
+            pos: types::glam::Vec3::ZERO,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut engine = Engine::new(scenario, start_pose);
+        let world = WorldState::new();
+        let out = engine.frame(&FrameInput {
+            dt: 0.016,
+            server_tick: 1,
+            world: &world,
+            spawned: &[],
+        });
+        assert!(
+            out.perf_reset,
+            "perf_reset 步必须置位 FrameOutput.perf_reset"
+        );
+        apply_perf_reset_step(out.perf_reset, &mut fps);
+        assert!(fps.dts_ms.is_empty());
+        assert_eq!(fps.dropped_prefix, 0);
+        assert_eq!(fps.first_dig_frame, None);
+        assert_eq!(fps.last_edit_upload_frame, None);
+
+        // 3. push [16,32,16] → marker 均 Some(2), storm_window(2,2,3) == Some((2,2)), 切片 [16] → (62.5, 62.5)。
+        for dt in [16.0, 32.0, 16.0] {
+            fps.push_dt_ms(dt);
+        }
+        fps.record_first_dig();
+        fps.record_edit_upload();
+        assert_eq!(fps.first_dig_frame, Some(2));
+        assert_eq!(fps.last_edit_upload_frame, Some(2));
+        let win = storm_window(
+            fps.first_dig_frame,
+            fps.last_edit_upload_frame,
+            fps.dts_ms.len() as u64,
+        );
+        assert_eq!(win, Some((2, 2)));
+        let (s, e) = win.expect("窗口非空");
+        assert_eq!(&fps.dts_ms[s..=e], &[16.0]);
+        assert_eq!(fps_summary(&fps.dts_ms[s..=e]), (62.5, 62.5));
     }
 }

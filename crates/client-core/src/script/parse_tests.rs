@@ -750,3 +750,20 @@ fn mark_agent_no_at_without_possess() {
         e.message
     );
 }
+
+/// REQ-013 C01b-3 R1 MS11:`perf_reset = {}` 合法空表解析为 `Action::PerfReset`;
+/// 带多余键报错。
+#[test]
+fn ms11_parse_perf_reset() {
+    let s = parse_scenario(&one_step("perf_reset = {}")).expect("空表 perf_reset 应合法解析");
+    assert_eq!(s.steps.len(), 1);
+    assert_eq!(s.steps[0].action, Action::PerfReset);
+
+    let e = err(&one_step("perf_reset = { extra = 1 }"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("extra"),
+        "带多余键必须点名报错:{}",
+        e.message
+    );
+}

@@ -152,6 +152,9 @@ pub enum Action {
         within: f32,
         timeout_ticks: u64,
     },
+    /// 重置客户端性能采样窗口(REQ-013 C01b-3 R1 §2.1):瞬时步,不阻塞引擎,
+    /// 通知渲染层清空 FPS 历史与风暴窗口标记。
+    PerfReset,
 }
 
 /// 生成位置:绝对坐标,或相机前方 `ahead` 米再抬高 `lift` 米。
@@ -410,6 +413,8 @@ pub struct FrameOutput {
     /// A06 §4:脚本附身状态(Some = 已附身主体;follow 是否切第三人称)。
     /// 渲染层据此决定相机模式(follow = false 时相机保持 fly 位姿)。
     pub possess: Option<(EntityId, bool)>,
+    /// C01b-3 R1 §2.1:本帧执行了 `perf_reset` 瞬时步,渲染层据此清空 FPS 历史与风暴标记。
+    pub perf_reset: bool,
 }
 
 /// 引擎状态。

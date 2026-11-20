@@ -38,6 +38,20 @@ pub struct InferReply {
     pub seq: u64,
     pub entity: EntityId,
     pub result: Result<policy::Action, String>,
+    /// 本次 `policy.act` 推理耗时(微秒;策略键缺失的错误路径为 0,REQ-013 C01b-3 §1.2)。
+    pub infer_us: u64,
+}
+
+/// 测量单次策略推理耗时(微秒):墙钟只用于驱动侧遥测(非确定性遥测面,与 `recv_until` 同口径)。
+#[allow(clippy::disallowed_methods)]
+fn timed_act<F, T>(f: F) -> (T, u64)
+where
+    F: FnOnce() -> T,
+{
+    let t0 = Instant::now();
+    let res = f();
+    let us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+    (res, us)
 }
 
 /// 策略工作线程宿主:请求端、回复端、线程句柄、参数、累计发出请求数。
@@ -65,15 +79,18 @@ impl PolicyWorker {
                     if !debug_delay.is_zero() {
                         std::thread::sleep(debug_delay);
                     }
-                    let result = match table.get_mut(req.key) {
-                        Some(entry) => entry.policy.act(&req.snapshot).map_err(|e| e.to_string()),
-                        None => Err(format!("策略键不在表中:{:?}", req.key)),
+                    let (result, infer_us) = match table.get_mut(req.key) {
+                        Some(entry) => {
+                            timed_act(|| entry.policy.act(&req.snapshot).map_err(|e| e.to_string()))
+                        }
+                        None => (Err(format!("策略键不在表中:{:?}", req.key)), 0),
                     };
                     if rep_tx
                         .send(InferReply {
                             seq: req.seq,
                             entity: req.entity,
                             result,
+                            infer_us,
                         })
                         .is_err()
                     {

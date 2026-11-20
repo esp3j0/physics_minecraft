@@ -1,0 +1,77 @@
+name = "client_perf_baseline"
+req = "REQ-013"
+description = "bevy 客户端性能基线组合(vd8 + 4 只 quad_gpu1 策略狗 + 64 无策略刚体),采集 sim/策略推理/渲染/meshing 实测数据"
+timeout_secs = 180
+
+[viewer]
+view_distance = 8
+
+[server]
+world_seed = 3
+
+[[server.agents]]
+body = "quad"
+position = [16.5, -59.5, 12.5]
+controller = "policy"
+policy = "quad_gpu1"
+leash_m = 16.0
+intent = [0.5, 0.0, 0.0]
+
+[[server.agents]]
+body = "quad"
+position = [26.5, -59.5, 12.5]
+controller = "policy"
+policy = "quad_gpu1"
+leash_m = 16.0
+intent = [0.5, 0.0, 0.0]
+
+[[server.agents]]
+body = "quad"
+position = [16.5, -59.5, 22.5]
+controller = "policy"
+policy = "quad_gpu1"
+leash_m = 16.0
+intent = [0.5, 0.0, 0.0]
+
+[[server.agents]]
+body = "quad"
+position = [26.5, -59.5, 22.5]
+controller = "policy"
+policy = "quad_gpu1"
+leash_m = 16.0
+intent = [0.5, 0.0, 0.0]
+
+[[step]]
+label = "顶视全景视角"
+camera = { pos = [5.2, -25.0, 17.6], yaw = -90.0, pitch = -89.0 }
+
+[[step]]
+label = "等待出生区区块就绪"
+wait_until = { chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+
+[[step]]
+label = "等待 vd8 网格上传完毕"
+wait_ticks = { n = 1200 }
+
+[[step]]
+label = "生成 64 个无策略刚体"
+spawn = { at = [2.0, -52.0, 8.0], count = 64, spacing = 1.6, label = "baseline_bodies" }
+
+[[step]]
+label = "等 64 条 Spawned 回执归属"
+wait_until = { labeled_alive = { label = "baseline_bodies", ge = 64 }, timeout_ticks = 120 }
+
+[[step]]
+label = "重置稳态性能采样窗口"
+perf_reset = {}
+
+[[step]]
+label = "运行基线采样窗 80 拍(下落+着地动态相;凝固桥最早 rest+20 拍,窗末 64 刚体必存活)"
+wait_ticks = { n = 80 }
+
+[[step]]
+label = "校验 vd8 视距满载 289 区块与 64 刚体存活"
+check = { chunks_loaded = { eq = 289 }, labeled_alive = { label = "baseline_bodies", eq = 64 } }
+
+[[step]]
+screenshot = { name = "baseline", expect = "顶视棕色地表连续铺满全帧(刚体渲染属 C03,本单元截图不含主体)" }

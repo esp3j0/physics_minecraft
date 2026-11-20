@@ -7,6 +7,7 @@
 pub mod client;
 pub mod mesh;
 pub mod mirror;
+pub mod perf;
 pub mod script;
 pub mod world;
 

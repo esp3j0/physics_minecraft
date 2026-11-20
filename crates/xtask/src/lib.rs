@@ -441,6 +441,63 @@ fn verify_client_mesh_stats(
     Ok(())
 }
 
+/// 校客户端性能基线/编辑风暴场景的 perf 机制断言(C01b-3 §2.3;只锚机制,不锚 FPS 阈值):
+/// - `client_perf_baseline`:`manifest.perf` 存在、`sim_samples > 0`、`policy_infer_count > 0`、`mesh_count > 0`;
+/// - `client_edit_storm`:`manifest.perf` 存在、`fps_storm_min` 存在且 `storm_frames > 0`。
+fn verify_client_perf_stats(
+    scenario_name: &str,
+    manifest: Option<&Manifest>,
+) -> Result<(), String> {
+    match scenario_name {
+        "client_perf_baseline" => {
+            let Some(m) = manifest else {
+                return Err("client_perf_baseline 缺失 manifest,无法校验 perf".to_owned());
+            };
+            let Some(perf) = m.perf.as_ref() else {
+                return Err("client_perf_baseline manifest 缺失 perf 字段".to_owned());
+            };
+            if perf.sim_samples == 0 {
+                return Err(
+                    "client_perf_baseline 机器断言失败: perf.sim_samples = 0 (要求 > 0)".to_owned(),
+                );
+            }
+            if perf.policy_infer_count == 0 {
+                return Err(
+                    "client_perf_baseline 机器断言失败: perf.policy_infer_count = 0 (要求 > 0)"
+                        .to_owned(),
+                );
+            }
+            if perf.mesh_count == 0 {
+                return Err(
+                    "client_perf_baseline 机器断言失败: perf.mesh_count = 0 (要求 > 0)".to_owned(),
+                );
+            }
+            Ok(())
+        }
+        "client_edit_storm" => {
+            let Some(m) = manifest else {
+                return Err("client_edit_storm 缺失 manifest,无法校验 perf".to_owned());
+            };
+            let Some(perf) = m.perf.as_ref() else {
+                return Err("client_edit_storm manifest 缺失 perf 字段".to_owned());
+            };
+            if perf.fps_storm_min.is_none() {
+                return Err(
+                    "client_edit_storm 机器断言失败: perf.fps_storm_min 为 None (要求 Some)"
+                        .to_owned(),
+                );
+            }
+            if perf.storm_frames == 0 {
+                return Err(
+                    "client_edit_storm 机器断言失败: perf.storm_frames = 0 (要求 > 0)".to_owned(),
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `cargo build -j 10 -p client`(dev profile,依赖 opt-level=2 已在根 Cargo.toml 配置)。
 fn cargo_build_client_dev(repo_root: &Path) -> Result<(), String> {
     let status = std::process::Command::new("cargo")
@@ -577,6 +634,7 @@ fn run_client_scenario(
         && !timed_out
         && !panicked
         && let Err(msg) = verify_client_mesh_stats(&name, manifest.as_ref())
+            .and_then(|()| verify_client_perf_stats(&name, manifest.as_ref()))
     {
         eprintln!("{msg}");
         client_exit = Some(1);
@@ -1292,6 +1350,7 @@ mod tests {
                 steps,
                 result: None,
                 mesh_stats: None,
+                perf: None,
             }
         };
         // 预期失败发生:退出码 1 + 一步 check_failed → 全部成立 → 0。
@@ -1357,6 +1416,7 @@ mod tests {
             steps,
             result: None,
             mesh_stats: None,
+            perf: None,
         };
         let entries = vec![
             ScenarioEntry {
@@ -1495,6 +1555,7 @@ mod tests {
                 steps: vec![step("screenshot", Some(shot))],
                 result: None,
                 mesh_stats: None,
+                perf: None,
             }),
         }];
         // 故意用相对 out_root(验收两轮也用相对 --out,以此证明修复有效)。
@@ -1535,6 +1596,7 @@ mod tests {
             steps: vec![],
             result: None,
             mesh_stats: ms,
+            perf: None,
         };
         assert!(verify_client_mesh_stats("client_startup", None).is_ok());
         assert!(verify_client_mesh_stats("client_block_edit", None).is_err());
@@ -1591,6 +1653,138 @@ mod tests {
                     uploads: 25,
                     discards: 1,
                 })))
+            )
+            .is_ok()
+        );
+    }
+
+    /// C01b-3 §2.3:`client_perf_baseline` 与 `client_edit_storm` 的 perf 机制断言
+    /// (只锚机制字段存在性与非零性,不锚 FPS 阈值)。
+    #[test]
+    fn verify_client_perf_stats_enforces_mechanism_checks() {
+        use viewer::script::manifest::ManifestPerf;
+
+        let make = |name: &str, perf: Option<ManifestPerf>| Manifest {
+            scenario: name.to_owned(),
+            req: Some("REQ-013".to_owned()),
+            description: "d".to_owned(),
+            steps: vec![],
+            result: None,
+            mesh_stats: None,
+            perf,
+        };
+
+        let ok_baseline = ManifestPerf {
+            fps_mean: 12.0, // 低 FPS 不应触发机制断言失败(FPS 不做机器门禁)
+            fps_min: 5.0,
+            fps_storm_min: None,
+            storm_frames: 0,
+            mesh_max_ms: 9.0,
+            mesh_count: 100,
+            sim_p95_ms: Some(12.0),
+            sim_samples: 60,
+            policy_infer_count: 40,
+            policy_ms_per_body: Some(3.0),
+        };
+        assert!(verify_client_perf_stats("client_startup", None).is_ok());
+        assert!(verify_client_perf_stats("client_perf_baseline", None).is_err());
+        assert!(
+            verify_client_perf_stats(
+                "client_perf_baseline",
+                Some(&make("client_perf_baseline", None))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_perf_baseline",
+                Some(&make(
+                    "client_perf_baseline",
+                    Some(ManifestPerf {
+                        sim_samples: 0,
+                        ..ok_baseline.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_perf_baseline",
+                Some(&make(
+                    "client_perf_baseline",
+                    Some(ManifestPerf {
+                        policy_infer_count: 0,
+                        ..ok_baseline.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_perf_baseline",
+                Some(&make(
+                    "client_perf_baseline",
+                    Some(ManifestPerf {
+                        mesh_count: 0,
+                        ..ok_baseline.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_perf_baseline",
+                Some(&make("client_perf_baseline", Some(ok_baseline)))
+            )
+            .is_ok()
+        );
+
+        let ok_storm = ManifestPerf {
+            fps_mean: 30.0,
+            fps_min: 10.0,
+            fps_storm_min: Some(12.0),
+            storm_frames: 20,
+            mesh_max_ms: 1.5,
+            mesh_count: 80,
+            sim_p95_ms: Some(1.0),
+            sim_samples: 60,
+            policy_infer_count: 0,
+            policy_ms_per_body: None,
+        };
+        assert!(verify_client_perf_stats("client_edit_storm", None).is_err());
+        assert!(
+            verify_client_perf_stats(
+                "client_edit_storm",
+                Some(&make(
+                    "client_edit_storm",
+                    Some(ManifestPerf {
+                        fps_storm_min: None,
+                        ..ok_storm.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_edit_storm",
+                Some(&make(
+                    "client_edit_storm",
+                    Some(ManifestPerf {
+                        storm_frames: 0,
+                        ..ok_storm.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_edit_storm",
+                Some(&make("client_edit_storm", Some(ok_storm)))
             )
             .is_ok()
         );
