@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -299,6 +299,18 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   N1/N2/N3 击杀,M3(try_pop 先 world 后 critical)R1 后被 T9 击杀;
   门禁(sim-api/app/client-core/viewer 测试 + clippy + fmt + e2e 编译)
   架构师复跑全过。验收与 R1 裁定见 #27。
+- C01b-1 ✅ 验收通过(2026-11-20,含 R1 返修):提交 ba282fa(实施)+
+  9a0a52b(R1 补 MB4 邻 chunk 连带标脏锚点)。世界镜像(互斥双 BTreeSet
+  脏队列、Arc 写时复制)+ subchunk 网格生成(固定面序/外平面三采样顶点
+  AO/方向亮度烘焙)+ bevy 0.20.1 壳(CLI/飞行相机/同步 32 段每帧上传/
+  F2 截图)。MB1–MB4/MA1–MA5/AC4-t 全绿;PM1–PM5 与架构师 N2/N3/N4 击杀,
+  N1/N5(insert/remove 邻 chunk 连带标脏无锚点)R1 后被 MB4 击杀;
+  门禁(app 203/client-core 11/sim-api 66 + clippy + fmt)复跑全过;
+  人工验收审图通过(地表连续、相机位移、F2/Esc/CLI 守卫)。
+  Cargo.lock 新增 329 包全为 bevy 系传递依赖;`zstd_rust` 为
+  tonemapping_luts 强制 zstd 后端的最小补加,已认可。
+  遗留:mesh 资产替换时旧 handle 未 remove,归 C01b-2 收口。
+  验收与 R1 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
