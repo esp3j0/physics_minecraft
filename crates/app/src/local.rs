@@ -629,4 +629,66 @@ mod tests {
         advance_one_tick().await;
         driver.await.expect("驱动正常退出");
     }
+
+    /// T9 两队列均非空时的排序锚点(C01a-R1):
+    /// 6 轮 advance(100ms)+yield 不 drain 使 Critical 含 2 个 Welcome、World 含 25 个 ChunkData,
+    /// 再发 Ping 使 Pong 入 Critical 队尾,单次 drain 必按 Critical FIFO 在前、World 25 块在后。
+    #[tokio::test(start_paused = true)]
+    async fn t9_critical_before_world_under_contention() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let (handle, driver) = spawn_in_current_runtime(local_test_config(tmp.path(), 2))
+            .await
+            .expect("spawn_in_current_runtime");
+
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        handle.send(C2S::Ping);
+
+        let batch = handle.drain();
+        assert_eq!(
+            batch.len(),
+            28,
+            "手算:2 Welcome + 1 Pong + 25 ChunkData = 28"
+        );
+        assert_eq!(
+            batch[0],
+            S2C::Welcome {
+                player_id: InputSource(1),
+                tick: Tick(0),
+            },
+            "batch[0] 必为初始 Welcome(tick=0)"
+        );
+        assert_eq!(
+            batch[1],
+            S2C::Welcome {
+                player_id: InputSource(1),
+                tick: Tick(1),
+            },
+            "batch[1] 必为驱动 Joined 回执 Welcome(tick=1)"
+        );
+        assert_eq!(batch[2], S2C::Pong, "batch[2] 必为 Critical 队尾的 Pong");
+
+        let mut chunk_positions: BTreeSet<ChunkPos> = BTreeSet::new();
+        for msg in &batch[3..] {
+            match msg {
+                S2C::ChunkData { pos, .. } => {
+                    assert!(
+                        chunk_positions.insert(*pos),
+                        "ChunkData pos 不得重复:{pos:?}"
+                    );
+                }
+                other => panic!("batch[3..] 必须全为 ChunkData,实际遇到:{other:?}"),
+            }
+        }
+        assert_eq!(
+            chunk_positions,
+            view_square(ChunkPos::new(0, 0), 2),
+            "batch[3..] pos 集合必为 view_square((0,0), 2)(25 个不重复)"
+        );
+
+        drop(handle);
+        driver.await.expect("驱动正常退出");
+    }
 }
