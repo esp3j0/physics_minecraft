@@ -177,7 +177,7 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
 不是本 REQ 基线**,batch/多线程推理单列未来优化项,不在 C01 口径内。
 
 性能基线报告(sim ms/拍、推理 ms/主体、meshing ms/chunk、FPS、
-内存)是验收件,归档本文档 §10。
+内存)是验收件,归档本文档 §11。
 
 ## 5. bevy 渲染栈与可搬运性
 
@@ -252,7 +252,7 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   编辑风暴(脚本连挖 64 格)期间 FPS ≥ 55(实测报告)。
 - [ ] AC7:viewer 纯逻辑层(client/possess/world/script/tools)
   搬运后既有测试全绿,语义不变。
-- [ ] AC8:性能基线报告归档 §10,§4 预算逐项实测对照;未达项
+- [x] AC8:性能基线报告归档 §11,§4 预算逐项实测对照;未达项
   如实报实测值并归因,不私自放宽。
 
 ## 7. 图形冒烟场景
@@ -328,6 +328,22 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   (增量指纹损坏)后全单元沿用。遗留:chunk 卸载路径句柄回收无机器锚点
   (两场景不触发卸载),归 C02/C03 视距移动场景;uploads 含空段且受帧对齐
   ±8 抖动,C01b-3 基线口径需注明。验收与 R1 裁定见 #27。
+- C01b-3 ✅ 验收通过(2026-11-20,含 R1/R1b 返修):提交 2893347。
+  性能测量钩子(policy_worker timed_act/infer_us、controller 仅 Ok 路径累计、
+  client-core perf.rs 纯函数、manifest perf serde(default)、S2C::PerfStats
+  判别 14 追加 golden 不动、driver 订阅门控 10 拍、FpsHistoryRes 7200 上限 +
+  绝对索引标记 + reset、脚本 perf_reset 全链路、w03 不变量扩展、dev
+  opt-level=2)+ 基线/编辑风暴两场景 + xtask 机器断言。R1:perf_reset 稳态窗、
+  before 截图前移、80 拍动态相采样窗(凝固桥 rest+20 口径修订,手算裕量≥16 拍);
+  R1b:LabeledAlive = entities ∪ agents。MS7–MS13 全绿;PM14–PM21 击杀
+  (PM19/PM20 架构师补跑,PM19 超时遗留变异事故已还原);架构师 N8/N9 击杀。
+  门禁复跑全过(e2e 33 二进制;acn2 首轮偶发 flake 复跑绿,环境竞态另案);
+  四场景冒烟 failed 0;审图闭环(白盒 = 凝固桥 stone 写入,旧轮遗留截图误判
+  已按 manifest+mtime 核对)。实测归档 §11:sim_p95 3.3231≤8 ✓、策略
+  0.09640≤2 ✓、mesh_max 0.737≤4 ✓、编辑→画面 1≤2 ✓、稳态 fps_mean
+  60.0223≥60 ✓;AC6 风暴 FPS 本机 780M 跨轮 52.28–56.86 不稳定达标,
+  如实记录待 2080Ti 基准机复测,不私自放宽。遗留:storm 基准机复测;
+  卸载句柄锚点归 C02/C03 视距移动场景。验收与 R1/R1b 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
@@ -361,4 +377,42 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
 
 ## 11. 性能基线报告(验收时填)
 
-(待 C01 实测归档)
+**C01b-3 归档(2026-11-20,验收通过)**。实测环境:用户本机 AMD 780M 核显
+(非 §4 目标 2080Ti 级基准机);CARGO_INCREMENTAL=0、dev opt-level=2。
+数据源:四场景冒烟 manifest(target/c01b3-r1-smoke-out/,failed_checks 全 0);
+实施提交 2893347;实施自报 #27 comment 7046295876,架构师裁定 comment 7046312114。
+
+基线组合口径:vd8 + 4 只 quad_gpu1 策略狗 + 64 无策略刚体。采样窗 =
+spawn 后 80 拍**动态相**(perf_reset 重置后):凝固桥(REQ-001 §9.5)最早
+rest+20 拍移除刚体,手算下落 8m≈76.6 拍 → 最早凝固≈96.6 拍,窗末 64 刚体
+必存活(裕量≥16 拍);"64 静态刚体稳态"按游戏设计不存在,MarkActor 不对
+客户端开放,无豁免路径。整轮 fps_mean 含初始装载停顿,不作稳态判据。
+
+| 项 | §4 预算 | 实测(基线窗) | 判定 |
+| --- | --- | --- | --- |
+| sim 步进 | ≤8 ms/拍 | sim_p95 3.3231 ms(60 样本) | ✓ |
+| 策略推理 | ≤2 ms/主体·控制拍 | 0.09640 ms/主体(2616 次推理) | ✓ |
+| meshing 单段 | ≤4 ms | mesh_max 0.737 ms(7008 段) | ✓ |
+| 编辑→画面 | ≤2 帧 | 1 帧(storm 与 block_edit) | ✓ |
+| 稳态渲染 | ≥60 FPS | fps_mean 60.0223(fps_min 54.089) | ✓ |
+| 风暴 FPS(AC6) | ≥55 | 本轮 56.856;跨轮 52.28/54.48/54.87/54.17/56.86 | 本机波动,不稳定达标 |
+
+其余场景:startup fps_mean 57.485/fps_min 7.784(初始装载停顿,仅参考);
+block_edit fps_mean 57.999/fps_storm_min 52.035(含中间截图 readback,仅参考);
+edit_storm fps_mean 59.875/uploads 605。uploads 含空段且受帧对齐 ±8 抖动
+(C01b-2 遗留口径)。
+
+**未达/波动项归因(不私自放宽)**:AC6 风暴 FPS 在 780M 核显上跨轮不稳定达标;
+截图 readback 停顿已证实会拉低窗内 FPS(窗内含 before 截图 20.11 vs 无截图
+55.13,故 before 截图前移到采样窗之前);核显带宽/帧调度抖动部分未跨机验证,
+**未归因**,待 2080Ti 级基准机复测后由架构师走 §4 修订流程定值。
+
+审图:baseline 截图 09-baseline.png(tick 1310、live 64、chunks 289)顶视棕色
+地表连续铺满全帧,与 expect 一致(主体/刚体渲染属 C03)。白盒归因:spawn 默认
+半格 stone 立方体,凝固桥 rest+20 拍写体素并移除刚体 → 白盒只出现在凝固波后
+的截图;复用输出目录遗留旧轮截图曾致误判,已按 manifest+mtime 核对闭环。
+
+锚点与变异:MS7–MS13 全绿;PM14–PM21 击杀(PM19/PM20 架构师补跑,PM19 曾有
+超时遗留变异事故,已还原);架构师自注 N8/N9 击杀。e2e acn2 首轮偶发 flake
+(start_paused 与 spawn_blocking 竞态),单跑/整二进制/全量 33 二进制复跑全绿,
+非本单元缺陷,复发另案。
