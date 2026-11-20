@@ -1,0 +1,16 @@
+[package]
+name = "client-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+app = { path = "../app" }
+sim-api = { path = "../sim-api" }
+types = { path = "../types" }
+voxel = { path = "../voxel" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

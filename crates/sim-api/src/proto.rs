@@ -72,6 +72,12 @@ pub enum C2S {
         yaw: f32,
         jump: bool,
     },
+    /// 带序号命令包装(REQ-013 §3.3):客户端输入路径统一走 seq;
+    /// C01a 阶段翻译层透明转发 inner,ack 语义 C04 落。
+    Sequenced {
+        seq: u64,
+        inner: Box<C2S>,
+    },
 }
 
 /// 服务器 → 客户端(追加式)。
@@ -149,6 +155,17 @@ pub enum S2C {
     /// (客户端请求或主体被移除而被迫解除)。
     Possessed {
         entity: Option<EntityId>,
+    },
+    /// 输入确认(REQ-013 §3.3;C04 才由驱动产生,C01a 只落 schema)。
+    InputAck {
+        seq: u64,
+        tick: Tick,
+    },
+    /// 预测实体权威校正(REQ-013 §3.3;单机无预测,不产生)。
+    Correction {
+        entity: EntityId,
+        state: EntityState,
+        tick: Tick,
     },
 }
 
@@ -620,6 +637,62 @@ mod tests {
             decode_frame(&encode_frame(&possessed_none)),
             Some(possessed_none),
             "Possessed(None) 往返"
+        );
+    }
+
+    /// REQ-013 C01a T1:Sequenced / InputAck / Correction 单帧编解码往返 +
+    /// 声明序判别值钉死(C2S::Sequenced = 12,S2C::InputAck = 12,
+    /// S2C::Correction = 13)。
+    #[test]
+    fn t1_c01a_variants_roundtrip() {
+        let seq_ping = C2S::Sequenced {
+            seq: 7,
+            inner: Box::new(C2S::Ping),
+        };
+        let frame = encode_c2s_frame(&seq_ping);
+        assert_eq!(frame[4], 12, "Sequenced 判别值 = 12(声明序追加)");
+        assert_eq!(
+            decode_c2s_frame(&frame),
+            Some(seq_ping),
+            "Sequenced(Ping) 帧往返相等"
+        );
+
+        let ack = S2C::InputAck {
+            seq: 7,
+            tick: Tick(42),
+        };
+        let frame = encode_frame(&ack);
+        assert_eq!(frame[4], 12, "InputAck 判别值 = 12(声明序追加)");
+        assert_eq!(decode_frame(&frame), Some(ack), "InputAck 帧往返相等");
+
+        let corr = S2C::Correction {
+            entity: EntityId::from_parts(1, 2),
+            state: EntityState {
+                translation: Vec3::new(1.5, 2.5, 3.5),
+                rotation: Quat::IDENTITY,
+                linvel: Vec3::X,
+                angvel: Vec3::ZERO,
+            },
+            tick: Tick(42),
+        };
+        let frame = encode_frame(&corr);
+        assert_eq!(frame[4], 13, "Correction 判别值 = 13(声明序追加)");
+        assert_eq!(decode_frame(&frame), Some(corr), "Correction 帧往返相等");
+    }
+
+    /// REQ-013 C01a T2:追加新变体后,既有 `C2S::Ping` 与 `S2C::Pong` 帧字节
+    /// 逐字节不变(期望字节来自追加前的固定编码,手抄固化)。
+    #[test]
+    fn t2_c01a_old_frames_unchanged() {
+        assert_eq!(
+            encode_c2s_frame(&C2S::Ping),
+            vec![1, 0, 0, 0, 4],
+            "C2S::Ping 编码字节必须不变"
+        );
+        assert_eq!(
+            encode_frame(&S2C::Pong),
+            vec![1, 0, 0, 0, 5],
+            "S2C::Pong 编码字节必须不变"
         );
     }
 }

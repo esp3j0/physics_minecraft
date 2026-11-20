@@ -13,6 +13,7 @@
 pub mod config;
 pub mod controller;
 pub mod driver;
+pub mod local;
 pub mod net;
 pub mod respawn;
 pub mod startup_agents;

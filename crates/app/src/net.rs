@@ -204,6 +204,7 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
         C2S::SubscribeDebug => TranslateOutcome::SubscribeDebug,
+        C2S::Sequenced { inner, .. } => translate(player, *inner),
     }
 }
 
@@ -488,7 +489,7 @@ impl OutboundHub {
     }
 
     /// 注册玩家的 chunk 流泵态(A03 §5;Subscribe 建流时)。
-    fn register_center(
+    pub(crate) fn register_center(
         &self,
         player: InputSource,
         state: std::sync::Arc<std::sync::Mutex<ChunkStreamState>>,
@@ -511,7 +512,7 @@ impl OutboundHub {
     }
 
     /// 注销玩家出站(连接任务终止时;Drop 路径同步执行)。返回是否确有注册。
-    fn unregister(&self, player: &InputSource) -> bool {
+    pub(crate) fn unregister(&self, player: &InputSource) -> bool {
         self.centers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
