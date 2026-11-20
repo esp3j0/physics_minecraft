@@ -334,4 +334,75 @@ mod tests {
         }
         assert_eq!(load_count, 23);
     }
+
+    /// MB4(C01b-1-R1):insert_chunk / remove_chunk 对已装载水平邻 chunk 的连带 Load 标脏与确定性顺序。
+    #[test]
+    fn mb4_neighbor_load_marks_on_insert_and_remove() {
+        let mut mirror = ChunkMirror::new();
+
+        // 1. insert (0,0) → 24 段 Load,section 0..=23 升序
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        assert_eq!(mirror.dirty_len(), 24);
+        for section in 0..24u8 {
+            assert_eq!(
+                mirror.pop_dirty(),
+                Some((
+                    SubchunkPos {
+                        chunk: ChunkPos::new(0, 0),
+                        section,
+                    },
+                    DirtyKind::Load
+                ))
+            );
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        // 2. insert (1,0) → 自身 24 + 已装载邻 (0,0) 24 = 48 段 Load;
+        //    Ord 升序:前 24 为 (0,0) section 0..=23,后 24 为 (1,0) section 0..=23
+        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+        assert_eq!(mirror.dirty_len(), 48);
+        for section in 0..24u8 {
+            assert_eq!(
+                mirror.pop_dirty(),
+                Some((
+                    SubchunkPos {
+                        chunk: ChunkPos::new(0, 0),
+                        section,
+                    },
+                    DirtyKind::Load
+                ))
+            );
+        }
+        for section in 0..24u8 {
+            assert_eq!(
+                mirror.pop_dirty(),
+                Some((
+                    SubchunkPos {
+                        chunk: ChunkPos::new(1, 0),
+                        section,
+                    },
+                    DirtyKind::Load
+                ))
+            );
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        // 3. remove (1,0) → 清自身脏并标已装载邻 (0,0) 24 段 Load
+        mirror.remove_chunk(ChunkPos::new(1, 0));
+        assert_eq!(mirror.dirty_len(), 24);
+        for section in 0..24u8 {
+            assert_eq!(
+                mirror.pop_dirty(),
+                Some((
+                    SubchunkPos {
+                        chunk: ChunkPos::new(0, 0),
+                        section,
+                    },
+                    DirtyKind::Load
+                ))
+            );
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+        assert_eq!(mirror.pop_dirty(), None);
+    }
 }
