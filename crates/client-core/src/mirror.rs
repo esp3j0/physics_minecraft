@@ -41,6 +41,7 @@ pub struct ChunkMirror {
     chunks: BTreeMap<ChunkPos, Arc<Chunk>>,
     dirty_edit: BTreeSet<SubchunkPos>,
     dirty_load: BTreeSet<SubchunkPos>,
+    epochs: BTreeMap<SubchunkPos, u64>,
 }
 
 impl Default for ChunkMirror {
@@ -56,6 +57,7 @@ impl ChunkMirror {
             chunks: BTreeMap::new(),
             dirty_edit: BTreeSet::new(),
             dirty_load: BTreeSet::new(),
+            epochs: BTreeMap::new(),
         }
     }
 
@@ -193,9 +195,22 @@ impl ChunkMirror {
         self.dirty_edit.len() + self.dirty_load.len()
     }
 
-    /// 供同 crate 网格生成器只读访问已装载 chunk。
-    pub(crate) fn chunk(&self, pos: ChunkPos) -> Option<&Chunk> {
-        self.chunks.get(&pos).map(Arc::as_ref)
+    /// 零拷贝克隆已装载 chunk 的 `Arc` 句柄(供异步网格快照使用)。
+    pub fn chunk_arc(&self, pos: ChunkPos) -> Option<Arc<Chunk>> {
+        self.chunks.get(&pos).map(Arc::clone)
+    }
+
+    /// 返回指定 subchunk 的脏世代计数(初值 0,每次 `mark_dirty` 命中 +1)。
+    ///
+    /// `remove_chunk` 清自身脏条目时**保留** `epoch` 计数不清零——卸载再装载同段
+    /// 视为新一代,计数继续累加。
+    pub fn epoch(&self, sc: SubchunkPos) -> u64 {
+        self.epochs.get(&sc).copied().unwrap_or(0)
+    }
+
+    /// 将 subchunk 重新入脏队(等价内部 `mark_dirty`,供异步过期结果回队或 pending 跳过回队)。
+    pub fn requeue(&mut self, sc: SubchunkPos, kind: DirtyKind) {
+        self.mark_dirty(sc, kind);
     }
 
     fn mark_chunk_load(&mut self, pos: ChunkPos) {
@@ -211,6 +226,8 @@ impl ChunkMirror {
     }
 
     fn mark_dirty(&mut self, sc: SubchunkPos, kind: DirtyKind) {
+        let entry = self.epochs.entry(sc).or_insert(0);
+        *entry = entry.saturating_add(1);
         match kind {
             DirtyKind::Edit => {
                 self.dirty_load.remove(&sc);
@@ -223,6 +240,12 @@ impl ChunkMirror {
             }
         }
     }
+}
+
+/// 异步网格任务过期判定:任务记录的世代与镜像当前世代不等即过期(纯函数,C01b-2 MS4)。
+#[inline]
+pub fn is_stale(pending_epoch: u64, current_epoch: u64) -> bool {
+    pending_epoch != current_epoch
 }
 
 #[cfg(test)]
@@ -404,5 +427,69 @@ mod tests {
         }
         assert_eq!(mirror.dirty_len(), 0);
         assert_eq!(mirror.pop_dirty(), None);
+    }
+
+    /// MS2(C01b-2):epoch 世代计数 0→1→2→3→4→5,且 remove_chunk 保留已卸载段 epoch 不清零。
+    #[test]
+    fn ms2_epoch_lifecycle_and_retention_on_remove() {
+        let mut mirror = ChunkMirror::new();
+        let s0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+        let s1 = SubchunkPos {
+            chunk: ChunkPos::new(1, 0),
+            section: 0,
+        };
+
+        assert_eq!(mirror.epoch(s0), 0);
+
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        assert_eq!(mirror.epoch(s0), 1);
+
+        for _ in 0..24 {
+            assert!(matches!(mirror.pop_dirty(), Some((_, DirtyKind::Load))));
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        mirror.apply_updates(&[(BlockPos::new(0, -60, 0), STONE)]);
+        assert_eq!(mirror.epoch(s0), 2);
+
+        mirror.apply_updates(&[(BlockPos::new(15, -60, 0), DIRT)]);
+        assert_eq!(mirror.epoch(s0), 3);
+
+        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+        assert_eq!(mirror.epoch(s0), 4);
+        assert_eq!(mirror.epoch(s1), 1);
+
+        mirror.remove_chunk(ChunkPos::new(1, 0));
+        assert_eq!(mirror.epoch(s0), 5);
+        assert_eq!(mirror.epoch(s1), 1);
+    }
+
+    /// MS3(C01b-2):requeue(Edit) 弹出 Edit;requeue(Edit) 后再 requeue(Load) 不降级且不重复入队。
+    #[test]
+    fn ms3_requeue_priority_no_downgrade() {
+        let mut mirror = ChunkMirror::new();
+        let s0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+
+        mirror.requeue(s0, DirtyKind::Edit);
+        assert_eq!(mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
+        assert_eq!(mirror.pop_dirty(), None);
+
+        mirror.requeue(s0, DirtyKind::Edit);
+        mirror.requeue(s0, DirtyKind::Load);
+        assert_eq!(mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
+        assert_eq!(mirror.pop_dirty(), None);
+    }
+
+    /// MS4(C01b-2):异步网格任务过期判定纯函数。
+    #[test]
+    fn ms4_is_stale_epoch_check() {
+        assert!(is_stale(1, 2));
+        assert!(!is_stale(2, 2));
     }
 }

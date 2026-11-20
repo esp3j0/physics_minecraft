@@ -22,6 +22,7 @@ bevy = { version = "0.20.1", default-features = false, features = [
 ] }
 client-core = { path = "../client-core" }
 app = { path = "../app" }
+messaging = { path = "../messaging" }
 sim-api = { path = "../sim-api" }
 types = { path = "../types" }
 voxel = { path = "../voxel" }

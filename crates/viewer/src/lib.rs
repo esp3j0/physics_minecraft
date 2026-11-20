@@ -9,14 +9,12 @@
 pub mod bodies;
 /// REQ-008:命令行参数(交互 / 脚本模式)。
 pub mod cli;
-pub mod client;
 pub mod mesh;
 /// REQ-012 A06:附身状态机与意图映射(纯逻辑,零 macroquad)。
 pub mod possess;
 pub mod render;
-/// REQ-008:场景脚本(纯逻辑,零 macroquad)。
-pub mod script;
 /// REQ-011 W01:交互模式调试工具(纯逻辑层;拾取/预制/动作)。
 pub mod tools;
-/// REQ-008:世界状态(纯逻辑;渲染与脚本引擎共用)。
-pub mod world;
+
+/// REQ-013 C01b-2:纯逻辑层已迁入 `client-core`,此处 `pub use` 保持旧路径兼容(D10)。
+pub use client_core::{client, script, world};

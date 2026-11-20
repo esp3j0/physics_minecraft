@@ -1,0 +1,41 @@
+name = "client_block_edit"
+req = "REQ-013"
+description = "bevy 客户端单机放置与挖掘方块闭环,校验体素更新与异步网格编辑上传延迟"
+timeout_secs = 90
+
+[viewer]
+view_distance = 2
+
+[[step]]
+label = "初始俯视视角"
+camera = { pos = [0.0, -48.0, 24.0], yaw = -90.0, pitch = -26.565 }
+
+[[step]]
+wait_ticks = { n = 120 }
+
+[[step]]
+screenshot = { name = "before", expect = "平整棕色泥土地表,无凸起" }
+
+[[step]]
+set_block = { pos = [0, -60, 0], block = "stone" }
+
+[[step]]
+wait_ticks = { n = 10 }
+
+[[step]]
+check = { block = { pos = [0, -60, 0], is = "stone" } }
+
+[[step]]
+screenshot = { name = "after_place", expect = "(0,-60,0) 处凸起一格灰色石块,无闪烁残影" }
+
+[[step]]
+set_block = { pos = [0, -60, 0], block = "air" }
+
+[[step]]
+wait_ticks = { n = 10 }
+
+[[step]]
+check = { block = { pos = [0, -60, 0], is = "air" } }
+
+[[step]]
+screenshot = { name = "after_dig", expect = "地表恢复平整,无残影" }

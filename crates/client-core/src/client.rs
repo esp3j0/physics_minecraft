@@ -76,7 +76,7 @@ pub enum ViewEvent {
 /// 控制端(主循环 → 连接循环):观察者移动与主动离场。
 /// REQ-010 §5.4:Command/Spawn 的载荷不再 `Copy`,本枚举随之只有 `Clone`。
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Control {
+pub enum Control {
     /// 观察者位姿(渲染节流后送达;连接循环原样发 `C2S::MoveObserver`)。
     Move(Vec3),
     /// 白名单命令(引爆等;连接循环发 `C2S::Command`,翻译层在服务器侧)。
@@ -195,10 +195,10 @@ impl ControlHandle {
         let _ = self.tx.try_send(Control::Goodbye);
     }
 
-    /// 测试构造(仅 viewer 内部测试):有界内存通道(容量同生产 64),收端
+    /// 测试构造(供 viewer / client 内部测试):有界内存通道(容量同生产 64),收端
     /// 原样读回 [`Control`] 消息——`forward_commands` 的发送层断言用,不起线程。
-    #[cfg(test)]
-    pub(crate) fn for_test() -> (Self, std_mpsc::Receiver<Control>) {
+    #[doc(hidden)]
+    pub fn for_test() -> (Self, std_mpsc::Receiver<Control>) {
         let (tx, rx) = std_mpsc::sync_channel(CONTROL_CAPACITY);
         (Self { tx }, rx)
     }

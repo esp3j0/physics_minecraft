@@ -324,6 +324,7 @@ fn fixture(calibration: Option<CalibrationOutcome>) -> RunReport {
             failed_checks: usize::from(exit == 1),
             reason: None,
         }),
+        mesh_stats: None,
     };
     RunReport {
         scenarios: vec![

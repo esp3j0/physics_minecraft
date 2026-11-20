@@ -1830,6 +1830,7 @@ dependencies = [
  "app",
  "bevy",
  "client-core",
+ "messaging",
  "sim-api",
  "types",
  "voxel",
@@ -1841,8 +1842,12 @@ version = "0.1.0"
 dependencies = [
  "app",
  "messaging",
+ "serde",
+ "serde_json",
  "sim-api",
  "tempfile",
+ "tokio",
+ "toml",
  "types",
  "voxel",
 ]
@@ -5739,6 +5744,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "viewer"
 version = "0.1.0"
 dependencies = [
+ "client-core",
  "macroquad",
  "messaging",
  "serde",

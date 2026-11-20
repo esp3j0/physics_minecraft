@@ -67,9 +67,12 @@ pub fn run(args: Vec<String>) -> i32 {
                 out,
                 no_ai,
                 selftest,
+                client,
             }) => {
                 if selftest {
                     cmd_selftest(no_ai, out.as_deref())
+                } else if client {
+                    cmd_smoke_client(&selectors, out.as_deref(), no_ai)
                 } else {
                     cmd_smoke(&selectors, out.as_deref(), no_ai)
                 }
@@ -84,7 +87,7 @@ pub fn run(args: Vec<String>) -> i32 {
 
 /// 解析出的子命令。
 enum Command {
-    /// `smoke [场景名或路径 ...] [--out <目录>] [--no-ai] [--selftest]`。
+    /// `smoke [--client] [场景名或路径 ...] [--out <目录>] [--no-ai] [--selftest]`。
     Smoke {
         selectors: Vec<String>,
         out: Option<PathBuf>,
@@ -92,19 +95,22 @@ enum Command {
         no_ai: bool,
         /// 自检:跑 selftest-negative 与校准,预期失败全部发生才以 0 退出(AC-S8)。
         selftest: bool,
+        /// REQ-013 C01b-2:跑 bevy `client`(dev profile,单机进程内宿主,不起 app 服务器)。
+        client: bool,
     },
 }
 
-/// 参数解析:未知子命令、未知参数、缺值、重复旗标、`--selftest` 带选择项都报错。
+/// 参数解析:未知子命令、未知参数、缺值、重复旗标、`--selftest` 带选择项或与 `--client` 同现都报错。
 fn parse_args(args: &[String]) -> Result<Command, String> {
     let mut selectors = Vec::new();
     let mut out: Option<PathBuf> = None;
     let mut no_ai = false;
     let mut selftest = false;
+    let mut client = false;
     let mut iter = args.iter();
     let Some(sub) = iter.next() else {
         return Err(
-            "用法:cargo xtask smoke [场景名或路径 ...] [--out <目录>] [--no-ai] [--selftest]"
+            "用法:cargo xtask smoke [--client] [场景名或路径 ...] [--out <目录>] [--no-ai] [--selftest]"
                 .to_owned(),
         );
     };
@@ -132,6 +138,12 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 }
                 selftest = true;
             }
+            "--client" => {
+                if client {
+                    return Err("--client 重复给出".to_owned());
+                }
+                client = true;
+            }
             other => {
                 if other.starts_with("--") {
                     return Err(format!("未知参数 `{other}`"));
@@ -143,11 +155,15 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if selftest && !selectors.is_empty() {
         return Err("--selftest 只跑内置的 selftest-negative,不接受场景选择项".to_owned());
     }
+    if selftest && client {
+        return Err("--selftest 与 --client 互斥".to_owned());
+    }
     Ok(Command::Smoke {
         selectors,
         out,
         no_ai,
         selftest,
+        client,
     })
 }
 
@@ -281,6 +297,300 @@ fn cmd_smoke(selectors: &[String], out: Option<&Path>, no_ai: bool) -> i32 {
     let code = smoke::overall_exit_code(&runs);
     println!("overall_exit_code = {code}");
     code
+}
+
+/// `cargo xtask smoke --client`(REQ-013 C01b-2 §3.2):dev profile 构建 `client`
+/// (依赖已配 opt-level=2),单机进程内宿主跑场景(不起 app 服务器),共用 AI 审图与报告路径。
+fn cmd_smoke_client(selectors: &[String], out: Option<&Path>, no_ai: bool) -> i32 {
+    let repo_root = repo_root();
+    let scenario_dir = repo_root.join(SCENARIO_DIR);
+    let scenarios = match smoke::resolve_scenarios(&scenario_dir, selectors) {
+        Ok(paths) => paths,
+        Err(e) => {
+            eprintln!("场景选择失败:{e}");
+            return 2;
+        }
+    };
+
+    if let Err(e) = cargo_build_client_dev(&repo_root) {
+        eprintln!("编译 client 失败:{e}");
+        return 2;
+    }
+    let target_dir = target_dir(&repo_root);
+    let client_bin = target_dir.join("debug").join(if cfg!(windows) {
+        "client.exe"
+    } else {
+        "client"
+    });
+    if !client_bin.is_file() {
+        eprintln!("编译产物缺失:{}", client_bin.display());
+        return 2;
+    }
+
+    let out_root = std::path::absolute(out.map(Path::to_path_buf).unwrap_or_else(|| {
+        let stamp = timestamp_now();
+        target_dir.join("smoke").join(format!("client-{stamp}"))
+    }))
+    .expect("out_root 转绝对路径失败");
+    if let Err(e) = std::fs::create_dir_all(&out_root) {
+        eprintln!("创建输出目录 {} 失败:{e}", out_root.display());
+        return 2;
+    }
+
+    let mut entries: Vec<ScenarioEntry> = Vec::new();
+    for path in &scenarios {
+        println!("=== [client] 场景 {} ===", path.display());
+        let (run, manifest) = run_client_scenario(path, &repo_root, &client_bin, &out_root);
+        println!(
+            "--- {}:{name}(client 退出码 {exit:?}{timeout};panic {panic})\n",
+            if run.passed() { "通过" } else { "未通过" },
+            name = run.name,
+            exit = run.viewer_exit,
+            timeout = if run.timed_out {
+                ",编排器超时"
+            } else {
+                ""
+            },
+            panic = if run.server_panicked { "是" } else { "否" },
+        );
+        entries.push(ScenarioEntry { run, manifest });
+    }
+
+    let (calibration, shots) = if no_ai {
+        println!("AI 审图:未运行(--no-ai),截图全部标记待复核");
+        (None, collect_shots(&entries))
+    } else {
+        match review_all(&repo_root, &out_root, &entries) {
+            Ok(pair) => pair,
+            Err(e) => {
+                eprintln!("AI 审图中止:{e}(全部截图标记待复核)");
+                (None, collect_shots(&entries))
+            }
+        }
+    };
+
+    let report = RunReport {
+        scenarios: entries,
+        calibration,
+        shots,
+    };
+    for (name, content) in [
+        ("report.md", report_markdown(&report)),
+        ("report.json", report_json(&report)),
+    ] {
+        let path = out_root.join(name);
+        if let Err(e) = std::fs::write(&path, content) {
+            eprintln!("写 {} 失败:{e}", path.display());
+            return 2;
+        }
+        println!("报告:{}", path.display());
+    }
+
+    println!(
+        "==== [client] 汇总(共 {} 个场景)====",
+        report.scenarios.len()
+    );
+    for entry in &report.scenarios {
+        let run = &entry.run;
+        println!(
+            "[{}] {name}:client 退出码 {exit:?}{};panic {panic}",
+            if run.passed() { "通过" } else { "未通过" },
+            if run.timed_out {
+                ";编排器超时"
+            } else {
+                ""
+            },
+            name = run.name,
+            exit = run.viewer_exit,
+            panic = if run.server_panicked { "是" } else { "否" },
+        );
+    }
+    let runs: Vec<ScenarioRun> = report.scenarios.iter().map(|e| e.run.clone()).collect();
+    let code = smoke::overall_exit_code(&runs);
+    println!("overall_exit_code = {code}");
+    code
+}
+
+/// 校客户端 `client_block_edit` 场景的异步网格上传机器断言(C01b-2 §3.2 / PM10 靶):
+/// 要求 `uploads >= 1` 且 `1 <= max_edit_upload_frames <= 2`。
+fn verify_client_mesh_stats(
+    scenario_name: &str,
+    manifest: Option<&Manifest>,
+) -> Result<(), String> {
+    if scenario_name != "client_block_edit" {
+        return Ok(());
+    }
+    let Some(m) = manifest else {
+        return Err("client_block_edit 缺失 manifest,无法校验 mesh_stats".to_owned());
+    };
+    let Some(ms) = m.mesh_stats else {
+        return Err("client_block_edit manifest 缺失 mesh_stats 字段".to_owned());
+    };
+    if ms.uploads < 1 {
+        return Err(format!(
+            "client_block_edit 机器断言失败: mesh_stats.uploads = {} (要求 >= 1)",
+            ms.uploads
+        ));
+    }
+    if !(1..=2).contains(&ms.max_edit_upload_frames) {
+        return Err(format!(
+            "client_block_edit 机器断言失败: mesh_stats.max_edit_upload_frames = {} (要求 1..=2)",
+            ms.max_edit_upload_frames
+        ));
+    }
+    Ok(())
+}
+
+/// `cargo build -j 10 -p client`(dev profile,依赖 opt-level=2 已在根 Cargo.toml 配置)。
+fn cargo_build_client_dev(repo_root: &Path) -> Result<(), String> {
+    let status = std::process::Command::new("cargo")
+        .args(["build", "-j", "10", "-p", "client"])
+        .current_dir(repo_root)
+        .status()
+        .map_err(|e| format!("cargo 启动失败:{e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo build -p client 失败:{status}"))
+    }
+}
+
+/// 跑单个 client 冒烟场景(TempDir 世界目录 → 校验 [server] 白名单 → 起 client --script → 扫 panic + 校验 mesh_stats)。
+fn run_client_scenario(
+    path: &Path,
+    repo_root: &Path,
+    client_bin: &Path,
+    out_root: &Path,
+) -> (ScenarioRun, Option<Manifest>) {
+    let failed = |name: &str| ScenarioRun {
+        name: name.to_owned(),
+        viewer_exit: None,
+        timed_out: false,
+        server_panicked: false,
+    };
+    let name = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(name) => name.to_owned(),
+        None => return (failed(""), None),
+    };
+    let out_dir = out_root.join(&name);
+    if let Err(e) = std::fs::create_dir_all(&out_dir) {
+        eprintln!("创建场景输出目录 {} 失败:{e}", out_dir.display());
+        return (failed(&name), None);
+    }
+
+    let scenario = match std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| viewer::script::parse_scenario(&text).map_err(|e| e.to_string()))
+    {
+        Ok(scenario) => scenario,
+        Err(e) => {
+            eprintln!("场景 {} 解析失败:{e}", path.display());
+            return (failed(&name), None);
+        }
+    };
+
+    // 临时世界目录(场景结束后 Drop 守卫自动清理,绝不触碰仓库根 data/)。
+    let data_dir =
+        std::env::temp_dir().join(format!("xtask-smoke-client-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        eprintln!("创建临时世界目录 {} 失败:{e}", data_dir.display());
+        return (failed(&name), None);
+    }
+    struct DirGuard<'a>(&'a Path);
+    impl Drop for DirGuard<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0);
+        }
+    }
+    let _guard = DirGuard(&data_dir);
+
+    // 校验 [server] 白名单(同服务器路径口径,但不启动 app 服务器)。
+    if let Err(e) = server_config(&scenario.server, "127.0.0.1:0", &data_dir) {
+        eprintln!("场景 [server] 配置校验失败:{e}");
+        return (failed(&name), None);
+    }
+
+    let stdout_file =
+        std::fs::File::create(out_dir.join("client.stdout.log")).expect("创建 client 标准输出日志");
+    let stderr_file =
+        std::fs::File::create(out_dir.join("client.stderr.log")).expect("创建 client 标准错误日志");
+
+    let view_distance = scenario.view_distance.unwrap_or(8);
+    let wait = Duration::from_secs(scenario.timeout_secs) + VIEWER_GRACE;
+    let mut child = match std::process::Command::new(client_bin)
+        .arg("--world-dir")
+        .arg(&data_dir)
+        .arg("--script")
+        .arg(path)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--view-distance")
+        .arg(view_distance.to_string())
+        .current_dir(repo_root)
+        .stdout(stdout_file)
+        .stderr(stderr_file)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("启动 client 失败:{e}");
+            return (failed(&name), None);
+        }
+    };
+
+    #[allow(clippy::disallowed_methods)]
+    let started = Instant::now();
+    let mut timed_out = false;
+    let mut client_exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("等待 client 失败:{e}");
+                break None;
+            }
+        }
+        if started.elapsed() > wait {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let read_log = |file: &str| std::fs::read_to_string(out_dir.join(file)).unwrap_or_default();
+    let panicked = matches!(
+        scan_server_log(
+            &read_log("client.stdout.log"),
+            &read_log("client.stderr.log")
+        ),
+        ServerLog::Panicked { .. }
+    );
+
+    let manifest = std::fs::read_to_string(out_dir.join("manifest.json"))
+        .ok()
+        .and_then(|text| Manifest::from_json(&text).ok());
+
+    if client_exit == Some(0)
+        && !timed_out
+        && !panicked
+        && let Err(msg) = verify_client_mesh_stats(&name, manifest.as_ref())
+    {
+        eprintln!("{msg}");
+        client_exit = Some(1);
+    }
+
+    (
+        ScenarioRun {
+            name,
+            viewer_exit: client_exit,
+            timed_out,
+            server_panicked: panicked,
+        },
+        manifest,
+    )
 }
 
 /// 跑单个场景(配置 → 服务器 → viewer → 收尾),产出 ([`ScenarioRun`], manifest)。
@@ -873,7 +1183,7 @@ mod tests {
     fn parse_args_smoke_selectors_and_flags() {
         let cmd = parse_args(&["smoke".to_owned()]).expect("无选择项 = 全部场景");
         assert!(
-            matches!(cmd, Command::Smoke { ref selectors, out: None, no_ai: false, selftest: false } if selectors.is_empty()),
+            matches!(cmd, Command::Smoke { ref selectors, out: None, no_ai: false, selftest: false, client: false } if selectors.is_empty()),
             "无选择项 = 全部场景"
         );
         let cmd = parse_args(&[
@@ -890,11 +1200,29 @@ mod tests {
             out,
             no_ai,
             selftest,
+            client,
         } = &cmd;
         assert_eq!(selectors, &["a", "b"]);
         assert_eq!(*out, Some(PathBuf::from("o")));
         assert!(*no_ai, "--no-ai 被接受");
         assert!(!*selftest);
+        assert!(!*client);
+        let cmd = parse_args(&[
+            "smoke".to_owned(),
+            "--client".to_owned(),
+            "client_startup".to_owned(),
+            "--no-ai".to_owned(),
+        ])
+        .expect("--client 被接受");
+        assert!(matches!(
+            cmd,
+            Command::Smoke {
+                client: true,
+                no_ai: true,
+                selftest: false,
+                ..
+            }
+        ));
         let cmd = parse_args(&["smoke".to_owned(), "--selftest".to_owned()]).expect("自检");
         assert!(
             matches!(
@@ -902,6 +1230,7 @@ mod tests {
                 Command::Smoke {
                     selftest: true,
                     no_ai: false,
+                    client: false,
                     ..
                 }
             ),
@@ -915,6 +1244,8 @@ mod tests {
             vec!["smoke", "--no-ai", "--no-ai"],
             vec!["smoke", "--selftest", "--selftest"],
             vec!["smoke", "--selftest", "basic-world"],
+            vec!["smoke", "--client", "--client"],
+            vec!["smoke", "--client", "--selftest"],
         ] {
             let args: Vec<String> = bad.iter().map(|s| (*s).to_owned()).collect();
             assert!(parse_args(&args).is_err(), "应报错:{bad:?}");
@@ -960,6 +1291,7 @@ mod tests {
                 description: "d".to_owned(),
                 steps,
                 result: None,
+                mesh_stats: None,
             }
         };
         // 预期失败发生:退出码 1 + 一步 check_failed → 全部成立 → 0。
@@ -1024,6 +1356,7 @@ mod tests {
             description: "d".to_owned(),
             steps,
             result: None,
+            mesh_stats: None,
         };
         let entries = vec![
             ScenarioEntry {
@@ -1161,6 +1494,7 @@ mod tests {
                 description: "d".to_owned(),
                 steps: vec![step("screenshot", Some(shot))],
                 result: None,
+                mesh_stats: None,
             }),
         }];
         // 故意用相对 out_root(验收两轮也用相对 --out,以此证明修复有效)。
@@ -1185,6 +1519,80 @@ mod tests {
         assert!(
             image.ends_with("alpha/02-a.png") || image.ends_with("alpha\\02-a.png"),
             "路径仍应指向场景目录下的截图:{image:?}"
+        );
+    }
+
+    /// C01b-2 §3.2:`client_block_edit` 的 mesh_stats 机器断言校验 `uploads >= 1` 与
+    /// `1 <= max_edit_upload_frames <= 2`,其余场景不强检。
+    #[test]
+    fn verify_client_mesh_stats_enforces_edit_bounds() {
+        use viewer::script::manifest::ManifestMeshStats;
+
+        let make = |ms| Manifest {
+            scenario: "client_block_edit".to_owned(),
+            req: Some("REQ-013".to_owned()),
+            description: "d".to_owned(),
+            steps: vec![],
+            result: None,
+            mesh_stats: ms,
+        };
+        assert!(verify_client_mesh_stats("client_startup", None).is_ok());
+        assert!(verify_client_mesh_stats("client_block_edit", None).is_err());
+        assert!(verify_client_mesh_stats("client_block_edit", Some(&make(None))).is_err());
+        assert!(
+            verify_client_mesh_stats(
+                "client_block_edit",
+                Some(&make(Some(ManifestMeshStats {
+                    max_edit_upload_frames: 1,
+                    uploads: 0,
+                    discards: 0,
+                })))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_mesh_stats(
+                "client_block_edit",
+                Some(&make(Some(ManifestMeshStats {
+                    max_edit_upload_frames: 0,
+                    uploads: 10,
+                    discards: 0,
+                })))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_mesh_stats(
+                "client_block_edit",
+                Some(&make(Some(ManifestMeshStats {
+                    max_edit_upload_frames: 3,
+                    uploads: 10,
+                    discards: 0,
+                })))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_mesh_stats(
+                "client_block_edit",
+                Some(&make(Some(ManifestMeshStats {
+                    max_edit_upload_frames: 1,
+                    uploads: 25,
+                    discards: 0,
+                })))
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_client_mesh_stats(
+                "client_block_edit",
+                Some(&make(Some(ManifestMeshStats {
+                    max_edit_upload_frames: 2,
+                    uploads: 25,
+                    discards: 1,
+                })))
+            )
+            .is_ok()
         );
     }
 }

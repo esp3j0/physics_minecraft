@@ -1,0 +1,20 @@
+name = "client_startup"
+req = "REQ-013"
+description = "bevy 客户端单机启动装载视距 2 超平坦地表并校验块数与无悬空实体"
+timeout_secs = 90
+
+[viewer]
+view_distance = 2
+
+[[step]]
+label = "初始俯视视角"
+camera = { pos = [0.0, -48.0, 24.0], yaw = -90.0, pitch = -26.565 }
+
+[[step]]
+wait_ticks = { n = 120 }
+
+[[step]]
+check = { chunks_loaded = { eq = 25 }, no_floating = { height = 1.5, still_ticks = 30 } }
+
+[[step]]
+screenshot = { name = "startup", expect = "棕色泥土地表连续无空洞,视距方形边界可见" }

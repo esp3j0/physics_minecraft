@@ -14,6 +14,14 @@ use serde::{Deserialize, Serialize};
 
 use super::{EngineStatus, Scenario, StepOutcome, StepRecord, WorldQuery};
 
+/// 客户端异步网格上传统计(REQ-013 C01b-2 §2.2/§3.1;本地 manifest 字段,非协议)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestMeshStats {
+    pub max_edit_upload_frames: u32,
+    pub uploads: u64,
+    pub discards: u64,
+}
+
 /// 场景运行记录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -22,6 +30,9 @@ pub struct Manifest {
     pub description: String,
     pub steps: Vec<ManifestStep>,
     pub result: Option<ManifestResult>,
+    /// 客户端异步网格上传测量统计(缺省为 `None`,保证旧 manifest JSON 可读)。
+    #[serde(default)]
+    pub mesh_stats: Option<ManifestMeshStats>,
 }
 
 /// 一步的记录。
@@ -86,6 +97,7 @@ impl Manifest {
             description: scenario.description.clone(),
             steps: Vec::new(),
             result: None,
+            mesh_stats: None,
         }
     }
 
@@ -370,5 +382,24 @@ mod tests {
         let result = m.result.as_ref().expect("结果已写");
         assert_eq!(result.status, "failed");
         assert_eq!(result.failed_checks, 0, "error 步骤不计 check_failed");
+    }
+
+    /// REQ-013 C01b-2:无 `mesh_stats` 字段的旧 manifest JSON 可读(`None`),
+    /// 带 `mesh_stats` 的新 manifest 往返逐字段一致。
+    #[test]
+    fn manifest_mesh_stats_backcompat_and_roundtrip() {
+        let mut m = sample();
+        let legacy_json =
+            r#"{"scenario":"t","req":"REQ-008","description":"d","steps":[],"result":null}"#;
+        let parsed = Manifest::from_json(legacy_json).expect("旧 manifest 无 mesh_stats 可读");
+        assert_eq!(parsed.mesh_stats, None);
+
+        m.mesh_stats = Some(ManifestMeshStats {
+            max_edit_upload_frames: 2,
+            uploads: 42,
+            discards: 3,
+        });
+        let back = Manifest::from_json(&m.to_json()).expect("新 manifest 可读");
+        assert_eq!(back.mesh_stats, m.mesh_stats);
     }
 }

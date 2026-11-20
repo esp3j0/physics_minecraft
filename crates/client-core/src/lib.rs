@@ -4,12 +4,43 @@
 //! C01a 建立传输边界 [`Transport`] 与进程内单机实现 [`LocalTransport`];
 //! C01b-1 建立世界镜像 [`mirror`] 与 subchunk 网格生成 [`mesh`]。
 
+pub mod client;
 pub mod mesh;
 pub mod mirror;
+pub mod script;
+pub mod world;
 
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use app::config::Config;
 use app::driver::AppError;
 use app::local::{LocalConfig, LocalHandle, LocalHost};
 use sim_api::proto::{C2S, S2C};
+
+/// 将场景 TOML 的 `[server]` 覆写表与 `data_dir` 转为 `app::config::Config`
+/// (与 `xtask::smoke::server_config` 同白名单与 `Config::from_toml_str` 校验口径,用于
+/// `client --script` 单机进程内装配)。
+pub fn config_from_server_table(server: &toml::Table, data_dir: &Path) -> Result<Config, String> {
+    let known: BTreeSet<String> = Config::default()
+        .to_toml_string()
+        .parse::<toml::Table>()
+        .expect("默认配置的 toml 输出必为表")
+        .keys()
+        .cloned()
+        .collect();
+    for key in server.keys() {
+        if !known.contains(key) {
+            return Err(format!("未知的 [server] 覆盖键 `{key}`"));
+        }
+    }
+    let overrides = toml::to_string(server).map_err(|e| format!("覆盖项序列化失败:{e}"))?;
+    let text = format!(
+        "data_dir = {:?}\n{overrides}",
+        data_dir.display().to_string()
+    );
+    Config::from_toml_str(&text).map_err(|e| e.to_string())
+}
 
 /// 传输边界(REQ-013 §3.1):单机 in-process,未来多人换网络实现,
 /// 客户端核代码路径不变。

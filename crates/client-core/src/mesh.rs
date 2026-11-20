@@ -2,10 +2,33 @@
 //!
 //! 纯函数、零渲染依赖、零墙钟。输出世界坐标顶点/法向/烘焙顶点色与 `u32` 三角索引。
 
-use types::{BlockId, BlockPos, CHUNK_SIZE, WORLD_Y_MIN};
-use voxel::{CHUNK_X, CHUNK_Z};
+use std::sync::Arc;
+
+use types::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
+use voxel::{CHUNK_X, CHUNK_Z, Chunk};
 
 use crate::mirror::{ChunkMirror, SECTION_HEIGHT, SECTIONS_PER_CHUNK, SubchunkPos};
+
+/// 异步网格任务持有的只读体素快照:中心 chunk 与四水平邻 chunk。
+///
+/// `neighbors` 固定顺序为 `(-1, 0), (1, 0), (0, -1), (0, 1)`(与 `mirror::HORIZONTAL_NEIGHBORS` 一致)。
+#[derive(Clone)]
+pub struct ChunkSnapshot {
+    pub center: Arc<Chunk>,
+    pub neighbors: [Option<Arc<Chunk>>; 4],
+}
+
+/// 从镜像截取单段所需的只读快照(仅 clone `Arc`,零拷贝);中心 chunk 未装载返回 `None`。
+pub fn snapshot(mirror: &ChunkMirror, sc: SubchunkPos) -> Option<ChunkSnapshot> {
+    let center = mirror.chunk_arc(sc.chunk)?;
+    let neighbors = [
+        mirror.chunk_arc(ChunkPos::new(sc.chunk.x - 1, sc.chunk.z)),
+        mirror.chunk_arc(ChunkPos::new(sc.chunk.x + 1, sc.chunk.z)),
+        mirror.chunk_arc(ChunkPos::new(sc.chunk.x, sc.chunk.z - 1)),
+        mirror.chunk_arc(ChunkPos::new(sc.chunk.x, sc.chunk.z + 1)),
+    ];
+    Some(ChunkSnapshot { center, neighbors })
+}
 
 /// 单个 subchunk 的网格几何数据(世界坐标)。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -100,16 +123,28 @@ pub fn block_color(id: BlockId) -> [f32; 4] {
     }
 }
 
-/// 生成单个 subchunk 的网格(纯函数):跨 chunk 查询邻格与顶点 AO 采样,烘焙方向亮度与 AO。
+/// 生成单个 subchunk 的网格(纯函数):从镜像截取快照后委托 [`mesh_subchunk_snapshot`]。
 /// 未装载 chunk、非法段号或全空气段返回四个全空 `Vec`。
 pub fn mesh_subchunk(mirror: &ChunkMirror, sc: SubchunkPos) -> SubchunkMesh {
+    if sc.section >= SECTIONS_PER_CHUNK {
+        return SubchunkMesh::default();
+    }
+    let Some(snap) = snapshot(mirror, sc) else {
+        return SubchunkMesh::default();
+    };
+    mesh_subchunk_snapshot(&snap, sc)
+}
+
+/// 基于只读快照 [`ChunkSnapshot`] 生成单个 subchunk 的网格(纯函数,供异步任务池调用)。
+///
+/// 算法与输出(面序/绕序/AO/方向亮度/方块色)与 [`mesh_subchunk`] 完全一致;
+/// 邻格与 AO 采样走 `center` + 四水平邻 `(-1,0),(1,0),(0,-1),(0,1)`,越界或 `None` 视为空气。
+pub fn mesh_subchunk_snapshot(snap: &ChunkSnapshot, sc: SubchunkPos) -> SubchunkMesh {
     let mut mesh = SubchunkMesh::default();
     if sc.section >= SECTIONS_PER_CHUNK {
         return mesh;
     }
-    let Some(chunk) = mirror.chunk(sc.chunk) else {
-        return mesh;
-    };
+    let chunk = snap.center.as_ref();
 
     let origin_x = sc.chunk.x * CHUNK_SIZE;
     let origin_z = sc.chunk.z * CHUNK_SIZE;
@@ -133,7 +168,7 @@ pub fn mesh_subchunk(mirror: &ChunkMirror, sc: SubchunkPos) -> SubchunkMesh {
                     let mut outer = cell;
                     outer[face.axis] += face.sign;
                     let neighbor_pos = BlockPos::new(outer[0], outer[1], outer[2]);
-                    if is_solid(mirror, neighbor_pos) {
+                    if is_solid_in_snapshot(snap, sc.chunk, neighbor_pos) {
                         continue;
                     }
 
@@ -158,9 +193,17 @@ pub fn mesh_subchunk(mirror: &ChunkMirror, sc: SubchunkPos) -> SubchunkMesh {
                         c[v_axis] += dv;
 
                         let ao_level = vertex_ao(
-                            is_solid(mirror, BlockPos::new(s1[0], s1[1], s1[2])),
-                            is_solid(mirror, BlockPos::new(s2[0], s2[1], s2[2])),
-                            is_solid(mirror, BlockPos::new(c[0], c[1], c[2])),
+                            is_solid_in_snapshot(
+                                snap,
+                                sc.chunk,
+                                BlockPos::new(s1[0], s1[1], s1[2]),
+                            ),
+                            is_solid_in_snapshot(
+                                snap,
+                                sc.chunk,
+                                BlockPos::new(s2[0], s2[1], s2[2]),
+                            ),
+                            is_solid_in_snapshot(snap, sc.chunk, BlockPos::new(c[0], c[1], c[2])),
                         );
                         let ao_factor = 0.4 + 0.2 * f32::from(ao_level);
                         let shade = face.brightness * ao_factor;
@@ -196,8 +239,37 @@ pub fn mesh_subchunk(mirror: &ChunkMirror, sc: SubchunkPos) -> SubchunkMesh {
 }
 
 #[inline]
-fn is_solid(mirror: &ChunkMirror, pos: BlockPos) -> bool {
-    mirror.get_block(pos).is_some_and(|id| !id.is_air())
+fn is_solid_in_snapshot(snap: &ChunkSnapshot, center_pos: ChunkPos, world: BlockPos) -> bool {
+    if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&world.y) {
+        return false;
+    }
+    let cpos = world.chunk_of();
+    let dx = cpos.x - center_pos.x;
+    let dz = cpos.z - center_pos.z;
+    let chunk: &Chunk = match (dx, dz) {
+        (0, 0) => snap.center.as_ref(),
+        (-1, 0) => match snap.neighbors[0].as_deref() {
+            Some(c) => c,
+            None => return false,
+        },
+        (1, 0) => match snap.neighbors[1].as_deref() {
+            Some(c) => c,
+            None => return false,
+        },
+        (0, -1) => match snap.neighbors[2].as_deref() {
+            Some(c) => c,
+            None => return false,
+        },
+        (0, 1) => match snap.neighbors[3].as_deref() {
+            Some(c) => c,
+            None => return false,
+        },
+        _ => return false,
+    };
+    let lx = world.x.rem_euclid(CHUNK_SIZE) as usize;
+    let ly = (world.y - WORLD_Y_MIN) as usize;
+    let lz = world.z.rem_euclid(CHUNK_SIZE) as usize;
+    !chunk.get(lx, ly, lz).is_air()
 }
 
 #[cfg(test)]
@@ -416,5 +488,46 @@ mod tests {
         assert_eq!(mirror.pop_dirty(), Some((s0, DirtyKind::Edit)));
         assert_eq!(mirror.pop_dirty(), Some((s1, DirtyKind::Edit)));
         assert_eq!(mirror.pop_dirty(), None);
+    }
+
+    /// MS1(C01b-2):L 形快照网格与 `mesh_subchunk` 四 Vec 逐元素相等(56 顶点/84 索引);
+    /// 跨 chunk(MA4 双 chunk)快照版 positions.len()==20。
+    #[test]
+    fn ms1_snapshot_mesh_matches_direct_and_cross_chunk() {
+        // L 形(同 MA3):B1(0,-60,0), B2(1,-60,0), B3(1,-59,0)
+        let mut mirror = ChunkMirror::new();
+        let mut chunk = Chunk::air();
+        chunk.set(0, 4, 0, STONE);
+        chunk.set(1, 4, 0, STONE);
+        chunk.set(1, 5, 0, STONE);
+        mirror.insert_chunk(ChunkPos::new(0, 0), chunk);
+
+        let s0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+        let snap = snapshot(&mirror, s0).expect("chunk(0,0) 已装载");
+        let m_snap = mesh_subchunk_snapshot(&snap, s0);
+        let m_direct = mesh_subchunk(&mirror, s0);
+
+        assert_eq!(m_snap.positions, m_direct.positions);
+        assert_eq!(m_snap.normals, m_direct.normals);
+        assert_eq!(m_snap.colors, m_direct.colors);
+        assert_eq!(m_snap.indices, m_direct.indices);
+        assert_eq!(m_snap.positions.len(), 56);
+        assert_eq!(m_snap.indices.len(), 84);
+
+        // 跨 chunk(同 MA4):chunk(0,0)@(15,-60,0) 与 chunk(1,0)@(16,-60,0)
+        let mut cross = ChunkMirror::new();
+        let mut c0 = Chunk::air();
+        c0.set(15, 4, 0, STONE);
+        let mut c1 = Chunk::air();
+        c1.set(0, 4, 0, STONE);
+        cross.insert_chunk(ChunkPos::new(0, 0), c0);
+        cross.insert_chunk(ChunkPos::new(1, 0), c1);
+
+        let snap_cross = snapshot(&cross, s0).expect("chunk(0,0) 已装载");
+        let m_cross = mesh_subchunk_snapshot(&snap_cross, s0);
+        assert_eq!(m_cross.positions.len(), 20);
     }
 }
