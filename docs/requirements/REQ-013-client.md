@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:草案(方向已拍板,细节待评审)
+- 状态:已确认(2026-11-20 定稿;Q1–Q4 拍板见 §10)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -89,15 +89,43 @@ REQ-004A 的 macroquad viewer 是"服务器状态 → 插值渲染"的 demo(#9 �
 - 驱动侧复用 `app` 的命令翻译/校验白名单(net `translate`),
   **单机不绕校验**——命令合法性口径与多人完全一致。
 
-### 3.2 拍与时间
+### 3.2 拍与时间(线程模型)
 
-- sim 固定 60 Hz(`dt = 1/60`,与 `app/config.rs` 共识 1 一致);
-  渲染与 sim 解耦(bevy `FixedUpdate` 驱动 sim,渲染每帧取最新状态)。
+- sim 固定 60 Hz(`dt = 1/60`,与 `app/config.rs` 共识 1 一致)。
+- **宿主 = 独立后台 OS 线程**跑 `app::driver`(current_thread tokio
+  runtime,与 `viewer::client` 同款模式),固定 60 Hz 步进;**bevy 主线程
+  每帧排空 S2C 通道渲染最新态**。不用 bevy `FixedUpdate` 驱动 sim——
+  渲染掉帧/卡顿天然不拖慢、不改变 sim 拍序(AC4 由结构保证),且与
+  未来多人模式(独立网络线程)客户端侧线程/事件消费模型完全一致。
+- 单元测试无时钟步进:`tokio::time::pause()`(app dev-deps 已有
+  tokio/test-util)或单拍驱动入口;客户端核不读墙钟(继承 possess
+  状态机纪律)。
 - 单机渲染**直接取最新**(与 viewer possess 现行口径一致,不插值);
   多人远端实体插值需要的时间戳信息,`EntityStates.tick` 已携带,
   边界消息不需要改。
-- 客户端核不读墙钟:时间一律由壳传入(继承 possess 状态机纪律,
-  纯逻辑可单测)。
+- **单机观察节奏 = 每拍推**:宿主 `ObserveCadence.interval_ticks = 1`
+  (网络默认 10 拍 = 6 Hz,单机不插值下会呈 6 FPS 抽搐;全量周期
+  沿用 60)。chunk 泵速单机适度放宽(`PumpConfig.interval_ms` 小于
+  网络默认 100 ms)。AC2 对账两侧共用同一 cadence/泵配置。
+
+### 3.2a 宿主装配(复用 app,不拼第二套)
+
+单机宿主**直接复用 `app::driver`**,不另拼轻量 Session:
+
+- `driver::run` 本身零 TCP 依赖(`DriverArgs.observe: Option<ObserveLink>`;
+  socket 只在 `net::serve`);命令翻译 `net::translate`(纯函数)、
+  chunk 流 `ChunkStreamState`/`StreamLink::spawn` 均独立可复用。
+- 复用即零重写获得:命令白名单校验、Spawn ID 高水位、附身表与主体
+  清扫、PolicyWorker 推理线程、StartupAgents、redb 持久化屏障与
+  checkpoint 轮转。
+- 落点 = **`app` crate 新模块 `app::local`**:`OutboundHub::register`
+  是 `pub(crate)`,进程内注册本地玩家必须在 app 内;不改动既有
+  可见性、不改 driver/net 行为。
+- 存档:与服务器同一 `bootstrap` 路径、同一 redb 格式(v5 lz4 bundle),
+  零格式改造。世界目录由 `--world-dir` 显式指定;测试/冒烟一律
+  `tempfile::TempDir`,**绝不默认触碰仓库根 `data/`**。同一世界目录
+  不能被两个进程同时打开(redb 文件锁),打开失败报清晰错误,
+  不静默覆盖。
 
 ### 3.3 多人预留的协议扩展(本 REQ 定 schema,不实现网络)
 
@@ -114,6 +142,10 @@ REQ-004A 的 macroquad viewer 是"服务器状态 → 插值渲染"的 demo(#9 �
 命令 seq:现有 C2S 命令不带序号。扩展方式 = 追加
 `Sequenced { seq: u64, inner: Box<C2S> }` 包装(只追加、旧包不动),
 单机 in-process 也走包装,保证多人落地时客户端不重写输入路径。
+**schema 前置到 C01a**(纯数据结构 + codec 往返,几十行),避免
+C04 回头改 C01/C02 发送层;C01a 阶段驱动对 `Sequenced` 透明转发
+inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
+不产生。
 
 **带宽预设计**(多人落地时按此实施,本 REQ 只定口径与预算):
 
@@ -130,13 +162,19 @@ REQ-004A 的 macroquad viewer 是"服务器状态 → 插值渲染"的 demo(#9 �
 
 | 项 | 预算 | 口径 |
 | --- | --- | --- |
-| sim 步进 | ≤ 8 ms/拍 @ 64 主体 + 视距 8 chunk | 60 Hz 帧预算 16.6 ms 的一半留给渲染;`Session` 单片基准 |
+| sim 步进 | ≤ 8 ms/拍 @ 基线组合 + 视距 8 chunk | 60 Hz 帧预算 16.6 ms 的一半留给渲染;`Session` 单片基准 |
 | 策略推理 | ≤ 2 ms/主体·控制拍 | tract CPU,control_period=2 拍(30 Hz);worker 线程不阻塞 tick(复用 D01b-2 模式) |
-| 渲染 | ≥ 60 FPS @ 上述规模 | bevy 壳,视距 8 |
-| meshing | 异步,不占渲染线程;单 chunk 重网格 ≤ 4 ms | bevy AsyncComputeTaskPool;编辑 → 画面 ≤ 2 帧 |
+| 渲染 | ≥ 60 FPS @ 基线组合 | bevy 壳,视距 8 |
+| meshing | 异步,不占渲染线程;单 subchunk 重网格 ≤ 4 ms | bevy AsyncComputeTaskPool;编辑 → 画面 ≤ 2 帧 |
 | 输入延迟 | 输入 → sim 生效 ≤ 1 拍;方块编辑 → 画面 ≤ 2 帧 | 单机本地生效,无网络往返 |
 | 内存 | chunk 缓存 LRU 上限可配;主体流环形缓冲 | 无界增长 = 缺陷 |
 | 多人带宽 | ≤ 64 KB/s/客户端 @32 可见主体 | 预留口径,未来 REQ 校准 |
+
+**基线组合(算力口径,防串行推理超预算)**:64 个**无策略**激活刚体
++ **4 只策略狗**(quad_gpu1)+ 视距 8 chunk。现有 PolicyWorker 是
+单工作线程串行推理:控制拍预算 33.3 ms,4 × 2 ms = 8 ms 富余充足;
+若 64 只全跑策略则 64 × 2 ms = 128 ms 必然超时降级——**64 只策略狗
+不是本 REQ 基线**,batch/多线程推理单列未来优化项,不在 C01 口径内。
 
 性能基线报告(sim ms/拍、推理 ms/主体、meshing ms/chunk、FPS、
 内存)是验收件,归档本文档 §10。
@@ -144,18 +182,56 @@ REQ-004A 的 macroquad viewer 是"服务器状态 → 插值渲染"的 demo(#9 �
 ## 5. bevy 渲染栈与可搬运性
 
 - **sim 内核保持 bevy 无关**:physics-sim/shard/policy 以库形式被
-  bevy 系统驱动,**不用 bevy_rapier3d 插件**(现有 rapier3d 0.36
+  宿主驱动,**不用 bevy_rapier3d 插件**(现有 rapier3d 0.36
   内核 + agent 电机/冻结/迁移逻辑原样复用,换插件等于重写内核)。
-- bevy 版本立项时选定并锁 Cargo.lock;新增第三方依赖仅限任务书
-  写明(bevy 及其必要子 crate 在本 REQ 范围内预授权,具体清单
-  C01 任务书列明)。
+- **版本与裁剪(Q1 拍板)**:锁定 crates.io 最新稳定版 **bevy 0.20.1**
+  (2026-11-20 `cargo search` 核实),写死 Cargo.lock,**只在
+  `crates/client` 引用,绝不泄漏到其他 crate**。`default-features = false`,
+  首期必开:`bevy_asset`、`bevy_core_pipeline`、`bevy_pbr`、`bevy_render`、
+  `bevy_scene`、`bevy_text`、`bevy_ui`、`bevy_winit`、`bevy_window`、
+  `bevy_gizmos`(选区线框)、`tonemapping_luts`、`multi_threaded`、
+  `png`(截图接 REQ-008 冒烟)。暂不开:audio/vorbis、sprite/2d、
+  animation、gltf、gilrs(手柄 §8 非目标)、wayland。C02 调试面板
+  若只是移植 tools/panel 纯文本 HUD,原生 bevy_ui + bevy_text 够用,
+  **不引 bevy_egui**(复杂交互需求出现再议)。
+- **glam 版本隔离**:`types` 锁 glam 0.33,与 bevy_math 内置 glam
+  不同版——`crates/client` 建薄 `conv.rs` 做 Vec3/Quat 字段转换,
+  **不动 types**;世界坐标 → 渲染坐标统一收口一个函数(未来
+  Floating Origin 只改一处)。
+- **lint 口径**:workspace `unsafe_code = forbid`、clippy 禁
+  `Instant::now`/`HashMap`/`HashSet`。client-core 严格遵守确定性核
+  lint;`crates/client` 渲染边缘层按 app 同口径对渲染计时/缓存做
+  局部 `#[allow]`(逐处注明理由)。
+- **编译/帧率保护(Windows)**:根 Cargo.toml 给 bevy*/wgpu*/naga*
+  配 `[profile.dev.package."*"] opt-level = 2`(依赖只编一次,
+  Debug 运行也能 60 FPS,人工手测与基线才测得准);纯逻辑单测全部
+  放 client-core,平时跑核心包测试不触发 bevy 编译。
 - **viewer 纯逻辑层搬运**:`client.rs`(零 macroquad)、`possess/`、
   `world.rs`、`script/`、`tools/` 移入 client-core,既有测试全绿
-  (AC7);macroquad 渲染层不搬,bevy 重写。
+  (AC7);**搬运后 viewer 改为依赖 client-core**(不两处维护同一份
+  代码,V01 合并也干净);macroquad 渲染层不搬,bevy 重写。
 - macroquad viewer 保留为 demo/测试床直到 bevy 客户端达到功能
   平价;V01(准星拾取附身任意主体,#26)仍落在 viewer,其成果
   (agent_pick、possess 扩展)随纯逻辑层一起搬运。
-- 存档:复用 `storage`(redb),单机世界 = 本地存档,格式不新造。
+- 存档:复用 `storage`(redb),单机世界 = 本地存档,格式不新造
+  (§3.2a)。
+
+### 5a. 渲染组织(C01b 口径)
+
+- **subchunk 切分**:底层 `voxel::Chunk` 是 16×384×16 全高柱
+  (98,304 格 ≈ 192 KB);渲染网格实体按 **16×16×16 subchunk(垂直
+  24 段)**组织,单格编辑只脏受影响段,不整柱重扫——AC6 编辑风暴
+  与后期贪心合并/AO 都不用重构实体结构。
+- **零整块拷贝**:渲染侧镜像用 `Arc<Chunk>`(或按段拆存,每段 8 KB),
+  丢给 AsyncComputeTaskPool 只传 Arc 引用或受影响段 + 1 格边框
+  (跨块边界剔除);脏队列优先级:**玩家编辑 > 远处新装载**,保
+  "编辑 → 画面 ≤ 2 帧"。
+- **顶点 AO + 太阳光**:mesher 顺手算基础 4 角顶点环境光遮蔽
+  (纯函数,可单测)+ 一盏方向太阳光;方块棱角/洞口深度可读性
+  显著提升,人工验收与截图冒烟直观。
+- **主体渲染层级**:每连杆一个父 Transform 实体(AgentStates 驱动),
+  碰撞形状 Mesh 挂子实体;留调试开关,未来换 glTF 视觉模型或叠加
+  碰撞线框零侵入。
 
 ## 6. 验收标准
 
@@ -181,7 +257,7 @@ REQ-004A 的 macroquad viewer 是"服务器状态 → 插值渲染"的 demo(#9 �
 
 ## 7. 图形冒烟场景
 
-bevy 客户端的冒烟接线(截图 + 机器检查通道)随 C01 建立;机器检查
+bevy 客户端的冒烟接线(截图 + 机器检查通道)随 C01b 建立;机器检查
 走进程内 sim 查询(与现有 smoke 同口径:`live_entities`、
 `labeled_alive`、`block`、`chunks_loaded`、`no_floating`)。
 
@@ -208,33 +284,43 @@ bevy 客户端的冒烟接线(截图 + 机器检查通道)随 C01 建立;机器�
 
 | 单元 | 内容 | 依赖 |
 | --- | --- | --- |
-| C01 | bevy 骨架 + Transport trait + in-process sim 宿主 + 飞行相机 + chunk 渲染 + 冒烟接线 + 性能基线 | — |
-| C02 | 体素交互(拾取/挖/放)+ possess 状态机搬运 + HUD | C01 |
-| C03 | 主体渲染(BodyShapeTable 搬运)+ 本地策略推理(quad_gpu1) | C01 |
-| C04 | 协议追加包 schema + codec + loopback 对账(AC2/AC3) | C01 |
+| C01a | 协议追加包 schema + codec(Sequenced/InputAck/Correction)+ `app::local` 进程内宿主 + client-core crate 与 Transport trait + 无头对账测试(AC2/AC3 的 schema 与宿主部分);**无 bevy** | — |
+| C01b | bevy 壳 + 飞行相机 + subchunk 渲染(Arc/脏优先级/AO/太阳光)+ 冒烟接线 + 性能基线(AC1/AC4/AC6/AC8) | C01a |
+| C02 | 体素交互(拾取/挖/放)+ possess 状态机搬运 + HUD;viewer 纯逻辑层移入 client-core、viewer 改依赖 client-core(AC7) | C01b |
+| C03 | 主体渲染(BodyShapeTable 搬运)+ 本地策略推理(quad_gpu1)(AC5) | C01b |
+| C04 | Sequenced ack 语义(驱动回 InputAck)+ loopback 传输对账(AC2 收尾) | C01a |
 
 V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
 
 ## 10. 决策记录与开放问题
 
-已拍板(用户 2026-11-19):
+已拍板(用户 2026-11-19 立项;2026-11-20 定稿):
 
 - D1:单机/本地 host 优先,客户端捆绑服务器;
 - D2:bevy 重选型;
 - D3:本地计算优先 = **单份计算客户端持有**(否决双份比对与
   碰撞事件驱动);策略推理单机本地化;
 - D4:多人协议/性能提前设计——边界用现有 C2S/S2C 口径、
-  追加包 schema 先行、性能预算先行。
+  追加包 schema 先行、性能预算先行;
+- D5(Q1):bevy 0.20.1 锁版本、default-features=false 裁剪、
+  只在 crates/client 引用;glam 0.33 隔离走 conv.rs;dev profile
+  依赖 opt-level=2;不引 bevy_egui(纯文本 HUD 够用);
+- D6(Q2):宿主直接复用 `app::driver`(独立后台线程 +
+  current_thread tokio),落 `app::local` 模块;不用 FixedUpdate
+  驱动 sim;单机 cadence interval_ticks=1、chunk 泵放宽;
+- D7(Q3):存档与服务器同一 bootstrap/redb 路径;--world-dir
+  显式指定,测试用 TempDir,不碰仓库根 data/;redb 文件锁冲突
+  报清晰错误;
+- D8(Q4):多人输入路由留未来 REQ,本 REQ 只保协议边界不破坏;
+- D9:渲染按 16³ subchunk 组织 + Arc 零整块拷贝 + 脏优先级 +
+  顶点 AO + 方向太阳光 + 连杆父子 Transform 层级(§5a);
+- D10:viewer 搬运后改依赖 client-core,不两处维护;
+- D11:性能基线组合 = 64 无策略刚体 + 4 策略狗(§4;64 只策略狗
+  超单线程推理预算,不是基线);
+- D12:Sequenced/InputAck/Correction schema 前置 C01a,C04 只补
+  ack 语义与 loopback 对账。
 
-开放问题(C01 任务书前定):
-
-- Q1:bevy 版本与子 crate 清单(立项时选型,锁版本);
-- Q2:sim 宿主粒度——直接嵌 `app` 驱动 vs 轻量 `Session` 组装
-  (倾向复用 app 驱动:校验/策略/存档全在,避免第二套宿主逻辑;
-  需评估 tokio 运行时进 bevy 进程的开销);
-- Q3:存档兼容——单机存档与现有服务器存档同一 redb 格式,
-  切换模式不丢世界;
-- Q4:多人输入路由(附身他人身体的权限模型)留多人 REQ。
+开放问题:无(Q1–Q4 已拍板;实施中发现的新冲突按纪律停下回报)。
 
 ## 11. 性能基线报告(验收时填)
 
