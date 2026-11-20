@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -311,6 +311,23 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   tonemapping_luts 强制 zstd 后端的最小补加,已认可。
   遗留:mesh 资产替换时旧 handle 未 remove,归 C01b-2 收口。
   验收与 R1 裁定见 #27。
+- C01b-2 ✅ 验收通过(2026-11-20,含 R1 返修):提交 a216523(实施)+
+  53039dc(R1 补 MS5 异步 meshing 接线锚点)。纯逻辑层搬运
+  (viewer client/world/script → client-core,re-export 保旧路径,
+  viewer 220→115、client-core 11→93,总数不变);异步 meshing
+  (ChunkSnapshot 零拷贝快照 + epoch 世代计数 + requeue +
+  AsyncComputeTaskPool 每帧≤8 spawn/collect 世代判定上传/
+  旧 Mesh 句柄回收 + MeshStats 帧计数);client --script/--out
+  冒烟模式 + xtask smoke --client + 两场景(client_startup/
+  client_block_edit,机器断言 uploads>=1 且 1<=max_edit_upload_frames<=2)。
+  MS1–MS5 全绿;PM6–PM13 击杀;架构师 N6(collect 忽略过期)/
+  N7(替换不回收句柄)存活 → R1 无头 bevy App 接线锚点 MS5 四例后击杀。
+  门禁(client-core 93/client 5/viewer 115/app/sim-api/e2e 54 二进制 +
+  clippy + fmt + smoke --selftest)复跑全过;冒烟 manifest 与三张截图、
+  人工回归两张截图目视通过。CARGO_INCREMENTAL=0 纪律:rustc ICE
+  (增量指纹损坏)后全单元沿用。遗留:chunk 卸载路径句柄回收无机器锚点
+  (两场景不触发卸载),归 C02/C03 视距移动场景;uploads 含空段且受帧对齐
+  ±8 抖动,C01b-3 基线口径需注明。验收与 R1 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
