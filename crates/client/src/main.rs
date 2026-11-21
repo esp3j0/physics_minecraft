@@ -649,7 +649,13 @@ fn setup_scene(
                 ..default()
             })
             .with_children(|parent| {
-                parent.spawn((Text::new(""), HudText));
+                parent.spawn((
+                    Node::default(),
+                    Text::new(""),
+                    TextFont::from_font_size(16.0),
+                    TextColor(Color::WHITE),
+                    HudText,
+                ));
             });
     }
 }
@@ -1856,18 +1862,13 @@ mod tests {
         assert_eq!(fps_summary(&fps.dts_ms[s..=e]), (62.5, 62.5));
     }
 
-    /// MS18(REQ-013 C02-1 §3.2 / PM26 靶点):无头 Bevy App 调度 `hud_update_system`,
-    /// 插入 `dts=[16,16]`、`tick=42`、`mirror` 3 chunk、`ToolState::default()`,跑一帧后
+    /// MS18(REQ-013 C02-1 §3.2 + R4 / PM26 靶点):无头 Bevy App 调度 `setup_scene` +
+    /// `hud_update_system`,验证 `HudText` 实体同时含 `Node`、`TextFont(16px)`、`TextColor(WHITE)`,
+    /// 且插入 `dts=[16,16]`、`tick=42`、`mirror` 3 chunk、`ToolState::default()` 跑一帧后
     /// `Text.0 == hud_text(...)` 且恰 5 行。
     #[test]
     fn ms18_hud_update_system_headless() {
-        let mut mirror = ChunkMirror::new();
-        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
-        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
-        mirror.insert_chunk(ChunkPos::new(0, 1), Chunk::air());
-        assert_eq!(mirror.chunks_loaded(), 3);
-
-        let mut app = headless_app(mirror, false, false);
+        let mut app = headless_app(ChunkMirror::new(), false, false);
         let mut fps = FpsHistoryRes::default();
         fps.push_dt_ms(16.0);
         fps.push_dt_ms(16.0);
@@ -1875,10 +1876,52 @@ mod tests {
             .insert_resource(ServerTickRes(42))
             .insert_resource(ToolRes::default())
             .insert_resource(PossessRes::default())
+            .add_systems(Startup, setup_scene)
             .add_systems(Update, hud_update_system);
 
-        let hud_entity = app.world_mut().spawn((Text::new(""), HudText)).id();
+        // 首帧执行 Startup::setup_scene 生成交互模式 HUD 根/子实体并初始化 WorldRenderRes。
         app.update();
+
+        {
+            let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+            world_res
+                .mirror
+                .insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+            world_res
+                .mirror
+                .insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+            world_res
+                .mirror
+                .insert_chunk(ChunkPos::new(0, 1), Chunk::air());
+            assert_eq!(world_res.mirror.chunks_loaded(), 3);
+        }
+
+        app.update();
+
+        let hud_entity = {
+            let mut q = app.world_mut().query_filtered::<Entity, With<HudText>>();
+            q.single(app.world())
+                .expect("setup_scene 必须生成唯一 HudText 实体")
+        };
+
+        assert!(
+            app.world().get::<Node>(hud_entity).is_some(),
+            "HudText 实体必须含 Node 组件供 bevy_ui 布局"
+        );
+        let font = app
+            .world()
+            .get::<TextFont>(hud_entity)
+            .expect("HudText 实体必须含 TextFont 组件");
+        assert_eq!(
+            font.font_size,
+            bevy::text::FontSize::Px(16.0),
+            "HudText 字号必须为 16px"
+        );
+        let color = app
+            .world()
+            .get::<TextColor>(hud_entity)
+            .expect("HudText 实体必须含 TextColor 组件");
+        assert_eq!(color.0, Color::WHITE, "HudText 颜色必须为白色");
 
         let text = app
             .world()
