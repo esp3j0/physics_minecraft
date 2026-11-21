@@ -83,3 +83,10 @@ wait_ticks = { n = 2 }
 [[step]]
 label = "校验解除附身不杀主体"
 check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "HUD 截图前置等待"
+wait_ticks = { n = 2 }
+
+[[step]]
+screenshot = { name = "hud", hud = true, expect = "左上角可见五行白色 HUD 文本:fps 行、tick 行、chunks 行、tool 行、possess 行;背景为体素地表" }

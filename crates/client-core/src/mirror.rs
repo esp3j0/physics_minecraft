@@ -4,7 +4,7 @@
 //! 每个 chunk 高度 384(世界 y ∈ [-64, 319])按 16 格切为 24 段(section 0..=23)。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use types::{BlockId, BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
 use voxel::Chunk;
@@ -32,6 +32,13 @@ pub enum DirtyKind {
     Load,
 }
 
+/// LRU 逻辑时钟状态(零墙钟,确定性单调计数)。
+#[derive(Default)]
+struct LruState {
+    last_use: BTreeMap<ChunkPos, u64>,
+    use_clock: u64,
+}
+
 /// 客户端侧世界体素镜像与确定性脏队列。
 ///
 /// 内部使用 `Arc<Chunk>` 支持写时复制(`Arc::make_mut`),便于后续异步网格任务共享快照;
@@ -42,6 +49,7 @@ pub struct ChunkMirror {
     dirty_edit: BTreeSet<SubchunkPos>,
     dirty_load: BTreeSet<SubchunkPos>,
     epochs: BTreeMap<SubchunkPos, u64>,
+    lru: Mutex<LruState>,
 }
 
 impl Default for ChunkMirror {
@@ -58,13 +66,23 @@ impl ChunkMirror {
             dirty_edit: BTreeSet::new(),
             dirty_load: BTreeSet::new(),
             epochs: BTreeMap::new(),
+            lru: Mutex::new(LruState::default()),
         }
+    }
+
+    /// 命中 chunk 时推进逻辑时钟并记录 `last_use[pos]`(不跨 await、不嵌套锁)。
+    fn touch(&self, pos: ChunkPos) {
+        let mut lru = self.lru.lock().expect("ChunkMirror LRU lock poisoned");
+        lru.use_clock = lru.use_clock.saturating_add(1);
+        let clock = lru.use_clock;
+        lru.last_use.insert(pos, clock);
     }
 
     /// 装载(或替换)一个 chunk:本 chunk 全 24 段标 `Load`,已装载的四水平邻 chunk
     /// 全 24 段亦标 `Load`(已有 `Edit` 标记不被降级)。
     pub fn insert_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
         self.chunks.insert(pos, Arc::new(chunk));
+        self.touch(pos);
         self.mark_chunk_load(pos);
         for (dx, dz) in HORIZONTAL_NEIGHBORS {
             let neighbor = ChunkPos::new(pos.x + dx, pos.z + dz);
@@ -77,6 +95,11 @@ impl ChunkMirror {
     /// 卸载一个 chunk:移除本体、清除其全部脏条目,并将已装载的四水平邻 chunk 全 24 段标 `Load`。
     pub fn remove_chunk(&mut self, pos: ChunkPos) {
         self.chunks.remove(&pos);
+        self.lru
+            .lock()
+            .expect("ChunkMirror LRU lock poisoned")
+            .last_use
+            .remove(&pos);
         for section in 0..SECTIONS_PER_CHUNK {
             let sc = SubchunkPos {
                 chunk: pos,
@@ -91,6 +114,29 @@ impl ChunkMirror {
                 self.mark_chunk_load(neighbor);
             }
         }
+    }
+
+    /// 按 LRU 上限驱逐非保护 chunk(REQ-013 C02-2 D1):
+    /// 当 `chunks.len() > cap` 时循环在非 `protect` 候选中选 `(last_use, ChunkPos)` 最小者
+    /// 经 [`Self::remove_chunk`] 移除并按移除顺序返回;无非保护候选时立即退出。
+    pub fn enforce_cap(&mut self, cap: usize, protect: &BTreeSet<ChunkPos>) -> Vec<ChunkPos> {
+        let mut evicted = Vec::new();
+        while self.chunks.len() > cap {
+            let victim = {
+                let lru = self.lru.lock().expect("ChunkMirror LRU lock poisoned");
+                self.chunks
+                    .keys()
+                    .copied()
+                    .filter(|pos| !protect.contains(pos))
+                    .min_by_key(|pos| (lru.last_use.get(pos).copied().unwrap_or(0), *pos))
+            };
+            let Some(pos) = victim else {
+                break;
+            };
+            self.remove_chunk(pos);
+            evicted.push(pos);
+        }
+        evicted
     }
 
     /// 批量应用世界坐标方块更新(写时复制 `Arc::make_mut`),并标脏本格所在段及存在的边界邻段。
@@ -109,6 +155,7 @@ impl ChunkMirror {
                 continue;
             };
             Arc::make_mut(arc).set(local_x, local_y, local_z, block);
+            self.touch(chunk_pos);
 
             let section = (local_y / SECTION_HEIGHT) as u8;
             self.mark_dirty(
@@ -171,6 +218,7 @@ impl ChunkMirror {
         }
         let chunk_pos = world.chunk_of();
         let chunk = self.chunks.get(&chunk_pos)?;
+        self.touch(chunk_pos);
         let local_x = world.x.rem_euclid(CHUNK_SIZE) as usize;
         let local_y = (world.y - WORLD_Y_MIN) as usize;
         let local_z = world.z.rem_euclid(CHUNK_SIZE) as usize;
@@ -197,7 +245,9 @@ impl ChunkMirror {
 
     /// 零拷贝克隆已装载 chunk 的 `Arc` 句柄(供异步网格快照使用)。
     pub fn chunk_arc(&self, pos: ChunkPos) -> Option<Arc<Chunk>> {
-        self.chunks.get(&pos).map(Arc::clone)
+        let arc = self.chunks.get(&pos).map(Arc::clone)?;
+        self.touch(pos);
+        Some(arc)
     }
 
     /// 返回指定 subchunk 的脏世代计数(初值 0,每次 `mark_dirty` 命中 +1)。
@@ -218,13 +268,14 @@ impl ChunkMirror {
         if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&pos.y) {
             return None;
         }
-        self.chunks.get(&pos.chunk_of()).map(|chunk| {
-            chunk.get(
-                pos.x.rem_euclid(CHUNK_SIZE) as usize,
-                (pos.y - WORLD_Y_MIN) as usize,
-                pos.z.rem_euclid(CHUNK_SIZE) as usize,
-            )
-        })
+        let chunk_pos = pos.chunk_of();
+        let chunk = self.chunks.get(&chunk_pos)?;
+        self.touch(chunk_pos);
+        Some(chunk.get(
+            pos.x.rem_euclid(CHUNK_SIZE) as usize,
+            (pos.y - WORLD_Y_MIN) as usize,
+            pos.z.rem_euclid(CHUNK_SIZE) as usize,
+        ))
     }
 
     fn mark_chunk_load(&mut self, pos: ChunkPos) {
@@ -519,5 +570,91 @@ mod tests {
     fn ms4_is_stale_epoch_check() {
         assert!(is_stale(1, 2));
         assert!(!is_stale(2, 2));
+    }
+
+    fn ms25_setup_abc_touch_a() -> ChunkMirror {
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+        mirror.insert_chunk(ChunkPos::new(2, 0), Chunk::air());
+        for _ in 0..72 {
+            assert!(matches!(mirror.pop_dirty(), Some((_, DirtyKind::Load))));
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+        // 读 A → A 时钟推进至 4(B=2, C=3, A=4)。
+        assert_eq!(mirror.block(BlockPos::new(0, -60, 0)), Some(BlockId::AIR));
+        mirror
+    }
+
+    /// MS25 t1(C02-2 D1 + R1 B1 / PM28 靶点):读 A 后驱逐最久未用的 B(1,0),
+    /// 连带标脏已装载邻 A/C 共 48 段,且 B 的 section0 epoch 保留 == 2(insert B 为 1, insert C 邻标为 2)。
+    #[test]
+    fn ms25_t1_evict_lru_retains_epoch() {
+        let mut mirror = ms25_setup_abc_touch_a();
+        let evicted = mirror.enforce_cap(2, &BTreeSet::new());
+        assert_eq!(evicted, vec![ChunkPos::new(1, 0)]);
+        assert_eq!(mirror.chunk_count(), 2);
+        assert_eq!(mirror.get_block(BlockPos::new(16, -60, 0)), None);
+        assert_eq!(mirror.dirty_len(), 48);
+        assert_eq!(
+            mirror.epoch(SubchunkPos {
+                chunk: ChunkPos::new(1, 0),
+                section: 0,
+            }),
+            2
+        );
+    }
+
+    /// MS25 t2(C02-2 D1 / PM27 靶点):protect={B} 时跳过更旧的 B,驱逐次旧的 C(2,0),
+    /// 仅连带已装载邻 B 共 24 段。
+    #[test]
+    fn ms25_t2_protect_skips_oldest() {
+        let mut mirror = ms25_setup_abc_touch_a();
+        let protect = BTreeSet::from([ChunkPos::new(1, 0)]);
+        let evicted = mirror.enforce_cap(2, &protect);
+        assert_eq!(evicted, vec![ChunkPos::new(2, 0)]);
+        assert_eq!(mirror.dirty_len(), 24);
+    }
+
+    /// MS25 t3(C02-2 D1):已装载数 <= cap 时不驱逐、脏队列保持 0。
+    #[test]
+    fn ms25_t3_under_cap_noop() {
+        let mut mirror = ms25_setup_abc_touch_a();
+        let evicted = mirror.enforce_cap(3, &BTreeSet::new());
+        assert!(evicted.is_empty());
+        assert_eq!(mirror.dirty_len(), 0);
+    }
+
+    /// MS25 t4(C02-2 D1):全部 chunk 均在 protect 内时不驱逐且不死循环。
+    #[test]
+    fn ms25_t4_all_protected_no_evict() {
+        let mut mirror = ms25_setup_abc_touch_a();
+        let protect = BTreeSet::from([
+            ChunkPos::new(0, 0),
+            ChunkPos::new(1, 0),
+            ChunkPos::new(2, 0),
+        ]);
+        let evicted = mirror.enforce_cap(1, &protect);
+        assert!(evicted.is_empty());
+        assert_eq!(mirror.chunk_count(), 3);
+    }
+
+    /// MS25 t5(C02-2 D1 / R2 期望更正):A/B/C/D 依次装载后不读,enforce_cap(2) 依序驱逐
+    /// A(0,0)、B(1,0);移 A 连带 B 24 段,但移 B 时 remove_chunk 先清 B 自身这 24 条待处理
+    /// 标记再连带 C 24 段 → 总 dirty_len == 24(架构师 R2 手算更正,原 48 漏清自身步骤)。
+    #[test]
+    fn ms25_t5_multi_evict_order() {
+        let mut mirror = ChunkMirror::new();
+        for cx in 0..4 {
+            mirror.insert_chunk(ChunkPos::new(cx, 0), Chunk::air());
+        }
+        for _ in 0..96 {
+            assert!(matches!(mirror.pop_dirty(), Some((_, DirtyKind::Load))));
+        }
+        assert_eq!(mirror.dirty_len(), 0);
+
+        let evicted = mirror.enforce_cap(2, &BTreeSet::new());
+        assert_eq!(evicted, vec![ChunkPos::new(0, 0), ChunkPos::new(1, 0)]);
+        assert_eq!(mirror.dirty_len(), 24);
     }
 }

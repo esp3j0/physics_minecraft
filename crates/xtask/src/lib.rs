@@ -496,15 +496,116 @@ fn verify_client_perf_stats(
         }
         "client_interact" => {
             let Some(m) = manifest else {
-                return Err("client_interact 缺失 manifest,无法校验 perf".to_owned());
+                return Err("client_interact 缺失 manifest,无法校验 perf/hud".to_owned());
             };
             if m.perf.is_none() {
                 return Err("client_interact manifest 缺失 perf 字段".to_owned());
+            }
+            let shots: Vec<_> = m
+                .steps
+                .iter()
+                .filter_map(|s| s.screenshot.as_ref())
+                .collect();
+            let hud_true = shots.iter().filter(|s| s.hud).count();
+            let hud_false = shots.iter().filter(|s| !s.hud).count();
+            if hud_true != 1 || hud_false == 0 {
+                return Err(format!(
+                    "client_interact HUD 截图锚点断言失败: hud=true 共 {hud_true} 步(要求 == 1), hud=false 共 {hud_false} 步(要求 >= 1)"
+                ));
             }
             Ok(())
         }
         _ => Ok(()),
     }
+}
+
+/// 校客户端 `client_view_move` 场景的视距移动与卸载句柄回收机器断言(C02-2 D2 + R2-3):
+/// 全步 ok、`unloads >= 1`、`evictions == 0`、`assets_live_end == entities_live_end + assets_baseline`、
+/// `uploads >= 1`、`perf` 存在。
+fn verify_client_view_move(scenario_name: &str, manifest: Option<&Manifest>) -> Result<(), String> {
+    if scenario_name != "client_view_move" {
+        return Ok(());
+    }
+    let Some(m) = manifest else {
+        return Err("client_view_move 缺失 manifest,无法校验".to_owned());
+    };
+    if m.steps.is_empty() || m.steps.iter().any(|s| s.outcome != "ok") {
+        return Err("client_view_move 存在非 ok 步骤".to_owned());
+    }
+    let Some(ms) = m.mesh_stats else {
+        return Err("client_view_move manifest 缺失 mesh_stats 字段".to_owned());
+    };
+    if ms.unloads < 1 {
+        return Err(format!(
+            "client_view_move 机器断言失败: mesh_stats.unloads = {} (要求 >= 1)",
+            ms.unloads
+        ));
+    }
+    if ms.evictions != 0 {
+        return Err(format!(
+            "client_view_move 机器断言失败: mesh_stats.evictions = {} (要求 == 0)",
+            ms.evictions
+        ));
+    }
+    if ms.assets_live_end != ms.entities_live_end + ms.assets_baseline {
+        return Err(format!(
+            "client_view_move 网格句柄泄漏: assets_live_end={} != entities_live_end={} + assets_baseline={}",
+            ms.assets_live_end, ms.entities_live_end, ms.assets_baseline
+        ));
+    }
+    if ms.uploads < 1 {
+        return Err(format!(
+            "client_view_move 机器断言失败: mesh_stats.uploads = {} (要求 >= 1)",
+            ms.uploads
+        ));
+    }
+    if m.perf.is_none() {
+        return Err("client_view_move manifest 缺失 perf 字段".to_owned());
+    }
+    Ok(())
+}
+
+/// 校客户端截图文件非退化(C02-2 验收补强):窗口创建时物理尺寸偶发报 0,
+/// wgpu 把交换链钳成 1×1,截出 72 字节空图而冒烟仍绿。逐张解 PNG IHDR,
+/// 宽高均须 >= 16(1280×720 是逻辑分辨率,HiDPI 下物理尺寸更大,不钉死精确值)。
+fn verify_client_screenshots(out_dir: &Path, manifest: Option<&Manifest>) -> Result<(), String> {
+    let Some(m) = manifest else {
+        return Ok(());
+    };
+    for step in &m.steps {
+        let Some(shot) = step.screenshot.as_ref() else {
+            continue;
+        };
+        let path = out_dir.join(&shot.file);
+        let bytes =
+            std::fs::read(&path).map_err(|e| format!("读取截图 {} 失败:{e}", path.display()))?;
+        let Some((w, h)) = png_size(&bytes) else {
+            return Err(format!(
+                "截图 {} 不是合法 PNG(长度 {} 字节)",
+                shot.file,
+                bytes.len()
+            ));
+        };
+        if w < 16 || h < 16 {
+            return Err(format!(
+                "截图 {} 尺寸退化:{w}x{h}(交换链疑似被钳成 1×1)",
+                shot.file
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 解 PNG 头 24 字节取 IHDR 宽高;签名或 IHDR 标记不符返回 None。
+fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.len() < 24 || bytes[..8] != SIG || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(bytes[16..20].try_into().ok()?),
+        u32::from_be_bytes(bytes[20..24].try_into().ok()?),
+    ))
 }
 
 /// `cargo build -j 10 -p client`(dev profile,依赖 opt-level=2 已在根 Cargo.toml 配置)。
@@ -644,6 +745,8 @@ fn run_client_scenario(
         && !panicked
         && let Err(msg) = verify_client_mesh_stats(&name, manifest.as_ref())
             .and_then(|()| verify_client_perf_stats(&name, manifest.as_ref()))
+            .and_then(|()| verify_client_view_move(&name, manifest.as_ref()))
+            .and_then(|()| verify_client_screenshots(&out_dir, manifest.as_ref()))
     {
         eprintln!("{msg}");
         client_exit = Some(1);
@@ -1617,6 +1720,7 @@ mod tests {
                     max_edit_upload_frames: 1,
                     uploads: 0,
                     discards: 0,
+                    ..Default::default()
                 })))
             )
             .is_err()
@@ -1628,6 +1732,7 @@ mod tests {
                     max_edit_upload_frames: 0,
                     uploads: 10,
                     discards: 0,
+                    ..Default::default()
                 })))
             )
             .is_err()
@@ -1639,6 +1744,7 @@ mod tests {
                     max_edit_upload_frames: 3,
                     uploads: 10,
                     discards: 0,
+                    ..Default::default()
                 })))
             )
             .is_err()
@@ -1650,6 +1756,7 @@ mod tests {
                     max_edit_upload_frames: 1,
                     uploads: 25,
                     discards: 0,
+                    ..Default::default()
                 })))
             )
             .is_ok()
@@ -1661,6 +1768,7 @@ mod tests {
                     max_edit_upload_frames: 2,
                     uploads: 25,
                     discards: 1,
+                    ..Default::default()
                 })))
             )
             .is_ok()
@@ -1803,12 +1911,121 @@ mod tests {
             verify_client_perf_stats("client_interact", Some(&make("client_interact", None)))
                 .is_err()
         );
+        // 缺少 screenshot(hud=true) 与 screenshot(hud=false) 组合 → 失败。
         assert!(
             verify_client_perf_stats(
                 "client_interact",
-                Some(&make("client_interact", Some(ok_storm)))
+                Some(&make("client_interact", Some(ok_storm.clone())))
             )
-            .is_ok()
+            .is_err()
         );
+
+        let shot_step = |step: usize, hud: bool| viewer::script::manifest::ManifestStep {
+            step,
+            label: None,
+            action: "screenshot".to_owned(),
+            start_tick: 1,
+            end_tick: 1,
+            camera: viewer::script::manifest::ManifestCamera {
+                pos: [0.0, 0.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            outcome: "ok".to_owned(),
+            messages: vec![],
+            screenshot: Some(viewer::script::manifest::ManifestShot {
+                file: format!("{step:02}-shot.png"),
+                name: "shot".to_owned(),
+                expect: "e".to_owned(),
+                hud,
+                live_entities: 0,
+                chunks_loaded: 25,
+            }),
+        };
+        let mut interact_ok = make("client_interact", Some(ok_storm.clone()));
+        interact_ok.steps = vec![shot_step(7, false), shot_step(21, true)];
+        assert!(verify_client_perf_stats("client_interact", Some(&interact_ok)).is_ok());
+
+        // C02-2 D2 + R2-3:verify_client_view_move 断言检查(含 Bevy 内置资产基线)。
+        let mut vm = make("client_view_move", Some(ok_storm));
+        vm.steps = vec![shot_step(8, false)];
+        vm.mesh_stats = Some(viewer::script::manifest::ManifestMeshStats {
+            max_edit_upload_frames: 1,
+            uploads: 100,
+            discards: 0,
+            unloads: 10,
+            evictions: 0,
+            assets_live_end: 30,
+            entities_live_end: 25,
+            assets_baseline: 5,
+        });
+        assert!(verify_client_view_move("client_view_move", Some(&vm)).is_ok());
+
+        let mut vm_no_unload = vm.clone();
+        vm_no_unload.mesh_stats.as_mut().unwrap().unloads = 0;
+        assert!(verify_client_view_move("client_view_move", Some(&vm_no_unload)).is_err());
+
+        let mut vm_evict = vm.clone();
+        vm_evict.mesh_stats.as_mut().unwrap().evictions = 1;
+        assert!(verify_client_view_move("client_view_move", Some(&vm_evict)).is_err());
+
+        let mut vm_leak = vm.clone();
+        vm_leak.mesh_stats.as_mut().unwrap().assets_live_end = 31;
+        assert!(verify_client_view_move("client_view_move", Some(&vm_leak)).is_err());
+    }
+
+    #[test]
+    fn verify_client_screenshots_rejects_degenerate_png() {
+        let png = |w: u32, h: u32| {
+            let mut b = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+            b.extend_from_slice(&13u32.to_be_bytes());
+            b.extend_from_slice(b"IHDR");
+            b.extend_from_slice(&w.to_be_bytes());
+            b.extend_from_slice(&h.to_be_bytes());
+            b
+        };
+        assert_eq!(png_size(&png(1, 1)), Some((1, 1)));
+        assert_eq!(png_size(&png(1280, 720)), Some((1280, 720)));
+        assert_eq!(png_size(&[0u8; 24]), None);
+        assert_eq!(png_size(&png(1, 1)[..23]), None);
+
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let step = viewer::script::manifest::ManifestStep {
+            step: 1,
+            label: None,
+            action: "screenshot".to_owned(),
+            start_tick: 1,
+            end_tick: 1,
+            camera: viewer::script::manifest::ManifestCamera {
+                pos: [0.0, 0.0, 0.0],
+                yaw: 0.0,
+                pitch: 0.0,
+            },
+            outcome: "ok".to_owned(),
+            messages: vec![],
+            screenshot: Some(viewer::script::manifest::ManifestShot {
+                file: "01-shot.png".to_owned(),
+                name: "shot".to_owned(),
+                expect: "e".to_owned(),
+                hud: false,
+                live_entities: 0,
+                chunks_loaded: 25,
+            }),
+        };
+        let manifest = Manifest {
+            scenario: "client_interact".to_owned(),
+            req: Some("REQ-013".to_owned()),
+            description: "d".to_owned(),
+            steps: vec![step],
+            result: None,
+            mesh_stats: None,
+            perf: None,
+        };
+        assert!(verify_client_screenshots(dir.path(), None).is_ok());
+        assert!(verify_client_screenshots(dir.path(), Some(&manifest)).is_err());
+        std::fs::write(dir.path().join("01-shot.png"), png(1, 1)).expect("写 1x1 图");
+        assert!(verify_client_screenshots(dir.path(), Some(&manifest)).is_err());
+        std::fs::write(dir.path().join("01-shot.png"), png(1280, 720)).expect("写正常图");
+        assert!(verify_client_screenshots(dir.path(), Some(&manifest)).is_ok());
     }
 }

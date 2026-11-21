@@ -6,16 +6,16 @@
 
 mod conv;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use app::config::Config;
 use app::local::LocalConfig;
 use bevy::app::AppExit;
-use bevy::asset::RenderAssetUsages;
+use bevy::asset::{AssetEventSystems, RenderAssetUsages};
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::GlobalAmbientLight;
 use bevy::mesh::{Indices, PrimitiveTopology};
@@ -32,8 +32,8 @@ use client_core::perf::{MeshPerf, acc_mesh_perf, fps_summary, storm_window};
 use client_core::possess::{self, PossessState, p_press_hint};
 use client_core::script::manifest::{Manifest, ManifestMeshStats, ManifestPerf};
 use client_core::script::{
-    CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, WorldQuery,
-    parse_scenario,
+    CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, ScreenshotRequest,
+    WorldQuery, parse_scenario,
 };
 use client_core::tools::{
     Hit, ToolAction, ToolState, dig, hud_text, pick_at_camera, place, select_material,
@@ -71,6 +71,7 @@ enum RunMode {
 struct CliArgs {
     world_dir: PathBuf,
     view_distance: Option<u8>,
+    chunk_cap: Option<usize>,
     mode: RunMode,
 }
 
@@ -78,6 +79,7 @@ fn parse_cli() -> Result<CliArgs, String> {
     let mut args = std::env::args().skip(1);
     let mut world_dir: Option<PathBuf> = None;
     let mut view_distance: Option<u8> = None;
+    let mut chunk_cap: Option<usize> = None;
     let mut script: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
 
@@ -98,6 +100,15 @@ fn parse_cli() -> Result<CliArgs, String> {
                     .map_err(|e| format!("--view-distance 无效({val}): {e}"))?;
                 view_distance = Some(parsed);
             }
+            "--chunk-cap" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--chunk-cap 缺少数值参数".to_owned())?;
+                let parsed = val
+                    .parse::<usize>()
+                    .map_err(|e| format!("--chunk-cap 无效({val}): {e}"))?;
+                chunk_cap = Some(parsed);
+            }
             "--script" => {
                 let val = args
                     .next()
@@ -110,7 +121,7 @@ fn parse_cli() -> Result<CliArgs, String> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "用法: client --world-dir <PATH> [--view-distance <u8, 默认 8>] [--script <TOML> --out <DIR>]"
+                    "用法: client --world-dir <PATH> [--view-distance <u8, 默认 8>] [--chunk-cap <usize>] [--script <TOML> --out <DIR>]"
                         .to_owned(),
                 );
             }
@@ -131,14 +142,47 @@ fn parse_cli() -> Result<CliArgs, String> {
     Ok(CliArgs {
         world_dir,
         view_distance,
+        chunk_cap,
         mode,
     })
 }
 
-/// 进程内传输资源:App 退出或脚本结束显式释放时触发 `LocalTransport::drop`(Goodbye + join)。
+/// 进程内或测试假传输资源:App 退出或脚本结束显式释放时触发底层 `Drop`(Goodbye + join)。
 #[derive(Resource)]
 struct TransportRes {
-    transport: Option<LocalTransport>,
+    transport: Option<Mutex<Box<dyn Transport + Send>>>,
+}
+
+impl TransportRes {
+    fn new(t: impl Transport + Send + 'static) -> Self {
+        Self {
+            transport: Some(Mutex::new(Box::new(t))),
+        }
+    }
+
+    fn with_mut<R>(&mut self, f: impl FnOnce(&mut dyn Transport) -> R) -> Option<R> {
+        let mtx = self.transport.as_mut()?;
+        let guard = mtx.get_mut().expect("TransportRes mutex poisoned");
+        Some(f(guard.as_mut()))
+    }
+
+    fn close(&mut self) {
+        let _ = self.transport.take();
+    }
+}
+
+/// 视距与镜像 LRU chunk 上限配置(REQ-013 C02-2 D1b;交互与脚本模式均插入)。
+#[derive(Resource, Debug, Clone, Copy)]
+struct ViewCapRes {
+    view_distance: u8,
+    chunk_cap: usize,
+}
+
+impl ViewCapRes {
+    fn default_cap(view_distance: u8) -> usize {
+        let side = 2usize * usize::from(view_distance) + 1;
+        2 * side * side
+    }
 }
 
 /// 世界体素镜像与已上传 subchunk 实体/网格句柄映射。
@@ -172,22 +216,46 @@ struct EditFrameTracker {
     frames: BTreeMap<SubchunkPos, u64>,
 }
 
-/// 异步网格上传测量钩子(REQ-013 C01b-2 §2.2 / C01b-3 基线复用)。
+/// 异步网格上传与卸载/驱逐测量钩子(REQ-013 C01b-2 §2.2 / C02-2 D1b + R2-3 基线)。
 #[derive(Resource, Default, Debug, Clone, Copy)]
 struct MeshStats {
     max_edit_upload_frames: u32,
     uploads: u64,
     discards: u64,
+    unloads: u64,
+    evictions: u64,
+    baseline: Option<usize>,
 }
 
 impl MeshStats {
-    fn to_manifest(self) -> ManifestMeshStats {
+    fn to_manifest(self, assets_live_end: usize, entities_live_end: usize) -> ManifestMeshStats {
         ManifestMeshStats {
             max_edit_upload_frames: self.max_edit_upload_frames,
             uploads: self.uploads,
             discards: self.discards,
+            unloads: self.unloads,
+            evictions: self.evictions,
+            assets_live_end,
+            entities_live_end,
+            assets_baseline: self.baseline.unwrap_or(0),
         }
     }
+}
+
+/// 一次性采样 Bevy 内置插件自持 Mesh 资产基线(REQ-013 C02-2 R2-3):
+/// 挂在真 App 的 `PostUpdate` 且晚于 `AssetEventSystems`(晚于 `SpriteMeshPlugin::add_mesh`),
+/// 首帧记录 `meshes.len() - world_res.entities.len()` 后永久幂等跳过;headless 裸 App 不挂载。
+fn sample_mesh_assets_baseline_system(
+    mut done: Local<bool>,
+    meshes: Res<Assets<Mesh>>,
+    world_res: Res<WorldRenderRes>,
+    mut stats: ResMut<MeshStats>,
+) {
+    if *done {
+        return;
+    }
+    *done = true;
+    stats.baseline = Some(meshes.len().saturating_sub(world_res.entities.len()));
 }
 
 /// 异步网格构建耗时累计遥测(REQ-013 C01b-3 §1.4)。
@@ -361,9 +429,27 @@ struct PossessRes {
     was_possessed: bool,
 }
 
-/// 交互 HUD 文本节点标记组件(REQ-013 C02-1 §3.2)。
+/// HUD 根容器节点标记组件(REQ-013 C02-2 D3:脚本模式按 `shot.hud` 切换显隐)。
+#[derive(Component)]
+struct HudRoot;
+
+/// 交互/脚本 HUD 文本节点标记组件(REQ-013 C02-1 §3.2)。
 #[derive(Component)]
 struct HudText;
+
+/// 按布尔开关设置 HUD 根节点的可见性(`true` → `Inherited`,`false` → `Hidden`;供 MS24 直调)。
+#[cfg_attr(not(test), allow(dead_code))]
+fn set_hud_visibility(world: &mut World, show: bool) {
+    let target = if show {
+        Visibility::Inherited
+    } else {
+        Visibility::Hidden
+    };
+    let mut q = world.query_filtered::<&mut Visibility, With<HudRoot>>();
+    for mut vis in q.iter_mut(world) {
+        *vis = target;
+    }
+}
 
 /// 将 Bevy 键盘快照映射为 `possess::Keys`(REQ-013 C02-1 §2.2 / MS20 锚点)。
 fn possess_keys_from_input(keys: &ButtonInput<KeyCode>) -> possess::Keys {
@@ -388,6 +474,8 @@ struct ScriptModeRes {
     coupled: bool,
     last_observer_pos: Option<Vec3>,
     pending_shots: Arc<AtomicUsize>,
+    /// REQ-013 C02-2 R3:延迟 1 帧 spawn `Screenshot` 实体的缓存 `(请求, shot 帧号)`。
+    pending_spawn: Option<(ScreenshotRequest, u64)>,
     finished_exit: Option<i32>,
     disconnected: Option<String>,
 }
@@ -494,6 +582,7 @@ fn main() {
                 coupled: true,
                 last_observer_pos: None,
                 pending_shots: Arc::new(AtomicUsize::new(0)),
+                pending_spawn: None,
                 finished_exit: None,
                 disconnected: None,
             };
@@ -522,6 +611,9 @@ fn main() {
     }
 
     let screenshot_dir = cli.world_dir.join("screenshots");
+    let chunk_cap = cli
+        .chunk_cap
+        .unwrap_or_else(|| ViewCapRes::default_cap(view_distance));
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -537,8 +629,10 @@ fn main() {
         brightness: 150.0,
         ..default()
     })
-    .insert_resource(TransportRes {
-        transport: Some(transport),
+    .insert_resource(TransportRes::new(transport))
+    .insert_resource(ViewCapRes {
+        view_distance,
+        chunk_cap,
     })
     .insert_resource(FrameCounter::default())
     .insert_resource(PendingMeshesRes::default())
@@ -548,12 +642,18 @@ fn main() {
     .insert_resource(FpsHistoryRes::default())
     .insert_resource(ServerPerfRes::default())
     .insert_resource(ServerTickRes::default())
+    .insert_resource(ToolRes::default())
+    .insert_resource(PossessRes::default())
     .insert_resource(ObserverTracker::default())
     .insert_resource(ScreenshotState {
         dir: screenshot_dir,
         next_seq: 1,
     })
-    .add_systems(Startup, setup_scene);
+    .add_systems(Startup, setup_scene)
+    .add_systems(
+        PostUpdate,
+        sample_mesh_assets_baseline_system.after(AssetEventSystems),
+    );
 
     if let Some(script_mode) = script_res {
         app.insert_resource(script_mode).add_systems(
@@ -564,27 +664,26 @@ fn main() {
                 collect_mesh_tasks_system,
                 script_driver_system,
                 spawn_mesh_tasks_system,
+                hud_update_system,
             )
                 .chain(),
         );
     } else {
-        app.insert_resource(ToolRes::default())
-            .insert_resource(PossessRes::default())
-            .add_systems(
-                Update,
-                (
-                    advance_frame_counter_system,
-                    fly_camera_system,
-                    sync_observer_system,
-                    interact_system,
-                    drain_transport_system,
-                    collect_mesh_tasks_system,
-                    spawn_mesh_tasks_system,
-                    hud_update_system,
-                    screenshot_system,
-                )
-                    .chain(),
-            );
+        app.add_systems(
+            Update,
+            (
+                advance_frame_counter_system,
+                fly_camera_system,
+                sync_observer_system,
+                interact_system,
+                drain_transport_system,
+                collect_mesh_tasks_system,
+                spawn_mesh_tasks_system,
+                hud_update_system,
+                screenshot_system,
+            )
+                .chain(),
+        );
     }
 
     app.run();
@@ -635,29 +734,40 @@ fn setup_scene(
         Transform::from_xyz(30.0, 50.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    if script_mode.is_none() {
-        if let Ok(mut cursor) = cursor_q.single_mut() {
-            cursor.visible = false;
-            cursor.grab_mode = CursorGrabMode::Locked;
-        }
-        // REQ-013 C02-1 §3.2:交互模式左上角绝对定位 HUD 根 Node + 单 Text。
-        commands
-            .spawn(Node {
+    if script_mode.is_none()
+        && let Ok(mut cursor) = cursor_q.single_mut()
+    {
+        cursor.visible = false;
+        cursor.grab_mode = CursorGrabMode::Locked;
+    }
+
+    // REQ-013 C02-1 §3.2 / C02-2 D3:交互与脚本模式均 spawn HUD 根 Node + 子 Text;
+    // 脚本模式初始 Hidden,由 script_driver_system 按 shot.hud 切换。
+    let hud_visibility = if script_mode.is_some() {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    commands
+        .spawn((
+            Node {
                 position_type: PositionType::Absolute,
                 left: Val::Px(12.0),
                 top: Val::Px(12.0),
                 ..default()
-            })
-            .with_children(|parent| {
-                parent.spawn((
-                    Node::default(),
-                    Text::new(""),
-                    TextFont::from_font_size(16.0),
-                    TextColor(Color::WHITE),
-                    HudText,
-                ));
-            });
-    }
+            },
+            hud_visibility,
+            HudRoot,
+        ))
+        .with_children(|parent| {
+            parent.spawn((
+                Node::default(),
+                Text::new(""),
+                TextFont::from_font_size(16.0),
+                TextColor(Color::WHITE),
+                HudText,
+            ));
+        });
 }
 
 /// 每帧推进渲染帧计数器并记录帧耗时(脚本与交互模式均记录,上限 7200 帧)。
@@ -750,9 +860,6 @@ fn sync_observer_system(
     mut tracker: ResMut<ObserverTracker>,
     cam_q: Query<&Transform, With<FlyCamera>>,
 ) {
-    let Some(transport) = transport_res.transport.as_mut() else {
-        return;
-    };
     let Ok(transform) = cam_q.single() else {
         return;
     };
@@ -762,9 +869,11 @@ fn sync_observer_system(
         (world_pos.z / 16.0).floor() as i32,
     );
     if tracker.last_chunk != Some(chunk) {
-        tracker.last_chunk = Some(chunk);
-        transport.send(C2S::MoveObserver {
-            position: world_pos,
+        transport_res.with_mut(|transport| {
+            tracker.last_chunk = Some(chunk);
+            transport.send(C2S::MoveObserver {
+                position: world_pos,
+            });
         });
     }
 }
@@ -810,7 +919,7 @@ fn interact_system(
         select_material(&mut tool_res.state, 3);
     }
 
-    if let Some(transport) = transport_res.transport.as_mut() {
+    transport_res.with_mut(|transport| {
         // 鼠标锁定时左右键挖掘/放置(同 viewer render.rs:1286)。
         if fly.cursor_grabbed {
             if mouse_buttons.just_pressed(MouseButton::Left) {
@@ -873,7 +982,7 @@ fn interact_system(
                 }
             }
         }
-    }
+    });
 
     possess_res.state.tick(now);
 
@@ -1012,26 +1121,56 @@ fn record_edit_frames(
     }
 }
 
-/// 消费宿主 S2C 帧更新世界镜像(脚本模式同时喂 `WorldState`,交互模式维护 `PossessRes`),并在 chunk 卸载时回收实体/资产/任务。
+/// 清理单个 chunk 关联的全部渲染实体、网格句柄、在途任务与编辑帧追踪(REQ-013 C02-2 D1b / PM29 靶点)。
+///
+/// 调用方负责先在镜像侧完成 `remove_chunk`(显式 `S2C::ChunkUnload` 先移除再调本函数;
+/// LRU `enforce_cap` 内部已完成 `remove_chunk`)。
+fn unload_chunk_visuals(
+    pos: ChunkPos,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    world_res: &mut WorldRenderRes,
+    pending: &mut PendingMeshesRes,
+    edit_frames: &mut EditFrameTracker,
+) {
+    for section in 0..SECTIONS_PER_CHUNK {
+        let sc = SubchunkPos {
+            chunk: pos,
+            section,
+        };
+        pending.tasks.remove(&sc);
+        edit_frames.frames.remove(&sc);
+        if let Some((entity, old_handle)) = world_res.entities.remove(&sc) {
+            meshes.remove(&old_handle);
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
+/// 消费宿主 S2C 帧更新世界镜像(脚本模式同时喂 `WorldState`,交互与脚本模式维护 `PossessRes`),
+/// 并在 chunk 卸载或 LRU 驱逐时经 [`unload_chunk_visuals`] 回收实体/资产/任务。
 #[allow(clippy::too_many_arguments)]
 fn drain_transport_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     frame_counter: Res<FrameCounter>,
+    view_cap: Res<ViewCapRes>,
     mut transport_res: ResMut<TransportRes>,
     mut world_res: ResMut<WorldRenderRes>,
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
-    mut server_perf: ResMut<ServerPerfRes>,
+    mut stats: ResMut<MeshStats>,
+    mut server_perf: Option<ResMut<ServerPerfRes>>,
     mut server_tick: ResMut<ServerTickRes>,
     mut possess_res: Option<ResMut<PossessRes>>,
     mut script_mode: Option<ResMut<ScriptModeRes>>,
+    cam_q: Query<&Transform, With<FlyCamera>>,
 ) {
-    let Some(transport) = transport_res.transport.as_mut() else {
+    let Some(msgs) = transport_res.with_mut(|transport| transport.drain()) else {
         return;
     };
     let mut pending_sends: Vec<C2S> = Vec::new();
-    for msg in transport.drain() {
+    for msg in msgs {
         if let Some(script) = script_mode.as_mut()
             && let Some(ev) = s2c_to_event(msg.clone())
         {
@@ -1059,18 +1198,15 @@ fn drain_transport_system(
             }
             S2C::ChunkUnload { pos } => {
                 world_res.mirror.remove_chunk(pos);
-                for section in 0..SECTIONS_PER_CHUNK {
-                    let sc = SubchunkPos {
-                        chunk: pos,
-                        section,
-                    };
-                    pending.tasks.remove(&sc);
-                    edit_frames.frames.remove(&sc);
-                    if let Some((entity, old_handle)) = world_res.entities.remove(&sc) {
-                        meshes.remove(&old_handle);
-                        commands.entity(entity).despawn();
-                    }
-                }
+                unload_chunk_visuals(
+                    pos,
+                    &mut commands,
+                    &mut meshes,
+                    &mut world_res,
+                    &mut pending,
+                    &mut edit_frames,
+                );
+                stats.unloads = stats.unloads.saturating_add(1);
             }
             S2C::Spawned { entity } => {
                 if let Some(possess) = possess_res.as_mut() {
@@ -1122,18 +1258,52 @@ fn drain_transport_system(
                 policy_total_us,
                 ..
             } => {
-                server_perf.latest = Some(ServerPerfSample {
-                    sim_p95_ms,
-                    sim_samples,
-                    policy_infer_count,
-                    policy_total_us,
-                });
+                if let Some(perf) = server_perf.as_mut() {
+                    perf.latest = Some(ServerPerfSample {
+                        sim_p95_ms,
+                        sim_samples,
+                        policy_infer_count,
+                        policy_total_us,
+                    });
+                }
             }
             _ => {}
         }
     }
-    for c2s in pending_sends {
-        transport.send(c2s);
+    if !pending_sends.is_empty() {
+        transport_res.with_mut(|transport| {
+            for c2s in pending_sends {
+                transport.send(c2s);
+            }
+        });
+    }
+
+    // REQ-013 C02-2 D1b:按相机所在 chunk ± vd 构造保护集,超上限时按 LRU 驱逐并回收视觉句柄。
+    let mut protect = BTreeSet::new();
+    if let Ok(cam_tf) = cam_q.single() {
+        let cam_pos = conv::from_bevy_vec3(cam_tf.translation);
+        let cx = (cam_pos.x / 16.0).floor() as i32;
+        let cz = (cam_pos.z / 16.0).floor() as i32;
+        let vd = i32::from(view_cap.view_distance);
+        for dx in -vd..=vd {
+            for dz in -vd..=vd {
+                protect.insert(ChunkPos::new(cx + dx, cz + dz));
+            }
+        }
+    }
+    let evicted = world_res.mirror.enforce_cap(view_cap.chunk_cap, &protect);
+    if !evicted.is_empty() {
+        stats.evictions = stats.evictions.saturating_add(evicted.len() as u64);
+        for pos in evicted {
+            unload_chunk_visuals(
+                pos,
+                &mut commands,
+                &mut meshes,
+                &mut world_res,
+                &mut pending,
+                &mut edit_frames,
+            );
+        }
     }
 }
 
@@ -1147,8 +1317,8 @@ fn collect_mesh_tasks_system(
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut stats: ResMut<MeshStats>,
-    mut mesh_perf: ResMut<MeshPerfRes>,
-    mut fps_history: ResMut<FpsHistoryRes>,
+    mut mesh_perf: Option<ResMut<MeshPerfRes>>,
+    mut fps_history: Option<ResMut<FpsHistoryRes>>,
 ) {
     let material = world_res.terrain_material.clone();
     let mut completed: Vec<(SubchunkPos, DirtyKind, u64, SubchunkMesh, u64)> = Vec::new();
@@ -1163,7 +1333,9 @@ fn collect_mesh_tasks_system(
     });
 
     for (sc, kind, pending_epoch, submesh, us) in completed {
-        acc_mesh_perf(&mut mesh_perf.0, us);
+        if let Some(mp) = mesh_perf.as_mut() {
+            acc_mesh_perf(&mut mp.0, us);
+        }
         let current_epoch = world_res.mirror.epoch(sc);
         if is_stale(pending_epoch, current_epoch) {
             stats.discards += 1;
@@ -1202,7 +1374,9 @@ fn collect_mesh_tasks_system(
 
         stats.uploads += 1;
         if kind == DirtyKind::Edit {
-            fps_history.record_edit_upload();
+            if let Some(fps) = fps_history.as_mut() {
+                fps.record_edit_upload();
+            }
             if let Some(arrived_frame) = edit_frames.frames.remove(&sc) {
                 let diff = frame_counter.0.saturating_sub(arrived_frame) as u32;
                 stats.max_edit_upload_frames = stats.max_edit_upload_frames.max(diff);
@@ -1287,19 +1461,22 @@ fn forward_engine_commands_with(
     rejected
 }
 
-/// 将 `EngineCommand` 列表翻译为 `C2S` 并经 `LocalTransport` 发送(返回被拒绝的 `ToolAction` 提示)。
+/// 将 `EngineCommand` 列表翻译为 `C2S` 并经 `Transport` 发送(返回被拒绝的 `ToolAction` 提示)。
 fn forward_engine_commands(
     commands: &[EngineCommand],
-    transport: &mut LocalTransport,
+    transport: &mut dyn Transport,
 ) -> Vec<String> {
     forward_engine_commands_with(commands, |c2s| transport.send(c2s))
 }
 
-/// 脚本冒烟模式主驱动系统:等 `tick_known` → 推进 `Engine` → 相机/命令/截图/manifest → 优雅收口退出。
+/// 脚本冒烟模式主驱动系统:等 `tick_known` → 推进 `Engine` → 相机/命令/截图/HUD 显隐/manifest → 优雅收口退出。
 #[allow(clippy::too_many_arguments)]
 fn script_driver_system(
     mut commands: Commands,
     time: Res<Time>,
+    frame_counter: Res<FrameCounter>,
+    meshes: Res<Assets<Mesh>>,
+    world_res: Res<WorldRenderRes>,
     stats: Res<MeshStats>,
     mesh_perf: Res<MeshPerfRes>,
     mut fps_history: ResMut<FpsHistoryRes>,
@@ -1307,17 +1484,39 @@ fn script_driver_system(
     mut transport_res: ResMut<TransportRes>,
     mut script: ResMut<ScriptModeRes>,
     mut cam_q: Query<(&mut Transform, &mut FlyCamera)>,
+    mut hud_root_q: Query<&mut Visibility, With<HudRoot>>,
 ) {
+    // REQ-013 C02-2 R3:延迟 1 帧 spawn Screenshot 实体(确保 HUD Visibility 切换已完成渲染传播)。
+    // 必须放在 finished_exit 与 pending_shots 门控之前:末张截图的延迟 spawn 发生在 finished_exit 已置位之后。
+    if let Some((_, shot_frame)) = script.pending_spawn.as_ref()
+        && frame_counter.0 > *shot_frame
+    {
+        let (shot, _) = script
+            .pending_spawn
+            .take()
+            .expect("pending_spawn 刚完成帧号检查");
+        let path = script.out_dir.join(shot.file_name());
+        let done = Arc::clone(&script.pending_shots);
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path))
+            .observe(move |_: On<ScreenshotCaptured>| {
+                done.fetch_sub(1, Ordering::SeqCst);
+            });
+    }
+
+    let sample_mesh_stats = || stats.to_manifest(meshes.len(), world_res.entities.len());
+
     // 场景已结束:等待最后一张异步截图写盘完毕,再写终版 manifest、关闭宿主并按 exit_code 退出。
     if let Some(code) = script.finished_exit {
         if script.pending_shots.load(Ordering::SeqCst) > 0 {
             return;
         }
-        script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.mesh_stats = Some(sample_mesh_stats());
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
-        // 显式 drop LocalTransport → 发送 Goodbye 并 join 宿主线程,确保 redb 收口。
-        let _ = transport_res.transport.take();
+        // 显式 drop Transport → 发送 Goodbye 并 join 宿主线程,确保 redb 收口。
+        transport_res.close();
         std::process::exit(code);
     }
 
@@ -1332,13 +1531,13 @@ fn script_driver_system(
 
     // 若尚未收到第一个 EntityStates 心跳(tick_known),先上报初始观察者位姿让分片注册发心跳。
     if !script.world.tick_known() {
-        if script.last_observer_pos.is_none()
-            && let Some(transport) = transport_res.transport.as_mut()
-        {
+        if script.last_observer_pos.is_none() {
             let pos = transform.translation;
-            script.last_observer_pos = Some(pos);
-            transport.send(C2S::MoveObserver {
-                position: conv::from_bevy_vec3(pos),
+            transport_res.with_mut(|transport| {
+                script.last_observer_pos = Some(pos);
+                transport.send(C2S::MoveObserver {
+                    position: conv::from_bevy_vec3(pos),
+                });
             });
         }
         return;
@@ -1361,7 +1560,7 @@ fn script_driver_system(
             reason: format!("断连:{reason}"),
         };
         script.manifest.finish(&status);
-        script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.mesh_stats = Some(sample_mesh_stats());
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(2);
@@ -1412,7 +1611,7 @@ fn script_driver_system(
         fps_history.record_first_dig();
     }
     let mut rejected_messages: Vec<String> = Vec::new();
-    if let Some(transport) = transport_res.transport.as_mut() {
+    transport_res.with_mut(|transport| {
         rejected_messages = forward_engine_commands(&output.commands, transport);
         if script.coupled {
             let need_send = match script.last_observer_pos {
@@ -1426,7 +1625,7 @@ fn script_driver_system(
                 });
             }
         }
-    }
+    });
 
     if !output.finished.is_empty() {
         let ScriptModeRes {
@@ -1450,26 +1649,29 @@ fn script_driver_system(
                 step.messages.extend(rejected_messages);
             }
         }
-        manifest.mesh_stats = Some(stats.to_manifest());
+        manifest.mesh_stats = Some(sample_mesh_stats());
         manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(manifest, out_dir);
     }
 
     if let Some(shot) = output.screenshot {
-        let path = script.out_dir.join(shot.file_name());
+        // REQ-013 C02-2 D3 + R3 / PM30 靶点:shot 帧只切换 HUD 根可见性、计入 pending_shots
+        // 并缓存 pending_spawn,不于同帧 spawn Screenshot(下一帧由顶部延迟 spawn 段发出)。
+        let hud_vis = if shot.hud {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        for mut vis in &mut hud_root_q {
+            *vis = hud_vis;
+        }
         script.pending_shots.fetch_add(1, Ordering::SeqCst);
-        let done = Arc::clone(&script.pending_shots);
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path))
-            .observe(move |_: On<ScreenshotCaptured>| {
-                done.fetch_sub(1, Ordering::SeqCst);
-            });
+        script.pending_spawn = Some((shot, frame_counter.0));
     }
 
     if !matches!(final_status, EngineStatus::Running { .. }) {
         script.manifest.finish(&final_status);
-        script.manifest.mesh_stats = Some(stats.to_manifest());
+        script.manifest.mesh_stats = Some(sample_mesh_stats());
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(exit_code.unwrap_or(2));
@@ -2125,5 +2327,404 @@ mod tests {
         handle.send(C2S::Goodbye);
         drop(handle);
         join.join().expect("app-local-host 线程正常退出");
+    }
+
+    /// 假传输(C02-2 MS26/MS24 无头接线测试用):`send` 丢弃,`drain` 取空共享入队缓冲。
+    struct FakeTransport(Arc<Mutex<Vec<S2C>>>);
+
+    impl FakeTransport {
+        fn new() -> (Self, Arc<Mutex<Vec<S2C>>>) {
+            let queue = Arc::new(Mutex::new(Vec::new()));
+            (Self(Arc::clone(&queue)), queue)
+        }
+    }
+
+    impl Transport for FakeTransport {
+        fn send(&mut self, _c2s: C2S) {}
+        fn drain(&mut self) -> Vec<S2C> {
+            let mut q = self.0.lock().expect("FakeTransport queue poisoned");
+            std::mem::take(&mut *q)
+        }
+    }
+
+    /// MS26(REQ-013 C02-2 D1b / PM29 靶点):假传输无头 App 调度
+    /// `drain_transport + collect_mesh + spawn_mesh`,验证 LRU 驱逐与 `ChunkUnload`
+    /// 均经 `unload_chunk_visuals` 清空实体并回收 `Assets<Mesh>`(`assets == entities`)。
+    #[test]
+    fn ms26_lru_evict_and_chunk_unload_visuals_headless() {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+
+        let terrain_material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
+        let (fake_transport, inbound) = FakeTransport::new();
+
+        app.insert_resource(WorldRenderRes {
+            mirror: ChunkMirror::new(),
+            entities: BTreeMap::new(),
+            terrain_material,
+        })
+        .insert_resource(TransportRes::new(fake_transport))
+        .insert_resource(PendingMeshesRes::default())
+        .insert_resource(EditFrameTracker::default())
+        .insert_resource(MeshStats::default())
+        .insert_resource(ServerTickRes::default())
+        .insert_resource(FrameCounter::default())
+        .insert_resource(ViewCapRes {
+            view_distance: 0,
+            chunk_cap: 3,
+        })
+        .add_systems(
+            Update,
+            (
+                drain_transport_system,
+                collect_mesh_tasks_system,
+                spawn_mesh_tasks_system,
+            )
+                .chain(),
+        );
+
+        app.world_mut().spawn((
+            Transform::from_xyz(0.5, -48.0, 0.5),
+            FlyCamera {
+                yaw: 0.0,
+                pitch: 0.0,
+                cursor_grabbed: true,
+            },
+        ));
+
+        let make_stone_chunk = || {
+            let mut c = Chunk::air();
+            // 世界 (chunk_x*16, -60, 0) → 局部 (0, 4, 0),保证 section 0 网格非空。
+            c.set(0, 4, 0, STONE);
+            c
+        };
+
+        // ① 入队 (0,0)/(1,0)/(2,0),有界泵 ≤64 帧直到三 chunk 各有 ≥1 个 subchunk 实体。
+        {
+            let mut q = inbound.lock().expect("queue lock");
+            for cx in 0..=2 {
+                q.push(S2C::ChunkData {
+                    pos: ChunkPos::new(cx, 0),
+                    chunk: make_stone_chunk(),
+                });
+            }
+        }
+        let mut all_uploaded = false;
+        for _ in 0..64 {
+            app.update();
+            let wr = app.world().resource::<WorldRenderRes>();
+            let has = |cx: i32| {
+                wr.entities
+                    .keys()
+                    .any(|sc| sc.chunk == ChunkPos::new(cx, 0))
+            };
+            if has(0) && has(1) && has(2) {
+                all_uploaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            all_uploaded,
+            "前置断言:≤64 帧内 (0,0)/(1,0)/(2,0) 必须各有 ≥1 个 subchunk 实体"
+        );
+
+        // ② 入队 (3,0)/(4,0),泵 1 帧 → protect={(0,0)},驱逐 (1,0)/(2,0),evictions==2,unloads==0。
+        {
+            let mut q = inbound.lock().expect("queue lock");
+            q.push(S2C::ChunkData {
+                pos: ChunkPos::new(3, 0),
+                chunk: make_stone_chunk(),
+            });
+            q.push(S2C::ChunkData {
+                pos: ChunkPos::new(4, 0),
+                chunk: make_stone_chunk(),
+            });
+        }
+        app.update();
+
+        {
+            let wr = app.world().resource::<WorldRenderRes>();
+            assert_eq!(wr.mirror.chunk_count(), 3);
+            assert!(wr.mirror.chunk_arc(ChunkPos::new(1, 0)).is_none());
+            assert!(
+                !wr.entities
+                    .keys()
+                    .any(|sc| sc.chunk == ChunkPos::new(1, 0) || sc.chunk == ChunkPos::new(2, 0)),
+                "(1,0)/(2,0) 的 subchunk 实体必须全部 despawn"
+            );
+            assert_eq!(
+                app.world().resource::<Assets<Mesh>>().len(),
+                wr.entities.len(),
+                "Assets<Mesh>.len() 必须恒等于 entities.len()"
+            );
+            let st = *app.world().resource::<MeshStats>();
+            assert_eq!(st.evictions, 2);
+            assert_eq!(st.unloads, 0);
+        }
+
+        // ③ 入队 ChunkUnload{(3,0)},泵 1 帧 → unloads==1,(3,0) 实体清空,assets==entities 仍成立。
+        {
+            let mut q = inbound.lock().expect("queue lock");
+            q.push(S2C::ChunkUnload {
+                pos: ChunkPos::new(3, 0),
+            });
+        }
+        app.update();
+
+        {
+            let wr = app.world().resource::<WorldRenderRes>();
+            let st = *app.world().resource::<MeshStats>();
+            assert_eq!(st.unloads, 1);
+            assert!(
+                !wr.entities.keys().any(|sc| sc.chunk == ChunkPos::new(3, 0)),
+                "(3,0) 实体必须清空"
+            );
+            assert_eq!(
+                app.world().resource::<Assets<Mesh>>().len(),
+                wr.entities.len(),
+                "ChunkUnload 后 Assets<Mesh>.len() == entities.len() 必须成立"
+            );
+        }
+    }
+
+    /// MS24(REQ-013 C02-2 D3 + R1 B4 / PM30 靶点):无头 App 真实调度
+    /// `Startup::setup_scene`(脚本模式)+ `script_driver_system` + `hud_update_system`,
+    /// 验证初始 `Hidden`、手算五行文本串、`set_hud_visibility` 直调、以及三步脚本
+    /// (`screenshot hud=true` → `wait_ticks 2` → `screenshot hud=false`)的四帧可见性时序。
+    #[test]
+    fn ms24_script_shot_hud_visibility_and_text() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let scenario = parse_scenario(
+            "name = \"ms24\"\ndescription = \"shot.hud\"\n\n\
+             [[step]]\nscreenshot = { name = \"s1\", expect = \"hud on\", hud = true }\n\
+             [[step]]\nwait_ticks = { n = 2 }\n\
+             [[step]]\nscreenshot = { name = \"s2\", expect = \"hud off\", hud = false }\n",
+        )
+        .expect("ms24 场景合法");
+        let manifest = Manifest::new(&scenario);
+        let script_res = ScriptModeRes {
+            scenario,
+            out_dir: tmp.path().to_path_buf(),
+            world: WorldState::new(),
+            engine: None,
+            manifest,
+            coupled: true,
+            last_observer_pos: None,
+            pending_shots: Arc::new(AtomicUsize::new(0)),
+            pending_spawn: None,
+            finished_exit: None,
+            disconnected: None,
+        };
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+
+        let (fake_transport, _inbound) = FakeTransport::new();
+        app.insert_resource(TransportRes::new(fake_transport))
+            .insert_resource(FrameCounter::default())
+            .insert_resource(MeshStats::default())
+            .insert_resource(MeshPerfRes::default())
+            .insert_resource(FpsHistoryRes::default())
+            .insert_resource(ServerPerfRes::default())
+            .insert_resource(ServerTickRes::default())
+            .insert_resource(ToolRes::default())
+            .insert_resource(PossessRes::default())
+            .insert_resource(script_res)
+            .add_systems(Startup, setup_scene)
+            .add_systems(
+                Update,
+                (
+                    advance_frame_counter_system,
+                    script_driver_system,
+                    hud_update_system,
+                )
+                    .chain(),
+            );
+
+        let hud_vis = |world: &mut World| -> Visibility {
+            let mut q = world.query_filtered::<&Visibility, With<HudRoot>>();
+            *q.single(world).expect("必须存在唯一 HudRoot")
+        };
+        let screenshot_count = |world: &mut World| -> usize {
+            let mut q = world.query_filtered::<Entity, With<Screenshot>>();
+            q.iter(world).count()
+        };
+
+        // 首帧执行 Startup::setup_scene(tick_known=false, script_driver 早退)+ hud_update_system。
+        app.update();
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Hidden,
+            "脚本模式 setup 后 HUD 根初始必须为 Hidden"
+        );
+        {
+            let mut q = app.world_mut().query_filtered::<&Text, With<HudText>>();
+            let text = q.single(app.world()).expect("必须存在唯一 HudText");
+            assert_eq!(
+                text.0,
+                "fps: 0.0 (min 0.0)\ntick: 0\nchunks: 0\ntool: material dirt | placeable single block | shape single | preset 20 m/s | target -\npossess: NoBody"
+            );
+        }
+
+        // 直调 set_hud_visibility 断言。
+        set_hud_visibility(app.world_mut(), true);
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Inherited);
+        set_hud_visibility(app.world_mut(), false);
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Hidden);
+
+        let push_tick = |world: &mut World, t: u64| {
+            let mut sm = world.resource_mut::<ScriptModeRes>();
+            sm.world.apply(ViewEvent::Entities {
+                tick: types::Tick(t),
+                states: vec![],
+                removed: vec![],
+                full: false,
+            });
+        };
+
+        // update1(tick=1):step 1 screenshot hud=true 触发 → Inherited,且同帧不 spawn Screenshot(R3)。
+        push_tick(app.world_mut(), 1);
+        app.update();
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update1 执行 hud=true 截图步后必须为 Inherited"
+        );
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            0,
+            "update1 shot 帧只切显隐与缓存 pending_spawn,世界内 Screenshot 实体数必须为 0(R3)"
+        );
+
+        // 无头无 RenderPlugin 不会触发 ScreenshotCaptured,模拟上一步截图完成以继续推进。
+        app.world()
+            .resource::<ScriptModeRes>()
+            .pending_shots
+            .store(0, Ordering::SeqCst);
+
+        // update2(tick=2):延迟 1 帧 spawn Screenshot 实体(==1),step 2 wait_ticks 2 入等 → 仍 Inherited。
+        push_tick(app.world_mut(), 2);
+        app.update();
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            1,
+            "update2 延迟 1 帧后世界内必须恰有 1 个 Screenshot 实体(R3)"
+        );
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update2 处于 wait_ticks 2 期间 HUD 显隐持续保持 Inherited"
+        );
+
+        // update3(tick=3):wait_ticks 2 未满(3 < 4)→ 仍 Inherited。
+        push_tick(app.world_mut(), 3);
+        app.update();
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Inherited);
+
+        // update4(tick=4):wait_ticks 2 结束并执行 step 3 screenshot hud=false → Hidden。
+        push_tick(app.world_mut(), 4);
+        app.update();
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Hidden,
+            "update4 执行 hud=false 截图步后必须切回 Hidden"
+        );
+    }
+
+    /// MS23(REQ-013 C02-2 D4 / PM31 靶点):裸 App 调度 `fly_camera_system`,六例手算断言。
+    #[test]
+    fn ms23_fly_camera_headless_six_cases() {
+        let run_case = |press_keys: &[KeyCode],
+                        delta: Vec2,
+                        possessed: Option<EntityId>|
+         -> (Vec3, f32, f32, usize) {
+            let mut app = App::new();
+            app.add_message::<AppExit>();
+            let mut time = Time::<()>::default();
+            time.advance_by(Duration::from_secs_f32(0.5));
+            let mut keys = ButtonInput::<KeyCode>::default();
+            for &k in press_keys {
+                keys.press(k);
+            }
+            let possess = PossessRes {
+                possessed,
+                ..PossessRes::default()
+            };
+            app.insert_resource(time)
+                .insert_resource(keys)
+                .insert_resource(ButtonInput::<MouseButton>::default())
+                .insert_resource(AccumulatedMouseMotion { delta })
+                .insert_resource(possess)
+                .add_systems(Update, fly_camera_system);
+
+            let cam = app
+                .world_mut()
+                .spawn((
+                    Transform::from_xyz(0.0, 0.0, 0.0),
+                    FlyCamera {
+                        yaw: 0.0,
+                        pitch: 0.0,
+                        cursor_grabbed: true,
+                    },
+                ))
+                .id();
+            app.update();
+
+            let tf = *app.world().get::<Transform>(cam).expect("Transform");
+            let fly = app.world().get::<FlyCamera>(cam).expect("FlyCamera");
+            let exits = app.world().resource::<Messages<AppExit>>().len();
+            (tf.translation, fly.yaw, fly.pitch, exits)
+        };
+
+        // a: W held → (8, 0, 0) (16 m/s × 0.5 s, yaw 0 前向 = +x)。
+        let (pos, _, _, _) = run_case(&[KeyCode::KeyW], Vec2::ZERO, None);
+        assert!(
+            (pos - Vec3::new(8.0, 0.0, 0.0)).length() < 1e-5,
+            "MS23 a: 实得 {pos:?}"
+        );
+
+        // b: W+D held → (8/√2, 0, 8/√2), eps 1e-5;手算 5.656854249492380…,
+        // f64 字面量转 f32 保精度并避 clippy::excessive_precision。
+        let (pos, _, _, _) = run_case(&[KeyCode::KeyW, KeyCode::KeyD], Vec2::ZERO, None);
+        assert!(
+            (pos.x - 5.656_854_249_492_38_f64 as f32).abs() < 1e-5
+                && pos.y.abs() < 1e-5
+                && (pos.z - 5.656_854_249_492_38_f64 as f32).abs() < 1e-5,
+            "MS23 b: 实得 {pos:?}"
+        );
+
+        // c: mouse delta (100, 50), grabbed → yaw == 0.3, pitch == -0.15, eps 1e-6。
+        let (_, yaw, pitch, _) = run_case(&[], Vec2::new(100.0, 50.0), None);
+        assert!(
+            (yaw - 0.3).abs() < 1e-6 && (pitch - (-0.15)).abs() < 1e-6,
+            "MS23 c: 实得 yaw={yaw}, pitch={pitch}"
+        );
+
+        // d: PossessRes.possessed = Some(EntityId(1)) + W held → translation 不变 (0, 0, 0)。
+        let (pos, _, _, _) = run_case(
+            &[KeyCode::KeyW],
+            Vec2::ZERO,
+            Some(EntityId::from_parts(0, 1)),
+        );
+        assert_eq!(pos, Vec3::ZERO, "MS23 d: 附身时 WASD 不得平移飞行相机");
+
+        // e: just_pressed Escape → Messages<AppExit> 当帧消息数 == 1。
+        let (_, _, _, exits) = run_case(&[KeyCode::Escape], Vec2::ZERO, None);
+        assert_eq!(exits, 1, "MS23 e: Escape 必须发出 1 条 AppExit");
+
+        // f: mouse delta (0, -10000) → pitch == 1.55334303, eps 1e-6 (89° clamp 上界)。
+        let (_, _, pitch, _) = run_case(&[], Vec2::new(0.0, -10_000.0), None);
+        assert!(
+            (pitch - 1.553_343).abs() < 1e-6,
+            "MS23 f: pitch 上界 clamp 实得 {pitch}"
+        );
     }
 }

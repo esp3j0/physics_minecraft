@@ -14,12 +14,22 @@ use serde::{Deserialize, Serialize};
 
 use super::{EngineStatus, Scenario, StepOutcome, StepRecord, WorldQuery};
 
-/// 客户端异步网格上传统计(REQ-013 C01b-2 §2.2/§3.1;本地 manifest 字段,非协议)。
+/// 客户端异步网格上传统计(REQ-013 C01b-2 §2.2/§3.1;C02-2 D1b 追加卸载/驱逐/句柄不变量字段)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestMeshStats {
     pub max_edit_upload_frames: u32,
     pub uploads: u64,
     pub discards: u64,
+    #[serde(default)]
+    pub unloads: u64,
+    #[serde(default)]
+    pub evictions: u64,
+    #[serde(default)]
+    pub assets_live_end: usize,
+    #[serde(default)]
+    pub entities_live_end: usize,
+    #[serde(default)]
+    pub assets_baseline: usize,
 }
 
 /// 客户端与服务端性能测量汇总(REQ-013 C01b-3 §1.4;本地 manifest 字段,非协议)。
@@ -415,10 +425,32 @@ mod tests {
         assert_eq!(parsed.mesh_stats, None);
         assert_eq!(parsed.perf, None);
 
+        let legacy_mesh_json = r#"{"scenario":"t","req":"REQ-008","description":"d","steps":[],"result":null,"mesh_stats":{"max_edit_upload_frames":1,"uploads":10,"discards":2}}"#;
+        let parsed_mesh = Manifest::from_json(legacy_mesh_json)
+            .expect("旧版仅含 3 字段的 mesh_stats JSON 仍可读回(新四字段缺省 0)");
+        assert_eq!(
+            parsed_mesh.mesh_stats,
+            Some(ManifestMeshStats {
+                max_edit_upload_frames: 1,
+                uploads: 10,
+                discards: 2,
+                unloads: 0,
+                evictions: 0,
+                assets_live_end: 0,
+                entities_live_end: 0,
+                assets_baseline: 0,
+            })
+        );
+
         m.mesh_stats = Some(ManifestMeshStats {
             max_edit_upload_frames: 2,
             uploads: 42,
             discards: 3,
+            unloads: 5,
+            evictions: 2,
+            assets_live_end: 30,
+            entities_live_end: 25,
+            assets_baseline: 5,
         });
         m.perf = Some(ManifestPerf {
             fps_mean: 60.0,
