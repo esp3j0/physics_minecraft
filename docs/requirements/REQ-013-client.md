@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -369,6 +369,28 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   遗留归 C02-2:LRU 上限 + 视距移动场景 + 卸载句柄机器锚、脚本 shot.hud
   HUD 显隐接线 + 冒烟可见性锚(R6 延期)、MS23 fly 锚。验收与 R2–R6
   裁定见 #27。
+- C02-2 ✅ 验收通过(2026-11-21,含 R2–R4 裁定):提交 2dcf005。
+  D1 ChunkMirror LRU(last_use/use_clock;enforce_cap 保护集外按
+  (last_use,pos) 逐出;remove_chunk 清被逐区块自身脏标、保留 epochs、
+  标记 loaded 邻居;MS25 t1 epoch=2、t5 dirty=24 架构师手算);
+  D2 client_view_move 8 步场景 + xtask 机器断言(unloads>=1、
+  evictions==0、assets==entities+baseline 三值等式、uploads>=1);
+  D3 脚本 shot.hud 显隐 + 延迟一帧生成(R3:截图帧只切 Visibility 并记
+  pending_spawn,次帧帧首 spawn Screenshot,早于两个 early-return 门;
+  MS24 headless 锚 u1=0/u2=1)+ client_interact 第 21 步 hud=true
+  视觉锚(审图五行白色 HUD 通过);MS23 fly headless 锚落地。
+  R2:assets 与 entities 差 5 为 Bevy 内置不朽 Mesh(decal quad、
+  fog plane+cube、PointList fallback、SpriteMesh 无条件首帧 quad),
+  非产品泄漏 → PostUpdate `.after(AssetEventSystems)` 一次性采样
+  assets_baseline(N13 证明挂载顺序必要)。R4:批跑偶发 72B 截图 =
+  1x1(窗口创建物理尺寸报 0、wgpu 钳交换链),环境偶发、未归因产品
+  代码;补 xtask verify_client_screenshots 解 PNG IHDR 宽高 >=16
+  门禁堵"空图冒烟绿"缺口(N14)。门禁:client-core 204/client 12/
+  viewer 19/app/messaging/sim-api/xtask + e2e 33 + clippy workspace 0
+  + fmt 0 + selftest 5/5 + 六场景冒烟 exit 0 且全图 1280x720;
+  PM27–PM31、N12–N14 全击杀并还原。实施归属如实:agy 4 次派发均
+  print-timeout(worktree 存活、代码落地),门禁/变异/归因/裁定由
+  架构师完成,含还原 agy 遗留 PM30 变异。验收与 R2–R4 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
