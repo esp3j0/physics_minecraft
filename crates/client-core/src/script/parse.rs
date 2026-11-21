@@ -25,8 +25,8 @@ const TOP_KEYS: [&str; 7] = [
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
 /// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作,B02c
-/// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`)。
-const ACTION_KEYS: [&str; 19] = [
+/// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`,C02-1 追加 `dig`/`place`/`select_material`)。
+const ACTION_KEYS: [&str; 22] = [
     "camera",
     "look_at",
     "fly",
@@ -46,6 +46,9 @@ const ACTION_KEYS: [&str; 19] = [
     "mark_agent",
     "adopt_agent",
     "perf_reset",
+    "dig",
+    "place",
+    "select_material",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -344,6 +347,10 @@ fn parse_action(
         "adopt_agent" => &["label", "near", "within", "timeout_ticks"],
         // C01b-3 R1 §2.1:重置客户端性能采样窗口(空表,多余键报错)。
         "perf_reset" => &[],
+        // C02-1 §4.1:工具挖掘/放置/切材料动作。
+        "dig" => &[],
+        "place" => &["material"],
+        "select_material" => &["index"],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -598,6 +605,29 @@ fn parse_action(
         }
         "unpossess" => Ok(Action::Unpossess),
         "perf_reset" => Ok(Action::PerfReset),
+        "dig" => Ok(Action::Dig),
+        "place" => {
+            let material = match t.get("material") {
+                Some(v) => {
+                    let n = u64_of(v, "place.material").map_err(e)?;
+                    Some(
+                        usize::try_from(n)
+                            .map_err(|_| e("动作 place 的 material 应为非负整数".into()))?,
+                    )
+                }
+                None => None,
+            };
+            Ok(Action::Place { material })
+        }
+        "select_material" => {
+            let index = t
+                .get("index")
+                .ok_or_else(|| e("动作 select_material 缺必填参数 index".into()))?;
+            let n = u64_of(index, "select_material.index").map_err(e)?;
+            let index = usize::try_from(n)
+                .map_err(|_| e("动作 select_material 的 index 应为非负整数".into()))?;
+            Ok(Action::SelectMaterial { index })
+        }
         "intent" => {
             let mv = t
                 .get("move")

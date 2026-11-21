@@ -20,6 +20,24 @@ use types::{BlockId, BlockPos};
 use crate::mesh::FaceDir;
 use crate::script::WorldQuery;
 
+/// 拾取最远距离(REQ-011 §3.3 / C02-1 §1.5)。
+pub const PICK_MAX_DIST: f32 = 48.0;
+
+/// 按相机位姿沿前向射线做体素 DDA 拾取(REQ-013 C02-1 §1.5)。
+///
+/// 方向约定与 `script::CameraPose::forward` 同式:`forward = (cy*cp, sp, sy*cp)`(角度为度)。
+pub fn pick_at_camera(
+    world: &dyn WorldQuery,
+    origin: Vec3,
+    yaw_deg: f32,
+    pitch_deg: f32,
+) -> Option<Hit> {
+    let (sy, cy) = yaw_deg.to_radians().sin_cos();
+    let (sp, cp) = pitch_deg.to_radians().sin_cos();
+    let dir = Vec3::new(cy * cp, sp, sy * cp);
+    pick(world, origin, dir, PICK_MAX_DIST)
+}
+
 /// 一个拾取命中。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hit {
@@ -458,5 +476,28 @@ mod tests {
         .expect("命中替换的基岩格");
         assert_eq!(hit.block_pos, BlockPos::new(7, TOP, 7));
         assert_eq!(hit.block, BEDROCK);
+    }
+
+    /// MS14(REQ-013 C02-1 §1.5):`pick_at_camera` 轴向 DDA 手算三向验证。
+    #[test]
+    fn ms14_pick_at_camera_axial() {
+        // (a) origin (0.5,-59,0.5), yaw 0, pitch -90 → dir (0,-1,0) → hit (0,-61,0), place (0,-60,0)
+        let wa = FakeWorld::new(&[], &[(0, -61, 0, DIRT)]);
+        let ha = pick_at_camera(&wa, Vec3::new(0.5, -59.0, 0.5), 0.0, -90.0)
+            .expect("(a) 垂直下视必命中 (0,-61,0)");
+        assert_eq!(ha.block_pos, BlockPos::new(0, -61, 0));
+        assert_eq!(ha.place_pos(), BlockPos::new(0, -60, 0));
+
+        // (b) origin (0.5,-60.5,0.5), yaw 0, pitch 0 → dir (1,0,0) → hit (3,-61,0)
+        let wb = FakeWorld::new(&[], &[(3, -61, 0, DIRT)]);
+        let hb = pick_at_camera(&wb, Vec3::new(0.5, -60.5, 0.5), 0.0, 0.0)
+            .expect("(b) +x 平视必命中 (3,-61,0)");
+        assert_eq!(hb.block_pos, BlockPos::new(3, -61, 0));
+
+        // (c) origin (0.5,-60.5,0.5), yaw -90, pitch 0 → dir (0,0,-1) → hit (0,-61,-3)
+        let wc = FakeWorld::new(&[], &[(0, -61, -3, DIRT)]);
+        let hc = pick_at_camera(&wc, Vec3::new(0.5, -60.5, 0.5), -90.0, 0.0)
+            .expect("(c) -z 平视必命中 (0,-61,-3)");
+        assert_eq!(hc.block_pos, BlockPos::new(0, -61, -3));
     }
 }

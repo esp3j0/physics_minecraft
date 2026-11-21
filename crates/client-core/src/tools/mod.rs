@@ -24,7 +24,7 @@ pub use launch::{
 pub use panel::{
     DebugPacket, PanelColor, PanelLine, PanelState, disconnect_text, is_break, panel_lines,
 };
-pub use pick::{Hit, pick};
+pub use pick::{Hit, PICK_MAX_DIST, pick, pick_at_camera};
 pub use prefab::{ExpandError, Orientation, Prefab, expand, orientation_from_yaw};
 pub use stage::{
     StageDriver, StageOut, StagePhase, StageSplit, has_server_table, is_action_step, split,
@@ -197,6 +197,45 @@ pub fn hud_tool_line(
             None => String::new(),
         }
     )
+}
+
+/// Bevy 客户端 HUD 文本拼装(REQ-013 C02-1 §3.1;纯函数,零渲染依赖)。
+///
+/// 行序:`[fps 行(mean 与 min 各保留 1 位小数), tick 行, chunks 行, hud_tool_line 行,
+/// possess phase 行]` + 每条 notice 一行,`\n` 连接。
+#[must_use]
+pub fn hud_text(
+    state: &ToolState,
+    hit: Option<&Hit>,
+    phase: crate::possess::Phase,
+    fps: (f32, f32),
+    tick: u64,
+    chunks: usize,
+    notices: &[String],
+) -> String {
+    struct HitWorld<'a>(Option<&'a Hit>);
+    impl crate::script::WorldQuery for HitWorld<'_> {
+        fn live_entities(&self) -> Vec<(types::EntityId, types::glam::Vec3)> {
+            Vec::new()
+        }
+        fn block_at(&self, pos: BlockPos) -> Option<BlockId> {
+            self.0.filter(|h| h.block_pos == pos).map(|h| h.block)
+        }
+        fn chunks_loaded(&self) -> usize {
+            0
+        }
+    }
+
+    let mut lines = Vec::with_capacity(5 + notices.len());
+    lines.push(format!("fps: {:.1} (min {:.1})", fps.0, fps.1));
+    lines.push(format!("tick: {tick}"));
+    lines.push(format!("chunks: {chunks}"));
+    lines.push(hud_tool_line(state, hit, &HitWorld(hit)));
+    lines.push(format!("possess: {phase:?}"));
+    for notice in notices {
+        lines.push(notice.clone());
+    }
+    lines.join("\n")
 }
 
 /// 方块名(交互显示用;与 voxel::builtin 注册表同名)。

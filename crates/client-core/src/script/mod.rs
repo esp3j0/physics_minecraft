@@ -155,6 +155,16 @@ pub enum Action {
     /// 重置客户端性能采样窗口(REQ-013 C01b-3 R1 §2.1):瞬时步,不阻塞引擎,
     /// 通知渲染层清空 FPS 历史与风暴窗口标记。
     PerfReset,
+    /// 挖掘当前相机准星拾取格(REQ-013 C02-1 §4):瞬时步,经 `tools::dig` 产出 `ToolAction`。
+    Dig,
+    /// 在当前相机准星命中面外侧放置方块(REQ-013 C02-1 §4):瞬时步,`material` 可选(不传保持当前材料)。
+    Place {
+        material: Option<usize>,
+    },
+    /// 切换引擎内工具材料槽位 0..=3(REQ-013 C02-1 §4):瞬时步。
+    SelectMaterial {
+        index: usize,
+    },
 }
 
 /// 生成位置:绝对坐标,或相机前方 `ahead` 米再抬高 `lift` 米。
@@ -342,6 +352,8 @@ pub enum EngineCommand {
         yaw: f32,
         jump: bool,
     },
+    /// 工具动作(REQ-013 C02-1 §2.3/§4:脚本 dig/place 与交互共用翻译出口)。
+    ToolAction(crate::tools::ToolAction),
 }
 
 /// `fill` 单步格数上限(REQ-009 §10)。

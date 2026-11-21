@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use app::config::Config;
 use app::local::LocalConfig;
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
-use bevy::input::mouse::AccumulatedMouseMotion;
+use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::GlobalAmbientLight;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
@@ -28,15 +29,20 @@ use client_core::mirror::{
     ChunkMirror, DirtyKind, SECTION_HEIGHT, SECTIONS_PER_CHUNK, SubchunkPos, is_stale,
 };
 use client_core::perf::{MeshPerf, acc_mesh_perf, fps_summary, storm_window};
+use client_core::possess::{self, PossessState, p_press_hint};
 use client_core::script::manifest::{Manifest, ManifestMeshStats, ManifestPerf};
 use client_core::script::{
-    CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, parse_scenario,
+    CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, WorldQuery,
+    parse_scenario,
+};
+use client_core::tools::{
+    Hit, ToolAction, ToolState, dig, hud_text, pick_at_camera, place, select_material,
 };
 use client_core::world::WorldState;
 use client_core::{LocalTransport, Transport, config_from_server_table};
 use messaging::SimCommand;
 use sim_api::proto::{C2S, S2C};
-use types::{BlockPos, CHUNK_SIZE, ChunkPos, WORLD_Y_MAX, WORLD_Y_MIN};
+use types::{BlockPos, CHUNK_SIZE, ChunkPos, EntityId, WORLD_Y_MAX, WORLD_Y_MIN};
 
 /// 飞行相机移动速度(m/s,沿用 viewer `MOVE_SPEED`)。
 const MOVE_SPEED: f32 = 16.0;
@@ -52,6 +58,8 @@ const START_CAMERA_LOOK_AT: Vec3 = Vec3::new(8.0, -61.0, 0.0);
 const OBSERVER_JUMP_METERS: f32 = 1.0;
 /// FPS 帧耗时环形历史上限(REQ-013 C01b-3 §1.4:7200 帧 ≈ 60 Hz 下 120 s)。
 const FPS_HISTORY_CAP: usize = 7200;
+/// 交互工具提示生存时间(与 `viewer` `tools::NOTICE_SECS` 同为 3 秒)。
+const NOTICE_TTL: Duration = Duration::from_secs(3);
 
 /// 运行模式:交互飞行或脚本冒烟。
 enum RunMode {
@@ -318,6 +326,57 @@ struct ScreenshotState {
     next_seq: u32,
 }
 
+/// 最新服务器拍号(HUD 显示用,由 `drain_transport_system` 从 S2C 帧更新)。
+#[derive(Resource, Default, Debug, Clone, Copy)]
+struct ServerTickRes(u64);
+
+/// 交互工具状态资源(REQ-013 C02-1 §2.2;仅交互模式使用)。
+#[derive(Resource, Default)]
+struct ToolRes {
+    state: ToolState,
+    last_hit: Option<Hit>,
+    notices: Vec<(String, Instant)>,
+}
+
+impl ToolRes {
+    fn push_notice(&mut self, msg: String, now: Instant) {
+        self.notices.push((msg, now));
+    }
+
+    fn prune_notices(&mut self, now: Instant) {
+        self.notices
+            .retain(|(_, created)| now.duration_since(*created) < NOTICE_TTL);
+    }
+}
+
+/// 交互附身状态资源(REQ-013 C02-1 §2.2;仅交互模式使用)。
+#[derive(Resource, Default)]
+struct PossessRes {
+    state: PossessState,
+    possessed: Option<EntityId>,
+    /// 主体最新根位置表(供第三人称相机追踪,同 `viewer/src/render.rs:1469-1474`)。
+    agents: BTreeMap<EntityId, types::glam::Vec3>,
+    /// 附身期间最后一次位于世界高度内的安全相机位(同 `viewer/src/render.rs:1485-1491`)。
+    last_safe_camera: Option<types::glam::Vec3>,
+    was_possessed: bool,
+}
+
+/// 交互 HUD 文本节点标记组件(REQ-013 C02-1 §3.2)。
+#[derive(Component)]
+struct HudText;
+
+/// 将 Bevy 键盘快照映射为 `possess::Keys`(REQ-013 C02-1 §2.2 / MS20 锚点)。
+fn possess_keys_from_input(keys: &ButtonInput<KeyCode>) -> possess::Keys {
+    possess::Keys {
+        w: keys.pressed(KeyCode::KeyW),
+        a: keys.pressed(KeyCode::KeyA),
+        s: keys.pressed(KeyCode::KeyS),
+        d: keys.pressed(KeyCode::KeyD),
+        shift: keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+        jump_down: keys.pressed(KeyCode::Space),
+    }
+}
+
 /// 脚本冒烟模式运行时状态(仅 `--script --out` 时插入)。
 #[derive(Resource)]
 struct ScriptModeRes {
@@ -488,6 +547,7 @@ fn main() {
     .insert_resource(MeshPerfRes::default())
     .insert_resource(FpsHistoryRes::default())
     .insert_resource(ServerPerfRes::default())
+    .insert_resource(ServerTickRes::default())
     .insert_resource(ObserverTracker::default())
     .insert_resource(ScreenshotState {
         dir: screenshot_dir,
@@ -508,19 +568,23 @@ fn main() {
                 .chain(),
         );
     } else {
-        app.add_systems(
-            Update,
-            (
-                advance_frame_counter_system,
-                fly_camera_system,
-                sync_observer_system,
-                drain_transport_system,
-                collect_mesh_tasks_system,
-                spawn_mesh_tasks_system,
-                screenshot_system,
-            )
-                .chain(),
-        );
+        app.insert_resource(ToolRes::default())
+            .insert_resource(PossessRes::default())
+            .add_systems(
+                Update,
+                (
+                    advance_frame_counter_system,
+                    fly_camera_system,
+                    sync_observer_system,
+                    interact_system,
+                    drain_transport_system,
+                    collect_mesh_tasks_system,
+                    spawn_mesh_tasks_system,
+                    hud_update_system,
+                    screenshot_system,
+                )
+                    .chain(),
+            );
     }
 
     app.run();
@@ -571,11 +635,22 @@ fn setup_scene(
         Transform::from_xyz(30.0, 50.0, 30.0).looking_at(Vec3::ZERO, Vec3::Y),
     ));
 
-    if script_mode.is_none()
-        && let Ok(mut cursor) = cursor_q.single_mut()
-    {
-        cursor.visible = false;
-        cursor.grab_mode = CursorGrabMode::Locked;
+    if script_mode.is_none() {
+        if let Ok(mut cursor) = cursor_q.single_mut() {
+            cursor.visible = false;
+            cursor.grab_mode = CursorGrabMode::Locked;
+        }
+        // REQ-013 C02-1 §3.2:交互模式左上角绝对定位 HUD 根 Node + 单 Text。
+        commands
+            .spawn(Node {
+                position_type: PositionType::Absolute,
+                left: Val::Px(12.0),
+                top: Val::Px(12.0),
+                ..default()
+            })
+            .with_children(|parent| {
+                parent.spawn((Text::new(""), HudText));
+            });
     }
 }
 
@@ -590,11 +665,13 @@ fn advance_frame_counter_system(
 }
 
 /// 飞行相机控制(交互模式):鼠标转视角、WASD 水平移动、Shift/Ctrl 升降、M 切换鼠标锁定、Esc 退出。
+#[allow(clippy::too_many_arguments)]
 fn fly_camera_system(
     time: Res<Time>,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mouse_motion: Res<AccumulatedMouseMotion>,
+    possess_res: Res<PossessRes>,
     mut exit_writer: MessageWriter<AppExit>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
     mut cam_q: Query<(&mut Transform, &mut FlyCamera)>,
@@ -627,31 +704,34 @@ fn fly_camera_system(
             .clamp(-89.0_f32.to_radians(), 89.0_f32.to_radians());
     }
 
-    let flat_fwd = fly.flat_forward();
-    let right = flat_fwd.cross(Vec3::Y);
-    let mut move_dir = Vec3::ZERO;
-    if keys.pressed(KeyCode::KeyW) {
-        move_dir += flat_fwd;
-    }
-    if keys.pressed(KeyCode::KeyS) {
-        move_dir -= flat_fwd;
-    }
-    if keys.pressed(KeyCode::KeyD) {
-        move_dir += right;
-    }
-    if keys.pressed(KeyCode::KeyA) {
-        move_dir -= right;
-    }
-    if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
-        move_dir += Vec3::Y;
-    }
-    if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
-        move_dir -= Vec3::Y;
-    }
+    let routing = possess::input_routing(possess_res.possessed.is_some());
+    if routing.wasd_moves_camera {
+        let flat_fwd = fly.flat_forward();
+        let right = flat_fwd.cross(Vec3::Y);
+        let mut move_dir = Vec3::ZERO;
+        if keys.pressed(KeyCode::KeyW) {
+            move_dir += flat_fwd;
+        }
+        if keys.pressed(KeyCode::KeyS) {
+            move_dir -= flat_fwd;
+        }
+        if keys.pressed(KeyCode::KeyD) {
+            move_dir += right;
+        }
+        if keys.pressed(KeyCode::KeyA) {
+            move_dir -= right;
+        }
+        if keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) {
+            move_dir += Vec3::Y;
+        }
+        if keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight) {
+            move_dir -= Vec3::Y;
+        }
 
-    let dt = time.delta_secs();
-    if move_dir != Vec3::ZERO {
-        transform.translation += move_dir.normalize_or_zero() * MOVE_SPEED * dt;
+        let dt = time.delta_secs();
+        if move_dir != Vec3::ZERO {
+            transform.translation += move_dir.normalize_or_zero() * MOVE_SPEED * dt;
+        }
     }
 
     let look_target = transform.translation + fly.forward();
@@ -681,6 +761,168 @@ fn sync_observer_system(
             position: world_pos,
         });
     }
+}
+
+/// 交互模式体素编辑与附身系统(REQ-013 C02-1 §2.2):
+/// 每帧拾取、1–4 选材、LMB 挖掘 / RMB 放置、P 键生成/附身/解除、附身中 WASD/Shift/Space 意图与
+/// 第三人称相机跟随(语义逐位照搬 `viewer/src/render.rs:1226-1298, 1467-1503`)。
+#[allow(clippy::too_many_arguments)]
+fn interact_system(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse_buttons: Res<ButtonInput<MouseButton>>,
+    mouse_scroll: Res<AccumulatedMouseScroll>,
+    world_res: Res<WorldRenderRes>,
+    mut transport_res: ResMut<TransportRes>,
+    mut tool_res: ResMut<ToolRes>,
+    mut possess_res: ResMut<PossessRes>,
+    mut cam_q: Query<(&mut Transform, &FlyCamera)>,
+) {
+    let Ok((mut transform, fly)) = cam_q.single_mut() else {
+        return;
+    };
+
+    #[allow(clippy::disallowed_methods)]
+    // 墙钟(工具提示 3s 过期与附身节流/超时;渲染侧授权,同 viewer render.rs:1244)
+    let now = Instant::now();
+    tool_res.prune_notices(now);
+
+    let cam_pos = conv::from_bevy_vec3(transform.translation);
+    let yaw_deg = fly.yaw.to_degrees();
+    let pitch_deg = fly.pitch.to_degrees();
+    tool_res.last_hit = pick_at_camera(&world_res.mirror, cam_pos, yaw_deg, pitch_deg);
+
+    if keys.just_pressed(KeyCode::Digit1) {
+        select_material(&mut tool_res.state, 0);
+    }
+    if keys.just_pressed(KeyCode::Digit2) {
+        select_material(&mut tool_res.state, 1);
+    }
+    if keys.just_pressed(KeyCode::Digit3) {
+        select_material(&mut tool_res.state, 2);
+    }
+    if keys.just_pressed(KeyCode::Digit4) {
+        select_material(&mut tool_res.state, 3);
+    }
+
+    if let Some(transport) = transport_res.transport.as_mut() {
+        // 鼠标锁定时左右键挖掘/放置(同 viewer render.rs:1286)。
+        if fly.cursor_grabbed {
+            if mouse_buttons.just_pressed(MouseButton::Left) {
+                let action = dig(tool_res.last_hit.as_ref());
+                for reason in
+                    forward_engine_commands(&[EngineCommand::ToolAction(action)], transport)
+                {
+                    tool_res.push_notice(reason, now);
+                }
+            }
+            if mouse_buttons.just_pressed(MouseButton::Right) {
+                let action = place(
+                    &tool_res.state,
+                    tool_res.last_hit.as_ref(),
+                    yaw_deg,
+                    &world_res.mirror,
+                );
+                for reason in
+                    forward_engine_commands(&[EngineCommand::ToolAction(action)], transport)
+                {
+                    tool_res.push_notice(reason, now);
+                }
+            }
+            if possess_res.possessed.is_some() && mouse_scroll.delta.y != 0.0 {
+                possess_res.state.adjust_camera_dist(mouse_scroll.delta.y);
+            }
+        }
+
+        // P 键按下沿(逐位照搬 viewer/src/render.rs:1231-1260)。
+        if keys.just_pressed(KeyCode::KeyP) {
+            let spawn_target = tool_res.last_hit.as_ref().map(|hit| {
+                let top = hit.block_pos;
+                let px = top.x as f32 + 0.5;
+                let py = top.y as f32 + 1.0 + 0.9;
+                let pz = top.z as f32 + 0.5;
+                (types::glam::Vec3::new(px, py, pz), yaw_deg)
+            });
+            let commands = possess_res.state.on_p_pressed(spawn_target, now);
+            if commands.is_empty()
+                && let Some(hint) =
+                    p_press_hint(possess_res.state.phase(), tool_res.last_hit.is_some())
+            {
+                tool_res.push_notice(hint.to_owned(), now);
+            }
+            let intent_target = possess_res.possessed;
+            for cmd in commands {
+                if let Some(c2s) = possess::to_c2s(&cmd, intent_target) {
+                    transport.send(c2s);
+                }
+            }
+        }
+
+        // 附身中 WASD/Shift/Space 意图(逐位照搬 viewer/src/render.rs:1262-1277)。
+        if possess_res.possessed.is_some() {
+            let pkeys = possess_keys_from_input(&keys);
+            let intent_target = possess_res.possessed;
+            for cmd in possess_res.state.on_keys(&pkeys, yaw_deg, now) {
+                if let Some(c2s) = possess::to_c2s(&cmd, intent_target) {
+                    transport.send(c2s);
+                }
+            }
+        }
+    }
+
+    possess_res.state.tick(now);
+
+    // 第三人称相机跟随与身体消失放回(逐位照搬 viewer/src/render.rs:1467-1503)。
+    let possessed_id = possess_res.possessed;
+    if let Some(id) = possessed_id
+        && let Some(&root) = possess_res.agents.get(&id)
+    {
+        let pos = possess::possessed_camera_position(
+            root,
+            yaw_deg,
+            pitch_deg,
+            possess_res.state.camera_dist(),
+        );
+        transform.translation = conv::to_bevy_vec3(pos);
+        let look_target = transform.translation + fly.forward();
+        transform.look_at(look_target, Vec3::Y);
+        if pos.y >= WORLD_Y_MIN as f32 {
+            possess_res.last_safe_camera = Some(pos);
+        }
+    }
+    if possess_res.was_possessed && possessed_id.is_none() {
+        let cur = conv::from_bevy_vec3(transform.translation);
+        let fixed =
+            possess::camera_after_body_lost(cur, possess_res.last_safe_camera, WORLD_Y_MIN as f32);
+        transform.translation = conv::to_bevy_vec3(fixed);
+        let look_target = transform.translation + fly.forward();
+        transform.look_at(look_target, Vec3::Y);
+    }
+    possess_res.was_possessed = possessed_id.is_some();
+}
+
+/// 交互模式 HUD 文本更新系统(REQ-013 C02-1 §3.2 / MS18 & PM26 靶点)。
+fn hud_update_system(
+    fps_history: Res<FpsHistoryRes>,
+    server_tick: Res<ServerTickRes>,
+    world_res: Res<WorldRenderRes>,
+    tool_res: Res<ToolRes>,
+    possess_res: Res<PossessRes>,
+    mut hud_q: Query<&mut Text, With<HudText>>,
+) {
+    let Ok(mut text) = hud_q.single_mut() else {
+        return;
+    };
+    let (mean_f64, min_f64) = fps_summary(&fps_history.dts_ms);
+    let notices: Vec<String> = tool_res.notices.iter().map(|(m, _)| m.clone()).collect();
+    text.0 = hud_text(
+        &tool_res.state,
+        tool_res.last_hit.as_ref(),
+        possess_res.state.phase(),
+        (mean_f64 as f32, min_f64 as f32),
+        server_tick.0,
+        world_res.mirror.chunks_loaded(),
+        &notices,
+    );
 }
 
 /// 记录受 `BlockUpdates` 影响的 subchunk(含存在的边界邻段)到达帧号。
@@ -764,7 +1006,7 @@ fn record_edit_frames(
     }
 }
 
-/// 消费宿主 S2C 帧更新世界镜像(脚本模式同时喂 `WorldState`),并在 chunk 卸载时回收实体/资产/任务。
+/// 消费宿主 S2C 帧更新世界镜像(脚本模式同时喂 `WorldState`,交互模式维护 `PossessRes`),并在 chunk 卸载时回收实体/资产/任务。
 #[allow(clippy::too_many_arguments)]
 fn drain_transport_system(
     mut commands: Commands,
@@ -775,11 +1017,14 @@ fn drain_transport_system(
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut server_perf: ResMut<ServerPerfRes>,
+    mut server_tick: ResMut<ServerTickRes>,
+    mut possess_res: Option<ResMut<PossessRes>>,
     mut script_mode: Option<ResMut<ScriptModeRes>>,
 ) {
     let Some(transport) = transport_res.transport.as_mut() else {
         return;
     };
+    let mut pending_sends: Vec<C2S> = Vec::new();
     for msg in transport.drain() {
         if let Some(script) = script_mode.as_mut()
             && let Some(ev) = s2c_to_event(msg.clone())
@@ -791,6 +1036,9 @@ fn drain_transport_system(
         }
 
         match msg {
+            S2C::Welcome { tick, .. } | S2C::EntityStates { tick, .. } => {
+                server_tick.0 = tick.0;
+            }
             S2C::ChunkData { pos, chunk } => {
                 world_res.mirror.insert_chunk(pos, chunk);
             }
@@ -818,6 +1066,49 @@ fn drain_transport_system(
                     }
                 }
             }
+            S2C::Spawned { entity } => {
+                if let Some(possess) = possess_res.as_mut() {
+                    possess.state.on_spawned(entity);
+                }
+            }
+            S2C::Possessed { entity } => {
+                if let Some(possess) = possess_res.as_mut() {
+                    possess.state.on_possessed(entity);
+                    possess.possessed = entity;
+                }
+            }
+            S2C::AgentStates {
+                tick,
+                states,
+                removed,
+                full,
+            } => {
+                server_tick.0 = tick.0;
+                if let Some(possess) = possess_res.as_mut() {
+                    if full {
+                        possess.agents.clear();
+                    }
+                    for id in &removed {
+                        possess.agents.remove(id);
+                    }
+                    for (id, _, poses) in &states {
+                        if let Some(root) = poses.first() {
+                            possess.agents.insert(*id, root.translation);
+                        }
+                    }
+                    let ids: Vec<EntityId> = states.iter().map(|(id, ..)| *id).collect();
+                    let intent_target = possess.possessed;
+                    for cmd in possess.state.on_agents(&ids, &removed) {
+                        if let Some(c2s) = possess::to_c2s(&cmd, intent_target) {
+                            pending_sends.push(c2s);
+                        }
+                    }
+                    // 若主体被移除导致状态机回退 NoBody,同步清理 possessed 缓存。
+                    if possess.state.possessed().is_none() && possess.possessed.is_some() {
+                        possess.possessed = None;
+                    }
+                }
+            }
             S2C::PerfStats {
                 sim_p95_ms,
                 sim_samples,
@@ -834,6 +1125,9 @@ fn drain_transport_system(
             }
             _ => {}
         }
+    }
+    for c2s in pending_sends {
+        transport.send(c2s);
     }
 }
 
@@ -911,39 +1205,43 @@ fn collect_mesh_tasks_system(
     }
 }
 
-/// 将脚本引擎输出的 `EngineCommand` 列表翻译为 `C2S` 并经 `Transport` 发送
-/// (与 `viewer/src/render.rs:739-796` `forward_commands` 同口径)。
-fn forward_engine_commands(commands: &[EngineCommand], transport: &mut LocalTransport) {
+/// 将脚本引擎或交互工具输出的 `EngineCommand` 列表翻译为 `C2S` 并经发送闭包转发
+/// (与 `viewer/src/render.rs:739-796` `forward_commands` 同口径;返回被拒绝的 `ToolAction` 提示)。
+fn forward_engine_commands_with(
+    commands: &[EngineCommand],
+    mut send: impl FnMut(C2S),
+) -> Vec<String> {
     let mut batch: Vec<SimCommand> = Vec::new();
-    let flush_batch = |batch: &mut Vec<SimCommand>, transport: &mut LocalTransport| {
+    let mut rejected: Vec<String> = Vec::new();
+    let flush_batch = |batch: &mut Vec<SimCommand>, send: &mut dyn FnMut(C2S)| {
         for sim_cmd in batch.drain(..) {
-            transport.send(C2S::Command(sim_cmd));
+            send(C2S::Command(sim_cmd));
         }
     };
     for command in commands {
         match command {
             EngineCommand::Spawn { state, desc } => {
-                flush_batch(&mut batch, transport);
-                transport.send(C2S::Spawn {
+                flush_batch(&mut batch, &mut send);
+                send(C2S::Spawn {
                     state: *state,
                     desc: desc.clone(),
                 });
             }
             EngineCommand::SpawnAgent { position, yaw } => {
-                flush_batch(&mut batch, transport);
-                transport.send(C2S::SpawnAgent {
+                flush_batch(&mut batch, &mut send);
+                send(C2S::SpawnAgent {
                     body: "capsule".to_owned(),
                     position: *position,
                     yaw: *yaw,
                 });
             }
             EngineCommand::Possess { entity } => {
-                flush_batch(&mut batch, transport);
-                transport.send(C2S::Possess { entity: *entity });
+                flush_batch(&mut batch, &mut send);
+                send(C2S::Possess { entity: *entity });
             }
             EngineCommand::Unpossess => {
-                flush_batch(&mut batch, transport);
-                transport.send(C2S::Unpossess);
+                flush_batch(&mut batch, &mut send);
+                send(C2S::Unpossess);
             }
             EngineCommand::AgentIntent {
                 entity,
@@ -951,8 +1249,8 @@ fn forward_engine_commands(commands: &[EngineCommand], transport: &mut LocalTran
                 yaw,
                 jump,
             } => {
-                flush_batch(&mut batch, transport);
-                transport.send(C2S::AgentIntent {
+                flush_batch(&mut batch, &mut send);
+                send(C2S::AgentIntent {
                     entity: *entity,
                     move_xz: *move_xz,
                     yaw: *yaw,
@@ -972,9 +1270,23 @@ fn forward_engine_commands(commands: &[EngineCommand], transport: &mut LocalTran
                 pos: *pos,
                 block: *block,
             }),
+            EngineCommand::ToolAction(action) => match action {
+                ToolAction::Single(sim_cmd) => batch.push(sim_cmd.clone()),
+                ToolAction::Batch(sim_cmds) => batch.extend(sim_cmds.iter().cloned()),
+                ToolAction::Rejected(reason) => rejected.push(reason.clone()),
+            },
         }
     }
-    flush_batch(&mut batch, transport);
+    flush_batch(&mut batch, &mut send);
+    rejected
+}
+
+/// 将 `EngineCommand` 列表翻译为 `C2S` 并经 `LocalTransport` 发送(返回被拒绝的 `ToolAction` 提示)。
+fn forward_engine_commands(
+    commands: &[EngineCommand],
+    transport: &mut LocalTransport,
+) -> Vec<String> {
+    forward_engine_commands_with(commands, |c2s| transport.send(c2s))
 }
 
 /// 脚本冒烟模式主驱动系统:等 `tick_known` → 推进 `Engine` → 相机/命令/截图/manifest → 优雅收口退出。
@@ -1082,15 +1394,20 @@ fn script_driver_system(
 
     script.coupled = output.coupled;
     apply_perf_reset_step(output.perf_reset, &mut fps_history);
-    if output
-        .commands
-        .iter()
-        .any(|cmd| matches!(cmd, EngineCommand::SetBlock { .. }))
-    {
+    if output.commands.iter().any(|cmd| {
+        matches!(
+            cmd,
+            EngineCommand::SetBlock { .. }
+                | EngineCommand::ToolAction(
+                    ToolAction::Single(SimCommand::SetBlock { .. }) | ToolAction::Batch(_)
+                )
+        )
+    }) {
         fps_history.record_first_dig();
     }
+    let mut rejected_messages: Vec<String> = Vec::new();
     if let Some(transport) = transport_res.transport.as_mut() {
-        forward_engine_commands(&output.commands, transport);
+        rejected_messages = forward_engine_commands(&output.commands, transport);
         if script.coupled {
             let need_send = match script.last_observer_pos {
                 None => true,
@@ -1114,6 +1431,18 @@ fn script_driver_system(
         } = &mut *script;
         for record in &output.finished {
             manifest.push(record, world);
+        }
+        if !rejected_messages.is_empty() {
+            if let Some(step) = manifest
+                .steps
+                .iter_mut()
+                .rev()
+                .find(|s| s.action == "dig" || s.action == "place")
+            {
+                step.messages.extend(rejected_messages);
+            } else if let Some(step) = manifest.steps.last_mut() {
+                step.messages.extend(rejected_messages);
+            }
         }
         manifest.mesh_stats = Some(stats.to_manifest());
         manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
@@ -1525,5 +1854,233 @@ mod tests {
         let (s, e) = win.expect("窗口非空");
         assert_eq!(&fps.dts_ms[s..=e], &[16.0]);
         assert_eq!(fps_summary(&fps.dts_ms[s..=e]), (62.5, 62.5));
+    }
+
+    /// MS18(REQ-013 C02-1 §3.2 / PM26 靶点):无头 Bevy App 调度 `hud_update_system`,
+    /// 插入 `dts=[16,16]`、`tick=42`、`mirror` 3 chunk、`ToolState::default()`,跑一帧后
+    /// `Text.0 == hud_text(...)` 且恰 5 行。
+    #[test]
+    fn ms18_hud_update_system_headless() {
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+        mirror.insert_chunk(ChunkPos::new(1, 0), Chunk::air());
+        mirror.insert_chunk(ChunkPos::new(0, 1), Chunk::air());
+        assert_eq!(mirror.chunks_loaded(), 3);
+
+        let mut app = headless_app(mirror, false, false);
+        let mut fps = FpsHistoryRes::default();
+        fps.push_dt_ms(16.0);
+        fps.push_dt_ms(16.0);
+        app.insert_resource(fps)
+            .insert_resource(ServerTickRes(42))
+            .insert_resource(ToolRes::default())
+            .insert_resource(PossessRes::default())
+            .add_systems(Update, hud_update_system);
+
+        let hud_entity = app.world_mut().spawn((Text::new(""), HudText)).id();
+        app.update();
+
+        let text = app
+            .world()
+            .get::<Text>(hud_entity)
+            .expect("HUD Text 组件存在");
+        let expected = hud_text(
+            &ToolState::default(),
+            None,
+            possess::Phase::NoBody,
+            (62.5, 62.5),
+            42,
+            3,
+            &[],
+        );
+        assert_eq!(
+            text.0, expected,
+            "hud_update_system 必须将 hud_text 写入 Text"
+        );
+        assert_eq!(text.0.lines().count(), 5, "无 notices 时 HUD 恰 5 行");
+    }
+
+    /// MS20(REQ-013 C02-1 §2.2):Bevy `KeyCode::KeyW` → `possess_keys_from_input` →
+    /// `intent_from_keys` 产出世界系水平前向速度,期望值取迁移 `possess` 测试已手算值。
+    #[test]
+    fn ms20_possess_keys_w_matches_forward() {
+        let mut input = ButtonInput::<KeyCode>::default();
+        input.press(KeyCode::KeyW);
+        let pkeys = possess_keys_from_input(&input);
+        assert!(pkeys.w && !pkeys.a && !pkeys.s && !pkeys.d && !pkeys.shift && !pkeys.jump_down);
+
+        for yaw_deg in [0.0_f32, 90.0, 180.0, -45.0] {
+            let yaw = yaw_deg.to_radians();
+            let expect = (
+                yaw.cos() * possess::WALK_SPEED,
+                yaw.sin() * possess::WALK_SPEED,
+            );
+            let got = possess::intent_from_keys(&pkeys, yaw_deg);
+            assert!(
+                (got.0 - expect.0).abs() <= 1e-5 && (got.1 - expect.1).abs() <= 1e-5,
+                "yaw {yaw_deg}°:W 单独按下实得 {got:?},期望 {expect:?}"
+            );
+        }
+    }
+
+    /// MS16b(REQ-013 C02-1 R1 F3 / PM22 端到端靶点):无头端到端 `app::local::LocalHost::spawn` +
+    /// `LocalHandle` send/drain + `Engine` place→dig 步,有界轮询(上限 ≤4 拍 t4 口径,挂死上限 600)
+    /// 验证 `(2,-60,8)` 先置 `BlockId(1)` 再挖回 `AIR` 且 `(2,-61,8)` 保持 `DIRT`。
+    #[test]
+    fn ms16b_e2e_place_then_dig_via_local_host() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let cfg = Config {
+            data_dir: tmp.path().to_path_buf(),
+            world_seed: types::WorldSeed(3),
+            ..Config::default()
+        };
+        let (handle, join) = app::local::LocalHost::spawn(LocalConfig {
+            config: cfg,
+            view_distance: 2,
+        })
+        .expect("LocalHost::spawn");
+
+        let mut mirror = ChunkMirror::new();
+        let mut server_tick: u64 = 0;
+        let mut tick_known = false;
+        let ground_pos = BlockPos::new(2, -61, 8);
+        let placed_pos = BlockPos::new(2, -60, 8);
+
+        handle.send(C2S::MoveObserver {
+            position: types::glam::Vec3::new(2.5, -59.0, 8.5),
+        });
+
+        // 预热:等待 chunk (0,0) 与初始地表 (2,-61,8)=DIRT 到达镜像,且收到至少一拍心跳。
+        for _ in 0..600 {
+            for msg in handle.drain() {
+                match msg {
+                    S2C::ChunkData { pos, chunk } => mirror.insert_chunk(pos, chunk),
+                    S2C::BlockUpdates { updates } => mirror.apply_updates(&updates),
+                    S2C::EntityStates { tick, .. } => {
+                        server_tick = tick.0;
+                        tick_known = true;
+                    }
+                    _ => {}
+                }
+            }
+            if tick_known && mirror.block(ground_pos) == Some(DIRT) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(tick_known, "600 轮内必须收到宿主拍号心跳");
+        assert_eq!(
+            mirror.block(ground_pos),
+            Some(DIRT),
+            "seed 3 超平坦顶格 (2,-61,8) 应为 DIRT"
+        );
+        assert_eq!(mirror.block(placed_pos), Some(BlockId::AIR));
+
+        let scenario = parse_scenario(
+            "name = \"ms16b\"\ndescription = \"e2e place then dig\"\n\n\
+             [[step]]\ncamera = { pos = [2.5, -59.0, 8.5], yaw = -90.0, pitch = -89.0 }\n\
+             [[step]]\nplace = { material = 1 }\n\
+             [[step]]\nwait_ticks = { n = 1 }\n\
+             [[step]]\ndig = {}\n",
+        )
+        .expect("ms16b 场景合法");
+        let start_pose = CameraPose {
+            pos: types::glam::Vec3::new(2.5, -59.0, 8.5),
+            yaw: -90.0,
+            pitch: -89.0,
+        };
+        let mut engine = Engine::new(scenario, start_pose);
+
+        // 1) 执行 place={material=1} 并转发给 LocalHandle。
+        let out_place = engine.frame(&FrameInput {
+            dt: 0.016,
+            server_tick,
+            world: &mirror,
+            spawned: &[],
+        });
+        let rej_place = forward_engine_commands_with(&out_place.commands, |c2s| handle.send(c2s));
+        assert!(rej_place.is_empty(), "place 不应被拒绝:{rej_place:?}");
+
+        let place_send_tick = server_tick;
+        let mut place_waited_steps: Option<u32> = None;
+        for step in 1..=600u32 {
+            std::thread::sleep(Duration::from_millis(50));
+            for msg in handle.drain() {
+                match msg {
+                    S2C::ChunkData { pos, chunk } => mirror.insert_chunk(pos, chunk),
+                    S2C::BlockUpdates { updates } => {
+                        mirror.apply_updates(&updates);
+                        if updates.contains(&(placed_pos, STONE)) && place_waited_steps.is_none() {
+                            place_waited_steps = Some(step);
+                        }
+                    }
+                    S2C::EntityStates { tick, .. } => server_tick = tick.0,
+                    _ => {}
+                }
+            }
+            if place_waited_steps.is_some() {
+                break;
+            }
+        }
+        let place_waited =
+            place_waited_steps.expect("上限 600 拍内必须收到含 (2,-60,8)=STONE 的 BlockUpdates");
+        let place_tick_delta = server_tick.saturating_sub(place_send_tick);
+        assert!(
+            place_waited <= 4,
+            "place 回传应在 ≤4 拍内到达(t4 口径),实测 waited={place_waited}, tick_delta={place_tick_delta}"
+        );
+        assert_eq!(mirror.block(placed_pos), Some(STONE));
+
+        // 2) 推进至 wait_ticks=1 完成并执行 dig={}。
+        let dig_engine_tick = server_tick.max(place_send_tick + 1);
+        let out_dig = engine.frame(&FrameInput {
+            dt: 0.016,
+            server_tick: dig_engine_tick,
+            world: &mirror,
+            spawned: &[],
+        });
+        let rej_dig = forward_engine_commands_with(&out_dig.commands, |c2s| handle.send(c2s));
+        assert!(rej_dig.is_empty(), "dig 不应被拒绝:{rej_dig:?}");
+
+        let dig_send_tick = server_tick;
+        let mut dig_waited_steps: Option<u32> = None;
+        for step in 1..=600u32 {
+            std::thread::sleep(Duration::from_millis(50));
+            for msg in handle.drain() {
+                match msg {
+                    S2C::ChunkData { pos, chunk } => mirror.insert_chunk(pos, chunk),
+                    S2C::BlockUpdates { updates } => {
+                        mirror.apply_updates(&updates);
+                        if updates.contains(&(placed_pos, BlockId::AIR))
+                            && dig_waited_steps.is_none()
+                        {
+                            dig_waited_steps = Some(step);
+                        }
+                    }
+                    S2C::EntityStates { tick, .. } => server_tick = tick.0,
+                    _ => {}
+                }
+            }
+            if dig_waited_steps.is_some() {
+                break;
+            }
+        }
+        let dig_waited =
+            dig_waited_steps.expect("上限 600 拍内必须收到含 (2,-60,8)=AIR 的 BlockUpdates");
+        let dig_tick_delta = server_tick.saturating_sub(dig_send_tick);
+        assert!(
+            dig_waited <= 4,
+            "dig 回传应在 ≤4 拍内到达(t4 口径),实测 waited={dig_waited}, tick_delta={dig_tick_delta}"
+        );
+        assert_eq!(mirror.block(placed_pos), Some(BlockId::AIR));
+        assert_eq!(mirror.block(ground_pos), Some(DIRT));
+        assert_eq!(engine.status(), &EngineStatus::Done { failed_checks: 0 });
+        eprintln!(
+            "[MS16b] place_waited={place_waited} (tick_delta={place_tick_delta}), dig_waited={dig_waited} (tick_delta={dig_tick_delta})"
+        );
+
+        handle.send(C2S::Goodbye);
+        drop(handle);
+        join.join().expect("app-local-host 线程正常退出");
     }
 }

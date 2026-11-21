@@ -186,6 +186,7 @@ fn staging_executes_expanded_set_and_fill_in_batches() {
             StageOut::Command(EngineCommand::Possess { .. }) => panic!("布景段不发 possess"),
             StageOut::Command(EngineCommand::Unpossess) => panic!("布景段不发 unpossess"),
             StageOut::Command(EngineCommand::AgentIntent { .. }) => panic!("布景段不发 intent"),
+            StageOut::Command(EngineCommand::ToolAction(_)) => panic!("布景段不发 tool_action"),
             StageOut::Remove(_) => panic!("布景段不应发 RemoveEntity"),
         }
     }

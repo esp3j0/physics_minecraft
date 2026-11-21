@@ -162,6 +162,8 @@ pub(super) struct EngineInner {
     /// A06 §4:possess 步骤的跨帧状态(已发 Possess 命令,等回执与主体流
     /// 可见;`follow` 缺省 false——相机不动)。
     possess_pending: Option<PossessPending>,
+    /// REQ-013 C02-1 §4.2:脚本引擎内部工具逻辑态(交互与脚本各持一份)。
+    tool_state: crate::tools::ToolState,
 }
 
 /// possess 步骤的跨帧状态(A06 §4):等待 Spawned 回执 → 发 Possess →
@@ -212,6 +214,7 @@ impl EngineInner {
             agent_marks: BTreeMap::new(),
             possessed: None,
             possess_pending: None,
+            tool_state: crate::tools::ToolState::default(),
             scenario,
         }
     }
@@ -819,6 +822,68 @@ impl EngineInner {
                         step_no,
                         label,
                         "perf_reset",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
+                // C02-1 §4.2:瞬时工具挖掘/放置/切材料动作。
+                Action::Dig => {
+                    let hit = crate::tools::pick_at_camera(
+                        input.world,
+                        self.camera.pos,
+                        self.camera.yaw,
+                        self.camera.pitch,
+                    );
+                    let action = crate::tools::dig(hit.as_ref());
+                    out.commands.push(EngineCommand::ToolAction(action));
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "dig",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
+                Action::Place { material } => {
+                    if let Some(idx) = material {
+                        crate::tools::select_material(&mut self.tool_state, idx);
+                    }
+                    let hit = crate::tools::pick_at_camera(
+                        input.world,
+                        self.camera.pos,
+                        self.camera.yaw,
+                        self.camera.pitch,
+                    );
+                    let action = crate::tools::place(
+                        &self.tool_state,
+                        hit.as_ref(),
+                        self.camera.yaw,
+                        input.world,
+                    );
+                    out.commands.push(EngineCommand::ToolAction(action));
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "place",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                }
+                Action::SelectMaterial { index } => {
+                    crate::tools::select_material(&mut self.tool_state, index);
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "select_material",
                         StepOutcome::Ok,
                         None,
                         tick,

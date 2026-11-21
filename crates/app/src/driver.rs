@@ -8493,4 +8493,110 @@ mod tests {
         );
         session.shutdown();
     }
+
+    /// MS16a(REQ-013 C02-1 R1 F3, AC1 ≤1 拍判据):
+    /// 复用 driver 测试段 `crate::net::translate` + `ObserveOrchestrator::consume_net_up` +
+    /// `session.tick()` 恰 1 拍模式(同 `debug_telemetry_accumulate_and_gate` / driver.rs:7575):
+    /// 1) `Superflat::classic()` seed 3 装载 chunk (0,0),顶格 (2,-61,8) == DIRT;
+    /// 2) `translate(C2S::Command(SetBlock{(2,-60,8), BlockId(1)}))` → `consume_net_up` →
+    ///    `session.tick()` 恰 1 次 → `(2,-60,8) == BlockId(1)`;
+    /// 3) `translate(C2S::Command(SetBlock{(2,-60,8), AIR}))` → `consume_net_up` →
+    ///    `session.tick()` 恰 1 次 → `(2,-60,8) == AIR` 且 `(2,-61,8) == DIRT`。
+    #[test]
+    fn ms16a_set_block_effective_in_one_tick() {
+        use voxel::WorldGenerator;
+
+        let config = test_config(600);
+        let mut session = sim_api::session::Session::new(config.session_config());
+        let shard = shard_id(0, 0);
+        session.register(physics_sim::ShardSim::new(
+            config.shard_sim_config(shard),
+            Box::new(voxel::SimpleRegistry::builtin()),
+        ));
+        let chunk_pos = types::ChunkPos::new(0, 0);
+        let chunk = voxel::Superflat::classic().generate(types::WorldSeed(3), chunk_pos);
+        session.apply_chunk_load(shard, chunk_pos, chunk);
+
+        let block_at = |sess: &sim_api::session::Session, p: types::BlockPos| -> types::BlockId {
+            let c = sess
+                .voxel_chunk(shard, p.chunk_of())
+                .expect("chunk (0,0) 已装载");
+            c.get(
+                p.x.rem_euclid(types::CHUNK_SIZE) as usize,
+                (p.y - types::WORLD_Y_MIN) as usize,
+                p.z.rem_euclid(types::CHUNK_SIZE) as usize,
+            )
+        };
+
+        let placed_pos = types::BlockPos::new(2, -60, 8);
+        let ground_pos = types::BlockPos::new(2, -61, 8);
+        assert_eq!(block_at(&session, ground_pos), voxel::builtin::DIRT);
+        assert_eq!(block_at(&session, placed_pos), types::BlockId::AIR);
+
+        let mut o = ObserveOrchestrator::new(ObserveCadence::default(), 0);
+        let hub = OutboundHub::new();
+        let mut log = sim_api::log::CommandLog::new();
+        let mut rejected = 0u64;
+        let player = messaging::InputSource(1);
+
+        // 1) place: SetBlock (2,-60,8) = BlockId(1) → 恰 1 拍生效。
+        let place_c2s = sim_api::proto::C2S::Command(messaging::SimCommand::SetBlock {
+            pos: placed_pos,
+            block: types::BlockId(1),
+        });
+        let place_cmd = match crate::net::translate(player, place_c2s) {
+            crate::net::TranslateOutcome::Send(cmd) => cmd,
+            other => panic!("SetBlock 应经白名单翻译为 Send,实得 {other:?}"),
+        };
+        o.consume_net_up(
+            NetUp::DriverCommand {
+                player,
+                cmd: place_cmd,
+            },
+            &mut session,
+            &mut log,
+            &mut rejected,
+            &hub,
+        );
+        assert_eq!(rejected, 0);
+        session.tick();
+        assert_eq!(
+            block_at(&session, placed_pos),
+            types::BlockId(1),
+            "place 后恰 1 拍 (2,-60,8) 必须为 BlockId(1)"
+        );
+
+        // 2) dig: SetBlock (2,-60,8) = AIR → 恰 1 拍生效,原地表 (2,-61,8) 仍为 DIRT。
+        let dig_c2s = sim_api::proto::C2S::Command(messaging::SimCommand::SetBlock {
+            pos: placed_pos,
+            block: types::BlockId::AIR,
+        });
+        let dig_cmd = match crate::net::translate(player, dig_c2s) {
+            crate::net::TranslateOutcome::Send(cmd) => cmd,
+            other => panic!("SetBlock AIR 应经白名单翻译为 Send,实得 {other:?}"),
+        };
+        o.consume_net_up(
+            NetUp::DriverCommand {
+                player,
+                cmd: dig_cmd,
+            },
+            &mut session,
+            &mut log,
+            &mut rejected,
+            &hub,
+        );
+        assert_eq!(rejected, 0);
+        session.tick();
+        assert_eq!(
+            block_at(&session, placed_pos),
+            types::BlockId::AIR,
+            "dig 后恰 1 拍 (2,-60,8) 必须恢复 AIR"
+        );
+        assert_eq!(
+            block_at(&session, ground_pos),
+            voxel::builtin::DIRT,
+            "原地表 (2,-61,8) 未被破坏,仍为 DIRT"
+        );
+        session.shutdown();
+    }
 }

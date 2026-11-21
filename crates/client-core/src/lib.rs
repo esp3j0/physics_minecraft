@@ -8,7 +8,9 @@ pub mod client;
 pub mod mesh;
 pub mod mirror;
 pub mod perf;
+pub mod possess;
 pub mod script;
+pub mod tools;
 pub mod world;
 
 use std::collections::BTreeSet;

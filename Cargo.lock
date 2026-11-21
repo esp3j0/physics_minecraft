@@ -1832,6 +1832,7 @@ dependencies = [
  "client-core",
  "messaging",
  "sim-api",
+ "tempfile",
  "types",
  "voxel",
 ]

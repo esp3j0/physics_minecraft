@@ -9,6 +9,47 @@ use voxel::{CHUNK_X, CHUNK_Z, Chunk};
 
 use crate::mirror::{ChunkMirror, SECTION_HEIGHT, SECTIONS_PER_CHUNK, SubchunkPos};
 
+/// 面方向(6 邻居;声明序 = 提取遍历序,故带 Ord 供去重/比对;C02-1 自 `viewer::mesh` 迁入)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FaceDir {
+    /// -x(西)。
+    West,
+    /// +x(东)。
+    East,
+    /// -y(下)。
+    Bottom,
+    /// +y(上)。
+    Top,
+    /// -z(北)。
+    North,
+    /// +z(南)。
+    South,
+}
+
+impl FaceDir {
+    /// 单位法线(轴对齐;x 东 / y 上 / z 南)。
+    pub fn normal(self) -> [f32; 3] {
+        match self {
+            Self::West => [-1.0, 0.0, 0.0],
+            Self::East => [1.0, 0.0, 0.0],
+            Self::Bottom => [0.0, -1.0, 0.0],
+            Self::Top => [0.0, 1.0, 0.0],
+            Self::North => [0.0, 0.0, -1.0],
+            Self::South => [0.0, 0.0, 1.0],
+        }
+    }
+
+    /// 方向亮度(简单方向光照:法线 dot 光向定 0..=1 系数;顶面最亮、底面最暗)。
+    pub fn brightness(self) -> f32 {
+        match self {
+            Self::Top => 1.0,
+            Self::South | Self::North => 0.8,
+            Self::East | Self::West => 0.6,
+            Self::Bottom => 0.4,
+        }
+    }
+}
+
 /// 异步网格任务持有的只读体素快照:中心 chunk 与四水平邻 chunk。
 ///
 /// `neighbors` 固定顺序为 `(-1, 0), (1, 0), (0, -1), (0, 1)`(与 `mirror::HORIZONTAL_NEIGHBORS` 一致)。

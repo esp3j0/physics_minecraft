@@ -1,0 +1,85 @@
+name = "client_interact"
+req = "REQ-013"
+description = "bevy 客户端交互动词(place/dig/spawn_agent/possess/intent/unpossess)端到端闭环"
+timeout_secs = 180
+
+[viewer]
+view_distance = 2
+
+[server]
+world_seed = 3
+
+[[step]]
+label = "顶视对准 (2,-61,8) 地表"
+camera = { pos = [2.5, -56.0, 8.5], yaw = -90.0, pitch = -89.0 }
+
+[[step]]
+label = "等待 vd2 区块就绪"
+wait_until = { chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+
+[[step]]
+label = "等待初始网格上传稳定"
+wait_ticks = { n = 300 }
+
+[[step]]
+label = "在 (2,-61,8) 顶面上方放置石块"
+place = { material = 1 }
+
+[[step]]
+label = "等待放置回传"
+wait_ticks = { n = 4 }
+
+[[step]]
+label = "校验 (2,-60,8) 为 stone"
+check = { block = { pos = [2, -60, 8], is = "stone" } }
+
+[[step]]
+screenshot = { name = "after_place", expect = "顶视棕色地表连续铺满,中央 (2,8) 一格白色 stone 立方顶面" }
+
+[[step]]
+label = "挖掘新放置的 (2,-60,8) 石块"
+dig = {}
+
+[[step]]
+label = "等待挖掘回传"
+wait_ticks = { n = 4 }
+
+[[step]]
+label = "校验 (2,-60,8) 为 air 且原地表 (2,-61,8) 为 dirt"
+check = { block = { pos = [2, -60, 8], is = "air" } }
+
+[[step]]
+label = "校验原地表 (2,-61,8) 仍为 dirt"
+check = { block = { pos = [2, -61, 8], is = "dirt" } }
+
+[[step]]
+label = "生成玩家胶囊主体"
+spawn_agent = { at = [4.0, -59.0, 8.0], yaw = 0.0, label = "dog" }
+
+[[step]]
+label = "附身主体"
+possess = { label = "dog" }
+
+[[step]]
+label = "施加前进意图"
+intent = { move = [0.5, 0.0] }
+
+[[step]]
+label = "附身运行 60 拍"
+wait_ticks = { n = 60 }
+
+[[step]]
+label = "校验主体存活"
+check = { agent_alive = { label = "dog" } }
+
+[[step]]
+label = "解除附身"
+unpossess = {}
+
+[[step]]
+label = "等待解除生效"
+wait_ticks = { n = 2 }
+
+[[step]]
+label = "校验解除附身不杀主体"
+check = { agent_alive = { label = "dog" } }

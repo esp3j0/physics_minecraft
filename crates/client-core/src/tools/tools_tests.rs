@@ -196,3 +196,31 @@ fn default_tool_state_matches_spec() {
     assert!(!state.help_shown);
     assert!(state.notice.is_none());
 }
+
+/// MS17(REQ-013 C02-1 §3.1):`hud_text` 固定 5 行结构 + notice 追加行。
+#[test]
+fn ms17_hud_text_lines_and_fields() {
+    use crate::possess::Phase;
+
+    let state = ToolState::default();
+    let text = hud_text(&state, None, Phase::NoBody, (62.5, 62.5), 42, 3, &[]);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "无 notice 时恰 5 行,实得:\n{text}");
+    assert!(text.contains("62.5"), "含 FPS 62.5:{text}");
+    assert!(text.contains("42"), "含 tick 42:{text}");
+    assert!(text.contains("3"), "含 chunks 3:{text}");
+    assert!(text.contains("dirt"), "含默认材料 dirt:{text}");
+
+    let with_notice = hud_text(
+        &state,
+        None,
+        Phase::NoBody,
+        (62.5, 62.5),
+        42,
+        3,
+        &["x".to_owned()],
+    );
+    let lines2: Vec<&str> = with_notice.lines().collect();
+    assert_eq!(lines2.len(), 6, "1 条 notice 时恰 6 行");
+    assert_eq!(lines2[5], "x", "末行为 notice 内容");
+}

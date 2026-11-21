@@ -494,6 +494,15 @@ fn verify_client_perf_stats(
             }
             Ok(())
         }
+        "client_interact" => {
+            let Some(m) = manifest else {
+                return Err("client_interact 缺失 manifest,无法校验 perf".to_owned());
+            };
+            if m.perf.is_none() {
+                return Err("client_interact manifest 缺失 perf 字段".to_owned());
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1784,7 +1793,20 @@ mod tests {
         assert!(
             verify_client_perf_stats(
                 "client_edit_storm",
-                Some(&make("client_edit_storm", Some(ok_storm)))
+                Some(&make("client_edit_storm", Some(ok_storm.clone())))
+            )
+            .is_ok()
+        );
+
+        assert!(verify_client_perf_stats("client_interact", None).is_err());
+        assert!(
+            verify_client_perf_stats("client_interact", Some(&make("client_interact", None)))
+                .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_interact",
+                Some(&make("client_interact", Some(ok_storm)))
             )
             .is_ok()
         );

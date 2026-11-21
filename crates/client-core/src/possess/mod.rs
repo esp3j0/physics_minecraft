@@ -107,6 +107,31 @@ pub enum PossessCommand {
     },
 }
 
+/// 将附身状态机命令翻译为上行协议帧 `C2S`(REQ-013 C02-1 §2.1):
+/// - `SpawnAgent` → `C2S::SpawnAgent { body: "capsule", position, yaw }`;
+/// - `Possess(id)` → `C2S::Possess { entity: id }`;
+/// - `Unpossess` → `C2S::Unpossess`;
+/// - `Intent` → 若 `possessed == Some(entity)` 则 `C2S::AgentIntent`,否则 `None`(丢弃)。
+#[must_use]
+pub fn to_c2s(cmd: &PossessCommand, possessed: Option<EntityId>) -> Option<sim_api::proto::C2S> {
+    use sim_api::proto::C2S;
+    match cmd {
+        PossessCommand::SpawnAgent { position, yaw } => Some(C2S::SpawnAgent {
+            body: "capsule".to_owned(),
+            position: *position,
+            yaw: *yaw,
+        }),
+        PossessCommand::Possess(entity) => Some(C2S::Possess { entity: *entity }),
+        PossessCommand::Unpossess => Some(C2S::Unpossess),
+        PossessCommand::Intent { move_xz, yaw, jump } => possessed.map(|entity| C2S::AgentIntent {
+            entity,
+            move_xz: *move_xz,
+            yaw: *yaw,
+            jump: *jump,
+        }),
+    }
+}
+
 /// 状态机相位(R1 §3.2 转移表)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {

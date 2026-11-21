@@ -11,46 +11,8 @@ use macroquad::models::{Mesh, Vertex};
 use types::BlockId;
 use voxel::Chunk;
 
-/// 面方向(6 邻居;声明序 = 提取遍历序,故带 Ord 供去重/比对)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum FaceDir {
-    /// -x(西)。
-    West,
-    /// +x(东)。
-    East,
-    /// -y(下)。
-    Bottom,
-    /// +y(上)。
-    Top,
-    /// -z(北)。
-    North,
-    /// +z(南)。
-    South,
-}
-
-impl FaceDir {
-    /// 单位法线(轴对齐;x 东 / y 上 / z 南)。
-    pub fn normal(self) -> [f32; 3] {
-        match self {
-            Self::West => [-1.0, 0.0, 0.0],
-            Self::East => [1.0, 0.0, 0.0],
-            Self::Bottom => [0.0, -1.0, 0.0],
-            Self::Top => [0.0, 1.0, 0.0],
-            Self::North => [0.0, 0.0, -1.0],
-            Self::South => [0.0, 0.0, 1.0],
-        }
-    }
-
-    /// 方向亮度(简单方向光照:法线 dot 光向定 0..=1 系数;顶面最亮、底面最暗)。
-    pub fn brightness(self) -> f32 {
-        match self {
-            Self::Top => 1.0,
-            Self::South | Self::North => 0.8,
-            Self::East | Self::West => 0.6,
-            Self::Bottom => 0.4,
-        }
-    }
-}
+/// C02-1:`FaceDir` 已迁入 `client-core::mesh`,此处 `pub use` 保持旧路径兼容。
+pub use client_core::mesh::FaceDir;
 
 /// 6 邻居暴露面提取:6 邻居为 air(**或界外**)即暴露。
 /// 返回 [(局部格, 面方向)](枚举序遍历,序确定)。

@@ -213,6 +213,20 @@ impl ChunkMirror {
         self.mark_dirty(sc, kind);
     }
 
+    /// 按世界坐标读取方块;越界或所在 chunk 未装载返回 `None`。
+    pub fn block(&self, pos: BlockPos) -> Option<BlockId> {
+        if !(WORLD_Y_MIN..=WORLD_Y_MAX).contains(&pos.y) {
+            return None;
+        }
+        self.chunks.get(&pos.chunk_of()).map(|chunk| {
+            chunk.get(
+                pos.x.rem_euclid(CHUNK_SIZE) as usize,
+                (pos.y - WORLD_Y_MIN) as usize,
+                pos.z.rem_euclid(CHUNK_SIZE) as usize,
+            )
+        })
+    }
+
     fn mark_chunk_load(&mut self, pos: ChunkPos) {
         for section in 0..SECTIONS_PER_CHUNK {
             self.mark_dirty(
@@ -246,6 +260,20 @@ impl ChunkMirror {
 #[inline]
 pub fn is_stale(pending_epoch: u64, current_epoch: u64) -> bool {
     pending_epoch != current_epoch
+}
+
+impl crate::script::WorldQuery for ChunkMirror {
+    fn live_entities(&self) -> Vec<(types::EntityId, types::glam::Vec3)> {
+        Vec::new()
+    }
+
+    fn block_at(&self, pos: BlockPos) -> Option<BlockId> {
+        self.block(pos)
+    }
+
+    fn chunks_loaded(&self) -> usize {
+        self.chunks.len()
+    }
 }
 
 #[cfg(test)]

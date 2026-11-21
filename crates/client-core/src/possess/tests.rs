@@ -661,3 +661,58 @@ fn r3_p_press_hint_by_phase_and_target() {
         );
     }
 }
+
+/// MS19(REQ-013 C02-1 §2.1 / PM25 靶点):`possess::to_c2s` 四变体逐字段手算断言 +
+/// `Intent` 无附身 → `None`。
+#[test]
+fn ms19_to_c2s_all_variants() {
+    use sim_api::proto::C2S;
+
+    let id = agent_id(7);
+    let pos = Vec3::new(1.5, -59.1, 2.5);
+
+    assert_eq!(
+        to_c2s(
+            &PossessCommand::SpawnAgent {
+                position: pos,
+                yaw: 45.0,
+            },
+            None,
+        ),
+        Some(C2S::SpawnAgent {
+            body: "capsule".to_owned(),
+            position: pos,
+            yaw: 45.0,
+        }),
+        "SpawnAgent 固定 body=\"capsule\" 并透传位置与偏航角"
+    );
+
+    assert_eq!(
+        to_c2s(&PossessCommand::Possess(id), None),
+        Some(C2S::Possess { entity: id }),
+        "Possess 映射为 C2S::Possess"
+    );
+
+    assert_eq!(
+        to_c2s(&PossessCommand::Unpossess, Some(id)),
+        Some(C2S::Unpossess),
+        "Unpossess 映射为 C2S::Unpossess"
+    );
+
+    let intent = PossessCommand::Intent {
+        move_xz: (4.3, -1.2),
+        yaw: -90.0,
+        jump: true,
+    };
+    assert_eq!(
+        to_c2s(&intent, Some(id)),
+        Some(C2S::AgentIntent {
+            entity: id,
+            move_xz: (4.3, -1.2),
+            yaw: -90.0,
+            jump: true,
+        }),
+        "Intent 有附身实体时映射为 C2S::AgentIntent"
+    );
+    assert_eq!(to_c2s(&intent, None), None, "Intent 无附身实体时丢弃(None)");
+}

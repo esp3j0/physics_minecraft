@@ -40,7 +40,7 @@ use crate::script::{
 use crate::tools::{
     ChargeState, Hit, PanelColor, PanelState, Placeable, StageDriver, ToolAction, ToolState,
     adjust_preset_speed, cycle_placeable, dig, help_lines, launch_request, orientation_from_yaw,
-    panel_lines, pick, place, preview_outline, speed_bar, toggle_help,
+    panel_lines, place, preview_outline, speed_bar, toggle_help,
 };
 use crate::world::WorldState;
 
@@ -73,9 +73,6 @@ const BLAST_SNAP: f32 = 25.0;
 /// 脚本模式观察者上报的立即触发阈值:相机较上次上报移动超过 1 m 即上报
 /// (不等 100 ms 节流——传送当帧即可带动观察者;REQ-008 单元 02 任务书)。
 const OBSERVER_JUMP_METERS: f32 = 1.0;
-
-/// 拾取最远距离(REQ-011 §3.3)。
-const PICK_MAX_DIST: f32 = 48.0;
 
 /// 面板行颜色 → macroquad 颜色(§3.5.3 第 4 条:断开行红、标题黄、提示橙、
 /// 其余白;纯函数层 [`PanelColor`] 的唯一映射点)。
@@ -112,16 +109,15 @@ fn draw_cell_wire(pos: BlockPos, color: macroquad::color::Color) {
     );
 }
 
-/// 拾取(每帧;相机位姿 → 3D 线框用命中)。零 macroquad 依赖的纯函数在
-/// tools::pick,这里只做 glam 版本换算。
+/// 拾取(每帧;相机位姿 → 3D 线框用命中)。直接委托 `client_core::tools::pick_at_camera`
+/// (REQ-013 C02-1 §1.5,语义逐位不变)。
 fn pick_at_camera(camera: &FlyCamera, world: &WorldState) -> Option<Hit> {
     let o = camera.position;
-    let d = camera.forward();
-    pick(
+    crate::tools::pick_at_camera(
         world,
         TVec3::new(o.x, o.y, o.z),
-        TVec3::new(d.x, d.y, d.z),
-        PICK_MAX_DIST,
+        camera.yaw.to_degrees(),
+        camera.pitch.to_degrees(),
     )
 }
 
@@ -790,6 +786,11 @@ fn forward_commands(commands: &[EngineCommand], control: &crate::client::Control
                 pos: *pos,
                 block: *block,
             }),
+            EngineCommand::ToolAction(action) => match action {
+                ToolAction::Single(cmd) => batch.push(cmd.clone()),
+                ToolAction::Batch(cmds) => batch.extend(cmds.iter().cloned()),
+                ToolAction::Rejected(_) => {}
+            },
         }
     }
     control.command_batch(batch);

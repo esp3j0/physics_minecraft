@@ -108,11 +108,11 @@ fn engine(steps: &str) -> Engine {
     )
 }
 
-fn frame(
+fn frame<W: WorldQuery>(
     e: &mut Engine,
     dt: f32,
     tick: u64,
-    world: &FlatWorld,
+    world: &W,
     spawned: &[EntityId],
 ) -> crate::script::FrameOutput {
     e.frame(&FrameInput {
@@ -1592,4 +1592,73 @@ fn ms13_labeled_alive_counts_entities_and_agents_union() {
         .map(|r| &r.outcome)
         .collect();
     assert_eq!(check_outcomes, vec![&StepOutcome::Ok, &StepOutcome::Ok]);
+}
+
+/// MS22(REQ-013 C02-1 §4.2 + R1 F1 / PM22 靶点):place 先、dig 后顺序——
+/// 假世界单列 dirt `(2,-61,8)`,camera `(2.5,-59,8.5)/-90/-89`:
+/// 1) `place = { material = 1 }` 产出 `ToolAction::Single(SetBlock { pos: (2,-60,8), block: BlockId(1) })`;
+/// 2) 假世界写入 `(2,-60,8) = STONE` 后 `dig = {}` 产出 `ToolAction::Single(SetBlock { pos: (2,-60,8), block: AIR })`。
+#[test]
+fn ms22_script_place_then_dig_tool_actions() {
+    use crate::script::EngineCommand;
+    use crate::tools::ToolAction;
+    use messaging::SimCommand;
+    use std::collections::BTreeMap;
+    use types::{BlockId, BlockPos};
+
+    struct SingleColWorld {
+        blocks: BTreeMap<BlockPos, BlockId>,
+    }
+    impl WorldQuery for SingleColWorld {
+        fn live_entities(&self) -> Vec<(EntityId, Vec3)> {
+            Vec::new()
+        }
+        fn block_at(&self, pos: BlockPos) -> Option<BlockId> {
+            Some(self.blocks.get(&pos).copied().unwrap_or(BlockId::AIR))
+        }
+        fn chunks_loaded(&self) -> usize {
+            1
+        }
+    }
+
+    let mut w = SingleColWorld {
+        blocks: BTreeMap::new(),
+    };
+    w.blocks
+        .insert(BlockPos::new(2, -61, 8), voxel::builtin::DIRT);
+
+    let mut e = engine(
+        "[[step]]\ncamera = { pos = [2.5, -59.0, 8.5], yaw = -90.0, pitch = -89.0 }\n\
+         [[step]]\nplace = { material = 1 }\n\
+         [[step]]\nwait_ticks = { n = 1 }\n\
+         [[step]]\ndig = {}\n",
+    );
+
+    // 帧 1(tick 0):camera + place 瞬时执行,命中 (2,-61,8) 顶面 → place_pos (2,-60,8) 置 STONE(BlockId(1))。
+    let out1 = frame(&mut e, 0.016, 0, &w, &[]);
+    assert_eq!(
+        out1.commands,
+        vec![EngineCommand::ToolAction(ToolAction::Single(
+            SimCommand::SetBlock {
+                pos: BlockPos::new(2, -60, 8),
+                block: BlockId(1),
+            }
+        ))],
+        "place={{material=1}} 应在 (2,-60,8) 放置 BlockId(1)"
+    );
+
+    // 模拟服务端应用放置后的块状态,再推进到 tick 1 执行 dig。
+    w.blocks.insert(BlockPos::new(2, -60, 8), BlockId(1));
+    let out2 = frame(&mut e, 0.016, 1, &w, &[]);
+    assert_eq!(
+        out2.commands,
+        vec![EngineCommand::ToolAction(ToolAction::Single(
+            SimCommand::SetBlock {
+                pos: BlockPos::new(2, -60, 8),
+                block: BlockId::AIR,
+            }
+        ))],
+        "dig={{}} 应命中新放置的 (2,-60,8) 并置为 AIR"
+    );
+    assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
 }

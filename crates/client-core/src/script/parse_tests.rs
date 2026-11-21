@@ -767,3 +767,45 @@ fn ms11_parse_perf_reset() {
         e.message
     );
 }
+
+/// REQ-013 C02-1 §4.1 MS21:`dig`/`place`/`select_material` 白名单与参数校验。
+#[test]
+fn ms21_parse_dig_place_select_material() {
+    let s = parse_scenario(&one_step("dig = {}")).expect("空表 dig 应合法解析");
+    assert_eq!(s.steps.len(), 1);
+    assert_eq!(s.steps[0].action, Action::Dig);
+
+    let e = err(&one_step("dig = { extra = 1 }"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("extra"),
+        "dig 多余键必须点名 extra:{}",
+        e.message
+    );
+
+    let s = parse_scenario(&one_step("place = { material = 1 }")).expect("place 带 material 合法");
+    assert_eq!(s.steps[0].action, Action::Place { material: Some(1) });
+
+    let s_default = parse_scenario(&one_step("place = {}")).expect("place 省去 material 合法");
+    assert_eq!(s_default.steps[0].action, Action::Place { material: None });
+
+    let e = err(&one_step("place = { material = 1, extra = 2 }"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("extra"),
+        "place 多余键必须点名 extra:{}",
+        e.message
+    );
+
+    let e = err(&one_step("select_material = {}"));
+    assert_eq!(e.step, Some(1));
+    assert!(
+        e.message.contains("index"),
+        "select_material 缺 index 必须点名报错:{}",
+        e.message
+    );
+
+    let s_sel = parse_scenario(&one_step("select_material = { index = 2 }"))
+        .expect("select_material 带 index 合法");
+    assert_eq!(s_sel.steps[0].action, Action::SelectMaterial { index: 2 });
+}
