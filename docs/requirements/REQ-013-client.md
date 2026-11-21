@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -190,7 +190,11 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   首期必开:`bevy_asset`、`bevy_core_pipeline`、`bevy_pbr`、`bevy_render`、
   `bevy_scene`、`bevy_text`、`bevy_ui`、`bevy_winit`、`bevy_window`、
   `bevy_gizmos`(选区线框)、`tonemapping_luts`、`multi_threaded`、
-  `png`(截图接 REQ-008 冒烟)。暂不开:audio/vorbis、sprite/2d、
+  `png`(截图接 REQ-008 冒烟)、`default_font`、`bevy_ui_render`
+  (后两项 C02-1 验收补记,2026-11-20:`default_font` 提供内嵌字形,
+  缺它 HUD 文本无字形;`bevy_ui` 特性不含渲染插件,缺
+  `bevy_ui_render` 则 UI 只布局不画——两者均为零/单包增量,
+  见 #27 R3/R5b/R6 裁定)。暂不开:audio/vorbis、sprite/2d、
   animation、gltf、gilrs(手柄 §8 非目标)、wayland。C02 调试面板
   若只是移植 tools/panel 纯文本 HUD,原生 bevy_ui + bevy_text 够用,
   **不引 bevy_egui**(复杂交互需求出现再议)。
@@ -235,9 +239,10 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
 
 ## 6. 验收标准
 
-- [ ] AC1:单机可玩闭环——bevy 客户端进程内起 sim,飞行相机 +
+- [x] AC1:单机可玩闭环——bevy 客户端进程内起 sim,飞行相机 +
   chunk 流式装载 + 准星拾取挖/放方块,**零网络依赖**;方块编辑
-  ≤ 1 拍本地生效(单元测试 + 人工)。
+  ≤ 1 拍本地生效(单元测试 + 人工)。C02-1 人工闭环通过
+  (2026-11-20,见 §9;held 键/鼠标转视角注入限制与 MS23 锚归 C02-2)。
 - [ ] AC2:`Transport` trait + in-process 与 loopback(进程内消息
   队列)两个实现;同一客户端核分别接两种传输跑同一脚本,
   S2C 帧序列**同机逐位一致**(测试)。
@@ -344,6 +349,26 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   60.0223≥60 ✓;AC6 风暴 FPS 本机 780M 跨轮 52.28–56.86 不稳定达标,
   如实记录待 2080Ti 基准机复测,不私自放宽。遗留:storm 基准机复测;
   卸载句柄锚点归 C02/C03 视距移动场景。验收与 R1/R1b 裁定见 #27。
+- C02-1 ✅ 验收通过(2026-11-20,含 R2–R6 裁定):提交 8c7095b(实施)+
+  b3b28f2(R3 default_font)+ 997dc36(R4 HUD 组件集 + MS18)+
+  1078fe1(R6 bevy_ui_render,lock 恰 +1 包)。交互接线(每帧拾取/
+  1–4 选材/LMB 挖/RMB 放/M 锁定切换/P 附身圆环/滚轮语义路由)+
+  possess/tools 纯逻辑搬运 client-core + HUD 五行 + MS16b/MS18/MS20/
+  MS22 锚点 + client_interact 冒烟场景(19 步)。门禁复跑全过
+  (client-core 199/client 9/viewer 19/app/messaging/sim-api + e2e 33
+  二进制 + clippy 七包 + fmt);PM22–PM26 5/5 击杀,架构师 N10/N11 击杀
+  并还原。R2:F5 tempfile 追认、F6 编辑回环 3 拍→wait 4、F7 相机 y=-56;
+  R3/R4/R6:HUD 三层静默失败(缺字形/裸 Text 无 Node 不布局/bevy_ui
+  不含渲染插件)逐层真机截图复核修复,根因属需求清单遗漏,已补记 Q1。
+  AC1 人工真机闭环通过:HUD 五行、放 dirt/挖/选 stone 再放、P 附身
+  (Possessed+第三人称)、再 P 解除(HasBody)、F2 落盘审图、Esc exit 0。
+  限制如实记录:computer-use press_key 点按语义使 held 键(WASD/
+  Shift/Space)与鼠标转视角无法人工注入(bevy 同帧 down+up 只置
+  just_pressed),fly_camera_system held 平移/转视角无 headless 锚 →
+  C02-2 追加 MS23(期望值架构师手算);附身意图行走需策略模型归 C03。
+  遗留归 C02-2:LRU 上限 + 视距移动场景 + 卸载句柄机器锚、脚本 shot.hud
+  HUD 显隐接线 + 冒烟可见性锚(R6 延期)、MS23 fly 锚。验收与 R2–R6
+  裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
