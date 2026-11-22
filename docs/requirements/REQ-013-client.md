@@ -391,6 +391,36 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   PM27–PM31、N12–N14 全击杀并还原。实施归属如实:agy 4 次派发均
   print-timeout(worktree 存活、代码落地),门禁/变异/归因/裁定由
   架构师完成,含还原 agy 遗留 PM30 变异。验收与 R2–R4 裁定见 #27。
+- C03-1 ✅ 验收通过(2026-11-22,含 R1/R2 机械强化):提交见 #27 回报。
+  client-core `entities.rs` EntityMirror(AgentStates/EntityStates 的
+  full 重建与增量 upsert+removed、EntityShapes 先到挂载)+ `bodies.rs`
+  BodyShapeTable 自 viewer 搬运;client `entities.rs` 每帧四段对账
+  (过期 agent despawn、agent spawn/附身青绿换材、compound 变更 solid
+  重建、solid spawn/位姿更新;despawn 同步 meshes.remove 1:1)、
+  `solid_mesh` 逐 cell 0.9 立方合并;MS27 t1–t4/MS28 t1–t2/MS29 锚点;
+  xtask `--client` 八场景门禁;新场景 client_fall/client_possess_walk。
+  门禁复跑全过:四包测试 313(client-core 212/client 26/viewer/xtask)
+  + e2e 全二进制 + clippy 四包 0 + fmt 0 + selftest 5/5;八场景冒烟
+  exit 0、failed_checks 全 0、mesh 三值等式全 True。PM32–PM35 与
+  架构师 N16(removed 漏清 shapes 表)5/5 击杀并还原,还原字节比对一致。
+  R1 机械强化:镜像就绪早于服务端可编辑/可 spawn(fall SetBlock 丢弃、
+  possess_walk spawn 回执超时)→ 前置 60 拍;异步 meshing 与 UI 文本
+  不按拍计 → fall before/pile 与 interact hud 截图前 +600 拍墙钟余量。
+  R2 裁定(midfall 空帧,~50% 偶发):查证链 = SOLDIAG 镜像/渲染主世界
+  正确 → 截图拍号按调度(tick 706=dig+20,live_entities=1)→ spawn 墙钟
+  早于捕获 316ms 且无 despawn churn → 连拍 m20 空/m26 起可见 → 屏外
+  预挖温暖柱探针 m20 可见(因果确认)。根因 = solid 材质首用触发着色器/
+  管线编译使渲染线程停帧 ~0.4s,截图读到旧交换链帧;属 780M 核显驱动/
+  环境行为,非 C03-1 实体同步逻辑;驱动层细节未归因。机械强化:
+  client_fall 加屏外温暖柱预挖 +600 拍,强化后 midfall 可见 3/3
+  (probe5/gate-r3/gate-r4)。同轮修 edit_storm before 截图落初始
+  meshing 窗(C01b-3 遗留,纯天空色 15061B)→ wait_until+600 拍,
+  强化后 before 可见、after 沟槽成立,风暴遥测与旧批一致
+  (storm_frames 14–16、fps_storm_min 50.7–71.4)。审图:fall before
+  4 格石柱/midfall 3 格蓝簇悬空与地面分离/pile 凝回石色无残影;
+  possess_walk 青绿胶囊第三人称跟随;interact 21-hud 五行 HUD。
+  磁盘:D 盘再被 PDB 占满(余 172K,LNK1318),按已批准先例删
+  target/debug 下 387 个可再生 PDB 释放 57.9G。验收与 R1/R2 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
@@ -463,3 +493,22 @@ edit_storm fps_mean 59.875/uploads 605。uploads 含空段且受帧对齐 ±8 �
 超时遗留变异事故,已还原);架构师自注 N8/N9 击杀。e2e acn2 首轮偶发 flake
 (start_paused 与 spawn_blocking 竞态),单跑/整二进制/全量 33 二进制复跑全绿,
 非本单元缺陷,复发另案。
+
+**C03-1 归档(2026-11-22,验收通过)**。数据源:八场景门禁批
+target/c03-1-gate-r3/(failed_checks 全 0)+ 补跑批 gate-r4(edit_storm/fall
+时序强化后)。环境同 C01b-3(780M 核显、CARGO_INCREMENTAL=0、dev opt-level=2)。
+
+| 项 | §4 预算 | 实测(perf_baseline 窗) | 判定 |
+| --- | --- | --- | --- |
+| sim 步进 | ≤8 ms/拍 | sim_p95 3.9467 ms(60 样本) | ✓ |
+| 策略推理 | ≤2 ms/主体·控制拍 | 0.10099 ms/主体(2616 次推理) | ✓ |
+| meshing 单段 | ≤4 ms | mesh_max 0.772 ms(6952 段) | ✓ |
+| 编辑→画面 | ≤2 帧 | 1 帧(fall max_edit_upload_frames=1) | ✓ |
+
+其余场景参考:fall fps_mean 114.26(fps_min 7.05 含首渲管线编译停顿,
+R2 已用屏外温暖柱把该停顿移出 midfall 截图窗);edit_storm fps_storm_min
+50.709/storm_frames 16(跨批 14–16、50.7–71.4,AC6 本机波动口径沿用
+C01b-3,待 2080Ti 复测);possess_walk sim_p95 0.7799、mesh_max 0.392。
+整轮 fps_mean 含初始装载停顿,不作稳态判据(口径同 C01b-3)。
+C03-1 不含策略接线变更(perf_baseline 沿用 C01b-3 四狗组合);
+本地策略 attach-on-spawn 与双路径位一致归 C03-2。
