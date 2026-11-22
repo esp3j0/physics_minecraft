@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -251,8 +251,11 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   枚举只追加)。
 - [ ] AC4:sim 60 Hz 固定拍与渲染解耦;渲染掉帧不改变 sim 拍序
   (测试:人为阻塞渲染 N 帧,sim tick 计数与状态不受影响)。
-- [ ] AC5:本地策略推理驱动 quad(quad_gpu1),同机与服务器路径
+- [x] AC5:本地策略推理驱动 quad(quad_gpu1),同机与服务器路径
   playback 位级一致(复用 check-policy 同机核对口径 + 回放比对)。
+  C03-2 验收:app `dual_path::ac5_dual_path_bit_exact_consistency` 绿
+  (quad_gpu1 真实策略包);check-policy quad_gpu1 加载 OK、quad_mj1_ft
+  probe 总最大差 2.980e-7;见 §11 C03-2 归档。
 - [ ] AC6:meshing 异步不阻塞渲染线程;方块编辑 → 画面 ≤ 2 帧;
   编辑风暴(脚本连挖 64 格)期间 FPS ≥ 55(实测报告)。
 - [ ] AC7:viewer 纯逻辑层(client/possess/world/script/tools)
@@ -421,6 +424,27 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   possess_walk 青绿胶囊第三人称跟随;interact 21-hud 五行 HUD。
   磁盘:D 盘再被 PDB 占满(余 172K,LNK1318),按已批准先例删
   target/debug 下 387 个可再生 PDB 释放 57.9G。验收与 R1/R2 裁定见 #27。
+- C03-2 ✅ 验收通过(2026-11-22,含 R4 机械强化):提交 3daa475(实施)、
+  f2714ab(R4 钉死)。app `driver.rs` 生成即挂(C2S::SpawnAgent 与 startup
+  B03a 同口径 `attached_at = now.next()`、pending 按 EntityId 排序、挂载
+  意图清零)+ 策略哈希门(policy_body_hash 不符拒挂)+ `controller/mod.rs`
+  drive_policies 到期/frozen/skip 计数;`local.rs` T-A2–T-A5 锚点;
+  `dual_path.rs` AC5 同机位级一致(quad_gpu1);xtask check-policy 同机
+  核对 + probe 核对。门禁复跑全过:workspace 1785 passed / 0 failed +
+  clippy 0 + fmt 0;check-policy 双资产 OK(mj1_ft probe 2.980e-7);
+  冒烟 client 9/9 + server 16/16 + req012 9/9 + selftest 4/4(DPI 对齐
+  环境,见 §11)。架构师变异轮:M2/M3/M-Y1–M-Y4 共 6 击杀;M1(哈希门)/
+  M4(挂载拍 now vs now.next())存活 → 归因(零 dof 静默 skip 的
+  policy_no_state 链 / drain 丢弃生成拍 AgentStates)→ R4 钉死 t_a3
+  `policy_no_state == 0` 与新增 t_a7 `attached_at == first_tick`,复注
+  双红(60≠0 / 14≠15);M5(drain 在 drive 前/后)/M7(pending 排序)
+  裁定等价变异(attached_at=now.next() 使新槽生成拍必不到期;slots 为
+  BTreeMap,迭代序恒 EntityId 序)。R1 裁定:意图行走场景改用
+  quad_mj1_ft(quad_gpu1 开环偏航漂移画圈,实测记 REQ-012 §15.3/§15.4;
+  AC5 双路径仍用 quad_gpu1)。审图:quad 四图洋红行走 → 青绿附身转 →
+  青绿转回 → 洋红恢复,全程站姿无翻倒。磁盘:D 盘再被 PDB 占满
+  (LNK1318),按已批准先例删 target/debug 下 131 个可再生 PDB 释放 33G。
+  验收与 R1–R4 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
@@ -512,3 +536,38 @@ C01b-3,待 2080Ti 复测);possess_walk sim_p95 0.7799、mesh_max 0.392。
 整轮 fps_mean 含初始装载停顿,不作稳态判据(口径同 C01b-3)。
 C03-1 不含策略接线变更(perf_baseline 沿用 C01b-3 四狗组合);
 本地策略 attach-on-spawn 与双路径位一致归 C03-2。
+
+**C03-2 归档(2026-11-22,验收通过)**。数据源:DPI 对齐环境冒烟批
+target/smoke/client-20261122-173911/(perf_baseline + quad_policy)、
+client-20261122-174036/(client 七场景)、server 批 gate_smoke_sDE_dpi
+(16/16)与 gate_smoke_sF_dpi(req012 9/9)、selftest 4/4;failed_checks 全 0。
+环境同 C01b-3(780M 核显、CARGO_INCREMENTAL=0、dev opt-level=2),另加
+`__COMPAT_LAYER=DpiUnaware` 使窗口物理分辨率对齐 1280×720(见环境注记)。
+
+| 项 | §4 预算 | 实测(perf_baseline 窗) | 判定 |
+| --- | --- | --- | --- |
+| sim 步进 | ≤8 ms/拍 | sim_p95 3.4058 ms(60 样本) | ✓ |
+| 策略推理 | ≤2 ms/主体·控制拍 | 0.10491 ms/主体(2616 次推理) | ✓ |
+| meshing 单段 | ≤4 ms | mesh_max 0.521 ms(7040 段) | ✓ |
+| 编辑→画面 | ≤2 帧 | 1 帧(block_edit/edit_storm/fall/interact max_edit_upload_frames=1) | ✓ |
+| 稳态渲染 | ≥60 FPS | fps_mean 256.18(fps_min 196.60) | ✓ |
+| 风暴 FPS(AC6) | ≥55 | 本轮 edit_storm 245.01(storm_frames 20)、block_edit 79.52 | 本机本轮达标;跨机定值仍待基准机 |
+
+quad_policy 窗:fps_mean 233.89 / fps_min 49.54(含附身转向与截图 readback
+停顿,仅参考)、sim_p95 1.2897、policy 0.26720 ms/主体(1459 次推理)、
+mesh_max 0.588;相位拍 adopt 628 / possess 927 / 转回 intent 1648 /
+unpossess 2369 / 恢复行走 2.0 m 核对 2921 全 ok。整轮 fps_mean 含初始装载
+停顿,不作稳态判据(口径同 C01b-3)。AC6 跨轮波动口径沿用 C01b-3/C03-1:
+780M 核显非 §4 基准机,最终定值待 2080Ti 级复测后走 §4 修订流程。
+
+环境注记(DPI):架构师 Bash 启动上下文为 DPI-aware(1.75×),客户端逻辑
+1280×720 被放大为物理 2240×1260(3.06× 像素),780M 核显批窗 fps ~16;
+agy CLI 与 C03-1 gate-r3 为 1280×720。以 `__COMPAT_LAYER=DpiUnaware` 对齐后
+1280×720、fps 233–256(与基线同量级),本轮验收冒烟全部在对齐环境复跑。
+fps 非机器门禁;批窗 fps 争用部分未归因。
+
+AC5 证据:dual_path 位级一致绿 + check-policy quad_gpu1 加载 OK /
+quad_mj1_ft probe 2.980e-7。变异与锚点见 §9 C03-2(6 击杀、M1/M4 经 R4
+钉死复注双红、M5/M7 等价裁定)。审图:173911 quad 四图(11-flat-walk 洋红
+站姿行走 / 20-possessed-turn 青绿 / 23-turned-back 青绿转回 / 29-resumed
+洋红恢复站姿),架构师亲审裁剪图,无翻倒/残影。
