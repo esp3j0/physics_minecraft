@@ -901,6 +901,10 @@ mod tests {
         );
         assert_eq!(outcome.controller_counters.policy_errors, 0);
         assert_eq!(outcome.controller_counters.send_rejected, 0);
+        assert_eq!(
+            outcome.controller_counters.policy_no_state, 0,
+            "哈希门失守时 capsule 会被挂上策略槽,每到期拍 policy_no_state 递增"
+        );
     }
 
     /// T-A4 附身闭环:attach-on-spawn(quad_gpu1)+ Possess → Possessed(Some);
@@ -1118,6 +1122,58 @@ mod tests {
         assert!(
             msg2.contains("bad_hash_pack") && msg2.contains("0000000000000000"),
             "错误消息须含策略名与 body_hash,实际:{msg2}"
+        );
+    }
+
+    /// T-A7 挂载拍口径:C2S::SpawnAgent 生成即挂,`attached_at = now.next()`
+    /// (REQ-013 §3.2a,照 startup B03a X1 口径)。观测:Spawned 回执后首个含该
+    /// 主体的 AgentStates 拍号 = 生成处理拍 + 1 = attached_at;终末检查点槽位可证。
+    #[tokio::test(start_paused = true)]
+    async fn t_a7_c2s_spawn_attaches_at_next_tick() {
+        let policies_dir = tempfile::TempDir::new().expect("policies TempDir");
+        write_fixture_pack(
+            policies_dir.path(),
+            "stand_fix",
+            &quad_hash_hex_from_assets(),
+        );
+        let data = tempfile::TempDir::new().expect("data TempDir");
+        let (handle, driver) = spawn_in_current_runtime(local_policy_config(
+            data.path(),
+            policies_dir.path(),
+            Some("stand_fix"),
+        ))
+        .await
+        .expect("spawn_in_current_runtime");
+        wait_for_chunk_0_0(&handle).await;
+        let entity = spawn_agent_and_wait(&handle, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+        let mut first_tick: Option<Tick> = None;
+        for _ in 0..120 {
+            advance_sim_tick().await;
+            for m in handle.drain() {
+                if let S2C::AgentStates { tick, states, .. } = m
+                    && first_tick.is_none()
+                    && states.iter().any(|(id, _, _)| *id == entity)
+                {
+                    first_tick = Some(tick);
+                }
+            }
+        }
+        let first_tick = first_tick.expect("120 拍内必收到含该主体的 AgentStates");
+        handle.send(C2S::Goodbye);
+        let _outcome = driver.await.expect("驱动正常退出");
+        use storage::traits::CheckpointStore as _;
+        let store = storage::redb::RedbStore::open(&data.path().join("checkpoints.redb"))
+            .expect("检查点库可读");
+        let (_, blob) = store.read_latest().expect("读最新").expect("存在检查点");
+        let bundle = driver::decode_checkpoint(&blob).expect("检查点可解");
+        let record = bundle
+            .controllers
+            .iter()
+            .find(|r| r.entity == entity)
+            .expect("检查点含该主体槽位");
+        assert_eq!(
+            record.slot.attached_at, first_tick,
+            "attached_at 应为 Spawned 后首个 AgentStates 拍(first={first_tick:?})"
         );
     }
 }
