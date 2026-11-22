@@ -4,7 +4,9 @@
 //! C01a 建立传输边界 [`Transport`] 与进程内单机实现 [`LocalTransport`];
 //! C01b-1 建立世界镜像 [`mirror`] 与 subchunk 网格生成 [`mesh`]。
 
+pub mod bodies;
 pub mod client;
+pub mod entities;
 pub mod mesh;
 pub mod mirror;
 pub mod perf;

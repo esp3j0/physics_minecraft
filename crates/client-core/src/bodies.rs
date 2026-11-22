@@ -1,8 +1,7 @@
-//! bodies —— 哈希 → 形状表(REQ-012 A06 §1):启动时从 `assets/bodies/
-//! *.body.toml` 用 `types::BodyDef::from_toml_str` + `hash()` 建表;渲染层
-//! 按 `AgentStates` 里的哈希查形状逐连杆画。查不到 = 占位盒 + HUD 计数,
-//! 不 panic。纯逻辑、零 macroquad(渲染接线在 render.rs;本文件可单测,
-//! 判据 A06-3)。
+//! bodies —— 哈希 → 形状表(REQ-012 A06 §1;REQ-013 C03-1 D1 迁入 `client-core`):
+//! 启动时从 `assets/bodies/*.body.toml` 用 `types::BodyDef::from_toml_str` + `hash()` 建表;
+//! 渲染层按 `AgentStates` 里的哈希查形状逐连杆画。查不到 = 占位盒 + HUD 计数,
+//! 不 panic。纯逻辑、零渲染依赖(供 `viewer` 与 `client` 共用,AC7)。
 
 use std::collections::BTreeMap;
 
@@ -24,7 +23,7 @@ pub enum LinkShape {
         radius: f32,
         offset: [f32; 3],
     },
-    /// 凸包(顶点集、连杆局部系平移;viewer 画包围盒)。
+    /// 凸包(顶点集、连杆局部系平移;渲染层画包围盒)。
     ConvexHull(Vec<[f32; 3]>, [f32; 3]),
 }
 
@@ -48,7 +47,7 @@ impl BodyShapeTable {
         Self::default()
     }
 
-    /// 从解析后的身体定义建表(`types::BodyDef`;viewer 不依赖
+    /// 从解析后的身体定义建表(`types::BodyDef`;客户端不依赖
     /// physics-sim,直接用 types 的解析与哈希——与服务端同一哈希口径:
     /// 服务端 `BodyRegistry::insert_toml` → `BodyDef::from_toml_str` +
     /// `hash()`,逐位同源)。
@@ -89,9 +88,9 @@ impl BodyShapeTable {
     }
 
     /// 从目录读 `*.body.toml` 建表(路径不存在 = 只有内置身体,不报错——
-    /// viewer 不因缺资产 fail-stop;解析失败同样跳过该文件并计数,渲染走
+    /// 客户端不因缺资产 fail-stop;解析失败同样跳过该文件并计数,渲染走
     /// 占位)。R1 §3.5:内置 `capsule`(`include_str!` 随二进制),目录读到
-    /// 的定义覆盖或补充——不在仓库根目录启动 viewer 时胶囊也能正常画出来。
+    /// 的定义覆盖或补充——不在仓库根目录启动时胶囊也能正常画出来。
     pub fn from_dir(dir: &std::path::Path) -> Self {
         let mut defs = load_defs(dir);
         if let Ok(builtin) = BodyDef::from_toml_str(BUILTIN_CAPSULE) {
@@ -127,7 +126,7 @@ impl BodyShapeTable {
     }
 }
 
-/// 读目录里的全部 `*.body.toml`(排序读取;解析失败跳过——viewer 的形状
+/// 读目录里的全部 `*.body.toml`(排序读取;解析失败跳过——形状
 /// 表只是渲染辅助,坏文件不 fail-stop;主体会走占位路径)。
 fn load_defs(dir: &std::path::Path) -> Vec<BodyDef> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -193,8 +192,8 @@ mod tests {
     }
 
     /// 目录加载(R1 §3.5):目录不存在也至少有内置 capsule(不报错);
-    /// 真目录(工作区根的 assets/bodies;测试 cwd = crates/viewer)读到的
-    /// 同名定义覆盖内置(表内仍是 1 条——同名哈希覆盖,不重复)。
+    /// 真目录(工作区根的 assets/bodies;测试 cwd = crates/client-core)读到的
+    /// 同名定义覆盖内置。
     #[test]
     fn from_dir_missing_has_builtin_capsule() {
         let table = BodyShapeTable::from_dir(std::path::Path::new("no/such/dir"));
@@ -204,9 +203,6 @@ mod tests {
             table.get(&def.hash()).is_some(),
             "内置 capsule 的哈希可查(不在仓库根启动也能画)"
         );
-        // 真目录:同名 capsule 覆盖内置(B01a 起目录还有 quad.body.toml,
-        // 表内 = 目录里的文件数;这里的"1 条"断言改成对数量不敏感的
-        // "目录读取增加了条目",覆盖语义由 from_defs 的 BTreeMap 保证)。
         let real = BodyShapeTable::from_dir(std::path::Path::new("../../assets/bodies"));
         assert!(
             !real.is_empty(),

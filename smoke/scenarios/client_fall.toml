@@ -1,0 +1,113 @@
+name = "client_fall"
+req = "REQ-013"
+description = "bevy 客户端挖落 4 格石柱 → 3 格蓝色复合脱落簇悬空下落 → 凝固回石地形的视觉与机器闭环(C03-1 D6)"
+timeout_secs = 180
+
+[viewer]
+view_distance = 8
+
+[server]
+world_seed = 3
+
+[server.destruction]
+enabled = true
+
+[server.cohesion]
+enabled = true
+
+[[step]]
+label = "相机就位(侧俯视 4 格石柱位置)"
+camera = { pos = [8.5, -57.5, 14.5], yaw = -90.0, pitch = -15.0 }
+
+[[step]]
+look_at = { target = [8.5, -58.0, 8.5] }
+
+[[step]]
+label = "等待地表区块就绪"
+wait_until = { block = { pos = [8, -61, 8], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+
+[[step]]
+label = "服务端目标 chunk 装载余量(镜像就绪早于服务端可编辑,R1 机械强化)"
+wait_ticks = { n = 60 }
+
+[[step]]
+label = "屏外温暖柱(z=20,相机背后;R2 机械强化)"
+fill = { from = [8, -60, 20], to = [8, -57, 20], block = "stone" }
+
+[[step]]
+wait_until = { block = { pos = [8, -57, 20], is = "stone" }, timeout_ticks = 120 }
+
+[[step]]
+look_at = { target = [8.5, -59.5, 20.5] }
+
+[[step]]
+label = "预挖温暖柱:首用 solid 材质触发管线编译,避免主柱 midfall 落在编译停帧窗(R2 机械强化)"
+dig = {}
+
+[[step]]
+label = "等首渲管线编译完成(墙钟余量,R2 机械强化)"
+wait_ticks = { n = 600 }
+
+[[step]]
+look_at = { target = [8.5, -58.0, 8.5] }
+
+[[step]]
+label = "建造 4 格石柱(立于 y=-61 地表上)"
+fill = { from = [8, -60, 8], to = [8, -57, 8], block = "stone" }
+
+[[step]]
+label = "等待石柱网格上传完成"
+wait_until = { block = { pos = [8, -57, 8], is = "stone" }, timeout_ticks = 120 }
+
+[[step]]
+label = "网格上传墙钟余量(异步 meshing 不按拍计,R1 机械强化)"
+wait_ticks = { n = 600 }
+
+[[step]]
+screenshot = { name = "before", hud = false, expect = "沙地上立着一根 4 格石柱" }
+
+[[step]]
+label = "准星对准最底格 [8,-60,8]"
+look_at = { target = [8.5, -59.5, 8.5] }
+
+[[step]]
+label = "挖掘最底格触发上段 3 格整块脱落"
+dig = {}
+
+[[step]]
+label = "等待下落 20 拍(约下落 0.55 m,悬空间隙可见)"
+wait_ticks = { n = 20 }
+
+[[step]]
+label = "校验下落中存在活实体"
+check = { live_entities = { ge = 1 } }
+
+[[step]]
+screenshot = { name = "midfall", hud = false, expect = "一列蓝色立方体悬空、与地面分离、柱形完整(3 格),尚未落地" }
+
+[[step]]
+label = "等待脱落簇落地并凝固"
+wait_until = { live_entities = { eq = 0 }, timeout_ticks = 240 }
+
+[[step]]
+label = "校验凝固底格 [8,-60,8] 为 stone"
+check = { block = { pos = [8, -60, 8], is = "stone" } }
+
+[[step]]
+label = "校验凝固中格 [8,-59,8] 为 stone"
+check = { block = { pos = [8, -59, 8], is = "stone" } }
+
+[[step]]
+label = "校验凝固顶格 [8,-58,8] 为 stone"
+check = { block = { pos = [8, -58, 8], is = "stone" } }
+
+[[step]]
+label = "校验动态实体已清空"
+check = { live_entities = { eq = 0 } }
+
+[[step]]
+label = "等待凝固后地形网格上传稳定(墙钟余量,R1 机械强化)"
+wait_ticks = { n = 600 }
+
+[[step]]
+screenshot = { name = "pile", hud = false, expect = "蓝色立方体消失,落堆已凝回地形石色,无悬空残影" }

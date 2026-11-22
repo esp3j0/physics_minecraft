@@ -565,6 +565,47 @@ fn verify_client_view_move(scenario_name: &str, manifest: Option<&Manifest>) -> 
     Ok(())
 }
 
+/// 校客户端 `client_fall` 场景的挖落-凝固视觉与句柄回收机器断言(C03-1 D6):
+/// 全步 ok、`mesh_stats` 存在、且三值等式 `assets_live_end == entities_live_end + assets_baseline` 成立。
+fn verify_client_fall(scenario_name: &str, manifest: Option<&Manifest>) -> Result<(), String> {
+    if scenario_name != "client_fall" {
+        return Ok(());
+    }
+    let Some(m) = manifest else {
+        return Err("client_fall 缺失 manifest,无法校验".to_owned());
+    };
+    if m.steps.is_empty() || m.steps.iter().any(|s| s.outcome != "ok") {
+        return Err("client_fall 存在非 ok 步骤".to_owned());
+    }
+    let Some(ms) = m.mesh_stats else {
+        return Err("client_fall manifest 缺失 mesh_stats 字段".to_owned());
+    };
+    if ms.assets_live_end != ms.entities_live_end + ms.assets_baseline {
+        return Err(format!(
+            "client_fall 网格句柄泄漏: assets_live_end={} != entities_live_end={} + assets_baseline={}",
+            ms.assets_live_end, ms.entities_live_end, ms.assets_baseline
+        ));
+    }
+    Ok(())
+}
+
+/// 校客户端 `client_possess_walk` 场景的附身行走机器断言(C03-1 D6):全步 ok。
+fn verify_client_possess_walk(
+    scenario_name: &str,
+    manifest: Option<&Manifest>,
+) -> Result<(), String> {
+    if scenario_name != "client_possess_walk" {
+        return Ok(());
+    }
+    let Some(m) = manifest else {
+        return Err("client_possess_walk 缺失 manifest,无法校验".to_owned());
+    };
+    if m.steps.is_empty() || m.steps.iter().any(|s| s.outcome != "ok") {
+        return Err("client_possess_walk 存在非 ok 步骤".to_owned());
+    }
+    Ok(())
+}
+
 /// 校客户端截图文件非退化(C02-2 验收补强):窗口创建时物理尺寸偶发报 0,
 /// wgpu 把交换链钳成 1×1,截出 72 字节空图而冒烟仍绿。逐张解 PNG IHDR,
 /// 宽高均须 >= 16(1280×720 是逻辑分辨率,HiDPI 下物理尺寸更大,不钉死精确值)。
@@ -746,6 +787,8 @@ fn run_client_scenario(
         && let Err(msg) = verify_client_mesh_stats(&name, manifest.as_ref())
             .and_then(|()| verify_client_perf_stats(&name, manifest.as_ref()))
             .and_then(|()| verify_client_view_move(&name, manifest.as_ref()))
+            .and_then(|()| verify_client_fall(&name, manifest.as_ref()))
+            .and_then(|()| verify_client_possess_walk(&name, manifest.as_ref()))
             .and_then(|()| verify_client_screenshots(&out_dir, manifest.as_ref()))
     {
         eprintln!("{msg}");
@@ -1972,6 +2015,33 @@ mod tests {
         let mut vm_leak = vm.clone();
         vm_leak.mesh_stats.as_mut().unwrap().assets_live_end = 31;
         assert!(verify_client_view_move("client_view_move", Some(&vm_leak)).is_err());
+
+        // C03-1 D6:verify_client_fall 与 verify_client_possess_walk 断言检查。
+        let mut fall_ok = make("client_fall", None);
+        fall_ok.steps = vec![shot_step(11, false)];
+        fall_ok.mesh_stats = Some(viewer::script::manifest::ManifestMeshStats {
+            max_edit_upload_frames: 1,
+            uploads: 30,
+            discards: 0,
+            unloads: 0,
+            evictions: 0,
+            assets_live_end: 30,
+            entities_live_end: 25,
+            assets_baseline: 5,
+        });
+        assert!(verify_client_fall("client_fall", Some(&fall_ok)).is_ok());
+
+        let mut fall_leak = fall_ok.clone();
+        fall_leak.mesh_stats.as_mut().unwrap().assets_live_end = 31;
+        assert!(verify_client_fall("client_fall", Some(&fall_leak)).is_err());
+
+        let mut walk_ok = make("client_possess_walk", None);
+        walk_ok.steps = vec![shot_step(9, false)];
+        assert!(verify_client_possess_walk("client_possess_walk", Some(&walk_ok)).is_ok());
+
+        let mut walk_fail = walk_ok.clone();
+        walk_fail.steps[0].outcome = "check_failed".to_owned();
+        assert!(verify_client_possess_walk("client_possess_walk", Some(&walk_fail)).is_err());
     }
 
     #[test]

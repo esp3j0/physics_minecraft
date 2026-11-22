@@ -5,6 +5,7 @@
 //! `AsyncComputeTaskPool` 异步网格上传、飞行相机、光照与截图。
 
 mod conv;
+mod entities;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -40,6 +41,7 @@ use client_core::tools::{
 };
 use client_core::world::WorldState;
 use client_core::{LocalTransport, Transport, config_from_server_table};
+use entities::{EntityMirrorRes, EntityRenderRes, sync_entities_system};
 use messaging::SimCommand;
 use sim_api::proto::{C2S, S2C};
 use types::{BlockPos, CHUNK_SIZE, ChunkPos, EntityId, WORLD_Y_MAX, WORLD_Y_MIN};
@@ -242,20 +244,27 @@ impl MeshStats {
     }
 }
 
-/// 一次性采样 Bevy 内置插件自持 Mesh 资产基线(REQ-013 C02-2 R2-3):
+/// 身体资产目录路径资源(供 `setup_scene` 初始化 [`EntityRenderRes`],REQ-013 C03-1 D3)。
+#[derive(Resource)]
+struct BodiesDirRes(PathBuf);
+
+/// 一次性采样 Bevy 内置插件自持 Mesh 资产基线(REQ-013 C02-2 R2-3 / C03-1 D5):
 /// 挂在真 App 的 `PostUpdate` 且晚于 `AssetEventSystems`(晚于 `SpriteMeshPlugin::add_mesh`),
-/// 首帧记录 `meshes.len() - world_res.entities.len()` 后永久幂等跳过;headless 裸 App 不挂载。
+/// 首帧记录 `meshes.len() - (chunk 段实体 + 实体渲染 mesh 子实体)` 后永久幂等跳过;headless 裸 App 不挂载。
 fn sample_mesh_assets_baseline_system(
     mut done: Local<bool>,
     meshes: Res<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    entity_render: Option<Res<EntityRenderRes>>,
     mut stats: ResMut<MeshStats>,
 ) {
     if *done {
         return;
     }
     *done = true;
-    stats.baseline = Some(meshes.len().saturating_sub(world_res.entities.len()));
+    let live_entities =
+        world_res.entities.len() + entity_render.as_ref().map_or(0, |r| r.live_mesh_entities());
+    stats.baseline = Some(meshes.len().saturating_sub(live_entities));
 }
 
 /// 异步网格构建耗时累计遥测(REQ-013 C01b-3 §1.4)。
@@ -590,6 +599,7 @@ fn main() {
         }
     };
 
+    let bodies_dir = config.bodies_dir.clone();
     let local_cfg = LocalConfig {
         config,
         view_distance,
@@ -644,6 +654,8 @@ fn main() {
     .insert_resource(ServerTickRes::default())
     .insert_resource(ToolRes::default())
     .insert_resource(PossessRes::default())
+    .insert_resource(EntityMirrorRes::default())
+    .insert_resource(BodiesDirRes(bodies_dir))
     .insert_resource(ObserverTracker::default())
     .insert_resource(ScreenshotState {
         dir: screenshot_dir,
@@ -661,6 +673,7 @@ fn main() {
             (
                 advance_frame_counter_system,
                 drain_transport_system,
+                sync_entities_system,
                 collect_mesh_tasks_system,
                 script_driver_system,
                 spawn_mesh_tasks_system,
@@ -677,6 +690,7 @@ fn main() {
                 sync_observer_system,
                 interact_system,
                 drain_transport_system,
+                sync_entities_system,
                 collect_mesh_tasks_system,
                 spawn_mesh_tasks_system,
                 hud_update_system,
@@ -693,6 +707,7 @@ fn main() {
 fn setup_scene(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    bodies_dir: Option<Res<BodiesDirRes>>,
     script_mode: Option<Res<ScriptModeRes>>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
@@ -707,6 +722,11 @@ fn setup_scene(
         entities: BTreeMap::new(),
         terrain_material,
     });
+    let dir = bodies_dir
+        .as_deref()
+        .map(|b| b.0.as_path())
+        .unwrap_or_else(|| Path::new("assets/bodies"));
+    commands.insert_resource(EntityRenderRes::new(dir, &mut materials));
 
     // 飞行相机:初始位 (8, -48, 24) 朝向 (8, -61, 0),fov 70°。
     let mut fly = FlyCamera::from_look(START_CAMERA_POS, START_CAMERA_LOOK_AT);
@@ -1163,6 +1183,7 @@ fn drain_transport_system(
     mut server_perf: Option<ResMut<ServerPerfRes>>,
     mut server_tick: ResMut<ServerTickRes>,
     mut possess_res: Option<ResMut<PossessRes>>,
+    mut entity_mirror: Option<ResMut<EntityMirrorRes>>,
     mut script_mode: Option<ResMut<ScriptModeRes>>,
     cam_q: Query<&Transform, With<FlyCamera>>,
 ) {
@@ -1171,6 +1192,9 @@ fn drain_transport_system(
     };
     let mut pending_sends: Vec<C2S> = Vec::new();
     for msg in msgs {
+        if let Some(em) = entity_mirror.as_mut() {
+            em.0.apply(&msg);
+        }
         if let Some(script) = script_mode.as_mut()
             && let Some(ev) = s2c_to_event(msg.clone())
         {
@@ -1477,6 +1501,7 @@ fn script_driver_system(
     frame_counter: Res<FrameCounter>,
     meshes: Res<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    entity_render: Option<Res<EntityRenderRes>>,
     stats: Res<MeshStats>,
     mesh_perf: Res<MeshPerfRes>,
     mut fps_history: ResMut<FpsHistoryRes>,
@@ -1505,7 +1530,11 @@ fn script_driver_system(
             });
     }
 
-    let sample_mesh_stats = || stats.to_manifest(meshes.len(), world_res.entities.len());
+    let sample_mesh_stats = || {
+        let live_entities =
+            world_res.entities.len() + entity_render.as_ref().map_or(0, |r| r.live_mesh_entities());
+        stats.to_manifest(meshes.len(), live_entities)
+    };
 
     // 场景已结束:等待最后一张异步截图写盘完毕,再写终版 manifest、关闭宿主并按 exit_code 退出。
     if let Some(code) = script.finished_exit {
@@ -1585,8 +1614,8 @@ fn script_driver_system(
         (output, status, code)
     };
 
-    // 应用引擎输出的相机位姿。
-    let cam_pos = conv::to_bevy_vec3(output.camera.pos);
+    // 应用引擎输出的相机位姿;possess follow=true 时切第三人称跟随视角(同 viewer render.rs:918-927)。
+    let mut cam_pos = conv::to_bevy_vec3(output.camera.pos);
     fly.yaw = output.camera.yaw.to_radians();
     fly.pitch = output
         .camera
@@ -1596,6 +1625,20 @@ fn script_driver_system(
     transform.translation = cam_pos;
     let look_target = cam_pos + fly.forward();
     transform.look_at(look_target, Vec3::Y);
+
+    if let Some((id, follow)) = output.possess
+        && follow
+        && let Some((_, poses)) = script.world.agent(id)
+        && let Some(pose) = poses.first()
+    {
+        let root = conv::to_bevy_vec3(pose.translation);
+        let look = Vec3::new(root.x, root.y + 0.6, root.z);
+        cam_pos = Vec3::new(look.x, look.y + 4.0, look.z + 4.0);
+        fly.yaw = -90.0_f32.to_radians();
+        fly.pitch = -45.0_f32.to_radians();
+        transform.translation = cam_pos;
+        transform.look_at(look, Vec3::Y);
+    }
 
     script.coupled = output.coupled;
     apply_perf_reset_step(output.perf_reset, &mut fps_history);

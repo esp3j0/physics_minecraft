@@ -11,6 +11,14 @@ label = "初始俯视视角"
 camera = { pos = [0.0, -48.0, 24.0], yaw = -90.0, pitch = -26.565 }
 
 [[step]]
+label = "等待地表区块就绪(R2 机械强化:before 截图不得落在初始 meshing 窗内)"
+wait_until = { block = { pos = [0, -61, 0], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+
+[[step]]
+label = "初始地形网格上传墙钟余量(R2 机械强化)"
+wait_ticks = { n = 600 }
+
+[[step]]
 screenshot = { name = "before", expect = "平整棕色泥土地表,无挖掘沟槽" }
 
 [[step]]

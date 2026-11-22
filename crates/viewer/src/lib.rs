@@ -5,12 +5,11 @@
 //! 窗口编排。bin 入口在 main.rs(双 target 各自编译,窗口行为不测试,
 //! ACV4 手动清单)。
 
-/// REQ-012 A06:哈希 → 形状表(纯逻辑,零 macroquad)。
-pub mod bodies;
 /// REQ-008:命令行参数(交互 / 脚本模式)。
 pub mod cli;
 pub mod mesh;
 pub mod render;
 
 /// REQ-013 C01b-2/C02-1:纯逻辑层已迁入 `client-core`,此处 `pub use` 保持旧路径兼容(AC7)。
-pub use client_core::{client, possess, script, tools, world};
+/// C03-1:`bodies` 形状表迁 client-core。
+pub use client_core::{bodies, client, possess, script, tools, world};

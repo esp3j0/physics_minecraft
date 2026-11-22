@@ -1,0 +1,49 @@
+name = "client_possess_walk"
+req = "REQ-013"
+description = "bevy 客户端附身胶囊主体第三人称跟随行走闭环(C03-1 D6)"
+timeout_secs = 180
+
+[viewer]
+view_distance = 2
+
+[server]
+world_seed = 3
+
+[[step]]
+label = "初始相机就位"
+camera = { pos = [8.0, -54.0, 14.0], yaw = -90.0, pitch = -30.0 }
+
+[[step]]
+label = "等待地表区块就绪"
+wait_until = { block = { pos = [8, -61, 8], is = "dirt" }, chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+
+[[step]]
+label = "服务端生成前置余量(镜像就绪早于服务端可 spawn,R1 机械强化)"
+wait_ticks = { n = 60 }
+
+[[step]]
+label = "在地表生成胶囊主体"
+spawn_agent = { at = [8.0, -59.0, 8.0], label = "cap" }
+
+[[step]]
+label = "附身胶囊并启用第三人称跟随"
+possess = { label = "cap", follow = true }
+
+[[step]]
+label = "记录起点"
+mark_agent = { label = "cap" }
+
+[[step]]
+label = "施加向东行走意图(4.3 m/s)"
+intent = { move = [4.3, 0.0], yaw = 0.0, jump = false }
+
+[[step]]
+label = "行走 90 拍(1.5 s,手算位移约 6.4 m)"
+wait_ticks = { n = 90 }
+
+[[step]]
+label = "校验位移 >= 2.0 m"
+check = { agent_moved = { label = "cap", ge = 2.0 } }
+
+[[step]]
+screenshot = { name = "walk", hud = false, expect = "青绿高亮胶囊(附身色)在地表,第三人称跟随视角" }
