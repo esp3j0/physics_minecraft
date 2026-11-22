@@ -441,8 +441,10 @@ fn verify_client_mesh_stats(
     Ok(())
 }
 
-/// 校客户端性能基线/编辑风暴场景的 perf 机制断言(C01b-3 §2.3;只锚机制,不锚 FPS 阈值):
+/// 校客户端性能基线/编辑风暴/策略狗场景的 perf 机制断言(C01b-3 §2.3, C03-2 §1;不锚 FPS 阈值):
 /// - `client_perf_baseline`:`manifest.perf` 存在、`sim_samples > 0`、`policy_infer_count > 0`、`mesh_count > 0`;
+/// - `client_quad_policy`:`manifest.perf` 存在、`sim_samples > 0`、`mesh_count > 0`、`policy_infer_count > 0`、
+///   `policy_ms_per_body` 为 `Some(ms)` 且 `<= 2.0`(REQ-013 §4 预算);
 /// - `client_edit_storm`:`manifest.perf` 存在、`fps_storm_min` 存在且 `storm_frames > 0`。
 fn verify_client_perf_stats(
     scenario_name: &str,
@@ -471,6 +473,42 @@ fn verify_client_perf_stats(
                 return Err(
                     "client_perf_baseline 机器断言失败: perf.mesh_count = 0 (要求 > 0)".to_owned(),
                 );
+            }
+            Ok(())
+        }
+        "client_quad_policy" => {
+            let Some(m) = manifest else {
+                return Err("client_quad_policy 缺失 manifest,无法校验 perf".to_owned());
+            };
+            let Some(perf) = m.perf.as_ref() else {
+                return Err("client_quad_policy manifest 缺失 perf 字段".to_owned());
+            };
+            if perf.sim_samples == 0 {
+                return Err(
+                    "client_quad_policy 机器断言失败: perf.sim_samples = 0 (要求 > 0)".to_owned(),
+                );
+            }
+            if perf.mesh_count == 0 {
+                return Err(
+                    "client_quad_policy 机器断言失败: perf.mesh_count = 0 (要求 > 0)".to_owned(),
+                );
+            }
+            if perf.policy_infer_count == 0 {
+                return Err(
+                    "client_quad_policy 机器断言失败: perf.policy_infer_count = 0 (要求 > 0)"
+                        .to_owned(),
+                );
+            }
+            let Some(ms) = perf.policy_ms_per_body else {
+                return Err(
+                    "client_quad_policy 机器断言失败: perf.policy_ms_per_body 为 None (要求 Some <= 2.0)"
+                        .to_owned(),
+                );
+            };
+            if !ms.is_finite() || ms > 2.0 {
+                return Err(format!(
+                    "client_quad_policy 机器断言失败: perf.policy_ms_per_body = {ms} (要求 <= 2.0 ms)"
+                ));
             }
             Ok(())
         }
@@ -2042,6 +2080,113 @@ mod tests {
         let mut walk_fail = walk_ok.clone();
         walk_fail.steps[0].outcome = "check_failed".to_owned();
         assert!(verify_client_possess_walk("client_possess_walk", Some(&walk_fail)).is_err());
+
+        // C03-2:`client_quad_policy` perf 机制与 2.0 ms 预算门禁断言。
+        let ok_quad = ManifestPerf {
+            fps_mean: 15.0,
+            fps_min: 8.0,
+            fps_storm_min: None,
+            storm_frames: 0,
+            mesh_max_ms: 2.0,
+            mesh_count: 50,
+            sim_p95_ms: Some(1.2),
+            sim_samples: 60,
+            policy_infer_count: 120,
+            policy_ms_per_body: Some(0.15),
+        };
+        assert!(verify_client_perf_stats("client_quad_policy", None).is_err());
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make("client_quad_policy", None))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        sim_samples: 0,
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        mesh_count: 0,
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        policy_infer_count: 0,
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        policy_ms_per_body: None,
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        policy_ms_per_body: Some(2.01),
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_err()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make(
+                    "client_quad_policy",
+                    Some(ManifestPerf {
+                        policy_ms_per_body: Some(2.0),
+                        ..ok_quad.clone()
+                    })
+                ))
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_client_perf_stats(
+                "client_quad_policy",
+                Some(&make("client_quad_policy", Some(ok_quad)))
+            )
+            .is_ok()
+        );
     }
 
     #[test]

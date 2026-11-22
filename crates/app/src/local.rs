@@ -691,4 +691,433 @@ mod tests {
         drop(handle);
         driver.await.expect("驱动正常退出");
     }
+
+    // ---- W1 单测(REQ-013 §3.2a, C03-2:T-A2 ~ T-A6) ----------------------------
+
+    const FIXTURE_ZERO_ONNX: &[u8] =
+        include_bytes!("../../../assets/policies/test_fixtures/zero45x12.onnx");
+
+    fn repo_assets_dir(sub: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets")
+            .join(sub)
+    }
+
+    fn quad_hash_hex_from_assets() -> String {
+        let mut bodies = physics_sim::BodyRegistry::new();
+        bodies
+            .insert_toml(include_str!("../../../assets/bodies/quad.body.toml"))
+            .expect("quad.body.toml 合法");
+        bodies.hash_of("quad").expect("quad 在注册表").hex()
+    }
+
+    fn terms45_manifest(name: &str, hash_hex: &str) -> String {
+        format!(
+            "name = \"{name}\"\n\
+             body_hash = \"{hash_hex}\"\n\
+             control_period_ticks = 2\n\
+             action_scale = 0.25\n\
+             [[obs]]\nterm = \"base_lin_vel\"\n\
+             [[obs]]\nterm = \"base_ang_vel\"\n\
+             [[obs]]\nterm = \"projected_gravity\"\n\
+             [[obs]]\nterm = \"joint_pos\"\n\
+             [[obs]]\nterm = \"joint_vel\"\n\
+             [[obs]]\nterm = \"last_action\"\n"
+        )
+    }
+
+    fn write_fixture_pack(dir: &Path, name: &str, hash_hex: &str) {
+        let pack_dir = dir.join(name);
+        std::fs::create_dir_all(&pack_dir).expect("创建夹具策略包目录");
+        std::fs::write(pack_dir.join("policy.onnx"), FIXTURE_ZERO_ONNX).expect("写 policy.onnx");
+        std::fs::write(
+            pack_dir.join("policy.toml"),
+            terms45_manifest(name, hash_hex),
+        )
+        .expect("写 policy.toml");
+    }
+
+    fn local_policy_config(
+        data_dir: &Path,
+        policies_dir: &Path,
+        default_policy: Option<&str>,
+    ) -> LocalConfig {
+        let config = Config {
+            worker_count: 2,
+            world_seed: types::WorldSeed(3),
+            data_dir: data_dir.to_path_buf(),
+            bodies_dir: repo_assets_dir("bodies"),
+            policies_dir: policies_dir.to_path_buf(),
+            default_policy: default_policy.map(str::to_owned),
+            policy_wait_budget_us: 1_000_000,
+            ..Config::default()
+        };
+        LocalConfig {
+            config,
+            view_distance: 2,
+        }
+    }
+
+    /// 精确推进 1 个逻辑模拟拍(tokio 定时器轮为 1 ms 粒度,dt = 16.667 ms 向上取整 17 ms,
+    /// 推进 17 ms 恰好触发 1 次 `MissedTickBehavior::Skip` interval,避免 16.667 ms 隔拍漏触)。
+    async fn advance_sim_tick() {
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+    }
+
+    /// 等到 chunk(0,0) 的 ChunkData 到达(先 MoveObserver(8,-60,8),上限 200 拍)。
+    async fn wait_for_chunk_0_0(handle: &LocalHandle) {
+        handle.send(C2S::MoveObserver {
+            position: Vec3::new(8.0, -60.0, 8.0),
+        });
+        let mut saw_chunk = false;
+        for _ in 0..200 {
+            advance_sim_tick().await;
+            for msg in handle.drain() {
+                if matches!(msg, S2C::ChunkData { pos, .. } if pos == ChunkPos::new(0, 0)) {
+                    saw_chunk = true;
+                }
+            }
+            if saw_chunk {
+                break;
+            }
+        }
+        assert!(saw_chunk, "200 拍内必须收到 chunk(0,0) 的 ChunkData");
+        // 再推进 10 拍确保分片激活/chunk 装载就绪。
+        for _ in 0..10 {
+            advance_sim_tick().await;
+        }
+        let _ = handle.drain();
+    }
+
+    /// 发 SpawnAgent 并等待 Spawned 回执(上限 20 拍)。
+    async fn spawn_agent_and_wait(handle: &LocalHandle, body: &str, position: Vec3) -> EntityId {
+        handle.send(C2S::SpawnAgent {
+            body: body.to_owned(),
+            position,
+            yaw: 0.0,
+        });
+        for _ in 0..20 {
+            advance_sim_tick().await;
+            for msg in handle.drain() {
+                if let S2C::Spawned { entity } = msg {
+                    return entity;
+                }
+            }
+        }
+        panic!("20 拍内未收到 SpawnAgent({body}) 的 Spawned 回执");
+    }
+
+    /// T-A2 attach-on-spawn:local 宿主 + default_policy=夹具名 → SpawnAgent quad 推 300 拍 →
+    /// policy_inferences >= 100、policy_errors == 0、send_rejected == 0;对照 None → == 0。
+    #[tokio::test(start_paused = true)]
+    async fn t_a2_attach_on_spawn_and_control_none() {
+        let policies_dir = tempfile::TempDir::new().expect("policies TempDir");
+        write_fixture_pack(
+            policies_dir.path(),
+            "stand_fix",
+            &quad_hash_hex_from_assets(),
+        );
+
+        // 实验组:default_policy = Some("stand_fix")。
+        let data_on = tempfile::TempDir::new().expect("data_on TempDir");
+        let (handle, driver) = spawn_in_current_runtime(local_policy_config(
+            data_on.path(),
+            policies_dir.path(),
+            Some("stand_fix"),
+        ))
+        .await
+        .expect("spawn_in_current_runtime");
+        wait_for_chunk_0_0(&handle).await;
+        let _entity = spawn_agent_and_wait(&handle, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+        for _ in 0..300 {
+            advance_sim_tick().await;
+            let _ = handle.drain();
+        }
+        handle.send(C2S::Goodbye);
+        let outcome = driver.await.expect("驱动正常退出");
+        let c = outcome.controller_counters;
+        assert!(
+            c.policy_inferences >= 100,
+            "300 拍理论 ~150 次推理,期望 >= 100,实测 {}",
+            c.policy_inferences
+        );
+        assert_eq!(c.policy_errors, 0, "policy_errors 必须为 0");
+        assert_eq!(c.send_rejected, 0, "send_rejected 必须为 0");
+
+        // 对照组:default_policy = None → policy_inferences == 0。
+        let data_off = tempfile::TempDir::new().expect("data_off TempDir");
+        let (handle2, driver2) = spawn_in_current_runtime(local_policy_config(
+            data_off.path(),
+            policies_dir.path(),
+            None,
+        ))
+        .await
+        .expect("spawn_in_current_runtime(None)");
+        wait_for_chunk_0_0(&handle2).await;
+        let _entity2 = spawn_agent_and_wait(&handle2, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+        for _ in 0..300 {
+            advance_sim_tick().await;
+            let _ = handle2.drain();
+        }
+        handle2.send(C2S::Goodbye);
+        let outcome2 = driver2.await.expect("对照组驱动正常退出");
+        assert_eq!(
+            outcome2.controller_counters.policy_inferences, 0,
+            "default_policy = None 对照组推理计数必须为 0"
+        );
+    }
+
+    /// T-A3 哈希门:default_policy 指向 quad 夹具包,但 SpawnAgent capsule →
+    /// Spawned 照收、policy_inferences == 0、不 panic。
+    #[tokio::test(start_paused = true)]
+    async fn t_a3_hash_gate_skips_capsule() {
+        let policies_dir = tempfile::TempDir::new().expect("policies TempDir");
+        write_fixture_pack(
+            policies_dir.path(),
+            "stand_fix",
+            &quad_hash_hex_from_assets(),
+        );
+        let data = tempfile::TempDir::new().expect("data TempDir");
+
+        let (handle, driver) = spawn_in_current_runtime(local_policy_config(
+            data.path(),
+            policies_dir.path(),
+            Some("stand_fix"),
+        ))
+        .await
+        .expect("spawn_in_current_runtime");
+        wait_for_chunk_0_0(&handle).await;
+        let _entity = spawn_agent_and_wait(&handle, "capsule", Vec3::new(8.5, -59.0, 8.5)).await;
+        for _ in 0..120 {
+            advance_sim_tick().await;
+            let _ = handle.drain();
+        }
+        handle.send(C2S::Goodbye);
+        let outcome = driver.await.expect("驱动正常退出");
+        assert_eq!(
+            outcome.controller_counters.policy_inferences, 0,
+            "capsule 与 quad 策略哈希不匹配,不挂策略 → policy_inferences == 0"
+        );
+        assert_eq!(outcome.controller_counters.policy_errors, 0);
+        assert_eq!(outcome.controller_counters.send_rejected, 0);
+    }
+
+    /// T-A4 附身闭环:attach-on-spawn(quad_gpu1)+ Possess → Possessed(Some);
+    /// AgentIntent move(0.5, 0) 推 120 拍 → 根 +x 位移 > 0;
+    /// Unpossess → Possessed(None);全程 policy_inferences > 0 且 policy_errors == 0。
+    #[tokio::test(start_paused = true)]
+    async fn t_a4_possess_intent_unpossess_loop() {
+        let data = tempfile::TempDir::new().expect("data TempDir");
+        let policies_dir = repo_assets_dir("policies");
+        let (handle, driver) = spawn_in_current_runtime(local_policy_config(
+            data.path(),
+            &policies_dir,
+            Some("quad_gpu1"),
+        ))
+        .await
+        .expect("spawn_in_current_runtime");
+        wait_for_chunk_0_0(&handle).await;
+        let entity = spawn_agent_and_wait(&handle, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+
+        let mut last_x: Option<f32> = None;
+        let drain_states = |h: &LocalHandle, lx: &mut Option<f32>| -> Vec<S2C> {
+            let msgs = h.drain();
+            for m in &msgs {
+                if let S2C::AgentStates { states, .. } = m {
+                    for (id, _, links) in states {
+                        if *id == entity
+                            && let Some(root) = links.first()
+                        {
+                            *lx = Some(root.translation.x);
+                        }
+                    }
+                }
+            }
+            msgs
+        };
+
+        // 先站稳 120 拍。
+        for _ in 0..120 {
+            advance_sim_tick().await;
+            let _ = drain_states(&handle, &mut last_x);
+        }
+
+        // Possess 自己的策略身体 → 收到 Possessed(Some(entity))。
+        handle.send(C2S::Possess { entity });
+        let mut saw_possessed = false;
+        for _ in 0..20 {
+            advance_sim_tick().await;
+            for msg in drain_states(&handle, &mut last_x) {
+                if msg
+                    == (S2C::Possessed {
+                        entity: Some(entity),
+                    })
+                {
+                    saw_possessed = true;
+                }
+            }
+            if saw_possessed {
+                break;
+            }
+        }
+        assert!(saw_possessed, "Possess 后必须收到 Possessed(Some(entity))");
+
+        let start_x = last_x.expect("附身前必已采样到根 x");
+        handle.send(C2S::AgentIntent {
+            entity,
+            move_xz: (0.5, 0.0),
+            yaw: 0.0,
+            jump: false,
+        });
+        for _ in 0..120 {
+            advance_sim_tick().await;
+            let _ = drain_states(&handle, &mut last_x);
+        }
+        let end_x = last_x.expect("行走后必有根 x");
+        let dx = end_x - start_x;
+        assert!(
+            dx > 0.0,
+            "附身 + AgentIntent(0.5, 0) 120 拍后根 +x 位移须 > 0,实测 start={start_x:.4} end={end_x:.4} dx={dx:.4}"
+        );
+
+        // Unpossess → 收到 Possessed(None)。
+        handle.send(C2S::Unpossess);
+        let mut saw_unpossessed = false;
+        for _ in 0..20 {
+            advance_sim_tick().await;
+            for msg in drain_states(&handle, &mut last_x) {
+                if msg == (S2C::Possessed { entity: None }) {
+                    saw_unpossessed = true;
+                }
+            }
+            if saw_unpossessed {
+                break;
+            }
+        }
+        assert!(saw_unpossessed, "Unpossess 后必须收到 Possessed(None)");
+
+        handle.send(C2S::Goodbye);
+        let outcome = driver.await.expect("驱动正常退出");
+        assert!(
+            outcome.controller_counters.policy_inferences > 0,
+            "全程 policy_inferences 须 > 0"
+        );
+        assert_eq!(outcome.controller_counters.policy_errors, 0);
+        assert_eq!(outcome.controller_counters.send_rejected, 0);
+    }
+
+    /// T-A5 恢复:同 data_dir 二次 `spawn_in_current_runtime`(检查点里有策略槽位)→
+    /// 不 fail-stop、继续推理(再推进 120 拍 inferences 增量 > 0)。
+    #[tokio::test(start_paused = true)]
+    async fn t_a5_recovery_keeps_policy_running() {
+        let policies_dir = tempfile::TempDir::new().expect("policies TempDir");
+        write_fixture_pack(
+            policies_dir.path(),
+            "stand_fix",
+            &quad_hash_hex_from_assets(),
+        );
+        let data = tempfile::TempDir::new().expect("data TempDir");
+
+        // 第一段:生成 quad 并挂 default_policy,推 60 拍后直接 Goodbye(不推进新拍)
+        // 使终末检查点包含该主体的 Policy 槽位。
+        let (handle1, driver1) = spawn_in_current_runtime(local_policy_config(
+            data.path(),
+            policies_dir.path(),
+            Some("stand_fix"),
+        ))
+        .await
+        .expect("首段 spawn_in_current_runtime");
+        wait_for_chunk_0_0(&handle1).await;
+        let entity1 = spawn_agent_and_wait(&handle1, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+        for _ in 0..60 {
+            advance_sim_tick().await;
+            let _ = handle1.drain();
+        }
+        handle1.send(C2S::Goodbye);
+        let outcome1 = driver1.await.expect("首段驱动正常退出");
+        assert!(
+            outcome1.controller_counters.policy_inferences > 0,
+            "首段必已有推理"
+        );
+
+        // 核验检查点里确有 Policy(stand_fix) 槽位。
+        {
+            use storage::traits::CheckpointStore as _;
+            let store = storage::redb::RedbStore::open(&data.path().join("checkpoints.redb"))
+                .expect("检查点库可读");
+            let (_, blob) = store.read_latest().expect("读最新").expect("存在检查点");
+            let bundle = driver::decode_checkpoint(&blob).expect("检查点可解");
+            let has_slot = bundle.controllers.iter().any(|r| {
+                r.entity == entity1
+                    && r.slot.kind
+                        == crate::controller::ControllerKind::Policy(
+                            crate::controller::PolicyKey::of("stand_fix"),
+                        )
+            });
+            assert!(has_slot, "终末检查点必须包含 stand_fix 策略槽位");
+        }
+
+        // 第二段:同 data_dir + 同 default_policy 恢复启动 → 不 fail-stop;
+        // 恢复首拍清理断线玩家旧身体后,新连接再生成 quad 并推 120 拍 → inferences > 0。
+        let (handle2, driver2) = spawn_in_current_runtime(local_policy_config(
+            data.path(),
+            policies_dir.path(),
+            Some("stand_fix"),
+        ))
+        .await
+        .expect("恢复启动不得 fail-stop");
+        wait_for_chunk_0_0(&handle2).await;
+        let _entity2 = spawn_agent_and_wait(&handle2, "quad", Vec3::new(8.5, -59.5, 8.5)).await;
+        for _ in 0..120 {
+            advance_sim_tick().await;
+            let _ = handle2.drain();
+        }
+        handle2.send(C2S::Goodbye);
+        let outcome2 = driver2.await.expect("恢复段驱动正常退出");
+        assert!(
+            outcome2.controller_counters.policy_inferences > 0,
+            "恢复段推 120 拍后 inferences 须 > 0,实测 {}",
+            outcome2.controller_counters.policy_inferences
+        );
+        assert_eq!(outcome2.controller_counters.policy_errors, 0);
+        assert_eq!(outcome2.controller_counters.send_rejected, 0);
+    }
+
+    /// T-A6 fail-stop:default_policy 指不存在的包 → bootstrap Err;
+    /// 包 body_hash 与注册表任何身体都不匹配 → Err(消息含策略名)。
+    #[test]
+    fn t_a6_fail_stop_missing_or_mismatched_default_policy() {
+        let policies_dir = tempfile::TempDir::new().expect("policies TempDir");
+        let data1 = tempfile::TempDir::new().expect("data1 TempDir");
+        let cfg_missing =
+            local_policy_config(data1.path(), policies_dir.path(), Some("no_such_pack"));
+        let err1 = match driver::bootstrap(&cfg_missing.config, || {
+            Box::new(voxel::SimpleRegistry::builtin())
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("不存在的 default_policy 包必须 fail-stop"),
+        };
+        let msg1 = format!("{err1}");
+        assert!(
+            msg1.contains("no_such_pack"),
+            "错误消息须含策略名 no_such_pack,实际:{msg1}"
+        );
+
+        write_fixture_pack(policies_dir.path(), "bad_hash_pack", "0000000000000000");
+        let data2 = tempfile::TempDir::new().expect("data2 TempDir");
+        let cfg_mismatch =
+            local_policy_config(data2.path(), policies_dir.path(), Some("bad_hash_pack"));
+        let err2 = match driver::bootstrap(&cfg_mismatch.config, || {
+            Box::new(voxel::SimpleRegistry::builtin())
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("body_hash 无匹配身体的 default_policy 必须 fail-stop"),
+        };
+        let msg2 = format!("{err2}");
+        assert!(
+            msg2.contains("bad_hash_pack") && msg2.contains("0000000000000000"),
+            "错误消息须含策略名与 body_hash,实际:{msg2}"
+        );
+    }
 }

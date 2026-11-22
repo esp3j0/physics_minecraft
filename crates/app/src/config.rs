@@ -294,6 +294,11 @@ pub struct Config {
     /// `[[agents]]` 的 policy 名加载 `<policies_dir>/<名>`。相对路径的
     /// 基准与 `bodies_dir` 相同。
     pub policies_dir: PathBuf,
+    /// 默认策略名(REQ-013 §3.2a, C03-2):经 `C2S::SpawnAgent`(含重生路径)生成的
+    /// 主体,若该策略 manifest 的 `body_hash` 与生成身体哈希一致,则生成被接受时
+    /// 挂策略控制者;不一致(如 capsule)不挂、生成照常。名字只许 `[A-Za-z0-9_-]`,
+    /// 长度 1–64;默认 `None`。
+    pub default_policy: Option<String>,
     /// 策略推理每拍等待预算(微秒;REQ-012 D01b-2 §1.4,AC-D3):到了控制拍
     /// 发出推理请求后,最多等回复这么久;超时沿用上次目标并记遥测。默认
     /// 2000,范围 `0..=1_000_000`,越界 = 配置错误。
@@ -332,6 +337,7 @@ impl Default for Config {
             world_kind: WorldKind::Superflat,
             bodies_dir: PathBuf::from("assets/bodies"),
             policies_dir: PathBuf::from("assets/policies"),
+            default_policy: None,
             policy_wait_budget_us: 2000,
             policy_debug_delay_ms: 0,
             listen_addr: "127.0.0.1:25565".to_string(),
@@ -601,6 +607,19 @@ impl Config {
                 return Err(ConfigError::StartupAgent(format!(
                     "第 {idx} 条 [[agents]]:intent {:?} 每项须有限且绝对值 ≤ 1",
                     a.intent
+                )));
+            }
+        }
+        // 默认策略名(REQ-013 §3.2a, C03-2):与 startup policy 名同字符集与长度。
+        if let Some(name) = &self.default_policy {
+            let ok = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !ok {
+                return Err(ConfigError::Validate(format!(
+                    "default_policy 名 {name:?} 只许 [A-Za-z0-9_-]、长度 1–64"
                 )));
             }
         }
@@ -1947,5 +1966,39 @@ unload_radius = 64
         let err = Config::from_toml_str("policy_debug_delay_ms = 1001\n").expect_err("越界拒绝");
         assert!(matches!(err, ConfigError::Validate(_)), "{err:?}");
         assert!(format!("{err}").contains("policy_debug_delay_ms"), "{err}");
+    }
+
+    /// T-A1(C03-2):`default_policy` 缺省 None;合法名/64 字符过;
+    /// `../x`、`a b`、空串、65 字符拒(`ConfigError::Validate`,消息含 `default_policy`)。
+    #[test]
+    fn t_a1_default_policy_config_validation() {
+        assert_eq!(Config::default().default_policy, None, "Default 缺省 None");
+        let empty = Config::from_toml_str("").expect("空串全默认");
+        assert_eq!(empty.default_policy, None, "toml 缺省 None");
+
+        let ok = Config::from_toml_str("default_policy = \"quad_gpu1\"\n").expect("合法名通过");
+        assert_eq!(ok.default_policy.as_deref(), Some("quad_gpu1"));
+        let back = Config::from_toml_str(&ok.to_toml_string()).expect("roundtrip 可解析");
+        assert_eq!(back, ok, "default_policy roundtrip 无损");
+
+        let ok64 = "a".repeat(64);
+        let c64 = Config::from_toml_str(&format!("default_policy = \"{ok64}\"\n"))
+            .expect("64 字符边界通过");
+        assert_eq!(c64.default_policy.as_deref(), Some(ok64.as_str()));
+        Config::from_toml_str("default_policy = \"A_z-9\"\n").expect("混合合法字符集通过");
+
+        let long65 = "a".repeat(65);
+        for bad in ["../x", "a b", "", long65.as_str()] {
+            let err = Config::from_toml_str(&format!("default_policy = \"{bad}\"\n"))
+                .expect_err("非法 default_policy 名必须拒绝");
+            assert!(
+                matches!(err, ConfigError::Validate(_)),
+                "应返回 ConfigError::Validate,实际:{err:?}"
+            );
+            assert!(
+                format!("{err}").contains("default_policy"),
+                "错误消息须含 default_policy,实际:{err}"
+            );
+        }
     }
 }

@@ -112,7 +112,7 @@ pub enum Action {
         hud: bool,
     },
     /// 主体生成(A06 §4):发 `SpawnAgent`(body 固定 capsule 资产——viewer
-    /// 冒烟统一用玩家胶囊;`at` = 出生位置),收到 `Spawned` 后登记标签。
+    /// 冒烟统一用玩家胶囊;`at` = 出生位置,`yaw` 度(引擎出口转弧度,与相机同约定)),收到 `Spawned` 后登记标签。
     /// 一个场景最多一个身体(放行 §4;第二条 spawn_agent = 解析错误)。
     SpawnAgent {
         at: Vec3,
@@ -334,7 +334,7 @@ pub enum EngineCommand {
         pos: BlockPos,
         block: BlockId,
     },
-    /// 主体生成(A06 §4;发送层转 `C2S::SpawnAgent`,逐条不混批)。
+    /// 主体生成(A06 §4;发送层转 `C2S::SpawnAgent`,逐条不混批;yaw 弧度)。
     SpawnAgent {
         position: Vec3,
         yaw: f32,
@@ -345,7 +345,7 @@ pub enum EngineCommand {
     },
     /// 解除附身(A06 §4;发送层转 `C2S::Unpossess`)。
     Unpossess,
-    /// 主体意图(A06 §4;发送层转 `C2S::AgentIntent`;move_xz 世界系)。
+    /// 主体意图(A06 §4;发送层转 `C2S::AgentIntent`;move_xz 世界系;yaw 弧度)。
     AgentIntent {
         entity: EntityId,
         move_xz: (f32, f32),

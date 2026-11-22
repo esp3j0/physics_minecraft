@@ -141,7 +141,8 @@ fn t6a_p_with_bigger_foreign_agent_spawns_and_possesses_own() {
         cmds,
         vec![PossessCommand::SpawnAgent {
             position: Vec3::new(8.0, -57.0, 24.0),
-            yaw: 45.0,
+            // R2 度→弧度修复,架构师批准期望更新
+            yaw: std::f32::consts::FRAC_PI_4,
         }],
         "视野里有别人的主体,按 P 仍发 SpawnAgent"
     );
@@ -715,4 +716,53 @@ fn ms19_to_c2s_all_variants() {
         "Intent 有附身实体时映射为 C2S::AgentIntent"
     );
     assert_eq!(to_c2s(&intent, None), None, "Intent 无附身实体时丢弃(None)");
+}
+
+/// W4(C03-2 R2):`on_keys` 将 `yaw_deg`(度)转弧度写入 `PossessCommand::Intent.yaw`。
+#[test]
+fn on_keys_intent_yaw_degrees_to_radians() {
+    let mut st = PossessState::new();
+    st.on_possessed(Some(agent_id(1)));
+
+    let cmds1 = st.on_keys(&keys(true, false, false, false, false), 90.0, t(0));
+    assert_eq!(cmds1.len(), 1, "首帧按 W 应发一条 Intent");
+    match &cmds1[0] {
+        PossessCommand::Intent { yaw, .. } => {
+            assert!(
+                (*yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6,
+                "yaw_deg 90° 应转 π/2,实得 {yaw}"
+            );
+        }
+        other => panic!("应为 Intent,实为 {other:?}"),
+    }
+
+    let cmds2 = st.on_keys(&keys(true, false, false, false, false), -90.0, t(100));
+    assert_eq!(cmds2.len(), 1, "隔 >= 50 ms 节流窗换向应发一条 Intent");
+    match &cmds2[0] {
+        PossessCommand::Intent { yaw, .. } => {
+            assert!(
+                (*yaw - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6,
+                "yaw_deg -90° 应转 -π/2,实得 {yaw}"
+            );
+        }
+        other => panic!("应为 Intent,实为 {other:?}"),
+    }
+}
+
+/// W4(C03-2 R2):`on_p_pressed` 将 `spawn_target` 中的 yaw(度)转弧度写入 `PossessCommand::SpawnAgent.yaw`。
+#[test]
+fn on_p_pressed_spawn_yaw_degrees_to_radians() {
+    let mut st = PossessState::new();
+    assert_eq!(st.phase(), Phase::NoBody);
+    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 90.0)), t(0));
+    assert_eq!(cmds.len(), 1, "NoBody 按 P 应发一条 SpawnAgent");
+    match &cmds[0] {
+        PossessCommand::SpawnAgent { yaw, .. } => {
+            assert!(
+                (*yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6,
+                "spawn_target yaw 90° 应转 π/2,实得 {yaw}"
+            );
+        }
+        other => panic!("应为 SpawnAgent,实为 {other:?}"),
+    }
 }

@@ -93,13 +93,13 @@ pub fn intent_from_keys(keys: &Keys, yaw_deg: f32) -> (f32, f32) {
 /// 附身状态机的命令(渲染层转发给 [`crate::client::ControlHandle`])。
 #[derive(Debug, Clone, PartialEq)]
 pub enum PossessCommand {
-    /// 生成身体(`P` 在屏幕中心拾取的地面格顶面上方;朝向 = 相机水平朝向)。
+    /// 生成身体(`P` 在屏幕中心拾取的地面格顶面上方;朝向 = 相机水平朝向;yaw 弧度)。
     SpawnAgent { position: Vec3, yaw: f32 },
     /// 附身某实体(自动:自己的身体出现在主体流;手动:P 有身体未附身)。
     Possess(EntityId),
     /// 解除附身(已附身时按 P)。
     Unpossess,
-    /// 主体意图(保持状态;有变化才发,节流 50 ms;跳跃立即发)。
+    /// 主体意图(保持状态;有变化才发,节流 50 ms;跳跃立即发;yaw 弧度)。
     Intent {
         move_xz: (f32, f32),
         yaw: f32,
@@ -301,7 +301,7 @@ impl PossessState {
         }
     }
 
-    /// `P` 按下沿(R1 §3.2 转移表):
+    /// `P` 按下沿(R1 §3.2 转移表;`spawn_target` 中 yaw 度):
     /// - `NoBody` + 有 spawn_target → 发 SpawnAgent、`auto_possess = true`、
     ///   → `SpawnRequested`;
     /// - `HasBody` → 发 Possess(my_body)、→ `PossessRequested`;
@@ -318,7 +318,10 @@ impl PossessState {
                     self.auto_possess = true;
                     self.requested_at = Some(now);
                     self.phase = Phase::SpawnRequested;
-                    vec![PossessCommand::SpawnAgent { position, yaw }]
+                    vec![PossessCommand::SpawnAgent {
+                        position,
+                        yaw: yaw.to_radians(),
+                    }]
                 }
                 None => Vec::new(),
             },
@@ -361,7 +364,7 @@ impl PossessState {
         if (changed && throttled_ok) || jump_now {
             let command = PossessCommand::Intent {
                 move_xz: intent,
-                yaw: yaw_deg,
+                yaw: yaw_deg.to_radians(),
                 jump: jump_now,
             };
             self.last_intent = Some((intent, yaw_deg));

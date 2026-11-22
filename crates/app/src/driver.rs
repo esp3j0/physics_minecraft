@@ -885,6 +885,11 @@ pub struct ObserveOrchestrator {
     /// 主体遥测计数(A03 §6;驱动内存,放 DriverOutcome,不改 DebugCounters
     /// ——bincode 协议结构,加字段破坏兼容)。
     agent_counters: AgentCounters,
+    /// 默认策略挂载元数据(REQ-013 §3.2a, C03-2):`(key, body_hash, dof, period)`。
+    default_policy: Option<(crate::controller::PolicyKey, types::BodyHash, usize, u32)>,
+    /// `C2S::SpawnAgent`(含重生)接受后待挂载默认策略的主体队列;
+    /// 驱动每拍循环在 `startup.poll` 之后、`drive_policies` 之前按 EntityId 升序排空。
+    pending_policy_attach: Vec<(types::EntityId, crate::controller::PolicyKey)>,
     /// 节奏副本(输出点用)。
     _cadence: ObserveCadence,
 }
@@ -1050,7 +1055,49 @@ impl ObserveOrchestrator {
             pending_intents: BTreeMap::new(),
             saved_intent: BTreeMap::new(),
             agent_counters: AgentCounters::default(),
+            default_policy: None,
+            pending_policy_attach: Vec::new(),
             _cadence: cadence,
+        }
+    }
+
+    /// 注入默认策略挂载元数据(REQ-013 §3.2a, C03-2)。
+    pub fn with_default_policy(
+        mut self,
+        default_policy: Option<(crate::controller::PolicyKey, types::BodyHash, usize, u32)>,
+    ) -> Self {
+        self.default_policy = default_policy;
+        self
+    }
+
+    /// 按 EntityId 升序排空待挂载默认策略列表(REQ-013 §3.2a, C03-2):
+    /// `attached_at = now.next()` 照 startup 的 B03a X1 口径;`leash = None`。
+    /// `host.attach` 失败 = 编程错误,fail-stop panic。
+    fn drain_pending_policy_attach(
+        &mut self,
+        host: &mut crate::controller::ControllerHost,
+        now: types::Tick,
+    ) {
+        if self.pending_policy_attach.is_empty() {
+            return;
+        }
+        let (_, _, dof, period) = self
+            .default_policy
+            .expect("pending_policy_attach 非空时 default_policy 必为 Some(fail-stop)");
+        let mut pending = std::mem::take(&mut self.pending_policy_attach);
+        pending.sort_by_key(|(entity, _)| *entity);
+        for (entity, key) in pending {
+            if let Err(err) = host.attach(
+                entity,
+                crate::controller::ControllerKind::Policy(key),
+                dof,
+                period,
+                now.next(),
+                None,
+            ) {
+                panic!("默认策略挂载失败(实体 {entity:?}, 原因:{err})(fail-stop)");
+            }
+            host.set_intent(entity, [0.0; 3]);
         }
     }
 
@@ -1217,6 +1264,11 @@ impl ObserveOrchestrator {
                         body: body_name,
                     },
                 );
+                if let Some((key, policy_body_hash, _, _)) = self.default_policy
+                    && policy_body_hash == body_hash
+                {
+                    self.pending_policy_attach.push((entity, key));
+                }
                 hub.push_critical(player, S2C::Spawned { entity });
                 return Some(entity);
             }
@@ -2585,6 +2637,25 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // D01b-2(AC-D3):整张策略表交给工作线程;startup 挂载只读 meta 快照
     // (裁定方案 2)。键校验已在 load_policy_table(交出所有权前)做完。
     let policy_meta = policy_table.meta();
+    // C03-2(REQ-013 §3.2a):构造期从 policy_table/policy_meta + bodies 解析
+    // default_policy 挂载元数据,移交表给工作线程前抽取。
+    let default_policy_meta: Option<(crate::controller::PolicyKey, types::BodyHash, usize, u32)> =
+        config.default_policy.as_deref().map(|name| {
+            let key = crate::controller::PolicyKey::of(name);
+            let entry = policy_table
+                .get(key)
+                .expect("default_policy 必已在 load_policy_table 加载(fail-stop)");
+            let manifest_hash = entry.policy.manifest().body_hash.as_str();
+            let body_hash = bodies
+                .hashes()
+                .into_iter()
+                .find(|h| h.hex() == manifest_hash)
+                .expect("default_policy body_hash 必在身体注册表中(fail-stop)");
+            let meta = policy_meta
+                .get(&key)
+                .expect("default_policy 元数据必在 policy_meta 中(fail-stop)");
+            (key, body_hash, meta.dof, meta.control_period_ticks)
+        });
     let mut policy_worker = crate::controller::policy_worker::PolicyWorker::spawn(
         policy_table,
         crate::controller::policy_worker::WorkerOptions {
@@ -2634,7 +2705,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     // 第 ⑤ 步);None = 无网络,编排整体关闭(既有行为不变)。
     let mut observe_state = observe.map(|link| {
         (
-            ObserveOrchestrator::with_bodies(link.cadence, spawn_next_seq, bodies),
+            ObserveOrchestrator::with_bodies(link.cadence, spawn_next_seq, bodies)
+                .with_default_policy(default_policy_meta),
             link.up,
             link.hub,
             link.cadence,
@@ -2719,6 +2791,11 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     },
                     now,
                 );
+                // C03-2(REQ-013 §3.2a):排空 C2S::SpawnAgent(含重生)待挂载默认策略,
+                // 在 startup.poll 之后、drive_policies 之前按 EntityId 升序挂上。
+                if let Some((orchestrator, ..)) = observe_state.as_mut() {
+                    orchestrator.drain_pending_policy_attach(&mut host, now);
+                }
                 // B03a 2.1:本拍迁移在途的主体集合(无挂载时不调 Session;
                 // 有挂载时取一次传给 drive 与拍末 retain_alive 共用)。
                 // B03c 3.2:同口径取已冻结的主体集合,drive 跳过不发目标。
@@ -3282,6 +3359,32 @@ pub fn load_policy_table(
         table
             .load(&config.policies_dir, name, def)
             .map_err(|e| ConfigError::StartupAgent(format!("第 {idx} 条 [[agents]]:{e}")))?;
+    }
+    if let Some(name) = config.default_policy.as_deref() {
+        let toml_path = config.policies_dir.join(name).join("policy.toml");
+        let text = std::fs::read_to_string(&toml_path).map_err(|e| {
+            ConfigError::Validate(format!(
+                "default_policy 策略 {name}:读取 {} 失败:{e}",
+                toml_path.display()
+            ))
+        })?;
+        let manifest = policy::PolicyManifest::from_toml_str(&text)
+            .map_err(|e| ConfigError::Validate(format!("default_policy 策略 {name}:{e}")))?;
+        let matched_def = bodies
+            .hashes()
+            .into_iter()
+            .filter_map(|h| bodies.get(&h))
+            .find(|def| def.hash().hex() == manifest.body_hash);
+        let Some(def) = matched_def else {
+            return Err(ConfigError::Validate(format!(
+                "default_policy 策略 \"{name}\" 的 body_hash ({}) 在身体注册表中无匹配身体",
+                manifest.body_hash
+            ))
+            .into());
+        };
+        table
+            .load(&config.policies_dir, name, def)
+            .map_err(|e| ConfigError::Validate(format!("default_policy:{e}")))?;
     }
     if let Some(records) = resume_controllers {
         for record in records {

@@ -1662,3 +1662,61 @@ fn ms22_script_place_then_dig_tool_actions() {
     );
     assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
 }
+
+/// W4(C03-2 R2):脚本 `spawn_agent` 与 `intent` 的 `yaw`(度)在引擎出口转弧度。
+#[test]
+fn spawn_and_intent_yaw_degrees_to_radians() {
+    use crate::script::EngineCommand;
+
+    let mut e = engine(
+        "[[step]]
+spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }
+[[step]]
+possess = { label = \"p\" }
+[[step]]
+intent = { move = [0.3, 0.0], yaw = 25.0, jump = false }
+[[step]]
+intent = { move = [0.3, 0.0], yaw = -90.0, jump = false }",
+    );
+
+    let w = FlatWorld::default();
+    let out1 = frame(&mut e, 0.016, 0, &w, &[]);
+    assert_eq!(out1.commands.len(), 1, "首帧应只发 SpawnAgent");
+    match &out1.commands[0] {
+        EngineCommand::SpawnAgent { yaw, .. } => {
+            assert!(
+                (*yaw - std::f32::consts::FRAC_PI_2).abs() < 1e-6,
+                "spawn_agent yaw 90° 应转 π/2,实得 {yaw}"
+            );
+        }
+        other => panic!("首帧应为 SpawnAgent,实得 {other:?}"),
+    }
+
+    let mut w = FlatWorld::with_entities(&[]);
+    w.agent = Some((eid(7), Vec3::new(8.0, -57.0, 24.0)));
+    let out2 = frame(&mut e, 0.016, 1, &w, &[eid(7)]);
+    let intents: Vec<f32> = out2
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            EngineCommand::AgentIntent { yaw, .. } => Some(*yaw),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        intents.len(),
+        2,
+        "回执后 possess 接两条 intent 应产出两条 AgentIntent,实得 {:?}",
+        out2.commands
+    );
+    assert!(
+        (intents[0] - 0.4363323).abs() < 1e-6,
+        "intent yaw 25° 应转 0.4363323 rad,实得 {}",
+        intents[0]
+    );
+    assert!(
+        (intents[1] - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6,
+        "intent yaw -90° 应转 -π/2,实得 {}",
+        intents[1]
+    );
+}

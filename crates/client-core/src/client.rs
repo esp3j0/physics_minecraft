@@ -111,7 +111,7 @@ pub enum Control {
     /// 解除附身(A06 §2;连接循环发 `C2S::Unpossess`)。
     Unpossess,
     /// 主体意图(A06 §2;连接循环发 `C2S::AgentIntent`;move_xz 为**世界系**
-    /// 水平速度)。
+    /// 水平速度;yaw 弧度)。
     AgentIntent {
         entity: EntityId,
         move_xz: (f32, f32),

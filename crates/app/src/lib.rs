@@ -18,3 +18,6 @@ pub mod net;
 pub mod respawn;
 pub mod startup_agents;
 pub mod telemetry;
+
+#[cfg(test)]
+mod dual_path;

@@ -123,8 +123,9 @@ wait_until = { agent_moved = { label = "dog", ge = 2.0 }, hold_ticks = 60, timeo
 check = { agent_alive = { label = "dog" } }
 
 [[step]]
-label = "不再持续侧移(z 带 [24.9,26.8])+ 站立高度带"
-check = { agent_in = { label = "dog", from = [33.0, -59.95, 24.9], to = [46.0, -59.55, 26.8] } }
+label = "不再持续侧移(z 带 [24.9,27.6])+ 站立高度带"
+# R2:yaw 度→弧度修复后 25.0 才是真 +25°,侧移 ≈ +1.7 m;z 上限 26.8 → 27.6(架构师标定)。
+check = { agent_in = { label = "dog", from = [33.0, -59.95, 24.9], to = [46.0, -59.55, 27.6] } }
 
 [[step]]
 screenshot = { name = "resumed", expect = "品红色四足在棕色平地上朝 +x 方向行走,躯干水平,四条腿在身体下方,没有侧翻。" }

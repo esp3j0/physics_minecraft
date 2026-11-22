@@ -678,8 +678,10 @@ impl EngineInner {
                     };
                     let emitted = matches!(self.wait, Some(WaitState::Spawn { emitted: true, .. }));
                     if !emitted {
-                        out.commands
-                            .push(EngineCommand::SpawnAgent { position: at, yaw });
+                        out.commands.push(EngineCommand::SpawnAgent {
+                            position: at,
+                            yaw: yaw.to_radians(),
+                        });
                         self.spawn_requests.push_back(SpawnKind::Agent {
                             label: label.clone(),
                         });
@@ -898,7 +900,7 @@ impl EngineInner {
                         out.commands.push(EngineCommand::AgentIntent {
                             entity,
                             move_xz: mv,
-                            yaw,
+                            yaw: yaw.to_radians(),
                             jump,
                         });
                     }
