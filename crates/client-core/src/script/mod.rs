@@ -356,6 +356,85 @@ pub enum EngineCommand {
     ToolAction(crate::tools::ToolAction),
 }
 
+/// 将引擎或交互工具产出的 [`EngineCommand`] 列表翻译为 [`sim_api::proto::C2S`] 序列
+/// (REQ-013 C04 §1.4:渲染客户端与 headless 对账共用同一映射;SetBlock/Detonate/ToolAction
+/// 攒 batch,非 batch 命令前按序 flush)。
+pub fn engine_commands_to_c2s(commands: &[EngineCommand]) -> Vec<sim_api::proto::C2S> {
+    use messaging::SimCommand;
+    use sim_api::proto::C2S;
+
+    use crate::tools::ToolAction;
+
+    let mut batch: Vec<SimCommand> = Vec::new();
+    let mut out: Vec<C2S> = Vec::new();
+    let flush_batch = |batch: &mut Vec<SimCommand>, out: &mut Vec<C2S>| {
+        for sim_cmd in batch.drain(..) {
+            out.push(C2S::Command(sim_cmd));
+        }
+    };
+    for command in commands {
+        match command {
+            EngineCommand::Spawn { state, desc } => {
+                flush_batch(&mut batch, &mut out);
+                out.push(C2S::Spawn {
+                    state: *state,
+                    desc: desc.clone(),
+                });
+            }
+            EngineCommand::SpawnAgent { position, yaw } => {
+                flush_batch(&mut batch, &mut out);
+                out.push(C2S::SpawnAgent {
+                    body: "capsule".to_owned(),
+                    position: *position,
+                    yaw: *yaw,
+                });
+            }
+            EngineCommand::Possess { entity } => {
+                flush_batch(&mut batch, &mut out);
+                out.push(C2S::Possess { entity: *entity });
+            }
+            EngineCommand::Unpossess => {
+                flush_batch(&mut batch, &mut out);
+                out.push(C2S::Unpossess);
+            }
+            EngineCommand::AgentIntent {
+                entity,
+                move_xz,
+                yaw,
+                jump,
+            } => {
+                flush_batch(&mut batch, &mut out);
+                out.push(C2S::AgentIntent {
+                    entity: *entity,
+                    move_xz: *move_xz,
+                    yaw: *yaw,
+                    jump: *jump,
+                });
+            }
+            EngineCommand::Detonate {
+                center,
+                power,
+                radius,
+            } => batch.push(SimCommand::Detonate {
+                center: *center,
+                power: *power,
+                radius: *radius,
+            }),
+            EngineCommand::SetBlock { pos, block } => batch.push(SimCommand::SetBlock {
+                pos: *pos,
+                block: *block,
+            }),
+            EngineCommand::ToolAction(action) => match action {
+                ToolAction::Single(sim_cmd) => batch.push(sim_cmd.clone()),
+                ToolAction::Batch(sim_cmds) => batch.extend(sim_cmds.iter().cloned()),
+                ToolAction::Rejected(_) => {}
+            },
+        }
+    }
+    flush_batch(&mut batch, &mut out);
+    out
+}
+
 /// `fill` 单步格数上限(REQ-009 §10)。
 pub const FILL_MAX_CELLS: usize = 4096;
 /// `fill` 每帧最多发出的 `SetBlock` 条数(服务器分片收件箱每拍 256 条,REQ-009 §10)。

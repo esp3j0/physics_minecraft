@@ -1927,6 +1927,16 @@ impl ObserveOrchestrator {
                 // 断连由 Left 分支移除。不发任何回执帧。
                 self.debug_subscribers.insert(player);
             }
+            NetUp::Ack { player, seq } => {
+                // 带序号输入确认(REQ-013 C04):World 级 FIFO,拍号取当前已完成拍。
+                hub.push_world(
+                    player,
+                    S2C::InputAck {
+                        seq,
+                        tick: session.tick_now(),
+                    },
+                );
+            }
             NetUp::DriverCommand { player, cmd } => match cmd {
                 DriverCommand::MoveObserver { position } => {
                     // REQ-012 A03 §5(AC-A7):附身期间该连接的 MoveObserver

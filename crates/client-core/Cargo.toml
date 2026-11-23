@@ -16,6 +16,8 @@ serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+# 只为并入 test-util feature(start_paused 确定性对账测试),cargo 会与上面合并。
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

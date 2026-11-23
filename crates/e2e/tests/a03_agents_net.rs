@@ -1670,3 +1670,55 @@ async fn a03_4b_player_body_check_uses_is_agent_not_actor() {
         "断线只移除玩家身体(1),方块不算"
     );
 }
+
+// ===========================================================================
+// C04 T8:TCP 路径 Sequenced → Pong + InputAck
+// ===========================================================================
+
+/// C04 T8:TCP 连接订阅后发 `Sequenced { seq: 42, inner: Ping }` →
+/// 收到 `Pong` 与 `InputAck { seq: 42, .. }`(tick 任意有限值)。
+#[tokio::test(start_paused = true)]
+async fn c04_t8_tcp_sequenced_ping_ack() {
+    let h = harness(base_config(), (2, 60)).await;
+    let (mut c, mut rx) = client(h.addr).await;
+    tokio::task::yield_now().await;
+    let _p = join(&mut c, &mut rx, 4).await;
+
+    c.send(&C2S::Sequenced {
+        seq: 42,
+        inner: Box::new(C2S::Ping),
+    })
+    .await
+    .expect("Sequenced(Ping) 写入");
+
+    let mut got_pong = false;
+    let mut got_ack = None;
+    for _ in 0..200 {
+        advance_ticks(1).await;
+        for _ in 0..16 {
+            match next_frame(&mut rx).await {
+                Some(S2C::Pong) => got_pong = true,
+                Some(S2C::InputAck { seq: 42, tick }) => got_ack = Some(tick),
+                Some(_) => {}
+                None => {
+                    real_yield();
+                    break;
+                }
+            }
+            if got_pong && got_ack.is_some() {
+                break;
+            }
+        }
+        if got_pong && got_ack.is_some() {
+            break;
+        }
+    }
+
+    assert!(got_pong, "TCP 路径发 Sequenced(42, Ping) 必须收到 Pong");
+    assert!(
+        got_ack.is_some(),
+        "TCP 路径发 Sequenced(42, Ping) 必须收到 InputAck(seq=42)"
+    );
+
+    let _outcome = shutdown(h).await;
+}

@@ -88,9 +88,9 @@ impl LocalHost {
 
 /// 在当前 tokio runtime 内完成宿主装配并 `tokio::spawn` 驱动任务。
 ///
-/// 生产路径([`LocalHost::spawn`])与暂停时钟确定性测试共享同一套装配逻辑,
-/// 零代码分叉。
-pub(crate) async fn spawn_in_current_runtime(
+/// headless / 暂停时钟入口(供确定性测试与双传输对账使用);生产路径([`LocalHost::spawn`])
+/// 与暂停时钟测试共享同一套装配逻辑,零代码分叉。
+pub async fn spawn_in_current_runtime(
     cfg: LocalConfig,
 ) -> Result<(LocalHandle, tokio::task::JoinHandle<DriverOutcome>), AppError> {
     let view_distance = cfg.view_distance.min(VIEW_DISTANCE_MAX);
@@ -191,7 +191,17 @@ impl LocalHandle {
             return;
         }
 
-        match translate(LOCAL_PLAYER, c2s) {
+        let (seqs, outcome) = crate::net::unwrap_sequenced(translate(LOCAL_PLAYER, c2s));
+        if !matches!(outcome, TranslateOutcome::Reject(_)) {
+            for seq in seqs {
+                let _ = self.up_tx.try_send(NetUp::Ack {
+                    player: LOCAL_PLAYER,
+                    seq,
+                });
+            }
+        }
+
+        match outcome {
             TranslateOutcome::Hello => {}
             TranslateOutcome::Subscribe(view_distance) => {
                 let vd = view_distance.min(VIEW_DISTANCE_MAX);
@@ -250,6 +260,9 @@ impl LocalHandle {
             }
             TranslateOutcome::Reject(why) => {
                 self.disconnect_locked(&mut state, DisconnectReason::ProtocolViolation(why), false);
+            }
+            TranslateOutcome::Sequenced { .. } => {
+                unreachable!("unwrap_sequenced 已剥尽 Sequenced 层")
             }
         }
     }
@@ -1175,5 +1188,260 @@ mod tests {
             record.slot.attached_at, first_tick,
             "attached_at 应为 Spawned 后首个 AgentStates 拍(first={first_tick:?})"
         );
+    }
+
+    // ---- REQ-013 C04 单测(T2 / T3 / T4,按 R1 修订裁定) -------------------------
+
+    /// C04 T2:local spawn 自动订阅(无需 Subscribe);推进 10 次(每次 drain 弃)后发
+    /// `Sequenced{7, Ping}`,再推进 1 次 → drain 含 `InputAck{seq:7, tick:Tick(11)}`,
+    /// 且 `Pong` 先于 `InputAck`。
+    #[tokio::test(start_paused = true)]
+    async fn c04_t2_sequenced_ping_ack_tick_and_priority() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let (handle, driver) = spawn_in_current_runtime(local_test_config(tmp.path(), 2))
+            .await
+            .expect("spawn_in_current_runtime");
+        // 让 driver_task 在 t=0 初始化 ticker 并吃掉首枚立即 tick,使推进 K 次与迭代 K 对齐。
+        tokio::task::yield_now().await;
+
+        for _ in 0..10 {
+            tokio::time::advance(Duration::from_millis(17)).await;
+            tokio::task::yield_now().await;
+            let _ = handle.drain();
+        }
+
+        handle.send(C2S::Sequenced {
+            seq: 7,
+            inner: Box::new(C2S::Ping),
+        });
+
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        let batch = handle.drain();
+
+        let pong_idx = batch
+            .iter()
+            .position(|m| matches!(m, S2C::Pong))
+            .expect("第 11 拍 batch 必含 Pong");
+        let ack_idx = batch
+            .iter()
+            .position(|m| {
+                matches!(
+                    m,
+                    S2C::InputAck {
+                        seq: 7,
+                        tick: Tick(11)
+                    }
+                )
+            })
+            .unwrap_or_else(|| panic!("第 11 拍 batch 必含 InputAck(7, Tick(11)),实际:{batch:?}"));
+        assert!(
+            pong_idx < ack_idx,
+            "Pong(Critical) 必须先于 InputAck(World),实际 pong_idx={pong_idx}, ack_idx={ack_idx}"
+        );
+
+        handle.send(C2S::Goodbye);
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        driver.await.expect("驱动正常退出");
+    }
+
+    /// C04 T3(R1 修订):MoveObserver 裸发 + 推进至 ChunkData(0,0) 后:
+    /// 1) 发 `Sequenced{3, SpawnAgent capsule}` 推进 1 次 → 同批 `Spawned` 先于
+    ///    `InputAck{3}`(Critical 先 World),且 `ack.tick == 同批 EntityStates.tick`;
+    /// 2) 发 `Sequenced{4, Command(SetBlock(0,-60,0,STONE))}`:
+    ///    - 推进第 1 次批含 `InputAck{4}` 且不含该格 `BlockUpdates`;
+    ///    - 推进第 2 次批含该格 `BlockUpdates`,且 `ack.tick + 1 == 该批 EntityStates.tick`。
+    #[tokio::test(start_paused = true)]
+    async fn c04_t3_sequenced_spawn_agent_and_set_block_ordering() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let cfg = LocalConfig {
+            config: Config {
+                data_dir: tmp.path().to_path_buf(),
+                bodies_dir: repo_assets_dir("bodies"),
+                policies_dir: tmp.path().join("policies"),
+                ..Config::default()
+            },
+            view_distance: 2,
+        };
+        let (handle, driver) = spawn_in_current_runtime(cfg)
+            .await
+            .expect("spawn_in_current_runtime");
+
+        handle.send(C2S::MoveObserver {
+            position: Vec3::new(8.0, -60.0, 8.0),
+        });
+        let mut saw_chunk = false;
+        for _ in 0..200 {
+            tokio::time::advance(Duration::from_millis(17)).await;
+            tokio::task::yield_now().await;
+            for msg in handle.drain() {
+                if matches!(msg, S2C::ChunkData { pos, .. } if pos == ChunkPos::new(0, 0)) {
+                    saw_chunk = true;
+                }
+            }
+            if saw_chunk {
+                break;
+            }
+        }
+        assert!(saw_chunk, "200 拍内必须收到 ChunkData(0,0)");
+
+        // 1) Sequenced{3, SpawnAgent capsule}
+        handle.send(C2S::Sequenced {
+            seq: 3,
+            inner: Box::new(C2S::SpawnAgent {
+                body: "capsule".to_owned(),
+                position: Vec3::new(8.5, -59.5, 8.5),
+                yaw: 0.0,
+            }),
+        });
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        let spawn_batch = handle.drain();
+
+        let spawned_idx = spawn_batch
+            .iter()
+            .position(|m| matches!(m, S2C::Spawned { .. }))
+            .unwrap_or_else(|| panic!("同批必含 Spawned,实际:{spawn_batch:?}"));
+        let (ack3_idx, ack3_tick) = spawn_batch
+            .iter()
+            .enumerate()
+            .find_map(|(i, m)| match m {
+                S2C::InputAck { seq: 3, tick } => Some((i, *tick)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("同批必含 InputAck(3),实际:{spawn_batch:?}"));
+        let es_tick = spawn_batch
+            .iter()
+            .find_map(|m| match m {
+                S2C::EntityStates { tick, .. } => Some(*tick),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("同批必含 EntityStates,实际:{spawn_batch:?}"));
+
+        assert!(
+            spawned_idx < ack3_idx,
+            "Spawned(Critical) 必须先于 InputAck(World),实际 spawned_idx={spawned_idx}, ack3_idx={ack3_idx}"
+        );
+        assert_eq!(
+            ack3_tick, es_tick,
+            "InputAck(3).tick 必须等于同批 EntityStates.tick"
+        );
+
+        // 2) Sequenced{4, Command(SetBlock(0,-60,0,STONE))}
+        let target_pos = BlockPos::new(0, -60, 0);
+        let target_cell = (target_pos, voxel::builtin::STONE);
+        handle.send(C2S::Sequenced {
+            seq: 4,
+            inner: Box::new(C2S::Command(SimCommand::SetBlock {
+                pos: target_pos,
+                block: voxel::builtin::STONE,
+            })),
+        });
+
+        // 推进第 1 次:含 InputAck{4},不含该格 BlockUpdates
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        let batch1 = handle.drain();
+        let ack4_tick = batch1
+            .iter()
+            .find_map(|m| match m {
+                S2C::InputAck { seq: 4, tick } => Some(*tick),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("推进第 1 次批必含 InputAck(4),实际:{batch1:?}"));
+        let has_block_in_batch1 = batch1
+            .iter()
+            .any(|m| matches!(m, S2C::BlockUpdates { updates } if updates.contains(&target_cell)));
+        assert!(
+            !has_block_in_batch1,
+            "推进第 1 次批不得含该格 BlockUpdates(SetBlock n 拍盖章、n+1 拍执行)"
+        );
+
+        // 推进第 2 次:含该格 BlockUpdates,且 ack.tick + 1 == 该批 EntityStates.tick
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        let batch2 = handle.drain();
+        let has_block_in_batch2 = batch2
+            .iter()
+            .any(|m| matches!(m, S2C::BlockUpdates { updates } if updates.contains(&target_cell)));
+        assert!(
+            has_block_in_batch2,
+            "推进第 2 次批必含 (0,-60,0)->STONE 的 BlockUpdates,实际:{batch2:?}"
+        );
+        let es2_tick = batch2
+            .iter()
+            .find_map(|m| match m {
+                S2C::EntityStates { tick, .. } => Some(*tick),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("推进第 2 次批必含 EntityStates,实际:{batch2:?}"));
+        assert_eq!(
+            Tick(ack4_tick.0 + 1),
+            es2_tick,
+            "ack4.tick + 1 必须等于第 2 批 EntityStates.tick"
+        );
+
+        handle.send(C2S::Goodbye);
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        driver.await.expect("驱动正常退出");
+    }
+
+    /// C04 T4(R1 修订):`Sequenced{9, Command(SpawnDynamic)}` → 断连(后续 send 无效)+ Bye;
+    /// drain 不含任何 `InputAck`。
+    #[tokio::test(start_paused = true)]
+    async fn c04_t4_sequenced_reject_disconnects_without_ack() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let (handle, driver) = spawn_in_current_runtime(local_test_config(tmp.path(), 2))
+            .await
+            .expect("spawn_in_current_runtime");
+
+        let _ = handle.drain();
+
+        handle.send(C2S::Sequenced {
+            seq: 9,
+            inner: Box::new(C2S::Command(SimCommand::SpawnDynamic {
+                entity: EntityId::from_parts(1, 1),
+                state: EntityState::default(),
+                desc: EntityDesc::default(),
+            })),
+        });
+
+        let mut all_msgs = handle.drain();
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(17)).await;
+            tokio::task::yield_now().await;
+            all_msgs.extend(handle.drain());
+        }
+
+        assert!(
+            all_msgs.iter().any(|m| matches!(m, S2C::Bye { .. })),
+            "Reject 断连必含 Bye,实际:{all_msgs:?}"
+        );
+        assert!(
+            !all_msgs.iter().any(|m| matches!(m, S2C::InputAck { .. })),
+            "Reject 路径不得收到任何 InputAck,实际:{all_msgs:?}"
+        );
+
+        // 断连后后续 send 无效。
+        handle.send(C2S::Sequenced {
+            seq: 10,
+            inner: Box::new(C2S::Ping),
+        });
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(17)).await;
+            tokio::task::yield_now().await;
+        }
+        let post = handle.drain();
+        assert!(
+            !post.contains(&S2C::Pong) && !post.iter().any(|m| matches!(m, S2C::InputAck { .. })),
+            "断连后 send 无效,不得收到 Pong 或 InputAck,实际:{post:?}"
+        );
+
+        drop(handle);
+        tokio::time::advance(Duration::from_millis(17)).await;
+        tokio::task::yield_now().await;
+        driver.await.expect("驱动正常退出");
     }
 }

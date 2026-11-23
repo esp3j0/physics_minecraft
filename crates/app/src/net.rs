@@ -126,6 +126,9 @@ pub enum NetUp {
     /// 调试遥测订阅(REQ-011 §3.5.2;W03):幂等上报(重复发送不重复生效);
     /// 驱动侧记录订阅集合,断连(NetUp::Left)即移除。
     SubscribeDebug { player: InputSource },
+    /// 带序号输入的确认上行(REQ-013 C04):intake 剥尽 `Sequenced` 层后(非 Reject 才)
+    /// 按外→内逐层上报,驱动侧以 World 优先级回 `S2C::InputAck`。
+    Ack { player: InputSource, seq: u64 },
 }
 
 /// 订阅视距上限(REQ-003 §4.3:钳制 ≤32 chunk)。
@@ -154,6 +157,21 @@ pub enum TranslateOutcome {
     Agent(DriverCommand),
     /// 非白名单命令等(协议违规 → 断连)。
     Reject(&'static str),
+    /// 带序号命令包装(REQ-013 C04):保留外→内序号层,由 intake 统一剥包装。
+    Sequenced {
+        seq: u64,
+        inner: Box<TranslateOutcome>,
+    },
+}
+
+/// 循环剥尽 [`TranslateOutcome::Sequenced`] 包装层,返回 `(外→内 seq 列表, 最内层 outcome)`。
+pub(crate) fn unwrap_sequenced(mut outcome: TranslateOutcome) -> (Vec<u64>, TranslateOutcome) {
+    let mut seqs = Vec::new();
+    while let TranslateOutcome::Sequenced { seq, inner } = outcome {
+        seqs.push(seq);
+        outcome = *inner;
+    }
+    (seqs, outcome)
 }
 
 /// 翻译层(纯函数;零 IO、零时钟,任务书细则 6):C2S → [`TranslateOutcome`]
@@ -204,7 +222,10 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
         C2S::SubscribeDebug => TranslateOutcome::SubscribeDebug,
-        C2S::Sequenced { inner, .. } => translate(player, *inner),
+        C2S::Sequenced { seq, inner } => TranslateOutcome::Sequenced {
+            seq,
+            inner: Box::new(translate(player, *inner)),
+        },
     }
 }
 
@@ -939,7 +960,14 @@ async fn handle_frame(
         }
     }
 
-    match translate(player, c2s) {
+    let (seqs, outcome) = unwrap_sequenced(translate(player, c2s));
+    if !matches!(outcome, TranslateOutcome::Reject(_)) {
+        for seq in seqs {
+            let _ = up_tx.send(NetUp::Ack { player, seq }).await;
+        }
+    }
+
+    match outcome {
         TranslateOutcome::Hello => Flow::Continue,
         TranslateOutcome::Subscribe(view_distance) => {
             if let Some(link) = stream_link.as_ref() {
@@ -1064,6 +1092,7 @@ async fn handle_frame(
             Flow::Continue
         }
         TranslateOutcome::Reject(why) => Flow::Disconnect(DisconnectReason::ProtocolViolation(why)),
+        TranslateOutcome::Sequenced { .. } => unreachable!("unwrap_sequenced 已剥尽 Sequenced 层"),
     }
 }
 
@@ -2799,5 +2828,39 @@ pub(crate) mod tests {
             .expect("驱动仍存活");
         driver.await.expect("驱动不 panic");
         handle.shutdown.shutdown();
+    }
+
+    /// C04 T1:`translate` 保留 `Sequenced` 包装层,嵌套剥序为外→内 `[1, 2]`。
+    #[test]
+    fn c04_t1_translate_sequenced_and_unwrap_order() {
+        let player = InputSource(1);
+        let single = translate(
+            player,
+            C2S::Sequenced {
+                seq: 7,
+                inner: Box::new(C2S::Ping),
+            },
+        );
+        assert_eq!(
+            single,
+            TranslateOutcome::Sequenced {
+                seq: 7,
+                inner: Box::new(TranslateOutcome::Ping),
+            }
+        );
+
+        let nested = translate(
+            player,
+            C2S::Sequenced {
+                seq: 1,
+                inner: Box::new(C2S::Sequenced {
+                    seq: 2,
+                    inner: Box::new(C2S::Ping),
+                }),
+            },
+        );
+        let (seqs, inner) = unwrap_sequenced(nested);
+        assert_eq!(seqs, vec![1, 2], "嵌套 Sequenced 剥序必须为外→内 [1, 2]");
+        assert_eq!(inner, TranslateOutcome::Ping);
     }
 }

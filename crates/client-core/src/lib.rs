@@ -13,7 +13,10 @@ pub mod perf;
 pub mod possess;
 pub mod script;
 pub mod tools;
+pub mod transport;
 pub mod world;
+
+pub use transport::{LoopbackTransport, SequencedTransport};
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -71,6 +74,14 @@ impl LocalTransport {
             handle: Some(handle),
             thread: Some(thread),
         })
+    }
+
+    /// 由既有 [`LocalHandle`] 构造传输(无后台线程;供 headless / 暂停时钟对账用)。
+    pub fn from_handle(handle: LocalHandle) -> Self {
+        Self {
+            handle: Some(handle),
+            thread: None,
+        }
     }
 }
 

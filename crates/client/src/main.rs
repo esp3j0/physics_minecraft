@@ -34,13 +34,13 @@ use client_core::possess::{self, PossessState, p_press_hint};
 use client_core::script::manifest::{Manifest, ManifestMeshStats, ManifestPerf};
 use client_core::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, ScreenshotRequest,
-    WorldQuery, parse_scenario,
+    WorldQuery, engine_commands_to_c2s, parse_scenario,
 };
 use client_core::tools::{
     Hit, ToolAction, ToolState, dig, hud_text, pick_at_camera, place, select_material,
 };
 use client_core::world::WorldState;
-use client_core::{LocalTransport, Transport, config_from_server_table};
+use client_core::{LocalTransport, SequencedTransport, Transport, config_from_server_table};
 use entities::{EntityMirrorRes, EntityRenderRes, sync_entities_system};
 use messaging::SimCommand;
 use sim_api::proto::{C2S, S2C};
@@ -605,7 +605,7 @@ fn main() {
         view_distance,
     };
 
-    let mut transport = match LocalTransport::new(local_cfg) {
+    let local_transport = match LocalTransport::new(local_cfg) {
         Ok(t) => t,
         Err(err) => {
             eprintln!(
@@ -615,6 +615,7 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let mut transport = SequencedTransport::new(local_transport);
     if script_res.is_some() {
         // 脚本模式启动即订阅服务端性能/调试遥测(REQ-013 C01b-3 §1.4;交互模式行为不变)。
         transport.send(C2S::SubscribeDebug);
@@ -1415,74 +1416,16 @@ fn forward_engine_commands_with(
     commands: &[EngineCommand],
     mut send: impl FnMut(C2S),
 ) -> Vec<String> {
-    let mut batch: Vec<SimCommand> = Vec::new();
-    let mut rejected: Vec<String> = Vec::new();
-    let flush_batch = |batch: &mut Vec<SimCommand>, send: &mut dyn FnMut(C2S)| {
-        for sim_cmd in batch.drain(..) {
-            send(C2S::Command(sim_cmd));
-        }
-    };
-    for command in commands {
-        match command {
-            EngineCommand::Spawn { state, desc } => {
-                flush_batch(&mut batch, &mut send);
-                send(C2S::Spawn {
-                    state: *state,
-                    desc: desc.clone(),
-                });
-            }
-            EngineCommand::SpawnAgent { position, yaw } => {
-                flush_batch(&mut batch, &mut send);
-                send(C2S::SpawnAgent {
-                    body: "capsule".to_owned(),
-                    position: *position,
-                    yaw: *yaw,
-                });
-            }
-            EngineCommand::Possess { entity } => {
-                flush_batch(&mut batch, &mut send);
-                send(C2S::Possess { entity: *entity });
-            }
-            EngineCommand::Unpossess => {
-                flush_batch(&mut batch, &mut send);
-                send(C2S::Unpossess);
-            }
-            EngineCommand::AgentIntent {
-                entity,
-                move_xz,
-                yaw,
-                jump,
-            } => {
-                flush_batch(&mut batch, &mut send);
-                send(C2S::AgentIntent {
-                    entity: *entity,
-                    move_xz: *move_xz,
-                    yaw: *yaw,
-                    jump: *jump,
-                });
-            }
-            EngineCommand::Detonate {
-                center,
-                power,
-                radius,
-            } => batch.push(SimCommand::Detonate {
-                center: *center,
-                power: *power,
-                radius: *radius,
-            }),
-            EngineCommand::SetBlock { pos, block } => batch.push(SimCommand::SetBlock {
-                pos: *pos,
-                block: *block,
-            }),
-            EngineCommand::ToolAction(action) => match action {
-                ToolAction::Single(sim_cmd) => batch.push(sim_cmd.clone()),
-                ToolAction::Batch(sim_cmds) => batch.extend(sim_cmds.iter().cloned()),
-                ToolAction::Rejected(reason) => rejected.push(reason.clone()),
-            },
-        }
+    for c2s in engine_commands_to_c2s(commands) {
+        send(c2s);
     }
-    flush_batch(&mut batch, &mut send);
-    rejected
+    commands
+        .iter()
+        .filter_map(|command| match command {
+            EngineCommand::ToolAction(ToolAction::Rejected(reason)) => Some(reason.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// 将 `EngineCommand` 列表翻译为 `C2S` 并经 `Transport` 发送(返回被拒绝的 `ToolAction` 提示)。
