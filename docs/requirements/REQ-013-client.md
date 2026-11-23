@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -256,8 +256,14 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   两入口剥尽 `Sequenced` 外→内、非 `Reject` 才上行 `NetUp::Ack`,
   驱动以 World 优先级回 `InputAck{seq, tick_now}`;workspace
   1793 passed / 0 failed,枚举零新增变体。
-- [ ] AC4:sim 60 Hz 固定拍与渲染解耦;渲染掉帧不改变 sim 拍序
+- [x] AC4:sim 60 Hz 固定拍与渲染解耦;渲染掉帧不改变 sim 拍序
   (测试:人为阻塞渲染 N 帧,sim tick 计数与状态不受影响)。
+  C05 验收:headless 双跑对账 `c05_ta_render_stall_dual_run_reconcile`
+  (暂停时钟,栈 B 第 10..=19 拍跳过 drain;终态 `world.tick()==51`、
+  整段 `encode_frame` S2C 字节流逐位相等、落体 y 逐位相等)绿;真实
+  OS 线程 `c05_tc_real_thread_stall_sim_keeps_ticking`(800ms 不 drain,
+  `tick>=40`、落体 y<=-57)绿;冒烟 `client_render_stall` 阻塞 1500ms
+  期间宿主自主推进 +91 拍(115→206),`no_floating`/`block` 两项 check 均 ok。
 - [x] AC5:本地策略推理驱动 quad(quad_gpu1),同机与服务器路径
   playback 位级一致(复用 check-policy 同机核对口径 + 回放比对)。
   C03-2 验收:app `dual_path::ac5_dual_path_bit_exact_consistency` 绿
@@ -476,6 +482,28 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   洋红行走 → 青绿附身转 → 青绿转回 → 洋红恢复,全程站姿无翻倒。
   磁盘:D 盘再被 PDB 占满(LNK1318),按已批准先例删 target/debug 下
   82 个可再生 PDB 释放 25G。验收与 R1 裁定见 #27。
+- C05 ✅ 验收通过(2026-11-23):提交 6b889c8。`Action::StallRender{ms}`
+  (parse 键 `stall_render`、必填 `ms`、范围 1..=5000)+
+  `FrameOutput.stall_render_ms: Option<u64>`(照 perf_reset 渲染层标志
+  先例,非 EngineCommand、非协议);engine 臂照 Screenshot 的 break 模式
+  置位 + finish_step + break(每帧至多一次 stall、不读墙钟不 sleep);
+  sleep 仅落 `client/main.rs` `apply_stall_render_step`。T-A headless
+  双跑对账(暂停时钟、阻塞窗口不改拍计数与 S2C 字节流)、T-B parse/engine
+  单元、T-C 真实 OS 线程 800ms 不 drain 仍 tick>=40 全绿。门禁复跑:
+  workspace 1797 passed / 0 failed + clippy 0 + fmt 0;冒烟 client 9/10
+  首跑(client_interact 偶发 dig 回传 check 失败,单跑复绿)+ selftest
+  + req012 9/9 通过(DPI 对齐)。架构师变异轮:M-B(parse 上界 5000→
+  50000)/M-C(下界 1→0)击杀;M-A(engine 臂删 break)存活——裁定测试
+  缺口:break 语义测试用拍 100/101/103 未断言边界拍 102,删 break 使
+  wait_ticks 提前一拍起算仍全过,生产代码 break 正确、AC4 由 T-A/T-C/
+  冒烟拍计数证实,建议 R1 补边界断言。审图:quad 洋红行走正常渲染。
+  渲染观测(已归因,非 C05 回归):`client_render_stall` 着地白块系
+  `solidify` 机制(默认开、连续 20 拍低速→凝固成方块,sim.rs:53);
+  落体下落段在 bevy client 截图不可见——诊断证实 solid 于拍 92 在
+  (4,-55,4) 正确生成、贯穿拍 97 截图帧仍存活,却未现于画面(agent 渲染
+  正常),根因未归因,属 C03 既有动态刚体渲染问题、与 C05 无关,留待
+  后续单元;场景 expect 文案"白色落体"与 SOLID_COLOR 蓝不符,待修。
+  验收见 #27。
 
 ## 10. 决策记录与开放问题
 
