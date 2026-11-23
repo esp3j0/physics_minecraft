@@ -324,6 +324,13 @@ fn apply_perf_reset_step(perf_reset: bool, fps_history: &mut FpsHistoryRes) {
     }
 }
 
+/// 脚本 `stall_render` 步执行分支(REQ-013 C05 §1.3):阻塞 bevy 渲染主线程以验证宿主独立推进。
+fn apply_stall_render_step(ms: Option<u64>) {
+    if let Some(ms) = ms {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
+}
+
 /// 最近一次从服务端收到的 `S2C::PerfStats` 采样。
 #[derive(Debug, Clone, Copy)]
 struct ServerPerfSample {
@@ -1585,6 +1592,7 @@ fn script_driver_system(
 
     script.coupled = output.coupled;
     apply_perf_reset_step(output.perf_reset, &mut fps_history);
+    apply_stall_render_step(output.stall_render_ms);
     if output.commands.iter().any(|cmd| {
         matches!(
             cmd,

@@ -1,0 +1,28 @@
+name = "client_render_stall"
+req = "REQ-013"
+description = "AC4 渲染阻塞 1.5s 期间 sim 自主推进:落体已着地、方块编辑已生效"
+timeout_secs = 120
+[viewer]
+view_distance = 2
+[[step]]
+camera = { pos = [4.0, -48.0, 16.0], yaw = -90.0, pitch = -55.0 }
+[[step]]
+wait_until = { chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+[[step]]
+wait_ticks = { n = 60 }
+[[step]]
+spawn = { at = [4.0, -55.0, 4.0] }
+[[step]]
+set_block = { pos = [0, -60, 0], block = "stone" }
+[[step]]
+wait_ticks = { n = 5 }
+[[step]]
+screenshot = { name = "before_stall", expect = "棕色地表,(4,4) 上方一格白色落体悬空" }
+[[step]]
+stall_render = { ms = 1500 }
+[[step]]
+check = { no_floating = { height = 1.5, still_ticks = 5 } }
+[[step]]
+check = { block = { pos = [0, -60, 0], is = "stone" } }
+[[step]]
+screenshot = { name = "after_stall", expect = "落体已着地静置地表,石块在 (0,0) 凸起,无残影" }

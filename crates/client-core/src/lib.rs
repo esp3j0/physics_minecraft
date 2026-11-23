@@ -16,6 +16,9 @@ pub mod tools;
 pub mod transport;
 pub mod world;
 
+#[cfg(test)]
+mod ac4_tests;
+
 pub use transport::{LoopbackTransport, SequencedTransport};
 
 use std::collections::BTreeSet;

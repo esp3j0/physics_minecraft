@@ -25,8 +25,9 @@ const TOP_KEYS: [&str; 7] = [
 /// 每步已知键(动作键之外)。
 const STEP_KEYS: [&str; 1] = ["label"];
 /// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作,B02c
-/// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`,C02-1 追加 `dig`/`place`/`select_material`)。
-const ACTION_KEYS: [&str; 22] = [
+/// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`,C02-1 追加 `dig`/`place`/`select_material`,
+/// C05 追加 `stall_render`)。
+const ACTION_KEYS: [&str; 23] = [
     "camera",
     "look_at",
     "fly",
@@ -49,6 +50,7 @@ const ACTION_KEYS: [&str; 22] = [
     "dig",
     "place",
     "select_material",
+    "stall_render",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -351,6 +353,8 @@ fn parse_action(
         "dig" => &[],
         "place" => &["material"],
         "select_material" => &["index"],
+        // C05 §1.1:阻塞渲染线程验证 sim 解耦。
+        "stall_render" => &["ms"],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -627,6 +631,18 @@ fn parse_action(
             let index = usize::try_from(n)
                 .map_err(|_| e("动作 select_material 的 index 应为非负整数".into()))?;
             Ok(Action::SelectMaterial { index })
+        }
+        "stall_render" => {
+            let ms = t
+                .get("ms")
+                .ok_or_else(|| e("动作 stall_render 缺必填参数 ms".into()))?;
+            let ms = u64_of(ms, "stall_render.ms").map_err(e)?;
+            if !(1..=5000).contains(&ms) {
+                return Err(e(format!(
+                    "动作 stall_render 的 ms 应在 1..=5000 范围内,实为 {ms}"
+                )));
+            }
+            Ok(Action::StallRender { ms })
         }
         "intent" => {
             let mv = t

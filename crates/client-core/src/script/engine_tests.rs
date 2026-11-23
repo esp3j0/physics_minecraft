@@ -769,6 +769,7 @@ spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
             finished: Vec::new(),
             possess: None,
             perf_reset: false,
+            stall_render_ms: None,
         };
         let _ = &mut o;
         e.frame(&FrameInput {
@@ -1718,5 +1719,66 @@ intent = { move = [0.3, 0.0], yaw = -90.0, jump = false }",
         (intents[1] - (-std::f32::consts::FRAC_PI_2)).abs() < 1e-6,
         "intent yaw -90° 应转 -π/2,实得 {}",
         intents[1]
+    );
+}
+
+/// REQ-013 C05 T-B(2/3):`stall_render` 照 Screenshot 的 break 语义仅置位 `stall_render_ms`,
+/// 同帧不产 `EngineCommand`、不推进后续 `wait_ticks`;下一帧 `stall_render_ms == None` 且 `wait_ticks`
+/// 正常起算;`engine_commands_to_c2s` 输出不受 `stall_render` 步影响。
+#[test]
+fn c05_tb_stall_render_break_semantics_and_c2s_invariance() {
+    use crate::script::engine_commands_to_c2s;
+
+    let mut e = engine("[[step]]\nstall_render = { ms = 800 }\n\n[[step]]\nwait_ticks = { n = 2 }");
+    let w = FlatWorld::with_entities(&[]);
+
+    // 第 1 帧:stall_render 置位、结束并 break,同帧不推进 wait_ticks,无命令。
+    let out1 = frame(&mut e, 0.016, 100, &w, &[]);
+    assert_eq!(out1.stall_render_ms, Some(800));
+    assert_eq!(
+        out1.finished.len(),
+        1,
+        "stall_render 帧不得同帧推进 wait_ticks"
+    );
+    assert_eq!(out1.finished[0].action, "stall_render");
+    assert_eq!(out1.finished[0].outcome, StepOutcome::Ok);
+    assert!(
+        out1.commands.is_empty(),
+        "stall_render 不得产出 EngineCommand"
+    );
+    assert!(
+        engine_commands_to_c2s(&out1.commands).is_empty(),
+        "stall_render 帧经 engine_commands_to_c2s 输出为空"
+    );
+
+    // 第 2 帧:stall_render_ms 归 None,wait_ticks 从拍 101 起算,尚未结束。
+    let out2 = frame(&mut e, 0.016, 101, &w, &[]);
+    assert_eq!(out2.stall_render_ms, None);
+    assert!(
+        out2.finished.is_empty(),
+        "wait_ticks 从拍 101 起,拍 101 尚未结束"
+    );
+
+    // 第 3 帧:拍 103 = 101 + 2,wait_ticks 结束。
+    let out3 = frame(&mut e, 0.016, 103, &w, &[]);
+    assert_eq!(out3.stall_render_ms, None);
+    assert_eq!(out3.finished.len(), 1);
+    assert_eq!(out3.finished[0].action, "wait_ticks");
+    assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
+
+    // 同帧先发 set_block 再遇 stall_render:engine_commands_to_c2s 输出与无 stall 步逐位一致。
+    let mut e_with_stall = engine(
+        "[[step]]\nset_block = { pos = [0, -60, 0], block = \"stone\" }\n\n[[step]]\nstall_render = { ms = 800 }",
+    );
+    let mut e_without_stall =
+        engine("[[step]]\nset_block = { pos = [0, -60, 0], block = \"stone\" }");
+    let out_with = frame(&mut e_with_stall, 0.016, 10, &w, &[]);
+    let out_without = frame(&mut e_without_stall, 0.016, 10, &w, &[]);
+    assert_eq!(out_with.stall_render_ms, Some(800));
+    assert_eq!(out_without.stall_render_ms, None);
+    assert_eq!(
+        engine_commands_to_c2s(&out_with.commands),
+        engine_commands_to_c2s(&out_without.commands),
+        "含 stall_render 步的帧经 engine_commands_to_c2s 输出必须与无 stall 帧一致"
     );
 }

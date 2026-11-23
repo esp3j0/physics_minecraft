@@ -809,3 +809,59 @@ fn ms21_parse_dig_place_select_material() {
         .expect("select_material 带 index 合法");
     assert_eq!(s_sel.steps[0].action, Action::SelectMaterial { index: 2 });
 }
+
+/// REQ-013 C05 T-B(1):`stall_render` 参数校验(ms 必填、整数且 1..=5000)。
+#[test]
+fn c05_tb_parse_stall_render() {
+    let s = parse_scenario(&one_step("stall_render = { ms = 800 }"))
+        .expect("stall_render = { ms = 800 } 应合法解析");
+    assert_eq!(s.steps.len(), 1);
+    assert_eq!(s.steps[0].action, Action::StallRender { ms: 800 });
+
+    let s_min = parse_scenario(&one_step("stall_render = { ms = 1 }")).expect("ms = 1 下边界合法");
+    assert_eq!(s_min.steps[0].action, Action::StallRender { ms: 1 });
+
+    let s_max =
+        parse_scenario(&one_step("stall_render = { ms = 5000 }")).expect("ms = 5000 上边界合法");
+    assert_eq!(s_max.steps[0].action, Action::StallRender { ms: 5000 });
+
+    let e_missing = err(&one_step("stall_render = {}"));
+    assert_eq!(e_missing.step, Some(1));
+    assert!(
+        e_missing.message.contains("ms"),
+        "缺 ms 必须点名报错:{}",
+        e_missing.message
+    );
+
+    let e_zero = err(&one_step("stall_render = { ms = 0 }"));
+    assert_eq!(e_zero.step, Some(1));
+    assert!(
+        e_zero.message.contains("1..=5000"),
+        "ms=0 越界必须报错:{}",
+        e_zero.message
+    );
+
+    let e_over = err(&one_step("stall_render = { ms = 5001 }"));
+    assert_eq!(e_over.step, Some(1));
+    assert!(
+        e_over.message.contains("1..=5000"),
+        "ms=5001 越界必须报错:{}",
+        e_over.message
+    );
+
+    let e_str = err(&one_step("stall_render = { ms = \"x\" }"));
+    assert_eq!(e_str.step, Some(1));
+    assert!(
+        e_str.message.contains("整数"),
+        "ms=\"x\" 非整数必须报错:{}",
+        e_str.message
+    );
+
+    let e_extra = err(&one_step("stall_render = { ms = 800, extra = 1 }"));
+    assert_eq!(e_extra.step, Some(1));
+    assert!(
+        e_extra.message.contains("extra"),
+        "多余键必须点名报错:{}",
+        e_extra.message
+    );
+}

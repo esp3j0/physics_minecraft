@@ -234,6 +234,7 @@ impl EngineInner {
             finished: Vec::new(),
             possess: None,
             perf_reset: false,
+            stall_render_ms: None,
         };
         if !matches!(self.status, EngineStatus::Running { .. }) {
             return (out, self.status.clone()); // 细则 11:结束后不再推进
@@ -829,6 +830,22 @@ impl EngineInner {
                         tick,
                         tick,
                     );
+                }
+                // C05 §1.2:照 Screenshot 的 break 模式仅置位 stall_render_ms,
+                // 不读墙钟不 sleep,保证每帧至多一次 stall 且下一步在 sleep 后下一帧执行。
+                Action::StallRender { ms } => {
+                    out.stall_render_ms = Some(ms);
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "stall_render",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
+                    break;
                 }
                 // C02-1 §4.2:瞬时工具挖掘/放置/切材料动作。
                 Action::Dig => {

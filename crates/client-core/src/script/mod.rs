@@ -165,6 +165,11 @@ pub enum Action {
     SelectMaterial {
         index: usize,
     },
+    /// 阻塞渲染线程指定毫秒数(REQ-013 C05 AC4):仅置位 `FrameOutput::stall_render_ms` 并 break,
+    /// 不读墙钟、不产 `EngineCommand`,由渲染层执行 sleep 以验证宿主独立推进。
+    StallRender {
+        ms: u64,
+    },
 }
 
 /// 生成位置:绝对坐标,或相机前方 `ahead` 米再抬高 `lift` 米。
@@ -506,6 +511,8 @@ pub struct FrameOutput {
     pub possess: Option<(EntityId, bool)>,
     /// C01b-3 R1 §2.1:本帧执行了 `perf_reset` 瞬时步,渲染层据此清空 FPS 历史与风暴标记。
     pub perf_reset: bool,
+    /// C05 AC4:本帧执行了 `stall_render` 步,渲染层据此阻塞主线程指定毫秒数。
+    pub stall_render_ms: Option<u64>,
 }
 
 /// 引擎状态。
