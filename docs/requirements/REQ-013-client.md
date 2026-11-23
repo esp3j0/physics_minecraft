@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -243,12 +243,19 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   chunk 流式装载 + 准星拾取挖/放方块,**零网络依赖**;方块编辑
   ≤ 1 拍本地生效(单元测试 + 人工)。C02-1 人工闭环通过
   (2026-11-20,见 §9;held 键/鼠标转视角注入限制与 MS23 锚归 C02-2)。
-- [ ] AC2:`Transport` trait + in-process 与 loopback(进程内消息
+- [x] AC2:`Transport` trait + in-process 与 loopback(进程内消息
   队列)两个实现;同一客户端核分别接两种传输跑同一脚本,
-  S2C 帧序列**同机逐位一致**(测试)。
-- [ ] AC3:协议追加包(`Sequenced`/`InputAck`/`Correction`)schema
+  S2C 帧序列**同机逐位一致**(测试)。C04 验收:client-core
+  `transport::tests::c04_t7_ac2_dual_transport_bitwise_reconcile` 绿
+  (`SequencedTransport<LocalTransport>` 对
+  `SequencedTransport<LoopbackTransport<LocalTransport>>`,整段 S2C
+  编码字节序列逐位相等,锚点 seq 1..=7 连续 / ChunkData 25 / Spawned 2)。
+- [x] AC3:协议追加包(`Sequenced`/`InputAck`/`Correction`)schema
   落地,codec 往返测试;既有 C2S/S2C 包与行为不变(既有测试全绿,
-  枚举只追加)。
+  枚举只追加)。schema 与 codec C01a 落地;C04 补齐 ack 语义:
+  两入口剥尽 `Sequenced` 外→内、非 `Reject` 才上行 `NetUp::Ack`,
+  驱动以 World 优先级回 `InputAck{seq, tick_now}`;workspace
+  1793 passed / 0 failed,枚举零新增变体。
 - [ ] AC4:sim 60 Hz 固定拍与渲染解耦;渲染掉帧不改变 sim 拍序
   (测试:人为阻塞渲染 N 帧,sim tick 计数与状态不受影响)。
 - [x] AC5:本地策略推理驱动 quad(quad_gpu1),同机与服务器路径
@@ -445,6 +452,29 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   青绿转回 → 洋红恢复,全程站姿无翻倒。磁盘:D 盘再被 PDB 占满
   (LNK1318),按已批准先例删 target/debug 下 131 个可再生 PDB 释放 33G。
   验收与 R1–R4 裁定见 #27。
+- C04 ✅ 验收通过(2026-11-23,R1 裁定后):提交 8ed1d72。`net.rs`
+  `unwrap_sequenced` 剥尽外→内、`handle_frame` 非 `Reject` 才按序上行
+  `NetUp::Ack`;`driver.rs` Ack 臂 `push_world(InputAck{seq, tick_now})`;
+  `local.rs` send 同口径 + `spawn_in_current_runtime` 转 pub;
+  client-core `transport.rs` `SequencedTransport`(seq 从 1 起、
+  Hello/Goodbye 透传、追踪 last_ack)+ `LoopbackTransport`(send 同步
+  flush 零相位差);T7 = AC2 双传输位级对账(整段 S2C 字节序列逐位相等);
+  `engine_commands_to_c2s` 收口渲染/headless 共用映射;e2e T8 TCP
+  Sequenced→Pong+InputAck。门禁复跑全过:workspace 1793 passed /
+  0 failed + clippy 0 + fmt 0;冒烟 client 9/9 + req012 9/9 + selftest
+  通过(DPI 对齐环境)。架构师变异轮:M-A(ack 拍号−1)/M-B(World→
+  Critical)/M-D(unwrap 序反转)/M-E(seq 从 0 起)/M-F(Goodbye 被
+  包装)/M-G'(loopback 延迟 flush)共 6 击杀;M-H(Reject 仍推 Ack)
+  裁定等价变异(`disconnect_locked` 同步 `hub.unregister`,驱动消费时
+  `push_world` 查无接收者静默丢弃,可观测行为不变)。R1 裁定:原任务书
+  T3/T4/T7 与现有代码三处实质冲突(Spawned 走 Critical 先于 World ack、
+  tick() 先于 consume_net_up 致 SetBlock 跨拍、loopback 延迟 send 相位差
+  及 ChunkMirror/bodies_dir/MoveObserver 前置),实施方停机查证属实后
+  修订重派。首批冒烟 client_interact 偶发 dig 回传 check 失败一次
+  (341 拍仍 stone),单跑与整批复跑均绿,原因未归因。审图:quad 四图
+  洋红行走 → 青绿附身转 → 青绿转回 → 洋红恢复,全程站姿无翻倒。
+  磁盘:D 盘再被 PDB 占满(LNK1318),按已批准先例删 target/debug 下
+  82 个可再生 PDB 释放 25G。验收与 R1 裁定见 #27。
 
 ## 10. 决策记录与开放问题
 
