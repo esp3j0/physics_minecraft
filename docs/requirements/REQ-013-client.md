@@ -304,6 +304,7 @@ bevy 客户端的冒烟接线(截图 + 机器检查通道)随 C01b 建立;机器
 | C02 | 体素交互(拾取/挖/放)+ possess 状态机搬运 + HUD;viewer 纯逻辑层移入 client-core、viewer 改依赖 client-core(AC7) | C01b |
 | C03 | 主体渲染(BodyShapeTable 搬运)+ 本地策略推理(quad_gpu1)(AC5) | C01b |
 | C04 | Sequenced ack 语义(驱动回 InputAck)+ loopback 传输对账(AC2 收尾) | C01a |
+| C05 | AC4 渲染/sim 解耦验证:`stall_render` 渲染层阻塞步 + headless 双跑对账(阻塞窗口不改变拍计数与状态)+ 真实线程阻塞测试 + 冒烟(AC4 收尾) | C01b、C04 |
 
 V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
 
