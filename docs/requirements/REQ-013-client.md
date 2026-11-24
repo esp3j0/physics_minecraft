@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -271,8 +271,13 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   probe 总最大差 2.980e-7;见 §11 C03-2 归档。
 - [ ] AC6:meshing 异步不阻塞渲染线程;方块编辑 → 画面 ≤ 2 帧;
   编辑风暴(脚本连挖 64 格)期间 FPS ≥ 55(实测报告)。
-- [ ] AC7:viewer 纯逻辑层(client/possess/world/script/tools)
+- [x] AC7:viewer 纯逻辑层(client/possess/world/script/tools)
   搬运后既有测试全绿,语义不变。
+  C06 收尾验证:viewer 仅余 cli/mesh/render(渲染侧),纯逻辑单源在
+  client-core;`viewer/src/lib.rs:15` `pub use client_core::{…}` 为文档化
+  兼容面(e2e 经 `viewer::client::…` 消费,受 script/mod.rs 公开面契约保护),
+  无两处维护。viewer lib 15/0、viewer_client e2e 5/0、app_e2e 6/0、
+  workspace 1798/0 全绿,语义不变。
 - [x] AC8:性能基线报告归档 §11,§4 预算逐项实测对照;未达项
   如实报实测值并归因,不私自放宽。
 
@@ -504,6 +509,14 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   正常),根因未归因,属 C03 既有动态刚体渲染问题、与 C05 无关,留待
   后续单元;场景 expect 文案"白色落体"与 SOLID_COLOR 蓝不符,待修。
   验收见 #27。
+- C06 ✅ 验收通过(2026-11-23):提交 2665ef1(仅 `engine_tests.rs` +30)。
+  R1 补 C05 M-A 缺口:`c05_tb_stall_render_break_semantics…` 插入边界拍 102
+  断言(有 break 时 wait_ticks 自 101 起算 102 未结束;漏 break 自 100 起算
+  102 已结束→红)+ 新增 `c06_tb_consecutive_stall_one_per_frame`(连续两
+  stall 每帧至多结束一个)。架构师自注 M-A(删 break)复跑:恰这两测试红
+  (221/2),还原后 223/0 绿——缺口确认闭合。门禁:client-core 223/0 +
+  clippy 0 + fmt 0 + workspace 1798/0。AC7 同单元收尾验证闭合(见 §6 AC7)。
+  测试_only 单元,无生产/渲染改动,不需冒烟。验收见 #27。
 
 ## 10. 决策记录与开放问题
 
