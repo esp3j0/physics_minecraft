@@ -1759,6 +1759,15 @@ fn c05_tb_stall_render_break_semantics_and_c2s_invariance() {
         "wait_ticks 从拍 101 起,拍 101 尚未结束"
     );
 
+    // 第 2.5 帧:拍 102 = 边界。有 break 时 wait_ticks 自 101 起算,102<103 未结束;
+    // 若 StallRender 臂漏 break(M-A),wait_ticks 自 100 起算,102 已结束 → 此断言红。
+    let out_mid = frame(&mut e, 0.016, 102, &w, &[]);
+    assert_eq!(out_mid.stall_render_ms, None);
+    assert!(
+        out_mid.finished.is_empty(),
+        "边界拍 102:wait_ticks 自 101 起算尚未结束(漏 break 会提前到 100 起算而在此结束)"
+    );
+
     // 第 3 帧:拍 103 = 101 + 2,wait_ticks 结束。
     let out3 = frame(&mut e, 0.016, 103, &w, &[]);
     assert_eq!(out3.stall_render_ms, None);
@@ -1781,4 +1790,25 @@ fn c05_tb_stall_render_break_semantics_and_c2s_invariance() {
         engine_commands_to_c2s(&out_without.commands),
         "含 stall_render 步的帧经 engine_commands_to_c2s 输出必须与无 stall 帧一致"
     );
+}
+
+/// REQ-013 C06 R1:连续两个 `stall_render` 每帧至多结束一个,后一步不得同帧覆盖前一步。
+#[test]
+fn c06_tb_consecutive_stall_one_per_frame() {
+    let mut e =
+        engine("[[step]]\nstall_render = { ms = 100 }\n\n[[step]]\nstall_render = { ms = 200 }");
+    let w = FlatWorld::with_entities(&[]);
+    let out1 = frame(&mut e, 0.016, 10, &w, &[]);
+    assert_eq!(out1.stall_render_ms, Some(100));
+    assert_eq!(
+        out1.finished.len(),
+        1,
+        "每帧至多结束一个 stall(漏 break 会同帧结束两个)"
+    );
+    assert_eq!(out1.finished[0].action, "stall_render");
+    let out2 = frame(&mut e, 0.016, 11, &w, &[]);
+    assert_eq!(out2.stall_render_ms, Some(200));
+    assert_eq!(out2.finished.len(), 1);
+    assert_eq!(out2.finished[0].action, "stall_render");
+    assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
 }
