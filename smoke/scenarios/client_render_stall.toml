@@ -17,7 +17,7 @@ set_block = { pos = [0, -60, 0], block = "stone" }
 [[step]]
 wait_ticks = { n = 5 }
 [[step]]
-screenshot = { name = "before_stall", expect = "棕色地表,(4,4) 上方一格白色落体悬空" }
+screenshot = { name = "before_stall", expect = "棕色地表,(4,4) 上方一格蓝色落体悬空" }
 [[step]]
 stall_render = { ms = 1500 }
 [[step]]

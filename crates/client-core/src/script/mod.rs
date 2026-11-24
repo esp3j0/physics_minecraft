@@ -170,6 +170,10 @@ pub enum Action {
     StallRender {
         ms: u64,
     },
+    /// 开关方块/区块描边叠加层(REQ-013 C07):瞬时步,仅置位 `FrameOutput::outline`,不阻塞引擎。
+    Outline {
+        on: bool,
+    },
 }
 
 /// 生成位置:绝对坐标,或相机前方 `ahead` 米再抬高 `lift` 米。
@@ -513,6 +517,8 @@ pub struct FrameOutput {
     pub perf_reset: bool,
     /// C05 AC4:本帧执行了 `stall_render` 步,渲染层据此阻塞主线程指定毫秒数。
     pub stall_render_ms: Option<u64>,
+    /// C07:本帧执行了 `outline` 步,渲染层据此开关描边。
+    pub outline: Option<bool>,
 }
 
 /// 引擎状态。

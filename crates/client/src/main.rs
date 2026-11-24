@@ -25,7 +25,10 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_dis
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
 use client_core::client::{ViewEvent, s2c_to_event};
-use client_core::mesh::{ChunkSnapshot, SubchunkMesh, mesh_subchunk_snapshot, snapshot};
+use client_core::mesh::{
+    ChunkSnapshot, OutlineMesh, SubchunkMesh, mesh_subchunk_snapshot, outline_subchunk_snapshot,
+    snapshot,
+};
 use client_core::mirror::{
     ChunkMirror, DirtyKind, SECTION_HEIGHT, SECTIONS_PER_CHUNK, SubchunkPos, is_stale,
 };
@@ -193,6 +196,18 @@ struct WorldRenderRes {
     mirror: ChunkMirror,
     entities: BTreeMap<SubchunkPos, (Entity, Handle<Mesh>)>,
     terrain_material: Handle<StandardMaterial>,
+}
+
+/// 描边线段实体标记组件(REQ-013 C07)。
+#[derive(Component)]
+struct OutlineEdge;
+
+/// 方块/区块描边叠加层状态与实体映射(REQ-013 C07;默认关)。
+#[derive(Resource)]
+struct OutlineRes {
+    enabled: bool,
+    entities: BTreeMap<SubchunkPos, (Entity, Handle<Mesh>)>,
+    material: Handle<StandardMaterial>,
 }
 
 /// 自增渲染帧计数器(不读墙钟,供 Edit 延迟测量)。
@@ -633,15 +648,32 @@ fn main() {
         .chunk_cap
         .unwrap_or_else(|| ViewCapRes::default_cap(view_distance));
 
+    // 仅当脚本含 `outline` 步时启用同步管线编译(C07):首次 spawn `LineList + Blend` 描边实体时
+    // Bevy 默认异步编译耗时长于脚本 `wait_ticks=2`(100ms),会致首张 `outline_on` 漏画;
+    // 交互模式与不含 `outline` 步的既有脚本保持默认异步编译,零基线扰动。
+    let sync_pipeline = script_res.as_ref().is_some_and(|s| {
+        s.scenario
+            .steps
+            .iter()
+            .any(|st| matches!(st.action, client_core::script::Action::Outline { .. }))
+    });
+
     let mut app = App::new();
-    app.add_plugins(DefaultPlugins.set(WindowPlugin {
-        primary_window: Some(Window {
-            title: "physics_minecraft client".to_owned(),
-            resolution: WindowResolution::new(1280, 720),
-            ..default()
-        }),
-        ..default()
-    }))
+    app.add_plugins(
+        DefaultPlugins
+            .set(WindowPlugin {
+                primary_window: Some(Window {
+                    title: "physics_minecraft client".to_owned(),
+                    resolution: WindowResolution::new(1280, 720),
+                    ..default()
+                }),
+                ..default()
+            })
+            .set(bevy::render::RenderPlugin {
+                synchronous_pipeline_compilation: sync_pipeline,
+                ..default()
+            }),
+    )
     .insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 150.0,
@@ -729,6 +761,18 @@ fn setup_scene(
         mirror: ChunkMirror::new(),
         entities: BTreeMap::new(),
         terrain_material,
+    });
+    let outline_material = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        unlit: true,
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        ..default()
+    });
+    commands.insert_resource(OutlineRes {
+        enabled: false,
+        entities: BTreeMap::new(),
+        material: outline_material,
     });
     let dir = bodies_dir
         .as_deref()
@@ -911,10 +955,13 @@ fn sync_observer_system(
 /// 第三人称相机跟随(语义逐位照搬 `viewer/src/render.rs:1226-1298, 1467-1503`)。
 #[allow(clippy::too_many_arguments)]
 fn interact_system(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mouse_buttons: Res<ButtonInput<MouseButton>>,
     mouse_scroll: Res<AccumulatedMouseScroll>,
+    mut meshes: ResMut<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    mut outline_res: ResMut<OutlineRes>,
     mut transport_res: ResMut<TransportRes>,
     mut tool_res: ResMut<ToolRes>,
     mut possess_res: ResMut<PossessRes>,
@@ -945,6 +992,11 @@ fn interact_system(
     }
     if keys.just_pressed(KeyCode::Digit4) {
         select_material(&mut tool_res.state, 3);
+    }
+    if keys.just_pressed(KeyCode::KeyG) {
+        let on = !outline_res.enabled;
+        set_outline_enabled(on, &mut commands, &mut meshes, &world_res, &mut outline_res);
+        tool_res.push_notice(format!("描边:{}", if on { "开" } else { "关" }), now);
     }
 
     transport_res.with_mut(|transport| {
@@ -1158,6 +1210,7 @@ fn unload_chunk_visuals(
     commands: &mut Commands,
     meshes: &mut Assets<Mesh>,
     world_res: &mut WorldRenderRes,
+    outline_res: &mut OutlineRes,
     pending: &mut PendingMeshesRes,
     edit_frames: &mut EditFrameTracker,
 ) {
@@ -1169,6 +1222,10 @@ fn unload_chunk_visuals(
         pending.tasks.remove(&sc);
         edit_frames.frames.remove(&sc);
         if let Some((entity, old_handle)) = world_res.entities.remove(&sc) {
+            meshes.remove(&old_handle);
+            commands.entity(entity).despawn();
+        }
+        if let Some((entity, old_handle)) = outline_res.entities.remove(&sc) {
             meshes.remove(&old_handle);
             commands.entity(entity).despawn();
         }
@@ -1185,6 +1242,7 @@ fn drain_transport_system(
     view_cap: Res<ViewCapRes>,
     mut transport_res: ResMut<TransportRes>,
     mut world_res: ResMut<WorldRenderRes>,
+    mut outline_res: ResMut<OutlineRes>,
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut stats: ResMut<MeshStats>,
@@ -1235,6 +1293,7 @@ fn drain_transport_system(
                     &mut commands,
                     &mut meshes,
                     &mut world_res,
+                    &mut outline_res,
                     &mut pending,
                     &mut edit_frames,
                 );
@@ -1332,6 +1391,7 @@ fn drain_transport_system(
                 &mut commands,
                 &mut meshes,
                 &mut world_res,
+                &mut outline_res,
                 &mut pending,
                 &mut edit_frames,
             );
@@ -1346,6 +1406,7 @@ fn collect_mesh_tasks_system(
     mut meshes: ResMut<Assets<Mesh>>,
     frame_counter: Res<FrameCounter>,
     mut world_res: ResMut<WorldRenderRes>,
+    mut outline_res: ResMut<OutlineRes>,
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut stats: ResMut<MeshStats>,
@@ -1403,6 +1464,7 @@ fn collect_mesh_tasks_system(
                 world_res.entities.insert(sc, (entity, new_handle));
             }
         }
+        refresh_outline(sc, &mut commands, &mut meshes, &world_res, &mut outline_res);
 
         stats.uploads += 1;
         if kind == DirtyKind::Edit {
@@ -1449,8 +1511,9 @@ fn script_driver_system(
     mut commands: Commands,
     time: Res<Time>,
     frame_counter: Res<FrameCounter>,
-    meshes: Res<Assets<Mesh>>,
+    mut meshes: ResMut<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    mut outline_res: ResMut<OutlineRes>,
     entity_render: Option<Res<EntityRenderRes>>,
     stats: Res<MeshStats>,
     mesh_perf: Res<MeshPerfRes>,
@@ -1480,7 +1543,7 @@ fn script_driver_system(
             });
     }
 
-    let sample_mesh_stats = || {
+    let sample_mesh_stats = |meshes: &Assets<Mesh>| {
         let live_entities =
             world_res.entities.len() + entity_render.as_ref().map_or(0, |r| r.live_mesh_entities());
         stats.to_manifest(meshes.len(), live_entities)
@@ -1491,7 +1554,7 @@ fn script_driver_system(
         if script.pending_shots.load(Ordering::SeqCst) > 0 {
             return;
         }
-        script.manifest.mesh_stats = Some(sample_mesh_stats());
+        script.manifest.mesh_stats = Some(sample_mesh_stats(&meshes));
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         // 显式 drop Transport → 发送 Goodbye 并 join 宿主线程,确保 redb 收口。
@@ -1539,7 +1602,7 @@ fn script_driver_system(
             reason: format!("断连:{reason}"),
         };
         script.manifest.finish(&status);
-        script.manifest.mesh_stats = Some(sample_mesh_stats());
+        script.manifest.mesh_stats = Some(sample_mesh_stats(&meshes));
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(2);
@@ -1593,6 +1656,9 @@ fn script_driver_system(
     script.coupled = output.coupled;
     apply_perf_reset_step(output.perf_reset, &mut fps_history);
     apply_stall_render_step(output.stall_render_ms);
+    if let Some(on) = output.outline {
+        set_outline_enabled(on, &mut commands, &mut meshes, &world_res, &mut outline_res);
+    }
     if output.commands.iter().any(|cmd| {
         matches!(
             cmd,
@@ -1643,7 +1709,7 @@ fn script_driver_system(
                 step.messages.extend(rejected_messages);
             }
         }
-        manifest.mesh_stats = Some(sample_mesh_stats());
+        manifest.mesh_stats = Some(sample_mesh_stats(&meshes));
         manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(manifest, out_dir);
     }
@@ -1665,7 +1731,7 @@ fn script_driver_system(
 
     if !matches!(final_status, EngineStatus::Running { .. }) {
         script.manifest.finish(&final_status);
-        script.manifest.mesh_stats = Some(sample_mesh_stats());
+        script.manifest.mesh_stats = Some(sample_mesh_stats(&meshes));
         script.manifest.perf = Some(build_manifest_perf(&fps_history, &mesh_perf, &server_perf));
         write_manifest(&script.manifest, &script.out_dir);
         script.finished_exit = Some(exit_code.unwrap_or(2));
@@ -1725,6 +1791,82 @@ fn to_bevy_mesh(submesh: SubchunkMesh) -> Mesh {
     .with_inserted_indices(Indices::U32(submesh.indices))
 }
 
+/// 将 `client-core` 的 [`OutlineMesh`] 转为 Bevy `LineList` [`Mesh`](REQ-013 C07)。
+fn to_bevy_outline_mesh(o: OutlineMesh) -> Mesh {
+    Mesh::new(PrimitiveTopology::LineList, RenderAssetUsages::default())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, o.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, o.colors)
+}
+
+/// 刷新单个 subchunk 的描边实体(REQ-013 C07;关态且无 entry 时直接返回零开销)。
+fn refresh_outline(
+    sc: SubchunkPos,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    world_res: &WorldRenderRes,
+    outline_res: &mut OutlineRes,
+) {
+    if !outline_res.enabled {
+        if let Some((entity, old_handle)) = outline_res.entities.remove(&sc) {
+            meshes.remove(&old_handle);
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+    let outline = snapshot(&world_res.mirror, sc)
+        .map(|snap| outline_subchunk_snapshot(&snap, sc))
+        .unwrap_or_default();
+    if outline.positions.is_empty() {
+        if let Some((entity, old_handle)) = outline_res.entities.remove(&sc) {
+            meshes.remove(&old_handle);
+            commands.entity(entity).despawn();
+        }
+        return;
+    }
+    let new_handle = meshes.add(to_bevy_outline_mesh(outline));
+    if let Some((entity, old_handle)) = outline_res.entities.get_mut(&sc) {
+        meshes.remove(&*old_handle);
+        *old_handle = new_handle.clone();
+        commands.entity(*entity).insert(Mesh3d(new_handle));
+    } else {
+        let entity = commands
+            .spawn((
+                Mesh3d(new_handle.clone()),
+                MeshMaterial3d(outline_res.material.clone()),
+                Transform::IDENTITY,
+                OutlineEdge,
+            ))
+            .id();
+        outline_res.entities.insert(sc, (entity, new_handle));
+    }
+}
+
+/// 切换描边开关并批量生成/清空全部已装载 subchunk 的描边实体(REQ-013 C07)。
+fn set_outline_enabled(
+    on: bool,
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    world_res: &WorldRenderRes,
+    outline_res: &mut OutlineRes,
+) {
+    if outline_res.enabled == on {
+        return;
+    }
+    outline_res.enabled = on;
+    if on {
+        let subchunks: Vec<SubchunkPos> = world_res.entities.keys().copied().collect();
+        for sc in subchunks {
+            refresh_outline(sc, commands, meshes, world_res, outline_res);
+        }
+    } else {
+        let entries = std::mem::take(&mut outline_res.entities);
+        for (_, (entity, old_handle)) in entries {
+            meshes.remove(&old_handle);
+            commands.entity(entity).despawn();
+        }
+    }
+}
+
 /// F2 截图保存到 `<world-dir>/screenshots/client-<序号>.png`(裁定 §3,仅交互模式)。
 fn screenshot_system(
     mut commands: Commands,
@@ -1773,6 +1915,10 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
+        let outline_material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
 
         app.insert_resource(FrameCounter(0))
             .insert_resource(EditFrameTracker::default())
@@ -1784,6 +1930,11 @@ mod tests {
                 mirror,
                 entities: BTreeMap::new(),
                 terrain_material,
+            })
+            .insert_resource(OutlineRes {
+                enabled: false,
+                entities: BTreeMap::new(),
+                material: outline_material,
             });
 
         if add_collect {
@@ -2355,12 +2506,21 @@ mod tests {
             .world_mut()
             .resource_mut::<Assets<StandardMaterial>>()
             .add(StandardMaterial::default());
+        let outline_material = app
+            .world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial::default());
         let (fake_transport, inbound) = FakeTransport::new();
 
         app.insert_resource(WorldRenderRes {
             mirror: ChunkMirror::new(),
             entities: BTreeMap::new(),
             terrain_material,
+        })
+        .insert_resource(OutlineRes {
+            enabled: false,
+            entities: BTreeMap::new(),
+            material: outline_material,
         })
         .insert_resource(TransportRes::new(fake_transport))
         .insert_resource(PendingMeshesRes::default())

@@ -865,3 +865,35 @@ fn c05_tb_parse_stall_render() {
         e_extra.message
     );
 }
+
+/// REQ-013 C07 §1.3:`outline` 参数校验(on 必填、布尔值、拒绝未知键)。
+#[test]
+fn c07_parse_outline() {
+    let s = parse_scenario(&one_step("outline = { on = true }"))
+        .expect("outline = { on = true } 应合法解析");
+    assert_eq!(s.steps.len(), 1);
+    assert_eq!(s.steps[0].action, Action::Outline { on: true });
+
+    let s_off = parse_scenario(&one_step("outline = { on = false }"))
+        .expect("outline = { on = false } 应合法解析");
+    assert_eq!(s_off.steps[0].action, Action::Outline { on: false });
+
+    let e_missing = err(&one_step("outline = {}"));
+    assert_eq!(e_missing.step, Some(1));
+    assert!(
+        e_missing.message.contains("outline"),
+        "缺 on 错误消息应含 outline:{}",
+        e_missing.message
+    );
+
+    let e_type = err(&one_step("outline = { on = 3 }"));
+    assert_eq!(e_type.step, Some(1));
+
+    let e_extra = err(&one_step("outline = { on = true, extra = 1 }"));
+    assert_eq!(e_extra.step, Some(1));
+    assert!(
+        e_extra.message.contains("extra"),
+        "多余键必须点名报错:{}",
+        e_extra.message
+    );
+}

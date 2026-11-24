@@ -1,0 +1,34 @@
+name = "client_outline"
+req = "REQ-013"
+description = "C07 描边:默认关;脚本步开后可见方块棱线与区块边界线,编辑同步,关后恢复"
+timeout_secs = 120
+[viewer]
+view_distance = 2
+[[step]]
+camera = { pos = [4.0, -48.0, 16.0], yaw = -90.0, pitch = -55.0 }
+[[step]]
+wait_until = { chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
+[[step]]
+wait_ticks = { n = 60 }
+[[step]]
+screenshot = { name = "outline_default_off", expect = "棕色地表,无描边(默认关)" }
+[[step]]
+outline = { on = true }
+[[step]]
+wait_ticks = { n = 2 }
+[[step]]
+screenshot = { name = "outline_on", expect = "地表每格方块带黑色细棱线,区块边界(每16格)呈琥珀色线" }
+[[step]]
+set_block = { pos = [0, -60, 0], block = "stone" }
+[[step]]
+wait_ticks = { n = 5 }
+[[step]]
+screenshot = { name = "outline_edit", expect = "(0,0) 新石块带描边凸起,棱线可见" }
+[[step]]
+outline = { on = false }
+[[step]]
+wait_ticks = { n = 2 }
+[[step]]
+screenshot = { name = "outline_off", expect = "描边消失,地表恢复无棱线纯色面" }
+[[step]]
+check = { block = { pos = [0, -60, 0], is = "stone" } }

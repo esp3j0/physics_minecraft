@@ -235,6 +235,7 @@ impl EngineInner {
             possess: None,
             perf_reset: false,
             stall_render_ms: None,
+            outline: None,
         };
         if !matches!(self.status, EngineStatus::Running { .. }) {
             return (out, self.status.clone()); // 细则 11:结束后不再推进
@@ -846,6 +847,20 @@ impl EngineInner {
                         tick,
                     );
                     break;
+                }
+                // C07 §1.3:照 PerfReset 模式瞬时置位 outline,不阻塞引擎。
+                Action::Outline { on } => {
+                    out.outline = Some(on);
+                    self.finish_step(
+                        &mut out,
+                        step_no,
+                        label,
+                        "outline",
+                        StepOutcome::Ok,
+                        None,
+                        tick,
+                        tick,
+                    );
                 }
                 // C02-1 §4.2:瞬时工具挖掘/放置/切材料动作。
                 Action::Dig => {

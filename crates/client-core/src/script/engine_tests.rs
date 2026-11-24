@@ -770,6 +770,7 @@ spawn_agent = { at = [8.0, -57.0, 24.0], yaw = 90.0, label = \"p\" }",
             possess: None,
             perf_reset: false,
             stall_render_ms: None,
+            outline: None,
         };
         let _ = &mut o;
         e.frame(&FrameInput {
@@ -1810,5 +1811,39 @@ fn c06_tb_consecutive_stall_one_per_frame() {
     assert_eq!(out2.stall_render_ms, Some(200));
     assert_eq!(out2.finished.len(), 1);
     assert_eq!(out2.finished[0].action, "stall_render");
+    assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
+}
+
+/// REQ-013 C07 §1.3:`outline` 瞬时步置位 `FrameOutput::outline` 不阻塞后续等待步。
+#[test]
+fn c07_tb_outline_step_output() {
+    let mut e = engine(
+        "[[step]]\noutline = { on = true }\n\n\
+         [[step]]\nwait_ticks = { n = 1 }\n\n\
+         [[step]]\noutline = { on = false }",
+    );
+    let w = FlatWorld::with_entities(&[]);
+
+    // 第 1 帧:outline(true) 瞬时完成并进入 wait_ticks(1)。
+    let out1 = frame(&mut e, 0.016, 10, &w, &[]);
+    assert_eq!(out1.outline, Some(true));
+    let last1 = out1.finished.last().expect("第 1 帧应完成 outline 步");
+    assert_eq!(last1.action, "outline");
+    assert_eq!(last1.outcome, StepOutcome::Ok);
+
+    // 第 2 帧:wait_ticks 进行中,outline 为 None。
+    let out2 = frame(&mut e, 0.016, 10, &w, &[]);
+    assert_eq!(out2.outline, None);
+    assert!(out2.finished.is_empty());
+
+    // 第 3 帧:wait_ticks 结束并同帧执行 outline(false)。
+    let out3 = frame(&mut e, 0.016, 11, &w, &[]);
+    assert_eq!(out3.outline, Some(false));
+    let last3 = out3
+        .finished
+        .last()
+        .expect("第 3 帧应完成 outline(false) 步");
+    assert_eq!(last3.action, "outline");
+    assert_eq!(last3.outcome, StepOutcome::Ok);
     assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
 }

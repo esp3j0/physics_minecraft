@@ -26,8 +26,8 @@ const TOP_KEYS: [&str; 7] = [
 const STEP_KEYS: [&str; 1] = ["label"];
 /// 全部动作键(与 [`Action`] 一一对应;A06 §4 追加 5 个主体动作,B02c
 /// 追加 `adopt_agent`,C01b-3 R1 追加 `perf_reset`,C02-1 追加 `dig`/`place`/`select_material`,
-/// C05 追加 `stall_render`)。
-const ACTION_KEYS: [&str; 23] = [
+/// C05 追加 `stall_render`,C07 追加 `outline`)。
+const ACTION_KEYS: [&str; 24] = [
     "camera",
     "look_at",
     "fly",
@@ -51,6 +51,7 @@ const ACTION_KEYS: [&str; 23] = [
     "place",
     "select_material",
     "stall_render",
+    "outline",
 ];
 
 fn top_err(message: impl Into<String>) -> ScriptError {
@@ -355,6 +356,8 @@ fn parse_action(
         "select_material" => &["index"],
         // C05 §1.1:阻塞渲染线程验证 sim 解耦。
         "stall_render" => &["ms"],
+        // C07 §1.3:开关方块/区块描边叠加层。
+        "outline" => &["on"],
         other => return Err(e(format!("未知动作 \"{other}\""))),
     };
     reject_unknown(t, known, &format!("动作 {key}")).map_err(e)?;
@@ -643,6 +646,14 @@ fn parse_action(
                 )));
             }
             Ok(Action::StallRender { ms })
+        }
+        "outline" => {
+            let on = t
+                .get("on")
+                .ok_or_else(|| e("动作 outline 缺必填参数 on".into()))?;
+            Ok(Action::Outline {
+                on: bool_of(on, "outline.on").map_err(e)?,
+            })
         }
         "intent" => {
             let mv = t
