@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -537,6 +537,34 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   10-edit 截图早于流式上传前沿到前景,石块出框——场景截图宜等上传 settled,
   留后续小修;②render_stall 落体下落段仍不可见(C03 既有问题,未归因,
   见 C05 条)。④render_stall expect"白色落体"→"蓝色落体"已修。验收见 #27。
+- C08 ✅ 验收通过(2026-11-25):提交 9d5e906(9 文件白名单内,+938/−96)。
+  原 V01(#26,macroquad viewer 口径)经用户裁定改写并入本需求:准星拾取
+  附身任意已有主体。client-core `tools::agent_pick` 纯函数(pick_agent:
+  射线经连杆位姿逆变换到局部系做形状 AABB slab、最近优先、平局取小 ID、
+  未知哈希跳过、任何输入不 panic;pick_target:agent 有效当且仅当
+  dist < block_dist)+ `pick_at_camera_with_dist`(DDA 语义不变,带进入 t);
+  possess 状态机分离 `possessed_entity` 与 `my_body`(on_possessed(Some)
+  不写归属、removed 分支按附身对象/我的身体分别回退、P 加 agent_target
+  参、tick 超时按 my_body 回退);bevy 接线 ToolRes.agent_target +
+  interact_system 每帧拾取 + agent_highlight_system(Gizmos::cube 琥珀
+  线框,仅交互)+ HUD agent 行(to_bits);viewer/render.rs 仅机械签名适配。
+  手算锚 T1–T7、D1、S1–S6 + 无头接线 MS-P1/P2(RecordingTransport)。
+  任务书 R1 裁定:实施方预检停下指出 T3 手算 7 应为 3(原 V01 算术笔误,
+  7 是离开面)、白名单漏 viewer/render.rs(CI 编译 viewer)、t6d/t6g 旧语义
+  与 S1/M3 冲突,三条全采纳;另采纳 Gizmos SystemParam/cube、
+  Res<EntityRenderRes>、from_table 测试构造、to_bits HUD、§5 两按切换。
+  门禁:client 17/0 + client-core 244/0 + viewer 15+22+3+3/0 + clippy 0 +
+  fmt 0。变异:实施方 M1–M6 全击杀;架构师 MA slab 返回离开面 tmax→T1 红
+  (实得 6)/MB 附身对象移除恒回 HasBody→S4 红,还原干净。回归冒烟
+  (client_possess_walk + client_quad_policy)架构师复跑 failed 0、exit 0、
+  资产差 5=基线;审图亲视:10-walk 胶囊直立、11-flat-walk 狗直立平台边、
+  20-possessed-turn 绿(附身材质)、29-resumed 品红(策略恢复)。
+  过程阻塞:D 盘满 LNK1318,实施方零删除停下回报;架构师按既定批准口径
+  删可再生 incremental 26.5G + 陈旧重复 PDB 2.24G 后放行收尾。
+  遗留:①AI 审图 11-flat-walk pass=false(0.65,主体小置信度问题),数值
+  判据 failed 0、架构师亲视姿态正常,未归因保留;②§5 交互人工清单架构师
+  未实跑,以 MS-P1/P2 + 用户实跑覆盖(任务书允许口径);③#26 原 V01 由
+  本单元取代,验收后关闭。验收见 #27。
 
 ## 10. 决策记录与开放问题
 
