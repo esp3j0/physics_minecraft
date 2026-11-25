@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08、C09 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -563,8 +563,31 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   删可再生 incremental 26.5G + 陈旧重复 PDB 2.24G 后放行收尾。
   遗留:①AI 审图 11-flat-walk pass=false(0.65,主体小置信度问题),数值
   判据 failed 0、架构师亲视姿态正常,未归因保留;②§5 交互人工清单架构师
-  未实跑,以 MS-P1/P2 + 用户实跑覆盖(任务书允许口径);③#26 原 V01 由
+  未实跑,以 MS-P1/P2 + 用户实跑覆盖(任务书允许口径)——**已由 C09 自动化
+  闭环**(清单 1–5 → IT1–IT5 进 cargo test 门禁);③#26 原 V01 由
   本单元取代,验收后关闭。验收见 #27。
+- C09 ✅ 验收通过(2026-11-25):提交 ff889de(4 文件白名单内,+1022,
+  生产代码零改动)。用户拍板"所有测试自动化"后立项,把 C08 §5 人工清单
+  1–5 做成进 cargo test 门禁的无头集成测试 IT1–IT5:真服务器权威
+  (app::local 进程内宿主 + LocalTransport)+ tokio 暂停时钟(每拍
+  advance(17ms)+yield,口径同 C05 ac4)+ bevy 交互系统链无头装配
+  (MinimalPlugins+AssetPlugin+GizmoPlugin,不建 PrimaryWindow)+
+  QuadStand 恒站立狗(seed 3 平地)保证确定性;记录型 Transport wrapper
+  断言 C2S 帧序。IT1 指狗附身/第三人称相机手算锚 (root.x−4, root.y+0.6,
+  root.z)/WASD 意图路由/解除;IT2 隔墙(t=1.5<agent t≈4)不附身;
+  IT3 指地面实格 (24,−61,20) 生成+自动附身(SpawnAgent 先于 Possess);
+  IT4 两按切换(帧序 possess_a<unpossess<possess_b);IT5 琥珀线框公开
+  读取路径(GizmoHandles+Assets<GizmoAsset>)几何锚(strip/list 11+6、
+  NaN 断点 [10]、8 独立顶点质心=root、各顶点距 root=√3)+ HUD agent 行。
+  任务书两轮裁定均采纳实施方停下查证:R1 三项(GizmoPlugin 需
+  init_asset SkinnedMeshInverseBindposes、GizmoBuffer 非 Resource、
+  cube 几何非 24 list 端点)+4 细节(弧度/节流/格坐标/A 遮挡);
+  R2 两项(strip 实长 11 NaN 在 [10]、相机校验拍消费 last_sent 致按 W
+  被 50ms 墙钟节流,裁定 sleep 55ms 尊重生产语义)。门禁:client 22/0
+  (既有 17+IT5 条)+ clippy 0 + fmt 0;生产零改动不跑冒烟。变异:
+  实施方 N1–N5 全击杀;架构师 MA on_p_pressed spawn_target→None→IT3 红
+  (无 SpawnAgent)/MB 线框 scale 2→1→IT5 红(距离 0.866=√3/2),
+  还原干净复绿。C08 遗留②闭环。验收见 #27。
 
 ## 10. 决策记录与开放问题
 
