@@ -136,7 +136,7 @@ fn t6a_p_with_bigger_foreign_agent_spawns_and_possesses_own() {
     st.on_agents(&[agent_id(42)], &[]);
     assert_eq!(st.phase(), Phase::NoBody);
     // 按 P:发 SpawnAgent(不是 Possess(42))。
-    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 45.0)), t(0));
+    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 45.0)), None, t(0));
     assert_eq!(
         cmds,
         vec![PossessCommand::SpawnAgent {
@@ -169,7 +169,7 @@ fn t6a_p_with_bigger_foreign_agent_spawns_and_possesses_own() {
 fn t6b_block_receipt_first_then_body_receipt() {
     let mut st = PossessState::new();
     // P 生成(请求在途)。
-    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), None, t(0));
     // 先到一条方块 Spawned 回执(此前 viewer 放过方块)。
     st.on_spawned(EntityId::from_parts(0, 999));
     // 再到身体的 Spawned 回执。
@@ -190,7 +190,7 @@ fn t6b_block_receipt_first_then_body_receipt() {
 #[test]
 fn t6c_spawn_requested_times_out_to_no_body() {
     let mut st = PossessState::new();
-    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), None, t(0));
     assert_eq!(st.phase(), Phase::SpawnRequested);
     // 1.9 s:还没超时。
     st.tick(t(1_900));
@@ -208,7 +208,7 @@ fn t6c_spawn_requested_times_out_to_no_body() {
     assert!(cmds.is_empty(), "被拒后的迟到回执不自动附身");
     assert_eq!(st.phase(), Phase::HasBody);
     // 再按 P:有身体未附身 → Possess(走 HasBody 分支,不是再生成)。
-    let cmds = st.on_p_pressed(None, t(2_100));
+    let cmds = st.on_p_pressed(None, None, t(2_100));
     assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(1))]);
 }
 
@@ -221,7 +221,7 @@ fn t6c2_possess_requested_times_out_to_has_body() {
     let _ = st.on_agents(&[agent_id(2)], &[]);
     assert_eq!(st.phase(), Phase::HasBody);
     // P → PossessRequested。
-    let _ = st.on_p_pressed(None, t(0));
+    let _ = st.on_p_pressed(None, None, t(0));
     assert_eq!(st.phase(), Phase::PossessRequested);
     // 2 s 无 Possessed 回执 → HasBody。
     st.tick(t(2_000));
@@ -233,18 +233,20 @@ fn t6c2_possess_requested_times_out_to_has_body() {
     assert_eq!(st.my_body(), Some(agent_id(2)), "身体归属不丢");
 }
 
-/// (d) 服务器主动重生:未请求的 Spawned(id) + AgentStates 含 id +
-/// Possessed(Some(id)) → my_body = id、Possessed。
+/// (d) 服务器主动重生(C08 R1 口径更新):on_spawned 只记回执,on_possessed(Some) 不写
+/// my_body,归属在 on_agents(回执∩present)完成且已 Possessed 不回退。
 #[test]
 fn t6d_server_initiated_respawn_becomes_my_body() {
     let mut st = PossessState::new();
     // 未发任何请求:回执直接到(服务器主动生成)。
     st.on_spawned(agent_id(9));
+    assert_eq!(st.my_body(), None, "on_spawned 只记回执,归属在 on_agents");
     // Possessed(Some(9)) 先到(驱动重生路径:Spawned → Possessed 连发)。
     st.on_possessed(Some(agent_id(9)));
+    assert_eq!(st.phase(), Phase::Possessed);
     assert_eq!(st.possessed(), Some(agent_id(9)));
-    assert_eq!(st.my_body(), Some(agent_id(9)));
-    // 主体流随后含 9:归属已确认,保持 Possessed(不被回退)。
+    assert_eq!(st.my_body(), None, "on_possessed(Some) 不写 my_body");
+    // 主体流随后含 9:回执∩present 归属 my_body,已 Possessed 不回退。
     let cmds = st.on_agents(&[agent_id(9)], &[]);
     assert!(cmds.is_empty(), "已确认的归属不重复发 Possess");
     assert_eq!(st.phase(), Phase::Possessed);
@@ -258,7 +260,7 @@ fn t6e_removed_my_body_goes_no_body() {
     // 布景:已附身 3。
     st.on_spawned(agent_id(3));
     let _ = st.on_agents(&[agent_id(3)], &[]);
-    let _ = st.on_p_pressed(None, t(0));
+    let _ = st.on_p_pressed(None, None, t(0));
     st.on_possessed(Some(agent_id(3)));
     assert_eq!(st.phase(), Phase::Possessed);
     // 掉出世界:removed 含 3 → NoBody(等 Possessed(None) 收尾)。
@@ -270,7 +272,7 @@ fn t6e_removed_my_body_goes_no_body() {
     st.on_possessed(None);
     assert_eq!(st.phase(), Phase::NoBody);
     // 再按 P(有拾取目标):重新生成。
-    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), t(10));
+    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), None, t(10));
     assert!(matches!(
         cmds.as_slice(),
         [PossessCommand::SpawnAgent { .. }]
@@ -286,7 +288,7 @@ fn t6f_possessed_none_branches_on_body_presence() {
     let mut st = PossessState::new();
     st.on_spawned(agent_id(4));
     let _ = st.on_agents(&[agent_id(4)], &[]);
-    let _ = st.on_p_pressed(None, t(0));
+    let _ = st.on_p_pressed(None, None, t(0));
     st.on_possessed(Some(agent_id(4)));
     st.on_possessed(None);
     assert_eq!(st.phase(), Phase::HasBody, "身体还在 → HasBody");
@@ -309,17 +311,17 @@ fn t6f_possessed_none_branches_on_body_presence() {
 }
 
 /// (g) 已附身按 P → Unpossess;状态保持 Possessed 等 Possessed(None)。
-/// 中途插 Spawned 回执不影响。
+/// 无 my_body 时解除回到 NoBody(C08 R1 口径更新)。
 #[test]
 fn t6g_p_while_possessed_sends_unpossess() {
     let mut st = PossessState::new();
     st.on_possessed(Some(agent_id(6)));
-    let cmds = st.on_p_pressed(None, t(0));
+    let cmds = st.on_p_pressed(None, None, t(0));
     assert_eq!(cmds, vec![PossessCommand::Unpossess]);
     assert_eq!(st.phase(), Phase::Possessed, "Unpossess 发出后等服务器确认");
-    // 服务器确认解除。
+    // 服务器确认解除(无 my_body → NoBody)。
     st.on_possessed(None);
-    assert_eq!(st.phase(), Phase::HasBody);
+    assert_eq!(st.phase(), Phase::NoBody);
 }
 
 /// (h) 请求等待期(SpawnRequested/PossessRequested)按 P 被忽略(转移表
@@ -327,8 +329,8 @@ fn t6g_p_while_possessed_sends_unpossess() {
 #[test]
 fn t6h_p_ignored_while_request_pending() {
     let mut st = PossessState::new();
-    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
-    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), t(100));
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), None, t(0));
+    let cmds = st.on_p_pressed(Some((Vec3::ONE, 0.0)), None, t(100));
     assert!(cmds.is_empty(), "SpawnRequested 期间按 P 忽略(不重复生成)");
     assert_eq!(st.phase(), Phase::SpawnRequested);
 }
@@ -397,7 +399,7 @@ fn t6j_receipt_consumed_once() {
     assert_eq!(st.phase(), Phase::HasBody);
     // 自动路径:回执窗口内同 ID 第二次出现在 present,不再发 Possess。
     let mut st2 = PossessState::new();
-    let _ = st2.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    let _ = st2.on_p_pressed(Some((Vec3::ZERO, 0.0)), None, t(0));
     st2.on_spawned(agent_id(12));
     let cmds = st2.on_agents(&[agent_id(12)], &[]);
     assert_eq!(
@@ -434,7 +436,7 @@ fn t6k_receipts_capped() {
 fn r2_5_tick_arms_timeout_for_auto_possess_request() {
     let mut st = PossessState::new();
     // 按 P 生成 → SpawnRequested(此刻有计时起点,走 on_agents 时被清)。
-    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), t(0));
+    let _ = st.on_p_pressed(Some((Vec3::ZERO, 0.0)), None, t(0));
     assert_eq!(st.phase(), Phase::SpawnRequested);
     st.on_spawned(agent_id(20));
     let cmds = st.on_agents(&[agent_id(20)], &[]);
@@ -456,7 +458,7 @@ fn r2_5_tick_arms_timeout_for_auto_possess_request() {
         "自动附身请求 2 s 无回应 → HasBody(超时兜底生效)"
     );
     // P 键恢复有效:再按 P 重发 Possess。
-    let cmds = st.on_p_pressed(None, t(2_200));
+    let cmds = st.on_p_pressed(None, None, t(2_200));
     assert_eq!(
         cmds,
         vec![PossessCommand::Possess(agent_id(20))],
@@ -632,9 +634,14 @@ fn r3_camera_below_world_without_last_safe_lifts_y() {
 #[test]
 fn r3_p_press_hint_by_phase_and_target() {
     assert_eq!(
-        p_press_hint(Phase::NoBody, false),
+        p_press_hint(Phase::NoBody, false, false),
         Some("aim at the ground, then press P"),
-        "NoBody 且无拾取目标 → 提示"
+        "NoBody 且无地面且无主体目标 → 提示"
+    );
+    assert_eq!(
+        p_press_hint(Phase::NoBody, false, true),
+        None,
+        "NoBody 有主体目标 → 不提示"
     );
     for (phase, name) in [
         (Phase::NoBody, "NoBody"),
@@ -644,7 +651,7 @@ fn r3_p_press_hint_by_phase_and_target() {
         (Phase::Possessed, "Possessed"),
     ] {
         assert_eq!(
-            p_press_hint(phase, true),
+            p_press_hint(phase, true, false),
             None,
             "{name} 有拾取目标 → 不提示"
         );
@@ -656,7 +663,7 @@ fn r3_p_press_hint_by_phase_and_target() {
         (Phase::Possessed, "Possessed"),
     ] {
         assert_eq!(
-            p_press_hint(phase, false),
+            p_press_hint(phase, false, false),
             None,
             "{name} 无拾取目标也不提示(有身体/请求在途/已附身的按 P 有别的语义)"
         );
@@ -754,7 +761,7 @@ fn on_keys_intent_yaw_degrees_to_radians() {
 fn on_p_pressed_spawn_yaw_degrees_to_radians() {
     let mut st = PossessState::new();
     assert_eq!(st.phase(), Phase::NoBody);
-    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 90.0)), t(0));
+    let cmds = st.on_p_pressed(Some((Vec3::new(8.0, -57.0, 24.0), 90.0)), None, t(0));
     assert_eq!(cmds.len(), 1, "NoBody 按 P 应发一条 SpawnAgent");
     match &cmds[0] {
         PossessCommand::SpawnAgent { yaw, .. } => {
@@ -765,4 +772,134 @@ fn on_p_pressed_spawn_yaw_degrees_to_radians() {
         }
         other => panic!("应为 SpawnAgent,实为 {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// C08 §2 状态机锚 S1–S6(外来主体附身与 my_body 分离)
+// ---------------------------------------------------------------------------
+
+/// S1:NoBody -> on_p_pressed(agent=7) 发 Possess(7)、PossessRequested ->
+/// on_possessed(Some(7)) -> Possessed、possessed()=7、my_body()=None ->
+/// on_p_pressed -> Unpossess -> on_possessed(None) -> NoBody。
+#[test]
+fn s1_nobody_possess_foreign_agent_and_unpossess() {
+    let mut st = PossessState::new();
+    let cmds = st.on_p_pressed(None, Some(agent_id(7)), t(0));
+    assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(7))]);
+    assert_eq!(st.phase(), Phase::PossessRequested);
+
+    st.on_possessed(Some(agent_id(7)));
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.possessed(), Some(agent_id(7)));
+    assert_eq!(st.my_body(), None, "附身外来主体不写 my_body");
+
+    let cmds = st.on_p_pressed(None, None, t(10));
+    assert_eq!(cmds, vec![PossessCommand::Unpossess]);
+    st.on_possessed(None);
+    assert_eq!(st.phase(), Phase::NoBody);
+    assert_eq!(st.possessed(), None);
+}
+
+/// S2:my_body=3(HasBody) -> 附身 7 确认 -> Possessed(7) -> 解除 -> HasBody、my_body=3。
+#[test]
+fn s2_has_body_possess_foreign_agent_returns_has_body() {
+    let mut st = PossessState::new();
+    st.on_spawned(agent_id(3));
+    let _ = st.on_agents(&[agent_id(3)], &[]);
+    assert_eq!(st.phase(), Phase::HasBody);
+    assert_eq!(st.my_body(), Some(agent_id(3)));
+
+    let cmds = st.on_p_pressed(None, Some(agent_id(7)), t(0));
+    assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(7))]);
+    assert_eq!(st.phase(), Phase::PossessRequested);
+
+    st.on_possessed(Some(agent_id(7)));
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.possessed(), Some(agent_id(7)));
+    assert_eq!(st.my_body(), Some(agent_id(3)));
+
+    let cmds = st.on_p_pressed(None, None, t(10));
+    assert_eq!(cmds, vec![PossessCommand::Unpossess]);
+    st.on_possessed(None);
+    assert_eq!(st.phase(), Phase::HasBody);
+    assert_eq!(st.my_body(), Some(agent_id(3)));
+    assert_eq!(st.possessed(), None);
+}
+
+/// S3:NoBody 发 Possess(7) tick +2.001s -> NoBody;HasBody(my=3) 超时 -> HasBody。
+#[test]
+fn s3_possess_requested_timeout_branches_on_my_body() {
+    let mut st1 = PossessState::new();
+    let cmds = st1.on_p_pressed(None, Some(agent_id(7)), t(0));
+    assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(7))]);
+    assert_eq!(st1.phase(), Phase::PossessRequested);
+    st1.tick(t(2_001));
+    assert_eq!(st1.phase(), Phase::NoBody, "无 my_body 超时回 NoBody");
+
+    let mut st2 = PossessState::new();
+    st2.on_spawned(agent_id(3));
+    let _ = st2.on_agents(&[agent_id(3)], &[]);
+    assert_eq!(st2.phase(), Phase::HasBody);
+    let cmds = st2.on_p_pressed(None, Some(agent_id(7)), t(0));
+    assert_eq!(cmds, vec![PossessCommand::Possess(agent_id(7))]);
+    assert_eq!(st2.phase(), Phase::PossessRequested);
+    st2.tick(t(2_001));
+    assert_eq!(st2.phase(), Phase::HasBody, "有 my_body 超时回 HasBody");
+    assert_eq!(st2.my_body(), Some(agent_id(3)));
+}
+
+/// S4:Possessed(7) -> on_agents(removed=[7]) -> NoBody(无 my_body);S2 态下 -> HasBody。
+#[test]
+fn s4_removed_possessed_agent_falls_back_by_my_body() {
+    // 无 my_body
+    let mut st1 = PossessState::new();
+    st1.on_possessed(Some(agent_id(7)));
+    assert_eq!(st1.phase(), Phase::Possessed);
+    let _ = st1.on_agents(&[], &[agent_id(7)]);
+    assert_eq!(st1.phase(), Phase::NoBody);
+    assert_eq!(st1.possessed(), None);
+
+    // 有 my_body = 3
+    let mut st2 = PossessState::new();
+    st2.on_spawned(agent_id(3));
+    let _ = st2.on_agents(&[agent_id(3)], &[]);
+    st2.on_possessed(Some(agent_id(7)));
+    assert_eq!(st2.phase(), Phase::Possessed);
+    let _ = st2.on_agents(&[], &[agent_id(7)]);
+    assert_eq!(st2.phase(), Phase::HasBody);
+    assert_eq!(st2.my_body(), Some(agent_id(3)));
+    assert_eq!(st2.possessed(), None);
+}
+
+/// S5:Possessed(7)、my=3 -> removed=[3] -> 仍 Possessed(7)、my_body=None。
+#[test]
+fn s5_removed_my_body_while_possessing_foreign_keeps_possessed() {
+    let mut st = PossessState::new();
+    st.on_spawned(agent_id(3));
+    let _ = st.on_agents(&[agent_id(3)], &[]);
+    st.on_possessed(Some(agent_id(7)));
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.my_body(), Some(agent_id(3)));
+
+    let cmds = st.on_agents(&[], &[agent_id(3)]);
+    assert!(cmds.is_empty());
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.possessed(), Some(agent_id(7)));
+    assert_eq!(st.my_body(), None);
+}
+
+/// S6:Possessed(7) 中归属判定 my=3 -> 仍 Possessed(7)、my_body=3。
+#[test]
+fn s6_my_body_claim_while_possessing_foreign_keeps_possessed() {
+    let mut st = PossessState::new();
+    st.on_possessed(Some(agent_id(7)));
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.my_body(), None);
+
+    st.on_spawned(agent_id(3));
+    let cmds = st.on_agents(&[agent_id(3)], &[]);
+    assert!(cmds.is_empty());
+    assert_eq!(st.phase(), Phase::Possessed);
+    assert_eq!(st.possessed(), Some(agent_id(7)));
+    assert_eq!(st.my_body(), Some(agent_id(3)));
 }

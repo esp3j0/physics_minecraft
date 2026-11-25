@@ -23,6 +23,21 @@ use crate::script::WorldQuery;
 /// 拾取最远距离(REQ-011 §3.3 / C02-1 §1.5)。
 pub const PICK_MAX_DIST: f32 = 48.0;
 
+/// 按相机位姿沿前向射线做体素 DDA 拾取并返回进入目标格的射线距离 `t`(世界米)。
+///
+/// 方向约定与 `script::CameraPose::forward` 同式:`forward = (cy*cp, sp, sy*cp)`(角度为度)。
+pub fn pick_at_camera_with_dist(
+    world: &dyn WorldQuery,
+    origin: Vec3,
+    yaw_deg: f32,
+    pitch_deg: f32,
+) -> Option<(Hit, f32)> {
+    let (sy, cy) = yaw_deg.to_radians().sin_cos();
+    let (sp, cp) = pitch_deg.to_radians().sin_cos();
+    let dir = Vec3::new(cy * cp, sp, sy * cp);
+    pick_with_dist(world, origin, dir, PICK_MAX_DIST)
+}
+
 /// 按相机位姿沿前向射线做体素 DDA 拾取(REQ-013 C02-1 §1.5)。
 ///
 /// 方向约定与 `script::CameraPose::forward` 同式:`forward = (cy*cp, sp, sy*cp)`(角度为度)。
@@ -32,10 +47,7 @@ pub fn pick_at_camera(
     yaw_deg: f32,
     pitch_deg: f32,
 ) -> Option<Hit> {
-    let (sy, cy) = yaw_deg.to_radians().sin_cos();
-    let (sp, cp) = pitch_deg.to_radians().sin_cos();
-    let dir = Vec3::new(cy * cp, sp, sy * cp);
-    pick(world, origin, dir, PICK_MAX_DIST)
+    pick_at_camera_with_dist(world, origin, yaw_deg, pitch_deg).map(|(hit, _)| hit)
 }
 
 /// 一个拾取命中。
@@ -63,6 +75,16 @@ impl Hit {
 
 /// 体素 DDA 拾取(§3.3;AC-W1)。
 pub fn pick(world: &dyn WorldQuery, origin: Vec3, dir: Vec3, max_dist: f32) -> Option<Hit> {
+    pick_with_dist(world, origin, dir, max_dist).map(|(hit, _)| hit)
+}
+
+/// 体素 DDA 拾取并附带进入目标格的射线参数 `t`(世界米;起点已在实心格内为 `0.0`)。
+fn pick_with_dist(
+    world: &dyn WorldQuery,
+    origin: Vec3,
+    dir: Vec3,
+    max_dist: f32,
+) -> Option<(Hit, f32)> {
     if dir == Vec3::ZERO {
         return None;
     }
@@ -80,11 +102,14 @@ pub fn pick(world: &dyn WorldQuery, origin: Vec3, dir: Vec3, max_dist: f32) -> O
         && !block.is_air()
     {
         let face = main_axis_face(-dir.x, -dir.y, -dir.z);
-        return Some(Hit {
-            block_pos: cell,
-            block,
-            face,
-        });
+        return Some((
+            Hit {
+                block_pos: cell,
+                block,
+                face,
+            },
+            0.0,
+        ));
     }
 
     // 各轴:步进方向与到下一格边界的 t(射线 p = origin + t·dir,t ∈ [0, max_dist])。
@@ -125,7 +150,8 @@ pub fn pick(world: &dyn WorldQuery, origin: Vec3, dir: Vec3, max_dist: f32) -> O
         } else {
             1
         };
-        if t_max[axis] > max_dist {
+        let t_enter = t_max[axis];
+        if t_enter > max_dist {
             return None; // 越过最远距离仍无命中
         }
         let (axis, s) = (axis, step[axis]);
@@ -149,11 +175,14 @@ pub fn pick(world: &dyn WorldQuery, origin: Vec3, dir: Vec3, max_dist: f32) -> O
                 (_, s) if s > 0 => FaceDir::North,
                 _ => FaceDir::South,
             };
-            return Some(Hit {
-                block_pos: cell,
-                block,
-                face,
-            });
+            return Some((
+                Hit {
+                    block_pos: cell,
+                    block,
+                    face,
+                },
+                t_enter,
+            ));
         }
     }
 }

@@ -1244,13 +1244,13 @@ pub async fn run_viewer(addr: SocketAddr, view_distance: u8, stage: Option<&Path
                 // 不再喂"主体表 ID 最大的"。
                 #[allow(clippy::disallowed_methods)] // 墙钟(P 按下沿时刻;渲染侧授权)
                 let now = Instant::now();
-                let commands = possess_state.on_p_pressed(spawn_target, now);
+                let commands = possess_state.on_p_pressed(spawn_target, None, now);
                 // R3(§6 修订):按 P 发不出命令(NoBody 且准星下没有可
                 // 拾取的地面,典型 = 掉出世界后相机在世界底下)→ 提示
                 // (复用工具提示通道,3 秒过期)。
                 if commands.is_empty()
                     && let Some(hint) =
-                        possess::p_press_hint(possess_state.phase(), target.is_none())
+                        possess::p_press_hint(possess_state.phase(), target.is_none(), false)
                 {
                     tools.reject(hint);
                 }

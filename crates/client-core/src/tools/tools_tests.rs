@@ -224,3 +224,23 @@ fn ms17_hud_text_lines_and_fields() {
     assert_eq!(lines2.len(), 6, "1 条 notice 时恰 6 行");
     assert_eq!(lines2[5], "x", "末行为 notice 内容");
 }
+
+/// D1(REQ-013 C08 §1):`pick_at_camera_with_dist` 距离手算锚。
+/// ChunkMirror chunk(0,0) 仅 (0,-64,0) stone;origin=(-5,-63.5,0.5)、yaw=0、pitch=0 -> dist=5.0。
+#[test]
+fn d1_pick_at_camera_with_dist_anchor() {
+    use crate::mirror::ChunkMirror;
+    use types::ChunkPos;
+    use voxel::Chunk;
+
+    let mut chunk = Chunk::air();
+    chunk.set(0, 0, 0, voxel::builtin::STONE);
+    let mut mirror = ChunkMirror::new();
+    mirror.insert_chunk(ChunkPos::new(0, 0), chunk);
+
+    let (hit, dist) = pick_at_camera_with_dist(&mirror, Vec3::new(-5.0, -63.5, 0.5), 0.0, 0.0)
+        .expect("D1 必命中 (0,-64,0)");
+    assert_eq!(hit.block_pos, BlockPos::new(0, -64, 0));
+    assert_eq!(hit.block, voxel::builtin::STONE);
+    assert!((dist - 5.0).abs() <= 1e-5, "D1 期望 dist=5.0,实得 {dist}");
+}

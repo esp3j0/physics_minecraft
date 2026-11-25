@@ -40,7 +40,8 @@ use client_core::script::{
     WorldQuery, engine_commands_to_c2s, parse_scenario,
 };
 use client_core::tools::{
-    Hit, ToolAction, ToolState, dig, hud_text, pick_at_camera, place, select_material,
+    AgentHit, Hit, PICK_MAX_DIST, Target, ToolAction, ToolState, dig, hud_text, pick_agent,
+    pick_at_camera_with_dist, pick_target, place, select_material,
 };
 use client_core::world::WorldState;
 use client_core::{LocalTransport, SequencedTransport, Transport, config_from_server_table};
@@ -429,11 +430,12 @@ struct ScreenshotState {
 #[derive(Resource, Default, Debug, Clone, Copy)]
 struct ServerTickRes(u64);
 
-/// 交互工具状态资源(REQ-013 C02-1 §2.2;仅交互模式使用)。
+/// 交互工具状态资源(REQ-013 C02-1 §2.2 + C08 §3;仅交互模式使用)。
 #[derive(Resource, Default)]
 struct ToolRes {
     state: ToolState,
     last_hit: Option<Hit>,
+    pub agent_target: Option<AgentHit>,
     notices: Vec<(String, Instant)>,
 }
 
@@ -731,6 +733,7 @@ fn main() {
                 interact_system,
                 drain_transport_system,
                 sync_entities_system,
+                agent_highlight_system,
                 collect_mesh_tasks_system,
                 spawn_mesh_tasks_system,
                 hud_update_system,
@@ -961,6 +964,8 @@ fn interact_system(
     mouse_scroll: Res<AccumulatedMouseScroll>,
     mut meshes: ResMut<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    entity_mirror: Res<EntityMirrorRes>,
+    entity_render: Res<EntityRenderRes>,
     mut outline_res: ResMut<OutlineRes>,
     mut transport_res: ResMut<TransportRes>,
     mut tool_res: ResMut<ToolRes>,
@@ -979,7 +984,31 @@ fn interact_system(
     let cam_pos = conv::from_bevy_vec3(transform.translation);
     let yaw_deg = fly.yaw.to_degrees();
     let pitch_deg = fly.pitch.to_degrees();
-    tool_res.last_hit = pick_at_camera(&world_res.mirror, cam_pos, yaw_deg, pitch_deg);
+    let (last_hit, block_dist) =
+        match pick_at_camera_with_dist(&world_res.mirror, cam_pos, yaw_deg, pitch_deg) {
+            Some((hit, dist)) => (Some(hit), Some(dist)),
+            None => (None, None),
+        };
+    tool_res.last_hit = last_hit;
+
+    let agents: Vec<(EntityId, types::BodyHash, &[types::EntityState])> = entity_mirror
+        .0
+        .agents
+        .iter()
+        .map(|(&id, view)| (id, view.hash, view.poses.as_slice()))
+        .collect();
+    let cam_dir = conv::from_bevy_vec3(fly.forward());
+    let agent_hit = pick_agent(
+        &agents,
+        entity_render.table(),
+        cam_pos,
+        cam_dir,
+        PICK_MAX_DIST,
+    );
+    tool_res.agent_target = match pick_target(block_dist, agent_hit) {
+        Target::Agent(hit) => Some(hit),
+        Target::Block => None,
+    };
 
     if keys.just_pressed(KeyCode::Digit1) {
         select_material(&mut tool_res.state, 0);
@@ -1037,10 +1066,16 @@ fn interact_system(
                 let pz = top.z as f32 + 0.5;
                 (types::glam::Vec3::new(px, py, pz), yaw_deg)
             });
-            let commands = possess_res.state.on_p_pressed(spawn_target, now);
+            let agent_target = tool_res.agent_target.map(|h| h.entity);
+            let commands = possess_res
+                .state
+                .on_p_pressed(spawn_target, agent_target, now);
             if commands.is_empty()
-                && let Some(hint) =
-                    p_press_hint(possess_res.state.phase(), tool_res.last_hit.is_some())
+                && let Some(hint) = p_press_hint(
+                    possess_res.state.phase(),
+                    tool_res.last_hit.is_some(),
+                    tool_res.agent_target.is_some(),
+                )
             {
                 tool_res.push_notice(hint.to_owned(), now);
             }
@@ -1095,7 +1130,32 @@ fn interact_system(
     possess_res.was_possessed = possessed_id.is_some();
 }
 
-/// 交互模式 HUD 文本更新系统(REQ-013 C02-1 §3.2 / MS18 & PM26 靶点)。
+/// 准星指向主体时在根连杆绘制琥珀色线框标记(REQ-013 C08 §3;仅交互模式注册)。
+fn agent_highlight_system(
+    mut gizmos: Gizmos,
+    tool_res: Res<ToolRes>,
+    entity_mirror: Res<EntityMirrorRes>,
+) {
+    let Some(hit) = tool_res.agent_target else {
+        return;
+    };
+    let Some(view) = entity_mirror.0.agents.get(&hit.entity) else {
+        return;
+    };
+    let Some(root) = view.poses.first() else {
+        return;
+    };
+    gizmos.cube(
+        Transform {
+            translation: conv::to_bevy_vec3(root.translation),
+            rotation: conv::to_bevy_quat(root.rotation),
+            scale: Vec3::splat(2.0),
+        },
+        Color::srgb(1.0, 0.75, 0.2),
+    );
+}
+
+/// 交互模式 HUD 文本更新系统(REQ-013 C02-1 §3.2 / MS18 & PM26 靶点 + C08 §3)。
 fn hud_update_system(
     fps_history: Res<FpsHistoryRes>,
     server_tick: Res<ServerTickRes>,
@@ -1109,7 +1169,7 @@ fn hud_update_system(
     };
     let (mean_f64, min_f64) = fps_summary(&fps_history.dts_ms);
     let notices: Vec<String> = tool_res.notices.iter().map(|(m, _)| m.clone()).collect();
-    text.0 = hud_text(
+    let mut hud = hud_text(
         &tool_res.state,
         tool_res.last_hit.as_ref(),
         possess_res.state.phase(),
@@ -1118,6 +1178,10 @@ fn hud_update_system(
         world_res.mirror.chunks_loaded(),
         &notices,
     );
+    if let Some(hit) = tool_res.agent_target {
+        hud.push_str(&format!("\nagent: {} — P 附身/解除", hit.entity.to_bits()));
+    }
+    text.0 = hud;
 }
 
 /// 记录受 `BlockUpdates` 影响的 subchunk(含存在的边界邻段)到达帧号。
@@ -2879,6 +2943,165 @@ mod tests {
         assert!(
             (pitch - 1.553_343).abs() < 1e-6,
             "MS23 f: pitch 上界 clamp 实得 {pitch}"
+        );
+    }
+
+    /// 记录型传输(C08 MS-P1/MS-P2 无头接线测试用):记录全部上行 `C2S` 帧。
+    struct RecordingTransport(Arc<Mutex<Vec<C2S>>>);
+
+    impl RecordingTransport {
+        fn new() -> (Self, Arc<Mutex<Vec<C2S>>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            (Self(Arc::clone(&sent)), sent)
+        }
+    }
+
+    impl Transport for RecordingTransport {
+        fn send(&mut self, c2s: C2S) {
+            self.0.lock().expect("RecordingTransport lock").push(c2s);
+        }
+        fn drain(&mut self) -> Vec<S2C> {
+            Vec::new()
+        }
+    }
+
+    fn setup_interact_agent_pick_app(mirror: ChunkMirror) -> (App, Arc<Mutex<Vec<C2S>>>) {
+        use client_core::bodies::BodyShapeTable;
+        use client_core::entities::AgentView;
+        use types::{BodyDef, EntityState};
+
+        let box_toml = r#"
+name = "test_box"
+[[links]]
+name = "root"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [1.0, 1.0, 1.0]
+"#;
+        let def = BodyDef::from_toml_str(box_toml).expect("内联 box 定义合法");
+        let hash = def.hash();
+        let table = BodyShapeTable::from_defs([&def]);
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+
+        let (terrain_material, outline_material, entity_render) = {
+            let mut mats = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            let tm = mats.add(StandardMaterial::default());
+            let om = mats.add(StandardMaterial::default());
+            let er = EntityRenderRes::from_table(table, &mut mats);
+            (tm, om, er)
+        };
+
+        let mut entity_mirror = EntityMirrorRes::default();
+        entity_mirror.0.agents.insert(
+            EntityId::from_parts(0, 7),
+            AgentView {
+                hash,
+                poses: vec![EntityState {
+                    translation: types::glam::Vec3::new(10.0, -0.5, 0.5),
+                    rotation: types::glam::Quat::IDENTITY,
+                    linvel: types::glam::Vec3::ZERO,
+                    angvel: types::glam::Vec3::ZERO,
+                }],
+            },
+        );
+
+        let (transport, sent) = RecordingTransport::new();
+        let mut keys = ButtonInput::<KeyCode>::default();
+        keys.press(KeyCode::KeyP);
+
+        app.insert_resource(keys)
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(AccumulatedMouseScroll::default())
+            .insert_resource(WorldRenderRes {
+                mirror,
+                entities: BTreeMap::new(),
+                terrain_material,
+            })
+            .insert_resource(OutlineRes {
+                enabled: false,
+                entities: BTreeMap::new(),
+                material: outline_material,
+            })
+            .insert_resource(entity_mirror)
+            .insert_resource(entity_render)
+            .insert_resource(PossessRes::default())
+            .insert_resource(ToolRes::default())
+            .insert_resource(TransportRes::new(transport))
+            .add_systems(Update, interact_system);
+
+        app.world_mut().spawn((
+            Transform::from_xyz(0.0, -0.5, 0.5),
+            FlyCamera {
+                yaw: 0.0,
+                pitch: 0.0,
+                cursor_grabbed: true,
+            },
+        ));
+
+        (app, sent)
+    }
+
+    /// MS-P1(REQ-013 C08 §3):准星指主体按 P → 发 `C2S::Possess { entity: 7 }`、
+    /// 相位 `PossessRequested`、无 `SpawnAgent`。
+    #[test]
+    fn ms_p1_aim_agent_press_p_sends_possess() {
+        let (mut app, sent) = setup_interact_agent_pick_app(ChunkMirror::new());
+        app.update();
+
+        let recorded = sent.lock().expect("sent lock");
+        let target_id = EntityId::from_parts(0, 7);
+        assert!(
+            recorded.contains(&C2S::Possess { entity: target_id }),
+            "MS-P1 必须发出 C2S::Possess(7),实得: {recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|c| matches!(c, C2S::SpawnAgent { .. })),
+            "MS-P1 不应发出 SpawnAgent,实得: {recorded:?}"
+        );
+        assert_eq!(
+            app.world().resource::<PossessRes>().state.phase(),
+            possess::Phase::PossessRequested
+        );
+        let hit = app
+            .world()
+            .resource::<ToolRes>()
+            .agent_target
+            .expect("MS-P1 agent_target 应命中");
+        assert_eq!(hit.entity, target_id);
+        assert!((hit.dist - 9.0).abs() <= 1e-5, "实得 dist={}", hit.dist);
+    }
+
+    /// MS-P2(REQ-013 C08 §3):隔墙指主体按 P(block t=2 < agent t=9)→
+    /// 走方块生成路径发 `C2S::SpawnAgent`、无 `Possess`。
+    #[test]
+    fn ms_p2_wall_occludes_agent_press_p_spawns() {
+        let mut chunk = Chunk::air();
+        // (2, -1, 0): local_x = 2, local_y = -1 - WORLD_Y_MIN = 63, local_z = 0
+        chunk.set(2, (-1 - WORLD_Y_MIN) as usize, 0, STONE);
+        let mut mirror = ChunkMirror::new();
+        mirror.insert_chunk(ChunkPos::new(0, 0), chunk);
+        assert_eq!(mirror.block(BlockPos::new(2, -1, 0)), Some(STONE));
+
+        let (mut app, sent) = setup_interact_agent_pick_app(mirror);
+        app.update();
+
+        let recorded = sent.lock().expect("sent lock");
+        assert!(
+            recorded.iter().any(|c| matches!(c, C2S::SpawnAgent { .. })),
+            "MS-P2 隔墙应走生成路径发 SpawnAgent,实得: {recorded:?}"
+        );
+        assert!(
+            !recorded.iter().any(|c| matches!(c, C2S::Possess { .. })),
+            "MS-P2 隔墙不应发出 Possess,实得: {recorded:?}"
+        );
+        assert!(
+            app.world().resource::<ToolRes>().agent_target.is_none(),
+            "MS-P2 方块遮挡时 agent_target 必须为 None"
         );
     }
 }

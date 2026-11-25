@@ -153,11 +153,13 @@ pub struct PossessState {
     phase: Phase,
     /// 我的身体(归属规则:收到过回执 + 出现在主体流)。
     my_body: Option<EntityId>,
+    /// 当前附身对象(可为外来主体,与 `my_body` 分离)。
+    possessed_entity: Option<EntityId>,
     /// 最近收到的 `Spawned` 回执,最多留 64 条(去重窗口)。
     receipts: VecDeque<EntityId>,
     /// 身体出现后是否自动发 Possess(P 生成路径置位)。
     auto_possess: bool,
-    /// `SpawnRequested` 的进入时刻(tick 超时用)。
+    /// `SpawnRequested`/`PossessRequested` 的进入时刻(tick 超时用)。
     requested_at: Option<std::time::Instant>,
     /// 上一帧的意图(变化检测;None = 尚未发过)。
     last_intent: Option<((f32, f32), f32)>,
@@ -180,6 +182,7 @@ impl PossessState {
         Self {
             phase: Phase::NoBody,
             my_body: None,
+            possessed_entity: None,
             receipts: VecDeque::new(),
             auto_possess: false,
             requested_at: None,
@@ -200,10 +203,10 @@ impl PossessState {
         self.my_body
     }
 
-    /// 当前附身的主体(`Phase::Possessed` 时 = `my_body`)。
+    /// 当前附身的主体(`Phase::Possessed` 时返回 `possessed_entity`,可为外来主体)。
     pub fn possessed(&self) -> Option<EntityId> {
         match self.phase {
-            Phase::Possessed => self.my_body,
+            Phase::Possessed => self.possessed_entity,
             _ => None,
         }
     }
@@ -234,34 +237,41 @@ impl PossessState {
     /// 主体流更新(`ViewEvent::Agents`;present = 本帧可见的主体 ID,
     /// removed = 本帧被移除的):归属判定 + 转移。
     ///
-    /// - present 里有 id ∈ receipts → 那是我的身体(从 receipts 删掉,防止
-    ///   同 ID 重复判定):`auto_possess` 为真发 Possess、清标志、→
-    ///   `PossessRequested`;否则 → `HasBody`。例外:该 ID 已被
-    ///   `Possessed(Some)` 确认(服务器主动重生且回执先于主体流到达)→
-    ///   只清 receipts,保持 `Possessed`(on_possessed(Some) 的"任何状态
-    ///   → Possessed"不被主体流事件回退)。
-    /// - removed 含 `my_body` → `my_body = None`,→ `NoBody`(等待服务器
-    ///   的 `Possessed(None)` 做相机侧收尾;本方法只管归属)。
+    /// - removed 含 `my_body`:只清 `my_body`;若当前附身别的主体则保持 `Possessed` 不回退。
+    /// - removed 含 `possessed_entity`:清 `possessed_entity`,有 `my_body` → `HasBody` 否则 `NoBody`。
+    /// - present 含 id ∈ receipts:归属 `my_body = Some(id)`,已 `Possessed` 时不回退相位。
     pub fn on_agents(&mut self, present: &[EntityId], removed: &[EntityId]) -> Vec<PossessCommand> {
         let mut commands = Vec::new();
         for id in removed {
             if self.my_body == Some(*id) {
                 self.my_body = None;
-                // 附身中被移除:等 Possessed(None) 收尾(相机、意图状态);
-                // 未附身有身体:直接没身体。两种都 → NoBody。
-                self.phase = Phase::NoBody;
-                self.auto_possess = false;
-                self.requested_at = None;
+                if self.phase != Phase::Possessed {
+                    self.phase = Phase::NoBody;
+                    self.auto_possess = false;
+                    self.requested_at = None;
+                }
+            }
+            if self.possessed_entity == Some(*id) {
+                self.possessed_entity = None;
+                if self.phase == Phase::Possessed {
+                    self.phase = if self.my_body.is_some() {
+                        Phase::HasBody
+                    } else {
+                        Phase::NoBody
+                    };
+                    self.auto_possess = false;
+                    self.requested_at = None;
+                }
             }
         }
         for id in present {
             if let Some(pos) = self.receipts.iter().position(|r| r == id) {
                 self.receipts.remove(pos);
-                if self.phase == Phase::Possessed && self.my_body == Some(*id) {
-                    // 归属已由 Possessed(Some) 确认(见上例外)。
+                self.my_body = Some(*id);
+                if self.phase == Phase::Possessed {
+                    self.auto_possess = false;
                     continue;
                 }
-                self.my_body = Some(*id);
                 self.requested_at = None;
                 if self.auto_possess {
                     self.auto_possess = false;
@@ -276,20 +286,21 @@ impl PossessState {
     }
 
     /// `Possessed` 回执(渲染层透传;任何相位都消费):
-    /// - `Some(x)`:服务器确认附身 → `my_body = x`、→ `Possessed`;意图
-    ///   节流状态清零(下一条意图立即发)。
-    /// - `None`:回飞行相机——`my_body` 还在 → `HasBody`,否则 → `NoBody`;
+    /// - `Some(x)`:服务器确认附身 → `possessed_entity = Some(x)`、→ `Possessed`,不写 `my_body`;
+    ///   意图节流状态清零。
+    /// - `None`:回飞行相机 → `possessed_entity = None`,有 `my_body` → `HasBody`,否则 → `NoBody`;
     ///   意图状态清零。
     pub fn on_possessed(&mut self, entity: Option<EntityId>) {
         self.last_intent = None;
         self.last_sent = None;
         match entity {
             Some(x) => {
-                self.my_body = Some(x);
+                self.possessed_entity = Some(x);
                 self.phase = Phase::Possessed;
                 self.requested_at = None;
             }
             None => {
+                self.possessed_entity = None;
                 self.phase = if self.my_body.is_some() {
                     Phase::HasBody
                 } else {
@@ -301,20 +312,25 @@ impl PossessState {
         }
     }
 
-    /// `P` 按下沿(R1 §3.2 转移表;`spawn_target` 中 yaw 度):
-    /// - `NoBody` + 有 spawn_target → 发 SpawnAgent、`auto_possess = true`、
-    ///   → `SpawnRequested`;
-    /// - `HasBody` → 发 Possess(my_body)、→ `PossessRequested`;
-    /// - `Possessed` → 发 Unpossess(状态等服务器的 `Possessed(None)` 再变);
-    /// - 其他(SpawnRequested / PossessRequested / 无目标)→ 忽略。
+    /// `P` 按下沿(REQ-013 C08 §2 转移表;`spawn_target` 中 yaw 度):
+    /// - `Possessed` → 发 Unpossess(等服务器 `Possessed(None)` 再变);
+    /// - `NoBody`/`HasBody` + `agent_target = Some(x)` → 发 `Possess(x)`、→ `PossessRequested`;
+    /// - `NoBody` + 无 agent + `spawn_target` → 发 `SpawnAgent`、`auto_possess = true`、→ `SpawnRequested`;
+    /// - `HasBody` + 无 agent → 发 `Possess(my_body)`、→ `PossessRequested`;
+    /// - 其他(`SpawnRequested` / `PossessRequested` / 无目标)→ 忽略。
     pub fn on_p_pressed(
         &mut self,
         spawn_target: Option<(Vec3, f32)>,
+        agent_target: Option<EntityId>,
         now: std::time::Instant,
     ) -> Vec<PossessCommand> {
         match self.phase {
-            Phase::NoBody => match spawn_target {
-                Some((position, yaw)) => {
+            Phase::NoBody => {
+                if let Some(agent) = agent_target {
+                    self.requested_at = Some(now);
+                    self.phase = Phase::PossessRequested;
+                    vec![PossessCommand::Possess(agent)]
+                } else if let Some((position, yaw)) = spawn_target {
                     self.auto_possess = true;
                     self.requested_at = Some(now);
                     self.phase = Phase::SpawnRequested;
@@ -322,17 +338,23 @@ impl PossessState {
                         position,
                         yaw: yaw.to_radians(),
                     }]
+                } else {
+                    Vec::new()
                 }
-                None => Vec::new(),
-            },
-            Phase::HasBody => match self.my_body {
-                Some(body) => {
+            }
+            Phase::HasBody => {
+                if let Some(agent) = agent_target {
+                    self.requested_at = Some(now);
+                    self.phase = Phase::PossessRequested;
+                    vec![PossessCommand::Possess(agent)]
+                } else if let Some(body) = self.my_body {
                     self.requested_at = Some(now);
                     self.phase = Phase::PossessRequested;
                     vec![PossessCommand::Possess(body)]
+                } else {
+                    Vec::new()
                 }
-                None => Vec::new(),
-            },
+            }
             Phase::Possessed => vec![PossessCommand::Unpossess],
             Phase::SpawnRequested | Phase::PossessRequested => Vec::new(),
         }
@@ -398,7 +420,11 @@ impl PossessState {
                 self.requested_at = None;
             }
             Phase::PossessRequested => {
-                self.phase = Phase::HasBody;
+                self.phase = if self.my_body.is_some() {
+                    Phase::HasBody
+                } else {
+                    Phase::NoBody
+                };
                 self.requested_at = None;
             }
             _ => self.requested_at = None,
@@ -443,12 +469,17 @@ pub fn camera_after_body_lost(current: Vec3, last_safe: Option<Vec3>, y_min: f32
     }
 }
 
-/// 按 P 但发不出命令时给用户的提示(R3 §6 修订;能发命令或不需要提示
-/// 时 None)。`NoBody` 且没有拾取目标 → 掉出世界后相机在世界底下时用户
-/// 按 P 无任何反馈的兜底提示。
-pub fn p_press_hint(phase: Phase, has_target: bool) -> Option<&'static str> {
+/// 按 P 但发不出命令时给用户的提示(R3 §6 修订 + C08 §2;能发命令或不需要提示
+/// 时 None)。`NoBody` 且无地面目标且无主体目标 → 提示。
+pub fn p_press_hint(
+    phase: Phase,
+    has_target: bool,
+    has_agent_target: bool,
+) -> Option<&'static str> {
     match phase {
-        Phase::NoBody if !has_target => Some("aim at the ground, then press P"),
+        Phase::NoBody if !has_target && !has_agent_target => {
+            Some("aim at the ground, then press P")
+        }
         _ => None,
     }
 }

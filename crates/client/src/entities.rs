@@ -65,6 +65,13 @@ pub(crate) struct EntityRenderRes {
 
 impl EntityRenderRes {
     pub(crate) fn new(bodies_dir: &Path, materials: &mut Assets<StandardMaterial>) -> Self {
+        Self::from_table(BodyShapeTable::from_dir(bodies_dir), materials)
+    }
+
+    pub(crate) fn from_table(
+        table: BodyShapeTable,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Self {
         let agent_material = materials.add(StandardMaterial {
             base_color: AGENT_COLOR,
             perceptual_roughness: 0.7,
@@ -84,7 +91,7 @@ impl EntityRenderRes {
             ..default()
         });
         Self {
-            table: BodyShapeTable::from_dir(bodies_dir),
+            table,
             mesh_templates: BTreeMap::new(),
             agent_material,
             possessed_material,
@@ -92,6 +99,11 @@ impl EntityRenderRes {
             agents: BTreeMap::new(),
             solids: BTreeMap::new(),
         }
+    }
+
+    /// 身体形状表访问器(供主体拾取系统读取)。
+    pub fn table(&self) -> &BodyShapeTable {
+        &self.table
     }
 
     /// 客户端自有全部带 Mesh 的非地形实体数(主体连杆 shape 子实体 + solid 实体;D5 口径)。

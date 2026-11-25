@@ -8,6 +8,7 @@
 //! 场景布景([`stage`],W05)按单元推进。
 
 mod actions;
+mod agent_pick;
 mod launch;
 mod panel;
 mod pick;
@@ -18,13 +19,14 @@ pub mod tests_support;
 
 pub use actions::{PLACEABLE_CYCLE, ToolAction};
 pub use actions::{dig, place, select_material};
+pub use agent_pick::{AgentHit, Target, pick_agent, pick_target};
 pub use launch::{
     ChargeState, LaunchShape, adjust_preset_speed, charge_speed, launch_request, speed_bar,
 };
 pub use panel::{
     DebugPacket, PanelColor, PanelLine, PanelState, disconnect_text, is_break, panel_lines,
 };
-pub use pick::{Hit, PICK_MAX_DIST, pick, pick_at_camera};
+pub use pick::{Hit, PICK_MAX_DIST, pick, pick_at_camera, pick_at_camera_with_dist};
 pub use prefab::{ExpandError, Orientation, Prefab, expand, orientation_from_yaw};
 pub use stage::{
     StageDriver, StageOut, StagePhase, StageSplit, has_server_table, is_action_step, split,
