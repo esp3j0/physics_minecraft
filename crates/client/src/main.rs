@@ -4,6 +4,8 @@
 //! 本 crate 负责 CLI(交互与脚本冒烟模式)、LocalTransport 装配、
 //! `AsyncComputeTaskPool` 异步网格上传、飞行相机、光照与截图。
 
+#[cfg(test)]
+mod c09_tests;
 mod conv;
 mod entities;
 

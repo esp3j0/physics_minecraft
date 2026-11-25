@@ -1871,6 +1871,7 @@ dependencies = [
  "messaging",
  "sim-api",
  "tempfile",
+ "tokio",
  "types",
  "voxel",
 ]
