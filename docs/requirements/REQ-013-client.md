@@ -269,8 +269,9 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   C03-2 验收:app `dual_path::ac5_dual_path_bit_exact_consistency` 绿
   (quad_gpu1 真实策略包);check-policy quad_gpu1 加载 OK、quad_mj1_ft
   probe 总最大差 2.980e-7;见 §11 C03-2 归档。
-- [ ] AC6:meshing 异步不阻塞渲染线程;方块编辑 → 画面 ≤ 2 帧;
-  编辑风暴(脚本连挖 64 格)期间 FPS ≥ 55(实测报告)。
+- [x] AC6:meshing 异步不阻塞渲染线程;方块编辑 → 画面 ≤ 2 帧;
+  编辑风暴(脚本连挖 64 格)期间 FPS ≥ 55(实测报告;2026-11-25 2080Ti
+  基准机复测三轮 fps_storm_min 139.60/140.30/139.58,见 §11 补记)。
 - [x] AC7:viewer 纯逻辑层(client/possess/world/script/tools)
   搬运后既有测试全绿,语义不变。
   C06 收尾验证:viewer 仅余 cli/mesh/render(渲染侧),纯逻辑单源在
@@ -588,6 +589,12 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   实施方 N1–N5 全击杀;架构师 MA on_p_pressed spawn_target→None→IT3 红
   (无 SpawnAgent)/MB 线框 scale 2→1→IT5 红(距离 0.866=√3/2),
   还原干净复绿。C08 遗留②闭环。验收见 #27。
+- AC6 基准机复测 ✅(2026-11-25):用户 2080Ti Windows 机(192.168.6.140)
+  由架构师远程配置(Git/rustup/VS BuildTools + 克隆 ~/rep/physics_minecraft),
+  client_edit_storm 三轮 fps_storm_min 139.60/140.30/139.58(≥55,极差 <0.72),
+  failed_checks 0,截图亲视与 expect 一致;AC6 勾选,§11 补记归档。
+  **AC1–AC8 全部达成**。过程坑:SSH 非交互会话 GUI 零输出超时,改交互会话
+  计划任务运行。见 #27。
 
 ## 10. 决策记录与开放问题
 
@@ -650,6 +657,28 @@ edit_storm fps_mean 59.875/uploads 605。uploads 含空段且受帧对齐 ±8 �
 截图 readback 停顿已证实会拉低窗内 FPS(窗内含 before 截图 20.11 vs 无截图
 55.13,故 before 截图前移到采样窗之前);核显带宽/帧调度抖动部分未跨机验证,
 **未归因**,待 2080Ti 级基准机复测后由架构师走 §4 修订流程定值。
+
+**2080Ti 基准机复测补记(2026-11-25,AC6 闭环)**。环境:用户基准机
+NVIDIA GeForce RTX 2080 Ti / Win11 专业版(esp3j@192.168.6.140,SSH 免密),
+仓库克隆 ~/rep/physics_minecraft(HEAD 2e2a779),rustup stable-msvc +
+VS BuildTools 14.44,dev opt-level=2、CARGO_INCREMENTAL=0、DpiUnaware,
+口径与 §11 基线一致;冒烟经交互会话计划任务运行(SSH 非交互会话起不了
+GUI 窗口,首轮 client 零输出超时,改交互会话后正常)。场景
+client_edit_storm 连跑三轮,manifest 目录
+target/smoke/client-20261125-175402 / -175619 / -175806(基准机本地):
+
+| 轮 | fps_storm_min | storm_frames | fps_mean | failed_checks |
+| --- | --- | --- | --- | --- |
+| 1 | 139.599 | 16 | 143.961 | 0 |
+| 2 | 140.296 | 16 | 143.924 | 0 |
+| 3 | 139.577 | 16 | 144.002 | 0 |
+
+三轮均 ≥55 且跨轮极差 <0.72 FPS,稳定达标;mesh_max 0.217 ms(≤4)、
+sim_p95 0.1323 ms(≤8)。审图亲视(第三轮 04-before/73-after):before 平整
+地表无沟槽、after 沿 +x 一条 1 格深沟槽、无残留闪烁碎片,与场景 expect
+一致。结论:**AC6 达成**;780M 跨轮波动经跨机验证归因为核显环境特性
+(基准机稳定远超判据),非产品缺陷,判据不放宽、以基准机实测为准。
+AI 审图在基准机未运行(zcode 运行时缺失),截图由架构师亲视闭环。
 
 审图:baseline 截图 09-baseline.png(tick 1310、live 64、chunks 289)顶视棕色
 地表连续铺满全帧,与 expect 一致(主体/刚体渲染属 C03)。白盒归因:spawn 默认
