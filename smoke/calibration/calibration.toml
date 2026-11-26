@@ -26,3 +26,18 @@ pass = false
 file = "flat-ground.png"
 expect = "俯视一片平坦的棕色泥土地面,上方是浅蓝色天空;地面连续完整,没有缺块、空洞或整块缺失的区块"
 pass = true
+
+[[case]]
+file = "client-flat-ground.png"
+expect = "斜视一片平坦的棕色泥土地面,背景为深灰色天空,地面延伸到画面上缘的斜向地平线边界(有限世界自然边界),地面内部没有缺块或空洞"
+pass = true
+
+[[case]]
+file = "client-flat-ground.png"
+expect = "画面上方是浅蓝色天空"
+pass = false
+
+[[case]]
+file = "client-flat-ground.png"
+expect = "画面中部有一只品红色四足实体"
+pass = false
