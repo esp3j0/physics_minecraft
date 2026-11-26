@@ -323,6 +323,7 @@ fn parse_action(
             "chunks_loaded",
             "no_floating",
             "agent_in",
+            "agent_delta_in",
             "agent_moved",
             "agent_alive",
             "timeout_ticks",
@@ -336,6 +337,7 @@ fn parse_action(
             "chunks_loaded",
             "no_floating",
             "agent_in",
+            "agent_delta_in",
             "agent_moved",
             "agent_alive",
         ],
@@ -865,6 +867,33 @@ fn parse_checks(
                     to: hi,
                 });
             }
+            "agent_delta_in" => {
+                let at = value.as_table().ok_or_else(|| {
+                    "agent_delta_in 应为 { label = \"..\", from = [..], to = [..] } 形式的表"
+                        .to_owned()
+                })?;
+                reject_unknown(at, &["label", "from", "to"], "agent_delta_in")?;
+                let label = at
+                    .get("label")
+                    .ok_or_else(|| "agent_delta_in 缺 label".to_owned())
+                    .and_then(|v| str_of(v, "agent_delta_in.label"))?;
+                let from = at
+                    .get("from")
+                    .ok_or_else(|| "agent_delta_in 缺 from".to_owned())
+                    .and_then(|v| vec3(v, "agent_delta_in.from"))?;
+                let to = at
+                    .get("to")
+                    .ok_or_else(|| "agent_delta_in 缺 to".to_owned())
+                    .and_then(|v| vec3(v, "agent_delta_in.to"))?;
+                // 闭区间盒:from/to 各分量不要求有序,统一规整为 min/max(同 agent_in 口径)。
+                let lo = Vec3::new(from.x.min(to.x), from.y.min(to.y), from.z.min(to.z));
+                let hi = Vec3::new(from.x.max(to.x), from.y.max(to.y), from.z.max(to.z));
+                checks.push(Check::AgentDeltaIn {
+                    label,
+                    from: lo,
+                    to: hi,
+                });
+            }
             "agent_moved" => {
                 let mt = value.as_table().ok_or_else(|| {
                     "agent_moved 应为 { label = \"..\", ge = 米 } 或 { label = \"..\", le = 米 } 形式的表"
@@ -1034,7 +1063,7 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
 
     // A06 §4 校验(解析期,跨步骤):错误各指名步骤(从 1 起)。
     // ① 主体动作的引用链:possess 的 label 必须先有 spawn_agent/adopt_agent
-    //    登记(E03 R1-a);agent_moved 的 label 必须先有同标签的 mark_agent;
+    //    登记(E03 R1-a);agent_moved/agent_delta_in 的 label 必须先有同标签的 mark_agent;
     //    agent_in/agent_alive 的 label 必须已由 spawn_agent/adopt_agent 定义。
     // ② 一场景最多一个身体:spawn_agent 至多一条(放行 §4);adopt_agent
     //    条数不限,但标签不许与 spawn_agent/其他 adopt_agent 重复(B02c §2.2)。
@@ -1146,7 +1175,7 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                             refer_registered(label, "mark_agent")?;
                         }
                     }
-                    marks.insert(label.clone(), step_no);
+                    marks.entry(label.clone()).or_insert(step_no);
                 }
                 _ => {}
             }
@@ -1189,10 +1218,19 @@ pub(super) fn parse_scenario(text: &str) -> Result<Scenario, ScriptError> {
                     }
                     Check::AgentMoved { label, .. } => {
                         refer_label(label, "agent_moved")?;
-                        if !marks.contains_key(label) {
+                        if marks.get(label).is_none_or(|&m| m >= step_no) {
                             return Err(step_err(
                                 step_no,
                                 format!("agent_moved 前没有同标签的 mark_agent(\"{label}\")"),
+                            ));
+                        }
+                    }
+                    Check::AgentDeltaIn { label, .. } => {
+                        refer_label(label, "agent_delta_in")?;
+                        if marks.get(label).is_none_or(|&m| m >= step_no) {
+                            return Err(step_err(
+                                step_no,
+                                format!("agent_delta_in 前没有同标签的 mark_agent(\"{label}\")"),
                             ));
                         }
                     }

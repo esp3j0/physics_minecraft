@@ -232,6 +232,12 @@ pub enum Check {
         from: Vec3,
         to: Vec3,
     },
+    /// 相对同标签 mark_agent 基准点的位移盒(C12 R1):pos − mark 各分量闭区间。
+    AgentDeltaIn {
+        label: String,
+        from: Vec3,
+        to: Vec3,
+    },
     /// 主体相对 `mark_agent` 记录点的位移满足比较(A06 §4;米,`ge`/`le`
     /// 恰一个——None 侧 = 无该向约束;两个都 None = 解析错误)。
     AgentMoved {

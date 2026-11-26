@@ -1329,6 +1329,40 @@ impl EngineInner {
                         )),
                     }
                 }
+                Check::AgentDeltaIn { label, from, to } => {
+                    let Some(id) = self.agent_labels.get(label) else {
+                        msgs.push(format!(
+                            "agent_delta_in:标签 \"{label}\" 未登记(spawn_agent 回执未到)"
+                        ));
+                        continue;
+                    };
+                    let Some(mark) = self.agent_marks.get(label) else {
+                        msgs.push(format!(
+                            "agent_delta_in:标签 \"{label}\" 没有 mark_agent 基准点(解析期应已拦截;运行期标记步骤失败)"
+                        ));
+                        continue;
+                    };
+                    match Self::agent_root(input.world, *id) {
+                        Some(p) => {
+                            let d = p - *mark;
+                            let inside = d.x >= from.x
+                                && d.x <= to.x
+                                && d.y >= from.y
+                                && d.y <= to.y
+                                && d.z >= from.z
+                                && d.z <= to.z;
+                            if !inside {
+                                msgs.push(format!(
+                                    "agent_delta_in:相对 mark 位移 ({:.2}, {:.2}, {:.2}) 不在盒 {from:?}..{to:?} 内",
+                                    d.x, d.y, d.z
+                                ));
+                            }
+                        }
+                        None => msgs.push(format!(
+                            "agent_delta_in:主体(标签 \"{label}\")不在主体表(未生成或已移除)"
+                        )),
+                    }
+                }
                 Check::AgentMoved { label, ge, le } => {
                     let Some(id) = self.agent_labels.get(label) else {
                         msgs.push(format!(

@@ -1847,3 +1847,175 @@ fn c07_tb_outline_step_output() {
     assert_eq!(last3.outcome, StepOutcome::Ok);
     assert_eq!(e.status(), &EngineStatus::Done { failed_checks: 0 });
 }
+
+/// C12 R1:`agent_delta_in` 相对 mark_agent 基准点位移盒的 6 个锚点分支。
+#[test]
+fn c12r1_agent_delta_in_anchors() {
+    use crate::script::{Action, Check, Scenario, Step};
+
+    let mark = Vec3::new(10.0, -60.0, 20.0);
+    let root = Vec3::new(11.0, -59.9, 20.9);
+    // 手算 Δ = root - mark = (1.0, 0.1, 0.9)。
+    let w_present = FlatWorld::with_agents(&[(eid(1), root)]);
+    let w_empty = FlatWorld::default();
+
+    let run_parsed = |from: [f32; 3], to: [f32; 3]| -> StepOutcome {
+        let mut e = engine(&format!(
+            "[[step]]\n\
+             adopt_agent = {{ label = \"dog\", near = [10.0, -60.0, 20.0], within = 2.0, timeout_ticks = 10 }}\n\
+             [[step]]\n\
+             mark_agent = {{ label = \"dog\", at = [10.0, -60.0, 20.0] }}\n\
+             [[step]]\n\
+             check = {{ agent_delta_in = {{ label = \"dog\", from = [{}, {}, {}], to = [{}, {}, {}] }} }}",
+            from[0], from[1], from[2], to[0], to[1], to[2]
+        ));
+        let out = frame(&mut e, 0.016, 1, &w_present, &[]);
+        out.finished
+            .into_iter()
+            .find(|r| r.action == "check")
+            .expect("check 步应已结束")
+            .outcome
+    };
+
+    // 1. 盒 [0.5, -0.2, 0.5]..[1.5, 0.3, 1.2] 包含 Δ=(1.0, 0.1, 0.9) → 通过。
+    assert_eq!(
+        run_parsed([0.5, -0.2, 0.5], [1.5, 0.3, 1.2]),
+        StepOutcome::Ok,
+        "例 1:Δ 在盒内应通过"
+    );
+
+    // 2. 盒 [1.2, -0.2, 0.5]..[1.5, 0.3, 1.2] → 失败(Δx 1.0 < 1.2),消息含 agent_delta_in 与 1.00。
+    match run_parsed([1.2, -0.2, 0.5], [1.5, 0.3, 1.2]) {
+        StepOutcome::CheckFailed(msgs) => {
+            assert_eq!(msgs.len(), 1, "例 2 应仅一条失败消息:{msgs:?}");
+            assert!(
+                msgs[0].contains("agent_delta_in") && msgs[0].contains("1.00"),
+                "例 2 消息应含 agent_delta_in 与 1.00,实得:{}",
+                msgs[0]
+            );
+        }
+        other => panic!("例 2 应 CheckFailed,实得:{other:?}"),
+    }
+
+    // 3. 盒 [0.5, -0.2, 1.0]..[1.5, 0.3, 1.2] → 失败(Δz 0.9 < 1.0)。
+    match run_parsed([0.5, -0.2, 1.0], [1.5, 0.3, 1.2]) {
+        StepOutcome::CheckFailed(msgs) => {
+            assert_eq!(msgs.len(), 1, "例 3 应仅一条失败消息:{msgs:?}");
+            assert!(
+                msgs[0].contains("agent_delta_in") && msgs[0].contains("0.90"),
+                "例 3 消息应含 agent_delta_in 与 0.90,实得:{}",
+                msgs[0]
+            );
+        }
+        other => panic!("例 3 应 CheckFailed,实得:{other:?}"),
+    }
+
+    let make_scenario = |steps: Vec<Step>| Scenario {
+        name: "t".to_owned(),
+        req: None,
+        description: "d".to_owned(),
+        timeout_secs: 180,
+        server: toml::Table::new(),
+        view_distance: None,
+        steps,
+    };
+
+    // 4. 标签已登记但无 mark → 消息含「没有 mark_agent 基准点」。
+    let mut e_no_mark = Engine::new(
+        make_scenario(vec![
+            Step {
+                label: None,
+                action: Action::AdoptAgent {
+                    label: "dog".to_owned(),
+                    near: mark,
+                    within: 2.0,
+                    timeout_ticks: 10,
+                },
+            },
+            Step {
+                label: None,
+                action: Action::Check {
+                    checks: vec![Check::AgentDeltaIn {
+                        label: "dog".to_owned(),
+                        from: Vec3::new(0.5, -0.2, 0.5),
+                        to: Vec3::new(1.5, 0.3, 1.2),
+                    }],
+                },
+            },
+        ]),
+        start_pose(),
+    );
+    let out4 = frame(&mut e_no_mark, 0.016, 1, &w_present, &[]);
+    let check4 = out4
+        .finished
+        .into_iter()
+        .find(|r| r.action == "check")
+        .expect("例 4 check 步应已结束");
+    match check4.outcome {
+        StepOutcome::CheckFailed(msgs) => {
+            assert!(
+                msgs.iter().any(|m| m.contains("没有 mark_agent 基准点")),
+                "例 4 消息应含「没有 mark_agent 基准点」,实得:{msgs:?}"
+            );
+        }
+        other => panic!("例 4 应 CheckFailed,实得:{other:?}"),
+    }
+
+    // 5. 标签未登记 → 消息含「未登记」。
+    let mut e_unreg = Engine::new(
+        make_scenario(vec![Step {
+            label: None,
+            action: Action::Check {
+                checks: vec![Check::AgentDeltaIn {
+                    label: "dog".to_owned(),
+                    from: Vec3::new(0.5, -0.2, 0.5),
+                    to: Vec3::new(1.5, 0.3, 1.2),
+                }],
+            },
+        }]),
+        start_pose(),
+    );
+    let out5 = frame(&mut e_unreg, 0.016, 1, &w_present, &[]);
+    let check5 = out5
+        .finished
+        .into_iter()
+        .find(|r| r.action == "check")
+        .expect("例 5 check 步应已结束");
+    match check5.outcome {
+        StepOutcome::CheckFailed(msgs) => {
+            assert!(
+                msgs.iter().any(|m| m.contains("未登记")),
+                "例 5 消息应含「未登记」,实得:{msgs:?}"
+            );
+        }
+        other => panic!("例 5 应 CheckFailed,实得:{other:?}"),
+    }
+
+    // 6. 主体不在主体表 → 消息含「不在主体表」。
+    let mut e_missing = engine(
+        "[[step]]\n\
+         adopt_agent = { label = \"dog\", near = [10.0, -60.0, 20.0], within = 2.0, timeout_ticks = 10 }\n\
+         [[step]]\n\
+         mark_agent = { label = \"dog\", at = [10.0, -60.0, 20.0] }\n\
+         [[step]]\n\
+         wait_ticks = { n = 1 }\n\
+         [[step]]\n\
+         check = { agent_delta_in = { label = \"dog\", from = [0.5, -0.2, 0.5], to = [1.5, 0.3, 1.2] } }",
+    );
+    let _ = frame(&mut e_missing, 0.016, 1, &w_present, &[]);
+    let out6 = frame(&mut e_missing, 0.016, 2, &w_empty, &[]);
+    let check6 = out6
+        .finished
+        .into_iter()
+        .find(|r| r.action == "check")
+        .expect("例 6 check 步应已结束");
+    match check6.outcome {
+        StepOutcome::CheckFailed(msgs) => {
+            assert!(
+                msgs.iter().any(|m| m.contains("不在主体表")),
+                "例 6 消息应含「不在主体表」,实得:{msgs:?}"
+            );
+        }
+        other => panic!("例 6 应 CheckFailed,实得:{other:?}"),
+    }
+}

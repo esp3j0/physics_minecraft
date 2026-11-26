@@ -3114,15 +3114,18 @@ mod tests {
         app.update();
         assert_eq!(c12_screenshot_count(app.world_mut()), 0);
 
-        // update2、update3:脏队 24 > 0 → 实体数各 0。
+        // update2、update3、update4:脏队 24 > 0 → 实体数各 0(3 帧阻挡,确保去掉 dirty_len 项在 update4 即红)。
         c12_push_tick(app.world_mut(), 2);
         app.update();
         assert_eq!(c12_screenshot_count(app.world_mut()), 0);
         c12_push_tick(app.world_mut(), 3);
         app.update();
         assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+        c12_push_tick(app.world_mut(), 4);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
 
-        // 排空脏队并插入一条在途网格任务。
+        // update4 后排空脏队并插入一条在途网格任务。
         {
             let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
             while world_res.mirror.pop_dirty().is_some() {}
@@ -3143,40 +3146,40 @@ mod tests {
                 },
             );
 
-        // update4、update5:tasks 非空 → 实体数各 0。
-        c12_push_tick(app.world_mut(), 4);
-        app.update();
-        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+        // update5、update6:tasks 非空 → 实体数各 0。
         c12_push_tick(app.world_mut(), 5);
         app.update();
         assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+        c12_push_tick(app.world_mut(), 6);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
 
-        // 清空在途任务后,连续 3 个安静帧(update6/7/8)后 spawn。
+        // 清空在途任务后,连续 3 个安静帧(update7/8/9)后 spawn。
         app.world_mut()
             .resource_mut::<PendingMeshesRes>()
             .tasks
             .clear();
 
-        c12_push_tick(app.world_mut(), 6);
-        app.update();
-        assert_eq!(
-            c12_screenshot_count(app.world_mut()),
-            0,
-            "update6 idle=1 必须不 spawn"
-        );
         c12_push_tick(app.world_mut(), 7);
         app.update();
         assert_eq!(
             c12_screenshot_count(app.world_mut()),
             0,
-            "update7 idle=2 必须不 spawn"
+            "update7 idle=1 必须不 spawn"
         );
         c12_push_tick(app.world_mut(), 8);
         app.update();
         assert_eq!(
             c12_screenshot_count(app.world_mut()),
+            0,
+            "update8 idle=2 必须不 spawn"
+        );
+        c12_push_tick(app.world_mut(), 9);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
             1,
-            "update8 idle=3 必须 spawn Screenshot"
+            "update9 idle=3 必须 spawn Screenshot"
         );
     }
 

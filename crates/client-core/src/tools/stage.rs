@@ -513,7 +513,10 @@ fn check_holds(check: &Check, world: &dyn WorldQuery) -> bool {
         Check::NoFloating { .. } => false,
         // A06 主体检查:布景执行器不跟踪主体(回执/标签归引擎);观测不足
         // 不下结论(不成立)。防御性(现有布景场景不用主体动作)。
-        Check::AgentIn { .. } | Check::AgentMoved { .. } | Check::AgentAlive { .. } => false,
+        Check::AgentIn { .. }
+        | Check::AgentDeltaIn { .. }
+        | Check::AgentMoved { .. }
+        | Check::AgentAlive { .. } => false,
     }
 }
 
@@ -539,6 +542,7 @@ fn describe_checks(checks: &[Check]) -> String {
             Check::ChunksLoaded(cmp) => format!("chunks_loaded {cmp:?}"),
             Check::NoFloating { .. } => "no_floating".to_owned(),
             Check::AgentIn { .. } => "agent_in".to_owned(),
+            Check::AgentDeltaIn { .. } => "agent_delta_in".to_owned(),
             Check::AgentMoved { .. } => "agent_moved".to_owned(),
             Check::AgentAlive { .. } => "agent_alive".to_owned(),
         })

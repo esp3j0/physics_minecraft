@@ -897,3 +897,135 @@ fn c07_parse_outline() {
         e_extra.message
     );
 }
+
+/// C12 R1:`agent_delta_in` 在 check/wait_until 中解析、乱序 from/to 规整、缺键与未知键报错。
+#[test]
+fn c12r1_parse_agent_delta_in() {
+    // check 中乱序 from/to 规整为 min/max。
+    let s = parse_scenario(&format!(
+        "{HEADER}[[step]]\n\
+         spawn_agent = {{ at = [0, 0, 0], label = \"dog\" }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", from = [1.5, 0.3, 1.2], to = [0.5, -0.2, 0.5] }} }}\n"
+    ))
+    .expect("check 中合法 agent_delta_in 应解析成功");
+    match &s.steps[2].action {
+        Action::Check { checks } => {
+            assert_eq!(
+                checks,
+                &[Check::AgentDeltaIn {
+                    label: "dog".to_owned(),
+                    from: Vec3::new(0.5, -0.2, 0.5),
+                    to: Vec3::new(1.5, 0.3, 1.2),
+                }]
+            );
+        }
+        other => panic!("应为 Check,实为 {other:?}"),
+    }
+
+    // wait_until 中合法 agent_delta_in 解析成功。
+    let s_wait = parse_scenario(&format!(
+        "{HEADER}[[step]]\n\
+         adopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n\
+         [[step]]\n\
+         wait_until = {{ agent_delta_in = {{ label = \"dog\", from = [1.5, 0.3, 1.2], to = [0.5, -0.2, 0.5] }}, timeout_ticks = 10 }}\n"
+    ))
+    .expect("wait_until 中合法 agent_delta_in 应解析成功");
+    match &s_wait.steps[2].action {
+        Action::WaitUntil { checks, .. } => {
+            assert_eq!(
+                checks,
+                &[Check::AgentDeltaIn {
+                    label: "dog".to_owned(),
+                    from: Vec3::new(0.5, -0.2, 0.5),
+                    to: Vec3::new(1.5, 0.3, 1.2),
+                }]
+            );
+        }
+        other => panic!("应为 WaitUntil,实为 {other:?}"),
+    }
+
+    // 缺 from 报错。
+    let e_missing = err(&format!(
+        "{HEADER}[[step]]\n\
+         spawn_agent = {{ at = [0, 0, 0], label = \"dog\" }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", to = [1.5, 0.3, 1.2] }} }}\n"
+    ));
+    assert_eq!(e_missing.step, Some(3));
+    assert!(
+        e_missing.message.contains("agent_delta_in") && e_missing.message.contains("from"),
+        "缺 from 应点名 agent_delta_in 与 from:{}",
+        e_missing.message
+    );
+
+    // 未知键报错。
+    let e_extra = err(&format!(
+        "{HEADER}[[step]]\n\
+         spawn_agent = {{ at = [0, 0, 0], label = \"dog\" }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", from = [0, 0, 0], to = [1, 1, 1], extra = 1 }} }}\n"
+    ));
+    assert_eq!(e_extra.step, Some(3));
+    assert!(
+        e_extra.message.contains("extra"),
+        "未知键应点名 extra:{}",
+        e_extra.message
+    );
+}
+
+/// C12 R1:`agent_delta_in` 跨步骤校验:此前必须有同标签 mark_agent,无 mark 或 mark 在后均报错并指名步骤号。
+#[test]
+fn c12r1_parse_delta_requires_mark() {
+    // 场景内完全无 mark_agent → 步骤 2 报错。
+    let e_none = err(&format!(
+        "{HEADER}[[step]]\n\
+         spawn_agent = {{ at = [0, 0, 0], label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", from = [0, 0, 0], to = [1, 1, 1] }} }}\n"
+    ));
+    assert_eq!(e_none.step, Some(2));
+    assert!(
+        e_none.message.contains("agent_delta_in") && e_none.message.contains("mark_agent"),
+        "无 mark 应报 agent_delta_in/mark_agent:{}",
+        e_none.message
+    );
+
+    // mark_agent 出现在 agent_delta_in 之后 → 步骤 2 报错。
+    let e_after = err(&format!(
+        "{HEADER}[[step]]\n\
+         spawn_agent = {{ at = [0, 0, 0], label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", from = [0, 0, 0], to = [1, 1, 1] }} }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n"
+    ));
+    assert_eq!(e_after.step, Some(2));
+    assert!(
+        e_after.message.contains("agent_delta_in") && e_after.message.contains("mark_agent"),
+        "mark 在后应报 agent_delta_in/mark_agent:{}",
+        e_after.message
+    );
+
+    // mark_agent 在前(即使后续还有二次 mark_agent)→ 通过。
+    let s_ok = parse_scenario(&format!(
+        "{HEADER}[[step]]\n\
+         adopt_agent = {{ label = \"dog\", near = [0, 0, 0], within = 1.0 }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n\
+         [[step]]\n\
+         check = {{ agent_delta_in = {{ label = \"dog\", from = [0, 0, 0], to = [1, 1, 1] }} }}\n\
+         [[step]]\n\
+         mark_agent = {{ label = \"dog\" }}\n"
+    ))
+    .expect("mark 在前应解析通过");
+    assert_eq!(s_ok.steps.len(), 4);
+}
