@@ -793,6 +793,7 @@ fn setup_scene(
         unlit: true,
         alpha_mode: AlphaMode::Blend,
         cull_mode: None,
+        fog_enabled: false,
         ..default()
     });
     commands.insert_resource(OutlineRes {
@@ -3189,5 +3190,72 @@ half = [1.0, 1.0, 1.0]
             empty.attribute(Mesh::ATTRIBUTE_UV_0).map(|a| a.len()),
             Some(0)
         );
+    }
+
+    /// C11 R1:`setup_scene` 材质与相机距离雾锚点(outline 免雾、terrain 图集与最近邻采样、线性雾范围与 SKY 雾色)。
+    #[test]
+    fn c11_scene_materials() {
+        let tmp_dir = tempfile::TempDir::new().expect("create temp bodies dir");
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 2,
+            chunk_cap: ViewCapRes::default_cap(2),
+        });
+        app.insert_resource(BodiesDirRes(tmp_dir.path().to_path_buf()));
+        app.add_systems(Startup, setup_scene);
+
+        app.update();
+
+        let outline_handle = app.world().resource::<OutlineRes>().material.clone();
+        let terrain_handle = app
+            .world()
+            .resource::<WorldRenderRes>()
+            .terrain_material
+            .clone();
+
+        let materials = app.world().resource::<Assets<StandardMaterial>>();
+        let outline_mat = materials
+            .get(&outline_handle)
+            .expect("outline_material 必须存在");
+        assert!(
+            !outline_mat.fog_enabled,
+            "outline_material 必须关闭距离雾 (fog_enabled == false)"
+        );
+
+        let terrain_mat = materials
+            .get(&terrain_handle)
+            .expect("terrain_material 必须存在");
+        let atlas_handle = terrain_mat
+            .base_color_texture
+            .as_ref()
+            .expect("terrain_material.base_color_texture 必须为 Some");
+        let images = app.world().resource::<Assets<Image>>();
+        let atlas_img = images.get(atlas_handle).expect("atlas Image 必须存在");
+        assert_eq!(atlas_img.width(), 128);
+        assert_eq!(atlas_img.height(), 16);
+        assert_eq!(atlas_img.sampler, ImageSampler::nearest());
+        assert_eq!(
+            atlas_img.texture_descriptor.format,
+            TextureFormat::Rgba8Unorm
+        );
+
+        let mut fog_q = app
+            .world_mut()
+            .query_filtered::<&DistanceFog, With<Camera3d>>();
+        let fog = fog_q
+            .single(app.world())
+            .expect("相机实体必须包含 DistanceFog");
+        match fog.falloff {
+            FogFalloff::Linear { start, end } => {
+                assert_eq!((start, end), (19.2, 30.4));
+            }
+            ref other => panic!("雾衰减类型应为 FogFalloff::Linear, 实得: {other:?}"),
+        }
+        let srgba = fog.color.to_srgba();
+        assert_eq!([srgba.red, srgba.green, srgba.blue], SKY);
     }
 }

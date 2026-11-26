@@ -11,13 +11,13 @@ wait_until = { chunks_loaded = { ge = 25 }, timeout_ticks = 600 }
 [[step]]
 wait_ticks = { n = 60 }
 [[step]]
-screenshot = { name = "outline_default_off", expect = "棕色地表,无描边(默认关)" }
+screenshot = { name = "outline_default_off", expect = "带纹理棕色地表,无叠加格网(默认关);远处渐隐入浅蓝雾色" }
 [[step]]
 outline = { on = true }
 [[step]]
 wait_ticks = { n = 2 }
 [[step]]
-screenshot = { name = "outline_on", expect = "地表每格方块带黑色细棱线,区块边界(每16格)呈琥珀色线" }
+screenshot = { name = "outline_on", expect = "地表覆盖半透明淡黑细格网(每格一线),区块边界(每16格)与世界边缘侧壁呈半透明琥珀色线" }
 [[step]]
 set_block = { pos = [0, -60, 0], block = "stone" }
 [[step]]
