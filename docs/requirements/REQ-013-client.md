@@ -665,6 +665,14 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   遗留:①三 fps 态(16.8 / ~32 / 195–284)根因未归因沿用 C11;②quad 小主体
   低置信度待复核沿用 C08/C10/C11;③interact 偶发 fps_storm_min flake(单帧跨
   6 拍)与 C12 无关,单跑复绿,记录在案。验收见 #27。
+- 2080Ti fps 复测 ✅(2026-11-26):HEAD 7df61be(C11 视觉 + C12 settle 后),
+  基准机交互任务三轮 perf_baseline / edit_storm / quad_policy 全 exit 0、
+  failed_checks 0。fps_storm_min 138.58 / 138.63 / 140.08(≥55,极差 1.50);
+  稳态 fps_mean ≈144、fps_min ≥134.6(≥60);sim_p95 ≤2.51 ms、mesh_max
+  ≤0.275 ms、policy ≤0.109 ms/主体,全预算达标。与 2026-11-25(2e2a779,
+  pre-C11)storm 139.6–140.3 同带,视觉与 settle 改动无性能回归。settle
+  自适应:144fps 仅 2 ticks(32fps ≈736)。quad 相对位移盒高 fps 通过。
+  截图亲视 7 张符合 expect。§11 补记归档。见 #27。
 
 ## 10. 决策记录与开放问题
 
@@ -749,6 +757,31 @@ sim_p95 0.1323 ms(≤8)。审图亲视(第三轮 04-before/73-after):before 平�
 一致。结论:**AC6 达成**;780M 跨轮波动经跨机验证归因为核显环境特性
 (基准机稳定远超判据),非产品缺陷,判据不放宽、以基准机实测为准。
 AI 审图在基准机未运行(zcode 运行时缺失),截图由架构师亲视闭环。
+
+**2080Ti fps 复测补记(2026-11-26,C11 视觉 + C12 settle 后)**。HEAD 7df61be,
+环境口径同上(dev opt-level=2、CARGO_INCREMENTAL=0、DpiUnaware),交互会话
+计划任务 FpsRecheck 连跑三轮,每轮 perf_baseline / edit_storm / quad_policy,
+`--no-ai`(基准机无 zcode);manifest 目录(基准机本地)
+target/smoke/client-20261126-084655 / -084822 / -084948,九场景批全
+exit 0、failed_checks 0:
+
+| 轮 | storm_min | storm_frames | baseline fps_mean/min | sim_p95 ms | mesh_max ms | policy ms/主体 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 138.58 | 16 | 144.0 / 135.9 | 2.4789 | 0.238 | 0.0628 |
+| 2 | 138.63 | 16 | 144.0 / 134.6 | 2.5056 | 0.275 | 0.0622 |
+| 3 | 140.08 | 16 | 143.9 / 135.3 | 2.3946 | 0.260 | 0.0617 |
+
+AC6(≥55)与稳态渲染(≥60)复确认;sim ≤8 / mesh ≤4 / policy ≤2 全达标。
+与 2026-11-25(2e2a779,pre-C11)storm 139.60/140.30/139.58 同带(极差 1.50),
+C11 纹理/天空/雾与 C12 settle 无性能回归。quad_policy 三轮 fps_mean ≈144、
+fps_min 52.2/85.1/77.4(含截图 readback 停顿,仅参考),sim_p95
+0.8449/0.8605/0.7729、mesh_max 0.345/0.326/0.339、policy
+0.1085/0.1057/0.1079;step 19/28/29 相对盒 + 绝对护栏全 ok;settle 自适应:
+144fps 下仅 2 ticks(940→942),32fps 核显 ≈736 ticks,跨 fps 语义一致。
+截图亲视(第三轮 7 张):baseline 顶视纹理地表连续 + 立方阵、before 平整、
+after 沿 +x 沟槽、quad 品红行走 / 青绿偏转 / 转回 +x / 品红恢复,均与 expect
+一致,无缺块。开发机三 fps 态(16.8 / ~32 / 195–284)根因仍未归因,沿用
+C11 遗留②;基准机三轮各场景 fps_mean 稳定 ≈144,跨机差异记录在案不解释。
 
 审图:baseline 截图 09-baseline.png(tick 1310、live 64、chunks 289)顶视棕色
 地表连续铺满全帧,与 expect 一致(主体/刚体渲染属 C03)。白盒归因:spawn 默认
