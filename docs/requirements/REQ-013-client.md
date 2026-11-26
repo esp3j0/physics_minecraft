@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08、C09、C10、C11 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08、C09、C10、C11、C12 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -639,6 +639,32 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   截图场景同步管线编译);②同 commit 实测三种 fps 态(16.8 / ~32 / 195–284,
   客户端无 WinitSettings 覆写),根因未归因;③quad_policy 小主体截图低置信度
   待复核沿用 C08/C10 记录。验收见 #27。
+- C12 ✅ 验收通过(2026-11-26):提交 101129f + R1 a5c8c45(白名单内 8 文件,
+  Cargo.lock 零改动、零下载)。截图 settle:客户端 main.rs 新增
+  SETTLE_IDLE_FRAMES=3 / SETTLE_MAX_WAIT_FRAMES=600,截图请求后等连续 3 静帧
+  (镜像脏队空 + 异步 mesh 任务队空 + uploads 无新增)才生成截图任务,600 帧
+  超时强制生成并留日志;引擎步推进语义不变(pending_shots 门控, settle 期间
+  相机静止)。闭 C07 遗留① / C11 遗留①低 fps 截图竞态(16.8fps 态截到未上传
+  subchunk)。MS24 改写 10 帧时序锚 + 新增 busy 延迟/upload 重置/超时三测试。
+  R1 裁定:settle 等待 × 策略狗自主行走使 quad_policy 绝对位移盒耦合 fps
+  (32fps settle ≈737 ticks ≈ +2.95 m,绝对盒超 +1.31/+0.68;放宽盒被否)。
+  引擎新增 Check::AgentDeltaIn(pos − mark_agent 基准的闭区间盒),parse 镜像
+  agent_in 规整 + 跨步骤校验要求此前同标签 mark_agent;场景 step19/28 改相对
+  位移盒(架构师探针 055558 手测 Δ19=(1.04,−0.03,0.97)、Δ28=(2.27,0.02,0.12),
+  R3 高 fps 交叉验证 Δ19≈(1.01,·,0.95),fps 稳定),step28 拆出绝对 z 护栏保留
+  「转回不恢复侧向位置」证据。门禁:client-core 252/0 + client 27/0 +
+  clippy 0 + fmt 0(架构师复跑)。变异:实施方 N1–N7 全击杀(N2 经 R1 补帧后
+  双杀 (a)(c));架构师 MA parse 规整去除→parse_tests 红 / MB Δ.y→p.y→
+  engine_tests 红,还原干净复绿。冒烟:实施方 R1 两轮 063313(interact 偶发
+  fps_storm flake + fall zcode 超时,单跑复绿,如实附记)/ 065540 正式 11/11;
+  架构师独立两轮 072405 / 074529 均 overall_exit 0、校准 8/8、failed_checks 0、
+  零 settle 超时,quad settle ≈733–738 ticks 跨轮同量级;AI 审图 quad 四轮
+  全 pass 仅小主体低置信度待复核(065540 一张 0.60 false 裁定为相机轴误读:
+  相机 −z 主导、屏幕水平=+x,架构师亲视核实)。架构师亲视 startup/flat-walk/
+  possessed-turn/turned-back/resumed 跨轮地形连续、朝向正确,缺块缺陷消除。
+  遗留:①三 fps 态(16.8 / ~32 / 195–284)根因未归因沿用 C11;②quad 小主体
+  低置信度待复核沿用 C08/C10/C11;③interact 偶发 fps_storm_min flake(单帧跨
+  6 拍)与 C12 无关,单跑复绿,记录在案。验收见 #27。
 
 ## 10. 决策记录与开放问题
 
