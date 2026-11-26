@@ -17,4 +17,4 @@ wait_ticks = { n = 120 }
 check = { chunks_loaded = { eq = 25 }, no_floating = { height = 1.5, still_ticks = 30 } }
 
 [[step]]
-screenshot = { name = "startup", expect = "棕色泥土地表连续无空洞,视距方形边界可见" }
+screenshot = { name = "startup", expect = "带像素纹理的棕色泥土地表连续无空洞,远处渐隐入浅蓝雾色" }

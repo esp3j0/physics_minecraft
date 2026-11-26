@@ -51,7 +51,7 @@ label = "策略行走采样窗 240 拍"
 wait_ticks = { n = 240 }
 
 [[step]]
-screenshot = { name = "flat-walk", expect = "棕色平地,一只品红色四足朝 +x 行走(方向以数值 check 为准),躯干水平,四条腿在身体下方;背景为深灰天空,画面上缘斜向地平线是有限世界自然边界,不算缺块" }
+screenshot = { name = "flat-walk", expect = "棕色平地,一只品红色四足朝 +x 行走(方向以数值 check 为准),躯干水平,四条腿在身体下方;背景为浅蓝天空,远处地面渐隐入雾色,属有限世界自然边界,不算缺块" }
 
 [[step]]
 check = { agent_in = { label = "dog", from = [24.0, -59.95, 20.0], to = [40.0, -59.55, 28.5] } }

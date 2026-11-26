@@ -77,6 +77,7 @@ pub struct SubchunkMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 4]>,
+    pub uvs: Vec<[f32; 2]>,
     pub indices: Vec<u32>,
 }
 
@@ -261,6 +262,11 @@ pub fn mesh_subchunk_snapshot(snap: &ChunkSnapshot, sc: SubchunkPos) -> Subchunk
                             base_color[2] * shade,
                             1.0,
                         ]);
+                        mesh.uvs.push(crate::texture::face_uv(
+                            block,
+                            corner[u_axis] as u32,
+                            corner[v_axis] as u32,
+                        ));
                     }
 
                     mesh.indices.extend_from_slice(&[
@@ -987,5 +993,73 @@ mod tests {
             outline_subchunk(&mirror, sc0),
             outline_subchunk_snapshot(&snapshot(&mirror, sc0).unwrap(), sc0)
         );
+    }
+
+    /// MA6(REQ-013 C11):单块 `BlockId(2)` 与未知方块 `BlockId(9)` 的图集 UV 锚点及全空气段守卫。
+    #[test]
+    fn ma6_uv_atlas_anchors() {
+        let mut mirror = ChunkMirror::new();
+        let mut chunk = Chunk::air();
+        chunk.set(0, 4, 0, BlockId(2));
+        mirror.insert_chunk(ChunkPos::new(0, 0), chunk);
+
+        let sc0 = SubchunkPos {
+            chunk: ChunkPos::new(0, 0),
+            section: 0,
+        };
+        let m0 = mesh_subchunk(&mirror, sc0);
+        assert_eq!(m0.uvs.len(), m0.positions.len());
+        for uv in &m0.uvs {
+            assert!((0.0..=1.0).contains(&uv[0]), "s 越界: {:?}", uv);
+            assert!((0.0..=1.0).contains(&uv[1]), "v 越界: {:?}", uv);
+        }
+
+        let uvs_for_normal = |m: &SubchunkMesh, normal: [f32; 3]| -> Vec<[f32; 2]> {
+            m.normals
+                .iter()
+                .zip(m.uvs.iter())
+                .filter(|(n, _)| **n == normal)
+                .map(|(_, uv)| *uv)
+                .collect()
+        };
+
+        assert_eq!(
+            uvs_for_normal(&m0, [0.0, 1.0, 0.0]),
+            vec![
+                [0.25390625, 0.96875],
+                [0.25390625, 0.03125],
+                [0.37109375, 0.03125],
+                [0.37109375, 0.96875],
+            ]
+        );
+        assert_eq!(
+            uvs_for_normal(&m0, [1.0, 0.0, 0.0]),
+            vec![
+                [0.25390625, 0.96875],
+                [0.37109375, 0.96875],
+                [0.37109375, 0.03125],
+                [0.25390625, 0.03125],
+            ]
+        );
+
+        // 未知方块 BlockId(9) 走 tile 7 fallback。
+        let mut unknown_mirror = ChunkMirror::new();
+        let mut unknown_chunk = Chunk::air();
+        unknown_chunk.set(0, 4, 0, BlockId(9));
+        unknown_mirror.insert_chunk(ChunkPos::new(0, 0), unknown_chunk);
+        let mu = mesh_subchunk(&unknown_mirror, sc0);
+        let top_u = uvs_for_normal(&mu, [0.0, 1.0, 0.0]);
+        assert_eq!(top_u[0], [0.87890625, 0.96875]);
+        assert_eq!(top_u[1], [0.87890625, 0.03125]);
+
+        // 全空气段:uvs 为空。
+        let m1 = mesh_subchunk(
+            &mirror,
+            SubchunkPos {
+                chunk: ChunkPos::new(0, 0),
+                section: 1,
+            },
+        );
+        assert!(m1.uvs.is_empty());
     }
 }

@@ -29,6 +29,6 @@ outline = { on = false }
 [[step]]
 wait_ticks = { n = 2 }
 [[step]]
-screenshot = { name = "outline_off", expect = "描边消失,地表恢复无棱线纯色面" }
+screenshot = { name = "outline_off", expect = "描边消失,地表恢复无棱线纹理面" }
 [[step]]
 check = { block = { pos = [0, -60, 0], is = "stone" } }

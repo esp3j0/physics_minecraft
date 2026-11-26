@@ -29,12 +29,12 @@ pass = true
 
 [[case]]
 file = "client-flat-ground.png"
-expect = "斜视一片平坦的棕色泥土地面,背景为深灰色天空,地面延伸到画面上缘的斜向地平线边界(有限世界自然边界),地面内部没有缺块或空洞"
+expect = "斜视一片带像素纹理的棕色泥土地面,背景为浅蓝色天空,远处地面渐隐入雾色;地面内部没有缺块或空洞"
 pass = true
 
 [[case]]
 file = "client-flat-ground.png"
-expect = "画面上方是浅蓝色天空"
+expect = "画面上方是品红色天空"
 pass = false
 
 [[case]]

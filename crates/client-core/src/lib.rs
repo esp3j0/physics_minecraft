@@ -12,6 +12,7 @@ pub mod mirror;
 pub mod perf;
 pub mod possess;
 pub mod script;
+pub mod texture;
 pub mod tools;
 pub mod transport;
 pub mod world;

@@ -19,10 +19,12 @@ use app::config::Config;
 use app::local::LocalConfig;
 use bevy::app::AppExit;
 use bevy::asset::{AssetEventSystems, RenderAssetUsages};
+use bevy::image::ImageSampler;
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll};
 use bevy::light::GlobalAmbientLight;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
@@ -41,6 +43,7 @@ use client_core::script::{
     CameraPose, Engine, EngineCommand, EngineStatus, FrameInput, Scenario, ScreenshotRequest,
     WorldQuery, engine_commands_to_c2s, parse_scenario,
 };
+use client_core::texture::{SKY, atlas_image, fog_range};
 use client_core::tools::{
     AgentHit, Hit, PICK_MAX_DIST, Target, ToolAction, ToolState, dig, hud_text, pick_agent,
     pick_at_camera_with_dist, pick_target, place, select_material,
@@ -678,6 +681,7 @@ fn main() {
                 ..default()
             }),
     )
+    .insert_resource(ClearColor(Color::srgb(SKY[0], SKY[1], SKY[2])))
     .insert_resource(GlobalAmbientLight {
         color: Color::WHITE,
         brightness: 150.0,
@@ -749,15 +753,32 @@ fn main() {
 }
 
 /// 初始化材质、飞行相机、平行光与交互模式初始鼠标锁定(脚本模式不锁定光标)。
+#[allow(clippy::too_many_arguments)]
 fn setup_scene(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    view_cap: Res<ViewCapRes>,
     bodies_dir: Option<Res<BodiesDirRes>>,
     script_mode: Option<Res<ScriptModeRes>>,
     mut cursor_q: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
+    let atlas_data = atlas_image();
+    let mut atlas = Image::new(
+        Extent3d {
+            width: atlas_data.width,
+            height: atlas_data.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        atlas_data.rgba,
+        TextureFormat::Rgba8Unorm,
+        RenderAssetUsages::RENDER_WORLD,
+    );
+    atlas.sampler = ImageSampler::nearest();
     let terrain_material = materials.add(StandardMaterial {
         base_color: Color::WHITE,
+        base_color_texture: Some(images.add(atlas)),
         perceptual_roughness: 0.9,
         metallic: 0.0,
         ..default()
@@ -792,12 +813,21 @@ fn setup_scene(
     }
     let initial_transform =
         Transform::from_translation(START_CAMERA_POS).looking_at(START_CAMERA_LOOK_AT, Vec3::Y);
+    let (fog_start, fog_end) = fog_range(u32::from(view_cap.view_distance));
     commands.spawn((
         Camera3d::default(),
         Projection::Perspective(PerspectiveProjection {
             fov: 70.0_f32.to_radians(),
             ..default()
         }),
+        DistanceFog {
+            color: Color::srgb(SKY[0], SKY[1], SKY[2]),
+            falloff: FogFalloff::Linear {
+                start: fog_start,
+                end: fog_end,
+            },
+            ..default()
+        },
         initial_transform,
         fly,
     ));
@@ -1854,6 +1884,7 @@ fn to_bevy_mesh(submesh: SubchunkMesh) -> Mesh {
     .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, submesh.positions)
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, submesh.normals)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, submesh.colors)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, submesh.uvs)
     .with_inserted_indices(Indices::U32(submesh.indices))
 }
 
@@ -1976,6 +2007,11 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()));
         app.init_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 8,
+            chunk_cap: ViewCapRes::default_cap(8),
+        });
 
         let terrain_material = app
             .world_mut()
@@ -2567,6 +2603,11 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()));
         app.init_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 8,
+            chunk_cap: ViewCapRes::default_cap(8),
+        });
 
         let terrain_material = app
             .world_mut()
@@ -2746,6 +2787,11 @@ mod tests {
         app.add_plugins((MinimalPlugins, AssetPlugin::default()));
         app.init_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 8,
+            chunk_cap: ViewCapRes::default_cap(8),
+        });
 
         let (fake_transport, _inbound) = FakeTransport::new();
         app.insert_resource(TransportRes::new(fake_transport))
@@ -2989,6 +3035,11 @@ half = [1.0, 1.0, 1.0]
         app.add_plugins((MinimalPlugins, AssetPlugin::default()));
         app.init_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 8,
+            chunk_cap: ViewCapRes::default_cap(8),
+        });
 
         let (terrain_material, outline_material, entity_render) = {
             let mut mats = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
@@ -3104,6 +3155,39 @@ half = [1.0, 1.0, 1.0]
         assert!(
             app.world().resource::<ToolRes>().agent_target.is_none(),
             "MS-P2 方块遮挡时 agent_target 必须为 None"
+        );
+    }
+
+    /// C11:`to_bevy_mesh` 将 `SubchunkMesh.uvs` 写入 `Mesh::ATTRIBUTE_UV_0`,空网格不 panic。
+    #[test]
+    fn c11_to_bevy_mesh_uv() {
+        use bevy::mesh::VertexAttributeValues;
+
+        let expected_uvs = vec![[0.25390625, 0.96875], [0.37109375, 0.03125]];
+        let submesh = SubchunkMesh {
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            normals: vec![[0.0, 1.0, 0.0], [0.0, 1.0, 0.0]],
+            colors: vec![[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]],
+            uvs: expected_uvs.clone(),
+            indices: vec![],
+        };
+        let mesh = to_bevy_mesh(submesh);
+        let attr = mesh
+            .attribute(Mesh::ATTRIBUTE_UV_0)
+            .expect("Mesh::ATTRIBUTE_UV_0 必须存在");
+        match attr {
+            VertexAttributeValues::Float32x2(uvs) => {
+                assert_eq!(uvs.len(), 2);
+                assert_eq!(uvs, &expected_uvs);
+            }
+            other => panic!("ATTRIBUTE_UV_0 类型应为 Float32x2, 实得: {other:?}"),
+        }
+
+        // 空网格(无 uv)不 panic。
+        let empty = to_bevy_mesh(SubchunkMesh::default());
+        assert_eq!(
+            empty.attribute(Mesh::ATTRIBUTE_UV_0).map(|a| a.len()),
+            Some(0)
         );
     }
 }

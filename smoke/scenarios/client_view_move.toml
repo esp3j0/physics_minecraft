@@ -35,4 +35,4 @@ label = "校验稳态区块数恒等于 25 并连续保持 10 拍"
 wait_until = { chunks_loaded = { eq = 25 }, hold_ticks = 10, timeout_ticks = 120 }
 
 [[step]]
-screenshot = { name = "after_move", expect = "连续平坦的 tan 色地表占满画面下部,地平线位于画面上部约四分之一处,左上角无 HUD 文字,画面中央无悬浮方块" }
+screenshot = { name = "after_move", expect = "连续平坦的 tan 色纹理地表占满画面下部,远处渐隐入浅蓝天空,左上角无 HUD 文字,画面中央无悬浮方块" }
