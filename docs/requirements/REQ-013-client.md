@@ -1,6 +1,6 @@
 # REQ-013: 正式客户端——单机本地优先,多人协议/性能预设计
 
-- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08、C09、C10 验收通过,见 §9 进度)
+- 状态:开发中(2026-11-20 定稿;C01a、C01b-1、C01b-2、C01b-3、C02-1、C02-2、C03-1、C03-2、C04、C05、C06、C07、C08、C09、C10、C11 验收通过,见 §9 进度)
 - 提出日期:2026-11-19
 - 关联讨论:[#9 未来客户端架构](https://github.com/esp3j0/physics_minecraft/issues/9)(结论收敛于本 REQ)
 - 关联 demo:`demos/client/`(开工后填)
@@ -614,6 +614,31 @@ V01(#26,viewer 上的准星拾取附身)独立先行,成果并入 C02 搬运。
   待复核(主体小,与 C08 往轮一致,画面无缺陷);quad_policy fps_mean ~32
   为核显长期常态(C08 往轮即 32.0,预算判据在 perf_baseline 场景),非本单元
   回归。C08 遗留①闭环。验收见 #27。
+- C11 ✅ 验收通过(2026-11-26):提交 d912284 + R1 752518d(11+3 文件白名单内,
+  +317/−8 与 +71/−3;Cargo.lock 零改动、零下载)。Minecraft 视觉:client-core
+  新增 texture.rs 纯函数(128×16 灰度细节图集 8 tile、手工 16 项常量噪声表、
+  半纹素内缩 UV + v 翻转、SKY 浅蓝、fog_range 线性雾);mesher 加 uvs 字段
+  (colors 语义与全部既有锚点不变,灰度纹理乘顶点色);客户端图集
+  Rgba8Unorm + nearest 采样接 terrain_material、ClearColor(SKY)、相机
+  DistanceFog;主体视觉不变。手算锚 T1–T4(图集字节 10 个/雾 3 组)+
+  ma6(UV 10 个)+ c11_to_bevy_mesh_uv。R1 裁定三项:①after_move expect
+  系架构书笔误(相机 pitch −89 全帧无天空)改俯视口径;②outline 被雾冲淡
+  系 C11 引入退化 → outline_material fog_enabled:false + c11_scene_materials
+  头装配锚(免雾/图集格式采样/雾区间 19.2–30.4);③outline_on AI 不通过
+  pre-C11 即存在(C07 先例亲视验收),expect 澄清到半透明渲染语义。
+  门禁:client-core 249/0 + client 24/0 + clippy 0 + fmt 0(架构师复跑)。
+  变异:实施方 N1–N7 全击杀;架构师 MA 泥 amp 1.5→0→T2 红 / MB v 翻转去除→
+  ma6 红 / MC s 内缩 15→16→ma6 红,还原干净复绿。冒烟:实施方 R0/R1 各两轮
+  + 架构师 R2 轮(041147)均 overall_exit 0、校准 8/8、数值 failed 0、
+  12 张审图全 pass(flat-walk 0.85、outline_on 0.78、after_move 0.95);
+  架构师亲视 flat-walk/startup/outline_on/baseline/after_move 符合期望。
+  遗留:①架构师 R1 轮(035542)fps_mean 16.8 低 fps 态下截图捕到未上传
+  subchunk(flat-walk 近全缺/startup 缺矩形块),AI 高置信度 fail 属正确看图;
+  机制链 = 低 fps × 异步管线编译/上传前沿 × tick 脚本截图(C07 遗留①同族
+  竞态在低 fps 态暴露),数值判据全过;建议后续小修(截图前等上传 settled 或
+  截图场景同步管线编译);②同 commit 实测三种 fps 态(16.8 / ~32 / 195–284,
+  客户端无 WinitSettings 覆写),根因未归因;③quad_policy 小主体截图低置信度
+  待复核沿用 C08/C10 记录。验收见 #27。
 
 ## 10. 决策记录与开放问题
 
