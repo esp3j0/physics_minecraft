@@ -61,6 +61,10 @@ const MOVE_SPEED: f32 = 16.0;
 const LOOK_SENSITIVITY: f32 = 0.003;
 /// C01b-2 异步 meshing 每帧提交任务上限。
 const MAX_SPAWN_PER_FRAME: usize = 8;
+/// C12:截图 settle——脏队/在途任务清空且 uploads 停增后,再等 3 个安静帧才 spawn Screenshot。
+const SETTLE_IDLE_FRAMES: u32 = 3;
+/// C12:settle 等待上限(帧);超时强制截图并打警告,保证循环有界。
+const SETTLE_MAX_WAIT_FRAMES: u32 = 600;
 /// 飞行相机初始位置。
 const START_CAMERA_POS: Vec3 = Vec3::new(8.0, -48.0, 24.0);
 /// 飞行相机初始注视点(俯角约 30°)。
@@ -512,8 +516,12 @@ struct ScriptModeRes {
     coupled: bool,
     last_observer_pos: Option<Vec3>,
     pending_shots: Arc<AtomicUsize>,
-    /// REQ-013 C02-2 R3:延迟 1 帧 spawn `Screenshot` 实体的缓存 `(请求, shot 帧号)`。
+    /// REQ-013 C02-2 R3:延迟 spawn `Screenshot` 实体的缓存 `(请求, shot 帧号)`。
     pending_spawn: Option<(ScreenshotRequest, u64)>,
+    /// C12:settle 安静帧计数 / 已等待帧数 / 上一帧 uploads 快照。
+    settle_idle: u32,
+    settle_waited: u32,
+    settle_last_uploads: u64,
     finished_exit: Option<i32>,
     disconnected: Option<String>,
 }
@@ -621,6 +629,9 @@ fn main() {
                 last_observer_pos: None,
                 pending_shots: Arc::new(AtomicUsize::new(0)),
                 pending_spawn: None,
+                settle_idle: 0,
+                settle_waited: 0,
+                settle_last_uploads: 0,
                 finished_exit: None,
                 disconnected: None,
             };
@@ -1610,6 +1621,7 @@ fn script_driver_system(
     frame_counter: Res<FrameCounter>,
     mut meshes: ResMut<Assets<Mesh>>,
     world_res: Res<WorldRenderRes>,
+    pending: Res<PendingMeshesRes>,
     mut outline_res: ResMut<OutlineRes>,
     entity_render: Option<Res<EntityRenderRes>>,
     stats: Res<MeshStats>,
@@ -1621,23 +1633,45 @@ fn script_driver_system(
     mut cam_q: Query<(&mut Transform, &mut FlyCamera)>,
     mut hud_root_q: Query<&mut Visibility, With<HudRoot>>,
 ) {
-    // REQ-013 C02-2 R3:延迟 1 帧 spawn Screenshot 实体(确保 HUD Visibility 切换已完成渲染传播)。
+    // REQ-013 C02-2 R3 + C12:延迟 spawn Screenshot 实体(确保 HUD Visibility 切换传播且地形网格 settle)。
     // 必须放在 finished_exit 与 pending_shots 门控之前:末张截图的延迟 spawn 发生在 finished_exit 已置位之后。
-    if let Some((_, shot_frame)) = script.pending_spawn.as_ref()
-        && frame_counter.0 > *shot_frame
+    let shot_frame = script.pending_spawn.as_ref().map(|(_, f)| *f);
+    if let Some(shot_frame) = shot_frame
+        && frame_counter.0 > shot_frame
     {
-        let (shot, _) = script
-            .pending_spawn
-            .take()
-            .expect("pending_spawn 刚完成帧号检查");
-        let path = script.out_dir.join(shot.file_name());
-        let done = Arc::clone(&script.pending_shots);
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path))
-            .observe(move |_: On<ScreenshotCaptured>| {
-                done.fetch_sub(1, Ordering::SeqCst);
-            });
+        let quiet = world_res.mirror.dirty_len() == 0
+            && pending.tasks.is_empty()
+            && stats.uploads == script.settle_last_uploads;
+        script.settle_last_uploads = stats.uploads;
+        if quiet {
+            script.settle_idle += 1;
+        } else {
+            script.settle_idle = 0;
+        }
+        script.settle_waited += 1;
+        if script.settle_idle >= SETTLE_IDLE_FRAMES
+            || script.settle_waited >= SETTLE_MAX_WAIT_FRAMES
+        {
+            let (shot, _) = script
+                .pending_spawn
+                .take()
+                .expect("pending_spawn 刚完成帧号检查");
+            if script.settle_idle < SETTLE_IDLE_FRAMES {
+                eprintln!(
+                    "settle 超时({} 帧),强制截图:{}",
+                    script.settle_waited,
+                    shot.file_name()
+                );
+            }
+            let path = script.out_dir.join(shot.file_name());
+            let done = Arc::clone(&script.pending_shots);
+            commands
+                .spawn(Screenshot::primary_window())
+                .observe(save_to_disk(path))
+                .observe(move |_: On<ScreenshotCaptured>| {
+                    done.fetch_sub(1, Ordering::SeqCst);
+                });
+        }
     }
 
     let sample_mesh_stats = |meshes: &Assets<Mesh>| {
@@ -1824,6 +1858,9 @@ fn script_driver_system(
         }
         script.pending_shots.fetch_add(1, Ordering::SeqCst);
         script.pending_spawn = Some((shot, frame_counter.0));
+        script.settle_idle = 0;
+        script.settle_waited = 0;
+        script.settle_last_uploads = stats.uploads;
     }
 
     if !matches!(final_status, EngineStatus::Running { .. }) {
@@ -2755,10 +2792,10 @@ mod tests {
         }
     }
 
-    /// MS24(REQ-013 C02-2 D3 + R1 B4 / PM30 靶点):无头 App 真实调度
+    /// MS24(REQ-013 C02-2 D3 + R1 B4 / PM30 + C12 settle 靶点):无头 App 真实调度
     /// `Startup::setup_scene`(脚本模式)+ `script_driver_system` + `hud_update_system`,
     /// 验证初始 `Hidden`、手算五行文本串、`set_hud_visibility` 直调、以及三步脚本
-    /// (`screenshot hud=true` → `wait_ticks 2` → `screenshot hud=false`)的四帧可见性时序。
+    /// (`screenshot hud=true` → `wait_ticks 2` → `screenshot hud=false`)在 C12 settle 下的十帧可见性与 spawn 时序。
     #[test]
     fn ms24_script_shot_hud_visibility_and_text() {
         let tmp = tempfile::TempDir::new().expect("TempDir");
@@ -2780,6 +2817,9 @@ mod tests {
             last_observer_pos: None,
             pending_shots: Arc::new(AtomicUsize::new(0)),
             pending_spawn: None,
+            settle_idle: 0,
+            settle_waited: 0,
+            settle_last_uploads: 0,
             finished_exit: None,
             disconnected: None,
         };
@@ -2797,6 +2837,7 @@ mod tests {
         let (fake_transport, _inbound) = FakeTransport::new();
         app.insert_resource(TransportRes::new(fake_transport))
             .insert_resource(FrameCounter::default())
+            .insert_resource(PendingMeshesRes::default())
             .insert_resource(MeshStats::default())
             .insert_resource(MeshPerfRes::default())
             .insert_resource(FpsHistoryRes::default())
@@ -2857,7 +2898,7 @@ mod tests {
             });
         };
 
-        // update1(tick=1):step 1 screenshot hud=true 触发 → Inherited,且同帧不 spawn Screenshot(R3)。
+        // update1(tick=1):step 1 screenshot hud=true 触发 → Inherited,pending_spawn=(s1, shot_frame),settle 重置,实体数 0。
         push_tick(app.world_mut(), 1);
         app.update();
         assert_eq!(
@@ -2868,41 +2909,359 @@ mod tests {
         assert_eq!(
             screenshot_count(app.world_mut()),
             0,
-            "update1 shot 帧只切显隐与缓存 pending_spawn,世界内 Screenshot 实体数必须为 0(R3)"
+            "update1 shot 帧只切显隐与缓存 pending_spawn,世界内 Screenshot 实体数必须为 0(C12)"
         );
 
-        // 无头无 RenderPlugin 不会触发 ScreenshotCaptured,模拟上一步截图完成以继续推进。
+        // update2(tick=2):idle=1,waited=1,不 spawn;引擎被 pending_shots=1 门控。
+        push_tick(app.world_mut(), 2);
+        app.update();
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            0,
+            "update2 处于 settle 第 1 安静帧,Screenshot 实体数必须为 0"
+        );
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update2 settle 期间 HUD 显隐持续保持 Inherited"
+        );
+
+        // update3(tick=3):idle=2,仍不 spawn。
+        push_tick(app.world_mut(), 3);
+        app.update();
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            0,
+            "update3 处于 settle 第 2 安静帧,Screenshot 实体数必须为 0"
+        );
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update3 settle 期间 HUD 显隐持续保持 Inherited"
+        );
+
+        // update4(tick=4):idle=3 → spawn s1(实体数 == 1)。
+        push_tick(app.world_mut(), 4);
+        app.update();
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            1,
+            "update4 满 3 个安静帧后世界内必须恰有 1 个 Screenshot 实体(C12)"
+        );
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update4 spawn s1 时 HUD 显隐仍为 Inherited"
+        );
+
+        // 无头无 RenderPlugin 不会触发 ScreenshotCaptured,模拟 s1 捕获完成以推进后续步骤。
         app.world()
             .resource::<ScriptModeRes>()
             .pending_shots
             .store(0, Ordering::SeqCst);
 
-        // update2(tick=2):延迟 1 帧 spawn Screenshot 实体(==1),step 2 wait_ticks 2 入等 → 仍 Inherited。
-        push_tick(app.world_mut(), 2);
+        // update5(tick=5):step 2 wait_ticks 2 入等(起点 tick=5),HUD 仍 Inherited。
+        push_tick(app.world_mut(), 5);
+        app.update();
+        assert_eq!(screenshot_count(app.world_mut()), 1);
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Inherited,
+            "update5 处于 wait_ticks 2 期间 HUD 显隐持续保持 Inherited"
+        );
+
+        // update6(tick=6):6 < 5+2,等待中。
+        push_tick(app.world_mut(), 6);
+        app.update();
+        assert_eq!(screenshot_count(app.world_mut()), 1);
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Inherited);
+
+        // update7(tick=7):wait_ticks 2 结束并执行 step 3 screenshot hud=false → Hidden,实体数仍 1。
+        push_tick(app.world_mut(), 7);
+        app.update();
+        assert_eq!(screenshot_count(app.world_mut()), 1);
+        assert_eq!(
+            hud_vis(app.world_mut()),
+            Visibility::Hidden,
+            "update7 执行 hud=false 截图步后必须切回 Hidden"
+        );
+
+        // update8(tick=8):s2 settle idle=1 → 实体数仍 1,HUD 仍 Hidden。
+        push_tick(app.world_mut(), 8);
         app.update();
         assert_eq!(
             screenshot_count(app.world_mut()),
             1,
-            "update2 延迟 1 帧后世界内必须恰有 1 个 Screenshot 实体(R3)"
+            "update8 处于 s2 第 1 安静帧,Screenshot 实体数必须仍为 1"
         );
-        assert_eq!(
-            hud_vis(app.world_mut()),
-            Visibility::Inherited,
-            "update2 处于 wait_ticks 2 期间 HUD 显隐持续保持 Inherited"
-        );
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Hidden);
 
-        // update3(tick=3):wait_ticks 2 未满(3 < 4)→ 仍 Inherited。
-        push_tick(app.world_mut(), 3);
-        app.update();
-        assert_eq!(hud_vis(app.world_mut()), Visibility::Inherited);
-
-        // update4(tick=4):wait_ticks 2 结束并执行 step 3 screenshot hud=false → Hidden。
-        push_tick(app.world_mut(), 4);
+        // update9(tick=9):s2 settle idle=2 → 实体数仍 1,HUD 仍 Hidden。
+        push_tick(app.world_mut(), 9);
         app.update();
         assert_eq!(
-            hud_vis(app.world_mut()),
-            Visibility::Hidden,
-            "update4 执行 hud=false 截图步后必须切回 Hidden"
+            screenshot_count(app.world_mut()),
+            1,
+            "update9 处于 s2 第 2 安静帧,Screenshot 实体数必须仍为 1"
+        );
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Hidden);
+
+        // update10(tick=10):s2 settle idle=3 → spawn s2,实体数 == 2,HUD 仍 Hidden。
+        push_tick(app.world_mut(), 10);
+        app.update();
+        assert_eq!(
+            screenshot_count(app.world_mut()),
+            2,
+            "update10 满 3 个安静帧后世界内必须恰有 2 个 Screenshot 实体(C12)"
+        );
+        assert_eq!(hud_vis(app.world_mut()), Visibility::Hidden);
+    }
+
+    /// 构造 C12 settle 测试脚手架(同 MS24:三步场景、同系统链、同资源;已跑首帧 Startup)。
+    fn c12_script_app() -> (App, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let scenario = parse_scenario(
+            "name = \"c12\"\ndescription = \"settle\"\n\n\
+             [[step]]\nscreenshot = { name = \"s1\", expect = \"hud on\", hud = true }\n\
+             [[step]]\nwait_ticks = { n = 2 }\n\
+             [[step]]\nscreenshot = { name = \"s2\", expect = \"hud off\", hud = false }\n",
+        )
+        .expect("c12 场景合法");
+        let manifest = Manifest::new(&scenario);
+        let script_res = ScriptModeRes {
+            scenario,
+            out_dir: tmp.path().to_path_buf(),
+            world: WorldState::new(),
+            engine: None,
+            manifest,
+            coupled: true,
+            last_observer_pos: None,
+            pending_shots: Arc::new(AtomicUsize::new(0)),
+            pending_spawn: None,
+            settle_idle: 0,
+            settle_waited: 0,
+            settle_last_uploads: 0,
+            finished_exit: None,
+            disconnected: None,
+        };
+
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+        app.insert_resource(ViewCapRes {
+            view_distance: 8,
+            chunk_cap: ViewCapRes::default_cap(8),
+        });
+
+        let (fake_transport, _inbound) = FakeTransport::new();
+        app.insert_resource(TransportRes::new(fake_transport))
+            .insert_resource(FrameCounter::default())
+            .insert_resource(PendingMeshesRes::default())
+            .insert_resource(MeshStats::default())
+            .insert_resource(MeshPerfRes::default())
+            .insert_resource(FpsHistoryRes::default())
+            .insert_resource(ServerPerfRes::default())
+            .insert_resource(ServerTickRes::default())
+            .insert_resource(ToolRes::default())
+            .insert_resource(PossessRes::default())
+            .insert_resource(script_res)
+            .add_systems(Startup, setup_scene)
+            .add_systems(
+                Update,
+                (
+                    advance_frame_counter_system,
+                    script_driver_system,
+                    hud_update_system,
+                )
+                    .chain(),
+            );
+        // 首帧执行 Startup::setup_scene。
+        app.update();
+        (app, tmp)
+    }
+
+    fn c12_push_tick(world: &mut World, t: u64) {
+        let mut sm = world.resource_mut::<ScriptModeRes>();
+        sm.world.apply(ViewEvent::Entities {
+            tick: types::Tick(t),
+            states: vec![],
+            removed: vec![],
+            full: false,
+        });
+    }
+
+    fn c12_screenshot_count(world: &mut World) -> usize {
+        let mut q = world.query_filtered::<Entity, With<Screenshot>>();
+        q.iter(world).count()
+    }
+
+    /// C12(a):脏队非空与在途网格任务非空均阻挡 Screenshot spawn,两者清空后再连续等 3 个安静帧才 spawn。
+    #[test]
+    fn c12_settle_busy_delays_spawn() {
+        let (mut app, _tmp) = c12_script_app();
+        {
+            let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+            world_res
+                .mirror
+                .insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+            assert_eq!(world_res.mirror.dirty_len(), 24);
+        }
+
+        // update1(tick=1):shot 触发,实体数 0。
+        c12_push_tick(app.world_mut(), 1);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // update2、update3:脏队 24 > 0 → 实体数各 0。
+        c12_push_tick(app.world_mut(), 2);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+        c12_push_tick(app.world_mut(), 3);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // 排空脏队并插入一条在途网格任务。
+        {
+            let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+            while world_res.mirror.pop_dirty().is_some() {}
+            assert_eq!(world_res.mirror.dirty_len(), 0);
+        }
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .insert(
+                SubchunkPos {
+                    chunk: ChunkPos::new(0, 0),
+                    section: 0,
+                },
+                PendingMesh {
+                    kind: DirtyKind::Load,
+                    epoch: 1,
+                    task: ready_task(SubchunkMesh::default()),
+                },
+            );
+
+        // update4、update5:tasks 非空 → 实体数各 0。
+        c12_push_tick(app.world_mut(), 4);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+        c12_push_tick(app.world_mut(), 5);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // 清空在途任务后,连续 3 个安静帧(update6/7/8)后 spawn。
+        app.world_mut()
+            .resource_mut::<PendingMeshesRes>()
+            .tasks
+            .clear();
+
+        c12_push_tick(app.world_mut(), 6);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            0,
+            "update6 idle=1 必须不 spawn"
+        );
+        c12_push_tick(app.world_mut(), 7);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            0,
+            "update7 idle=2 必须不 spawn"
+        );
+        c12_push_tick(app.world_mut(), 8);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            1,
+            "update8 idle=3 必须 spawn Screenshot"
+        );
+    }
+
+    /// C12(b):uploads 增长重置安静帧计数,随后需再连续 3 个安静帧才 spawn。
+    #[test]
+    fn c12_settle_upload_reset() {
+        let (mut app, _tmp) = c12_script_app();
+
+        // update1(tick=1):shot 触发,实体数 0。
+        c12_push_tick(app.world_mut(), 1);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // update2(tick=2):idle=1 → 0。
+        c12_push_tick(app.world_mut(), 2);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // 模拟一次上传:uploads 变为 1。
+        app.world_mut().resource_mut::<MeshStats>().uploads = 1;
+
+        // update3(tick=3):uploads != 快照 → idle=0 → 0。
+        c12_push_tick(app.world_mut(), 3);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // update4(tick=4):idle=1 → 0;update5(tick=5):idle=2 → 0;update6(tick=6):idle=3 → 1。
+        c12_push_tick(app.world_mut(), 4);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            0,
+            "update4 idle=1 必须不 spawn"
+        );
+        c12_push_tick(app.world_mut(), 5);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            0,
+            "update5 idle=2 必须不 spawn"
+        );
+        c12_push_tick(app.world_mut(), 6);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            1,
+            "update6 idle=3 必须 spawn Screenshot"
+        );
+    }
+
+    /// C12(c):脏队持续非空时达到 SETTLE_MAX_WAIT_FRAMES(600)上限强制 spawn 兜底。
+    #[test]
+    fn c12_settle_timeout_forces_spawn() {
+        let (mut app, _tmp) = c12_script_app();
+        {
+            let mut world_res = app.world_mut().resource_mut::<WorldRenderRes>();
+            world_res
+                .mirror
+                .insert_chunk(ChunkPos::new(0, 0), Chunk::air());
+            assert_eq!(world_res.mirror.dirty_len(), 24);
+        }
+
+        // update1(tick=1):shot 触发,实体数 0。
+        c12_push_tick(app.world_mut(), 1);
+        app.update();
+        assert_eq!(c12_screenshot_count(app.world_mut()), 0);
+
+        // update2..=600:脏队恒 24,未满上限(waited=1..=599),实体数恒 0。
+        for tick in 2..=600 {
+            c12_push_tick(app.world_mut(), tick);
+            app.update();
+            assert_eq!(
+                c12_screenshot_count(app.world_mut()),
+                0,
+                "update{tick} 未达上限前必须不 spawn"
+            );
+        }
+
+        // update601:waited=600 >= SETTLE_MAX_WAIT_FRAMES → 强制 spawn,实体数 1。
+        c12_push_tick(app.world_mut(), 601);
+        app.update();
+        assert_eq!(
+            c12_screenshot_count(app.world_mut()),
+            1,
+            "update601 到达上限 600 帧必须强制 spawn"
         );
     }
 
