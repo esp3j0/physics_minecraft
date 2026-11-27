@@ -1,7 +1,7 @@
 # REQ-014 多人联机:权威服务器 + LOD 分级状态流
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
-  架构师合稿 gemini 独立分析;M01 已验收 `11229ab`)
+  架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -42,7 +42,8 @@ v1 交付:局域网/低 RTT 下 2–4 人合作同一世界:编辑互见、附�
   断连 HUD(现交互分支 Bye 落 `_ => {}` 补齐)。
 - **能力协商(C2S 判别 13 `SetAgentStream { lod: bool }`)**:新客户端握手后
   显式启用 LOD/紧凑流;未发送者(旧 viewer、全部既有 REQ-012/013 自动化)
-  继续收原 AgentStates/ObserveCadence 流,**帧序列逐位不变**(ACM8)。
+  继续收原 AgentStates/ObserveCadence 流,**稳态帧序列逐位不变**(ACM8;
+  出站积压时 P2 最新覆盖对全部连接生效,属有意语义)。
 - **出站四级队列**(替换现 Critical 64 + World 512 丢最旧,net.rs:305–371):
   P0 Critical(Welcome/Bye/Possessed/Spawned,不丢);P1 可靠事件
   (BlockUpdates/ChunkUnload/EntityShapes/AgentMeta,不丢、满则反压计数);
@@ -201,8 +202,10 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   (16 人目标 P95 ≤12ms 为估算,实测定);policy_timeouts=0 @v1 规模。
 - ACM7 L0 端到端 P95 ≤ RTT+2 tick(局域网);自身 60Hz 平滑;L1 插值无 6/10Hz
   抽搐;换档混合 ≤150ms 不闪跳(截图架构师亲视);L2 静姿+摆腿远距可接受。
-- ACM8 未发 SetAgentStream 的连接(旧 viewer/既有自动化)帧序列逐位不变
-  (golden;M04a)。
+- ACM8 未发 SetAgentStream 的连接(旧 viewer/既有自动化)**稳态**(无出站
+  积压)帧序列逐位不变(golden;M04a)。积压时 P2 最新覆盖丢旧不丢新,对
+  全部连接生效(队列是连接级基础设施);M02a-1 起 REQ-013 C05 T-A 的
+  整段线字节逐位锚由「末帧 EntityStates 等价 + 字节数/帧数单调」取代。
 - ACM9 ★ 100ms RTT + ±15ms 抖动 + 1% 丢包注入:状态收敛无幽灵;手感=RTT
   记录在案(M05)。
 - ACM10 ★ chunk 首连突发期间 L0 专流停顿 ≤50ms(P3 限速;M02a 结构、M05 实测)。
@@ -217,6 +220,12 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
 - **M02a 服务端专流与队列隔离**:ClientSession/Arc<TickSnapshot>;Outbound
   P0–P3 + P3 限速;L0 60Hz 专流(过渡用现网 AgentStates 单实体);F6/F7/F8;
   F9 奇偶错峰;F10 静止短路。验收:ACM10 结构 + 队列单测 + 单主体查询复杂度。
+  **拆分**(2026-11-27):M02a-1 网络层(四级队列/P3 限速/L0 专流/F8/F10)
+  与 M02a-2 查询/策略层(F6 单主体 O(log A)/F7 Arc<TickSnapshot>/F9 错峰)。
+  **M02a-1 已验收**(2026-11-27,`4fe3a7b`;五包 627 绿 + e2e 13 绿;
+  架构师变异 MA–MI 9/9 击杀;T8 双空轮数锚经 R1 纠正 20/20/21,架构师原锚
+  错误认账;既有测试收帧手法经 R1/R2 授权改写 c05_ta 锚 2 / removed 顺序无关 /
+  compound_shapes full 感知增量窗 6 拍,语义锚不变,生产代码零改动)。
 - **M02b 客户端快照插值**(与 M02a 可并行):InterpBuffer 纯逻辑零墙钟单测;
   L0/单机旁路;≤50ms 钳制外推。验收:ACM7 插值部分。
 - **M03 双客户端权威 e2e**:编辑互见/附身互斥/迟到者活跃块编辑/带负荷断线

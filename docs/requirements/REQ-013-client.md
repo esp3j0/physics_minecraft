@@ -264,6 +264,10 @@ inner(ack 语义 C04 落),`InputAck`/`Correction` 只落枚举与 codec、
   OS 线程 `c05_tc_real_thread_stall_sim_keeps_ticking`(800ms 不 drain,
   `tick>=40`、落体 y<=-57)绿;冒烟 `client_render_stall` 阻塞 1500ms
   期间宿主自主推进 +91 拍(115→206),`no_floating`/`block` 两项 check 均 ok。
+  **REQ-014 M02a-1 取代注**(2026-11-27,`4fe3a7b`):出站 P2 最新覆盖
+  (积压丢旧不丢新)为有意语义,T-A 的「整段线字节逐位相等」锚改为
+  「末帧 EntityStates 逐位等价 + 字节数/帧数 B≤A」;终态锚(tick 51 /
+  ChunkData 25 / Spawned 1 / 落体 y 逐位)不变。见 REQ-014 ACM8 稳态口径。
 - [x] AC5:本地策略推理驱动 quad(quad_gpu1),同机与服务器路径
   playback 位级一致(复用 check-policy 同机核对口径 + 回放比对)。
   C03-2 验收:app `dual_path::ac5_dual_path_bit_exact_consistency` 绿
