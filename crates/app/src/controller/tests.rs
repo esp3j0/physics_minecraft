@@ -1579,6 +1579,117 @@ fn m02a2_t5_f9_script_zero_phase() {
     assert_eq!(ids, vec![e(2), e(3)], "脚本 phase 恒 0,n=0 双到期升序");
 }
 
+/// REQ-014 M02a-2 R1 T5b(F9 脚本挂载不扰策略相位计数器,击杀 N7):
+/// 按序挂载(全 now=Tick(0), period 2):Script e(2)(计数器保持 0)→ Policy e(1)(phase=0,
+/// 计数器→1)→ Script e(3)(计数器保持 1)→ Policy e(4)(phase=1,计数器→0)。
+/// 断言:Tick(0) 替身恰捕获 `[e(1)]`;Tick(1) 替身新增恰 `[e(4)]`。
+#[test]
+fn m02a2_t5b_f9_script_attach_does_not_disturb_policy_phase() {
+    use super::policy_worker::{InferReply, InferRequest, PolicyExecutor};
+
+    struct CaptureExecutor {
+        submitted: Vec<EntityId>,
+        ready: std::collections::VecDeque<InferReply>,
+    }
+
+    impl PolicyExecutor for CaptureExecutor {
+        fn submit(&mut self, req: InferRequest) {
+            self.submitted.push(req.entity);
+            self.ready.push_back(InferReply {
+                seq: req.seq,
+                entity: req.entity,
+                result: Ok(policy::Action {
+                    raw: vec![0.0; QUAD_DOF],
+                    targets: vec![0.0; QUAD_DOF],
+                    clamped: 0,
+                }),
+                infer_us: 0,
+            });
+        }
+
+        fn try_recv(&mut self) -> Option<InferReply> {
+            self.ready.pop_front()
+        }
+
+        fn recv_until(&mut self, _deadline: std::time::Instant) -> Option<InferReply> {
+            self.ready.pop_front()
+        }
+
+        fn wait_budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(5)
+        }
+    }
+
+    let (mut session, a1, _table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let hash = bodies.insert_toml(quad_asset()).expect("quad 合法");
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    let a4 = e(4);
+    session
+        .spawn_agent(
+            shard,
+            a4,
+            hash,
+            types::EntityState {
+                translation: types::glam::Vec3::new(12.0, 66.0, 8.0),
+                rotation: types::glam::Quat::IDENTITY,
+                linvel: types::glam::Vec3::ZERO,
+                angvel: types::glam::Vec3::ZERO,
+            },
+        )
+        .expect("生成四足 e(4)");
+    session.tick();
+
+    let mut host = ControllerHost::default();
+    host.attach(
+        e(2),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        Tick(0),
+        None,
+    )
+    .expect("挂脚本 e(2)");
+    attach_policy(&mut host, a1, "stand");
+    host.attach(
+        e(3),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        Tick(0),
+        None,
+    )
+    .expect("挂脚本 e(3)");
+    attach_policy(&mut host, a4, "stand");
+
+    let mut mock = CaptureExecutor {
+        submitted: Vec::new(),
+        ready: std::collections::VecDeque::new(),
+    };
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+
+    host.drive_policies(&mut session, &mut log, &mut mock, Tick(0), &empty, &empty);
+    assert_eq!(
+        mock.submitted,
+        vec![e(1)],
+        "Tick(0) 仅 e(1)(phase=0) 到期,e(4)(phase=1) 不到期"
+    );
+
+    let before_t1 = mock.submitted.len();
+    host.drive_policies(&mut session, &mut log, &mut mock, Tick(1), &empty, &empty);
+    assert_eq!(
+        &mock.submitted[before_t1..],
+        &[e(4)],
+        "Tick(1) 新增恰 [e(4)](phase=1 到期,e(1) 不到期)"
+    );
+    session.shutdown();
+}
+
 /// REQ-014 M02a-2 T6(F9 执行器边界):PolicyExecutor 测试替身注入 drive_policies,
 /// 捕获 1 条请求并回一条 canned 零动作回复。
 #[test]
