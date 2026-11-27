@@ -1,7 +1,7 @@
 # REQ-014 多人联机:权威服务器 + LOD 分级状态流
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
-  架构师合稿 gemini 独立分析;M01 任务书待派发)
+  架构师合稿 gemini 独立分析;M01 已验收 `11229ab`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -211,6 +211,9 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
 
 - **M01 网络传输与握手加固**:NetTransport(TCP)+ --connect + 断连 HUD;
   F1/F2/F5;F3 热块优先读。验收:ACM4 结构 + 握手/断连单测 + 旧流不变。
+  **已验收**(2026-11-27,`11229ab`;四包 552 绿 + e2e 5 绿;变异 MA–ME 击杀、
+  MF 拆批存活 = 既有套件无 TCP 批边界锚,覆盖缺口留 M02a/M03 补;
+  T5 Welcome 锚经 R1 裁决纠正为两阶段恰 2 条,架构师原锚错误认账)。
 - **M02a 服务端专流与队列隔离**:ClientSession/Arc<TickSnapshot>;Outbound
   P0–P3 + P3 限速;L0 60Hz 专流(过渡用现网 AgentStates 单实体);F6/F7/F8;
   F9 奇偶错峰;F10 静止短路。验收:ACM10 结构 + 队列单测 + 单主体查询复杂度。
