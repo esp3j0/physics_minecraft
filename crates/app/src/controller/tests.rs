@@ -645,6 +645,7 @@ fn l3_records_roundtrip() {
         attached_at: Tick(0),
         leash: None,
         intent: [0.0; 3],
+        phase: 0,
     };
 }
 
@@ -1401,4 +1402,244 @@ fn ms7_acc_policy_perf() {
             max_us: 2500,
         }
     );
+}
+
+/// REQ-014 M02a-2 T1(F6 存活等价):session 层四足多连杆,不 tick 即读,
+/// `agent_root_state` 与初始位姿逐位相等且等于 `agent_states()` poses[0],
+/// 不存在实体返回 None。
+#[test]
+fn m02a2_t1_f6_agent_root_state_alive_equiv() {
+    fn assert_state_bitwise_eq(got: types::EntityState, want: types::EntityState, label: &str) {
+        assert_eq!(got, want, "{label}: 值不等");
+        assert_eq!(
+            got.translation.to_array().map(f32::to_bits),
+            want.translation.to_array().map(f32::to_bits),
+            "{label}: translation 逐位不等"
+        );
+        assert_eq!(
+            got.rotation.to_array().map(f32::to_bits),
+            want.rotation.to_array().map(f32::to_bits),
+            "{label}: rotation 逐位不等"
+        );
+        assert_eq!(
+            got.linvel.to_array().map(f32::to_bits),
+            want.linvel.to_array().map(f32::to_bits),
+            "{label}: linvel 逐位不等"
+        );
+        assert_eq!(
+            got.angvel.to_array().map(f32::to_bits),
+            want.angvel.to_array().map(f32::to_bits),
+            "{label}: angvel 逐位不等"
+        );
+    }
+
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let hash = bodies.insert_toml(quad_asset()).expect("quad 合法");
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    let mut cfg = physics_sim::ShardSimConfig::new(shard);
+    cfg.solidify.enabled = false;
+    cfg.cohesion.enabled = false;
+    let mut sim = physics_sim::ShardSim::new_with_bodies(
+        cfg,
+        Box::new(voxel::SimpleRegistry::builtin()),
+        bodies,
+    );
+    let s1 = types::EntityState {
+        translation: types::glam::Vec3::new(8.0, 66.0, 8.0),
+        rotation: types::glam::Quat::IDENTITY,
+        linvel: types::glam::Vec3::ZERO,
+        angvel: types::glam::Vec3::ZERO,
+    };
+    let s2 = types::EntityState {
+        translation: types::glam::Vec3::new(12.0, 66.0, 8.0),
+        rotation: types::glam::Quat::IDENTITY,
+        linvel: types::glam::Vec3::ZERO,
+        angvel: types::glam::Vec3::ZERO,
+    };
+    sim.spawn_agent(e(1), hash, s1, None).expect("生成 e(1)");
+    sim.spawn_agent(e(2), hash, s2, None).expect("生成 e(2)");
+
+    let mut session = sim_api::session::Session::new(sim_api::session::SessionConfig::default());
+    session.register(sim);
+
+    let r1 = session.agent_root_state(e(1)).expect("e(1) 存活");
+    let r2 = session.agent_root_state(e(2)).expect("e(2) 存活");
+    assert_state_bitwise_eq(r1, s1, "e(1) vs 期望");
+    assert_state_bitwise_eq(r2, s2, "e(2) vs 期望");
+
+    let all = session.agent_states();
+    let p1 = all
+        .iter()
+        .find(|(id, _, _)| *id == e(1))
+        .expect("e(1) 在 agent_states")
+        .2[0];
+    let p2 = all
+        .iter()
+        .find(|(id, _, _)| *id == e(2))
+        .expect("e(2) 在 agent_states")
+        .2[0];
+    assert_state_bitwise_eq(r1, p1, "e(1) vs agent_states[0]");
+    assert_state_bitwise_eq(r2, p2, "e(2) vs agent_states[0]");
+    assert_eq!(
+        session.agent_root_state(e(999)),
+        None,
+        "不存在实体必返 None"
+    );
+    session.shutdown();
+}
+
+/// REQ-014 M02a-2 T4(F9 双狗错峰):同拍挂两只 period=2 策略狗 → phase 0/1,
+/// Tick(0..=3) 每拍恰发 1 条请求、累计 requests_sent 依次 1/2/3/4,每拍推理 +1。
+#[test]
+fn m02a2_t4_f9_policy_phase_stagger() {
+    let (mut session, a1, table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut bodies = physics_sim::BodyRegistry::new();
+    let hash = bodies.insert_toml(quad_asset()).expect("quad 合法");
+    let shard = types::ShardId::new(
+        types::WorldId(0),
+        types::DimensionId(0),
+        types::ShardPos::new(0, 0),
+    );
+    let a2 = e(2);
+    session
+        .spawn_agent(
+            shard,
+            a2,
+            hash,
+            types::EntityState {
+                translation: types::glam::Vec3::new(12.0, 66.0, 8.0),
+                rotation: types::glam::Quat::IDENTITY,
+                linvel: types::glam::Vec3::ZERO,
+                angvel: types::glam::Vec3::ZERO,
+            },
+        )
+        .expect("生成第二只四足");
+    session.tick();
+
+    let mut worker = worker5s(table);
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a1, "stand");
+    attach_policy(&mut host, a2, "stand");
+    let records = host.to_records();
+    assert_eq!(records[0].slot.phase, 0, "首只策略 phase=0");
+    assert_eq!(records[1].slot.phase, 1, "次只策略 phase=1");
+
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    for (tick, want) in [(Tick(0), 1u64), (Tick(1), 2), (Tick(2), 3), (Tick(3), 4)] {
+        host.drive_policies(&mut session, &mut log, &mut worker, tick, &empty, &empty);
+        assert_eq!(
+            worker.requests_sent(),
+            want,
+            "tick={}: 累计发出请求数",
+            tick.0
+        );
+        assert_eq!(
+            host.counters.policy_inferences, want,
+            "tick={}: 累计推理数",
+            tick.0
+        );
+    }
+    session.shutdown();
+}
+
+/// REQ-014 M02a-2 T5(F9 脚本零相位):先挂 Policy e(1)(计数器→1),再挂两只
+/// Script(QuadStand) e(2)、e(3)(period=2) → Tick(0) 脚本双到期 `[e(2), e(3)]`。
+#[test]
+fn m02a2_t5_f9_script_zero_phase() {
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, e(1), "stand");
+    host.attach(
+        e(2),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        Tick(0),
+        None,
+    )
+    .expect("挂脚本 e(2)");
+    host.attach(
+        e(3),
+        ControllerKind::Script(ScriptKind::QuadStand),
+        QUAD_DOF,
+        2,
+        Tick(0),
+        None,
+    )
+    .expect("挂脚本 e(3)");
+    let ids: Vec<EntityId> = host
+        .actions_for_tick(Tick(0))
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(ids, vec![e(2), e(3)], "脚本 phase 恒 0,n=0 双到期升序");
+}
+
+/// REQ-014 M02a-2 T6(F9 执行器边界):PolicyExecutor 测试替身注入 drive_policies,
+/// 捕获 1 条请求并回一条 canned 零动作回复。
+#[test]
+fn m02a2_t6_f9_policy_executor_boundary() {
+    use super::policy_worker::{InferReply, InferRequest, PolicyExecutor};
+
+    struct MockExecutor {
+        submitted: Vec<InferRequest>,
+        canned: Option<InferReply>,
+        ready: std::collections::VecDeque<InferReply>,
+    }
+
+    impl PolicyExecutor for MockExecutor {
+        fn submit(&mut self, req: InferRequest) {
+            self.submitted.push(req);
+            if let Some(reply) = self.canned.take() {
+                self.ready.push_back(reply);
+            }
+        }
+
+        fn try_recv(&mut self) -> Option<InferReply> {
+            self.ready.pop_front()
+        }
+
+        fn recv_until(&mut self, _deadline: std::time::Instant) -> Option<InferReply> {
+            self.ready.pop_front()
+        }
+
+        fn wait_budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(5)
+        }
+    }
+
+    let (mut session, a, _table) = policy_session("stand", STAND_ONNX, STAND_OBS, 0.25, None);
+    let mut host = ControllerHost::default();
+    attach_policy(&mut host, a, "stand");
+    let mut mock = MockExecutor {
+        submitted: Vec::new(),
+        canned: Some(InferReply {
+            seq: 0,
+            entity: a,
+            result: Ok(policy::Action {
+                raw: vec![0.0; QUAD_DOF],
+                targets: vec![0.0; QUAD_DOF],
+                clamped: 0,
+            }),
+            infer_us: 0,
+        }),
+        ready: std::collections::VecDeque::new(),
+    };
+    let mut log = sim_api::log::CommandLog::new();
+    let empty = std::collections::BTreeSet::new();
+    host.drive_policies(&mut session, &mut log, &mut mock, Tick(0), &empty, &empty);
+
+    assert_eq!(mock.submitted.len(), 1, "替身收到恰 1 条请求");
+    assert_eq!(mock.submitted[0].entity, e(1));
+    assert_eq!(mock.submitted[0].seq, 0);
+    assert_eq!(mock.submitted[0].key, PolicyKey::of("stand"));
+    assert_eq!(host.counters.policy_inferences, 1);
+    assert_eq!(host.counters.actions_emitted, 1);
+    assert_eq!(log.entries().len(), 1);
+    assert!(mock.try_recv().is_none(), "canned 回过即 None");
+    session.shutdown();
 }

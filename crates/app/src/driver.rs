@@ -536,6 +536,15 @@ impl From<&crate::net::NetConfig> for ObserveCadence {
     }
 }
 
+/// 每输出拍一次的主体共享只读表(REQ-014 F7;预量化留 M04a 新包型)。
+struct TickSnapshot {
+    agents: Vec<(
+        types::EntityId,
+        types::BodyHash,
+        std::sync::Arc<Vec<types::EntityState>>,
+    )>,
+}
+
 /// 每玩家观察流状态(任务书 03 接口设计:断连即弃;玩家互不影响)。
 struct PlayerStream {
     /// 距离过滤半径(米;Subscribe 钳制值 × 16,README 决策 8)。
@@ -543,9 +552,10 @@ struct PlayerStream {
     /// 上次发给该玩家的实体表快照(差分基准;实体消失 = 上轮有本轮无)。
     last_sent: BTreeMap<types::EntityId, types::EntityState>,
     /// 上次发给该玩家的主体表快照(REQ-012 A03 §1:`AgentStates` 差分基准;
-    /// `(EntityId, 身体哈希, 连杆姿态)`;是否发送的判据 = 本拍视距内有主体
+    /// `(EntityId, 身体哈希, 连杆姿态 Arc)`;是否发送的判据 = 本拍视距内有主体
     /// 或本表非空——世界无主体时帧序列与改动前逐位相同,AC-A8)。
-    last_agents: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)>,
+    last_agents:
+        BTreeMap<types::EntityId, (types::BodyHash, std::sync::Arc<Vec<types::EntityState>>)>,
     /// 是否经 `C2S::SetAgentStream { lod: true }` 启用 LOD/L0 专流(REQ-014 §3)。
     lod_enabled: bool,
 }
@@ -2284,8 +2294,14 @@ impl ObserveOrchestrator {
         // 主体、或上次发给它的主体表非空才发(A03 §1:世界无主体时帧序列与
         // 改动前逐位相同,AC-A8)。主体被移除 → 出现在增量包 removed(差分
         // 三源同型:迁移/移除/消失)。主体从不在 EntityStates 里(内核已过滤)。
-        let agent_table = session.agent_states();
-        let agents_visible_any = !agent_table.is_empty();
+        let snapshot = TickSnapshot {
+            agents: session
+                .agent_states()
+                .into_iter()
+                .map(|(id, h, p)| (id, h, std::sync::Arc::new(p)))
+                .collect(),
+        };
+        let agents_visible_any = !snapshot.agents.is_empty();
         for player in hub.subscribers() {
             let Some(stream) = self.players.get_mut(&player) else {
                 continue;
@@ -2306,16 +2322,18 @@ impl ObserveOrchestrator {
             let full = full_due || stream.last_agents.is_empty();
             let radius = stream.view_distance_m;
             // 视距内主体(3D 距离,与 EntityStates 同式;中心 = 观察者位置)。
-            let mut visible: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)> =
-                BTreeMap::new();
-            for (id, hash, poses) in &agent_table {
+            let mut visible: BTreeMap<
+                types::EntityId,
+                (types::BodyHash, std::sync::Arc<Vec<types::EntityState>>),
+            > = BTreeMap::new();
+            for (id, hash, poses) in &snapshot.agents {
                 if Some(*id) == l0_entity {
                     continue;
                 }
                 if let Some(root) = poses.first()
                     && position.distance(root.translation) <= radius
                 {
-                    visible.insert(*id, (*hash, poses.clone()));
+                    visible.insert(*id, (*hash, std::sync::Arc::clone(poses)));
                 }
             }
             let nothing_near = visible.is_empty();
@@ -2329,13 +2347,13 @@ impl ObserveOrchestrator {
             if full {
                 states = visible
                     .iter()
-                    .map(|(k, v)| (*k, v.0, v.1.clone()))
+                    .map(|(k, v)| (*k, v.0, (*v.1).clone()))
                     .collect();
             } else {
                 for (id, (hash, poses)) in &visible {
                     match stream.last_agents.get(id) {
-                        Some(prev) if prev.0 == *hash && prev.1 == *poses => {}
-                        _ => states.push((*id, *hash, poses.clone())),
+                        Some(prev) if prev.0 == *hash && *prev.1 == **poses => {}
+                        _ => states.push((*id, *hash, (**poses).clone())),
                     }
                 }
                 for id in stream.last_agents.keys() {
@@ -9252,5 +9270,153 @@ mod tests {
         tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
         let _ = driver.await.expect("驱动不 panic");
         let _ = bcast_tx.send(());
+    }
+
+    /// REQ-014 M02a-2 T3(F7 静止零增量):observe_harness 零重力、1 订阅玩家未发
+    /// SetAgentStream、cadence interval=3 / full=60;视距内 spawn 1 静止主体,
+    /// 第 1 个输出拍恰 1 帧 full=true,再推进 3 拍(第 2 个输出拍)无新帧,
+    /// 两输出拍窗口内 AgentStates 帧总数 == 1。
+    #[tokio::test(start_paused = true)]
+    async fn m02a2_t3_f7_static_agent_zero_incremental() {
+        let config = observe_config();
+        let (mut args, tx, _hub, addr, _checkpoints) = observe_harness(config.clone()).await;
+        args.observe.as_mut().expect("observe 缝在").cadence = ObserveCadence {
+            interval_ticks: 3,
+            full_interval_ticks: 60,
+        };
+        let mut bodies = physics_sim::BodyRegistry::new();
+        let hash = bodies
+            .insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+            .expect("capsule 合法");
+        args.bodies = bodies.clone();
+        let sim_source = config.clone();
+        args.new_sim = Box::new(move |shard: types::ShardId| {
+            let mut sim_cfg = sim_source.shard_sim_config(shard);
+            sim_cfg.gravity = Vec3::ZERO;
+            sim_cfg.solidify.displacement_gate_m = 0.0;
+            physics_sim::ShardSim::new_with_bodies(
+                sim_cfg,
+                Box::new(SimpleRegistry::builtin()),
+                bodies.clone(),
+            )
+        });
+        let driver = tokio::spawn(run(args));
+
+        async fn step_one_tick() {
+            advance_ticks(1).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn drain_ready(c: &mut MiniClient) -> Vec<S2C> {
+            let mut out = Vec::new();
+            for _ in 0..16 {
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                    out.push(msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+                while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                    out.push(msg);
+                }
+            }
+            out
+        }
+
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _player = join_player(&mut c, 4).await;
+        c.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("MoveObserver 写入");
+        // 先让 TCP 连接任务读入 MoveObserver,再推进 2 拍确保分片 (0,0) 注册与观察者落表。
+        let _ = drain_ready(&mut c).await;
+        step_one_tick().await;
+        step_one_tick().await;
+        let _ = drain_ready(&mut c).await;
+
+        let entity = EntityId::from_parts(1, 1);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 8.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+
+        // 推进到第 1 个输出拍,收齐窗口内全部 AgentStates 帧。
+        struct AgentFrame {
+            ids: Vec<EntityId>,
+            removed: Vec<EntityId>,
+            full: bool,
+        }
+        let mut frames: Vec<AgentFrame> = Vec::new();
+        for _ in 0..6 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut c).await {
+                if let S2C::AgentStates {
+                    states,
+                    removed,
+                    full,
+                    ..
+                } = msg
+                {
+                    frames.push(AgentFrame {
+                        ids: states.into_iter().map(|(id, _, _)| id).collect(),
+                        removed,
+                        full,
+                    });
+                }
+            }
+            if !frames.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(frames.len(), 1, "第 1 个输出拍恰 1 帧 AgentStates");
+        assert!(frames[0].full, "首包必为 full=true");
+        assert_eq!(frames[0].ids, vec![entity], "首包 states 恰含 [e]");
+        assert!(frames[0].removed.is_empty(), "首包 removed 必为空");
+
+        // 再推进 3 拍(跨过第 2 个输出拍,interval=3、full=60):静止内容相等 → 增量空 → 跳过。
+        for _ in 0..3 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut c).await {
+                if let S2C::AgentStates {
+                    states,
+                    removed,
+                    full,
+                    ..
+                } = msg
+                {
+                    frames.push(AgentFrame {
+                        ids: states.into_iter().map(|(id, _, _)| id).collect(),
+                        removed,
+                        full,
+                    });
+                }
+            }
+        }
+        assert_eq!(
+            frames.len(),
+            1,
+            "两输出拍窗口内 AgentStates 帧总数必 == 1(第 2 拍静止零增量跳过),实得 {}",
+            frames.len()
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        driver.await.expect("驱动不 panic");
     }
 }

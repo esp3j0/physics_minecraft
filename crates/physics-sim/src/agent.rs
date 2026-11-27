@@ -432,6 +432,27 @@ impl ShardSim {
             .map(|rb| crate::conv::rapier_to_vec3(rb.translation()))
     }
 
+    /// 主体根连杆状态(单主体直定位,REQ-014 F6)。不存在/已冻结 → None。
+    pub fn agent_root_state(&self, entity: EntityId) -> Option<types::EntityState> {
+        let record = self.agents.get(&entity)?;
+        if record.frozen.is_some() {
+            return None;
+        }
+        let def = self
+            .bodies
+            .get(&record.body_hash)
+            .expect("主体身体哈希必在注册表(fail-stop)");
+        let root = def.links.first()?;
+        let &handle = record.links.get(&root.name)?;
+        let rb = self.phys.bodies.get(handle)?;
+        Some(types::EntityState {
+            translation: crate::conv::rapier_to_vec3(rb.translation()),
+            rotation: crate::conv::rapier_to_quat(rb.rotation()),
+            linvel: crate::conv::rapier_to_vec3(rb.linvel()),
+            angvel: crate::conv::rapier_to_vec3(rb.angvel()),
+        })
+    }
+
     /// 生成主体(REQ-012 §3;A01 第 3 节 / B01a):
     /// - 未知哈希 → `Err(UnknownBody)` + 遥测(`agent_spawn_rejected`);
     /// - 单连杆 = 玩家胶囊路径(`spawn_agent_single`,一行不改地搬);
@@ -11403,6 +11424,29 @@ kd = 2.0
         let per_tick_us = t0.elapsed().as_secs_f64() * 1e6 / ticks as f64;
         println!(
             "CRUSH_TIMING: {n} 只四足,agent_runaway_guard 每拍均值 {per_tick_us:.1} us({ticks} 拍窗)"
+        );
+    }
+
+    /// REQ-014 M02a-2 T2(F6 冻结/缺失):四足冻结后 `agent_root_state` 返 None
+    /// 且 `is_agent_frozen` 为 true;未生成实体返 None。
+    #[test]
+    fn m02a2_t2_f6_agent_root_state_frozen_and_missing() {
+        let (mut s, hash) = quad_sim_with(0.01);
+        load_flat_ground(&mut s);
+        let a = types::EntityId::from_parts(1, 1);
+        s.spawn_agent(a, hash, quad_spawn_state(quad_origin(24.0, 24.0)), None)
+            .expect("四足生成");
+        s.freeze_agent(a);
+        assert!(s.is_agent_frozen(a), "冻结后 is_agent_frozen 必为 true");
+        assert_eq!(
+            s.agent_root_state(a),
+            None,
+            "冻结后 agent_root_state 必为 None"
+        );
+        assert_eq!(
+            s.agent_root_state(types::EntityId::from_parts(999, 1)),
+            None,
+            "未生成实体必为 None"
         );
     }
 }

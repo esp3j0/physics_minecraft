@@ -31,7 +31,7 @@ use sim_api::session::{AgentJointState, Session};
 use types::{EntityId, EntityState, Tick};
 
 use gait::{Gait, QUAD_DOF, SIM_DT, stand_targets, trot_targets};
-use policy_worker::{InferReply, InferRequest, PolicyWorker};
+use policy_worker::{InferReply, InferRequest, PolicyExecutor};
 
 /// 策略名的 FNV-1a 64 位(REQ-012 D01b-1 §1.2;算法与 `BodyHash::fnv1a`
 /// 相同,对名字的 UTF-8 字节算)。
@@ -90,6 +90,9 @@ pub struct ControllerSlot {
     /// 给策略的意图观测 [move_x, move_z, yaw](D01b-1 §1.2)。脚本和
     /// None 不用,恒为 0。
     pub intent: [f32; 3],
+    /// 策略奇偶错峰相位(仅 0/1;REQ-014 F9;脚本与 None 恒 0;运行态不入 v16 存档)。
+    #[serde(skip)]
+    pub phase: u32,
 }
 
 /// 检查点里的控制者条目(§2.5):EntityId + 槽位,恢复时 `from_records`
@@ -190,6 +193,8 @@ pub struct ControllerHost {
     pending: BTreeMap<EntityId, Pending>,
     /// 推理请求序号发生器(D01b-2 §1.2)。
     next_seq: u64,
+    /// 下一个策略槽位的奇偶错峰相位(仅 0/1;REQ-014 F9)。
+    next_policy_phase: u32,
 }
 
 impl ControllerHost {
@@ -222,14 +227,19 @@ impl ControllerHost {
         if period_ticks == 0 {
             return Err(AttachError::ZeroPeriod);
         }
-        if matches!(kind, ControllerKind::Policy(_)) {
+        let phase = if matches!(kind, ControllerKind::Policy(_)) {
             self.policy_state.insert(
                 entity,
                 PolicyRunState {
                     last_action: vec![0.0; dof],
                 },
             );
-        }
+            let p = self.next_policy_phase;
+            self.next_policy_phase ^= 1;
+            p
+        } else {
+            0
+        };
         self.slots.insert(
             entity,
             ControllerSlot {
@@ -239,6 +249,7 @@ impl ControllerHost {
                 attached_at: now,
                 leash,
                 intent: [0.0; 3],
+                phase,
             },
         );
         Ok(())
@@ -443,7 +454,7 @@ impl ControllerHost {
         &mut self,
         session: &mut Session,
         log: &mut CommandLog,
-        worker: &mut PolicyWorker,
+        worker: &mut dyn PolicyExecutor,
         now: Tick,
         skip: &std::collections::BTreeSet<EntityId>,
         frozen: &std::collections::BTreeSet<EntityId>,
@@ -459,7 +470,9 @@ impl ControllerHost {
             .filter(|(_, slot)| {
                 matches!(slot.kind, ControllerKind::Policy(_))
                     && now.0 >= slot.attached_at.0
-                    && now.0.saturating_sub(slot.attached_at.0) % u64::from(slot.period_ticks) == 0
+                    && (now.0.saturating_sub(slot.attached_at.0) + u64::from(slot.phase))
+                        % u64::from(slot.period_ticks)
+                        == 0
             })
             .map(|(&entity, _)| entity)
             .collect();

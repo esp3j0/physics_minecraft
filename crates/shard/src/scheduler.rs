@@ -1437,17 +1437,11 @@ impl Scheduler {
         sim.agent_intent_state(entity)
     }
 
-    /// 主体根连杆状态(位置、朝向、世界系线速度/角速度;D01b-1 §1.1):
-    /// 根连杆 = `agent_states` 连杆列表第 0 条。条件同 `agent_joint_state`。
+    /// 主体根连杆状态(位置、朝向、世界系线速度/角速度;D01b-1 §1.1 / REQ-014 F6):
+    /// 经 ownership 索引直定位分片与主体,不存在/迁移在途/已冻结 → None。
     pub fn agent_root_state(&self, entity: EntityId) -> Option<types::EntityState> {
-        let sim = self.sims.values().find(|sim| sim.is_agent(entity))?;
-        if sim.is_agent_frozen(entity) {
-            return None;
-        }
-        sim.agent_states()
-            .into_iter()
-            .find(|(id, _, _)| *id == entity)
-            .and_then(|(_, _, states)| states.into_iter().next())
+        let owner = self.entity_ownership.owner_of(entity)?;
+        self.sims.get(&owner.shard)?.agent_root_state(entity)
     }
 
     /// Router 待投递迁移信封(REQ-012 A03;驱动侧附身清理的"在途不算

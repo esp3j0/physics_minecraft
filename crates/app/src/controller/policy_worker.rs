@@ -158,6 +158,32 @@ impl PolicyWorker {
     }
 }
 
+/// 策略执行器边界(REQ-014 F9;M05b 扩池换实现的缝)。
+pub trait PolicyExecutor {
+    fn submit(&mut self, req: InferRequest);
+    fn try_recv(&mut self) -> Option<InferReply>;
+    fn recv_until(&mut self, deadline: std::time::Instant) -> Option<InferReply>;
+    fn wait_budget(&self) -> std::time::Duration;
+}
+
+impl PolicyExecutor for PolicyWorker {
+    fn submit(&mut self, req: InferRequest) {
+        PolicyWorker::submit(self, req);
+    }
+
+    fn try_recv(&mut self) -> Option<InferReply> {
+        PolicyWorker::try_recv(self)
+    }
+
+    fn recv_until(&mut self, deadline: std::time::Instant) -> Option<InferReply> {
+        PolicyWorker::recv_until(self, deadline)
+    }
+
+    fn wait_budget(&self) -> std::time::Duration {
+        PolicyWorker::wait_budget(self)
+    }
+}
+
 impl Drop for PolicyWorker {
     fn drop(&mut self) {
         // 先丢弃请求端:线程 recv 返回 Err 退出循环;再 join。
