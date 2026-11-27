@@ -1,7 +1,8 @@
 # REQ-014 多人联机:权威服务器 + LOD 分级状态流
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
-  架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`)
+  架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
+  M02a-2 已验收 `8e58db9`+`1722640`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -176,12 +177,26 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
 - F5 **TCP_NODELAY 缺失** → 两端开启;M01。
 - F6 **agent_root_state O(A·L) 克隆整片**(scheduler.rs:1447;drive_policies
   逐只调用)→ 单主体 O(log A) 查询(ownership 直定位分片);M02a。
+  **已落地**(M02a-2 `8e58db9`):内核新增 `ShardSim::agent_root_state`
+  (agents/frozen/links/bodies 四次 BTreeMap get),scheduler 经
+  entity_ownership 直定位分片;结构性 O(log E+log S+log A+log L),
+  无运行时复杂度锚(等价回退变异会存活,如实记录)。
 - F7 **每连接重复编码/克隆**(driver.rs:2221,2235 双克隆)→ 每拍预量化一次
   共享只读表(Arc<TickSnapshot>),分连接拼帧;M02a。
+  **已落地**(M02a-2 `8e58db9`):TickSnapshot 每输出轮构建一次,
+  `PlayerStream.last_agents` Arc 化 + **内容相等**差分(每轮新 Arc,
+  ptr_eq 不可用);仅对实发条目深克隆(全量=全部可见,增量=仅变化);
+  线字节逐位不变;预量化推迟到 M04a 新包型。
 - F8 **共享 up_tx 256** → 每连接隔离;M02a。
 - F9 **policy 单工作线程 + 2ms 全拍预算**(config.rs:341;实测单狗 0.10–0.27ms,
   REQ-013 §11):32 狗同偶拍到期 3.36ms > 2ms → attached_at 奇偶错峰(峰值减半)
   + PolicyExecutor 边界抽象;M02a;扩池拐点 M05 实测(M05b)。
+  **已落地**(M02a-2 `8e58db9`+`1722640`):`ControllerSlot.phase` 仅在
+  Policy 挂载时按全局计数器 0/1 轮转(Script/None 恒 0 且不动计数器);
+  due = `(now − attached_at + phase) % period == 0`;脚本公式不读 phase;
+  period 1 与单策略首挂(phase 0)行为不变。`#[serde(skip)]` 存档兼容 v16,
+  **观察项**:checkpoint 恢复后 phase/计数器归零,错峰失效直到重新挂载
+  ——留 M05 评估是否需要持久化。
 - F10 **chunk 流空转与无界 drain**(静止每 100ms 重建 289 节点方形;
   driver.rs:2531 同步逐块 provider.get)→ 静止短路 + 全局每拍 chunk 配额;
   M02a 短路、M05 配额与拆线程。
@@ -226,6 +241,10 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   架构师变异 MA–MI 9/9 击杀;T8 双空轮数锚经 R1 纠正 20/20/21,架构师原锚
   错误认账;既有测试收帧手法经 R1/R2 授权改写 c05_ta 锚 2 / removed 顺序无关 /
   compound_shapes full 感知增量窗 6 拍,语义锚不变,生产代码零改动)。
+  **M02a-2 已验收**(2026-11-27,`8e58db9`+R1 `1722640`;五包 905 绿 +
+  e2e d01b 12 绿;架构师变异 N1–N8 8/8 击杀;N7 原 T5 存活归因 = 脚本
+  actions_for_tick 不读 slot.phase,R1 补 T5b「脚本挂载不扰后续策略相位」
+  锚后击杀;既有 W1–W5/U4/H2/H7/d01b 零改动,单策略首挂 phase 0 保证)。
 - **M02b 客户端快照插值**(与 M02a 可并行):InterpBuffer 纯逻辑零墙钟单测;
   L0/单机旁路;≤50ms 钳制外推。验收:ACM7 插值部分。
 - **M03 双客户端权威 e2e**:编辑互见/附身互斥/迟到者活跃块编辑/带负荷断线
