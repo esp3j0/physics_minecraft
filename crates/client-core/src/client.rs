@@ -21,11 +21,11 @@ use types::{BlockId, BlockPos, ChunkPos, EntityId, EntityState, Tick};
 use voxel::Chunk;
 
 /// 事件通道容量(主循环每帧排空;正常节奏不会积满)。
-const EVENT_CAPACITY: usize = 4096;
+pub(crate) const EVENT_CAPACITY: usize = 4096;
 /// 控制通道容量(移动节流后不会积满;满即弃,latest-wins 语义)。
-const CONTROL_CAPACITY: usize = 64;
+pub(crate) const CONTROL_CAPACITY: usize = 64;
 /// 连接握手等待上限(spawn 同步返回;超时 = Err)。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 事件(client 连接循环 → 主循环;通道桥)。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ViewEvent {
@@ -209,7 +209,7 @@ pub struct ViewerClient;
 
 /// Hello 的 client_id(任务书接口设计:固定 0——viewer 非权威输入,
 /// 不需要唯一身份;服务器分配的 InputSource 才是观察者身份)。
-const HELLO_CLIENT_ID: u64 = 0;
+pub const HELLO_CLIENT_ID: u64 = 0;
 
 /// 读循环的 socket 缓冲块大小(4 KiB,app::net 迷你客户端同量级)。
 const READ_CHUNK: usize = 4096;
@@ -312,14 +312,49 @@ fn try_cut_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     Some(buf.drain(..4 + len).collect())
 }
 
+/// `Control` → `Vec<C2S>` 纯翻译(REQ-014 M01 §2.3):`Batch` 展开为多元素 vec
+/// (保 REQ-010 批原子性:下游一次 `write_all`),其余为单元素 vec。
+fn control_to_c2s(command: Control) -> Vec<C2S> {
+    match command {
+        Control::Move(position) => vec![C2S::MoveObserver { position }],
+        Control::Command(cmd) => vec![C2S::Command(cmd)],
+        Control::Batch(commands) => commands.into_iter().map(C2S::Command).collect(),
+        Control::Spawn { state, desc } => vec![C2S::Spawn { state, desc }],
+        Control::SubscribeDebug => vec![C2S::SubscribeDebug],
+        Control::SpawnAgent {
+            body,
+            position,
+            yaw,
+        } => vec![C2S::SpawnAgent {
+            body,
+            position,
+            yaw,
+        }],
+        Control::Possess { entity } => vec![C2S::Possess { entity }],
+        Control::Unpossess => vec![C2S::Unpossess],
+        Control::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            jump,
+        } => vec![C2S::AgentIntent {
+            entity,
+            move_xz,
+            yaw,
+            jump,
+        }],
+        Control::Goodbye => vec![C2S::Goodbye],
+    }
+}
+
 impl ViewerClient {
     /// 在独立 tokio 线程跑连接循环(自带 current_thread runtime),
     /// 返回 (事件接收端, 控制端)。连接失败 = `Err`(启动期错误,主循环
     /// fail-stop 自决);连接中途断连经 `ViewEvent::Disconnected` 呈现。
     ///
     /// 入会序列:Hello(固定 client_id)→ Subscribe{view_distance} → 等
-    /// Welcome;之后 Pump 帧 → 事件通道,Pong 吞掉,Bye/EOF/IO 错 →
-    /// Disconnected 收口(通道随后自然枯竭,主循环以 Disconnected 判终)。
+    /// Welcome;之后经共用 `run_raw_pump` 收发原始帧,转换线程映射 `S2C → ViewEvent`,
+    /// Pong 吞掉,Bye/EOF/IO 错 → Disconnected 收口(通道随后自然枯竭)。
     pub fn spawn(
         addr: SocketAddr,
         view_distance: u8,
@@ -330,30 +365,19 @@ impl ViewerClient {
         // 连接失败经 oneshot 回传(启动期 `Err`);成功后事件/控制双通道交接。
         let (addr_tx, addr_rx) = std_mpsc::sync_channel::<io::Result<()>>(1);
         let (event_tx, event_rx) = std_mpsc::sync_channel::<ViewEvent>(EVENT_CAPACITY);
-        // 控制面:渲染侧 std 通道(try_send 恒不阻塞)+ 桥线程搬进 tokio 通道
-        // (连接循环 select! 同时等 socket 读与控制命令;轮询式 try_recv 会被
-        // 阻塞 read 饿死——挂死教训,见 ControlHandle 注释)。
+        let (down_tx, down_rx) = std_mpsc::sync_channel::<S2C>(EVENT_CAPACITY);
         let (control_std_tx, control_std_rx) = std_mpsc::sync_channel::<Control>(CONTROL_CAPACITY);
-        let (control_tx, control_rx) = tokio::sync::mpsc::channel::<Control>(CONTROL_CAPACITY);
-        std::thread::Builder::new()
-            .name("viewer-control-bridge".to_owned())
-            .spawn(move || {
-                // 阻塞 recv 搬运;连接亡故(tokio 接收端 drop)→ 桥线程收口。
-                // 搬进 tokio 通道需 async send → 自持微型 runtime(独立线程,
-                // 同 spawn 主线程的隔离理由)。
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("控制桥 runtime 构建失败");
-                rt.block_on(async {
-                    while let Ok(command) = control_std_rx.recv() {
-                        if control_tx.send(command).await.is_err() {
-                            return; // 连接循环已收口
-                        }
-                    }
-                });
-            })
-            .expect("控制桥线程 spawn 失败");
+        let (up_tx, up_rx) = tokio::sync::mpsc::channel::<Vec<C2S>>(CONTROL_CAPACITY);
+
+        // 入会首帧先入 up 通道(裸帧不包装,同现网;保序位于所有后续控制帧之前)。
+        up_tx
+            .try_send(vec![
+                C2S::Hello {
+                    client_id: HELLO_CLIENT_ID,
+                },
+                C2S::Subscribe { view_distance },
+            ])
+            .expect("新建 up 通道容量足够容纳入会首帧");
 
         std::thread::Builder::new()
             .name("viewer-client".to_owned())
@@ -364,13 +388,16 @@ impl ViewerClient {
                     .expect("client runtime 构建失败");
                 rt.block_on(async move {
                     match TcpStream::connect(addr).await {
-                        // 直连成功:回执后进泵(connect 与泵同 runtime,socket
-                        // 注册不跨 runtime——tokio TcpStream 的mio 注册绑定
-                        // 建立 runtime,换 runtime 会得到「context shutdown」错)。
+                        // 直连成功:开启 TCP_NODELAY 并回执后进共用原始泵(connect 与泵同
+                        // runtime,socket 注册不跨 runtime)。
                         Ok(stream) => {
+                            if let Err(err) = stream.set_nodelay(true) {
+                                let _ = addr_tx.send(Err(err));
+                                return;
+                            }
                             let _ = addr_tx.send(Ok(()));
                             drop(addr_tx);
-                            run_connection(stream, view_distance, event_tx, control_rx).await;
+                            run_raw_pump(stream, up_rx, down_tx).await;
                         }
                         Err(err) => {
                             let _ = addr_tx.send(Err(err));
@@ -384,143 +411,122 @@ impl ViewerClient {
         addr_rx
             .recv_timeout(CONNECT_TIMEOUT)
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "连接超时"))??;
+
+        // 控制面桥线程:std 通道收 Control → control_to_c2s 翻译 → tokio up 通道。
+        std::thread::Builder::new()
+            .name("viewer-control-bridge".to_owned())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("控制桥 runtime 构建失败");
+                rt.block_on(async {
+                    while let Ok(command) = control_std_rx.recv() {
+                        let msgs = control_to_c2s(command);
+                        if up_tx.send(msgs).await.is_err() {
+                            return; // 连接循环已收口
+                        }
+                    }
+                });
+            })
+            .expect("控制桥线程 spawn 失败");
+
+        // 下行转换线程:down_rx → s2c_to_event → event_tx(满则阻塞,宁慢不丢);
+        // down 通道枯竭且未发出过 Disconnected 时补发 Disconnected{"goodbye"}(保现网 :548 语义)。
+        std::thread::Builder::new()
+            .name("viewer-event-convert".to_owned())
+            .spawn(move || {
+                let mut sent_disconnected = false;
+                while let Ok(s2c) = down_rx.recv() {
+                    if let Some(event) = s2c_to_event(s2c) {
+                        if matches!(event, ViewEvent::Disconnected { .. }) {
+                            sent_disconnected = true;
+                        }
+                        if event_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
+                if !sent_disconnected {
+                    let _ = event_tx.send(ViewEvent::Disconnected {
+                        reason: "goodbye".to_owned(),
+                    });
+                }
+            })
+            .expect("事件转换线程 spawn 失败");
+
         Ok((event_rx, ControlHandle { tx: control_std_tx }))
     }
 }
 
-/// 连接循环体(独立线程的 current_thread runtime 上跑):入会 → select 泵。
-/// 任何断连路径:先发 Disconnected 事件,再收口(通道随后自然死亡)。
-async fn run_connection(
+/// 原始协议收发泵(REQ-014 M01 §2.1;`ViewerClient` 与 `NetTransport` 共用):
+/// `select!(biased)` 同等 socket 读 / `up_rx` 上行批 / 3s Ping 心跳;
+/// 下行直接输出原始 `S2C`(满则阻塞,宁慢不丢),任何断连路径均发 `S2C::Bye` 后收口。
+pub(crate) async fn run_raw_pump(
     mut stream: TcpStream,
-    view_distance: u8,
-    event_tx: std_mpsc::SyncSender<ViewEvent>,
-    mut control_rx: tokio::sync::mpsc::Receiver<Control>,
+    mut up_rx: tokio::sync::mpsc::Receiver<Vec<C2S>>,
+    down_tx: std_mpsc::SyncSender<S2C>,
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK * 2);
     let mut chunk = vec![0u8; READ_CHUNK];
 
-    // 入会:Hello → Subscribe → 等 Welcome 帧(状态机:未 Subscribe 不进世界,
-    // 首帧必 Welcome;超时语义交由服务器 keepalive,此处尽力读写)。
-    let hello = encode_c2s_frame(&C2S::Hello {
-        client_id: HELLO_CLIENT_ID,
-    });
-    let subscribe = encode_c2s_frame(&C2S::Subscribe { view_distance });
-    if let Err(err) = write_all_frames(&mut stream, &[&hello, &subscribe]).await {
-        let _ = event_tx.send(ViewEvent::Disconnected {
-            reason: disconnect_reason(&err),
-        });
-        return;
-    }
+    // keepalive:服务器读超时按"任何入站帧"计时,须周期 Ping 自保(3s < 超时 10s)。
+    let mut ping = tokio::time::interval(Duration::from_secs(3));
+    ping.tick().await; // 吃掉首枚立即到期(同现网)
 
-    // 读侧主循环:socket 读与控制命令同一 select(控制面不会被阻塞 read 饿死;
-    // biased 下 socket 读优先——数据流是主生产物)。
-    // keepalive:服务器读超时按"任何入站帧"计时——观察者解耦/静止时无其它
-    // 流量,须周期 Ping 自保(评审发现 3,架构师修复;间隔 3s < 超时 10s)。
-    let mut ping = tokio::time::interval(std::time::Duration::from_secs(3));
-    ping.tick().await; // 吃掉首枚立即到期(照 driver 的 interval 处理)
-    // 控制臂开关:recv 对已关闭通道恒立即可返,继续轮询会 100% CPU 空转
-    // (评审发现 4,架构师修复)——None 后停询本臂。
-    let mut control_open = true;
-    'read: loop {
+    loop {
         tokio::select! {
             biased;
             read = stream.read(&mut chunk) => match read {
                 Ok(0) | Err(_) => {
                     // EOF/IO 错:对端断(服务器 Bye 通常先到;此处兜底)。
-                    let _ = event_tx.send(ViewEvent::Disconnected {
+                    let _ = down_tx.send(S2C::Bye {
                         reason: "连接关闭".to_owned(),
                     });
                     return;
                 }
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             },
-            command = control_rx.recv(), if control_open => match command {
-                Some(Control::Move(position)) => {
-                    let frame = encode_c2s_frame(&C2S::MoveObserver { position });
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
+            up = up_rx.recv() => match up {
+                Some(msgs) => {
+                    if msgs.is_empty() {
+                        continue;
                     }
-                }
-                Some(Control::Command(command)) => {
-                    let frame = encode_c2s_frame(&C2S::Command(command));
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
+                    // 单条消息内多帧拼成一个缓冲单次 write_all(保 REQ-010 批原子性)。
+                    let mut batch: Vec<u8> = Vec::with_capacity(msgs.len() * 16);
+                    let mut has_goodbye = false;
+                    for msg in &msgs {
+                        if matches!(msg, C2S::Goodbye) {
+                            has_goodbye = true;
+                        }
+                        batch.extend_from_slice(&encode_c2s_frame(msg));
                     }
-                }
-                Some(Control::Batch(commands)) => {
-                    // 同帧命令批一次写(REQ-010 终审返修 1):Batch 消息在
-                    // 生产侧(forward_commands)组装,一条消息 = 一次原子
-                    // 编辑;这里拼帧后单次 `write_all`,服务器一轮 read 收全、
-                    // 驱动同一轮 try_recv 排空盖同一 apply_at,不会跨拍。
-                    let mut batch: Vec<u8> = Vec::with_capacity(commands.len() * 16);
-                    for command in &commands {
-                        batch.extend_from_slice(&encode_c2s_frame(&C2S::Command(command.clone())));
+                    if let Err(err) = write_all(&mut stream, &batch).await {
+                        let _ = down_tx.send(S2C::Bye {
+                            reason: disconnect_reason(&err),
+                        });
+                        return;
                     }
-                    if write_all(&mut stream, &batch).await.is_err() {
-                        break 'read;
+                    if has_goodbye {
+                        finish_after_goodbye(&mut stream, &mut buf, &mut chunk, &down_tx).await;
+                        return;
                     }
-                }
-                Some(Control::Spawn { state, desc }) => {
-                    let frame = encode_c2s_frame(&C2S::Spawn { state, desc });
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::SubscribeDebug) => {
-                    let frame = encode_c2s_frame(&C2S::SubscribeDebug);
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::SpawnAgent { body, position, yaw }) => {
-                    let frame = encode_c2s_frame(&C2S::SpawnAgent { body, position, yaw });
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::Possess { entity }) => {
-                    let frame = encode_c2s_frame(&C2S::Possess { entity });
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::Unpossess) => {
-                    let frame = encode_c2s_frame(&C2S::Unpossess);
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::AgentIntent {
-                    entity,
-                    move_xz,
-                    yaw,
-                    jump,
-                }) => {
-                    let frame = encode_c2s_frame(&C2S::AgentIntent {
-                        entity,
-                        move_xz,
-                        yaw,
-                        jump,
-                    });
-                    if write_all(&mut stream, &frame).await.is_err() {
-                        break 'read;
-                    }
-                }
-                Some(Control::Goodbye) => {
-                    let frame = encode_c2s_frame(&C2S::Goodbye);
-                    let _ = write_all(&mut stream, &frame).await; // 尽力;随后读 EOF
-                    break 'read;
                 }
                 None => {
-                    // 控制桥亡故(主循环弃控制端):不主动断(窗口关闭即进程
-                    // 退),停询本臂,读至断连呈现。
-                    control_open = false;
+                    // up 通道关闭:尽力发 Goodbye,再等 Bye / EOF / 2s 超时收口。
+                    let frame = encode_c2s_frame(&C2S::Goodbye);
+                    let _ = write_all(&mut stream, &frame).await;
+                    finish_after_goodbye(&mut stream, &mut buf, &mut chunk, &down_tx).await;
+                    return;
                 }
             },
             _ = ping.tick() => {
                 let frame = encode_c2s_frame(&C2S::Ping);
-                if write_all(&mut stream, &frame).await.is_err() {
-                    break 'read;
+                if let Err(err) = write_all(&mut stream, &frame).await {
+                    let _ = down_tx.send(S2C::Bye {
+                        reason: disconnect_reason(&err),
+                    });
+                    return;
                 }
             },
         }
@@ -529,33 +535,57 @@ async fn run_connection(
         while let Some(frame) = try_cut_frame(&mut buf) {
             let Some(s2c) = decode_frame(&frame) else {
                 // 解码失败:协议错位,断连收口(不猜续帧)。
-                let _ = event_tx.send(ViewEvent::Disconnected {
+                let _ = down_tx.send(S2C::Bye {
                     reason: "帧解码失败".to_owned(),
                 });
                 return;
             };
-            if let Some(event) = s2c_to_event(s2c) {
-                // 事件通道满(主循环卡死)则阻塞等待:宁可慢不发丢;
-                // 接收端死亡(窗口关)→ 结束连接循环。
-                if event_tx.send(event).is_err() {
-                    return;
-                }
+            // 下行通道满则阻塞等待:宁可慢不丢;接收端亡则直接结束泵。
+            if down_tx.send(s2c).is_err() {
+                return;
             }
         }
     }
-
-    // 主动离场路径:等服务器 Bye/EOF 短窗后收口(读循环已退;尽力收尾)。
-    let _ = event_tx.send(ViewEvent::Disconnected {
-        reason: "goodbye".to_owned(),
-    });
 }
 
-/// 顺序写多帧(入会两连写)。
-async fn write_all_frames(stream: &mut TcpStream, frames: &[&[u8]]) -> io::Result<()> {
-    for frame in frames {
-        write_all(stream, frame).await?;
+/// 发 `C2S::Goodbye` 后的收口读循环:继续读直到收到 `S2C::Bye`、EOF/IO 错或 2s 超时;
+/// 若未从对端收到 `Bye` 则合成 `S2C::Bye { reason: "goodbye" }` 后返回。
+async fn finish_after_goodbye(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    chunk: &mut [u8],
+    down_tx: &std_mpsc::SyncSender<S2C>,
+) {
+    let delivered_bye = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            while let Some(frame) = try_cut_frame(buf) {
+                let Some(s2c) = decode_frame(&frame) else {
+                    let _ = down_tx.send(S2C::Bye {
+                        reason: "帧解码失败".to_owned(),
+                    });
+                    return true;
+                };
+                let is_bye = matches!(s2c, S2C::Bye { .. });
+                if down_tx.send(s2c).is_err() {
+                    return true;
+                }
+                if is_bye {
+                    return true;
+                }
+            }
+            match stream.read(chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+    })
+    .await;
+
+    if !matches!(delivered_bye, Ok(true)) {
+        let _ = down_tx.send(S2C::Bye {
+            reason: "goodbye".to_owned(),
+        });
     }
-    Ok(())
 }
 
 /// 单帧写全(socket 半写由 write_all 兜住)。
@@ -926,5 +956,29 @@ mod tests {
             }
             other => panic!("断连后应为 Disconnected,实为 {other:?}"),
         }
+    }
+
+    /// M01 §2.3:`control_to_c2s` 纯翻译——Batch 展为多元素 vec,其余单元素 vec。
+    #[test]
+    fn m01_control_to_c2s_pure() {
+        let cmd_a = messaging::SimCommand::SetBlock {
+            pos: BlockPos::new(0, -60, 0),
+            block: BlockId(1),
+        };
+        let cmd_b = messaging::SimCommand::SetBlock {
+            pos: BlockPos::new(1, -60, 0),
+            block: BlockId(2),
+        };
+        assert_eq!(
+            control_to_c2s(Control::Batch(vec![cmd_a.clone(), cmd_b.clone()])),
+            vec![C2S::Command(cmd_a), C2S::Command(cmd_b)]
+        );
+        assert_eq!(
+            control_to_c2s(Control::Move(Vec3::new(1.0, 2.0, 3.0))),
+            vec![C2S::MoveObserver {
+                position: Vec3::new(1.0, 2.0, 3.0),
+            }]
+        );
+        assert_eq!(control_to_c2s(Control::Goodbye), vec![C2S::Goodbye]);
     }
 }

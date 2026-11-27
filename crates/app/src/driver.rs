@@ -564,6 +564,8 @@ pub struct DriverOutcome {
     pub shards_despawned: u64,
     /// 经 provider 装载的 chunk 数。
     pub chunks_loaded: u64,
+    /// `StreamChunks` 命中 session 热块读取的 chunk 数(REQ-014 M01 F3)。
+    pub chunks_loaded_hot: u64,
     /// 卸载并入持久化批的 chunk 数(含 despawn 卸载)。
     pub chunks_unloaded: u64,
     /// 主体协议面遥测(REQ-012 A03 §6;生成/附身/意图等计数,不改
@@ -799,6 +801,7 @@ struct OrchestrationCounters {
     shards_spawned: u64,
     shards_despawned: u64,
     chunks_loaded: u64,
+    chunks_loaded_hot: u64,
     chunks_unloaded: u64,
 }
 
@@ -2546,10 +2549,22 @@ fn orchestrate(
                 dim: types::DimensionId(0),
                 pos,
             };
-            // 生成器兜底后不应 None——None = 生成器实现缺陷 → fail-stop(同 ②)。
-            let chunk = provider.get(key).unwrap_or_else(|| {
-                panic!("provider.get 返回 None(生成器实现缺陷,fail-stop):{key:?}")
-            });
+            // REQ-014 M01 F3:活跃热块优先读 session,未加载走 provider 兜底。
+            let shard =
+                types::ShardId::new(types::WorldId(0), types::DimensionId(0), pos.shard_of());
+            let chunk =
+                if session.shard_ids().contains(&shard) && session.is_chunk_loaded(shard, pos) {
+                    counters.chunks_loaded_hot += 1;
+                    session
+                        .voxel_chunk(shard, pos)
+                        .expect("is_chunk_loaded 蕴含 voxel_chunk Some")
+                        .clone()
+                } else {
+                    // 生成器兜底后不应 None——None = 生成器实现缺陷 → fail-stop(同 ②)。
+                    provider.get(key).unwrap_or_else(|| {
+                        panic!("provider.get 返回 None(生成器实现缺陷,fail-stop):{key:?}")
+                    })
+                };
             counters.chunks_loaded += 1;
             chunks.push((pos, chunk));
         }
@@ -2698,6 +2713,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
     let mut shards_spawned: u64 = 0;
     let mut shards_despawned: u64 = 0;
     let mut chunks_loaded: u64 = 0;
+    let mut chunks_loaded_hot: u64 = 0;
     let mut chunks_unloaded: u64 = 0;
     // 上次 checkpoint 时的 ticks_run(相对本次运行;bootstrap 的检查点在起点之前,
     // 故初值 0——起跑后任何 tick 都是"自上次 checkpoint 后的增量")。
@@ -2892,6 +2908,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 shards_spawned += counters.shards_spawned;
                 shards_despawned += counters.shards_despawned;
                 chunks_loaded += counters.chunks_loaded;
+                chunks_loaded_hot += counters.chunks_loaded_hot;
                 chunks_unloaded += counters.chunks_unloaded;
 
                 // 第 ⑤ 步(任务书 03):观察输出编排——网络上行事件消费 →
@@ -3118,6 +3135,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
         shards_spawned,
         shards_despawned,
         chunks_loaded,
+        chunks_loaded_hot,
         chunks_unloaded,
         agent: agent_counters,
         controller_counters: host.counters,
@@ -8711,5 +8729,121 @@ mod tests {
             "原地表 (2,-61,8) 未被破坏,仍为 DIRT"
         );
         session.shutdown();
+    }
+
+    /// M01 T3(F3 热块优先读):session 加载含 (0,-60,0) 的 chunk 后经既有命令路径
+    /// SetBlock 写 STONE(BlockId(1)),再发 `StreamChunks` load 该热块 + 未加载冷块:
+    /// - 热块回执 `.get(0, 4, 0) == BlockId(1)`(手算:y=-60 → 局部 y=4,STONE=BlockId(1));
+    /// - `chunks_loaded_hot >= 1`(恰 1);
+    /// - 未加载冷块走 provider 兜底,回执与 `provider.get` 逐格相等。
+    #[tokio::test(start_paused = true)]
+    async fn m01_t3_stream_chunks_hot_read_and_provider_fallback() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            bodies_dir: tmp.path().join("bodies"),
+            policies_dir: tmp.path().join("policies"),
+            checkpoint_interval_ticks: 600,
+            ..Config::default()
+        };
+        let (session, log, store, _resume_from, spawn_next_seq, resume) =
+            bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("bootstrap 成功");
+        let (provider, new_sim, bodies) = wire_provider_and_new_sim(config.clone(), &store, || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("wire_provider_and_new_sim 成功");
+
+        let hot_pos = types::ChunkPos::new(0, 0);
+        let cold_pos = types::ChunkPos::new(50, 50);
+        let hot_key = ChunkKey {
+            world: types::WorldId(0),
+            dim: types::DimensionId(0),
+            pos: hot_pos,
+        };
+        let cold_key = ChunkKey {
+            world: types::WorldId(0),
+            dim: types::DimensionId(0),
+            pos: cold_pos,
+        };
+        let provider_hot_before = provider.get(hot_key).expect("热块初始生成值");
+        assert_ne!(
+            provider_hot_before.get(0, 4, 0),
+            types::BlockId(1),
+            "前提:初始 Superflat 在 (0,-60,0) 非 STONE"
+        );
+        let expected_cold = provider.get(cold_key).expect("冷块 provider 生成值");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let driver = tokio::spawn(run(DriverArgs {
+            config,
+            session,
+            store,
+            log,
+            commands: rx,
+            listen_ctrl_c: false,
+            provider,
+            new_sim,
+            observe: None,
+            spawn_next_seq,
+            bodies,
+            resume,
+        }));
+
+        // 观察者移至 (0,-60,0) 附近 → ensure 分片 (0,0) 并装载 chunk (0,0) 为热块。
+        inject_move(&tx, Vec3::new(0.5, -60.0, 0.5)).await;
+        advance_ticks(5).await;
+
+        // 走现有命令路径修改活跃热块 (0,-60,0) → STONE(BlockId(1))。
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(0, -60, 0),
+                block: types::BlockId(1),
+            },
+        )
+        .await;
+        advance_ticks(5).await;
+
+        // StreamChunks 同时请求热块 (0,0) 与未加载冷块 (50,50)。
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(DriverCommand::StreamChunks {
+            load: vec![hot_pos, cold_pos],
+            unload: vec![],
+            reply: reply_tx,
+        })
+        .await
+        .expect("StreamChunks 注入成功");
+        advance_ticks(2).await;
+
+        let chunks = reply_rx.await.expect("StreamChunks 回执必达");
+        assert_eq!(chunks.len(), 2, "回执必须含热块与冷块共 2 块");
+
+        let (got_hot_pos, got_hot) = &chunks[0];
+        assert_eq!(*got_hot_pos, hot_pos);
+        assert_eq!(
+            got_hot.get(0, 4, 0),
+            types::BlockId(1),
+            "热块 (0,-60,0) 局部 (0,4,0) 必须读到活跃编辑 STONE(BlockId(1))"
+        );
+
+        let (got_cold_pos, got_cold) = &chunks[1];
+        assert_eq!(*got_cold_pos, cold_pos);
+        assert_eq!(
+            *got_cold, expected_cold,
+            "未加载进 session 的冷块必须走 provider 兜底且逐格相等"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("关机注入");
+        let outcome = driver.await.expect("驱动不 panic");
+        assert!(
+            outcome.chunks_loaded_hot >= 1,
+            "chunks_loaded_hot 必须 >= 1,实为 {}",
+            outcome.chunks_loaded_hot
+        );
+        assert_eq!(
+            outcome.chunks_loaded_hot, 1,
+            "1 热块 + 1 冷块 → chunks_loaded_hot 恰为 1"
+        );
     }
 }

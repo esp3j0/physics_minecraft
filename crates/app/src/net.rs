@@ -164,6 +164,17 @@ pub enum TranslateOutcome {
     },
 }
 
+/// 循环剥尽 [`C2S::Sequenced`] 包装层,返回 `(外→内 seq 列表, 最内层引用)`;
+/// 非 `Sequenced` 返回 `(空 vec, 原引用)`(REQ-014 M01 F1)。
+pub(crate) fn peel_sequenced(mut c2s: &C2S) -> (Vec<u64>, &C2S) {
+    let mut seqs = Vec::new();
+    while let C2S::Sequenced { seq, inner } = c2s {
+        seqs.push(*seq);
+        c2s = inner.as_ref();
+    }
+    (seqs, c2s)
+}
+
 /// 循环剥尽 [`TranslateOutcome::Sequenced`] 包装层,返回 `(外→内 seq 列表, 最内层 outcome)`。
 pub(crate) fn unwrap_sequenced(mut outcome: TranslateOutcome) -> (Vec<u64>, TranslateOutcome) {
     let mut seqs = Vec::new();
@@ -659,6 +670,16 @@ pub async fn serve(
     Ok(addr)
 }
 
+/// 回收已完成连接任务句柄,防 accept_loop 运行期句柄表无界增长(REQ-014 M01 F2)。
+pub(crate) fn reap_finished(handles: &mut Vec<tokio::task::JoinHandle<()>>) {
+    handles.retain(|h| !h.is_finished());
+}
+
+/// 开启 TCP_NODELAY,消除 Nagle + 延迟 ACK 对状态流的抖动(REQ-014 M01 F5)。
+pub(crate) fn tune_stream(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
+    stream.set_nodelay(true)
+}
+
 /// accept 循环(serve 的常驻体):每连接分配递增身份并 spawn 连接 task。
 async fn accept_loop(
     listener: tokio::net::TcpListener,
@@ -683,6 +704,9 @@ async fn accept_loop(
                     Ok(ok) => ok,
                     Err(_) => continue, // 瞬时 accept 失败:不塌监听
                 };
+                if tune_stream(&stream).is_err() {
+                    continue;
+                }
                 let player = InputSource(next_player);
                 next_player += 1;
                 let conn_shutdown = shutdown_tx.subscribe();
@@ -692,6 +716,7 @@ async fn accept_loop(
                 connections.push(tokio::spawn(run_connection(
                     player, stream, cfg, up, conn_shutdown, hub,
                 )));
+                reap_finished(&mut connections);
             }
         }
     }
@@ -944,9 +969,9 @@ async fn handle_frame(
     run_hub: std::sync::Arc<OutboundHub>,
     hub_guard: &mut Option<DisconnectGuard>,
 ) -> Flow {
-    // 状态机门(先于翻译:门是会话层的,翻译是纯形状映射)。
+    // 状态机门(先于翻译:门是会话层的,翻译是纯形状映射;REQ-014 M01 F1:剥尽 Sequenced 判内层)。
     if *state == SessionState::Connected {
-        match c2s {
+        match peel_sequenced(&c2s).1 {
             C2S::Hello { .. }
             | C2S::Subscribe { .. }
             | C2S::Ping
@@ -2862,5 +2887,242 @@ pub(crate) mod tests {
         let (seqs, inner) = unwrap_sequenced(nested);
         assert_eq!(seqs, vec![1, 2], "嵌套 Sequenced 剥序必须为外→内 [1, 2]");
         assert_eq!(inner, TranslateOutcome::Ping);
+    }
+
+    // ---- REQ-014 M01:F1 握手门 / F2 句柄回收 / F5 TCP_NODELAY ----
+
+    /// M01 `peel_sequenced` 纯函数:非包装返回空 vec + 原引用,嵌套按外→内剥序。
+    #[test]
+    fn m01_peel_sequenced_pure() {
+        let bare = C2S::Ping;
+        let (seqs, inner) = peel_sequenced(&bare);
+        assert!(seqs.is_empty());
+        assert_eq!(inner, &C2S::Ping);
+
+        let wrapped = C2S::Sequenced {
+            seq: 1,
+            inner: Box::new(C2S::Sequenced {
+                seq: 2,
+                inner: Box::new(C2S::Subscribe { view_distance: 4 }),
+            }),
+        };
+        let (seqs, inner) = peel_sequenced(&wrapped);
+        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(inner, &C2S::Subscribe { view_distance: 4 });
+    }
+
+    /// M01 T1a:Connected 态发 `Sequenced{seq:1, inner:Subscribe{view_distance:2}}` →
+    /// 不断连;收到 `S2C::Welcome{player_id: InputSource(1), ..}`;上行 `NetUp::Ack{seq:1}` 恰一条。
+    #[tokio::test]
+    async fn m01_t1a_connected_sequenced_subscribe_joins_and_acks() {
+        let (addr, mut up, shutdown) = spawn_server(10).await;
+        let mut c = MiniClient::connect(addr).await.expect("连入");
+
+        c.send(&C2S::Sequenced {
+            seq: 1,
+            inner: Box::new(C2S::Subscribe { view_distance: 2 }),
+        })
+        .await
+        .expect("Sequenced(Subscribe) 写入");
+
+        match c.recv_timeout().await {
+            S2C::Welcome { player_id, .. } => {
+                assert_eq!(player_id, InputSource(1), "首连接身份必须为 InputSource(1)");
+            }
+            other => panic!("应收到 Welcome,实为 {other:?}"),
+        }
+
+        // 发 Ping 确认连接未被断开。
+        c.send(&C2S::Ping).await.expect("Ping 写入");
+        match c.recv_timeout().await {
+            S2C::Pong => {}
+            other => panic!("连接应保持存活并应答 Pong,实为 {other:?}"),
+        }
+
+        let mut acks = Vec::new();
+        let mut saw_joined = false;
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), up.recv()).await {
+                Ok(Some(NetUp::Ack { player, seq })) => acks.push((player, seq)),
+                Ok(Some(NetUp::Joined {
+                    player: InputSource(1),
+                })) => {
+                    saw_joined = true;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+            if saw_joined && !acks.is_empty() {
+                // 再排空此刻通道里已有的事件,确认无重复 Ack。
+                while let Ok(ev) = up.try_recv() {
+                    if let NetUp::Ack { player, seq } = ev {
+                        acks.push((player, seq));
+                    }
+                }
+                break;
+            }
+        }
+        assert!(saw_joined, "Sequenced(Subscribe) 必须上报 Joined");
+        assert_eq!(
+            acks,
+            vec![(InputSource(1), 1)],
+            "上行 NetUp::Ack{{seq:1}} 必须恰一条"
+        );
+        bcast_shutdown(&shutdown).await;
+    }
+
+    /// M01 T1b:Connected 态发 `Sequenced{seq:1, inner:MoveObserver{..}}` →
+    /// `Flow::Disconnect(ProtocolViolation)`(门仍挡内层非白名单,不上报 Ack)。
+    #[tokio::test]
+    async fn m01_t1b_connected_sequenced_move_observer_disconnects() {
+        let (addr, mut up, shutdown) = spawn_server(10).await;
+        let mut c = MiniClient::connect(addr).await.expect("连入");
+
+        c.send(&C2S::Sequenced {
+            seq: 1,
+            inner: Box::new(C2S::MoveObserver {
+                position: Vec3::new(1.0, 2.0, 3.0),
+            }),
+        })
+        .await
+        .expect("Sequenced(MoveObserver) 写入");
+
+        assert!(
+            c.is_disconnected().await,
+            "Connected 态 Sequenced(MoveObserver) 必须断连"
+        );
+        assert_eq!(
+            next_up(&mut up).await,
+            NetUp::Left {
+                player: InputSource(1),
+                reason: DisconnectReason::ProtocolViolation("未 Subscribe 前的帧"),
+            },
+            "必须以 ProtocolViolation 断连且不先发 Ack"
+        );
+        bcast_shutdown(&shutdown).await;
+    }
+
+    /// M01 T1c:Connected 态裸 `MoveObserver` → 断连;Subscribed 态 `Sequenced{MoveObserver}` → Continue。
+    #[tokio::test]
+    async fn m01_t1c_connected_raw_move_disconnects_and_subscribed_sequenced_continues() {
+        let (addr, mut up, shutdown) = spawn_server(10).await;
+
+        // Connected 态裸 MoveObserver → 断连。
+        let mut c1 = MiniClient::connect(addr).await.expect("c1 连入");
+        c1.send(&C2S::MoveObserver {
+            position: Vec3::ZERO,
+        })
+        .await
+        .expect("裸 MoveObserver 写入");
+        assert!(
+            c1.is_disconnected().await,
+            "Connected 态裸 MoveObserver 必须断连"
+        );
+        assert_eq!(
+            next_up(&mut up).await,
+            NetUp::Left {
+                player: InputSource(1),
+                reason: DisconnectReason::ProtocolViolation("未 Subscribe 前的帧"),
+            }
+        );
+
+        // Subscribed 态 Sequenced{MoveObserver} → Continue(上报 Ack + MoveObserver,连接存活)。
+        let mut c2 = MiniClient::connect(addr).await.expect("c2 连入");
+        let id2 = join(&mut c2, 2).await;
+        assert_eq!(id2, InputSource(2));
+        assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id2 });
+
+        let pos = Vec3::new(12.0, -58.0, 4.0);
+        c2.send(&C2S::Sequenced {
+            seq: 7,
+            inner: Box::new(C2S::MoveObserver { position: pos }),
+        })
+        .await
+        .expect("Subscribed 态 Sequenced(MoveObserver) 写入");
+        c2.send(&C2S::Ping).await.expect("Ping 写入");
+        match c2.recv_timeout().await {
+            S2C::Pong => {}
+            other => panic!("Subscribed 态连接应继续存活并回 Pong,实为 {other:?}"),
+        }
+
+        let mut saw_ack = false;
+        let mut saw_move = false;
+        for _ in 0..8 {
+            match next_up(&mut up).await {
+                NetUp::Ack { player, seq } if player == id2 && seq == 7 => saw_ack = true,
+                NetUp::DriverCommand {
+                    player,
+                    cmd: DriverCommand::MoveObserver { position },
+                } if player == id2 && position == pos => saw_move = true,
+                _ => {}
+            }
+            if saw_ack && saw_move {
+                break;
+            }
+        }
+        assert!(
+            saw_ack,
+            "Subscribed 态 Sequenced(MoveObserver) 必须上报 Ack"
+        );
+        assert!(
+            saw_move,
+            "Subscribed 态 Sequenced(MoveObserver) 必须转发 MoveObserver"
+        );
+        bcast_shutdown(&shutdown).await;
+    }
+
+    /// M01 T2:`reap_finished` 回收已完成任务句柄,保留未完成(pending)任务句柄。
+    #[tokio::test]
+    async fn m01_t2_reap_finished_retains_only_pending() {
+        let mut handles = vec![
+            tokio::spawn(async {}),
+            tokio::spawn(async {}),
+            tokio::spawn(std::future::pending::<()>()),
+        ];
+        for _ in 0..100 {
+            if handles[0].is_finished() && handles[1].is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handles[0].is_finished() && handles[1].is_finished(),
+            "前两个立即结束任务必须已完成"
+        );
+
+        reap_finished(&mut handles);
+        assert_eq!(
+            handles.len(),
+            1,
+            "reap_finished 后必须仅剩 1 个 pending 任务"
+        );
+        assert!(
+            !handles[0].is_finished(),
+            "留下的必须是尚未完成的 pending 任务"
+        );
+        handles[0].abort();
+    }
+
+    /// M01 T4:`tune_stream` 对 TCP 流开启 TCP_NODELAY。
+    #[tokio::test]
+    async fn m01_t4_tune_stream_enables_nodelay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("绑定 127.0.0.1:0");
+        let addr = listener.local_addr().expect("取实际端口");
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let client = client.expect("客户端连入");
+        let (server, _) = accepted.expect("服务端 accept");
+
+        tune_stream(&server).expect("服务端 tune_stream 成功");
+        assert!(
+            server.nodelay().expect("读取服务端 nodelay"),
+            "tune_stream 后 nodelay 必须为 true"
+        );
+        tune_stream(&client).expect("客户端 tune_stream 成功");
+        assert!(
+            client.nodelay().expect("读取客户端 nodelay"),
+            "客户端 tune_stream 后 nodelay 必须为 true"
+        );
     }
 }

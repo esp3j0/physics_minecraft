@@ -10,6 +10,7 @@ mod conv;
 mod entities;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -28,7 +29,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
-use client_core::client::{ViewEvent, s2c_to_event};
+use client_core::client::{ViewEvent, localize_disconnect_reason, s2c_to_event};
 use client_core::mesh::{
     ChunkSnapshot, OutlineMesh, SubchunkMesh, mesh_subchunk_snapshot, outline_subchunk_snapshot,
     snapshot,
@@ -49,7 +50,10 @@ use client_core::tools::{
     pick_at_camera_with_dist, pick_target, place, select_material,
 };
 use client_core::world::WorldState;
-use client_core::{LocalTransport, SequencedTransport, Transport, config_from_server_table};
+use client_core::{
+    HELLO_CLIENT_ID, LocalTransport, NetTransport, SequencedTransport, Transport,
+    config_from_server_table,
+};
 use entities::{EntityMirrorRes, EntityRenderRes, sync_entities_system};
 use messaging::SimCommand;
 use sim_api::proto::{C2S, S2C};
@@ -84,15 +88,25 @@ enum RunMode {
 
 /// 解析后的命令行参数。
 struct CliArgs {
-    world_dir: PathBuf,
+    world_dir: Option<PathBuf>,
+    connect: Option<SocketAddr>,
     view_distance: Option<u8>,
     chunk_cap: Option<usize>,
     mode: RunMode,
 }
 
 fn parse_cli() -> Result<CliArgs, String> {
-    let mut args = std::env::args().skip(1);
+    parse_cli_from(std::env::args().skip(1))
+}
+
+fn parse_cli_from<I, S>(raw_args: I) -> Result<CliArgs, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut args = raw_args.into_iter().map(Into::into);
     let mut world_dir: Option<PathBuf> = None;
+    let mut connect: Option<SocketAddr> = None;
     let mut view_distance: Option<u8> = None;
     let mut chunk_cap: Option<usize> = None;
     let mut script: Option<PathBuf> = None;
@@ -105,6 +119,15 @@ fn parse_cli() -> Result<CliArgs, String> {
                     .next()
                     .ok_or_else(|| "--world-dir 缺少路径参数".to_owned())?;
                 world_dir = Some(PathBuf::from(val));
+            }
+            "--connect" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| "--connect 缺少地址参数".to_owned())?;
+                let parsed = val
+                    .parse::<SocketAddr>()
+                    .map_err(|e| format!("--connect 地址无效({val}): {e}"))?;
+                connect = Some(parsed);
             }
             "--view-distance" => {
                 let val = args
@@ -136,7 +159,7 @@ fn parse_cli() -> Result<CliArgs, String> {
             }
             "-h" | "--help" => {
                 return Err(
-                    "用法: client --world-dir <PATH> [--view-distance <u8, 默认 8>] [--chunk-cap <usize>] [--script <TOML> --out <DIR>]"
+                    "用法: client (--world-dir <PATH> | --connect <ADDR>) [--view-distance <u8, 默认 8>] [--chunk-cap <usize>] [--script <TOML> --out <DIR>]"
                         .to_owned(),
                 );
             }
@@ -146,8 +169,15 @@ fn parse_cli() -> Result<CliArgs, String> {
         }
     }
 
-    let world_dir = world_dir
-        .ok_or_else(|| "缺少必填参数 --world-dir <PATH>(禁止默认触碰仓库根 data/)".to_owned())?;
+    if world_dir.is_some() && connect.is_some() {
+        return Err("--connect 与 --world-dir 不可同用".to_owned());
+    }
+    if world_dir.is_none() && connect.is_none() {
+        return Err(
+            "缺少必填参数 --world-dir <PATH> 或 --connect <ADDR>(禁止默认触碰仓库根 data/)"
+                .to_owned(),
+        );
+    }
     let mode = match (script, out) {
         (None, None) => RunMode::Interactive,
         (Some(script), Some(out)) => RunMode::Script { script, out },
@@ -156,6 +186,7 @@ fn parse_cli() -> Result<CliArgs, String> {
     };
     Ok(CliArgs {
         world_dir,
+        connect,
         view_distance,
         chunk_cap,
         mode,
@@ -439,6 +470,11 @@ struct ScreenshotState {
 #[derive(Resource, Default, Debug, Clone, Copy)]
 struct ServerTickRes(u64);
 
+/// 交互模式断连 HUD 状态(REQ-014 M01):收到 `S2C::Bye` 后记录本地化原因,
+/// `hud_update_system` 在文本尾追加 `已断连:<reason>`。
+#[derive(Resource, Default, Debug, Clone, PartialEq, Eq)]
+struct DisconnectHud(pub Option<String>);
+
 /// 交互工具状态资源(REQ-013 C02-1 §2.2 + C08 §3;仅交互模式使用)。
 #[derive(Resource, Default)]
 struct ToolRes {
@@ -582,14 +618,16 @@ fn main() {
         }
     };
 
-    let (config, view_distance, script_res) = match cli.mode {
+    let (local_config, bodies_dir, view_distance, script_res) = match cli.mode {
         RunMode::Interactive => {
             // bodies_dir / policies_dir 沿用 app Config::default() 口径(assets/bodies, assets/policies)。
-            let cfg = Config {
-                data_dir: cli.world_dir.clone(),
-                ..Config::default()
-            };
-            (cfg, cli.view_distance.unwrap_or(8), None)
+            let default_cfg = Config::default();
+            let bodies_dir = default_cfg.bodies_dir.clone();
+            let local_cfg = cli.world_dir.as_ref().map(|dir| Config {
+                data_dir: dir.clone(),
+                ..default_cfg
+            });
+            (local_cfg, bodies_dir, cli.view_distance.unwrap_or(8), None)
         }
         RunMode::Script { script, out } => {
             let text = match std::fs::read_to_string(&script) {
@@ -610,12 +648,18 @@ fn main() {
                 eprintln!("创建输出目录 {} 失败: {err}", out.display());
                 std::process::exit(2);
             }
-            let cfg = match config_from_server_table(&scenario.server, &cli.world_dir) {
-                Ok(c) => c,
-                Err(err) => {
-                    eprintln!("场景 [server] 配置错误: {err}");
-                    std::process::exit(2);
-                }
+            let (local_cfg, bodies_dir) = if let Some(world_dir) = cli.world_dir.as_ref() {
+                let cfg = match config_from_server_table(&scenario.server, world_dir) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        eprintln!("场景 [server] 配置错误: {err}");
+                        std::process::exit(2);
+                    }
+                };
+                let bdir = cfg.bodies_dir.clone();
+                (Some(cfg), bdir)
+            } else {
+                (None, Config::default().bodies_dir)
             };
             let vd = cli.view_distance.or(scenario.view_distance).unwrap_or(8);
             let manifest = Manifest::new(&scenario);
@@ -635,33 +679,56 @@ fn main() {
                 finished_exit: None,
                 disconnected: None,
             };
-            (cfg, vd, Some(res))
+            (local_cfg, bodies_dir, vd, Some(res))
         }
     };
 
-    let bodies_dir = config.bodies_dir.clone();
-    let local_cfg = LocalConfig {
-        config,
-        view_distance,
-    };
-
-    let local_transport = match LocalTransport::new(local_cfg) {
-        Ok(t) => t,
-        Err(err) => {
-            eprintln!(
-                "启动单机宿主失败(world_dir={}): {err}",
-                cli.world_dir.display()
-            );
-            std::process::exit(1);
+    let transport_res = if let Some(addr) = cli.connect {
+        let net_transport = match NetTransport::connect(addr) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("连接服务器失败({addr}): {err}");
+                std::process::exit(1);
+            }
+        };
+        let mut transport = SequencedTransport::new(net_transport);
+        transport.send(C2S::Hello {
+            client_id: HELLO_CLIENT_ID,
+        });
+        transport.send(C2S::Subscribe { view_distance });
+        if script_res.is_some() {
+            transport.send(C2S::SubscribeDebug);
         }
+        TransportRes::new(transport)
+    } else {
+        let world_dir = cli
+            .world_dir
+            .as_ref()
+            .expect("parse_cli 保证 --world-dir 与 --connect 必居其一");
+        let local_cfg = LocalConfig {
+            config: local_config.expect("单机模式必有 local_config"),
+            view_distance,
+        };
+        let local_transport = match LocalTransport::new(local_cfg) {
+            Ok(t) => t,
+            Err(err) => {
+                eprintln!("启动单机宿主失败(world_dir={}): {err}", world_dir.display());
+                std::process::exit(1);
+            }
+        };
+        let mut transport = SequencedTransport::new(local_transport);
+        if script_res.is_some() {
+            // 脚本模式启动即订阅服务端性能/调试遥测(REQ-013 C01b-3 §1.4;交互模式行为不变)。
+            transport.send(C2S::SubscribeDebug);
+        }
+        TransportRes::new(transport)
     };
-    let mut transport = SequencedTransport::new(local_transport);
-    if script_res.is_some() {
-        // 脚本模式启动即订阅服务端性能/调试遥测(REQ-013 C01b-3 §1.4;交互模式行为不变)。
-        transport.send(C2S::SubscribeDebug);
-    }
 
-    let screenshot_dir = cli.world_dir.join("screenshots");
+    let screenshot_dir = cli
+        .world_dir
+        .as_ref()
+        .map(|dir| dir.join("screenshots"))
+        .unwrap_or_else(|| PathBuf::from("screenshots"));
     let chunk_cap = cli
         .chunk_cap
         .unwrap_or_else(|| ViewCapRes::default_cap(view_distance));
@@ -698,7 +765,8 @@ fn main() {
         brightness: 150.0,
         ..default()
     })
-    .insert_resource(TransportRes::new(transport))
+    .insert_resource(transport_res)
+    .insert_resource(DisconnectHud::default())
     .insert_resource(ViewCapRes {
         view_distance,
         chunk_cap,
@@ -1199,13 +1267,15 @@ fn agent_highlight_system(
     );
 }
 
-/// 交互模式 HUD 文本更新系统(REQ-013 C02-1 §3.2 / MS18 & PM26 靶点 + C08 §3)。
+/// 交互模式 HUD 文本更新系统(REQ-013 C02-1 §3.2 / MS18 & PM26 靶点 + C08 §3 + REQ-014 M01 断连提示)。
+#[allow(clippy::too_many_arguments)]
 fn hud_update_system(
     fps_history: Res<FpsHistoryRes>,
     server_tick: Res<ServerTickRes>,
     world_res: Res<WorldRenderRes>,
     tool_res: Res<ToolRes>,
     possess_res: Res<PossessRes>,
+    disconnect_hud: Option<Res<DisconnectHud>>,
     mut hud_q: Query<&mut Text, With<HudText>>,
 ) {
     let Ok(mut text) = hud_q.single_mut() else {
@@ -1224,6 +1294,9 @@ fn hud_update_system(
     );
     if let Some(hit) = tool_res.agent_target {
         hud.push_str(&format!("\nagent: {} — P 附身/解除", hit.entity.to_bits()));
+    }
+    if let Some(reason) = disconnect_hud.as_deref().and_then(|d| d.0.as_deref()) {
+        hud.push_str(&format!("\n已断连:{reason}"));
     }
     text.0 = hud;
 }
@@ -1340,6 +1413,16 @@ fn unload_chunk_visuals(
     }
 }
 
+/// `drain_transport_system` 的可选资源组(规避 Bevy 16 参数 `IntoSystem` 上限)。
+#[derive(bevy::ecs::system::SystemParam)]
+struct DrainOptionalRes<'w> {
+    server_perf: Option<ResMut<'w, ServerPerfRes>>,
+    possess: Option<ResMut<'w, PossessRes>>,
+    entity_mirror: Option<ResMut<'w, EntityMirrorRes>>,
+    disconnect_hud: Option<ResMut<'w, DisconnectHud>>,
+    script_mode: Option<ResMut<'w, ScriptModeRes>>,
+}
+
 /// 消费宿主 S2C 帧更新世界镜像(脚本模式同时喂 `WorldState`,交互与脚本模式维护 `PossessRes`),
 /// 并在 chunk 卸载或 LRU 驱逐时经 [`unload_chunk_visuals`] 回收实体/资产/任务。
 #[allow(clippy::too_many_arguments)]
@@ -1354,11 +1437,8 @@ fn drain_transport_system(
     mut pending: ResMut<PendingMeshesRes>,
     mut edit_frames: ResMut<EditFrameTracker>,
     mut stats: ResMut<MeshStats>,
-    mut server_perf: Option<ResMut<ServerPerfRes>>,
     mut server_tick: ResMut<ServerTickRes>,
-    mut possess_res: Option<ResMut<PossessRes>>,
-    mut entity_mirror: Option<ResMut<EntityMirrorRes>>,
-    mut script_mode: Option<ResMut<ScriptModeRes>>,
+    mut opt: DrainOptionalRes,
     cam_q: Query<&Transform, With<FlyCamera>>,
 ) {
     let Some(msgs) = transport_res.with_mut(|transport| transport.drain()) else {
@@ -1366,10 +1446,10 @@ fn drain_transport_system(
     };
     let mut pending_sends: Vec<C2S> = Vec::new();
     for msg in msgs {
-        if let Some(em) = entity_mirror.as_mut() {
+        if let Some(em) = opt.entity_mirror.as_mut() {
             em.0.apply(&msg);
         }
-        if let Some(script) = script_mode.as_mut()
+        if let Some(script) = opt.script_mode.as_mut()
             && let Some(ev) = s2c_to_event(msg.clone())
         {
             match ev {
@@ -1408,12 +1488,12 @@ fn drain_transport_system(
                 stats.unloads = stats.unloads.saturating_add(1);
             }
             S2C::Spawned { entity } => {
-                if let Some(possess) = possess_res.as_mut() {
+                if let Some(possess) = opt.possess.as_mut() {
                     possess.state.on_spawned(entity);
                 }
             }
             S2C::Possessed { entity } => {
-                if let Some(possess) = possess_res.as_mut() {
+                if let Some(possess) = opt.possess.as_mut() {
                     possess.state.on_possessed(entity);
                     possess.possessed = entity;
                 }
@@ -1425,7 +1505,7 @@ fn drain_transport_system(
                 full,
             } => {
                 server_tick.0 = tick.0;
-                if let Some(possess) = possess_res.as_mut() {
+                if let Some(possess) = opt.possess.as_mut() {
                     if full {
                         possess.agents.clear();
                     }
@@ -1457,13 +1537,21 @@ fn drain_transport_system(
                 policy_total_us,
                 ..
             } => {
-                if let Some(perf) = server_perf.as_mut() {
+                if let Some(perf) = opt.server_perf.as_mut() {
                     perf.latest = Some(ServerPerfSample {
                         sim_p95_ms,
                         sim_samples,
                         policy_infer_count,
                         policy_total_us,
                     });
+                }
+            }
+            S2C::Bye { reason } => {
+                if opt.script_mode.is_none()
+                    && let Some(hud) = opt.disconnect_hud.as_mut()
+                    && hud.0.is_none()
+                {
+                    hud.0 = Some(localize_disconnect_reason(&reason));
                 }
             }
             _ => {}
@@ -3619,5 +3707,112 @@ half = [1.0, 1.0, 1.0]
         }
         let srgba = fog.color.to_srgba();
         assert_eq!([srgba.red, srgba.green, srgba.blue], SKY);
+    }
+
+    /// M01 T7(FakeTransport 无头 harness):交互模式注入 `S2C::Bye { reason: "测试断连" }` →
+    /// `DisconnectHud` 变为 `Some("????")`(4 个非 ASCII 字符经本地化转 `?`,手算期望),
+    /// 且 `hud_update_system` 写出的 HUD 文本尾追加 `已断连:????`;
+    /// 另校验已知中文断连原因 `"连接关闭"` → `Some("connection closed")` 与尾行 `已断连:connection closed`。
+    #[test]
+    fn m01_t7_disconnect_hud_and_text_on_bye() {
+        let mut app = headless_app(ChunkMirror::new(), false, false);
+        let (fake_transport, inbound) = FakeTransport::new();
+        app.insert_resource(TransportRes::new(fake_transport))
+            .insert_resource(FpsHistoryRes::default())
+            .insert_resource(ServerTickRes::default())
+            .insert_resource(ToolRes::default())
+            .insert_resource(PossessRes::default())
+            .insert_resource(DisconnectHud::default())
+            .add_systems(Startup, setup_scene)
+            .add_systems(Update, (drain_transport_system, hud_update_system).chain());
+
+        // 首帧 Startup::setup_scene + 正常态 HUD(未断连)。
+        app.update();
+        assert_eq!(app.world().resource::<DisconnectHud>().0, None);
+        {
+            let mut q = app.world_mut().query_filtered::<&Text, With<HudText>>();
+            let text = q.single(app.world()).expect("唯一 HudText 实体");
+            assert!(!text.0.contains("已断连"), "断连前 HUD 不应包含已断连");
+        }
+
+        // 注入 S2C::Bye{reason:"测试断连"}。
+        inbound.lock().expect("inbound lock").push(S2C::Bye {
+            reason: "测试断连".to_owned(),
+        });
+        app.update();
+
+        assert_eq!(
+            app.world().resource::<DisconnectHud>().0.as_deref(),
+            Some("????"),
+            "DisconnectHud 必须记录 localize_disconnect_reason(\"测试断连\") 的手算期望 \"????\""
+        );
+        {
+            let mut q = app.world_mut().query_filtered::<&Text, With<HudText>>();
+            let text = q.single(app.world()).expect("唯一 HudText 实体");
+            assert!(
+                text.0.contains("已断连"),
+                "HUD 文本必须包含 \"已断连\",实得: {}",
+                text.0
+            );
+            assert!(
+                text.0.ends_with("\n已断连:????"),
+                "HUD 文本尾行必须为 \"已断连:????\",实得: {}",
+                text.0
+            );
+        }
+
+        // 校验已知中文原因 "连接关闭" → "connection closed"(手算期望)。
+        app.world_mut().resource_mut::<DisconnectHud>().0 = None;
+        inbound.lock().expect("inbound lock").push(S2C::Bye {
+            reason: "连接关闭".to_owned(),
+        });
+        app.update();
+        assert_eq!(
+            app.world().resource::<DisconnectHud>().0.as_deref(),
+            Some("connection closed"),
+        );
+        {
+            let mut q = app.world_mut().query_filtered::<&Text, With<HudText>>();
+            let text = q.single(app.world()).expect("唯一 HudText 实体");
+            assert!(text.0.ends_with("\n已断连:connection closed"));
+        }
+    }
+
+    /// M01 `parse_cli` 单测:`--connect` 与 `--world-dir` 互斥、坏地址 Err 点名、`--connect` 正常解析。
+    #[test]
+    fn m01_parse_cli_connect_and_mutex() {
+        let mutex_err =
+            parse_cli_from(["--connect", "127.0.0.1:25565", "--world-dir", "tmp_world"])
+                .err()
+                .expect("互斥参数必须返回 Err");
+        assert_eq!(mutex_err, "--connect 与 --world-dir 不可同用");
+
+        let bad_addr_err = parse_cli_from(["--connect", "not-a-socket-addr"])
+            .err()
+            .expect("坏地址必须返回 Err");
+        assert!(
+            bad_addr_err.contains("--connect") && bad_addr_err.contains("not-a-socket-addr"),
+            "坏地址 Err 必须点名参数与非法值,实得: {bad_addr_err}"
+        );
+
+        let missing_err = parse_cli_from(["--connect"])
+            .err()
+            .expect("缺少地址值必须返回 Err");
+        assert!(missing_err.contains("--connect"));
+
+        let neither_err = parse_cli_from(Vec::<&str>::new())
+            .err()
+            .expect("两者都缺必须返回 Err");
+        assert!(neither_err.contains("--world-dir") && neither_err.contains("--connect"));
+
+        let parsed = parse_cli_from(["--connect", "127.0.0.1:25565", "--view-distance", "6"])
+            .expect("合法 --connect 参数必须解析成功");
+        assert_eq!(
+            parsed.connect,
+            Some("127.0.0.1:25565".parse::<SocketAddr>().expect("合法地址"))
+        );
+        assert_eq!(parsed.world_dir, None);
+        assert_eq!(parsed.view_distance, Some(6));
+        assert!(matches!(parsed.mode, RunMode::Interactive));
     }
 }

@@ -9,6 +9,7 @@ pub mod client;
 pub mod entities;
 pub mod mesh;
 pub mod mirror;
+pub mod net_transport;
 pub mod perf;
 pub mod possess;
 pub mod script;
@@ -20,6 +21,8 @@ pub mod world;
 #[cfg(test)]
 mod ac4_tests;
 
+pub use client::HELLO_CLIENT_ID;
+pub use net_transport::NetTransport;
 pub use transport::{LoopbackTransport, SequencedTransport};
 
 use std::collections::BTreeSet;
