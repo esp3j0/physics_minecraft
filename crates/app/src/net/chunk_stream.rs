@@ -58,6 +58,14 @@ pub struct ChunkStreamState {
     view_distance: u8,
     /// 已对客户端发出且未卸载的 chunk 集合(差分基准)。
     loaded: BTreeSet<ChunkPos>,
+    /// 上次全量重算时的中心(REQ-014 F10 静止短路)。
+    last_center: Option<ChunkPos>,
+    /// 上次全量重算时的视距(REQ-014 F10 静止短路)。
+    last_vd: u8,
+    /// 上轮 diff 是否双空(REQ-014 F10 静止短路)。
+    settled: bool,
+    /// 全量重建 `view_square` 的累计次数(观测口径)。
+    square_rebuilds: u64,
 }
 
 impl ChunkStreamState {
@@ -67,7 +75,22 @@ impl ChunkStreamState {
             center,
             view_distance,
             loaded: BTreeSet::new(),
+            last_center: None,
+            last_vd: view_distance,
+            settled: false,
+            square_rebuilds: 0,
         }
+    }
+
+    /// 全量重建 `view_square` 的累计次数(REQ-014 F10 观测口径)。
+    pub fn square_rebuilds(&self) -> u64 {
+        self.square_rebuilds
+    }
+
+    /// 上轮 diff 后是否处于静止稳态(测试观测用)。
+    #[cfg(test)]
+    pub(crate) fn is_settled(&self) -> bool {
+        self.settled
     }
 
     /// 当前中心(测试与 pump 排序用)。
@@ -100,6 +123,13 @@ impl ChunkStreamState {
     /// v2 latest-wins:**每轮从最新 center 全量重算、不保留跨轮队列**——中间态
     /// 被新中心合并,过时的装卸意图自然消散。
     pub fn diff(&mut self) -> StreamDiff {
+        if self.last_center == Some(self.center)
+            && self.last_vd == self.view_distance
+            && self.settled
+        {
+            return StreamDiff::default();
+        }
+        self.square_rebuilds += 1;
         let desired = view_square(self.center, self.view_distance);
         let to_load: Vec<ChunkPos> = desired
             .difference(&self.loaded)
@@ -125,6 +155,9 @@ impl ChunkStreamState {
         for pos in &to_unload {
             self.loaded.remove(pos);
         }
+        self.settled = to_load.is_empty() && to_unload.is_empty();
+        self.last_center = Some(self.center);
+        self.last_vd = self.view_distance;
         StreamDiff { to_load, to_unload }
     }
 
@@ -143,11 +176,13 @@ impl ChunkStreamState {
         for pos in to_load {
             self.loaded.remove(pos);
         }
+        self.settled = false;
     }
 
     /// 连接终止后的状态丢弃(当前 loaded 集合;断连清理语义——非模拟侧
     /// 卸载,观察者的模拟激活/票据由 REQ-002 观察者生命周期管理)。
     pub fn take_loaded(&mut self) -> BTreeSet<ChunkPos> {
+        self.settled = false;
         std::mem::take(&mut self.loaded)
     }
 }
@@ -525,5 +560,124 @@ mod tests {
         let retry = state.diff();
         assert_eq!(retry.to_load.len(), 3, "差分只补被撤的 3 个");
         assert_eq!(state.loaded().len(), 9, "账面复原");
+    }
+
+    /// REQ-014 M02a-1 T8(F10 静止短路;R1 裁决更正双空轮数):
+    /// vd=8(289=(2×8+1)²)新态循环 diff 至双空:19 个装载轮(⌈289/16⌉=19)+ 1 个置 settled 的空轮 = 20 轮,
+    /// `square_rebuilds()==20`;再 diff 5 次双空且 rebuilds 仍 20;`set_center(同值)`仍短路(仍 20);
+    /// `set_center(x+1)` 下轮 rebuilds 21;`resubscribe(同 vd)` 不失效、`resubscribe(vd±1)` 失效;
+    /// `rollback_load` 后 `settled==false`。
+    #[test]
+    fn m02a1_t8_f10_settled_short_circuit() {
+        let mut state = ChunkStreamState::new(ChunkPos::new(0, 0), 8);
+        let mut non_empty_rounds = 0u64;
+        loop {
+            let diff = state.diff();
+            if diff.to_load.is_empty() && diff.to_unload.is_empty() {
+                break;
+            }
+            non_empty_rounds += 1;
+            assert!(non_empty_rounds < 100, "循环上限保护");
+        }
+        assert_eq!(non_empty_rounds, 19, "⌈289/16⌉ = 19 个装载轮");
+        assert_eq!(state.loaded().len(), 289);
+        assert_eq!(
+            state.square_rebuilds(),
+            20,
+            "19 个装载轮 + 1 个置 settled 的空轮 → square_rebuilds() == 20"
+        );
+
+        // 再 diff 5 次 → 双空且 rebuilds 仍 20。
+        for _ in 0..5 {
+            let diff = state.diff();
+            assert!(diff.to_load.is_empty() && diff.to_unload.is_empty());
+        }
+        assert_eq!(state.square_rebuilds(), 20, "再 diff 5 次 rebuilds 仍 20");
+
+        // set_center(同值) → 仍短路。
+        state.set_center(ChunkPos::new(0, 0));
+        let same = state.diff();
+        assert!(same.to_load.is_empty() && same.to_unload.is_empty());
+        assert_eq!(state.square_rebuilds(), 20, "set_center(同值) 仍短路");
+
+        // set_center(x+1) → 下轮 rebuilds 21。
+        state.set_center(ChunkPos::new(1, 0));
+        let moved = state.diff();
+        assert!(
+            !moved.to_load.is_empty() || !moved.to_unload.is_empty(),
+            "中心移动后必须产出差分"
+        );
+        assert_eq!(
+            state.square_rebuilds(),
+            21,
+            "set_center(x+1) 下轮 rebuilds 21"
+        );
+
+        // 先收敛到双空稳态再测 resubscribe 与 rollback_load。
+        for _ in 0..100 {
+            let diff = state.diff();
+            if diff.to_load.is_empty() && diff.to_unload.is_empty() {
+                break;
+            }
+        }
+        assert!(state.is_settled(), "收敛后处于 settled");
+        let settled_rebuilds = state.square_rebuilds();
+
+        // resubscribe(同 vd) 不失效。
+        state.resubscribe(8);
+        let same_vd = state.diff();
+        assert!(same_vd.to_load.is_empty() && same_vd.to_unload.is_empty());
+        assert_eq!(
+            state.square_rebuilds(),
+            settled_rebuilds,
+            "resubscribe(同 vd) 不失效"
+        );
+
+        // resubscribe(vd - 1) 失效。
+        state.resubscribe(7);
+        let shrink = state.diff();
+        assert!(!shrink.to_unload.is_empty(), "resubscribe(vd-1) 触发卸载");
+        assert_eq!(
+            state.square_rebuilds(),
+            settled_rebuilds + 1,
+            "resubscribe(vd-1) 失效重算"
+        );
+
+        // 收敛后再测 resubscribe(vd + 1) 失效。
+        for _ in 0..100 {
+            let diff = state.diff();
+            if diff.to_load.is_empty() && diff.to_unload.is_empty() {
+                break;
+            }
+        }
+        assert!(state.is_settled());
+        let before_expand = state.square_rebuilds();
+        state.resubscribe(8);
+        let expand = state.diff();
+        assert!(!expand.to_load.is_empty(), "resubscribe(vd+1) 触发装载");
+        assert_eq!(
+            state.square_rebuilds(),
+            before_expand + 1,
+            "resubscribe(vd+1) 失效重算"
+        );
+
+        // 收敛后 rollback_load 必须将 settled 置 false 且下轮重算。
+        for _ in 0..100 {
+            let diff = state.diff();
+            if diff.to_load.is_empty() && diff.to_unload.is_empty() {
+                break;
+            }
+        }
+        assert!(state.is_settled());
+        let before_rollback = state.square_rebuilds();
+        state.rollback_load(&[ChunkPos::new(1, 0)]);
+        assert!(!state.is_settled(), "rollback_load 后 settled 必须置 false");
+        let after_rollback = state.diff();
+        assert_eq!(
+            after_rollback.to_load,
+            vec![ChunkPos::new(1, 0)],
+            "回滚后下轮必须重算补回"
+        );
+        assert_eq!(state.square_rebuilds(), before_rollback + 1);
     }
 }

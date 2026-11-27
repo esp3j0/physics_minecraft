@@ -108,7 +108,7 @@ pub async fn spawn_in_current_runtime(
 
     // 启动即完成 Hello+Subscribe 等效装配(REQ-013 §3.2a;中心与 net.rs:980 同为 (0, 0))。
     let _ = outbound.push(
-        OutboundPriority::Critical,
+        OutboundPriority::P0,
         S2C::Welcome {
             player_id: LOCAL_PLAYER,
             tick: Tick(0),
@@ -245,12 +245,18 @@ impl LocalHandle {
                     player: LOCAL_PLAYER,
                 });
             }
+            TranslateOutcome::SetAgentStream(lod) => {
+                let _ = self.up_tx.try_send(NetUp::AgentStream {
+                    player: LOCAL_PLAYER,
+                    lod,
+                });
+            }
             TranslateOutcome::Ping => {
                 let res = self
                     .outbound
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(OutboundPriority::Critical, S2C::Pong);
+                    .push(OutboundPriority::P0, S2C::Pong);
                 if res == EnqueueResult::CriticalFull {
                     self.disconnect_locked(&mut state, DisconnectReason::CriticalOverflow, false);
                 }
@@ -297,7 +303,7 @@ impl LocalHandle {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .push(
-                        OutboundPriority::Critical,
+                        OutboundPriority::P0,
                         S2C::Bye {
                             reason: bye_text(&reason),
                         },

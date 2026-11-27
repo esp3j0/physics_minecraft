@@ -78,6 +78,10 @@ pub enum C2S {
         seq: u64,
         inner: Box<C2S>,
     },
+    /// LOD/紧凑流能力协商(REQ-014 §3):握手后显式启用;未发送者帧序列逐位不变。
+    SetAgentStream {
+        lod: bool,
+    },
 }
 
 /// 服务器 → 客户端(追加式)。
@@ -746,6 +750,28 @@ mod tests {
             decode_frame(&encode_frame(&zero)),
             Some(zero),
             "零值 PerfStats 往返相等"
+        );
+    }
+
+    /// REQ-014 M02a-1 T1:`C2S::SetAgentStream` 声明序判别值钉死(= 13) + lod true/false 往返。
+    #[test]
+    fn m02a1_t1_set_agent_stream_roundtrip_and_discriminant() {
+        let on = C2S::SetAgentStream { lod: true };
+        let frame_on = encode_c2s_frame(&on);
+        assert_eq!(frame_on[4], 13, "SetAgentStream 判别值 = 13(声明序追加)");
+        assert_eq!(
+            decode_c2s_frame(&frame_on),
+            Some(on),
+            "SetAgentStream(true) 帧往返相等"
+        );
+
+        let off = C2S::SetAgentStream { lod: false };
+        let frame_off = encode_c2s_frame(&off);
+        assert_eq!(frame_off[4], 13, "SetAgentStream 判别值 = 13");
+        assert_eq!(
+            decode_c2s_frame(&frame_off),
+            Some(off),
+            "SetAgentStream(false) 帧往返相等"
         );
     }
 }

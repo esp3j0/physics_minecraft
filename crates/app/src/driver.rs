@@ -546,6 +546,8 @@ struct PlayerStream {
     /// `(EntityId, 身体哈希, 连杆姿态)`;是否发送的判据 = 本拍视距内有主体
     /// 或本表非空——世界无主体时帧序列与改动前逐位相同,AC-A8)。
     last_agents: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)>,
+    /// 是否经 `C2S::SetAgentStream { lod: true }` 启用 LOD/L0 专流(REQ-014 §3)。
+    lod_enabled: bool,
 }
 /// 驱动结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1333,6 +1335,7 @@ impl ObserveOrchestrator {
             && prev != entity
         {
             self.unpossess_entity(player, prev, session, log);
+            self.emit_l0_removed_if_lod(player, prev, session.tick_now(), hub);
         }
         // 登记(双向一对一;同实体重复附身幂等)。
         self.possessed_by.insert(player, entity);
@@ -1371,6 +1374,33 @@ impl ObserveOrchestrator {
         };
         self.unpossess_entity(player, entity, session, log);
         hub.push_critical(player, S2C::Possessed { entity: None });
+        self.emit_l0_removed_if_lod(player, entity, session.tick_now(), hub);
+    }
+
+    /// LOD 玩家解除附身时补发一次性 P1 `removed` 帧(REQ-014 M02a-1 §5):
+    /// 清客户端 L0 残留;若实体仍在视距内,常规流下一输出拍将作为新实体重发。
+    fn emit_l0_removed_if_lod(
+        &self,
+        player: messaging::InputSource,
+        entity: types::EntityId,
+        tick: types::Tick,
+        hub: &OutboundHub,
+    ) {
+        if self
+            .players
+            .get(&player)
+            .is_some_and(|stream| stream.lod_enabled)
+        {
+            hub.push_p1(
+                player,
+                S2C::AgentStates {
+                    tick,
+                    states: Vec::new(),
+                    removed: vec![entity],
+                    full: false,
+                },
+            );
+        }
     }
 
     /// 附身表摘除 + 零意图(经日志;`handle_unpossess` 与附身切换、断线、
@@ -1676,6 +1706,7 @@ impl ObserveOrchestrator {
             // 主体已移除:存档一并清(控制者 slot 由 retain_alive 摘,无需恢复)。
             self.saved_intent.remove(&entity);
             hub.push_critical(player, S2C::Possessed { entity: None });
+            self.emit_l0_removed_if_lod(player, entity, session.tick_now(), hub);
         }
     }
 
@@ -1909,8 +1940,14 @@ impl ObserveOrchestrator {
                     view_distance_m: 0.0,
                     last_sent: BTreeMap::new(),
                     last_agents: BTreeMap::new(),
+                    lod_enabled: false,
                 });
                 stream.view_distance_m = f32::from(view_distance) * 16.0;
+            }
+            NetUp::AgentStream { player, lod } => {
+                if let Some(stream) = self.players.get_mut(&player) {
+                    stream.lod_enabled = lod;
+                }
             }
             NetUp::Left { player, .. } => {
                 // 断连即弃(细则 3):观察流状态清理 + 模拟侧观察者移除入日志
@@ -2055,6 +2092,50 @@ impl ObserveOrchestrator {
         }
         for (_shard, cell, block) in session.take_solidified() {
             self.pending_blocks.insert(cell, block);
+        }
+    }
+
+    /// L0 附身 60Hz 专流(REQ-014 M02a-1 §5;每拍先于 cadence 门调用):
+    /// 仅服务 `lod_enabled && possessed_by` 命中玩家,空集直接返回(不调 `session.agent_states()`);
+    /// 附身即专流(距离旁路),经 `hub.push_l0` 直投 P2 `agent_states_l0` 最新覆盖槽。
+    fn emit_l0_streams(
+        &mut self,
+        session: &sim_api::session::Session,
+        hub: &OutboundHub,
+        tick: types::Tick,
+    ) {
+        let targets: Vec<(messaging::InputSource, types::EntityId)> = self
+            .players
+            .iter()
+            .filter(|(_, stream)| stream.lod_enabled)
+            .filter_map(|(&player, _)| {
+                self.possessed_by
+                    .get(&player)
+                    .copied()
+                    .map(|entity| (player, entity))
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let by_id: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)> = session
+            .agent_states()
+            .into_iter()
+            .map(|(id, hash, poses)| (id, (hash, poses)))
+            .collect();
+        for (player, entity) in targets {
+            let Some((hash, poses)) = by_id.get(&entity) else {
+                continue;
+            };
+            hub.push_l0(
+                player,
+                S2C::AgentStates {
+                    tick,
+                    states: vec![(entity, *hash, poses.clone())],
+                    removed: Vec::new(),
+                    full: false,
+                },
+            );
         }
     }
 
@@ -2212,12 +2293,25 @@ impl ObserveOrchestrator {
             let Some(&position) = observers.get(&player) else {
                 continue; // 未 MoveObserver:无过滤中心,静默等待(0 视距语义)
             };
+            // REQ-014 M02a-1 §5 分档互斥:lod_enabled 玩家的附身实体只走 L0 专流,
+            // 从常规主体流的 visible 与 last_agents 基准中排除;未启用者维持现网语义。
+            let l0_entity = if stream.lod_enabled {
+                self.possessed_by.get(&player).copied()
+            } else {
+                None
+            };
+            if let Some(excluded) = l0_entity {
+                stream.last_agents.remove(&excluded);
+            }
             let full = full_due || stream.last_agents.is_empty();
             let radius = stream.view_distance_m;
             // 视距内主体(3D 距离,与 EntityStates 同式;中心 = 观察者位置)。
             let mut visible: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)> =
                 BTreeMap::new();
             for (id, hash, poses) in &agent_table {
+                if Some(*id) == l0_entity {
+                    continue;
+                }
                 if let Some(root) = poses.first()
                     && position.distance(root.translation) <= radius
                 {
@@ -2371,8 +2465,8 @@ impl ObserveOrchestrator {
             policy_max_us: policy_perf.max_us,
         };
         for player in self.debug_subscribers.clone() {
-            hub.push_critical(player, msg.clone());
-            hub.push_critical(player, perf.clone());
+            hub.push_world(player, msg.clone());
+            hub.push_world(player, perf.clone());
         }
     }
 }
@@ -2957,6 +3051,8 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     orchestrator.flush_pending_respawn_possess(&mut session, &mut log, hub);
                     orchestrator.flush_pending_intents(&mut session, &mut log);
                     orchestrator.follow_observers(&mut session, &mut log, hub);
+                    hub.begin_tick();
+                    orchestrator.emit_l0_streams(&session, hub, session.tick_now());
                     orchestrator.emit_outputs(&session, hub, session.tick_now(), *cadence);
                     // 调试遥测(REQ-011 §3.5.2;W03):先累计(读本拍 TickSummary),
                     // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
@@ -7058,38 +7154,32 @@ mod tests {
         let _ = recv_entity_states(&mut c).await; // 吃掉首全量
 
         // 跑到凝固被观察(增量 removed;期间可能有无变化静默——改为帧等待
-        // 上限,包到即判)。凝固包顺序:EntityStates(removed)与 BlockUpdates
-        // 同轮两包,顺序不限。
-        let mut saw_removed = false;
-        for _ in 0..160 {
+        // 上限,包到即判)。凝固包顺序:BlockUpdates(P1)与 EntityStates(removed,P2)
+        // 同轮两包,顺序不限;单循环顺序无关收集(REQ-014 M02a-1 R1 裁决 C,预算 320 帧)。
+        let mut removed_list: Option<Vec<EntityId>> = None;
+        let mut solidified_cell = false;
+        for _ in 0..320 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await {
                 Ok(Ok(S2C::EntityStates { removed, .. })) if !removed.is_empty() => {
-                    assert_eq!(removed, vec![entity], "凝固 → removed 含实体 ID");
-                    saw_removed = true;
-                    break;
+                    removed_list = Some(removed);
                 }
-                _ => {}
+                Ok(Ok(S2C::BlockUpdates { updates })) => {
+                    if updates
+                        .iter()
+                        .any(|(pos, _)| *pos == types::BlockPos::new(1, 3, 1))
+                    {
+                        solidified_cell = true;
+                    }
+                }
+                Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(_)) => break,
+            }
+            if removed_list.is_some() && solidified_cell {
+                break;
             }
         }
-        assert!(saw_removed, "凝固后 160 帧内 removed 必达");
-        // BlockUpdates:凝固格(实体出生列)在 removed 报文前后必达;收帧直到见。
-        let solidified_cell = 'search: {
-            for _ in 0..160 {
-                match tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await {
-                    Ok(Ok(S2C::BlockUpdates { updates })) => {
-                        if updates
-                            .iter()
-                            .any(|(pos, _)| *pos == types::BlockPos::new(1, 3, 1))
-                        {
-                            break 'search true;
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    _ => break 'search false,
-                }
-            }
-            false
-        };
+        let removed = removed_list.expect("凝固后 320 帧内 removed 必达");
+        assert_eq!(removed, vec![entity], "凝固 → removed 含实体 ID");
         assert!(solidified_cell, "凝固 → BlockUpdates 含凝固格 (1,3,1)");
 
         // RemoveEntity 同型:再生成一实体 → 移除 → 增量 removed。
@@ -7580,24 +7670,31 @@ mod tests {
         let _single_got = shapes_before_entity_states(&mut c, single).await;
 
         // 形状已发过:等下一次增量(状态仍会因物理微变/差分重置),确认增量
-        // 面不再重发形状——读帧窗里收集所有 EntityShapes,若含复合体即违例。
-        // (观察间隔 3 拍,推进足够拍数产生若干增量输出点。)
-        advance_ticks(9).await;
-        let mut incremental_shapes: Vec<EntityId> = Vec::new();
+        // 面不再重发形状——full 感知窗口(REQ-014 M02a-1 R1/R2 裁决 D/D2-1):
+        // 增量窗只覆盖增量周期;全量重发证据取自 tick-18 全量周期(实体 20 拍凝固寿命内)。
+        advance_ticks(6).await;
+        let mut pending_shapes: Vec<EntityId> = Vec::new();
         for _ in 0..16 {
             let frame = tokio::time::timeout(std::time::Duration::from_millis(50), c.recv()).await;
             match frame {
                 Ok(Ok(S2C::EntityShapes { shapes })) => {
-                    incremental_shapes.extend(shapes.into_iter().map(|(e, _)| e));
+                    pending_shapes.extend(shapes.into_iter().map(|(e, _)| e));
                 }
-                Ok(Ok(S2C::EntityStates { full: false, .. })) | Ok(Ok(_)) => {}
+                Ok(Ok(S2C::EntityStates { full: false, .. })) => {
+                    assert!(
+                        !pending_shapes.contains(&compound),
+                        "形状已发过:增量包不再重发,实得 {pending_shapes:?}"
+                    );
+                    pending_shapes.clear();
+                }
+                Ok(Ok(S2C::EntityStates { full: true, .. })) => {
+                    pending_shapes.clear();
+                    break;
+                }
+                Ok(Ok(_)) => {}
                 _ => break,
             }
         }
-        assert!(
-            !incremental_shapes.contains(&compound),
-            "形状已发过:增量包不再重发,实得 {incremental_shapes:?}"
-        );
 
         // 全量包前重发(observe full = 9 拍)。
         advance_ticks(9).await;
@@ -8845,5 +8942,315 @@ mod tests {
             outcome.chunks_loaded_hot, 1,
             "1 热块 + 1 冷块 → chunks_loaded_hot 恰为 1"
         );
+    }
+
+    /// REQ-014 M02a-1 T7(L0 附身 60Hz 专流 e2e):
+    /// 真 bootstrap+serve+driver.run(TempDir,暂停时钟):
+    /// - A: SpawnAgent(e_a) + Possess(e_a) + SetAgentStream{lod:true}, B: SpawnAgent(e_b)(未发 SetAgentStream);
+    /// - 跑 12 拍:A 的 L0 AgentStates(单实体 e_a, full=false) 恰 12 帧(每拍 1);
+    ///   A 的常规 AgentStates(10Hz 输出拍)不含 e_a(含 e_b);
+    ///   对照连接 B 的常规流含 e_a(现网语义);
+    /// - A 发 Unpossess → 收 removed==[e_a] 一次性帧(P1),其后 L0 停发。
+    #[tokio::test(start_paused = true)]
+    async fn m02a1_t7_l0_dedicated_stream_and_unpossess_removed() {
+        let tmp = tempfile::TempDir::new().expect("TempDir");
+        let bodies_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/bodies");
+        let config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            bodies_dir,
+            policies_dir: tmp.path().join("policies"),
+            checkpoint_interval_ticks: 600,
+            ..Config::default()
+        };
+        let (session, log, store, _resume_from, spawn_next_seq, resume) =
+            bootstrap(&config, || Box::new(SimpleRegistry::builtin())).expect("bootstrap 成功");
+        let (provider, new_sim, bodies) = wire_provider_and_new_sim(config.clone(), &store, || {
+            Box::new(SimpleRegistry::builtin())
+        })
+        .expect("wire_provider_and_new_sim 成功");
+
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (up_tx, up_rx) = tokio::sync::mpsc::channel(256);
+        let hub = std::sync::Arc::new(OutboundHub::new());
+        let (bcast_tx, bcast_rx) = tokio::sync::broadcast::channel::<()>(1);
+        let net_cfg = crate::net::NetConfig {
+            observe_interval_ticks: 6, // 60Hz / 6 = 10Hz 常规输出拍
+            full_snapshot_interval_ticks: 60,
+            ..crate::net::NetConfig::default()
+        };
+        let cadence = ObserveCadence::from(&net_cfg);
+        let addr = crate::net::serve(net_cfg, up_tx, bcast_rx, hub.clone())
+            .await
+            .expect("serve 监听成功");
+
+        let driver = tokio::spawn(run(DriverArgs {
+            config,
+            session,
+            store,
+            log,
+            commands: rx,
+            listen_ctrl_c: false,
+            provider,
+            new_sim,
+            observe: Some(ObserveLink {
+                up: up_rx,
+                hub: hub.clone(),
+                cadence,
+            }),
+            spawn_next_seq,
+            bodies,
+            resume,
+        }));
+
+        // 辅助:推进恰好 1 拍虚拟时钟(复用 advance_ticks 避免 tokio::time::advance 漏触发 interval)。
+        async fn step_one_tick() {
+            advance_ticks(1).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // 辅助:非阻塞读尽客户端 socket 已到达的全部 S2C 帧(不推进虚拟时钟)。
+        async fn drain_ready(c: &mut MiniClient) -> Vec<S2C> {
+            let mut out = Vec::new();
+            for _ in 0..16 {
+                for _ in 0..4 {
+                    tokio::task::yield_now().await;
+                }
+                while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                    out.push(msg);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+                while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                    out.push(msg);
+                }
+            }
+            out
+        }
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let _id_a = join_player(&mut a, 4).await;
+        let mut b = MiniClient::connect(addr).await.expect("B 连入");
+        let _id_b = join_player(&mut b, 4).await;
+
+        let pos_a = Vec3::new(8.0, -59.0, 8.0);
+        let pos_b = Vec3::new(10.0, -59.0, 8.0);
+        a.send(&C2S::MoveObserver { position: pos_a })
+            .await
+            .expect("A MoveObserver");
+        b.send(&C2S::MoveObserver { position: pos_b })
+            .await
+            .expect("B MoveObserver");
+
+        // 推进 6 拍确保 (0,0) 分片与出生 chunk 装载完成。
+        for _ in 0..6 {
+            step_one_tick().await;
+        }
+        let _ = drain_ready(&mut a).await;
+        let _ = drain_ready(&mut b).await;
+
+        // A、B 各自生成 capsule 主体。
+        a.send(&C2S::SpawnAgent {
+            body: "capsule".to_string(),
+            position: pos_a,
+            yaw: 0.0,
+        })
+        .await
+        .expect("A SpawnAgent");
+        b.send(&C2S::SpawnAgent {
+            body: "capsule".to_string(),
+            position: pos_b,
+            yaw: 0.0,
+        })
+        .await
+        .expect("B SpawnAgent");
+
+        let mut e_a = None;
+        let mut e_b = None;
+        for _ in 0..20 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if let S2C::Spawned { entity } = msg {
+                    e_a = Some(entity);
+                }
+            }
+            for msg in drain_ready(&mut b).await {
+                if let S2C::Spawned { entity } = msg {
+                    e_b = Some(entity);
+                }
+            }
+            if e_a.is_some() && e_b.is_some() {
+                break;
+            }
+        }
+        let e_a = e_a.expect("A 必须收到 Spawned");
+        let e_b = e_b.expect("B 必须收到 Spawned");
+
+        // 再跑 2 拍确保内核实体完成生成后,A 附身 e_a 并开启 SetAgentStream{lod:true}。
+        step_one_tick().await;
+        step_one_tick().await;
+        a.send(&C2S::Possess { entity: e_a })
+            .await
+            .expect("A Possess");
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("A SetAgentStream(true)");
+
+        let mut possessed_ok = false;
+        for _ in 0..10 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if msg == (S2C::Possessed { entity: Some(e_a) }) {
+                    possessed_ok = true;
+                }
+            }
+            let _ = drain_ready(&mut b).await;
+            if possessed_ok {
+                break;
+            }
+        }
+        assert!(possessed_ok, "A 必须成功附身 e_a");
+
+        // 额外清一拍,确保 SetAgentStream{lod:true} 已生效且所有历史在途帧排干。
+        step_one_tick().await;
+        let _ = drain_ready(&mut a).await;
+        let _ = drain_ready(&mut b).await;
+
+        // 干净的 12 拍窗口:逐拍推进并收集 A 与 B 的 AgentStates。
+        let mut a_l0_ticks = Vec::new();
+        let mut a_regular_frames = Vec::new();
+        let mut b_regular_saw_ea = false;
+        for _ in 0..12 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if let S2C::AgentStates {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                } = msg
+                {
+                    let is_l0 =
+                        !full && removed.is_empty() && states.len() == 1 && states[0].0 == e_a;
+                    if is_l0 {
+                        a_l0_ticks.push(tick);
+                    } else {
+                        a_regular_frames.push((tick, states, removed, full));
+                    }
+                }
+            }
+            for msg in drain_ready(&mut b).await {
+                if let S2C::AgentStates { states, .. } = msg
+                    && states.iter().any(|(id, _, _)| *id == e_a)
+                {
+                    b_regular_saw_ea = true;
+                }
+            }
+        }
+
+        assert_eq!(
+            a_l0_ticks.len(),
+            12,
+            "12 拍窗口内 A 必须收到恰 12 帧 L0 单实体 AgentStates(full=false),实得 {a_l0_ticks:?}"
+        );
+        for w in a_l0_ticks.windows(2) {
+            assert_eq!(w[1].0, w[0].0 + 1, "L0 专流必须每拍连续 1 帧");
+        }
+        let mut a_regular_saw_eb = false;
+        for (tick, states, _, full) in &a_regular_frames {
+            assert!(
+                !states.iter().any(|(id, _, _)| *id == e_a),
+                "A 的常规 AgentStates(tick={tick:?}, full={full})不得包含附身实体 e_a"
+            );
+            if states.iter().any(|(id, _, _)| *id == e_b) {
+                a_regular_saw_eb = true;
+            }
+        }
+        assert!(
+            a_regular_saw_eb,
+            "A 的常规 AgentStates(10Hz 输出拍)必须仍包含未附身实体 e_b"
+        );
+        assert!(
+            b_regular_saw_ea,
+            "对照连接 B(未发 SetAgentStream)常规流必须包含 e_a(现网语义)"
+        );
+
+        // Unpossess → 收 removed==[e_a] 一次性帧(P1),其后 L0 停发。
+        a.send(&C2S::Unpossess).await.expect("A Unpossess");
+        let mut saw_possessed_none = false;
+        let mut saw_removed_ea = false;
+        for _ in 0..6 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if msg == (S2C::Possessed { entity: None }) {
+                    saw_possessed_none = true;
+                }
+                if let S2C::AgentStates {
+                    states,
+                    removed,
+                    full,
+                    ..
+                } = msg
+                    && !full
+                    && states.is_empty()
+                    && removed == vec![e_a]
+                {
+                    saw_removed_ea = true;
+                }
+            }
+            if saw_possessed_none && saw_removed_ea {
+                break;
+            }
+        }
+        assert!(saw_possessed_none, "Unpossess 必须收到 Possessed(None)");
+        assert!(
+            saw_removed_ea,
+            "LOD 玩家 Unpossess 必须收到 removed==[e_a] 一次性 P1 帧"
+        );
+
+        // 等待下一个常规输出拍确认 e_a 重新回到常规流(随后紧邻的 5 个非输出拍内绝不得收到任何 L0 帧)。
+        let mut saw_regular_reappear = false;
+        for _ in 0..10 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if let S2C::AgentStates { states, .. } = msg
+                    && states.iter().any(|(id, _, _)| *id == e_a)
+                {
+                    saw_regular_reappear = true;
+                }
+            }
+            if saw_regular_reappear {
+                break;
+            }
+        }
+        assert!(
+            saw_regular_reappear,
+            "Unpossess 后常规流下一输出拍必须把 e_a 作为新实体重发"
+        );
+
+        // 紧接着的 5 拍(均为非常规输出拍,interval=6):若 L0 未停发必收到 5 帧,停发则恰为 0 帧。
+        let mut l0_after_unpossess = 0usize;
+        for _ in 0..5 {
+            step_one_tick().await;
+            for msg in drain_ready(&mut a).await {
+                if let S2C::AgentStates { states, .. } = msg
+                    && states.iter().any(|(id, _, _)| *id == e_a)
+                {
+                    l0_after_unpossess += 1;
+                }
+            }
+        }
+        assert_eq!(
+            l0_after_unpossess, 0,
+            "Unpossess 后 L0 专流必须停发(5 个非输出拍内实收 {l0_after_unpossess} 帧)"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        let _ = driver.await.expect("驱动不 panic");
+        let _ = bcast_tx.send(());
     }
 }

@@ -127,8 +127,10 @@ pub enum NetUp {
     /// 驱动侧记录订阅集合,断连(NetUp::Left)即移除。
     SubscribeDebug { player: InputSource },
     /// 带序号输入的确认上行(REQ-013 C04):intake 剥尽 `Sequenced` 层后(非 Reject 才)
-    /// 按外→内逐层上报,驱动侧以 World 优先级回 `S2C::InputAck`。
+    /// 按外→内逐层上报,驱动侧以 P1 可靠事件回 `S2C::InputAck`。
     Ack { player: InputSource, seq: u64 },
+    /// LOD/紧凑流能力协商(REQ-014 §3):Subscribed 态接收,幂等上报驱动侧置位。
+    AgentStream { player: InputSource, lod: bool },
 }
 
 /// 订阅视距上限(REQ-003 §4.3:钳制 ≤32 chunk)。
@@ -152,6 +154,8 @@ pub enum TranslateOutcome {
     /// 调试遥测订阅(REQ-011 §3.5.2;W03):幂等;该连接开始接收
     /// [`S2C::DebugStats`]。
     SubscribeDebug,
+    /// LOD/紧凑流能力协商(REQ-014 §3)。
+    SetAgentStream(bool),
     /// 主体协议面(REQ-012 A03):SpawnAgent/Possess/Unpossess/AgentIntent
     /// 的 DriverCommand 载体(驱动侧校验与回执;校验不过 = 拒绝计数)。
     Agent(DriverCommand),
@@ -233,6 +237,7 @@ pub fn translate(player: InputSource, c2s: C2S) -> TranslateOutcome {
         C2S::Ping => TranslateOutcome::Ping,
         C2S::Goodbye => TranslateOutcome::Goodbye,
         C2S::SubscribeDebug => TranslateOutcome::SubscribeDebug,
+        C2S::SetAgentStream { lod } => TranslateOutcome::SetAgentStream(lod),
         C2S::Sequenced { seq, inner } => TranslateOutcome::Sequenced {
             seq,
             inner: Box::new(translate(player, *inner)),
@@ -303,127 +308,377 @@ fn chunk_shard_of(cx: i32, cz: i32) -> types::ShardPos {
     )
 }
 
-// ---- 出站两级队列(README 决策 6;骨架——填充在任务 03) ----
+// ---- 出站四级队列(REQ-014 §3:P0 Critical / P1 可靠事件 / P2 最新覆盖 / P3 ChunkData 限速) ----
 
-/// 出站优先级(两级):Critical(Welcome/Bye/Pong)/ World(chunk 流/实体状态)。
+/// 出站优先级(四级):
+/// - `P0`:Critical(Welcome/Bye/Pong/Possessed/Spawned,满断连);
+/// - `P1`:可靠事件(BlockUpdates/ChunkUnload/EntityShapes/InputAck/Correction,永不丢);
+/// - `P2`:状态流(EntityStates/AgentStates/L0/DebugStats/PerfStats,每类最新覆盖);
+/// - `P3`:ChunkData(有界 512 满丢最旧,出网受全局每拍配额限速)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundPriority {
-    Critical,
-    World,
+    P0,
+    P1,
+    P2,
+    P3,
 }
 
-/// Critical 队列容量(README 决策 6:64;满 → 断连)。
+/// P0 Critical 队列容量(README 决策 6:64;满 → 断连)。
 pub const CRITICAL_CAPACITY: usize = 64;
-/// World 队列容量(README 决策 6:512;满 → 丢最旧)。
-pub const WORLD_CAPACITY: usize = 512;
+/// P1 可靠事件软上限(满仍入队,计数反压)。
+pub const P1_SOFT_CAPACITY: usize = 1024;
+/// P3 ChunkData 队列容量(512;满 → 丢最旧)。
+pub const P3_CAPACITY: usize = 512;
+/// P3 全局限速每拍配额(8 块/拍;REQ-014 ACM10 结构)。
+pub const CHUNK_PACE_PER_TICK: u64 = 8;
+/// 每连接独立上行通道容量(REQ-014 F8)。
+pub const UPLINK_CAPACITY: usize = 64;
 
-/// 出站入队结果(供本任务断言与任务 03 填充侧使用)。
+/// 出站入队结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueResult {
     Enqueued,
-    /// World 满:丢最旧,新值入队(EntityStates 天然 latest-wins;ChunkData
-    /// 丢失由客户端重新 Subscribe 修复,README 决策 6)。
+    /// P3 满:丢最旧,新值入队(ChunkData 丢失由客户端重新 Subscribe 修复,README 决策 6)。
     DroppedOldest,
-    /// Critical 满(或接收端已亡)= 断连信号。
+    /// P0 Critical 满(或接收端已亡)= 断连信号。
     CriticalFull,
+    /// P2 状态槽覆盖旧值(丢旧不丢新)。
+    Superseded,
 }
 
-/// 每连接出站队列:Critical 满或 send 失败 → 断连并上报 Left;World 满丢最旧。
+/// P2 状态流五槽(每类最新覆盖,按固定序出网)。
+#[derive(Default)]
+struct P2Slots {
+    entity_states: Option<S2C>,
+    agent_states: Option<S2C>,
+    agent_states_l0: Option<S2C>,
+    debug_stats: Option<S2C>,
+    perf_stats: Option<S2C>,
+}
+
+impl P2Slots {
+    fn is_empty(&self) -> bool {
+        self.entity_states.is_none()
+            && self.agent_states.is_none()
+            && self.agent_states_l0.is_none()
+            && self.debug_stats.is_none()
+            && self.perf_stats.is_none()
+    }
+
+    /// 按固定序弹出一槽(供 `try_pop` 与单机 `drain` 使用)。
+    fn pop_next(&mut self) -> Option<S2C> {
+        self.entity_states
+            .take()
+            .or_else(|| self.agent_states.take())
+            .or_else(|| self.agent_states_l0.take())
+            .or_else(|| self.debug_stats.take())
+            .or_else(|| self.perf_stats.take())
+    }
+
+    /// 按固定序一次取尽全部非空槽(供 `flush_outbound` 逐帧写出)。
+    fn take_all(&mut self) -> Vec<S2C> {
+        let mut out = Vec::with_capacity(5);
+        if let Some(m) = self.entity_states.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.agent_states.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.agent_states_l0.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.debug_stats.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.perf_stats.take() {
+            out.push(m);
+        }
+        out
+    }
+}
+
+/// P1/P2/P3 共享队列本体(短同步互斥临界区,零 await)。
+#[derive(Default)]
+struct TierQueues {
+    p1: std::collections::VecDeque<S2C>,
+    p2: P2Slots,
+    p3: std::collections::VecDeque<S2C>,
+}
+
+/// 按 S2C 变体自动路由四级优先级(REQ-014 M02a-1 §3)。
+fn route_priority(msg: &S2C) -> OutboundPriority {
+    match msg {
+        S2C::Welcome { .. }
+        | S2C::Bye { .. }
+        | S2C::Pong
+        | S2C::Possessed { .. }
+        | S2C::Spawned { .. } => OutboundPriority::P0,
+        S2C::BlockUpdates { .. }
+        | S2C::ChunkUnload { .. }
+        | S2C::EntityShapes { .. }
+        | S2C::InputAck { .. }
+        | S2C::Correction { .. } => OutboundPriority::P1,
+        S2C::EntityStates { .. }
+        | S2C::AgentStates { .. }
+        | S2C::DebugStats { .. }
+        | S2C::PerfStats { .. } => OutboundPriority::P2,
+        S2C::ChunkData { .. } => OutboundPriority::P3,
+    }
+}
+
+fn push_p0_raw(
+    critical_tx: &mpsc::Sender<S2C>,
+    notify: &tokio::sync::Notify,
+    msg: S2C,
+) -> EnqueueResult {
+    match critical_tx.try_send(msg) {
+        Ok(()) => {
+            notify.notify_one();
+            EnqueueResult::Enqueued
+        }
+        Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
+            EnqueueResult::CriticalFull
+        }
+    }
+}
+
+fn push_p1_raw(
+    queues: &std::sync::Mutex<TierQueues>,
+    p1_backpressure: &std::sync::atomic::AtomicU64,
+    notify: &tokio::sync::Notify,
+    msg: S2C,
+) -> EnqueueResult {
+    let mut guard = queues.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.p1.len() >= P1_SOFT_CAPACITY {
+        p1_backpressure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    guard.p1.push_back(msg);
+    drop(guard);
+    notify.notify_one();
+    EnqueueResult::Enqueued
+}
+
+fn push_p2_raw(
+    queues: &std::sync::Mutex<TierQueues>,
+    p2_superseded: &std::sync::atomic::AtomicU64,
+    notify: &tokio::sync::Notify,
+    msg: S2C,
+) -> EnqueueResult {
+    let mut guard = queues.lock().unwrap_or_else(|p| p.into_inner());
+    let slot = match &msg {
+        S2C::EntityStates { .. } => &mut guard.p2.entity_states,
+        S2C::AgentStates { .. } => &mut guard.p2.agent_states,
+        S2C::DebugStats { .. } => &mut guard.p2.debug_stats,
+        S2C::PerfStats { .. } => &mut guard.p2.perf_stats,
+        _ => {
+            // 非四类状态包显式走 P2 时的防御回退:落 P1 不丢失。
+            guard.p1.push_back(msg);
+            drop(guard);
+            notify.notify_one();
+            return EnqueueResult::Enqueued;
+        }
+    };
+    let res = if slot.replace(msg).is_some() {
+        p2_superseded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EnqueueResult::Superseded
+    } else {
+        EnqueueResult::Enqueued
+    };
+    drop(guard);
+    notify.notify_one();
+    res
+}
+
+fn push_l0_raw(
+    queues: &std::sync::Mutex<TierQueues>,
+    p2_superseded: &std::sync::atomic::AtomicU64,
+    notify: &tokio::sync::Notify,
+    msg: S2C,
+) -> EnqueueResult {
+    let mut guard = queues.lock().unwrap_or_else(|p| p.into_inner());
+    let res = if guard.p2.agent_states_l0.replace(msg).is_some() {
+        p2_superseded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EnqueueResult::Superseded
+    } else {
+        EnqueueResult::Enqueued
+    };
+    drop(guard);
+    notify.notify_one();
+    res
+}
+
+fn push_p3_raw(
+    queues: &std::sync::Mutex<TierQueues>,
+    world_dropped: &std::sync::atomic::AtomicU64,
+    notify: &tokio::sync::Notify,
+    msg: S2C,
+) -> EnqueueResult {
+    let mut guard = queues.lock().unwrap_or_else(|p| p.into_inner());
+    let res = if guard.p3.len() >= P3_CAPACITY {
+        guard.p3.pop_front();
+        guard.p3.push_back(msg);
+        world_dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        EnqueueResult::DroppedOldest
+    } else {
+        guard.p3.push_back(msg);
+        EnqueueResult::Enqueued
+    };
+    drop(guard);
+    notify.notify_one();
+    res
+}
+
+/// 每连接出站四级队列:
+/// - P0 = mpsc(64),满或接收端亡 → `CriticalFull` 断连信号;
+/// - P1 = 永不丢 VecDeque(软上限 1024 记反压);
+/// - P2 = 五槽最新覆盖(`entity_states`/`agent_states`/`agent_states_l0`/`debug_stats`/`perf_stats`);
+/// - P3 = 有界 512 VecDeque(满丢最旧,出网受全局每拍配额限速)。
 ///
-/// 结构(任务 02 起共享):Critical = 连接任务私有的 mpsc(Welcome/Pong/Bye);
-/// World = 共享 deque(`std::sync::Mutex<VecDeque>`,任务 02:泵任务写、连接
-/// 任务读——**socket 单写者始终是连接任务**)+ [`tokio::sync::Notify`] 提醒
-/// 连接冲刷(泵不入 socket;notify_one 无等待者时存票,不丢唤醒)。
-/// 互斥临界区全同步零 await,不会跨挂起点持有;锁中毒不可达
-/// (临界区无 panic 点),保守解包继续。
+/// 互斥临界区全同步零 await,不会跨挂起点持有;锁中毒不可达,保守解包继续。
 pub struct Outbound {
     critical_tx: mpsc::Sender<S2C>,
     critical_rx: mpsc::Receiver<S2C>,
-    world: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<S2C>>>,
-    /// World 入队提醒(泵 → 连接读循环;连接据此冲刷 World 队列出网)。
+    queues: std::sync::Arc<std::sync::Mutex<TierQueues>>,
+    /// 入队提醒(泵/驱动 → 连接读循环;连接据此按 P0→P1→P2→P3 冲刷出网)。
     pub(crate) data_ready: std::sync::Arc<tokio::sync::Notify>,
-    /// World 丢最旧计数(队列级共享:hub 注册的写方与泵写方累加同一计数;
-    /// `world_dropped()` 观测口径的总览)。
+    /// P3 丢最旧计数(队列级共享:`world_dropped()` 观测口径)。
     world_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// P1 软上限触发计数(`p1_backpressure()` 观测口径)。
+    p1_backpressure: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// P2 状态槽覆盖旧值计数(`p2_superseded()` 观测口径)。
+    p2_superseded: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Outbound {
-    /// 两级各按容量建队。
+    /// 按四级队列构造。
     pub fn new() -> Self {
         let (critical_tx, critical_rx) = mpsc::channel(CRITICAL_CAPACITY);
         Self {
             critical_tx,
             critical_rx,
-            world: std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            queues: std::sync::Arc::new(std::sync::Mutex::new(TierQueues::default())),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             world_dropped: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            p1_backpressure: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            p2_superseded: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
-    /// World 队列的泵句柄(任务 02):共享同一 deque 与提醒,只写不读。
-    /// 任务 03:附 Critical 发送端克隆(驱动 Welcome 下行经此直通玩家
-    /// Critical 队列;连接任务仍是唯一 socket 写者)与丢弃计数句柄。
+    /// 出站队列写句柄(泵/驱动共用,单 socket 写者始终为连接任务)。
     pub(crate) fn world_writer(&self) -> WorldWriter {
         WorldWriter {
-            world: self.world.clone(),
+            queues: self.queues.clone(),
             notify: self.data_ready.clone(),
             critical_tx: self.critical_tx.clone(),
-            dropped: self.world_dropped.clone(),
+            world_dropped: self.world_dropped.clone(),
+            p1_backpressure: self.p1_backpressure.clone(),
+            p2_superseded: self.p2_superseded.clone(),
         }
     }
 
-    /// World 入队核心(同步;满 512 → 丢最旧,新值入队尾)。
-    /// 锁中毒(理论不可达:临界区无 panic 点)→ 取内值继续,不放大故障。
-    fn world_push(
-        world: &std::sync::Mutex<std::collections::VecDeque<S2C>>,
-        msg: S2C,
-    ) -> EnqueueResult {
-        let mut guard = world.lock().unwrap_or_else(|p| p.into_inner());
-        if guard.len() >= WORLD_CAPACITY {
-            guard.pop_front(); // 丢最旧(README 决策 6)
-            guard.push_back(msg);
-            EnqueueResult::DroppedOldest
-        } else {
-            guard.push_back(msg);
-            EnqueueResult::Enqueued
-        }
-    }
-
-    /// 入队(按优先级);策略见 [`EnqueueResult`]。World 入队后提醒连接冲刷
-    /// (任务 02:泵/连接共写时,冲刷由连接任务统一执行)。
+    /// 显式按优先级入队。
     pub fn push(&mut self, priority: OutboundPriority, msg: S2C) -> EnqueueResult {
         match priority {
-            OutboundPriority::Critical => match self.critical_tx.try_send(msg) {
-                Ok(()) => EnqueueResult::Enqueued,
-                Err(mpsc::error::TrySendError::Full(_))
-                | Err(mpsc::error::TrySendError::Closed(_)) => EnqueueResult::CriticalFull,
-            },
-            OutboundPriority::World => {
-                let result = Self::world_push(&self.world, msg);
-                self.data_ready.notify_one();
-                result
+            OutboundPriority::P0 => push_p0_raw(&self.critical_tx, &self.data_ready, msg),
+            OutboundPriority::P1 => {
+                push_p1_raw(&self.queues, &self.p1_backpressure, &self.data_ready, msg)
+            }
+            OutboundPriority::P2 => {
+                push_p2_raw(&self.queues, &self.p2_superseded, &self.data_ready, msg)
+            }
+            OutboundPriority::P3 => {
+                push_p3_raw(&self.queues, &self.world_dropped, &self.data_ready, msg)
             }
         }
     }
 
-    /// 队列是否全空(测试与断连判定用)。
-    pub fn is_empty(&self) -> bool {
-        self.critical_rx.is_empty()
-            && self
-                .world
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_empty()
+    /// 按 S2C 变体自动路由入队(与 `WorldWriter::push_world` 同口径)。
+    pub fn push_world(&mut self, msg: S2C) -> EnqueueResult {
+        let priority = route_priority(&msg);
+        self.push(priority, msg)
     }
 
-    /// 取队头(Critical 先于 World;写泵任务 03 接线,本任务供测试)。
+    /// 直投 P2 `agent_states_l0` 槽(60Hz 附身专流,最新覆盖)。
+    pub fn push_l0(&mut self, msg: S2C) -> EnqueueResult {
+        push_l0_raw(&self.queues, &self.p2_superseded, &self.data_ready, msg)
+    }
+
+    /// P3 丢最旧累计次数。
+    pub fn world_dropped(&self) -> u64 {
+        self.world_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// P1 软上限反压累计次数。
+    pub fn p1_backpressure(&self) -> u64 {
+        self.p1_backpressure
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// P2 状态槽覆盖旧值累计次数。
+    pub fn p2_superseded(&self) -> u64 {
+        self.p2_superseded
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 队列是否全空(四级均空)。
+    pub fn is_empty(&self) -> bool {
+        if !self.critical_rx.is_empty() {
+            return false;
+        }
+        let guard = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        guard.p1.is_empty() && guard.p2.is_empty() && guard.p3.is_empty()
+    }
+
+    /// 按优先级取队头(P0 → P1 → P2 固定序 → P3;供单机 `drain` 与单测使用)。
     pub(crate) fn try_pop(&mut self) -> Option<S2C> {
-        self.critical_rx.try_recv().ok().or_else(|| {
-            self.world
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pop_front()
-        })
+        if let Ok(msg) = self.critical_rx.try_recv() {
+            return Some(msg);
+        }
+        let mut guard = self.queues.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(msg) = guard.p1.pop_front() {
+            return Some(msg);
+        }
+        if let Some(msg) = guard.p2.pop_next() {
+            return Some(msg);
+        }
+        guard.p3.pop_front()
+    }
+
+    fn pop_p0(&mut self) -> Option<S2C> {
+        self.critical_rx.try_recv().ok()
+    }
+
+    fn pop_p1(&mut self) -> Option<S2C> {
+        self.queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .p1
+            .pop_front()
+    }
+
+    fn take_p2_batch(&mut self) -> Vec<S2C> {
+        self.queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .p2
+            .take_all()
+    }
+
+    fn p3_len(&self) -> usize {
+        self.queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .p3
+            .len()
+    }
+
+    fn pop_p3(&mut self) -> Option<S2C> {
+        self.queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .p3
+            .pop_front()
     }
 }
 
@@ -433,86 +688,199 @@ impl Default for Outbound {
     }
 }
 
-/// World 队列的泵句柄(任务 02):只写 World + 提醒连接冲刷;不碰 Critical
-/// (Welcome/Pong/Bye 属连接任务)。入队即 notify_one——连接读循环的
-/// `data_ready` 臂据此冲刷出网(单 socket 写者)。
+/// 出站队列共享写句柄(泵/驱动只写不读;单 socket 写者始终为连接任务)。
 pub(crate) struct WorldWriter {
-    world: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<S2C>>>,
+    queues: std::sync::Arc<std::sync::Mutex<TierQueues>>,
     notify: std::sync::Arc<tokio::sync::Notify>,
-    /// Critical 发送端(任务 03:Welcome 经 hub 入玩家 Critical 队列——
-    /// 连接任务是唯一接收者;满 = CriticalFull 断连信号原样上浮)。
     critical_tx: mpsc::Sender<S2C>,
-    /// 本队列的丢最旧计数(deque 级共享:hub 写方与泵写方累加同一计数,
-    /// AC-N5 观测口径 = 该玩家 World 队列的全部丢最旧)。
-    dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    world_dropped: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    p1_backpressure: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    p2_superseded: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WorldWriter {
-    /// 入队 World 级(deque 永不"关闭":连接亡故由泵关机路径收口,
-    /// 见 [`StreamLink`] 的 Drop;故只有 Enqueued/DroppedOldest 两态)。
+    /// 按 S2C 变体自动路由入队(P0/P1/P2/P3)。
     pub(crate) fn push_world(&mut self, msg: S2C) -> EnqueueResult {
-        let result = Outbound::world_push(&self.world, msg);
-        if result == EnqueueResult::DroppedOldest {
-            self.dropped
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match route_priority(&msg) {
+            OutboundPriority::P0 => push_p0_raw(&self.critical_tx, &self.notify, msg),
+            OutboundPriority::P1 => {
+                push_p1_raw(&self.queues, &self.p1_backpressure, &self.notify, msg)
+            }
+            OutboundPriority::P2 => {
+                push_p2_raw(&self.queues, &self.p2_superseded, &self.notify, msg)
+            }
+            OutboundPriority::P3 => {
+                push_p3_raw(&self.queues, &self.world_dropped, &self.notify, msg)
+            }
         }
-        self.notify.notify_one();
-        result
     }
 
-    /// 入队 Critical 级(任务 03:驱动侧 Welcome 下行;满 → CriticalFull,
-    /// 连接侧断连收口;发送端已亡(连接任务终止)→ 同判(断连语义))。
+    /// 显式入队 P0 Critical(满 → `CriticalFull` 断连信号)。
     pub(crate) fn push_critical(&mut self, msg: S2C) -> EnqueueResult {
-        match self.critical_tx.try_send(msg) {
-            Ok(()) => {
-                self.notify.notify_one();
-                EnqueueResult::Enqueued
-            }
-            Err(mpsc::error::TrySendError::Full(_)) | Err(mpsc::error::TrySendError::Closed(_)) => {
-                EnqueueResult::CriticalFull
-            }
-        }
+        push_p0_raw(&self.critical_tx, &self.notify, msg)
     }
 
-    /// 本队列丢最旧累计(hub 总览求和用)。
+    /// 显式入队 P1 可靠事件(永不丢;如 L0 解除附身的一次性 `removed` 帧)。
+    pub(crate) fn push_p1(&mut self, msg: S2C) -> EnqueueResult {
+        push_p1_raw(&self.queues, &self.p1_backpressure, &self.notify, msg)
+    }
+
+    /// 直投 P2 `agent_states_l0` 槽(60Hz 附身专流,最新覆盖)。
+    pub(crate) fn push_l0(&mut self, msg: S2C) -> EnqueueResult {
+        push_l0_raw(&self.queues, &self.p2_superseded, &self.notify, msg)
+    }
+
+    fn has_p3(&self) -> bool {
+        !self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .p3
+            .is_empty()
+    }
+
+    /// 本队列 P3 丢最旧累计(hub 总览求和用)。
     pub(crate) fn dropped(&self) -> u64 {
-        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+        self.world_dropped
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 本队列 P1 反压累计。
+    pub(crate) fn p1_backpressure(&self) -> u64 {
+        self.p1_backpressure
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 本队列 P2 覆盖累计。
+    pub(crate) fn p2_superseded(&self) -> u64 {
+        self.p2_superseded
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-// ---- 出站注册表(任务 03):驱动观察输出 → 每玩家 World 队列的下行缝 ----
+// ---- 出站注册表(任务 03 + REQ-014 M02a-1):四级队列写缝 + P3 全局配额 + F8 上行注册 ----
 
-/// 出站队列注册表(REQ-003 §4.4「EntityStates 入 World 队列」的落地缝):
-/// 连接 Subscribe 成功时注册本连接的 [`WorldWriter`],驱动 tick 末端编排据此
-/// 把观察包逐玩家入队;连接终止(任务 Drop)即注销——注册表永不含死队列。
-///
-/// 无锁设计:注册/注销在连接任务的 Subscribe 处理路径同步完成
-/// (`Mutex` 临界区零 await);驱动侧只读快照。锁中毒不可达(临界区无
-/// panic 点),保守解包继续(app::net 既有同款纪律)。
-#[derive(Default)]
+/// 出站与上行注册表:
+/// - 连接 Subscribe 注册 [`WorldWriter`] 与 chunk 流泵态;
+/// - accept 分配身份后注册每连接独立上行 `Receiver<NetUp>`(F8);
+/// - 全局 `chunk_budget` 控制每拍 P3 ChunkData 总出网配额(ACM10 结构)。
 pub struct OutboundHub {
-    /// 玩家 → 该连接的 World 队列写入端(BTreeMap:键序确定性)。
+    /// 玩家 → 该连接的出站写句柄(BTreeMap:键序确定性)。
     writers: std::sync::Mutex<std::collections::BTreeMap<InputSource, WorldWriter>>,
-    /// 玩家 → 该连接的 chunk 流泵态(REQ-012 A03 §5 观察者跟随):服务端
-    /// 替玩家移观察者时同步泵中心(否则跟随不拉 chunk,沿途区域不下发)。
+    /// 玩家 → 该连接的 chunk 流泵态(REQ-012 A03 §5 观察者跟随)。
     centers: std::sync::Mutex<
         std::collections::BTreeMap<InputSource, std::sync::Arc<std::sync::Mutex<ChunkStreamState>>>,
     >,
-    /// World 满 → 丢最旧的累计次数(AC-N5 观测口径;单调;原子累计——
-    /// 计数本体在每连接的 Outbound 上,hub 注册/注销只存各队列的计数句柄,
-    /// 读侧对在场句柄求和 + 已注销队列的沉淀值)。
+    /// 玩家 → 该连接的独立上行通道读端(REQ-014 F8;merger 圆转消费)。
+    uplinks: std::sync::Mutex<std::collections::BTreeMap<InputSource, mpsc::Receiver<NetUp>>>,
+    /// 新上行事件提醒(加速 merger 唤醒;空转兜底 1ms sleep)。
+    uplink_notify: tokio::sync::Notify,
+    /// P3 全局每拍 chunk 出网配额(未启用 tick 限速的纯网络测试默认 `u64::MAX`,
+    /// 首次 `begin_tick()` 即重置为 [`CHUNK_PACE_PER_TICK`])。
+    chunk_budget: std::sync::atomic::AtomicU64,
+    /// 已注销连接的 P3 丢最旧沉淀值(`world_dropped()` 单调不回退)。
     dropped_retired: std::sync::atomic::AtomicU64,
+    /// 已注销连接的 P1 软上限反压沉淀值。
+    p1_backpressure_retired: std::sync::atomic::AtomicU64,
+    /// 已注销连接的 P2 覆盖旧值沉淀值。
+    p2_superseded_retired: std::sync::atomic::AtomicU64,
+}
+
+impl Default for OutboundHub {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl OutboundHub {
     /// 空注册表(装配期构造,与 `serve`/驱动共享)。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            writers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            centers: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            uplinks: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            uplink_notify: tokio::sync::Notify::new(),
+            chunk_budget: std::sync::atomic::AtomicU64::new(u64::MAX),
+            dropped_retired: std::sync::atomic::AtomicU64::new(0),
+            p1_backpressure_retired: std::sync::atomic::AtomicU64::new(0),
+            p2_superseded_retired: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
-    /// 注册玩家出站(连接 Subscribe 成功时;同玩家重复注册 = 替换——
-    /// 身份单调递增不循环,理论不可达,防御式覆盖)。crate 内可见:
-    /// driver 测试注入本地队列断言出站内容(R2-4)用。
+    /// 每拍重置 P3 全局出网配额为 [`CHUNK_PACE_PER_TICK`],并唤醒 P3 有积压的连接。
+    pub fn begin_tick(&self) {
+        self.chunk_budget
+            .store(CHUNK_PACE_PER_TICK, std::sync::atomic::Ordering::SeqCst);
+        let guard = self.writers.lock().unwrap_or_else(|p| p.into_inner());
+        for writer in guard.values() {
+            if writer.has_p3() {
+                writer.notify.notify_one();
+            }
+        }
+    }
+
+    /// CAS 扣减 P3 全局配额:返回实际扣得的数量(余额不足返回剩余)。
+    pub(crate) fn take_chunk_budget(&self, n: u64) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        let mut cur = self.chunk_budget.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if cur == 0 {
+                return 0;
+            }
+            let take = cur.min(n);
+            match self.chunk_budget.compare_exchange_weak(
+                cur,
+                cur - take,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => return take,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// 当前是否仍有剩余 P3 全局配额。
+    pub(crate) fn has_chunk_budget(&self) -> bool {
+        self.chunk_budget.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
+    /// 注册每连接独立上行通道读端(REQ-014 F8:accept 分配身份后注册)。
+    pub(crate) fn register_uplink(&self, player: InputSource, rx: mpsc::Receiver<NetUp>) {
+        self.uplinks
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(player, rx);
+        self.uplink_notify.notify_one();
+    }
+
+    /// 通知 merger 有新上行事件就绪。
+    pub(crate) fn notify_uplink(&self) {
+        self.uplink_notify.notify_one();
+    }
+
+    /// 圆转扫描全部已注册上行通道:按 player 升序每连接每轮至多取 1 条,
+    /// 并同步清理已断开且排空的通道。
+    pub(crate) fn uplink_round_robin(&self) -> Vec<NetUp> {
+        let mut guard = self.uplinks.lock().unwrap_or_else(|p| p.into_inner());
+        let mut batch = Vec::new();
+        let mut closed = Vec::new();
+        for (&player, rx) in guard.iter_mut() {
+            match rx.try_recv() {
+                Ok(event) => batch.push(event),
+                Err(mpsc::error::TryRecvError::Empty) => {}
+                Err(mpsc::error::TryRecvError::Disconnected) => closed.push(player),
+            }
+        }
+        for player in closed {
+            guard.remove(&player);
+        }
+        batch
+    }
+
+    /// 注册玩家出站(连接 Subscribe 成功时)。
     pub(crate) fn register(&self, player: InputSource, writer: WorldWriter) {
         self.writers
             .lock()
@@ -549,25 +917,36 @@ impl OutboundHub {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(player);
+        // 上行通道若已排空立即移除;若仍含未取走的 Left 等尾事件,留待 merger
+        // 取尽后遇 Disconnected 清理(防断连瞬间丢 Left)。
+        {
+            let mut uplinks = self.uplinks.lock().unwrap_or_else(|p| p.into_inner());
+            if uplinks.get(player).is_some_and(mpsc::Receiver::is_empty) {
+                uplinks.remove(player);
+            }
+        }
         let removed = self
             .writers
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(player);
         if let Some(writer) = removed {
-            // 已注销队列的丢弃计数沉淀(总览口径不因断连而回退)。
+            // 已注销队列的丢弃/反压/覆盖计数沉淀(总览口径不因断连而回退)。
             self.dropped_retired
                 .fetch_add(writer.dropped(), std::sync::atomic::Ordering::Relaxed);
+            self.p1_backpressure_retired.fetch_add(
+                writer.p1_backpressure(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.p2_superseded_retired
+                .fetch_add(writer.p2_superseded(), std::sync::atomic::Ordering::Relaxed);
             true
         } else {
             false
         }
     }
 
-    /// Welcome 入玩家 Critical 队列(任务书 03 细则 ⑤):满(64)→
-    /// `CriticalFull` 返回(调用方不重试——Critical 满 = 断连信号,连接侧
-    /// 断连收口后注册消失,后续 push 自然弃);玩家已断连 → `Enqueued` 于
-    /// 死队列(写入无害,写缓冲无人读——返回值仅诊断用)。
+    /// 入玩家 P0 Critical 队列(满 → `CriticalFull` 断连信号)。
     pub fn push_critical(&self, player: InputSource, msg: S2C) -> EnqueueResult {
         let writer = {
             let guard = self.writers.lock().unwrap_or_else(|p| p.into_inner());
@@ -589,23 +968,40 @@ impl OutboundHub {
             .collect()
     }
 
-    /// 观察包入玩家 World 队列(满 512 → 丢最旧,新值入队——EntityStates
-    /// latest-wins 语义丢旧无损正确性,下轮全量周期自愈,任务书细则 4)。
-    /// 玩家已断连(已注销)→ 静默弃(驱动与连接的竞先窗口,无泄漏)。
+    /// 按 S2C 变体自动路由入玩家出站四级队列;玩家已断连 → 静默弃。
     pub fn push_world(&self, player: InputSource, msg: S2C) {
         let writer = {
             let guard = self.writers.lock().unwrap_or_else(|p| p.into_inner());
             guard.get(&player).map(cloned_writer)
         };
         if let Some(mut writer) = writer {
-            // 丢弃计数本体在队列上(WorldWriter::push_world 内累加;泵写方
-            // 同计数)——hub 不再重复计数。
             let _ = writer.push_world(msg);
         }
     }
 
-    /// World 丢最旧累计次数(AC-N5 观测口径;测试与度量用):在场队列计数
-    /// 求和 + 已注销队列沉淀值。
+    /// 显式入玩家 P1 可靠事件队列(永不丢);玩家已断连 → 静默弃。
+    pub fn push_p1(&self, player: InputSource, msg: S2C) {
+        let writer = {
+            let guard = self.writers.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&player).map(cloned_writer)
+        };
+        if let Some(mut writer) = writer {
+            let _ = writer.push_p1(msg);
+        }
+    }
+
+    /// 直投玩家 P2 `agent_states_l0` 槽(60Hz 附身专流,最新覆盖);玩家已断连 → 静默弃。
+    pub fn push_l0(&self, player: InputSource, msg: S2C) {
+        let writer = {
+            let guard = self.writers.lock().unwrap_or_else(|p| p.into_inner());
+            guard.get(&player).map(cloned_writer)
+        };
+        if let Some(mut writer) = writer {
+            let _ = writer.push_l0(msg);
+        }
+    }
+
+    /// P3 丢最旧累计次数(AC-N5 观测口径):在场队列计数求和 + 已注销队列沉淀值。
     pub fn world_dropped(&self) -> u64 {
         let live: u64 = self
             .writers
@@ -618,30 +1014,84 @@ impl OutboundHub {
             .dropped_retired
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// P1 软上限反压累计次数:在场队列计数求和 + 已注销队列沉淀值。
+    pub fn p1_backpressure(&self) -> u64 {
+        let live: u64 = self
+            .writers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(WorldWriter::p1_backpressure)
+            .sum();
+        live + self
+            .p1_backpressure_retired
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// P2 状态槽覆盖旧值累计次数:在场队列计数求和 + 已注销队列沉淀值。
+    pub fn p2_superseded(&self) -> u64 {
+        let live: u64 = self
+            .writers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .map(WorldWriter::p2_superseded)
+            .sum();
+        live + self
+            .p2_superseded_retired
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
-/// `&WorldWriter` → 拥有的克隆(字段皆 Arc,克隆廉价;自由函数便于
-/// `map(cloned_writer)` 直接用于守卫内的借用)。
+/// `&WorldWriter` → 拥有的克隆(字段皆 Arc/Sender,克隆廉价)。
 fn cloned_writer(writer: &WorldWriter) -> WorldWriter {
     WorldWriter {
-        world: writer.world.clone(),
+        queues: writer.queues.clone(),
         notify: writer.notify.clone(),
         critical_tx: writer.critical_tx.clone(),
-        dropped: writer.dropped.clone(),
+        world_dropped: writer.world_dropped.clone(),
+        p1_backpressure: writer.p1_backpressure.clone(),
+        p2_superseded: writer.p2_superseded.clone(),
     }
 }
 
 // ---- 监听与连接任务 ----
 
-/// 启动监听(spawn accept 循环 + 每连接 task);返回实际绑定地址(测试取端口)。
-/// shutdown 关闭后停止 accept,广播存量连接退出,并兜底 abort 连接任务。
-///
-/// 本函数 bind 后 **spawn** accept 循环并立即返回地址(任务书:「spawn accept
-/// 循环 + 每连接 task;返回实际绑定地址」)——调用方无须等监听停止即可拿到
-/// 端口开连。
-///
-/// `hub`(任务 03):出站注册表,调用方(装配)持有克隆供驱动编排下行填充;
-/// 连接 Subscribe 注册、断连注销。
+/// F8 每连接上行隔离圆转合并任务:按 player 升序每连接每轮至多取 1 条转发至共享 `up_tx`;
+/// 整轮空则休眠 1ms(或被新上行事件提前唤醒);shutdown 广播即退出。
+async fn run_uplink_merger(
+    hub: std::sync::Arc<OutboundHub>,
+    up_tx: mpsc::Sender<NetUp>,
+    mut shutdown: broadcast::Receiver<()>,
+) {
+    loop {
+        let batch = hub.uplink_round_robin();
+        if batch.is_empty() {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => break,
+                _ = hub.uplink_notify.notified() => {}
+                _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+            continue;
+        }
+        for event in batch {
+            tokio::select! {
+                biased;
+                _ = shutdown.recv() => return,
+                res = up_tx.send(event) => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 启动监听(spawn accept 循环 + F8 上行 merger + 每连接 task);返回实际绑定地址(测试取端口)。
+/// shutdown 关闭后停止 accept,广播存量连接与 merger 退出,并兜底 abort 连接任务。
 pub async fn serve(
     cfg: NetConfig,
     up_tx: mpsc::Sender<NetUp>,
@@ -650,19 +1100,19 @@ pub async fn serve(
 ) -> io::Result<std::net::SocketAddr> {
     let listener = tokio::net::TcpListener::bind(&cfg.listen_addr).await?;
     let addr = listener.local_addr()?;
-    // accept 循环任务:自持一份关机发送端(广播存量连接退出;自身随 caller 的
-    // shutdown 或显式广播退出)。
+    // accept 循环任务:自持一份关机发送端(广播存量连接与 merger 退出)。
     let shutdown_tx = broadcast::channel::<()>(1).0;
+    let merger_shutdown = shutdown_tx.subscribe();
+    tokio::spawn(run_uplink_merger(hub.clone(), up_tx, merger_shutdown));
     let accept_loop_task = tokio::spawn(accept_loop(
         listener,
         cfg,
-        up_tx,
         shutdown,
         shutdown_tx.clone(),
         hub,
     ));
     // 退出钩子:accept 循环结束(自行返回或被 abort)时确保广播关机,
-    // 存量连接全部终止。
+    // 存量连接与 merger 全部终止。
     tokio::spawn(async move {
         let _ = accept_loop_task.await;
         let _ = shutdown_tx.send(());
@@ -680,11 +1130,10 @@ pub(crate) fn tune_stream(stream: &tokio::net::TcpStream) -> std::io::Result<()>
     stream.set_nodelay(true)
 }
 
-/// accept 循环(serve 的常驻体):每连接分配递增身份并 spawn 连接 task。
+/// accept 循环(serve 的常驻体):每连接分配递增身份、建独立上行通道并 spawn 连接 task。
 async fn accept_loop(
     listener: tokio::net::TcpListener,
     cfg: NetConfig,
-    up_tx: mpsc::Sender<NetUp>,
     mut shutdown: broadcast::Receiver<()>,
     shutdown_tx: tokio::sync::broadcast::Sender<()>,
     hub: std::sync::Arc<OutboundHub>,
@@ -709,12 +1158,13 @@ async fn accept_loop(
                 }
                 let player = InputSource(next_player);
                 next_player += 1;
+                let (conn_up_tx, conn_up_rx) = mpsc::channel(UPLINK_CAPACITY);
+                hub.register_uplink(player, conn_up_rx);
                 let conn_shutdown = shutdown_tx.subscribe();
-                let up = up_tx.clone();
                 let cfg = cfg.clone();
                 let hub = hub.clone();
                 connections.push(tokio::spawn(run_connection(
-                    player, stream, cfg, up, conn_shutdown, hub,
+                    player, stream, cfg, conn_up_tx, conn_shutdown, hub,
                 )));
                 reap_finished(&mut connections);
             }
@@ -841,7 +1291,7 @@ async fn run_connection(
         let result = tokio::select! {
             biased;
             _ = shutdown.recv() => {
-                disconnect(&mut stream, &mut outbound, &up_tx, player, DisconnectReason::Shutdown).await;
+                disconnect(&mut stream, &mut outbound, &up_tx, &hub, player, DisconnectReason::Shutdown).await;
                 return;
             }
             _ = outbound.data_ready.notified() => Ok(Ok(usize::MAX)), // 伪读:触发冲刷
@@ -857,7 +1307,7 @@ async fn run_connection(
                     DisconnectReason::SocketClosed
                 };
                 // 对端先关/写失败时 Bye 多半发不出去:仍走断连收口(尽力而为)。
-                disconnect(&mut stream, &mut outbound, &up_tx, player, reason).await;
+                disconnect(&mut stream, &mut outbound, &up_tx, &hub, player, reason).await;
                 return;
             }
         };
@@ -870,16 +1320,21 @@ async fn run_connection(
                         reason: DisconnectReason::SocketClosed,
                     })
                     .await;
+                hub.notify_uplink();
                 return;
             }
             buf.extend_from_slice(&chunk[..n]);
         }
-        // 先冲刷两级出站(Critical 先于 World;泵提醒/新帧都可能带着待发数据)。
-        if flush_outbound(&mut outbound, &mut stream).await.is_err() {
+        // 先冲刷四级出站(P0 → P1 → P2 → P3 受全局配额)。
+        if flush_outbound(&mut outbound, &mut stream, &hub)
+            .await
+            .is_err()
+        {
             disconnect(
                 &mut stream,
                 &mut outbound,
                 &up_tx,
+                &hub,
                 player,
                 DisconnectReason::SocketClosed,
             )
@@ -896,6 +1351,7 @@ async fn run_connection(
                         &mut stream,
                         &mut outbound,
                         &up_tx,
+                        &hub,
                         player,
                         DisconnectReason::ProtocolViolation("帧超限"),
                     )
@@ -909,6 +1365,7 @@ async fn run_connection(
                             &mut stream,
                             &mut outbound,
                             &up_tx,
+                            &hub,
                             player,
                             DisconnectReason::ProtocolViolation("解码失败"),
                         )
@@ -932,7 +1389,8 @@ async fn run_connection(
                     {
                         Flow::Continue => {}
                         Flow::Disconnect(reason) => {
-                            disconnect(&mut stream, &mut outbound, &up_tx, player, reason).await;
+                            disconnect(&mut stream, &mut outbound, &up_tx, &hub, player, reason)
+                                .await;
                             return;
                         }
                     }
@@ -943,18 +1401,8 @@ async fn run_connection(
 }
 
 /// 单帧处置(状态机 + 翻译 + 上报):返回 `Flow::Continue` 或按原因断连。
-/// 细则 1:未 Subscribe 前,只放行 Hello / Subscribe / Ping / Goodbye;
-/// 其余(含 MoveObserver / Command)= 协议违规断连。
-///
-/// 任务 02(chunk 流):Subscribe 成功 → 建 [`ChunkStreamState`] 并起泵 task
-/// (回执转发同 `NetUp::DriverCommand` 上行通道);Subscribed 后的 MoveObserver
-/// → 泵态 pending 中心单槽合并(socket 读路径零 chunk 工作,v2 语义)+
-/// 照常上报驱动(观察者位置仍由模拟侧消费)。
-///
-/// 任务 03(观察输出接线):Subscribe 成功 → 该连接的 World 队列写入端注册进
-/// [`OutboundHub`](驱动编排的下行填充缝),并以 `NetUp::Subscribed` 把(钳制
-/// 后)视距上报驱动——距离过滤半径的单一来源;连接终止由 [`DisconnectGuard`]
-/// 的 Drop 注销注册(注册表永不含死队列)。
+/// 细则 1:未 Subscribe 前,只放行 Hello / Subscribe / Ping / Goodbye / SubscribeDebug;
+/// 其余(含 MoveObserver / Command / SetAgentStream)= 协议违规断连。
 #[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     player: InputSource,
@@ -989,6 +1437,7 @@ async fn handle_frame(
     if !matches!(outcome, TranslateOutcome::Reject(_)) {
         for seq in seqs {
             let _ = up_tx.send(NetUp::Ack { player, seq }).await;
+            hub.notify_uplink();
         }
     }
 
@@ -996,9 +1445,6 @@ async fn handle_frame(
         TranslateOutcome::Hello => Flow::Continue,
         TranslateOutcome::Subscribe(view_distance) => {
             if let Some(link) = stream_link.as_ref() {
-                // 重复 Subscribe:换挡(钳制后替换视距;泵差分自然卸出外环)。
-                // 首订阅 Welcome 已发,此处不再发;最新视距重报驱动(任务 03:
-                // 距离过滤半径跟随)。
                 link.state
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -1009,28 +1455,20 @@ async fn handle_frame(
                         view_distance: view_distance.min(VIEW_DISTANCE_MAX),
                     })
                     .await;
+                hub.notify_uplink();
                 return Flow::Continue;
             }
             *state = SessionState::Subscribed;
-            // Welcome(Critical 级)+ 立即冲刷(客户端直读 socket 可见)。
-            // tick 暂填 0,连发后由驱动经 hub 刷新(任务 03 接线;语义:
-            // Welcome 到达即订阅成立,拍号随后一次刷新对齐)。
             let welcome = S2C::Welcome {
                 player_id: player,
                 tick: types::Tick(0),
             };
-            if outbound.push(OutboundPriority::Critical, welcome) == EnqueueResult::CriticalFull {
+            if outbound.push(OutboundPriority::P0, welcome) == EnqueueResult::CriticalFull {
                 return Flow::Disconnect(DisconnectReason::CriticalOverflow);
             }
-            if flush_outbound(outbound, stream).await.is_err() {
+            if flush_outbound(outbound, stream, hub).await.is_err() {
                 return Flow::Disconnect(DisconnectReason::SocketClosed);
             }
-            // chunk 流激活:起始中心 = 世界原点所在 chunk(玩家观察者尚未上报
-            // 位置;首个 MoveObserver 合并进 pending 单槽,首泵即按真实位置差分
-            // ——0 视距订阅静默等待,与 v2 spawn 前 pending 语义一致)。
-            // 泵经 WorldWriter 只写 World 队列(单 socket 写者 = 连接任务);
-            // StreamChunks 请求仍经 up_tx 上行(驱动侧经 NetUp 路由后持有
-            // oneshot 回执,REQ-003 §4.4)。
             let stream_state = std::sync::Arc::new(std::sync::Mutex::new(ChunkStreamState::new(
                 types::ChunkPos::new(0, 0),
                 view_distance,
@@ -1042,12 +1480,7 @@ async fn handle_frame(
                 outbound.world_writer(),
                 player,
             );
-            // 观察输出注册(任务 03):World 队列写入端入 hub,驱动编排据此
-            // 逐玩家填充 EntityStates/BlockUpdates;连接终止由注册守卫注销
-            // (守卫经 `&mut Option` 从连接任务写入——handle_frame 不持 Arc)。
             hub.register(player, outbound.world_writer());
-            // chunk 流泵态注册(A03 §5 观察者跟随:服务端替玩家移观察者
-            // 时同步泵中心)。
             hub.register_center(player, stream_state.clone());
             let hub_arc = run_hub.clone();
             *hub_guard = Some(DisconnectGuard {
@@ -1055,9 +1488,6 @@ async fn handle_frame(
                 hub: hub_arc,
             });
             *stream_link = Some(link);
-            // 入会三连报(任务 03):Joined(观察者建立)→ Subscribed(距离
-            // 过滤半径)→ 当前拍(Welcome 拍号一次刷新对齐;驱动 tick_now 即
-            // 已完成拍数,客户端开局即可对齐时间轴)。
             let _ = up_tx.send(NetUp::Joined { player }).await;
             let _ = up_tx
                 .send(NetUp::Subscribed {
@@ -1065,11 +1495,10 @@ async fn handle_frame(
                     view_distance: view_distance.min(VIEW_DISTANCE_MAX),
                 })
                 .await;
+            hub.notify_uplink();
             Flow::Continue
         }
         TranslateOutcome::Move(cmd) => {
-            // 观察者移动:泵态 pending 中心单槽合并(读路径零 chunk 工作);
-            // 上报驱动照旧(观察者表 = 模拟侧权威)。
             if let (Some(link), crate::driver::DriverCommand::MoveObserver { position }) =
                 (stream_link.as_ref(), &cmd)
             {
@@ -1083,37 +1512,38 @@ async fn handle_frame(
                     .set_center(center);
             }
             let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
+            hub.notify_uplink();
             Flow::Continue
         }
         TranslateOutcome::Send(cmd) => {
             let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
+            hub.notify_uplink();
             Flow::Continue
         }
-        // 主体协议面(REQ-012 A03):照 Send 同款经 DriverCommand 载体上行
-        // (驱动侧校验;校验不过 = 拒绝计数,不回包)。
         TranslateOutcome::Agent(cmd) => {
             let _ = up_tx.send(NetUp::DriverCommand { player, cmd }).await;
+            hub.notify_uplink();
             Flow::Continue
         }
-        TranslateOutcome::Ping => {
-            // Ping → Pong(Critical 级,细则 3)+ 立即冲刷(keepalive 应答可观测)。
-            match outbound.push(OutboundPriority::Critical, S2C::Pong) {
-                EnqueueResult::CriticalFull => Flow::Disconnect(DisconnectReason::CriticalOverflow),
-                _ => {
-                    if flush_outbound(outbound, stream).await.is_err() {
-                        Flow::Disconnect(DisconnectReason::SocketClosed)
-                    } else {
-                        Flow::Continue
-                    }
+        TranslateOutcome::Ping => match outbound.push(OutboundPriority::P0, S2C::Pong) {
+            EnqueueResult::CriticalFull => Flow::Disconnect(DisconnectReason::CriticalOverflow),
+            _ => {
+                if flush_outbound(outbound, stream, hub).await.is_err() {
+                    Flow::Disconnect(DisconnectReason::SocketClosed)
+                } else {
+                    Flow::Continue
                 }
             }
-        }
+        },
         TranslateOutcome::Goodbye => Flow::Disconnect(DisconnectReason::Goodbye),
         TranslateOutcome::SubscribeDebug => {
-            // 调试遥测订阅(REQ-011 §3.5.2):上行给驱动登记;幂等(重复
-            // SubscribeDebug 重复上报,驱动侧集合插入天然幂等);不入 Critical
-            // / World 队列,帧序列不变。
             let _ = up_tx.send(NetUp::SubscribeDebug { player }).await;
+            hub.notify_uplink();
+            Flow::Continue
+        }
+        TranslateOutcome::SetAgentStream(lod) => {
+            let _ = up_tx.send(NetUp::AgentStream { player, lod }).await;
+            hub.notify_uplink();
             Flow::Continue
         }
         TranslateOutcome::Reject(why) => Flow::Disconnect(DisconnectReason::ProtocolViolation(why)),
@@ -1152,6 +1582,7 @@ async fn disconnect(
     stream: &mut TcpStream,
     outbound: &mut Outbound,
     up_tx: &mpsc::Sender<NetUp>,
+    hub: &OutboundHub,
     player: InputSource,
     reason: DisconnectReason,
 ) {
@@ -1164,32 +1595,58 @@ async fn disconnect(
         let bye = S2C::Bye {
             reason: reason.as_bye_text(),
         };
-        if outbound.push(OutboundPriority::Critical, bye) != EnqueueResult::CriticalFull {
-            let _ = flush_outbound(outbound, stream).await;
+        if outbound.push(OutboundPriority::P0, bye) != EnqueueResult::CriticalFull {
+            let _ = flush_outbound(outbound, stream, hub).await;
         }
     }
     let _ = up_tx.send(left).await;
+    hub.notify_uplink();
     let _ = stream.shutdown().await;
 }
 
-/// 单次出站写超时(慢客户端保护,README 决策 6 的写侧补全):客户端不读
-/// socket → 写缓冲堆满 → 写阻塞;超时即放弃本次冲刷并断连(与读侧 keepalive
-/// 对称,服务器永不因单个慢客户端阻塞)。
+/// 单次出站写超时(慢客户端保护,README 决策 6 的写侧补全)。
 const FLUSH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 出站冲刷:Critical 先于 World(README 决策 6 优先级),逐帧编码写出。
-/// 写失败或写超时 → `Err`(调用方按 SocketClosed 断连)。
-async fn flush_outbound(outbound: &mut Outbound, stream: &mut TcpStream) -> io::Result<()> {
-    while let Some(msg) = outbound.try_pop() {
-        let frame = sim_api::proto::encode_frame(&msg);
-        match tokio::time::timeout(FLUSH_WRITE_TIMEOUT, stream.write_all(&frame)).await {
-            Ok(r) => r?,
-            Err(_elapsed) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "出站写超时(慢客户端不读)",
-                ));
-            }
+async fn write_frame(msg: &S2C, stream: &mut TcpStream) -> io::Result<()> {
+    let frame = sim_api::proto::encode_frame(msg);
+    match tokio::time::timeout(FLUSH_WRITE_TIMEOUT, stream.write_all(&frame)).await {
+        Ok(r) => r,
+        Err(_elapsed) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "出站写超时(慢客户端不读)",
+        )),
+    }
+}
+
+/// 出站冲刷(REQ-014 M02a-1 §3/§4):
+/// P0 取尽 → P1 取尽 → P2 五槽按固定序各取最新 → P3 受全局配额(`take_chunk_budget`)。
+/// 每帧写超时保护与 flush 超时保护原样保留。P3 冲刷后仍有剩且配额可用则自提醒,
+/// 配额耗尽则等待下拍 `hub.begin_tick()` 唤醒(避免忙等空转)。
+async fn flush_outbound(
+    outbound: &mut Outbound,
+    stream: &mut TcpStream,
+    hub: &OutboundHub,
+) -> io::Result<()> {
+    while let Some(msg) = outbound.pop_p0() {
+        write_frame(&msg, stream).await?;
+    }
+    while let Some(msg) = outbound.pop_p1() {
+        write_frame(&msg, stream).await?;
+    }
+    for msg in outbound.take_p2_batch() {
+        write_frame(&msg, stream).await?;
+    }
+    let want = outbound.p3_len() as u64;
+    if want > 0 {
+        let got = hub.take_chunk_budget(want);
+        for _ in 0..got {
+            let Some(msg) = outbound.pop_p3() else {
+                break;
+            };
+            write_frame(&msg, stream).await?;
+        }
+        if outbound.p3_len() > 0 && hub.has_chunk_budget() {
+            outbound.data_ready.notify_one();
         }
     }
     // flush 同样受写超时保护(缓冲语义下 flush 才是真正出网的一步)。
@@ -1337,6 +1794,31 @@ pub(crate) mod tests {
                     return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "对端关闭"));
                 }
                 self.buf.extend_from_slice(&chunk[..n]);
+            }
+        }
+
+        /// 非阻塞读一帧 S2C(暂停时钟测试不推进虚拟时钟用)。
+        pub(crate) fn try_recv_now(&mut self) -> io::Result<Option<S2C>> {
+            if let Some(s2c) = try_take_frame(&mut self.buf) {
+                return Ok(Some(s2c));
+            }
+            let mut chunk = [0u8; 4096];
+            loop {
+                match self.stream.try_read(&mut chunk) {
+                    Ok(0) => {
+                        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "对端关闭"));
+                    }
+                    Ok(n) => {
+                        self.buf.extend_from_slice(&chunk[..n]);
+                        if let Some(s2c) = try_take_frame(&mut self.buf) {
+                            return Ok(Some(s2c));
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        return Ok(try_take_frame(&mut self.buf));
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
@@ -1982,50 +2464,108 @@ pub(crate) mod tests {
     // ---- 测试清单 8:灌满 Critical(不读 socket 的客户端)→ 断连 ----
     #[tokio::test]
     async fn critical_overflow_disconnects() {
-        // 单元级:队列策略断言(容量 64,满 = CriticalFull 断连信号)。
+        // 单元级:P0 Critical 队列策略断言(容量 64,满 = CriticalFull 断连信号)。
         let mut outbound = Outbound::new();
         for i in 0..CRITICAL_CAPACITY {
             assert_eq!(
-                outbound.push(OutboundPriority::Critical, S2C::Pong),
+                outbound.push(OutboundPriority::P0, S2C::Pong),
                 EnqueueResult::Enqueued,
                 "第 {i} 条应入队(容量 {CRITICAL_CAPACITY})"
             );
         }
         assert_eq!(
-            outbound.push(OutboundPriority::Critical, S2C::Pong),
+            outbound.push(OutboundPriority::P0, S2C::Pong),
             EnqueueResult::CriticalFull,
             "Critical 满(64)再入 → CriticalFull(断连信号)"
         );
         assert!(!outbound.is_empty());
 
-        // World 级:满 512 → 丢最旧(DroppedOldest),不断连;新值保留在队尾。
-        let mut outbound2 = Outbound::new();
-        let sentinel = S2C::ChunkUnload {
+        // REQ-014 M02a-1 §3.1:P3 512 丢最旧 + P1 不丢 + P2 覆盖断言。
+        let mut outbound_p3 = Outbound::new();
+        let sentinel = S2C::ChunkData {
             pos: types::ChunkPos::new(9, 9),
+            chunk: voxel::Chunk::air(),
         };
-        for _ in 0..WORLD_CAPACITY {
+        for i in 0..P3_CAPACITY {
             assert_eq!(
-                outbound2.push(
-                    OutboundPriority::World,
-                    S2C::ChunkUnload {
-                        pos: types::ChunkPos::new(0, 0)
+                outbound_p3.push(
+                    OutboundPriority::P3,
+                    S2C::ChunkData {
+                        pos: types::ChunkPos::new(i as i32, 0),
+                        chunk: voxel::Chunk::air(),
                     }
                 ),
                 EnqueueResult::Enqueued
             );
         }
         assert_eq!(
-            outbound2.push(OutboundPriority::World, sentinel.clone()),
+            outbound_p3.push(OutboundPriority::P3, sentinel.clone()),
             EnqueueResult::DroppedOldest,
-            "World 满 → 丢最旧(新值入队)"
+            "P3 满(512)→ 丢最旧(新值入队)"
         );
-        assert!(!outbound2.is_empty());
-        // 逐条取尽:最后一帧必为 sentinel(丢的是最旧,新值在队尾)。
+        assert_eq!(outbound_p3.world_dropped(), 1, "P3 丢最旧计数 == 1");
         let mut last = None;
-        while let Some(msg) = outbound2.try_pop() {
+        let mut count = 0usize;
+        while let Some(msg) = outbound_p3.try_pop() {
             last = Some(msg);
+            count += 1;
         }
+        assert_eq!(count, P3_CAPACITY, "P3 容量上限 512");
         assert_eq!(last, Some(sentinel), "新值保留在队尾(丢最旧,非拒绝)");
+
+        // P1 可靠事件永不丢(软上限 1024 计反压)。
+        let mut outbound_p1 = Outbound::new();
+        for i in 0..(P1_SOFT_CAPACITY + 5) {
+            assert_eq!(
+                outbound_p1.push(
+                    OutboundPriority::P1,
+                    S2C::ChunkUnload {
+                        pos: types::ChunkPos::new(i as i32, 0),
+                    }
+                ),
+                EnqueueResult::Enqueued
+            );
+        }
+        assert_eq!(outbound_p1.p1_backpressure(), 5, "超 1024 的 5 条计反压");
+        let p1_popped = std::iter::from_fn(|| outbound_p1.try_pop()).count();
+        assert_eq!(p1_popped, P1_SOFT_CAPACITY + 5, "P1 永不丢");
+
+        // P2 状态流最新覆盖。
+        let mut outbound_p2 = Outbound::new();
+        assert_eq!(
+            outbound_p2.push(
+                OutboundPriority::P2,
+                S2C::EntityStates {
+                    tick: types::Tick(1),
+                    states: Vec::new(),
+                    removed: Vec::new(),
+                    full: false,
+                }
+            ),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            outbound_p2.push(
+                OutboundPriority::P2,
+                S2C::EntityStates {
+                    tick: types::Tick(2),
+                    states: Vec::new(),
+                    removed: Vec::new(),
+                    full: false,
+                }
+            ),
+            EnqueueResult::Superseded
+        );
+        assert_eq!(outbound_p2.p2_superseded(), 1);
+        let p2_msgs: Vec<S2C> = std::iter::from_fn(|| outbound_p2.try_pop()).collect();
+        assert_eq!(p2_msgs.len(), 1);
+        assert!(matches!(
+            p2_msgs[0],
+            S2C::EntityStates {
+                tick: types::Tick(2),
+                ..
+            }
+        ));
 
         // socket 级:客户端关闭连接 → 服务端断连,不养僵尸连接(#15 修正后
         // 的实际覆盖)。本测试现走 EOF 支路:客户端 shutdown(Both) → 服务端
@@ -3124,5 +3664,627 @@ pub(crate) mod tests {
             client.nodelay().expect("读取客户端 nodelay"),
             "客户端 tune_stream 后 nodelay 必须为 true"
         );
+    }
+
+    // ---- REQ-014 M02a-1 测试清单(T2/T3/T4/T5/T6) ----
+
+    /// M02a-1 T2:SetAgentStream 翻译与会话门:
+    /// - `translate` 纯函数映射 `SetAgentStream{lod:true/false}`;
+    /// - Subscribed 态 `Sequenced{seq:1, SetAgentStream{lod:true}}` → 不断连,
+    ///   `NetUp::AgentStream{player:InputSource(1), lod:true}` 恰 1 + `Ack{seq:1}` 恰 1;
+    /// - Connected 态裸/包装 `SetAgentStream` → ProtocolViolation 断连且无 Ack。
+    #[tokio::test]
+    async fn m02a1_t2_set_agent_stream_gate_and_translate() {
+        assert_eq!(
+            translate(InputSource(1), C2S::SetAgentStream { lod: true }),
+            TranslateOutcome::SetAgentStream(true)
+        );
+        assert_eq!(
+            translate(InputSource(1), C2S::SetAgentStream { lod: false }),
+            TranslateOutcome::SetAgentStream(false)
+        );
+
+        // Subscribed 态 Sequenced{seq:1, SetAgentStream{lod:true}} + 裸 SetAgentStream{lod:false}。
+        let (addr, mut up, shutdown) = spawn_server(10).await;
+        let mut c1 = MiniClient::connect(addr).await.expect("c1 连入");
+        let id1 = join(&mut c1, 2).await;
+        assert_eq!(id1, InputSource(1));
+        assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id1 });
+
+        c1.send(&C2S::Sequenced {
+            seq: 1,
+            inner: Box::new(C2S::SetAgentStream { lod: true }),
+        })
+        .await
+        .expect("Sequenced(SetAgentStream) 写入");
+        c1.send(&C2S::Ping).await.expect("Ping 写入");
+        assert_eq!(
+            c1.recv_timeout().await,
+            S2C::Pong,
+            "Subscribed 态 SetAgentStream 必须不断连"
+        );
+
+        let mut acks = Vec::new();
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            match tokio::time::timeout(std::time::Duration::from_millis(200), up.recv()).await {
+                Ok(Some(NetUp::Ack { player, seq })) => acks.push((player, seq)),
+                Ok(Some(NetUp::AgentStream { player, lod })) => streams.push((player, lod)),
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+            if !acks.is_empty() && !streams.is_empty() {
+                while let Ok(ev) = up.try_recv() {
+                    match ev {
+                        NetUp::Ack { player, seq } => acks.push((player, seq)),
+                        NetUp::AgentStream { player, lod } => streams.push((player, lod)),
+                        _ => {}
+                    }
+                }
+                break;
+            }
+        }
+        assert_eq!(
+            acks,
+            vec![(InputSource(1), 1)],
+            "Subscribed 态 Sequenced(SetAgentStream) 必须上报恰 1 条 Ack(1)"
+        );
+        assert_eq!(
+            streams,
+            vec![(InputSource(1), true)],
+            "Subscribed 态 Sequenced(SetAgentStream) 必须上报恰 1 条 AgentStream(true)"
+        );
+
+        // Subscribed 态裸 SetAgentStream{lod:false} 同样放行。
+        c1.send(&C2S::SetAgentStream { lod: false })
+            .await
+            .expect("裸 SetAgentStream 写入");
+        c1.send(&C2S::Ping).await.expect("Ping 写入");
+        assert_eq!(c1.recv_timeout().await, S2C::Pong);
+        let mut saw_false = false;
+        for _ in 0..8 {
+            if let Ok(Some(NetUp::AgentStream { player, lod })) =
+                tokio::time::timeout(std::time::Duration::from_millis(200), up.recv()).await
+                && player == InputSource(1)
+                && !lod
+            {
+                saw_false = true;
+                break;
+            }
+        }
+        assert!(saw_false, "Subscribed 态裸 SetAgentStream(false) 必须上报");
+        bcast_shutdown(&shutdown).await;
+
+        // Connected 态裸与包装 SetAgentStream → ProtocolViolation 断连且无 Ack。
+        let (addr2, mut up2, shutdown2) = spawn_server(10).await;
+        let mut raw_c = MiniClient::connect(addr2).await.expect("raw 连入");
+        raw_c
+            .send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("Connected 裸 SetAgentStream 写入");
+        assert!(
+            raw_c.is_disconnected().await,
+            "Connected 态裸 SetAgentStream 必须断连"
+        );
+        assert_eq!(
+            next_up(&mut up2).await,
+            NetUp::Left {
+                player: InputSource(1),
+                reason: DisconnectReason::ProtocolViolation("未 Subscribe 前的帧"),
+            }
+        );
+
+        let mut seq_c = MiniClient::connect(addr2).await.expect("seq 连入");
+        seq_c
+            .send(&C2S::Sequenced {
+                seq: 9,
+                inner: Box::new(C2S::SetAgentStream { lod: true }),
+            })
+            .await
+            .expect("Connected Sequenced(SetAgentStream) 写入");
+        assert!(
+            seq_c.is_disconnected().await,
+            "Connected 态包装 SetAgentStream 必须断连"
+        );
+        assert_eq!(
+            next_up(&mut up2).await,
+            NetUp::Left {
+                player: InputSource(2),
+                reason: DisconnectReason::ProtocolViolation("未 Subscribe 前的帧"),
+            },
+            "Connected 态包装 SetAgentStream 断连前不得上报 Ack"
+        );
+        bcast_shutdown(&shutdown2).await;
+    }
+
+    /// M02a-1 T3:四级出站队列路由与策略(手算值)。
+    #[test]
+    fn m02a1_t3_outbound_four_tier_routing_and_policies() {
+        // 1) 自动路由验证:Welcome/Possessed/Spawned → P0(critical_rx 可收);
+        //    BlockUpdates/ChunkUnload/EntityShapes → P1;
+        //    EntityStates/AgentStates/DebugStats/PerfStats → P2 对应槽;
+        //    ChunkData → P3。
+        let mut outbound = Outbound::new();
+        outbound.push_world(S2C::Welcome {
+            player_id: InputSource(1),
+            tick: types::Tick(1),
+        });
+        outbound.push_world(S2C::Possessed {
+            entity: Some(EntityId::from_parts(0, 1)),
+        });
+        outbound.push_world(S2C::Spawned {
+            entity: EntityId::from_parts(0, 2),
+        });
+        assert!(matches!(
+            outbound.critical_rx.try_recv(),
+            Ok(S2C::Welcome { .. })
+        ));
+        assert!(matches!(
+            outbound.critical_rx.try_recv(),
+            Ok(S2C::Possessed { .. })
+        ));
+        assert!(matches!(
+            outbound.critical_rx.try_recv(),
+            Ok(S2C::Spawned { .. })
+        ));
+        assert!(outbound.critical_rx.try_recv().is_err());
+
+        outbound.push_world(S2C::BlockUpdates {
+            updates: Vec::new(),
+        });
+        outbound.push_world(S2C::ChunkUnload {
+            pos: types::ChunkPos::new(1, 2),
+        });
+        outbound.push_world(S2C::EntityShapes { shapes: Vec::new() });
+        outbound.push_world(S2C::EntityStates {
+            tick: types::Tick(10),
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: false,
+        });
+        outbound.push_world(S2C::AgentStates {
+            tick: types::Tick(11),
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: false,
+        });
+        outbound.push_l0(S2C::AgentStates {
+            tick: types::Tick(12),
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: false,
+        });
+        outbound.push_world(S2C::DebugStats {
+            tick: types::Tick(13),
+            counters: sim_api::proto::DebugCounters::default(),
+            recent: Vec::new(),
+        });
+        outbound.push_world(S2C::PerfStats {
+            tick: types::Tick(14),
+            sim_p95_ms: 1.0,
+            sim_samples: 1,
+            policy_infer_count: 0,
+            policy_total_us: 0,
+            policy_max_us: 0,
+        });
+        outbound.push_world(S2C::ChunkData {
+            pos: types::ChunkPos::new(3, 4),
+            chunk: voxel::Chunk::air(),
+        });
+        {
+            let guard = outbound.queues.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(
+                guard.p1.len(),
+                3,
+                "BlockUpdates/ChunkUnload/EntityShapes 入 P1"
+            );
+            assert!(guard.p2.entity_states.is_some());
+            assert!(guard.p2.agent_states.is_some());
+            assert!(guard.p2.agent_states_l0.is_some());
+            assert!(guard.p2.debug_stats.is_some());
+            assert!(guard.p2.perf_stats.is_some());
+            assert_eq!(guard.p3.len(), 1, "ChunkData 入 P3");
+        }
+
+        // 2) P2 覆盖:连推 EntityStates{Tick(1)}, {Tick(2)} → 冲刷仅 1 帧 tick==2, p2_superseded()==1。
+        let mut p2_out = Outbound::new();
+        assert_eq!(
+            p2_out.push_world(S2C::EntityStates {
+                tick: types::Tick(1),
+                states: Vec::new(),
+                removed: Vec::new(),
+                full: false,
+            }),
+            EnqueueResult::Enqueued
+        );
+        assert_eq!(
+            p2_out.push_world(S2C::EntityStates {
+                tick: types::Tick(2),
+                states: Vec::new(),
+                removed: Vec::new(),
+                full: false,
+            }),
+            EnqueueResult::Superseded
+        );
+        assert_eq!(p2_out.p2_superseded(), 1);
+        let popped: Vec<S2C> = std::iter::from_fn(|| p2_out.try_pop()).collect();
+        assert_eq!(popped.len(), 1);
+        assert!(matches!(
+            popped[0],
+            S2C::EntityStates {
+                tick: types::Tick(2),
+                ..
+            }
+        ));
+
+        // 3) P1 不丢:连推 2000 条 BlockUpdates → 全在(2000), p1_backpressure()==976(2000-1024)。
+        let mut p1_out = Outbound::new();
+        for _ in 0..2000 {
+            assert_eq!(
+                p1_out.push_world(S2C::BlockUpdates {
+                    updates: Vec::new()
+                }),
+                EnqueueResult::Enqueued
+            );
+        }
+        assert_eq!(p1_out.p1_backpressure(), 976, "2000 - 1024 = 976");
+        let p1_count = std::iter::from_fn(|| p1_out.try_pop()).count();
+        assert_eq!(p1_count, 2000, "P1 永不丢");
+
+        // 4) P3 丢最旧:连推 513 条 ChunkData(pos 互异)→ DroppedOldest, world_dropped()==1, 队首 == 第 2 条。
+        let mut p3_out = Outbound::new();
+        for i in 0..512 {
+            assert_eq!(
+                p3_out.push_world(S2C::ChunkData {
+                    pos: types::ChunkPos::new(i, 0),
+                    chunk: voxel::Chunk::air(),
+                }),
+                EnqueueResult::Enqueued
+            );
+        }
+        assert_eq!(
+            p3_out.push_world(S2C::ChunkData {
+                pos: types::ChunkPos::new(512, 0),
+                chunk: voxel::Chunk::air(),
+            }),
+            EnqueueResult::DroppedOldest
+        );
+        assert_eq!(p3_out.world_dropped(), 1);
+        match p3_out.try_pop() {
+            Some(S2C::ChunkData { pos, .. }) => {
+                assert_eq!(pos, types::ChunkPos::new(1, 0), "队首 pos == 第 2 条");
+            }
+            other => panic!("队首应为第 2 条 ChunkData,实为 {other:?}"),
+        }
+    }
+
+    /// 辅助:非阻塞收集客户端 socket 当前已到齐的全部帧(不推进 tokio 虚拟时钟)。
+    async fn drain_client_frames_now(c: &mut MiniClient, expect_at_least: usize) -> Vec<S2C> {
+        let mut frames = Vec::new();
+        for _ in 0..80 {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                frames.push(msg);
+            }
+            if frames.len() >= expect_at_least {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 再扫一轮收尽尾字节。
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                frames.push(msg);
+            }
+        }
+        frames
+    }
+
+    /// M02a-1 T4:冲刷顺序 + P3 限速(真 serve + 暂停时钟 + socket 读帧):
+    /// `begin_tick()`(配额 8)后单连接 P0×1 + P1×2 + P2×3 + P3×10 → 一轮出网 14 帧(1+2+3+8),
+    /// 严格按 P0 → P1 → P2 → P3 序;同拍再冲 P3 出 0;再 `begin_tick()` → P3 出 2。
+    #[tokio::test(start_paused = true)]
+    async fn m02a1_t4_flush_order_and_p3_chunk_pace() {
+        let cfg = NetConfig {
+            pump: chunk_stream::PumpConfig {
+                interval_ms: 60_000,
+                max_catchup_rounds: 1,
+            },
+            ..NetConfig::default()
+        };
+        let (addr, mut up, shutdown, hub) = spawn_server_cfg(cfg).await;
+        let mut c = MiniClient::connect(addr).await.expect("连入");
+        let id = join(&mut c, 0).await;
+        assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id });
+
+        // 同步块内重置配额并倒序入队(P3 → P2 → P1 → P0),期间无 await 保证一轮同冲。
+        hub.begin_tick();
+        for i in 0..10 {
+            hub.push_world(
+                id,
+                S2C::ChunkData {
+                    pos: types::ChunkPos::new(i, 0),
+                    chunk: voxel::Chunk::air(),
+                },
+            );
+        }
+        hub.push_world(
+            id,
+            S2C::PerfStats {
+                tick: types::Tick(3),
+                sim_p95_ms: 0.0,
+                sim_samples: 0,
+                policy_infer_count: 0,
+                policy_total_us: 0,
+                policy_max_us: 0,
+            },
+        );
+        hub.push_world(
+            id,
+            S2C::AgentStates {
+                tick: types::Tick(2),
+                states: Vec::new(),
+                removed: Vec::new(),
+                full: false,
+            },
+        );
+        hub.push_world(
+            id,
+            S2C::EntityStates {
+                tick: types::Tick(1),
+                states: Vec::new(),
+                removed: Vec::new(),
+                full: false,
+            },
+        );
+        hub.push_world(
+            id,
+            S2C::BlockUpdates {
+                updates: Vec::new(),
+            },
+        );
+        hub.push_world(
+            id,
+            S2C::ChunkUnload {
+                pos: types::ChunkPos::new(99, 99),
+            },
+        );
+        hub.push_critical(id, S2C::Pong);
+
+        // 一轮冲刷出网恰 14 帧(1+2+3+8),帧序严格 P0 → P1 → P2(固定序) → P3。
+        let first_round = drain_client_frames_now(&mut c, 14).await;
+        assert_eq!(
+            first_round.len(),
+            14,
+            "首拍应出网 1+2+3+8 = 14 帧,实得 {}",
+            first_round.len()
+        );
+        assert!(matches!(first_round[0], S2C::Pong), "帧 0 必为 P0");
+        assert!(
+            matches!(first_round[1], S2C::BlockUpdates { .. }),
+            "帧 1 必为 P1 首条"
+        );
+        assert!(
+            matches!(first_round[2], S2C::ChunkUnload { .. }),
+            "帧 2 必为 P1 次条"
+        );
+        assert!(
+            matches!(first_round[3], S2C::EntityStates { .. }),
+            "帧 3 必为 P2 entity_states"
+        );
+        assert!(
+            matches!(first_round[4], S2C::AgentStates { .. }),
+            "帧 4 必为 P2 agent_states"
+        );
+        assert!(
+            matches!(first_round[5], S2C::PerfStats { .. }),
+            "帧 5 必为 P2 perf_stats"
+        );
+        for (idx, msg) in first_round[6..14].iter().enumerate() {
+            match msg {
+                S2C::ChunkData { pos, .. } => {
+                    assert_eq!(*pos, types::ChunkPos::new(idx as i32, 0));
+                }
+                other => panic!("帧 {} 应为 P3 ChunkData,实为 {other:?}", idx + 6),
+            }
+        }
+
+        // 同拍再冲(推 P0 主动触发一次冲刷):P0 照出,P3 出 0 帧。
+        hub.push_critical(id, S2C::Pong);
+        let same_tick = drain_client_frames_now(&mut c, 1).await;
+        assert_eq!(same_tick, vec![S2C::Pong], "同拍再冲 P3 必须出 0 帧");
+
+        // 再 begin_tick():剩余 2 帧 P3 自动被唤醒并冲出。
+        hub.begin_tick();
+        let next_tick = drain_client_frames_now(&mut c, 2).await;
+        assert_eq!(next_tick.len(), 2, "再 begin_tick() 应出剩余 2 帧 P3");
+        for (idx, msg) in next_tick.iter().enumerate() {
+            match msg {
+                S2C::ChunkData { pos, .. } => {
+                    assert_eq!(*pos, types::ChunkPos::new((idx + 8) as i32, 0));
+                }
+                other => panic!("剩余帧应为 ChunkData,实为 {other:?}"),
+            }
+        }
+        bcast_shutdown(&shutdown).await;
+    }
+
+    /// M02a-1 T5:多连接 P3 配额先到先得 + 专流(P0/P2)不受配额影响不饿死(ACM10 结构)。
+    #[tokio::test(start_paused = true)]
+    async fn m02a1_t5_multi_conn_p3_fcfs_and_p0_p2_unstarved() {
+        let cfg = NetConfig {
+            pump: chunk_stream::PumpConfig {
+                interval_ms: 60_000,
+                max_catchup_rounds: 1,
+            },
+            ..NetConfig::default()
+        };
+        let (addr, mut up, shutdown, hub) = spawn_server_cfg(cfg).await;
+        let mut c1 = MiniClient::connect(addr).await.expect("c1 连入");
+        let id1 = join(&mut c1, 0).await;
+        assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id1 });
+
+        let mut c2 = MiniClient::connect(addr).await.expect("c2 连入");
+        let id2 = join(&mut c2, 0).await;
+        assert_eq!(next_up(&mut up).await, NetUp::Joined { player: id2 });
+
+        // 同步块:重置配额为 8,两连接各入队 P3×10 + P0×1 + P2(L0)×1。
+        hub.begin_tick();
+        for id in [id1, id2] {
+            for i in 0..10 {
+                hub.push_world(
+                    id,
+                    S2C::ChunkData {
+                        pos: types::ChunkPos::new(i, 0),
+                        chunk: voxel::Chunk::air(),
+                    },
+                );
+            }
+            hub.push_critical(id, S2C::Pong);
+            hub.push_l0(
+                id,
+                S2C::AgentStates {
+                    tick: types::Tick(7),
+                    states: Vec::new(),
+                    removed: Vec::new(),
+                    full: false,
+                },
+            );
+        }
+
+        // 收集两连接本拍全部出网帧(总帧数应为 2×(P0+P2) + 8×P3 = 12)。
+        let mut f1 = Vec::new();
+        let mut f2 = Vec::new();
+        for _ in 0..100 {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            while let Some(m) = c1.try_recv_now().expect("c1 读帧") {
+                f1.push(m);
+            }
+            while let Some(m) = c2.try_recv_now().expect("c2 读帧") {
+                f2.push(m);
+            }
+            if f1.len() + f2.len() >= 12 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // 再静待 1 轮确认不会多发。
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            while let Some(m) = c1.try_recv_now().expect("c1 读帧") {
+                f1.push(m);
+            }
+            while let Some(m) = c2.try_recv_now().expect("c2 读帧") {
+                f2.push(m);
+            }
+        }
+
+        for (label, frames) in [("c1", &f1), ("c2", &f2)] {
+            assert!(
+                frames.iter().any(|m| matches!(m, S2C::Pong)),
+                "{label}: P0 帧不受 P3 配额影响必须出网"
+            );
+            assert!(
+                frames.iter().any(|m| matches!(
+                    m,
+                    S2C::AgentStates {
+                        tick: types::Tick(7),
+                        ..
+                    }
+                )),
+                "{label}: P2(L0) 帧不受 P3 配额影响必须出网"
+            );
+        }
+        let chunks_1 = f1
+            .iter()
+            .filter(|m| matches!(m, S2C::ChunkData { .. }))
+            .count();
+        let chunks_2 = f2
+            .iter()
+            .filter(|m| matches!(m, S2C::ChunkData { .. }))
+            .count();
+        assert_eq!(chunks_1 + chunks_2, 8, "两连接本拍 P3 出网总量必须恰 8");
+        let mut dist = [chunks_1, chunks_2];
+        dist.sort();
+        assert_eq!(dist, [0, 8], "多连接 P3 先到先得分布必为 {{0, 8}}");
+        bcast_shutdown(&shutdown).await;
+    }
+
+    /// M02a-1 T6:F8 上行 merger 圆转公平:
+    /// A 灌 100 条、B 灌 1 条;驱动不排空共享通道(cap=2)时,轮 1 取 A1、B1 → B 在位置 ≤ 2。
+    #[tokio::test(start_paused = true)]
+    async fn m02a1_t6_uplink_merger_round_robin_fairness() {
+        let hub = std::sync::Arc::new(OutboundHub::new());
+        let (tx_a, rx_a) = mpsc::channel(128);
+        let (tx_b, rx_b) = mpsc::channel(64);
+        for seq in 1..=100u64 {
+            tx_a.try_send(NetUp::Ack {
+                player: InputSource(1),
+                seq,
+            })
+            .expect("A 灌 100 条");
+        }
+        tx_b.try_send(NetUp::Ack {
+            player: InputSource(2),
+            seq: 999,
+        })
+        .expect("B 灌 1 条");
+        hub.register_uplink(InputSource(1), rx_a);
+        hub.register_uplink(InputSource(2), rx_b);
+
+        // 共享通道 cap=2:驱动不排空时,第 1 轮取 A1、B1 填满共享通道,第 2 轮起 send 阻塞。
+        let (up_tx, mut up_rx) = mpsc::channel(2);
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<()>(1);
+        let merger = tokio::spawn(run_uplink_merger(hub.clone(), up_tx, shutdown_rx));
+
+        let mut received = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(net_timeout(), up_rx.recv())
+                .await
+                .expect("merger 必须及时投递")
+                .expect("共享通道存活");
+            received.push(ev);
+        }
+        let b_pos = received
+            .iter()
+            .position(|ev| {
+                *ev == NetUp::Ack {
+                    player: InputSource(2),
+                    seq: 999,
+                }
+            })
+            .map(|idx| idx + 1)
+            .expect("B 事件必在首轮到达共享通道");
+        assert!(
+            b_pos <= 2,
+            "圆转公平:B 事件在共享通道位置必须 <= 2(实为 {b_pos}, 收到 {received:?})"
+        );
+        assert_eq!(
+            received[0],
+            NetUp::Ack {
+                player: InputSource(1),
+                seq: 1,
+            },
+            "第 1 条为 A1"
+        );
+        assert_eq!(
+            received[1],
+            NetUp::Ack {
+                player: InputSource(2),
+                seq: 999,
+            },
+            "第 2 条为 B1"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = tokio::time::timeout(net_timeout(), merger)
+            .await
+            .expect("shutdown 后 merger 退出");
     }
 }

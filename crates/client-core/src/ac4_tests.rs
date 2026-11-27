@@ -47,6 +47,8 @@ struct DualRunResult {
     spawned_count: usize,
     saw_stone_update: bool,
     falling_y: f32,
+    entity_states_count: usize,
+    last_entity_states_bytes: Option<Vec<u8>>,
 }
 
 fn repo_bodies_dir() -> PathBuf {
@@ -93,17 +95,24 @@ async fn run_ta_stack(stall_window: Option<(usize, usize)>) -> DualRunResult {
     let mut chunk_data_count = 0usize;
     let mut spawned_count = 0usize;
     let mut saw_stone_update = false;
+    let mut entity_states_count = 0usize;
+    let mut last_entity_states_bytes: Option<Vec<u8>> = None;
     let target_cell = (BlockPos::new(0, -60, 0), voxel::builtin::STONE);
 
     let mut drain_and_apply = |transport: &mut SequencedTransport<LocalTransport>,
                                world: &mut WorldState| {
         for msg in transport.drain() {
-            wire_bytes.extend_from_slice(&encode_frame(&msg));
+            let frame_bytes = encode_frame(&msg);
+            wire_bytes.extend_from_slice(&frame_bytes);
             match &msg {
                 S2C::ChunkData { .. } => chunk_data_count += 1,
                 S2C::Spawned { .. } => spawned_count += 1,
                 S2C::BlockUpdates { updates } if updates.contains(&target_cell) => {
                     saw_stone_update = true;
+                }
+                S2C::EntityStates { .. } => {
+                    entity_states_count += 1;
+                    last_entity_states_bytes = Some(frame_bytes);
                 }
                 _ => {}
             }
@@ -173,11 +182,13 @@ async fn run_ta_stack(stall_window: Option<(usize, usize)>) -> DualRunResult {
         spawned_count,
         saw_stone_update,
         falling_y,
+        entity_states_count,
+        last_entity_states_bytes,
     }
 }
 
 /// C05 T-A:headless 双跑对账 — 栈 A 每拍 drain,栈 B 第 10..=19 拍跳过 drain(模拟渲染阻塞)。
-/// 两栈终态拍号、flattened S2C 字节流、关键事件计数与落体根位置 y 必须逐位相等。
+/// REQ-014 M02a-1 起 P2 最新覆盖,线字节逐位锚改为末帧等价+字节数单调,见 REQ-014 §3。
 #[tokio::test(start_paused = true)]
 async fn c05_ta_render_stall_dual_run_reconcile() {
     let run_a = run_ta_stack(None).await;
@@ -187,14 +198,27 @@ async fn c05_ta_render_stall_dual_run_reconcile() {
     assert_eq!(run_a.world_tick, 51, "栈 A 终态拍号必须为 51");
     assert_eq!(run_b.world_tick, 51, "栈 B 终态拍号必须为 51");
 
-    // 锚点 2:两栈 flattened 字节向量逐位相等且非空。
+    // 锚点 2:REQ-014 M02a-1 起 P2 最新覆盖,线字节逐位锚改为末帧等价+字节数单调,见 REQ-014 §3。
     assert!(!run_a.wire_bytes.is_empty(), "栈 A 字节流非空");
+    assert!(
+        run_b.wire_bytes.len() <= run_a.wire_bytes.len(),
+        "P2 最新覆盖只会少发不会多发(B len={} > A len={})",
+        run_b.wire_bytes.len(),
+        run_a.wire_bytes.len()
+    );
+    assert!(
+        run_a.last_entity_states_bytes.is_some(),
+        "栈 A 必须至少收到 1 帧 EntityStates"
+    );
     assert_eq!(
-        run_a.wire_bytes,
-        run_b.wire_bytes,
-        "双跑 S2C 编码字节流必须逐位相等(A len={}, B len={})",
-        run_a.wire_bytes.len(),
-        run_b.wire_bytes.len()
+        run_a.last_entity_states_bytes, run_b.last_entity_states_bytes,
+        "两栈最后一帧 EntityStates 的原始线字节必须逐位相等(最新帧存活到终点)"
+    );
+    assert!(
+        run_b.entity_states_count <= run_a.entity_states_count,
+        "run_b EntityStates 帧数({})必须 <= run_a({})",
+        run_b.entity_states_count,
+        run_a.entity_states_count
     );
 
     // 锚点 3:ChunkData == 25、Spawned == 1、含 (0,-60,0)->STONE 的 BlockUpdates。
