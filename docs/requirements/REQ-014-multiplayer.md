@@ -3,7 +3,7 @@
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
   架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
   M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`;M03 已验收 `f117835`;
-  M04a 已验收 `8b5c112`;M04b-1 已验收 `6db0333`)
+  M04a 已验收 `8b5c112`;M04b-1 已验收 `6db0333`;M04b-2 已验收 `d28654e`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -202,6 +202,26 @@ entity_states_incremental_then_full 全量帧收到空表),单跑/全套/复跑�
   脚本 WorldState 仍按服务器最新态,仅渲染 Transform 换源。
   ACM7「无 6/10Hz 抽搐」:M03 已钉双客户端语义 e2e(T1/T3);目视/实测留 M05。
 - 换档混合 ≤150ms(§4);L2 静姿+程序化摆腿(§4);附身青绿高亮现网保留。
+  **已落地**(M04b-2 `d28654e`):
+  - `EntityMirror`(client-core/entities.rs)增 meta/agent_tiers/agent_speed
+    与 defs/statics 缓存;Compact/Lite 解码→AgentView(子连杆世界系展开,
+    速度零);Lite 按 statics 静姿展开 N 连杆,未知哈希仅根;分档 full 只清
+    本档(跨档保留),removed 清四表;legacy full 亦清辅助表。缺 meta 跳过。
+  - `present.rs`(纯逻辑零墙钟):tier2+已知 def 按 speed 积分摆腿相位
+    (SWING_AMPLITUDE=0.35rad、STRIDE_LENGTH=0.8m,M05 目视校准),
+    奇偶连杆反相;换档 150ms lerp/slerp 混合,完成逐位直写 target;
+    相位跨档保留;首帧无混合;tier0/1 旁路逐位等价(单机/附身不变)。
+  - `sync_agent_interp`(interp.rs):full 按 mirror 键集 retain,跨档轨道保留;
+    `sync_camera_roots`:相机根表同语义对账。render 侧 tier2 额外延迟
+    L2_EXTRA_DELAY_TICKS=24(总缓冲 36 拍=600ms,L1 12 拍=200ms)。
+  - 能力门控:交互 `--connect` 且非脚本才发 SetAgentStream{lod:true};
+    脚本/本地/ViewerClient::spawn 全走 legacy(ACM8 逐位不变,e2e T19 对照)。
+  - R1-C 跨单元修复:M04b-1 pack_lite yaw 公式 `atan2(z,x)` 符号反
+    (镜像朝向),改 `(-z).atan2(x)`,T6 golden [00,C0]→[00,40]。
+  - 验收:23/26 变异击杀;D16/D22/D26 存活 = main.rs 交互接线(门控发送/
+    插值喂入/相机+附身喂入)无无头锚,e2e 用 TestClient 不经二进制 drain,
+    M05 脚本冒烟+目视兜底。R1/R2 共 7 处裁决均为任务书锚错误(eps/时钟推进/
+    yaw 符号/相机接线/T22 预置/T23 混合感知/完成直写),生产语义经查证正确。
 - 断连 HUD + 重连入口(M01);重连 = 新连接新身体,全量自愈(ACM3)。
 
 ## 7 10+ 扩展隔离与现网缺陷清单(核实证据见 §12)
@@ -324,10 +344,13 @@ entity_states_incremental_then_full 全量帧收到空表),单跑/全套/复跑�
     分档自愈/换档补闪;L0/L1 迁 Compact;net 七槽;ACM8 非 lod 连接逐位不变。
     验收:15/15 变异击杀(C14 经 T8/T11)+ S1 杀 + S2 预期存活;
     全量门禁 1901/0/117;R1 裁决 T2 距离与 force_send 0→1 两处任务书错误。
-  - **M04b-2 客户端表现(待放行)**:mirror 分档标签/分档 full 清表、
-    Compact/Lite 解码→AgentView、150ms 换档混合、L2 静姿 FK+程序化摆腿
-    (phase 自 motion_flags)、InterpRes 接线;能力门控。
-    验收:ACM3 客户端侧/ACM7 + M03 回归。
+  - **M04b-2 客户端表现(已验收 `d28654e`)**:mirror 分档标签/分档 full 清表、
+    Compact/Lite 解码→AgentView、150ms 换档混合(完成逐位直写)、L2 静姿 FK+
+    程序化摆腿(phase 自 motion_flags 速率积分,跨档保留)、InterpRes/相机/
+    附身接线;能力门控(脚本/本地/ViewerClient 走 legacy,ACM8)。
+    验收:23/26 变异击杀,D16/D22/D26 存活(main.rs 交互接线无无头锚,
+    M05 冒烟+目视兜底);R1/R2 共 7 处任务书锚错误裁决(含 R1-C 修 M04b-1
+    yaw 符号);落地注记见 §6。ACM7 目视/ACM3 跨档幽灵留 M05。
 - **M05 隔离与实测校准**:F11 拆线程 + F10 chunk 配额;分散 10/16 与聚堆
   10/16+32 狗两套压测;§10 矩阵;修订 §5/§8 标 ★ 判据;决定 M05b。
 - **M05b(条件)**:ChunkDataCompressed(S2C=18,lz4 已在 lock)+ PolicyWorker
