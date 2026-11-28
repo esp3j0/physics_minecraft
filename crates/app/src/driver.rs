@@ -558,6 +558,10 @@ struct PlayerStream {
         BTreeMap<types::EntityId, (types::BodyHash, std::sync::Arc<Vec<types::EntityState>>)>,
     /// 是否经 `C2S::SetAgentStream { lod: true }` 启用 LOD/L0 专流(REQ-014 §3)。
     lod_enabled: bool,
+    /// 每连接 LOD 状态机表(REQ-014 M04b-1 §3.1;仅 `lod_enabled` 连接驱动)。
+    lod: crate::lod::LodTable,
+    /// L1 紧凑姿态流差分基准(REQ-014 M04b-1 §3.2e;上次发射时的 L1 全表)。
+    last_compact: BTreeMap<types::EntityId, sim_api::proto::CompactAgentPose>,
 }
 /// 驱动结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1401,8 +1405,8 @@ impl ObserveOrchestrator {
         self.emit_l0_removed_if_lod(player, entity, session.tick_now(), hub);
     }
 
-    /// LOD 玩家解除附身时补发一次性 P1 `removed` 帧(REQ-014 M02a-1 §5):
-    /// 清客户端 L0 残留;若实体仍在视距内,常规流下一输出拍将作为新实体重发。
+    /// LOD 玩家解除附身时补发一次性 P1 `removed` 帧(REQ-014 M04b-1 §3.5):
+    /// 清客户端 L0 残留;解除后该实体按 `lod.step` 自然落入 L1/L2。
     fn emit_l0_removed_if_lod(
         &self,
         player: messaging::InputSource,
@@ -1417,8 +1421,9 @@ impl ObserveOrchestrator {
         {
             hub.push_p1(
                 player,
-                S2C::AgentStates {
+                S2C::AgentStatesCompact {
                     tick,
+                    tier: 0,
                     states: Vec::new(),
                     removed: vec![entity],
                     full: false,
@@ -2005,12 +2010,56 @@ impl ObserveOrchestrator {
                     last_sent: BTreeMap::new(),
                     last_agents: BTreeMap::new(),
                     lod_enabled: false,
+                    lod: crate::lod::LodTable::new(crate::lod::K_L1),
+                    last_compact: BTreeMap::new(),
                 });
                 stream.view_distance_m = f32::from(view_distance) * 16.0;
             }
             NetUp::AgentStream { player, lod } => {
                 if let Some(stream) = self.players.get_mut(&player) {
-                    stream.lod_enabled = lod;
+                    if stream.lod_enabled == lod {
+                        // true->true / false->false 幂等无帧。
+                    } else if lod {
+                        stream.lod_enabled = true;
+                        stream.last_agents.clear();
+                        stream.lod = crate::lod::LodTable::new(crate::lod::K_L1);
+                        stream.last_compact.clear();
+                    } else {
+                        stream.lod_enabled = false;
+                        let tick = session.tick_now();
+                        hub.push_world(
+                            player,
+                            S2C::AgentStatesCompact {
+                                tick,
+                                tier: 0,
+                                states: Vec::new(),
+                                removed: Vec::new(),
+                                full: true,
+                            },
+                        );
+                        hub.push_world(
+                            player,
+                            S2C::AgentStatesCompact {
+                                tick,
+                                tier: 1,
+                                states: Vec::new(),
+                                removed: Vec::new(),
+                                full: true,
+                            },
+                        );
+                        hub.push_world(
+                            player,
+                            S2C::AgentStatesLite {
+                                tick,
+                                origin_chunk: [0; 8],
+                                states: Vec::new(),
+                                removed: Vec::new(),
+                                full: true,
+                            },
+                        );
+                        stream.lod = crate::lod::LodTable::new(crate::lod::K_L1);
+                        stream.last_compact.clear();
+                    }
                 }
             }
             NetUp::Left { player, .. } => {
@@ -2159,27 +2208,23 @@ impl ObserveOrchestrator {
         }
     }
 
-    /// L0 附身 60Hz 专流(REQ-014 M02a-1 §5;每拍先于 cadence 门调用):
-    /// 仅服务 `lod_enabled && possessed_by` 命中玩家,空集直接返回(不调 `session.agent_states()`);
-    /// 附身即专流(距离旁路),经 `hub.push_l0` 直投 P2 `agent_states_l0` 最新覆盖槽。
-    fn emit_l0_streams(
+    /// LOD 分级主体流(REQ-014 M04b-1 §3.2;每拍先于 `emit_outputs` 调用):
+    /// 仅服务 `lod_enabled` 玩家,空集直接返回(不调 `session.agent_states()`)。
+    /// 按每连接 `LodTable` 分档下发 Meta(P1 先行)/L0(60Hz Compact tier=0)/
+    /// L1(10Hz+force_send Compact tier=1)/L2(2Hz Lite full=true)。
+    fn emit_lod_streams(
         &mut self,
         session: &sim_api::session::Session,
         hub: &OutboundHub,
         tick: types::Tick,
     ) {
-        let targets: Vec<(messaging::InputSource, types::EntityId)> = self
+        let lod_players: Vec<messaging::InputSource> = self
             .players
             .iter()
             .filter(|(_, stream)| stream.lod_enabled)
-            .filter_map(|(&player, _)| {
-                self.possessed_by
-                    .get(&player)
-                    .copied()
-                    .map(|entity| (player, entity))
-            })
+            .map(|(&player, _)| player)
             .collect();
-        if targets.is_empty() {
+        if lod_players.is_empty() {
             return;
         }
         let by_id: BTreeMap<types::EntityId, (types::BodyHash, Vec<types::EntityState>)> = session
@@ -2187,19 +2232,165 @@ impl ObserveOrchestrator {
             .into_iter()
             .map(|(id, hash, poses)| (id, (hash, poses)))
             .collect();
-        for (player, entity) in targets {
-            let Some((hash, poses)) = by_id.get(&entity) else {
+        let observers: BTreeMap<messaging::InputSource, Vec3> =
+            session.observers().into_iter().collect();
+        let frozen = session.frozen_agents();
+
+        for player in lod_players {
+            let Some(&observer_pos) = observers.get(&player) else {
                 continue;
             };
-            hub.push_l0(
-                player,
-                S2C::AgentStates {
-                    tick,
-                    states: vec![(entity, *hash, poses.clone())],
-                    removed: Vec::new(),
-                    full: false,
-                },
-            );
+            let Some(stream) = self.players.get_mut(&player) else {
+                continue;
+            };
+            let view_m = stream.view_distance_m;
+            let phase = u64::from(player.0);
+            let possessed = self.possessed_by.get(&player).copied();
+
+            // a. candidates: 全部主体 (id, distance),按 id 升序。
+            let candidates: Vec<(types::EntityId, f32)> = by_id
+                .iter()
+                .filter_map(|(&id, (_, poses))| {
+                    let root = poses.first()?;
+                    Some((id, observer_pos.distance(root.translation)))
+                })
+                .collect();
+
+            // b. 推进一步 LOD 状态机。
+            let events = stream.lod.step(tick.0, &candidates, possessed, view_m);
+
+            // c. Meta 先行(P1 先于 P2 出网):need_meta 非空先推;meta_due 且 L0+L1+L2 非空推全表自愈。
+            if crate::lod::meta_due(tick.0, phase) && !stream.lod.tier_of.is_empty() {
+                let entries: Vec<(types::EntityId, types::BodyHash)> = stream
+                    .lod
+                    .tier_of
+                    .keys()
+                    .filter_map(|id| by_id.get(id).map(|(hash, _)| (*id, *hash)))
+                    .collect();
+                if !entries.is_empty() {
+                    hub.push_p1(player, S2C::AgentMeta { entries });
+                }
+            } else if !events.need_meta.is_empty() {
+                let entries: Vec<(types::EntityId, types::BodyHash)> = events
+                    .need_meta
+                    .iter()
+                    .filter_map(|id| by_id.get(id).map(|(hash, _)| (*id, *hash)))
+                    .collect();
+                if !entries.is_empty() {
+                    hub.push_p1(player, S2C::AgentMeta { entries });
+                }
+            }
+
+            // d. L0: possessed 命中且 by_id 有 -> 每拍 Compact tier=0 经 push_l0。
+            if let Some(entity) = possessed
+                && let Some((_, poses)) = by_id.get(&entity)
+                && !poses.is_empty()
+            {
+                hub.push_l0(
+                    player,
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 0,
+                        states: vec![crate::lod::pack_compact(entity, poses)],
+                        removed: Vec::new(),
+                        full: false,
+                    },
+                );
+            }
+
+            // e. L1: l1_due 或 force_send 非空 -> 组装 Compact tier=1。
+            let l1_due = crate::lod::l1_due(tick.0, phase);
+            if l1_due || !stream.lod.force_send.is_empty() {
+                let full = crate::lod::l1_full(tick.0, phase);
+                let mut current_l1: BTreeMap<types::EntityId, sim_api::proto::CompactAgentPose> =
+                    BTreeMap::new();
+                for (&id, &tier) in &stream.lod.tier_of {
+                    if tier == 1
+                        && let Some((_, poses)) = by_id.get(&id)
+                        && !poses.is_empty()
+                    {
+                        current_l1.insert(id, crate::lod::pack_compact(id, poses));
+                    }
+                }
+                let states: Vec<sim_api::proto::CompactAgentPose> = if full {
+                    current_l1.values().cloned().collect()
+                } else {
+                    current_l1
+                        .iter()
+                        .filter(|&(id, pose)| {
+                            stream.lod.force_send.contains(id)
+                                || match stream.last_compact.get(id) {
+                                    Some(prev) => prev != pose,
+                                    None => true,
+                                }
+                        })
+                        .map(|(_, pose)| pose.clone())
+                        .collect()
+                };
+                let removed = stream.lod.pending_removed.remove(&1).unwrap_or_default();
+                let should_send = if full {
+                    !current_l1.is_empty() || !removed.is_empty()
+                } else {
+                    !states.is_empty() || !removed.is_empty()
+                };
+                if should_send {
+                    for pose in &states {
+                        stream.lod.force_send.remove(&pose.entity);
+                    }
+                    stream.last_compact = current_l1;
+                    hub.push_world(
+                        player,
+                        S2C::AgentStatesCompact {
+                            tick,
+                            tier: 1,
+                            states,
+                            removed,
+                            full,
+                        },
+                    );
+                } else {
+                    stream.last_compact = current_l1;
+                }
+                stream
+                    .lod
+                    .force_send
+                    .retain(|id| stream.lod.tier_of.get(id) == Some(&1));
+            }
+
+            // f. L2: l2_due -> 全部 L2 打包 Lite(full 恒 true)+ pending_removed[2]。
+            if crate::lod::l2_due(tick.0, phase) {
+                let (cx, cz) = crate::lod::observer_origin_chunk(observer_pos);
+                let states: Vec<sim_api::proto::LiteAgentPose> = stream
+                    .lod
+                    .tier_of
+                    .iter()
+                    .filter(|&(_, &tier)| tier == 2)
+                    .filter_map(|(&id, _)| {
+                        let (_, poses) = by_id.get(&id)?;
+                        let root = poses.first()?;
+                        Some(crate::lod::pack_lite(
+                            id,
+                            root,
+                            cx,
+                            cz,
+                            frozen.contains(&id),
+                        ))
+                    })
+                    .collect();
+                let removed = stream.lod.pending_removed.remove(&2).unwrap_or_default();
+                if !states.is_empty() || !removed.is_empty() {
+                    hub.push_world(
+                        player,
+                        S2C::AgentStatesLite {
+                            tick,
+                            origin_chunk: sim_api::quant::pack_origin_chunk(cx, cz),
+                            states,
+                            removed,
+                            full: true,
+                        },
+                    );
+                }
+            }
         }
     }
 
@@ -2360,19 +2551,12 @@ impl ObserveOrchestrator {
             let Some(stream) = self.players.get_mut(&player) else {
                 continue;
             };
+            if stream.lod_enabled {
+                continue;
+            }
             let Some(&position) = observers.get(&player) else {
                 continue; // 未 MoveObserver:无过滤中心,静默等待(0 视距语义)
             };
-            // REQ-014 M02a-1 §5 分档互斥:lod_enabled 玩家的附身实体只走 L0 专流,
-            // 从常规主体流的 visible 与 last_agents 基准中排除;未启用者维持现网语义。
-            let l0_entity = if stream.lod_enabled {
-                self.possessed_by.get(&player).copied()
-            } else {
-                None
-            };
-            if let Some(excluded) = l0_entity {
-                stream.last_agents.remove(&excluded);
-            }
             let full = full_due || stream.last_agents.is_empty();
             let radius = stream.view_distance_m;
             // 视距内主体(3D 距离,与 EntityStates 同式;中心 = 观察者位置)。
@@ -2381,9 +2565,6 @@ impl ObserveOrchestrator {
                 (types::BodyHash, std::sync::Arc<Vec<types::EntityState>>),
             > = BTreeMap::new();
             for (id, hash, poses) in &snapshot.agents {
-                if Some(*id) == l0_entity {
-                    continue;
-                }
                 if let Some(root) = poses.first()
                     && position.distance(root.translation) <= radius
                 {
@@ -3125,7 +3306,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                     orchestrator.flush_pending_intents(&mut session, &mut log);
                     orchestrator.follow_observers(&mut session, &mut log, hub);
                     hub.begin_tick();
-                    orchestrator.emit_l0_streams(&session, hub, session.tick_now());
+                    orchestrator.emit_lod_streams(&session, hub, session.tick_now());
                     orchestrator.emit_outputs(&session, hub, session.tick_now(), *cadence);
                     // 调试遥测(REQ-011 §3.5.2;W03):先累计(读本拍 TickSummary),
                     // 再按 10 拍节奏对订阅者下发。订阅集合空 = 不组装任何帧。
@@ -9188,32 +9369,59 @@ mod tests {
         }
         assert!(possessed_ok, "A 必须成功附身 e_a");
 
-        // 额外清一拍,确保 SetAgentStream{lod:true} 已生效且所有历史在途帧排干。
+        // 额外清一拍,确保 SetAgentStream{lod:true} 已生效且所有历史在途帧排干;
+        // 同时记录本拍可能首次随 force_send 到达的 tier=1 e_b 帧。
         step_one_tick().await;
-        let _ = drain_ready(&mut a).await;
+        let mut a_tier1_saw_eb = false;
+        for msg in drain_ready(&mut a).await {
+            if let S2C::AgentStatesCompact {
+                tier: 1, states, ..
+            } = msg
+                && states.iter().any(|p| p.entity == e_b)
+            {
+                a_tier1_saw_eb = true;
+            }
+        }
         let _ = drain_ready(&mut b).await;
 
-        // 干净的 12 拍窗口:逐拍推进并收集 A 与 B 的 AgentStates。
+        // 干净的 12 拍窗口:逐拍推进并收集 A 与 B 的主体帧(REQ-014 M04b-1 T8)。
         let mut a_l0_ticks = Vec::new();
-        let mut a_regular_frames = Vec::new();
+        let mut a_legacy_agent_frames = 0usize;
+        let mut a_tier1_frames = Vec::new();
         let mut b_regular_saw_ea = false;
         for _ in 0..12 {
             step_one_tick().await;
             for msg in drain_ready(&mut a).await {
-                if let S2C::AgentStates {
-                    tick,
-                    states,
-                    removed,
-                    full,
-                } = msg
-                {
-                    let is_l0 =
-                        !full && removed.is_empty() && states.len() == 1 && states[0].0 == e_a;
-                    if is_l0 {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 0,
+                        states,
+                        removed,
+                        full,
+                    } => {
+                        assert!(
+                            !full
+                                && removed.is_empty()
+                                && states.len() == 1
+                                && states[0].entity == e_a,
+                            "A 的 Compact tier=0 必为单实体 e_a 且 full=false / removed 空"
+                        );
                         a_l0_ticks.push(tick);
-                    } else {
-                        a_regular_frames.push((tick, states, removed, full));
                     }
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 1,
+                        states,
+                        full,
+                        ..
+                    } => {
+                        a_tier1_frames.push((tick, states, full));
+                    }
+                    S2C::AgentStates { .. } => {
+                        a_legacy_agent_frames += 1;
+                    }
+                    _ => {}
                 }
             }
             for msg in drain_ready(&mut b).await {
@@ -9228,52 +9436,65 @@ mod tests {
         assert_eq!(
             a_l0_ticks.len(),
             12,
-            "12 拍窗口内 A 必须收到恰 12 帧 L0 单实体 AgentStates(full=false),实得 {a_l0_ticks:?}"
+            "12 拍窗口内 A 必须收到恰 12 帧 L0 Compact tier=0(full=false),实得 {a_l0_ticks:?}"
         );
         for w in a_l0_ticks.windows(2) {
             assert_eq!(w[1].0, w[0].0 + 1, "L0 专流必须每拍连续 1 帧");
         }
-        let mut a_regular_saw_eb = false;
-        for (tick, states, _, full) in &a_regular_frames {
+        assert_eq!(
+            a_legacy_agent_frames, 0,
+            "lod_enabled 连接 A 不得再收到任何旧 AgentStates(实收 {a_legacy_agent_frames} 帧)"
+        );
+        for (tick, states, full) in &a_tier1_frames {
             assert!(
-                !states.iter().any(|(id, _, _)| *id == e_a),
-                "A 的常规 AgentStates(tick={tick:?}, full={full})不得包含附身实体 e_a"
+                !states.iter().any(|p| p.entity == e_a),
+                "A 的 Compact tier=1(tick={tick:?}, full={full})不得包含附身实体 e_a"
             );
-            if states.iter().any(|(id, _, _)| *id == e_b) {
-                a_regular_saw_eb = true;
+            if states.iter().any(|p| p.entity == e_b) {
+                a_tier1_saw_eb = true;
             }
         }
-        assert!(
-            a_regular_saw_eb,
-            "A 的常规 AgentStates(10Hz 输出拍)必须仍包含未附身实体 e_b"
-        );
+        assert!(a_tier1_saw_eb, "A 的 Compact tier=1 必须包含未附身实体 e_b");
         assert!(
             b_regular_saw_ea,
             "对照连接 B(未发 SetAgentStream)常规流必须包含 e_a(现网语义)"
         );
 
-        // Unpossess → 收 removed==[e_a] 一次性帧(P1),其后 L0 停发。
+        // Unpossess → 收 P1 Compact tier=0 removed==[e_a] 一次性帧,其后 L0 停发。
         a.send(&C2S::Unpossess).await.expect("A Unpossess");
         let mut saw_possessed_none = false;
         let mut saw_removed_ea = false;
+        let mut saw_tier1_reappear = false;
         for _ in 0..6 {
             step_one_tick().await;
             for msg in drain_ready(&mut a).await {
                 if msg == (S2C::Possessed { entity: None }) {
                     saw_possessed_none = true;
                 }
-                if let S2C::AgentStates {
+                if let S2C::AgentStatesCompact {
+                    tier: 0,
                     states,
                     removed,
                     full,
                     ..
-                } = msg
+                } = &msg
                     && !full
                     && states.is_empty()
-                    && removed == vec![e_a]
+                    && *removed == vec![e_a]
                 {
                     saw_removed_ea = true;
                 }
+                if let S2C::AgentStatesCompact {
+                    tier: 1, states, ..
+                } = &msg
+                    && states.iter().any(|p| p.entity == e_a)
+                {
+                    saw_tier1_reappear = true;
+                }
+                assert!(
+                    !matches!(msg, S2C::AgentStates { .. }),
+                    "Unpossess 期间 lod 连接 A 不得收到旧 AgentStates"
+                );
             }
             if saw_possessed_none && saw_removed_ea {
                 break;
@@ -9282,36 +9503,41 @@ mod tests {
         assert!(saw_possessed_none, "Unpossess 必须收到 Possessed(None)");
         assert!(
             saw_removed_ea,
-            "LOD 玩家 Unpossess 必须收到 removed==[e_a] 一次性 P1 帧"
+            "LOD 玩家 Unpossess 必须收到 P1 Compact tier=0 removed==[e_a]"
         );
 
-        // 等待下一个常规输出拍确认 e_a 重新回到常规流(随后紧邻的 5 个非输出拍内绝不得收到任何 L0 帧)。
-        let mut saw_regular_reappear = false;
-        for _ in 0..10 {
-            step_one_tick().await;
-            for msg in drain_ready(&mut a).await {
-                if let S2C::AgentStates { states, .. } = msg
-                    && states.iter().any(|(id, _, _)| *id == e_a)
-                {
-                    saw_regular_reappear = true;
+        // 确认 e_a 经 Compact tier=1 回到 L1 流。
+        if !saw_tier1_reappear {
+            for _ in 0..10 {
+                step_one_tick().await;
+                for msg in drain_ready(&mut a).await {
+                    if let S2C::AgentStatesCompact {
+                        tier: 1, states, ..
+                    } = msg
+                        && states.iter().any(|p| p.entity == e_a)
+                    {
+                        saw_tier1_reappear = true;
+                    }
                 }
-            }
-            if saw_regular_reappear {
-                break;
+                if saw_tier1_reappear {
+                    break;
+                }
             }
         }
         assert!(
-            saw_regular_reappear,
-            "Unpossess 后常规流下一输出拍必须把 e_a 作为新实体重发"
+            saw_tier1_reappear,
+            "Unpossess 后 e_a 必须经 Compact tier=1 重入 L1 流"
         );
 
-        // 紧接着的 5 拍(均为非常规输出拍,interval=6):若 L0 未停发必收到 5 帧,停发则恰为 0 帧。
+        // 紧接着的 5 拍:L0 Compact tier=0 必须完全停发(0 帧)。
         let mut l0_after_unpossess = 0usize;
         for _ in 0..5 {
             step_one_tick().await;
             for msg in drain_ready(&mut a).await {
-                if let S2C::AgentStates { states, .. } = msg
-                    && states.iter().any(|(id, _, _)| *id == e_a)
+                if let S2C::AgentStatesCompact {
+                    tier: 0, states, ..
+                } = msg
+                    && states.iter().any(|p| p.entity == e_a)
                 {
                     l0_after_unpossess += 1;
                 }
@@ -9319,7 +9545,7 @@ mod tests {
         }
         assert_eq!(
             l0_after_unpossess, 0,
-            "Unpossess 后 L0 专流必须停发(5 个非输出拍内实收 {l0_after_unpossess} 帧)"
+            "Unpossess 后 L0 Compact tier=0 必须停发(5 拍内实收 {l0_after_unpossess} 帧)"
         );
 
         tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
@@ -9692,5 +9918,862 @@ mod tests {
             orchestrator.agent_counters.disconnect_cleanup_retries, 2,
             "B: disconnect_cleanup_retries == 2"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-014 M04b-1 驱动集成测试(T7 / T9 / T10 / T11,observe_harness 系)
+    // -----------------------------------------------------------------------
+
+    async fn m04b1_step_one_tick() {
+        advance_ticks(1).await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    async fn m04b1_drain_ready(c: &mut MiniClient) -> Vec<S2C> {
+        let mut out = Vec::new();
+        for _ in 0..16 {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                out.push(msg);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+            while let Some(msg) = c.try_recv_now().expect("读帧不失败") {
+                out.push(msg);
+            }
+        }
+        out
+    }
+
+    async fn m04b1_capsule_harness(
+        cadence: ObserveCadence,
+    ) -> (
+        tokio::task::JoinHandle<DriverOutcome>,
+        tokio::sync::mpsc::Sender<DriverCommand>,
+        std::net::SocketAddr,
+        types::BodyHash,
+    ) {
+        let config = observe_config();
+        let (mut args, tx, _hub, addr, _checkpoints) = observe_harness(config.clone()).await;
+        args.observe.as_mut().expect("observe 缝在").cadence = cadence;
+        let mut bodies = physics_sim::BodyRegistry::new();
+        let hash = bodies
+            .insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+            .expect("capsule 合法");
+        args.bodies = bodies.clone();
+        let sim_source = config.clone();
+        args.new_sim = Box::new(move |shard: types::ShardId| {
+            let mut sim_cfg = sim_source.shard_sim_config(shard);
+            sim_cfg.gravity = Vec3::ZERO;
+            sim_cfg.solidify.displacement_gate_m = 0.0;
+            physics_sim::ShardSim::new_with_bodies(
+                sim_cfg,
+                Box::new(SimpleRegistry::builtin()),
+                bodies.clone(),
+            )
+        });
+        let driver = tokio::spawn(run(args));
+        (driver, tx, addr, hash)
+    }
+
+    /// REQ-014 M04b-1 T7:lod 流端到端 + Meta 先行 + golden 字节 + 非 lod 对照 B。
+    #[tokio::test(start_paused = true)]
+    async fn m04b1_t7_lod_stream_e2e_and_meta_first() {
+        let (driver, tx, addr, hash) = m04b1_capsule_harness(ObserveCadence {
+            interval_ticks: 3,
+            full_interval_ticks: 60,
+        })
+        .await;
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let _id_a = join_player(&mut a, 8).await;
+        let mut b = MiniClient::connect(addr).await.expect("B 连入");
+        let _id_b = join_player(&mut b, 8).await;
+
+        let obs = Vec3::new(8.0, -60.0, -12.0);
+        a.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("A MoveObserver");
+        b.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("B MoveObserver");
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("A SetAgentStream(true)");
+        let _ = m04b1_drain_ready(&mut a).await;
+        let _ = m04b1_drain_ready(&mut b).await;
+        m04b1_step_one_tick().await;
+        m04b1_step_one_tick().await;
+        let _ = m04b1_drain_ready(&mut a).await;
+        let _ = m04b1_drain_ready(&mut b).await;
+
+        let e = EntityId::from_parts(0, 701);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, -60.0, 8.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+
+        let mut meta_seq: Option<(usize, usize)> = None;
+        let mut compact_seq: Option<(usize, usize, sim_api::proto::CompactAgentPose, bool)> = None;
+        let mut b_saw_legacy = false;
+        let mut step_idx = 0usize;
+        let mut global_ord = 0usize;
+
+        for _ in 0..10 {
+            step_idx += 1;
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                global_ord += 1;
+                match msg {
+                    S2C::AgentMeta { entries } => {
+                        assert_eq!(
+                            entries,
+                            vec![(e, hash)],
+                            "AgentMeta entries 必为 [(e, hash)]"
+                        );
+                        if meta_seq.is_none() {
+                            meta_seq = Some((step_idx, global_ord));
+                        }
+                    }
+                    S2C::AgentStatesCompact {
+                        tier: 1,
+                        states,
+                        removed,
+                        full,
+                        ..
+                    } => {
+                        assert_eq!(states.len(), 1, "Compact tier=1 states 必恰 1 条");
+                        assert!(removed.is_empty(), "首包 removed 必为空");
+                        if compact_seq.is_none() {
+                            compact_seq = Some((step_idx, global_ord, states[0].clone(), full));
+                        }
+                    }
+                    S2C::AgentStates { .. } => {
+                        panic!("lod_enabled 连接 A 不得收到旧 AgentStates");
+                    }
+                    _ => {}
+                }
+            }
+            for msg in m04b1_drain_ready(&mut b).await {
+                if let S2C::AgentStates { states, .. } = msg
+                    && states.iter().any(|(id, h, _)| *id == e && *h == hash)
+                {
+                    b_saw_legacy = true;
+                }
+            }
+            if meta_seq.is_some() && compact_seq.is_some() && b_saw_legacy {
+                break;
+            }
+        }
+
+        let (meta_step, meta_ord) = meta_seq.expect("A 必须收到 AgentMeta");
+        let (compact_step, compact_ord, pose, full) =
+            compact_seq.expect("A 必须收到 Compact tier=1");
+        assert!(
+            meta_ord < compact_ord,
+            "AgentMeta(P1) 必须先于 Compact tier=1(P2) 到达"
+        );
+        assert!(
+            compact_step <= meta_step + 1,
+            "force_send 首包必须在 Meta 后 <=1 拍内到达: meta_step={meta_step}, compact_step={compact_step}"
+        );
+        assert!(!full, "非 full 拍首包 full 必为 false");
+        assert_eq!(pose.entity, e);
+        assert_eq!(pose.root_pos, [8.0, -60.0, 8.0], "capsule root_pos golden");
+        assert_eq!(
+            pose.root_rot,
+            [0x03, 0x00, 0x01, 0x80, 0x00, 0x40],
+            "capsule root_rot identity golden"
+        );
+        assert_eq!(
+            pose.root_linvel, [0u8; 6],
+            "capsule 零速 root_linvel golden"
+        );
+        assert!(pose.child_links.is_empty(), "capsule 单连杆 child_links 空");
+        assert!(b_saw_legacy, "对照连接 B 必须收到旧 AgentStates");
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-014 M04b-1 T9:周期与错峰(L1 %6 / L1 full %60 / L2 %30 full=true / Meta %60 自愈)。
+    #[tokio::test(start_paused = true)]
+    async fn m04b1_t9_periods_stagger_and_meta_heal() {
+        let (driver, tx, addr, hash) = m04b1_capsule_harness(ObserveCadence {
+            interval_ticks: 6,
+            full_interval_ticks: 60,
+        })
+        .await;
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let id_a = join_player(&mut a, 8).await;
+        let mut b = MiniClient::connect(addr).await.expect("B 连入");
+        let id_b = join_player(&mut b, 8).await;
+        let phase_a = u64::from(id_a.0);
+        let phase_b = u64::from(id_b.0);
+
+        let obs = Vec3::new(8.0, 3.0, 8.0);
+        a.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("A MoveObserver");
+        b.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("B MoveObserver");
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("A SetAgentStream(true)");
+        b.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("B SetAgentStream(true)");
+        let _ = m04b1_drain_ready(&mut a).await;
+        let _ = m04b1_drain_ready(&mut b).await;
+        m04b1_step_one_tick().await;
+        m04b1_step_one_tick().await;
+        let _ = m04b1_drain_ready(&mut a).await;
+        let _ = m04b1_drain_ready(&mut b).await;
+
+        // 近距静止 capsule(d=20 -> L1)与远距静止 capsule(d=100 -> L2)。
+        let e_near = EntityId::from_parts(0, 901);
+        let e_far = EntityId::from_parts(0, 902);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e_near,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 28.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e_far,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 108.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+
+        // 推进 3 拍排干首次入场 force_send 与初始 Meta。
+        for _ in 0..3 {
+            m04b1_step_one_tick().await;
+            let _ = m04b1_drain_ready(&mut a).await;
+            let _ = m04b1_drain_ready(&mut b).await;
+        }
+
+        // 收 66 拍稳态帧,记录 L1 Compact / L2 Lite / Meta 自愈。
+        let mut a_l1_ticks = Vec::new();
+        let mut a_l1_full_ticks = Vec::new();
+        let mut a_l2_ticks = Vec::new();
+        let mut a_meta_heal_ticks = Vec::new();
+
+        let mut b_l1_ticks = Vec::new();
+        let mut b_l1_full_ticks = Vec::new();
+        let mut b_l2_ticks = Vec::new();
+        let mut b_meta_heal_ticks = Vec::new();
+
+        let expected_full_meta = vec![(e_near, hash), (e_far, hash)];
+
+        for _ in 0..66 {
+            m04b1_step_one_tick().await;
+            let batch_a = m04b1_drain_ready(&mut a).await;
+            let mut tick_a_seen = None;
+            let mut meta_a_seen = Vec::new();
+            for msg in batch_a {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 1,
+                        full,
+                        ..
+                    } => {
+                        tick_a_seen = Some(tick.0);
+                        a_l1_ticks.push(tick.0);
+                        if full {
+                            a_l1_full_ticks.push(tick.0);
+                        }
+                    }
+                    S2C::AgentStatesLite { tick, full, .. } => {
+                        assert!(full, "A: Lite 帧 full 必须恒为 true");
+                        tick_a_seen = Some(tick.0);
+                        a_l2_ticks.push(tick.0);
+                    }
+                    S2C::AgentMeta { entries } => {
+                        meta_a_seen.push(entries);
+                    }
+                    S2C::EntityStates { tick, .. } => {
+                        tick_a_seen = Some(tick.0);
+                    }
+                    _ => {}
+                }
+            }
+            for entries in meta_a_seen {
+                if entries == expected_full_meta
+                    && let Some(t) = tick_a_seen
+                {
+                    a_meta_heal_ticks.push(t);
+                }
+            }
+
+            let batch_b = m04b1_drain_ready(&mut b).await;
+            let mut tick_b_seen = None;
+            let mut meta_b_seen = Vec::new();
+            for msg in batch_b {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 1,
+                        full,
+                        ..
+                    } => {
+                        tick_b_seen = Some(tick.0);
+                        b_l1_ticks.push(tick.0);
+                        if full {
+                            b_l1_full_ticks.push(tick.0);
+                        }
+                    }
+                    S2C::AgentStatesLite { tick, full, .. } => {
+                        assert!(full, "B: Lite 帧 full 必须恒为 true");
+                        tick_b_seen = Some(tick.0);
+                        b_l2_ticks.push(tick.0);
+                    }
+                    S2C::AgentMeta { entries } => {
+                        meta_b_seen.push(entries);
+                    }
+                    S2C::EntityStates { tick, .. } => {
+                        tick_b_seen = Some(tick.0);
+                    }
+                    _ => {}
+                }
+            }
+            for entries in meta_b_seen {
+                if entries == expected_full_meta
+                    && let Some(t) = tick_b_seen
+                {
+                    b_meta_heal_ticks.push(t);
+                }
+            }
+        }
+
+        // 同时追加 18 拍带低速移动主体的增量期验证,确保非 full 的 (tick+phase)%6==0 同样受锚。
+        let e_move = EntityId::from_parts(0, 903);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e_move,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(10.0, 3.0, 20.0),
+                    linvel: Vec3::new(0.2, 0.0, 0.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+        // 排干首入 force_send 拍。
+        for _ in 0..2 {
+            m04b1_step_one_tick().await;
+            let _ = m04b1_drain_ready(&mut a).await;
+            let _ = m04b1_drain_ready(&mut b).await;
+        }
+        let mut a_l1_incr_ticks = Vec::new();
+        let mut b_l1_incr_ticks = Vec::new();
+        for _ in 0..18 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                if let S2C::AgentStatesCompact {
+                    tick,
+                    tier: 1,
+                    full,
+                    ..
+                } = msg
+                {
+                    a_l1_ticks.push(tick.0);
+                    if full {
+                        a_l1_full_ticks.push(tick.0);
+                    } else {
+                        a_l1_incr_ticks.push(tick.0);
+                    }
+                }
+            }
+            for msg in m04b1_drain_ready(&mut b).await {
+                if let S2C::AgentStatesCompact {
+                    tick,
+                    tier: 1,
+                    full,
+                    ..
+                } = msg
+                {
+                    b_l1_ticks.push(tick.0);
+                    if full {
+                        b_l1_full_ticks.push(tick.0);
+                    } else {
+                        b_l1_incr_ticks.push(tick.0);
+                    }
+                }
+            }
+        }
+
+        assert!(!a_l1_ticks.is_empty(), "A 必须收到 Compact tier=1 帧");
+        assert!(!b_l1_ticks.is_empty(), "B 必须收到 Compact tier=1 帧");
+        assert!(
+            a_l1_incr_ticks.len() >= 2 && b_l1_incr_ticks.len() >= 2,
+            "移动主体 18 拍内应收到至少 2 帧非 full L1 增量"
+        );
+        for &t in &a_l1_ticks {
+            assert!(
+                (t + phase_a).is_multiple_of(6),
+                "A L1 tick={t}, phase={phase_a} 必满足 (tick+phase)%6==0"
+            );
+        }
+        for &t in &b_l1_ticks {
+            assert!(
+                (t + phase_b).is_multiple_of(6),
+                "B L1 tick={t}, phase={phase_b} 必满足 (tick+phase)%6==0"
+            );
+        }
+        assert!(!a_l1_full_ticks.is_empty(), "A 66 拍窗内必有 full=true 拍");
+        assert!(!b_l1_full_ticks.is_empty(), "B 66 拍窗内必有 full=true 拍");
+        for &t in &a_l1_full_ticks {
+            assert!(
+                (t + phase_a).is_multiple_of(60),
+                "A L1 full tick={t}, phase={phase_a} 必满足 %60==0"
+            );
+        }
+        for &t in &b_l1_full_ticks {
+            assert!(
+                (t + phase_b).is_multiple_of(60),
+                "B L1 full tick={t}, phase={phase_b} 必满足 %60==0"
+            );
+        }
+        if !(phase_a % 6 == phase_b % 6) {
+            assert_ne!(a_l1_ticks, b_l1_ticks, "两连接不同相位 L1 tick 集必错开");
+        }
+
+        assert!(a_l2_ticks.len() >= 2, "A 66 拍窗内必有 >=2 帧 Lite");
+        assert!(b_l2_ticks.len() >= 2, "B 66 拍窗内必有 >=2 帧 Lite");
+        for &t in &a_l2_ticks {
+            assert!(
+                (t + phase_a).is_multiple_of(30),
+                "A Lite tick={t}, phase={phase_a} 必满足 %30==0"
+            );
+        }
+        for &t in &b_l2_ticks {
+            assert!(
+                (t + phase_b).is_multiple_of(30),
+                "B Lite tick={t}, phase={phase_b} 必满足 %30==0"
+            );
+        }
+
+        assert!(
+            a_meta_heal_ticks
+                .iter()
+                .any(|&t| (t + phase_a).is_multiple_of(60)),
+            "A 66 拍窗内必有满足 (tick+phase)%60==0 的全表 AgentMeta 自愈帧: {a_meta_heal_ticks:?}"
+        );
+        assert!(
+            b_meta_heal_ticks
+                .iter()
+                .any(|&t| (t + phase_b).is_multiple_of(60)),
+            "B 66 拍窗内必有满足 (tick+phase)%60==0 的全表 AgentMeta 自愈帧: {b_meta_heal_ticks:?}"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-014 M04b-1 T10:解除附身补闪(Unpossess -> P1 tier=0 removed + <=1 拍 tier=1 含 e,无 tier1 removed)。
+    #[tokio::test(start_paused = true)]
+    async fn m04b1_t10_unpossess_flash_recovery() {
+        let (driver, tx, addr, hash) = m04b1_capsule_harness(ObserveCadence {
+            interval_ticks: 6,
+            full_interval_ticks: 60,
+        })
+        .await;
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let id_a = join_player(&mut a, 8).await;
+        let phase_a = u64::from(id_a.0);
+
+        let obs = Vec3::new(8.0, 3.0, 8.0);
+        a.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("A MoveObserver");
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("A SetAgentStream(true)");
+        let _ = m04b1_drain_ready(&mut a).await;
+        m04b1_step_one_tick().await;
+        m04b1_step_one_tick().await;
+        let _ = m04b1_drain_ready(&mut a).await;
+
+        let e = EntityId::from_parts(0, 1001);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 28.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+        m04b1_step_one_tick().await;
+        m04b1_step_one_tick().await;
+        let _ = m04b1_drain_ready(&mut a).await;
+
+        // 附身 e -> 每拍 Compact tier=0。
+        a.send(&C2S::Possess { entity: e })
+            .await
+            .expect("A Possess");
+        let mut possessed_ok = false;
+        let mut last_l0_tick = 0u64;
+        for _ in 0..10 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                match msg {
+                    S2C::Possessed { entity } if entity == Some(e) => possessed_ok = true,
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 0,
+                        states,
+                        ..
+                    } if states.iter().any(|p| p.entity == e) => {
+                        last_l0_tick = tick.0;
+                    }
+                    S2C::AgentStatesCompact {
+                        tier: 1, removed, ..
+                    } => {
+                        assert!(!removed.contains(&e), "附身换档不得发 tier1 removed");
+                    }
+                    _ => {}
+                }
+            }
+            if possessed_ok && last_l0_tick > 0 {
+                break;
+            }
+        }
+        assert!(possessed_ok, "A 必须成功附身 e");
+
+        // 验证连续 4 拍 L0,并对齐到非 l1_due 拍以真实考验 force_send(而非常规 %6==0 周期)。
+        let mut l0_ticks = Vec::new();
+        for _ in 0..4 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                if let S2C::AgentStatesCompact {
+                    tick,
+                    tier: 0,
+                    states,
+                    removed,
+                    full,
+                } = msg
+                {
+                    assert!(
+                        !full && removed.is_empty() && states.len() == 1 && states[0].entity == e
+                    );
+                    l0_ticks.push(tick.0);
+                    last_l0_tick = tick.0;
+                }
+            }
+        }
+        assert_eq!(l0_ticks.len(), 4, "附身期间每拍必收 Compact tier=0");
+        for w in l0_ticks.windows(2) {
+            assert_eq!(w[1], w[0] + 1);
+        }
+
+        // 推进至 (next_t + phase_a) % 6 != 0 且 (next_t + 1 + phase_a) % 6 != 0。
+        for _ in 0..6 {
+            let next_t = last_l0_tick + 1;
+            if !(next_t + phase_a).is_multiple_of(6) && !(next_t + 1 + phase_a).is_multiple_of(6) {
+                break;
+            }
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                if let S2C::AgentStatesCompact { tick, tier: 0, .. } = msg {
+                    last_l0_tick = tick.0;
+                }
+            }
+        }
+
+        // Unpossess -> P1 Compact tier=0 removed=[e]; 随后 <=1 拍 Compact tier=1 含 e(force_send)。
+        a.send(&C2S::Unpossess).await.expect("A Unpossess");
+        let mut removed_t0_tick: Option<u64> = None;
+        let mut flash_t1_tick: Option<u64> = None;
+        for _ in 0..10 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 0,
+                        states,
+                        removed,
+                        full,
+                    } if !full && states.is_empty() && removed == vec![e] => {
+                        removed_t0_tick = Some(tick.0);
+                    }
+                    S2C::AgentStatesCompact {
+                        tick,
+                        tier: 1,
+                        states,
+                        removed,
+                        ..
+                    } => {
+                        assert!(!removed.contains(&e), "任何包不得含 e 的 tier1 removed");
+                        if states.iter().any(|p| p.entity == e) && flash_t1_tick.is_none() {
+                            flash_t1_tick = Some(tick.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if removed_t0_tick.is_some() && flash_t1_tick.is_some() {
+                break;
+            }
+        }
+
+        let t0 = removed_t0_tick.expect("Unpossess 必须收到 P1 Compact tier=0 removed=[e]");
+        let t1 = flash_t1_tick.expect("Unpossess 后必须收到 Compact tier=1 含 e");
+        assert!(
+            t1 <= t0 + 1,
+            "Unpossess 后 Compact tier=1 补闪必须在 <=1 拍内到达(force_send): t0_removed={t0}, t1_flash={t1}"
+        );
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-014 M04b-1 T11:关闭 LOD 自愈(三帧清表按 P2 槽序 + 旧 AgentStates 首包 full=true + 再次开启重发 Meta)。
+    #[tokio::test(start_paused = true)]
+    async fn m04b1_t11_disable_lod_and_self_heal() {
+        let (driver, tx, addr, hash) = m04b1_capsule_harness(ObserveCadence {
+            interval_ticks: 6,
+            full_interval_ticks: 60,
+        })
+        .await;
+
+        let mut a = MiniClient::connect(addr).await.expect("A 连入");
+        let _id_a = join_player(&mut a, 8).await;
+
+        let obs = Vec3::new(8.0, 3.0, 8.0);
+        a.send(&C2S::MoveObserver { position: obs })
+            .await
+            .expect("A MoveObserver");
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("A SetAgentStream(true)");
+        let _ = m04b1_drain_ready(&mut a).await;
+        m04b1_step_one_tick().await;
+        m04b1_step_one_tick().await;
+        let _ = m04b1_drain_ready(&mut a).await;
+
+        let e_near = EntityId::from_parts(0, 1101);
+        let e_far = EntityId::from_parts(0, 1102);
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e_near,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 28.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+        inject_send(
+            &tx,
+            shard_id(0, 0),
+            messaging::SimCommand::SpawnAgent {
+                entity: e_far,
+                body: hash,
+                state: EntityState {
+                    translation: Vec3::new(8.0, 3.0, 108.0),
+                    ..EntityState::default()
+                },
+            },
+        )
+        .await;
+
+        // 推进至同时见过 L1 Compact 与 L2 Lite。
+        let mut saw_t1 = false;
+        let mut saw_l2 = false;
+        for _ in 0..35 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tier: 1, states, ..
+                    } if states.iter().any(|p| p.entity == e_near) => saw_t1 = true,
+                    S2C::AgentStatesLite { states, .. }
+                        if states.iter().any(|p| p.entity == e_far) =>
+                    {
+                        saw_l2 = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_t1 && saw_l2 {
+                break;
+            }
+        }
+        assert!(saw_t1 && saw_l2, "关闭前应已处于 L1+L2 运行态");
+
+        // 幂等校验:true -> true 不产清表帧。
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("重复 SetAgentStream(true)");
+        m04b1_step_one_tick().await;
+        for msg in m04b1_drain_ready(&mut a).await {
+            assert!(
+                !matches!(
+                    msg,
+                    S2C::AgentStatesCompact {
+                        tier: 0,
+                        full: true,
+                        ..
+                    }
+                ),
+                "true->true 幂等不得发清表帧"
+            );
+        }
+
+        // 关闭 LOD:SetAgentStream{lod:false} -> 三帧清表(tier0 full 空 / tier1 full 空 / Lite full 空,按 P2 槽序),
+        // 之后旧 AgentStates 恢复且首包 full=true。
+        a.send(&C2S::SetAgentStream { lod: false })
+            .await
+            .expect("A SetAgentStream(false)");
+
+        let mut clear_order: Vec<&'static str> = Vec::new();
+        let mut first_legacy: Option<(bool, Vec<EntityId>)> = None;
+        for _ in 0..12 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                match msg {
+                    S2C::AgentStatesCompact {
+                        tier: 0,
+                        states,
+                        removed,
+                        full: true,
+                        ..
+                    } if states.is_empty() && removed.is_empty() => {
+                        clear_order.push("t0");
+                    }
+                    S2C::AgentStatesCompact {
+                        tier: 1,
+                        states,
+                        removed,
+                        full: true,
+                        ..
+                    } if states.is_empty() && removed.is_empty() => {
+                        clear_order.push("t1");
+                    }
+                    S2C::AgentStatesLite {
+                        origin_chunk,
+                        states,
+                        removed,
+                        full: true,
+                        ..
+                    } if origin_chunk == [0u8; 8] && states.is_empty() && removed.is_empty() => {
+                        clear_order.push("lite");
+                    }
+                    S2C::AgentStates { states, full, .. } if first_legacy.is_none() => {
+                        first_legacy =
+                            Some((full, states.into_iter().map(|(id, _, _)| id).collect()));
+                    }
+                    _ => {}
+                }
+            }
+            if clear_order.len() == 3 && first_legacy.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            clear_order,
+            vec!["t0", "t1", "lite"],
+            "关闭 LOD 必须按 P2 槽序发三帧空 full 清表包"
+        );
+        let (legacy_full, legacy_ids) = first_legacy.expect("关闭 LOD 后旧 AgentStates 必须恢复");
+        assert!(legacy_full, "恢复后首包旧 AgentStates 必须 full=true");
+        assert!(
+            legacy_ids.contains(&e_near) && legacy_ids.contains(&e_far),
+            "恢复后首包旧 AgentStates 必含全部可见主体:{legacy_ids:?}"
+        );
+
+        // 幂等校验:false -> false 不再发清表帧。
+        a.send(&C2S::SetAgentStream { lod: false })
+            .await
+            .expect("重复 SetAgentStream(false)");
+        m04b1_step_one_tick().await;
+        for msg in m04b1_drain_ready(&mut a).await {
+            assert!(
+                !matches!(
+                    msg,
+                    S2C::AgentStatesCompact { .. } | S2C::AgentStatesLite { .. }
+                ),
+                "false->false 幂等不得发清表帧"
+            );
+        }
+
+        // 再次开启 LOD:Meta 重发,LOD 流恢复。
+        a.send(&C2S::SetAgentStream { lod: true })
+            .await
+            .expect("再次 SetAgentStream(true)");
+        let mut saw_meta_again = false;
+        let mut saw_t1_again = false;
+        for _ in 0..10 {
+            m04b1_step_one_tick().await;
+            for msg in m04b1_drain_ready(&mut a).await {
+                match msg {
+                    S2C::AgentMeta { entries } => {
+                        if entries.contains(&(e_near, hash)) && entries.contains(&(e_far, hash)) {
+                            saw_meta_again = true;
+                        }
+                    }
+                    S2C::AgentStatesCompact {
+                        tier: 1, states, ..
+                    } if states.iter().any(|p| p.entity == e_near) => {
+                        saw_t1_again = true;
+                    }
+                    _ => {}
+                }
+            }
+            if saw_meta_again && saw_t1_again {
+                break;
+            }
+        }
+        assert!(saw_meta_again, "再次开启 LOD 必须重发 AgentMeta");
+        assert!(saw_t1_again, "再次开启 LOD 必须恢复 Compact tier=1");
+
+        tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
+        driver.await.expect("驱动不 panic");
     }
 }

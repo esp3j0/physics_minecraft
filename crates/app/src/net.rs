@@ -346,12 +346,14 @@ pub enum EnqueueResult {
     Superseded,
 }
 
-/// P2 状态流五槽(每类最新覆盖,按固定序出网)。
+/// P2 状态流七槽(每类最新覆盖,按固定序出网)。
 #[derive(Default)]
 struct P2Slots {
     entity_states: Option<S2C>,
     agent_states: Option<S2C>,
     agent_states_l0: Option<S2C>,
+    agent_compact_t1: Option<S2C>,
+    agent_lite: Option<S2C>,
     debug_stats: Option<S2C>,
     perf_stats: Option<S2C>,
 }
@@ -361,6 +363,8 @@ impl P2Slots {
         self.entity_states.is_none()
             && self.agent_states.is_none()
             && self.agent_states_l0.is_none()
+            && self.agent_compact_t1.is_none()
+            && self.agent_lite.is_none()
             && self.debug_stats.is_none()
             && self.perf_stats.is_none()
     }
@@ -371,13 +375,15 @@ impl P2Slots {
             .take()
             .or_else(|| self.agent_states.take())
             .or_else(|| self.agent_states_l0.take())
+            .or_else(|| self.agent_compact_t1.take())
+            .or_else(|| self.agent_lite.take())
             .or_else(|| self.debug_stats.take())
             .or_else(|| self.perf_stats.take())
     }
 
     /// 按固定序一次取尽全部非空槽(供 `flush_outbound` 逐帧写出)。
     fn take_all(&mut self) -> Vec<S2C> {
-        let mut out = Vec::with_capacity(5);
+        let mut out = Vec::with_capacity(7);
         if let Some(m) = self.entity_states.take() {
             out.push(m);
         }
@@ -385,6 +391,12 @@ impl P2Slots {
             out.push(m);
         }
         if let Some(m) = self.agent_states_l0.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.agent_compact_t1.take() {
+            out.push(m);
+        }
+        if let Some(m) = self.agent_lite.take() {
             out.push(m);
         }
         if let Some(m) = self.debug_stats.take() {
@@ -471,10 +483,13 @@ fn push_p2_raw(
     let slot = match &msg {
         S2C::EntityStates { .. } => &mut guard.p2.entity_states,
         S2C::AgentStates { .. } => &mut guard.p2.agent_states,
+        S2C::AgentStatesCompact { tier: 0, .. } => &mut guard.p2.agent_states_l0,
+        S2C::AgentStatesCompact { .. } => &mut guard.p2.agent_compact_t1,
+        S2C::AgentStatesLite { .. } => &mut guard.p2.agent_lite,
         S2C::DebugStats { .. } => &mut guard.p2.debug_stats,
         S2C::PerfStats { .. } => &mut guard.p2.perf_stats,
         _ => {
-            // 非四类状态包显式走 P2 时的防御回退:落 P1 不丢失。
+            // 非状态包显式走 P2 时的防御回退:落 P1 不丢失。
             guard.p1.push_back(msg);
             drop(guard);
             notify.notify_one();
@@ -534,7 +549,7 @@ fn push_p3_raw(
 /// 每连接出站四级队列:
 /// - P0 = mpsc(64),满或接收端亡 → `CriticalFull` 断连信号;
 /// - P1 = 永不丢 VecDeque(软上限 1024 记反压);
-/// - P2 = 五槽最新覆盖(`entity_states`/`agent_states`/`agent_states_l0`/`debug_stats`/`perf_stats`);
+/// - P2 = 七槽最新覆盖(`entity_states`/`agent_states`/`agent_states_l0`/`agent_compact_t1`/`agent_lite`/`debug_stats`/`perf_stats`);
 /// - P3 = 有界 512 VecDeque(满丢最旧,出网受全局每拍配额限速)。
 ///
 /// 互斥临界区全同步零 await,不会跨挂起点持有;锁中毒不可达,保守解包继续。
