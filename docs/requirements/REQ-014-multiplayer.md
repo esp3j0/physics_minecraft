@@ -3,7 +3,7 @@
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
   架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
   M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`;M03 已验收 `f117835`;
-  M04a 已验收 `8b5c112`)
+  M04a 已验收 `8b5c112`;M04b-1 已验收 `6db0333`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -148,6 +148,24 @@ T9 零重力 600 拍 PD 落定后逐连杆比对 ≤2e-3 m / 2e-3 rad 通过。
 变异 B8(旋转复合顺序交换)存活:现有测试链均单轴/零角可交换,
 多轴非零链缺口如实记录(B8b 位置复合丢父旋转已补杀 T7+T8);
 unpack 末归一化为防御性步骤,去之存活(无独立锚),如实记录。
+
+**M04b-1 落地注记(2026-11-28 验收,`6db0333`)**:服务器 LOD 状态机落地为
+app 纯函数模块 `lod.rs`(LodTable::step + 周期判定 + pack_compact/pack_lite,
+零网络零内核依赖),driver 按连接接线(emit_lod_streams;emit_outputs 跳过
+lod 连接;AgentStream 切换三帧空 full 清表),net.rs P2 扩七槽
+(t0/t1/lite 分槽最新覆盖)。常量:K_L1=8、驻留 30 拍(仅 L1↔L2、换档后起算)、
+L1 10Hz/L2 2Hz/full 与 Meta 自愈 60 拍、死区 32/40、互换余量 4m、
+L2 退出余量 8m;相位=player.0 错峰。R1 裁决两处任务书自身错误:
+T2 触发距离 35→45(35 落死区,手算笔误);force_send 条件改为任何进入 L1
+(含解除附身 0→1)均补闪,upgrades 语义保持排除 0→1(降档)。
+变异 C1–C15 全杀(C14 槽身份由 T8/T11 锚住,T9 不锚)、S1 Meta 自愈去除杀、
+S2 pending_removed 档内排序去除预期存活(无独立锚)如实记录。
+观察项(非阻断):① pending_removed[0] 只积不消费(L0 removed 实际经
+emit_l0_removed_if_lod P1 下发,表内残留为死数据,后续单元可清);
+② 既有帧接收时序敏感测试在全负载并发下各偶发一次
+(x3_double_run_bitwise 采样拍数 1906 vs 1916;
+entity_states_incremental_then_full 全量帧收到空表),单跑/全套/复跑均绿,
+非本单元引入(两测试连接均未启用 lod,发送路径零改动),M05 压测期可加固。
 
 **带宽场景表(估算,32 只可见 13 连杆全移动狗/客户端;M05 实测校准)**:
 
@@ -301,9 +319,15 @@ unpack 末归一化为防御性步骤,去之存活(无独立锚),如实记录。
   t3_c01b3),B8 旋转顺序交换存活(测试链单轴/零角可交换,缺口如实记录,
   B8b 丢父旋转补杀),S1 去 unpack 末归一化预期存活;e2e→client-core
   内部 dev-dep 边任务书授权,Cargo.lock 无新第三方包)。
-- **M04b LOD 状态机与客户端表现**:三重防抖/K_L1/错峰/分档自愈/换档补闪;
-  L0/L1 迁 Compact;客户端 150ms 混合 + L2 静姿摆腿;能力门控。
-  验收:ACM3/7/8 + M03 回归。
+- **M04b LOD 状态机与客户端表现**(拆两期,仿 M02a 先例):
+  - **M04b-1 服务器 LOD 状态机(已验收 `6db0333`)**:三重防抖/K_L1/错峰/
+    分档自愈/换档补闪;L0/L1 迁 Compact;net 七槽;ACM8 非 lod 连接逐位不变。
+    验收:15/15 变异击杀(C14 经 T8/T11)+ S1 杀 + S2 预期存活;
+    全量门禁 1901/0/117;R1 裁决 T2 距离与 force_send 0→1 两处任务书错误。
+  - **M04b-2 客户端表现(待放行)**:mirror 分档标签/分档 full 清表、
+    Compact/Lite 解码→AgentView、150ms 换档混合、L2 静姿 FK+程序化摆腿
+    (phase 自 motion_flags)、InterpRes 接线;能力门控。
+    验收:ACM3 客户端侧/ACM7 + M03 回归。
 - **M05 隔离与实测校准**:F11 拆线程 + F10 chunk 配额;分散 10/16 与聚堆
   10/16+32 狗两套压测;§10 矩阵;修订 §5/§8 标 ★ 判据;决定 M05b。
 - **M05b(条件)**:ChunkDataCompressed(S2C=18,lz4 已在 lock)+ PolicyWorker
@@ -312,7 +336,7 @@ unpack 末归一化为防御性步骤,去之存活(无独立锚),如实记录。
   (Correction 现 schema 单连杆,13 连杆 RL 主体永久走 L0 权威专流);
   启用 InputAck/Correction 预留位。WAN 需求出现再立。
 
-顺序:M01 → M02a/M02b(并行)→ M03 → M04a → M04b → M05 →(M05b)→(M06)。
+顺序:M01 → M02a/M02b(并行)→ M03 → M04a → M04b-1 → M04b-2 → M05 →(M05b)→(M06)。
 M03 在 M04 前 = LOD 的语义回归锚。每单元一任务书一回报,纪律同 agents.md。
 
 ## 10 M05 实测校准清单(禁止拍脑袋定硬门禁)
