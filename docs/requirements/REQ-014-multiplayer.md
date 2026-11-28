@@ -2,7 +2,7 @@
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
   架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
-  M02a-2 已验收 `8e58db9`+`1722640`)
+  M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -157,7 +157,18 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   包内 tick 双帧 lerp/slerp,渲染时刻 = now − 缓冲时长(L1 估 150–250ms、
   L2 估 600ms,M05 定);缓冲欠载时 ≤50ms 钳制外推(仅根线速;子连杆不外推,
   防关节撕裂),超钳制冻结待包。
+  **已落地**(M02b `ecb9654`,`client-core/src/interp.rs`,tick 域):
+  双帧 lerp/slerp(linvel/angvel 取新帧);外推钳 `EXTRAP_CLAMP_TICKS=3.0`
+  (=50ms@60Hz),仅根 translation,旋转/子连杆/速度冻结;向过去冻结不反推;
+  每实体轨道 ≤`MAX_SNAPS=4`,迟到旧包忽略、同 tick 替换、full retain 对账。
+  `RenderClock`:首帧一次性初始化 now=max(tick−buffer,0),后续 latest 只增
+  now 不跳,speed=(1+err/16).clamp(0.75,1.25) 限速 slew;
+  `DEFAULT_BUFFER_TICKS=12`(200ms)与 slew 常数 M05 实测再调。
 - L0 与单机 interval=1 旁路零缓冲直写(现网零插值语义保留)。
+  **已落地**(M02b):client 仅 `--connect` 网络模式启用 InterpRes;
+  bypass = 单机 || 附身实体,`resolve_view` 直写最新态;结构对账/possess/
+  脚本 WorldState 仍按服务器最新态,仅渲染 Transform 换源。
+  ACM7「无 6/10Hz 抽搐」目视/实测留 M03 双客户端与 M05。
 - 换档混合 ≤150ms(§4);L2 静姿+程序化摆腿(§4);附身青绿高亮现网保留。
 - 断连 HUD + 重连入口(M01);重连 = 新连接新身体,全量自愈(ACM3)。
 
@@ -247,6 +258,9 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   锚后击杀;既有 W1–W5/U4/H2/H7/d01b 零改动,单策略首挂 phase 0 保证)。
 - **M02b 客户端快照插值**(与 M02a 可并行):InterpBuffer 纯逻辑零墙钟单测;
   L0/单机旁路;≤50ms 钳制外推。验收:ACM7 插值部分。
+  **已验收**(2026-11-27,`ecb9654`;client-core+client 292 绿 + e2e
+  viewer_client 5 绿;架构师变异 N1–N8 8/8 击杀;既有测试零改动,
+  单机旁路逐位等价为硬锚;ACM7 目视/实测部分留 M03/M05)。
 - **M03 双客户端权威 e2e**:编辑互见/附身互斥/迟到者活跃块编辑/带负荷断线
   不 panic(F4)。验收:ACM1/2/4。
 - **M04a schema 与量化数学**:C2S=13、S2C=15/16/17 追加 + [u8;N] 编解码往返
