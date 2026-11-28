@@ -39,6 +39,7 @@ const BUILTIN_CAPSULE: &str = include_str!("../../../assets/bodies/capsule.body.
 #[derive(Debug, Default, Clone)]
 pub struct BodyShapeTable {
     by_hash: BTreeMap<BodyHash, Vec<LinkShapes>>,
+    defs: BTreeMap<BodyHash, BodyDef>,
     /// 未知哈希占位计数(A06 §1:HUD 计数;渲染到未知哈希 +1)。
     unknown_draws: u64,
 }
@@ -84,6 +85,7 @@ impl BodyShapeTable {
                 })
                 .collect();
             table.by_hash.insert(hash, links);
+            table.defs.insert(hash, def.clone());
         }
         table
     }
@@ -105,6 +107,16 @@ impl BodyShapeTable {
     /// 顺序);未知哈希 → None(调用方画占位 + 计数)。
     pub fn get(&self, hash: &BodyHash) -> Option<&[LinkShapes]> {
         self.by_hash.get(hash).map(Vec::as_slice)
+    }
+
+    /// 按哈希查缓存的身体定义(M04b-2 摆腿 FK 用);未知哈希 → None。
+    pub fn def(&self, hash: &BodyHash) -> Option<&BodyDef> {
+        self.defs.get(hash)
+    }
+
+    /// 克隆导出表内全部 `(BodyHash, BodyDef)`(启动期注入镜像用)。
+    pub fn defs_cloned(&self) -> Vec<(BodyHash, BodyDef)> {
+        self.defs.iter().map(|(&h, d)| (h, d.clone())).collect()
     }
 
     /// 表内身体数(HUD 显示)。
@@ -150,10 +162,14 @@ fn load_defs(dir: &std::path::Path) -> Vec<BodyDef> {
     defs
 }
 
-/// 静态前向运动学(REQ-014 §4 Lite 视觉退化):按 joints default_angle
-/// 展开各连杆**根相对**位姿,返回长度 = def.links.len(),下标 0 =
-/// (Vec3::ZERO, Quat::IDENTITY)。纯函数,无缓存(接线 M04b)。
-pub fn static_link_transforms(def: &BodyDef) -> Vec<(Vec3, Quat)> {
+/// 摆腿程序化动画振幅(rad;REQ-014 M04b-2 初值,M05 目视校准)。
+pub const SWING_AMPLITUDE: f32 = 0.35;
+/// 摆腿程序化动画步幅(m;REQ-014 M04b-2 初值,M05 目视校准)。
+pub const STRIDE_LENGTH: f32 = 0.8;
+
+/// 给定关节角数组的前向运动学:`thetas` 按连杆下标索引(要求 `thetas.len() >= def.links.len()`,
+/// 下标 0 不用);返回长度 = `def.links.len()`,下标 0 = `(Vec3::ZERO, Quat::IDENTITY)`。
+pub fn link_transforms_with_angles(def: &BodyDef, thetas: &[f32]) -> Vec<(Vec3, Quat)> {
     if def.links.is_empty() {
         return Vec::new();
     }
@@ -173,7 +189,7 @@ pub fn static_link_transforms(def: &BodyDef) -> Vec<(Vec3, Quat)> {
         let params = joint.kind.params();
         let anchor = Vec3::from_array(params.anchor);
         let child_anchor = Vec3::from_array(params.child_anchor);
-        let theta = params.default_angle.unwrap_or(0.0);
+        let theta = thetas[i];
 
         let (local_pos, local_rot) = match joint.kind {
             JointKind::Revolute(_) => {
@@ -195,6 +211,57 @@ pub fn static_link_transforms(def: &BodyDef) -> Vec<(Vec3, Quat)> {
     }
 
     out
+}
+
+/// 静态前向运动学(REQ-014 §4 Lite 视觉退化):按 joints default_angle
+/// 展开各连杆**根相对**位姿,返回长度 = def.links.len(),下标 0 =
+/// (Vec3::ZERO, Quat::IDENTITY)。委托 [`link_transforms_with_angles`]。
+pub fn static_link_transforms(def: &BodyDef) -> Vec<(Vec3, Quat)> {
+    if def.links.is_empty() {
+        return Vec::new();
+    }
+    let mut thetas = Vec::with_capacity(def.links.len());
+    thetas.push(0.0);
+    for link in def.links.iter().skip(1) {
+        let joint = def
+            .joints
+            .iter()
+            .find(|j| j.child == link.name)
+            .expect("非根连杆必为某关节的 child(validate 保证)");
+        thetas.push(joint.kind.params().default_angle.unwrap_or(0.0));
+    }
+    link_transforms_with_angles(def, &thetas)
+}
+
+/// 摆腿 FK:Revolute 子连杆 `i`(连杆下标)取 `θ_i = default_angle + SWING_AMPLITUDE * sin(phase + π*(i%2))`;
+/// Prismatic/Fixed 保持 `default_angle`。委托 [`link_transforms_with_angles`]。
+pub fn swing_link_transforms(def: &BodyDef, phase: f32) -> Vec<(Vec3, Quat)> {
+    if def.links.is_empty() {
+        return Vec::new();
+    }
+    let mut thetas = Vec::with_capacity(def.links.len());
+    thetas.push(0.0);
+    for (i, link) in def.links.iter().enumerate().skip(1) {
+        let joint = def
+            .joints
+            .iter()
+            .find(|j| j.child == link.name)
+            .expect("非根连杆必为某关节的 child(validate 保证)");
+        let base = joint.kind.params().default_angle.unwrap_or(0.0);
+        let theta = match joint.kind {
+            JointKind::Revolute(_) => {
+                let offset = if i % 2 == 1 {
+                    std::f32::consts::PI
+                } else {
+                    0.0
+                };
+                base + SWING_AMPLITUDE * (phase + offset).sin()
+            }
+            JointKind::Prismatic(_) | JointKind::Fixed(_) => base,
+        };
+        thetas.push(theta);
+    }
+    link_transforms_with_angles(def, &thetas)
 }
 
 #[cfg(test)]
@@ -466,5 +533,178 @@ default_angle = 1.0
             "leg1 shank",
         );
         assert_quat_near(xf[6].1, shank_rot, 1e-5, "leg1 shank");
+    }
+
+    /// REQ-014 M04b-2 T7:摆腿 FK 奇偶下标交替相位 + Prismatic 保持 default_angle。
+    #[test]
+    fn swing_revolute_parity_and_prismatic() {
+        let two_toml = r#"
+name = "two_rev"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "leg"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+"#;
+        let def2 = BodyDef::from_toml_str(two_toml).expect("two_rev 合法");
+        let xf2 = swing_link_transforms(&def2, std::f32::consts::FRAC_PI_2);
+        assert_eq!(xf2.len(), 2);
+        assert_eq!(xf2[0], (Vec3::ZERO, Quat::IDENTITY));
+        assert_vec3_near(
+            xf2[1].0,
+            Vec3::new(0.35_f32.cos(), 0.0, 0.35_f32.sin()),
+            1e-5,
+            "2 连杆 i=1 位置",
+        );
+        assert_quat_near(
+            xf2[1].1,
+            Quat::from_rotation_y(-0.35),
+            1e-5,
+            "2 连杆 i=1 旋转",
+        );
+
+        let three_toml = r#"
+name = "three_rev"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg1"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg2"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "leg1"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+[[joints]]
+parent = "base"
+child = "leg2"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+"#;
+        let def3 = BodyDef::from_toml_str(three_toml).expect("three_rev 合法");
+        let xf3 = swing_link_transforms(&def3, std::f32::consts::FRAC_PI_2);
+        assert_eq!(xf3.len(), 3);
+        assert_vec3_near(
+            xf3[1].0,
+            Vec3::new(0.35_f32.cos(), 0.0, 0.35_f32.sin()),
+            1e-5,
+            "3 连杆 i=1 位置",
+        );
+        assert_vec3_near(
+            xf3[2].0,
+            Vec3::new(0.35_f32.cos(), 0.0, -0.35_f32.sin()),
+            1e-5,
+            "3 连杆 i=2 奇偶交替位置",
+        );
+        assert_quat_near(
+            xf3[2].1,
+            Quat::from_rotation_y(0.35),
+            1e-5,
+            "3 连杆 i=2 旋转",
+        );
+
+        let prism_toml = r#"
+name = "two_prism"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "slider"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "slider"
+type = "prismatic"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [0.0, 0.0, 0.0]
+default_angle = 0.5
+"#;
+        let def_p = BodyDef::from_toml_str(prism_toml).expect("two_prism 合法");
+        let xf_p = swing_link_transforms(&def_p, std::f32::consts::FRAC_PI_2);
+        assert_eq!(xf_p.len(), 2);
+        assert_eq!(
+            xf_p[1].0,
+            Vec3::new(0.0, 0.5, 0.0),
+            "Prismatic 保持 default_angle 逐位不变"
+        );
+        assert_eq!(xf_p[1].1, Quat::IDENTITY, "Prismatic 旋转恒等逐位不变");
+    }
+
+    /// REQ-014 M04b-2 T9:`BodyShapeTable` 缓存 `BodyDef` 往返与未知哈希 None。
+    #[test]
+    fn defs_cache_roundtrip() {
+        let two_toml = r#"
+name = "two_cache"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "leg"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+"#;
+        let def = BodyDef::from_toml_str(two_toml).expect("two_cache 合法");
+        let hash = def.hash();
+        let table = BodyShapeTable::from_defs([&def]);
+        let cached = table.def(&hash).expect("应能查到缓存的 BodyDef");
+        assert_eq!(cached.links.len(), 2);
+        let cloned = table.defs_cloned();
+        assert_eq!(cloned.len(), 1);
+        assert_eq!(cloned[0].0, hash);
+        assert!(table.def(&BodyHash::fnv1a(b"unknown")).is_none());
     }
 }

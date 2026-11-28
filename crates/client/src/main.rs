@@ -29,9 +29,10 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_disk};
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
+use client_core::bodies::BodyShapeTable;
 use client_core::client::{ViewEvent, localize_disconnect_reason, s2c_to_event};
-use client_core::entities::{AgentView, SolidView};
-use client_core::interp::{DEFAULT_BUFFER_TICKS, InterpBuffer, RenderClock};
+use client_core::entities::{AgentView, EntityMirror, SolidView, sync_camera_roots};
+use client_core::interp::{DEFAULT_BUFFER_TICKS, InterpBuffer, RenderClock, sync_agent_interp};
 use client_core::mesh::{
     ChunkSnapshot, OutlineMesh, SubchunkMesh, mesh_subchunk_snapshot, outline_subchunk_snapshot,
     snapshot,
@@ -718,6 +719,9 @@ fn main() {
             client_id: HELLO_CLIENT_ID,
         });
         transport.send(C2S::Subscribe { view_distance });
+        if script_res.is_none() {
+            transport.send(C2S::SetAgentStream { lod: true });
+        }
         if script_res.is_some() {
             transport.send(C2S::SubscribeDebug);
         }
@@ -765,6 +769,9 @@ fn main() {
             .any(|st| matches!(st.action, client_core::script::Action::Outline { .. }))
     });
 
+    let mut entity_mirror = EntityMirror::new();
+    entity_mirror.set_defs(BodyShapeTable::from_dir(&bodies_dir).defs_cloned());
+
     let mut app = App::new();
     app.add_plugins(
         DefaultPlugins
@@ -803,7 +810,7 @@ fn main() {
     .insert_resource(ServerTickRes::default())
     .insert_resource(ToolRes::default())
     .insert_resource(PossessRes::default())
-    .insert_resource(EntityMirrorRes::default())
+    .insert_resource(EntityMirrorRes(entity_mirror))
     .insert_resource(InterpRes::new(cli.connect.is_some()))
     .insert_resource(BodiesDirRes(bodies_dir))
     .insert_resource(ObserverTracker::default())
@@ -1473,7 +1480,7 @@ fn drain_transport_system(
         if let Some(em) = opt.entity_mirror.as_mut() {
             em.0.apply(&msg);
         }
-        if let Some(interp) = opt.interp.as_mut()
+        if let Some(interp) = opt.interp.as_deref_mut()
             && interp.enabled
         {
             match &msg {
@@ -1502,6 +1509,47 @@ fn drain_transport_system(
                     }
                     interp.clock.on_snapshot(tick.0);
                 }
+                S2C::AgentStatesCompact {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                    ..
+                } => {
+                    let ids: Vec<EntityId> = states.iter().map(|s| s.entity).collect();
+                    if let Some(em) = opt.entity_mirror.as_ref() {
+                        sync_agent_interp(
+                            &mut interp.agents,
+                            &mut interp.clock,
+                            &em.0,
+                            tick.0,
+                            &ids,
+                            removed,
+                            *full,
+                        );
+                    }
+                }
+                S2C::AgentStatesLite {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                    ..
+                } => {
+                    let ids: Vec<EntityId> = states.iter().map(|s| s.entity).collect();
+                    if let Some(em) = opt.entity_mirror.as_ref() {
+                        sync_agent_interp(
+                            &mut interp.agents,
+                            &mut interp.clock,
+                            &em.0,
+                            tick.0,
+                            &ids,
+                            removed,
+                            *full,
+                        );
+                    }
+                }
+                S2C::AgentMeta { .. } => {}
                 S2C::EntityStates {
                     tick,
                     states,
@@ -1603,6 +1651,54 @@ fn drain_transport_system(
                         }
                     }
                     // 若主体被移除导致状态机回退 NoBody,同步清理 possessed 缓存。
+                    if possess.state.possessed().is_none() && possess.possessed.is_some() {
+                        possess.possessed = None;
+                    }
+                }
+            }
+            S2C::AgentStatesCompact {
+                tick,
+                states,
+                removed,
+                full,
+                ..
+            } => {
+                server_tick.0 = tick.0;
+                if let Some(possess) = opt.possess.as_mut() {
+                    let ids: Vec<EntityId> = states.iter().map(|s| s.entity).collect();
+                    if let Some(em) = opt.entity_mirror.as_ref() {
+                        sync_camera_roots(&mut possess.agents, &em.0, &ids, &removed, full);
+                    }
+                    let intent_target = possess.possessed;
+                    for cmd in possess.state.on_agents(&ids, &removed) {
+                        if let Some(c2s) = possess::to_c2s(&cmd, intent_target) {
+                            pending_sends.push(c2s);
+                        }
+                    }
+                    if possess.state.possessed().is_none() && possess.possessed.is_some() {
+                        possess.possessed = None;
+                    }
+                }
+            }
+            S2C::AgentStatesLite {
+                tick,
+                states,
+                removed,
+                full,
+                ..
+            } => {
+                server_tick.0 = tick.0;
+                if let Some(possess) = opt.possess.as_mut() {
+                    let ids: Vec<EntityId> = states.iter().map(|s| s.entity).collect();
+                    if let Some(em) = opt.entity_mirror.as_ref() {
+                        sync_camera_roots(&mut possess.agents, &em.0, &ids, &removed, full);
+                    }
+                    let intent_target = possess.possessed;
+                    for cmd in possess.state.on_agents(&ids, &removed) {
+                        if let Some(c2s) = possess::to_c2s(&cmd, intent_target) {
+                            pending_sends.push(c2s);
+                        }
+                    }
                     if possess.state.possessed().is_none() && possess.possessed.is_some() {
                         possess.possessed = None;
                     }

@@ -223,6 +223,34 @@ pub fn resolve_view<V: Interpolatable>(
     }
 }
 
+/// 把镜像已解码的主体快照喂入插值缓冲(M04b-2 Compact/Lite 共用)。
+///
+/// `full` 时按 `mirror.agents` 键集 retain(分档 full 后镜像即权威,跨档轨道保留);
+/// `ids` 中存在于 `mirror.agents` 者推入 `tick`;`removed` 逐条移除;最后推进 `clock.on_snapshot(tick)`。
+pub fn sync_agent_interp(
+    buffer: &mut InterpBuffer<AgentView>,
+    clock: &mut RenderClock,
+    mirror: &crate::entities::EntityMirror,
+    tick: u64,
+    ids: &[EntityId],
+    removed: &[EntityId],
+    full: bool,
+) {
+    if full {
+        let keep: BTreeSet<EntityId> = mirror.agents.keys().copied().collect();
+        buffer.retain(&keep);
+    }
+    for id in ids {
+        if let Some(view) = mirror.agents.get(id) {
+            buffer.push(tick, *id, view.clone());
+        }
+    }
+    for id in removed {
+        buffer.remove(*id);
+    }
+    clock.on_snapshot(tick);
+}
+
 #[cfg(test)]
 mod tests {
     use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
@@ -650,5 +678,93 @@ mod tests {
         );
         let s10 = buf.sample(id, 10.0).expect("sample(10)");
         assert_eq!(s10.poses[0].translation.x, 7.0, "首帧原值");
+    }
+
+    /// REQ-014 M04b-2 T21:`sync_agent_interp` 分档 full 保留跨档轨道、推入目标拍并初始化时钟,removed 清除轨道。
+    #[test]
+    fn sync_agent_interp_per_tier_full() {
+        use sim_api::proto::{CompactAgentPose, LiteAgentPose, S2C};
+        use types::{BodyDef, Tick};
+
+        let toml = r#"
+name = "two_interp"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "leg"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+"#;
+        let def = BodyDef::from_toml_str(toml).expect("two_interp 合法");
+        let hash = def.hash();
+        let id1 = eid(1);
+        let id2 = eid(2);
+
+        let mut mirror = crate::entities::EntityMirror::new();
+        mirror.set_defs([(hash, def)]);
+        mirror.apply(&S2C::AgentMeta {
+            entries: vec![(id1, hash), (id2, hash)],
+        });
+        mirror.apply(&S2C::AgentStatesCompact {
+            tick: Tick(10),
+            tier: 1,
+            states: vec![CompactAgentPose {
+                entity: id1,
+                root_pos: [10.0, 0.0, 0.0],
+                root_rot: [0x03, 0x00, 0x01, 0x80, 0x00, 0x40],
+                root_linvel: [0u8; 6],
+                child_links: vec![[
+                    0xD0, 0x87, 0x00, 0x80, 0x00, 0x80, 0x03, 0x00, 0x01, 0x80, 0x00, 0x40,
+                ]],
+            }],
+            removed: vec![],
+            full: false,
+        });
+        // x=20: 20*32 + 32768 = 33408 = 0x8280 -> [0x80, 0x82]
+        mirror.apply(&S2C::AgentStatesLite {
+            tick: Tick(10),
+            origin_chunk: [0u8; 8],
+            states: vec![LiteAgentPose {
+                entity: id2,
+                rel_pos: [0x80, 0x82, 0x00, 0x80, 0x00, 0x80],
+                yaw: [0, 0],
+                motion_flags: 0x80,
+            }],
+            removed: vec![],
+            full: true,
+        });
+
+        let mut buf: InterpBuffer<AgentView> = InterpBuffer::new();
+        buf.push(10, id1, mirror.agents[&id1].clone());
+        buf.push(10, id2, mirror.agents[&id2].clone());
+        let mut clock = RenderClock::new(DEFAULT_BUFFER_TICKS);
+
+        // 模拟 tier1 full=true 仅含 id1,镜像仍含跨档 id2。
+        sync_agent_interp(&mut buf, &mut clock, &mirror, 20, &[id1], &[], true);
+        assert_eq!(buf.track_len(id2), 1, "跨档轨道 id2 必须保留");
+        assert_eq!(buf.track_len(id1), 2, "id1 应推入 tick=20");
+        assert_eq!(
+            buf.tracks.get(&id1).and_then(|t| t.back()).map(|(t, _)| *t),
+            Some(20),
+            "id1 末拍应为 20"
+        );
+        assert_f64_near(clock.now(), 8.0, "clock 首帧 20 - 12 = 8");
+
+        sync_agent_interp(&mut buf, &mut clock, &mirror, 21, &[], &[id2], false);
+        assert_eq!(buf.track_len(id2), 0, "removed 必须移除 id2 轨道");
     }
 }

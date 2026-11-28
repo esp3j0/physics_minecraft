@@ -16,9 +16,13 @@ use bevy::prelude::*;
 use client_core::bodies::{BodyShapeTable, LinkShape};
 use client_core::entities::{ENTITY_CUBE_SIZE, EntityMirror};
 use client_core::interp::{TICKS_PER_SEC, resolve_view};
+use client_core::present::PresentationTable;
 use types::{BodyHash, CompoundShape, EntityId};
 
 use crate::{InterpRes, PossessRes, conv};
+
+/// tier 2(Lite)额外采样延迟(tick;总缓冲 12 + 24 = 36 拍 = 600ms,REQ-014 §6)。
+const L2_EXTRA_DELAY_TICKS: f64 = 24.0;
 
 /// 普通主体色(品红;与 `viewer/src/render.rs:374` `AGENT_COLOR` 同源)。
 pub(crate) const AGENT_COLOR: Color = Color::srgb(228.0 / 255.0, 92.0 / 255.0, 240.0 / 255.0);
@@ -62,6 +66,7 @@ pub(crate) struct EntityRenderRes {
     solid_material: Handle<StandardMaterial>,
     agents: BTreeMap<EntityId, AgentRenderRecord>,
     solids: BTreeMap<EntityId, SolidRenderRecord>,
+    present: PresentationTable,
 }
 
 impl EntityRenderRes {
@@ -99,6 +104,7 @@ impl EntityRenderRes {
             solid_material,
             agents: BTreeMap::new(),
             solids: BTreeMap::new(),
+            present: PresentationTable::default(),
         }
     }
 
@@ -311,22 +317,42 @@ pub(crate) fn sync_entities_system(
             }
             commands.entity(rec.root).despawn();
         }
+        entity_render.present.remove(id);
     }
 
     // 2. 更新既有主体或 spawn 新主体。
     let possessed_mat = entity_render.possessed_material.clone();
     let agent_mat = entity_render.agent_material.clone();
+    let dt_secs = time.delta_secs();
     for (&id, view) in &mirror.agents {
         let is_possessed = possessed_id == Some(id);
+        let tier = mirror.agent_tiers.get(&id).copied().unwrap_or(0);
+        let speed = mirror.agent_speed.get(&id).copied().unwrap_or(0.0);
+        let sample_tick = if tier == 2 {
+            render_tick - L2_EXTRA_DELAY_TICKS
+        } else {
+            render_tick
+        };
         let resolved = resolve_view(
             agents_buf,
-            render_tick,
+            sample_tick,
             id,
             view,
             !interp_enabled || is_possessed,
         );
-        let poses = if resolved.poses.len() == view.poses.len() {
-            &resolved.poses
+        let poses_out = {
+            let er = &mut *entity_render;
+            er.present.advance(
+                id,
+                &resolved,
+                tier,
+                speed,
+                er.table.def(&view.hash),
+                dt_secs,
+            )
+        };
+        let poses = if poses_out.len() == view.poses.len() {
+            &poses_out
         } else {
             &view.poses
         };
@@ -659,6 +685,289 @@ mod tests {
             app.world().resource::<Assets<Mesh>>().len(),
             baseline,
             "agent removed 后必须回收全部子 Mesh 句柄回到基线"
+        );
+    }
+
+    fn two_link_def() -> BodyDef {
+        let toml = r#"
+name = "two_link_render"
+[[links]]
+name = "base"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[links]]
+name = "leg"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+[[joints]]
+parent = "base"
+child = "leg"
+type = "revolute"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+child_anchor = [-1.0, 0.0, 0.0]
+default_angle = 0.0
+"#;
+        BodyDef::from_toml_str(toml).expect("two_link_render 合法")
+    }
+
+    fn fixed_dt(mut t: ResMut<Time>) {
+        t.advance_by(std::time::Duration::from_secs_f32(0.05));
+    }
+
+    fn setup_m04b2_app(def: &BodyDef, interp_enabled: bool) -> App {
+        let mut app = App::new();
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()));
+        app.init_asset::<Mesh>();
+        app.init_asset::<StandardMaterial>();
+        app.init_asset::<Image>();
+
+        let table = BodyShapeTable::from_defs([def]);
+        let defs_cloned = table.defs_cloned();
+        let render_res = {
+            let mut mats = app.world_mut().resource_mut::<Assets<StandardMaterial>>();
+            EntityRenderRes::from_table(table, &mut mats)
+        };
+        let mut mirror = EntityMirror::new();
+        mirror.set_defs(defs_cloned);
+
+        app.insert_resource(EntityMirrorRes(mirror))
+            .insert_resource(render_res)
+            .insert_resource(PossessRes::default())
+            .insert_resource(InterpRes::new(interp_enabled))
+            .add_systems(Update, (fixed_dt, sync_entities_system).chain());
+        app
+    }
+
+    fn assert_bevy_vec3_near(actual: Vec3, expected: Vec3, tol: f32, label: &str) {
+        let d = (actual - expected).abs();
+        assert!(
+            d.x <= tol && d.y <= tol && d.z <= tol,
+            "{label}: actual={actual:?}, expected={expected:?}, diff={d:?}, tol={tol}"
+        );
+    }
+
+    /// REQ-014 M04b-2 T16:Lite 静姿展开 spawn(N=2 连杆,2 Box 句柄)与摆腿 Transform 接线。
+    #[test]
+    fn m04b2_wiring_lite_swing_spawn() {
+        use sim_api::proto::LiteAgentPose;
+
+        let def = two_link_def();
+        let hash = def.hash();
+        let id = eid(101);
+        let mut app = setup_m04b2_app(&def, false);
+
+        {
+            let mut em = app.world_mut().resource_mut::<EntityMirrorRes>();
+            em.0.apply(&S2C::AgentMeta {
+                entries: vec![(id, hash)],
+            });
+            em.0.apply(&S2C::AgentStatesLite {
+                tick: Tick(1),
+                origin_chunk: [0u8; 8],
+                states: vec![LiteAgentPose {
+                    entity: id,
+                    rel_pos: [0x20, 0x80, 0x00, 0x80, 0x00, 0x80],
+                    yaw: [0x00, 0x00],
+                    motion_flags: 0x14,
+                }],
+                removed: vec![],
+                full: true,
+            });
+        }
+
+        app.update();
+
+        let (link0, link1, links_len, meshes_len) = {
+            let er = app.world().resource::<EntityRenderRes>();
+            let rec = er.agents.get(&id).expect("id 应已 spawn");
+            (
+                rec.links[0],
+                rec.links[1],
+                rec.links.len(),
+                rec.mesh_handles.len(),
+            )
+        };
+        assert_eq!(links_len, 2, "Lite 应展开 N=2 连杆");
+        assert_eq!(meshes_len, 2, "每连杆 1 Box,共 2 句柄");
+
+        let root_tf = app.world().get::<Transform>(link0).expect("root Transform");
+        let child_tf = app
+            .world()
+            .get::<Transform>(link1)
+            .expect("child Transform");
+        assert_bevy_vec3_near(
+            root_tf.translation,
+            conv::to_bevy_vec3(TVec3::new(1.0, 0.0, 0.0)),
+            1e-3,
+            "root tf",
+        );
+
+        let phase = std::f32::consts::PI / 8.0;
+        let theta = -0.35_f32 * phase.sin();
+        let expected_child = TVec3::new(1.0 + theta.cos(), 0.0, -theta.sin());
+        assert_bevy_vec3_near(
+            child_tf.translation,
+            conv::to_bevy_vec3(expected_child),
+            1e-3,
+            "child swing tf",
+        );
+    }
+
+    /// REQ-014 M04b-2 T17:tier 2 额外延迟 24 拍(L2_EXTRA_DELAY_TICKS)采样接线。
+    #[test]
+    fn m04b2_wiring_l2_delay() {
+        use sim_api::proto::LiteAgentPose;
+
+        let def = two_link_def();
+        let hash = def.hash();
+        let id = eid(102);
+        let mut app = setup_m04b2_app(&def, true);
+
+        // tick 60: root x=0, frozen(speed=0)
+        {
+            let mut em = app.world_mut().resource_mut::<EntityMirrorRes>();
+            em.0.apply(&S2C::AgentMeta {
+                entries: vec![(id, hash)],
+            });
+            em.0.apply(&S2C::AgentStatesLite {
+                tick: Tick(60),
+                origin_chunk: [0u8; 8],
+                states: vec![LiteAgentPose {
+                    entity: id,
+                    rel_pos: [0x00, 0x80, 0x00, 0x80, 0x00, 0x80],
+                    yaw: [0x00, 0x00],
+                    motion_flags: 0x80,
+                }],
+                removed: vec![],
+                full: true,
+            });
+            let snap60 = em.0.agents[&id].clone();
+            app.world_mut()
+                .resource_mut::<InterpRes>()
+                .agents
+                .push(60, id, snap60);
+        }
+
+        // tick 120: root x=60 (60*32+32768 = 34688 = 0x8780), frozen(speed=0)
+        {
+            let mut em = app.world_mut().resource_mut::<EntityMirrorRes>();
+            em.0.apply(&S2C::AgentStatesLite {
+                tick: Tick(120),
+                origin_chunk: [0u8; 8],
+                states: vec![LiteAgentPose {
+                    entity: id,
+                    rel_pos: [0x80, 0x87, 0x00, 0x80, 0x00, 0x80],
+                    yaw: [0x00, 0x00],
+                    motion_flags: 0x80,
+                }],
+                removed: vec![],
+                full: true,
+            });
+            let snap120 = em.0.agents[&id].clone();
+            let mut interp = app.world_mut().resource_mut::<InterpRes>();
+            interp.agents.push(120, id, snap120);
+            interp.clock.on_snapshot(120);
+        }
+
+        app.update();
+
+        let links = app.world().resource::<EntityRenderRes>().agents[&id]
+            .links
+            .clone();
+        let root_tf = app
+            .world()
+            .get::<Transform>(links[0])
+            .expect("root Transform");
+        assert_bevy_vec3_near(
+            root_tf.translation,
+            conv::to_bevy_vec3(TVec3::new(27.0, 0.0, 0.0)),
+            1e-3,
+            "L2 delay root tf",
+        );
+        let child_tf = app
+            .world()
+            .get::<Transform>(links[1])
+            .expect("child Transform");
+        assert_bevy_vec3_near(
+            child_tf.translation - root_tf.translation,
+            conv::to_bevy_vec3(TVec3::new(1.0, 0.0, 0.0)),
+            1e-6,
+            "L2 delay child rel tf",
+        );
+    }
+
+    /// REQ-014 M04b-2 T18:Compact tier 1 → Lite tier 2 换档触发 150ms 混合(dt=0.05 -> alpha=1/3)。
+    #[test]
+    fn m04b2_wiring_blend_trigger() {
+        use sim_api::proto::{CompactAgentPose, LiteAgentPose};
+
+        let def = two_link_def();
+        let hash = def.hash();
+        let id = eid(103);
+        let mut app = setup_m04b2_app(&def, false);
+
+        {
+            let mut em = app.world_mut().resource_mut::<EntityMirrorRes>();
+            em.0.apply(&S2C::AgentMeta {
+                entries: vec![(id, hash)],
+            });
+            em.0.apply(&S2C::AgentStatesCompact {
+                tick: Tick(1),
+                tier: 1,
+                states: vec![CompactAgentPose {
+                    entity: id,
+                    root_pos: [0.0, 0.0, 0.0],
+                    root_rot: [0x03, 0x00, 0x01, 0x80, 0x00, 0x40],
+                    root_linvel: [0u8; 6],
+                    child_links: vec![[
+                        0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x03, 0x00, 0x01, 0x80, 0x00, 0x40,
+                    ]],
+                }],
+                removed: vec![],
+                full: false,
+            });
+        }
+
+        app.update();
+        let link0 = app.world().resource::<EntityRenderRes>().agents[&id].links[0];
+        let root_tf0 = app.world().get::<Transform>(link0).expect("root tf0");
+        assert_bevy_vec3_near(
+            root_tf0.translation,
+            conv::to_bevy_vec3(TVec3::ZERO),
+            1e-3,
+            "tier1 初始 root x=0",
+        );
+
+        // 切到 Lite tier 2, root x=10 (10*32+32768 = 33088 = 0x8140), flags=0x80
+        {
+            let mut em = app.world_mut().resource_mut::<EntityMirrorRes>();
+            em.0.apply(&S2C::AgentStatesLite {
+                tick: Tick(2),
+                origin_chunk: [0u8; 8],
+                states: vec![LiteAgentPose {
+                    entity: id,
+                    rel_pos: [0x40, 0x81, 0x00, 0x80, 0x00, 0x80],
+                    yaw: [0x00, 0x00],
+                    motion_flags: 0x80,
+                }],
+                removed: vec![],
+                full: true,
+            });
+        }
+
+        app.update();
+        let link0 = app.world().resource::<EntityRenderRes>().agents[&id].links[0];
+        let root_tf1 = app.world().get::<Transform>(link0).expect("root tf1");
+        assert_bevy_vec3_near(
+            root_tf1.translation,
+            conv::to_bevy_vec3(TVec3::new(10.0 / 3.0, 0.0, 0.0)),
+            1e-3,
+            "tier 1->2 换档混合 alpha=1/3",
         );
     }
 }

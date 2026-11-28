@@ -269,7 +269,7 @@ pub fn pack_lite(
     let origin = Vec3::new(cx as f32 * 16.0, 0.0, cz as f32 * 16.0);
     let rel = root.translation - origin;
     let forward = root.rotation * Vec3::X;
-    let yaw = forward.z.atan2(forward.x);
+    let yaw = (-forward.z).atan2(forward.x);
     let horizontal_speed = (root.linvel.x * root.linvel.x + root.linvel.z * root.linvel.z).sqrt();
     LiteAgentPose {
         entity,
@@ -588,7 +588,7 @@ mod tests {
         let pose = pack_lite(entity, &root, -3, 7, true);
         assert_eq!(pose.entity, entity);
         assert_eq!(pose.rel_pos, [0x30, 0x80, 0xB8, 0x7F, 0x30, 0x80]);
-        assert_eq!(pose.yaw, [0x00, 0xC0]);
+        assert_eq!(pose.yaw, [0x00, 0x40]); // R1:yaw=真实 Y 旋转角(原 atan2(z,x) 符号反,架构师 M04b-1 公式错误)
         assert_eq!(pose.motion_flags, 0x94);
         assert_eq!(
             quant::pack_origin_chunk(-3, 7),
