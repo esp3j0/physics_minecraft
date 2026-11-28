@@ -905,6 +905,8 @@ pub struct ObserveOrchestrator {
     /// `C2S::SpawnAgent`(含重生)接受后待挂载默认策略的主体队列;
     /// 驱动每拍循环在 `startup.poll` 之后、`drive_policies` 之前按 EntityId 升序排空。
     pending_policy_attach: Vec<(types::EntityId, crate::controller::PolicyKey)>,
+    /// 断线时移除失败的玩家身体待清理队列(REQ-014 M03 F4:下拍重试,绝不 panic)。
+    pending_disconnect_bodies: BTreeMap<messaging::InputSource, types::EntityId>,
     /// 节奏副本(输出点用)。
     _cadence: ObserveCadence,
 }
@@ -960,6 +962,10 @@ pub struct AgentCounters {
     /// 关节目标被钳制个数的累计(B04 第 1 节 AC-B5;同上
     /// `agent_joint_targets_clamped`)。
     pub joint_targets_clamped: u64,
+    /// 待清理队列每拍重试的尝试次数(REQ-014 M03 F4;首次尝试不计)。
+    pub disconnect_cleanup_retries: u64,
+    /// 重试时发现实体已彻底消失(非在途)而销账的次数(REQ-014 M03 F4)。
+    pub disconnect_cleanup_gone: u64,
 }
 
 impl std::ops::Add for AgentCounters {
@@ -984,13 +990,16 @@ impl std::ops::Add for AgentCounters {
             agent_woken: self.agent_woken + rhs.agent_woken,
             joint_targets_rejected: self.joint_targets_rejected + rhs.joint_targets_rejected,
             joint_targets_clamped: self.joint_targets_clamped + rhs.joint_targets_clamped,
+            disconnect_cleanup_retries: self.disconnect_cleanup_retries
+                + rhs.disconnect_cleanup_retries,
+            disconnect_cleanup_gone: self.disconnect_cleanup_gone + rhs.disconnect_cleanup_gone,
         }
     }
 }
 
 /// `Add` 逐字段(B04 第 4 节第 6 条):漏加任何字段(含 B04 新增的
-/// joint_targets_rejected/clamped)即红——右侧每字段 +1,左侧每字段 1,
-/// 和必须 == 2。
+/// joint_targets_rejected/clamped 与 M03 新增的 disconnect_cleanup_retries/gone)
+/// 即红——右侧每字段 +1,左侧每字段 1,和必须 == 2。
 #[test]
 fn agent_counters_add_covers_every_field() {
     let one = AgentCounters {
@@ -1010,6 +1019,8 @@ fn agent_counters_add_covers_every_field() {
         agent_woken: 1,
         joint_targets_rejected: 1,
         joint_targets_clamped: 1,
+        disconnect_cleanup_retries: 1,
+        disconnect_cleanup_gone: 1,
     };
     let sum = one + one;
     assert_eq!(sum.spawn_rejected, 2);
@@ -1028,6 +1039,8 @@ fn agent_counters_add_covers_every_field() {
     assert_eq!(sum.agent_woken, 2);
     assert_eq!(sum.joint_targets_rejected, 2);
     assert_eq!(sum.joint_targets_clamped, 2);
+    assert_eq!(sum.disconnect_cleanup_retries, 2);
+    assert_eq!(sum.disconnect_cleanup_gone, 2);
 }
 
 /// 外部 spawn 请求(REQ-006 任务 02;降低 handler 参数)。
@@ -1072,6 +1085,7 @@ impl ObserveOrchestrator {
             agent_counters: AgentCounters::default(),
             default_policy: None,
             pending_policy_attach: Vec::new(),
+            pending_disconnect_bodies: BTreeMap::new(),
             _cadence: cadence,
         }
     }
@@ -1634,6 +1648,54 @@ impl ObserveOrchestrator {
         }
     }
 
+    /// 断线身体移除尝试(F4):成功入日志+计数+销账;失败时实体已彻底消失
+    /// (owner 查不到且不在途)→ 销账计 gone;否则(收件箱满/迁移窗口)挂待清理队列。
+    fn try_remove_disconnect_body(
+        &mut self,
+        player: messaging::InputSource,
+        body: types::EntityId,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        let cmd = messaging::SimCommand::RemoveEntity { entity: body };
+        match session.send_to_entity(player, body, cmd) {
+            Ok(entry) => {
+                log.append(entry);
+                self.agent_counters.bodies_removed_on_disconnect += 1;
+                self.pending_disconnect_bodies.remove(&player);
+            }
+            Err(_) => {
+                let in_transit = session.in_transit_entities().contains(&body);
+                if session.entity_owner(body).is_none() && !in_transit {
+                    self.pending_disconnect_bodies.remove(&player);
+                    self.agent_counters.disconnect_cleanup_gone += 1;
+                } else {
+                    self.pending_disconnect_bodies.insert(player, body);
+                }
+            }
+        }
+    }
+
+    /// 每拍重试断线身体移除(F4):session.tick() 之后、net up 消费之前调用。
+    pub(crate) fn retry_disconnect_cleanup(
+        &mut self,
+        session: &mut sim_api::session::Session,
+        log: &mut sim_api::log::CommandLog,
+    ) {
+        if self.pending_disconnect_bodies.is_empty() {
+            return;
+        }
+        let pending: Vec<(messaging::InputSource, types::EntityId)> = self
+            .pending_disconnect_bodies
+            .iter()
+            .map(|(&p, &e)| (p, e))
+            .collect();
+        for (player, body) in pending {
+            self.agent_counters.disconnect_cleanup_retries += 1;
+            self.try_remove_disconnect_body(player, body, session, log);
+        }
+    }
+
     /// 断线处理(§5,D12;`NetUp::Left` 分支调用):先解除附身;再移除该
     /// 连接名下的玩家身体(经日志的 RemoveEntity,内核走 despawn_agent);
     /// 被它附身的服务端主体保留,并收到一条零意图。
@@ -1650,24 +1712,16 @@ impl ObserveOrchestrator {
         if let Some(entity) = self.possessed_by.get(&player).copied() {
             self.unpossess_entity(player, entity, session, log);
         }
-        // ② 移除玩家身体(经日志;内核走 despawn_agent,不留残余)。
+        // ② 移除玩家身体(经日志;内核走 despawn_agent,不留残余;F4:失败挂待清理队列,绝不 panic)。
         if let Some(body) = self.player_body_of(session, player) {
-            let cmd = messaging::SimCommand::RemoveEntity { entity: body };
-            // 玩家身体的 owner.source = 该玩家;经 send_to_entity 按当前
-            // owner 投(§4 路由口径)。
-            match session.send_to_entity(player, body, cmd) {
-                Ok(entry) => log.append(entry),
-                Err(other) => panic!("断线移除玩家身体失败(非预期):{other:?}"),
-            }
-            self.agent_counters.bodies_removed_on_disconnect += 1;
+            self.try_remove_disconnect_body(player, body, session, log);
         }
         // ②.5 出生点与身体归属清掉(A06 §6:断线连接的出生点不再有效;
         // 重连是新连接、新身体,由新 SpawnAgent 重建)。
         self.respawn.on_disconnect(player);
-        // ③ 观察者移除(既有语义:断连票撤,幂等)。
-        match session.remove_observer_from(player) {
-            Ok(entry) => log.append(entry),
-            Err(other) => panic!("观察者移除失败(非预期):{other:?}"),
+        // ③ 观察者移除(既有语义:断连票撤,幂等;F4:绝不 panic)。
+        if let Ok(entry) = session.remove_observer_from(player) {
+            log.append(entry);
         }
     }
 
@@ -3028,6 +3082,7 @@ pub async fn run(args: DriverArgs) -> DriverOutcome {
                 // Welcome)。try_recv 排空(不新增 select 臂,细则 5);
                 // observe 关闭时整段跳过(既有行为不变)。
                 if let Some((orchestrator, up, hub, cadence)) = observe_state.as_mut() {
+                    orchestrator.retry_disconnect_cleanup(&mut session, &mut log);
                     while let Ok(event) = up.try_recv() {
                         // chunk 流请求(任务 02 泵上行,NetUp::DriverCommand
                         // 载体)→ 挂起队列,编排 ④ 处理(既有路径);其余
@@ -9418,5 +9473,224 @@ mod tests {
 
         tx.send(DriverCommand::Shutdown).await.expect("驱动关机");
         driver.await.expect("驱动不 panic");
+    }
+
+    /// REQ-014 M03 T4(F4 收件箱满断线 → 重试成功):
+    /// `inbox_capacity = 1`,客户端 spawn 玩家身体后单批发送 `[Command(SetBlock), Goodbye]`,
+    /// 同轮先投 SetBlock 填满收件箱,紧随 Left 触发 send_to_entity 收件箱满错 → 挂待清理队列
+    /// (绝不 panic),下拍 tick 排空收件箱后 `retry_disconnect_cleanup` 重试成功。
+    #[tokio::test(start_paused = true)]
+    async fn m03_t4_disconnect_inbox_full_retries() {
+        let mut config = observe_config();
+        config.inbox_capacity = 1;
+        let (mut args, tx, _hub, addr, _checkpoints) = observe_harness(config.clone()).await;
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        args.bodies = bodies.clone();
+        let sim_source = config.clone();
+        args.new_sim = Box::new(move |shard: types::ShardId| {
+            let mut sim_cfg = sim_source.shard_sim_config(shard);
+            sim_cfg.gravity = Vec3::ZERO;
+            sim_cfg.solidify.displacement_gate_m = 0.0;
+            physics_sim::ShardSim::new_with_bodies(
+                sim_cfg,
+                Box::new(SimpleRegistry::builtin()),
+                bodies.clone(),
+            )
+        });
+        let driver = tokio::spawn(run(args));
+
+        let mut c = MiniClient::connect(addr).await.expect("客户端连入");
+        let _player = join_player(&mut c, 3).await;
+        c.send(&C2S::MoveObserver {
+            position: Vec3::new(8.0, 3.0, 8.0),
+        })
+        .await
+        .expect("MoveObserver 写入");
+        std::thread::sleep(Duration::from_millis(1));
+        tokio::task::yield_now().await;
+        advance_ticks(3).await;
+
+        c.send(&C2S::SpawnAgent {
+            body: "capsule".to_string(),
+            position: Vec3::new(8.0, 3.0, 8.0),
+            yaw: 0.0,
+        })
+        .await
+        .expect("SpawnAgent 写入");
+        let mut spawned = None;
+        for _ in 0..128 {
+            match tokio::time::timeout(Duration::from_millis(50), c.recv()).await {
+                Ok(Ok(S2C::Spawned { entity })) => {
+                    spawned = Some(entity);
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(err)) => panic!("等 Spawned 期间读失败:{err}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+        assert!(spawned.is_some(), "SpawnAgent 必须收到 Spawned 回执");
+        advance_ticks(3).await;
+
+        // 单批发 [SetBlock, Goodbye]:同一轮 TCP 读入并排空至驱动 up 通道,
+        // SetBlock 填满容量 1 的收件箱,紧随 Left 触发收件箱满 → 挂待清理队列。
+        c.send_batch(&[
+            C2S::Command(messaging::SimCommand::SetBlock {
+                pos: types::BlockPos::new(10, 3, 10),
+                block: types::BlockId(1),
+            }),
+            C2S::Goodbye,
+        ])
+        .await
+        .expect("单批发送 SetBlock + Goodbye");
+        assert!(c.is_disconnected().await, "Goodbye 后服务端应正常收口连接");
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        advance_ticks(3).await;
+
+        tx.send(DriverCommand::Shutdown)
+            .await
+            .expect("驱动未 panic 死亡");
+        let outcome = driver.await.expect("驱动正常返回(绝不 panic)");
+        assert_eq!(
+            outcome.agent.bodies_removed_on_disconnect, 1,
+            "下拍重试后断线移除玩家身体计数必须 == 1"
+        );
+        assert!(
+            outcome.agent.disconnect_cleanup_retries >= 1,
+            "必须至少触发 1 次待清理重试,实为 {}",
+            outcome.agent.disconnect_cleanup_retries
+        );
+        assert_eq!(
+            outcome.agent.disconnect_cleanup_gone, 0,
+            "重试成功场景 gone 计数必须 == 0"
+        );
+    }
+
+    /// REQ-014 M03 T5(F4 同步单测:重试成功与实体已消失两分支)。
+    #[test]
+    fn m03_t5_cleanup_retry_and_gone() {
+        let config = test_config(600);
+        let bodies = {
+            let mut b = physics_sim::BodyRegistry::new();
+            b.insert_toml(include_str!("../../../assets/bodies/capsule.body.toml"))
+                .expect("capsule 合法");
+            b
+        };
+        let hash = bodies.hash_of("capsule").expect("capsule 已装");
+        let mut session = sim_api::session::Session::new(config.session_config());
+        session.register(physics_sim::ShardSim::new_with_bodies(
+            {
+                let mut cfg = physics_sim::ShardSimConfig::new(shard_id(0, 0));
+                cfg.solidify.enabled = false;
+                cfg.cohesion.enabled = false;
+                cfg
+            },
+            Box::new(SimpleRegistry::builtin()),
+            bodies,
+        ));
+        let cadence = ObserveCadence {
+            interval_ticks: 3,
+            full_interval_ticks: 9,
+        };
+        let mut orchestrator = ObserveOrchestrator::new(cadence, 0);
+        let mut log = sim_api::log::CommandLog::new();
+
+        // A: 重试成功分支
+        let body1 = EntityId::from_parts(0, 1);
+        session
+            .spawn_agent_from(
+                messaging::InputSource(1),
+                shard_id(0, 0),
+                body1,
+                hash,
+                EntityState {
+                    translation: Vec3::new(12.0, 1.95, 12.0),
+                    ..EntityState::default()
+                },
+            )
+            .expect("spawn body1");
+        session.tick();
+        assert!(
+            session.entity_owner(body1).is_some(),
+            "body1 tick 后应已认领 ownership"
+        );
+        orchestrator
+            .pending_disconnect_bodies
+            .insert(messaging::InputSource(1), body1);
+        orchestrator.retry_disconnect_cleanup(&mut session, &mut log);
+        assert!(
+            orchestrator.pending_disconnect_bodies.is_empty(),
+            "A: 重试成功后待清理队列必空"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.bodies_removed_on_disconnect, 1,
+            "A: bodies_removed_on_disconnect == 1"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.disconnect_cleanup_retries, 1,
+            "A: disconnect_cleanup_retries == 1"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.disconnect_cleanup_gone, 0,
+            "A: disconnect_cleanup_gone == 0"
+        );
+
+        // B: 实体已消失分支
+        let body2 = EntityId::from_parts(0, 2);
+        session
+            .spawn_agent_from(
+                messaging::InputSource(2),
+                shard_id(0, 0),
+                body2,
+                hash,
+                EntityState {
+                    translation: Vec3::new(16.0, 1.95, 16.0),
+                    ..EntityState::default()
+                },
+            )
+            .expect("spawn body2");
+        session.tick();
+        assert!(
+            session.entity_owner(body2).is_some(),
+            "body2 tick 后应已认领 ownership"
+        );
+        orchestrator
+            .pending_disconnect_bodies
+            .insert(messaging::InputSource(2), body2);
+        session
+            .send(
+                shard_id(0, 0),
+                messaging::SimCommand::RemoveEntity { entity: body2 },
+            )
+            .expect("投递 RemoveEntity 移除 body2");
+        session.tick();
+        assert!(
+            session.entity_owner(body2).is_none(),
+            "body2 移除 tick 后 owner 应已消失"
+        );
+        orchestrator.retry_disconnect_cleanup(&mut session, &mut log);
+        assert!(
+            orchestrator.pending_disconnect_bodies.is_empty(),
+            "B: 实体已消失销账后待清理队列必空"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.disconnect_cleanup_gone, 1,
+            "B: disconnect_cleanup_gone == 1"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.bodies_removed_on_disconnect, 1,
+            "B: bodies_removed_on_disconnect 仍 == 1"
+        );
+        assert_eq!(
+            orchestrator.agent_counters.disconnect_cleanup_retries, 2,
+            "B: disconnect_cleanup_retries == 2"
+        );
     }
 }

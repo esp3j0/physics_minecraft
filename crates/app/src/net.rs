@@ -1766,6 +1766,18 @@ pub(crate) mod tests {
             }
         }
 
+        /// 批原子发送(REQ-014 M03 §2.4):逐帧编码拼接后单次 write_all 发出(同 client-core 泵口径)。
+        pub(crate) async fn send_batch(&mut self, msgs: &[C2S]) -> io::Result<()> {
+            let mut batch = Vec::with_capacity(msgs.len() * 16);
+            for msg in msgs {
+                batch.extend_from_slice(&encode_c2s_frame(msg));
+            }
+            match tokio::time::timeout(net_timeout(), self.stream.write_all(&batch)).await {
+                Ok(r) => r,
+                Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "写超时(对端不读)")),
+            }
+        }
+
         /// 原始字节写(半帧/粘包测试用)。
         pub(crate) async fn send_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
             self.stream.write_all(bytes).await
@@ -4286,5 +4298,45 @@ pub(crate) mod tests {
         let _ = tokio::time::timeout(net_timeout(), merger)
             .await
             .expect("shutdown 后 merger 退出");
+    }
+
+    /// REQ-014 M03 T8(MF 服务器切帧多帧排空锚):
+    /// 单缓冲拼接 Ping + Goodbye + Ping + 第四帧前 3 字节(半帧),循环 cut_frame +
+    /// drain 直到 NeedMore:恰切出 3 帧且逐位还原,剩余缓冲精确保留半帧 3 字节。
+    #[test]
+    fn m03_t8_cut_frame_multi_frame_drain() {
+        let f1 = encode_c2s_frame(&C2S::Ping);
+        let f2 = encode_c2s_frame(&C2S::Goodbye);
+        let f3 = encode_c2s_frame(&C2S::Ping);
+        let f4 = encode_c2s_frame(&C2S::Ping);
+        assert!(f4.len() >= 3, "完整帧长度至少 4 字节");
+        let tail = f4[..3].to_vec();
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&f1);
+        buf.extend_from_slice(&f2);
+        buf.extend_from_slice(&f3);
+        buf.extend_from_slice(&tail);
+
+        let mut decoded = Vec::new();
+        for _ in 0..16 {
+            match cut_frame(&buf) {
+                Cut::Frame(raw, consumed) => {
+                    buf.drain(..consumed);
+                    let msg =
+                        sim_api::proto::decode_c2s_frame(&raw).expect("切出的完整帧必须可解码");
+                    decoded.push(msg);
+                }
+                Cut::NeedMore => break,
+                Cut::Oversized => panic!("合法多帧缓冲不应触发 Oversized"),
+            }
+        }
+
+        assert_eq!(
+            decoded,
+            vec![C2S::Ping, C2S::Goodbye, C2S::Ping],
+            "必须恰切出 3 帧且依次为 Ping / Goodbye / Ping"
+        );
+        assert_eq!(buf, tail, "剩余缓冲必须精确保留半帧前 3 字节(不吞不吐)");
     }
 }

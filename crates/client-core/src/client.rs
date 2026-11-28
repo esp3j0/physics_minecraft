@@ -462,11 +462,13 @@ impl ViewerClient {
 /// 原始协议收发泵(REQ-014 M01 §2.1;`ViewerClient` 与 `NetTransport` 共用):
 /// `select!(biased)` 同等 socket 读 / `up_rx` 上行批 / 3s Ping 心跳;
 /// 下行直接输出原始 `S2C`(满则阻塞,宁慢不丢),任何断连路径均发 `S2C::Bye` 后收口。
-pub(crate) async fn run_raw_pump(
-    mut stream: TcpStream,
+pub(crate) async fn run_raw_pump<S>(
+    mut stream: S,
     mut up_rx: tokio::sync::mpsc::Receiver<Vec<C2S>>,
     down_tx: std_mpsc::SyncSender<S2C>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let mut buf: Vec<u8> = Vec::with_capacity(READ_CHUNK * 2);
     let mut chunk = vec![0u8; READ_CHUNK];
 
@@ -550,12 +552,14 @@ pub(crate) async fn run_raw_pump(
 
 /// 发 `C2S::Goodbye` 后的收口读循环:继续读直到收到 `S2C::Bye`、EOF/IO 错或 2s 超时;
 /// 若未从对端收到 `Bye` 则合成 `S2C::Bye { reason: "goodbye" }` 后返回。
-async fn finish_after_goodbye(
-    stream: &mut TcpStream,
+async fn finish_after_goodbye<S>(
+    stream: &mut S,
     buf: &mut Vec<u8>,
     chunk: &mut [u8],
     down_tx: &std_mpsc::SyncSender<S2C>,
-) {
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     let delivered_bye = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             while let Some(frame) = try_cut_frame(buf) {
@@ -589,7 +593,10 @@ async fn finish_after_goodbye(
 }
 
 /// 单帧写全(socket 半写由 write_all 兜住)。
-async fn write_all(stream: &mut TcpStream, frame: &[u8]) -> io::Result<()> {
+async fn write_all<S>(stream: &mut S, frame: &[u8]) -> io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     stream.write_all(frame).await?;
     stream.flush().await
 }
@@ -980,5 +987,90 @@ mod tests {
             }]
         );
         assert_eq!(control_to_c2s(Control::Goodbye), vec![C2S::Goodbye]);
+    }
+
+    /// REQ-014 M03 T7(MF 上行批单次 write_all 边界锚):
+    /// `up_tx` 发送一条含 3 个 Ping 的批消息,记录器断言恰触发 1 次 `poll_write`,
+    /// 且字节与 3 帧顺序拼接逐位相同;关闭 `up_tx` 后泵写出恰 1 条 Goodbye 并正常收口。
+    #[tokio::test(start_paused = true)]
+    async fn m03_t7_up_batch_single_write() {
+        use std::pin::Pin;
+        use std::sync::{Arc, Mutex};
+        use std::task::{Context, Poll};
+
+        struct WriteRecorder {
+            writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        }
+
+        impl tokio::io::AsyncWrite for WriteRecorder {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                self.writes.lock().expect("writes lock").push(buf.to_vec());
+                Poll::Ready(Ok(buf.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        let writes: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorder = WriteRecorder {
+            writes: writes.clone(),
+        };
+        let (duplex_read, _duplex_keep_alive) = tokio::io::duplex(4096);
+        let io = tokio::io::join(duplex_read, recorder);
+        let (up_tx, up_rx) = tokio::sync::mpsc::channel(4);
+        let (down_tx, _down_rx) = std_mpsc::sync_channel(16);
+
+        let task = tokio::spawn(run_raw_pump(io, up_rx, down_tx));
+
+        up_tx
+            .send(vec![C2S::Ping, C2S::Ping, C2S::Ping])
+            .await
+            .expect("发送三帧批消息");
+
+        let mut seen = false;
+        for _ in 0..500 {
+            if !writes.lock().expect("writes lock").is_empty() {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(seen, "上行批未写出");
+        tokio::task::yield_now().await;
+
+        let snapshot = writes.lock().expect("writes lock").clone();
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "锚 A: 一条消息三帧必须恰 1 次 write_all,实为 {} 次",
+            snapshot.len()
+        );
+        let expected: Vec<u8> = [C2S::Ping, C2S::Ping, C2S::Ping]
+            .iter()
+            .flat_map(encode_c2s_frame)
+            .collect();
+        assert_eq!(
+            snapshot[0], expected,
+            "锚 B: 单次写入字节必须与三帧 Ping 顺序拼接逐位相同"
+        );
+
+        drop(up_tx);
+        task.await.expect("run_raw_pump 正常收口");
+        drop(_duplex_keep_alive);
+
+        let all_writes = writes.lock().expect("writes lock");
+        let goodbye = encode_c2s_frame(&C2S::Goodbye);
+        let goodbye_count = all_writes.iter().filter(|w| **w == goodbye).count();
+        assert_eq!(goodbye_count, 1, "收尾 Goodbye 帧应恰 1 条");
     }
 }
