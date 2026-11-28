@@ -294,8 +294,13 @@ pub fn s2c_to_event(s2c: S2C) -> Option<ViewEvent> {
             full,
         }),
         S2C::Possessed { entity } => Some(ViewEvent::Possessed { entity }),
-        // 多人预留包(REQ-013 §3.3)与性能遥测包(C01b-3;仅 bevy client 消费,viewer 不消费)。
-        S2C::InputAck { .. } | S2C::Correction { .. } | S2C::PerfStats { .. } => None,
+        // 多人预留包(REQ-013 §3.3)、性能遥测包(C01b-3)与 LOD 新流(REQ-014 M04a 只落 schema,M04b 接线)。
+        S2C::InputAck { .. }
+        | S2C::Correction { .. }
+        | S2C::PerfStats { .. }
+        | S2C::AgentMeta { .. }
+        | S2C::AgentStatesCompact { .. }
+        | S2C::AgentStatesLite { .. } => None,
     }
 }
 

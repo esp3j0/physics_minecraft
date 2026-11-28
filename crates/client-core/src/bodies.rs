@@ -5,7 +5,8 @@
 
 use std::collections::BTreeMap;
 
-use types::{BodyDef, BodyHash, ShapeDef};
+use types::glam::{Quat, Vec3};
+use types::{BodyDef, BodyHash, JointKind, ShapeDef};
 
 /// 一个连杆的渲染形状(世界系,连杆局部系;格 = 米)。B01a:每个变体带
 /// `offset`(形状在连杆局部系里的平移,缺省零——quad 脚球挂在小腿末端)。
@@ -149,6 +150,53 @@ fn load_defs(dir: &std::path::Path) -> Vec<BodyDef> {
     defs
 }
 
+/// 静态前向运动学(REQ-014 §4 Lite 视觉退化):按 joints default_angle
+/// 展开各连杆**根相对**位姿,返回长度 = def.links.len(),下标 0 =
+/// (Vec3::ZERO, Quat::IDENTITY)。纯函数,无缓存(接线 M04b)。
+pub fn static_link_transforms(def: &BodyDef) -> Vec<(Vec3, Quat)> {
+    if def.links.is_empty() {
+        return Vec::new();
+    }
+    let mut index_by_name: BTreeMap<&str, usize> = BTreeMap::new();
+    index_by_name.insert(def.links[0].name.as_str(), 0);
+    let mut out = Vec::with_capacity(def.links.len());
+    out.push((Vec3::ZERO, Quat::IDENTITY));
+
+    for (i, link) in def.links.iter().enumerate().skip(1) {
+        let joint = def
+            .joints
+            .iter()
+            .find(|j| j.child == link.name)
+            .expect("非根连杆必为某关节的 child(validate 保证)");
+        let parent_i = index_by_name[joint.parent.as_str()];
+        let (parent_pos, parent_rot) = out[parent_i];
+        let params = joint.kind.params();
+        let anchor = Vec3::from_array(params.anchor);
+        let child_anchor = Vec3::from_array(params.child_anchor);
+        let theta = params.default_angle.unwrap_or(0.0);
+
+        let (local_pos, local_rot) = match joint.kind {
+            JointKind::Revolute(_) => {
+                let axis = Vec3::from_array(params.axis).normalize();
+                let r = Quat::from_axis_angle(axis, theta);
+                (anchor + r * (-child_anchor), r)
+            }
+            JointKind::Prismatic(_) => {
+                let axis = Vec3::from_array(params.axis).normalize();
+                (anchor + axis * theta - child_anchor, Quat::IDENTITY)
+            }
+            JointKind::Fixed(_) => (anchor - child_anchor, Quat::IDENTITY),
+        };
+
+        let rel_pos = parent_pos + parent_rot * local_pos;
+        let rel_rot = parent_rot * local_rot;
+        out.push((rel_pos, rel_rot));
+        index_by_name.insert(link.name.as_str(), i);
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +290,181 @@ anchor = [0, 0, 0]
         assert_eq!(links.len(), 2);
         assert_eq!(links[0], vec![LinkShape::Box([0.1, 0.1, 0.1], [0.0; 3])]);
         assert_eq!(links[1], vec![LinkShape::Sphere(0.2, [0.0; 3])]);
+    }
+
+    fn assert_vec3_near(actual: Vec3, expected: Vec3, tol: f32, label: &str) {
+        let diff = (actual - expected).abs();
+        assert!(
+            diff.x <= tol && diff.y <= tol && diff.z <= tol,
+            "{label} 位置超容差 {tol}: actual={actual:?}, expected={expected:?}, diff={diff:?}"
+        );
+    }
+
+    fn assert_quat_near(actual: Quat, expected: Quat, tol: f32, label: &str) {
+        let dx = (actual.x - expected.x).abs();
+        let dy = (actual.y - expected.y).abs();
+        let dz = (actual.z - expected.z).abs();
+        let dw = (actual.w - expected.w).abs();
+        assert!(
+            dx <= tol && dy <= tol && dz <= tol && dw <= tol,
+            "{label} 旋转超容差 {tol}: actual={actual:?}, expected={expected:?}"
+        );
+    }
+
+    /// REQ-014 M04a T7:合成 5 连杆(revolute/prismatic/fixed)+ capsule 资产静姿 FK 单测。
+    #[test]
+    fn m04a_t7_fk_synthetic() {
+        let toml = r#"
+name = "fk_synth"
+
+[[links]]
+name = "root"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+
+[[links]]
+name = "a"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+
+[[links]]
+name = "b"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+
+[[links]]
+name = "c"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+
+[[links]]
+name = "d"
+mass = 1.0
+[[links.shapes]]
+kind = "box"
+half = [0.1, 0.1, 0.1]
+
+[[joints]]
+parent = "root"
+child = "a"
+type = "revolute"
+axis = [0.0, 0.0, 1.0]
+anchor = [1.0, 0.0, 0.0]
+limits = { lower = -3.2, upper = 3.2 }
+default_angle = 1.5707963267948966
+
+[[joints]]
+parent = "a"
+child = "b"
+type = "revolute"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 1.0, 0.0]
+limits = { lower = -3.2, upper = 3.2 }
+default_angle = 0.0
+
+[[joints]]
+parent = "root"
+child = "c"
+type = "prismatic"
+axis = [0.0, 1.0, 0.0]
+anchor = [0.0, 0.0, 0.0]
+limits = { lower = -1.0, upper = 1.0 }
+default_angle = 0.5
+
+[[joints]]
+parent = "root"
+child = "d"
+type = "fixed"
+axis = [1.0, 0.0, 0.0]
+anchor = [0.0, 0.0, 1.0]
+default_angle = 1.0
+"#;
+        let def = BodyDef::from_toml_str(toml).expect("fk_synth 定义合法");
+        let xf = static_link_transforms(&def);
+        assert_eq!(xf.len(), 5, "5 连杆");
+
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        let rz90 = Quat::from_xyzw(0.0, 0.0, s, s);
+
+        assert_eq!(xf[0], (Vec3::ZERO, Quat::IDENTITY), "root 恒等");
+        assert_vec3_near(xf[1].0, Vec3::new(1.0, 0.0, 0.0), 1e-5, "link a");
+        assert_quat_near(xf[1].1, rz90, 1e-5, "link a");
+        assert_vec3_near(xf[2].0, Vec3::ZERO, 1e-5, "link b");
+        assert_quat_near(xf[2].1, rz90, 1e-5, "link b");
+        assert_eq!(
+            xf[3],
+            (Vec3::new(0.0, 0.5, 0.0), Quat::IDENTITY),
+            "link c prismatic 精确"
+        );
+        assert_vec3_near(xf[4].0, Vec3::new(0.0, 0.0, 1.0), 1e-5, "link d fixed");
+        assert_quat_near(xf[4].1, Quat::IDENTITY, 1e-5, "link d fixed 忽略 θ");
+
+        let cap_def = BodyDef::from_toml_str(CAPSULE_TOML).expect("capsule 合法");
+        let cap_xf = static_link_transforms(&cap_def);
+        assert_eq!(
+            cap_xf,
+            vec![(Vec3::ZERO, Quat::IDENTITY)],
+            "capsule 单连杆恒等"
+        );
+    }
+
+    /// REQ-014 M04a T8:quad 资产 13 连杆静姿 FK 数值校验(leg0 + leg1 镜像)。
+    #[test]
+    fn m04a_t8_fk_quad_asset() {
+        const QUAD_TOML: &str = include_str!("../../../assets/bodies/quad.body.toml");
+        let def = BodyDef::from_toml_str(QUAD_TOML).expect("quad 合法");
+        let xf = static_link_transforms(&def);
+        assert_eq!(xf.len(), 13, "quad 13 连杆");
+        assert_eq!(xf[0], (Vec3::ZERO, Quat::IDENTITY), "根连杆恒等");
+        for (i, &(p, q)) in xf.iter().enumerate() {
+            assert!(p.is_finite() && q.is_finite(), "连杆 {i} 位姿必须有限");
+        }
+
+        let thigh_rot = Quat::from_xyzw(0.0, 0.0, -0.41395834, 0.91029583);
+        let shank_rot = Quat::from_xyzw(0.0, 0.0, 0.41395834, 0.91029583);
+
+        // leg0: links 1/2/3
+        assert_vec3_near(xf[1].0, Vec3::new(0.1934, 0.0, -0.09425), 1e-5, "leg0 hip");
+        assert_quat_near(xf[1].1, Quat::IDENTITY, 1e-5, "leg0 hip");
+        assert_vec3_near(
+            xf[2].0,
+            Vec3::new(0.11313637, -0.07, -0.142),
+            1e-5,
+            "leg0 thigh",
+        );
+        assert_quat_near(xf[2].1, thigh_rot, 1e-5, "leg0 thigh");
+        assert_vec3_near(
+            xf[3].0,
+            Vec3::new(0.11313637, -0.21, -0.142),
+            1e-5,
+            "leg0 shank",
+        );
+        assert_quat_near(xf[3].1, shank_rot, 1e-5, "leg0 shank");
+
+        // leg1 镜像: links 4/5/6
+        assert_vec3_near(xf[4].0, Vec3::new(0.1934, 0.0, 0.09425), 1e-5, "leg1 hip");
+        assert_quat_near(xf[4].1, Quat::IDENTITY, 1e-5, "leg1 hip");
+        assert_vec3_near(
+            xf[5].0,
+            Vec3::new(0.11313637, -0.07, 0.142),
+            1e-5,
+            "leg1 thigh",
+        );
+        assert_quat_near(xf[5].1, thigh_rot, 1e-5, "leg1 thigh");
+        assert_vec3_near(
+            xf[6].0,
+            Vec3::new(0.11313637, -0.21, 0.142),
+            1e-5,
+            "leg1 shank",
+        );
+        assert_quat_near(xf[6].1, shank_rot, 1e-5, "leg1 shank");
     }
 }

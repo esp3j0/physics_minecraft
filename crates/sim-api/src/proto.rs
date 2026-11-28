@@ -186,6 +186,30 @@ pub enum S2C {
         /// 单次策略推理最大耗时(微秒)。
         policy_max_us: u64,
     },
+    /// 主体形状元数据(REQ-014 §5;判别值 15):首入视野前发送 + 全量周期
+    /// 重发自愈;稳态 Compact/Lite 姿态包不再重复携带 BodyHash。
+    AgentMeta {
+        entries: Vec<(EntityId, types::BodyHash)>,
+    },
+    /// 紧凑主体姿态流(REQ-014 §5;判别值 16):L0(tier=0)/L1(tier=1)。
+    /// child_links 按 BodyDef.links[1..] 顺序、根相对位姿量化;
+    /// full 语义分档(只清本 tier 条目,M04b 落客户端)。
+    AgentStatesCompact {
+        tick: Tick,
+        tier: u8,
+        states: Vec<CompactAgentPose>,
+        removed: Vec<EntityId>,
+        full: bool,
+    },
+    /// 远距简包流(REQ-014 §5;判别值 17):L2。origin_chunk = 基准 chunk
+    /// (cx,cz) 2×i32 LE,包内显式;rel_pos 相对该 chunk 原点。
+    AgentStatesLite {
+        tick: Tick,
+        origin_chunk: [u8; 8],
+        states: Vec<LiteAgentPose>,
+        removed: Vec<EntityId>,
+        full: bool,
+    },
 }
 
 /// 调试遥测累计计数(REQ-011 §3.5.2;W03):sim-api 内定义的协议结构,
@@ -238,6 +262,30 @@ pub struct FlowEventWire {
     pub detached_cells: u64,
     /// 世界坐标(Impact = 被撞格格心;Compound = 刚体平移)。
     pub position: Vec3,
+}
+
+/// 紧凑姿态(REQ-014 §5):root_pos 世界系 f32 原值;root_rot 最小三元
+/// 15bit 四元数 6B;root_linvel 3×i16 LE(0.001 m/s);child_links 每连杆
+/// [u8;12] = 根相对位置 3×u16(0.5mm 步长、偏置 ±16.384m)+ 同式 6B 四元数。
+/// 子连杆线/角速度不传(客户端渲染零消费)。N 连杆身体 child_links 长 N−1。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactAgentPose {
+    pub entity: EntityId,
+    pub root_pos: [f32; 3],
+    pub root_rot: [u8; 6],
+    pub root_linvel: [u8; 6],
+    pub child_links: Vec<[u8; 12]>,
+}
+
+/// 简包姿态(REQ-014 §5):rel_pos 3×u16 LE(1/32m 步长、偏置 ±1024m,
+/// 相对 origin_chunk 原点);yaw u16 全圆;motion_flags 低 7 位水平速率
+/// (0.05 m/s 步长,0..6.35)、最高位 frozen/airborne。12B/狗。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiteAgentPose {
+    pub entity: EntityId,
+    pub rel_pos: [u8; 6],
+    pub yaw: [u8; 2],
+    pub motion_flags: u8,
 }
 
 /// 单帧字节上限(REQ-003 §4.1;超限断连)。
@@ -358,6 +406,37 @@ mod tests {
                 policy_infer_count: 15,
                 policy_total_us: 12_345,
                 policy_max_us: 2_500,
+            },
+            S2C::AgentMeta {
+                entries: vec![(
+                    EntityId::from_parts(0, 300),
+                    types::BodyHash([1, 2, 3, 4, 5, 6, 7, 8]),
+                )],
+            },
+            S2C::AgentStatesCompact {
+                tick: Tick(300),
+                tier: 1,
+                states: vec![CompactAgentPose {
+                    entity: EntityId::from_parts(0, 300),
+                    root_pos: [8.0, -60.0, 8.0],
+                    root_rot: crate::quant::pack_quat(Quat::IDENTITY),
+                    root_linvel: crate::quant::pack_linvel(Vec3::ZERO),
+                    child_links: vec![crate::quant::pack_child_link(Vec3::ZERO, Quat::IDENTITY)],
+                }],
+                removed: vec![EntityId::from_parts(0, 9)],
+                full: false,
+            },
+            S2C::AgentStatesLite {
+                tick: Tick(300),
+                origin_chunk: crate::quant::pack_origin_chunk(-3, 7),
+                states: vec![LiteAgentPose {
+                    entity: EntityId::from_parts(0, 300),
+                    rel_pos: crate::quant::pack_lite_pos(Vec3::new(1.5, -2.25, 1023.96875)),
+                    yaw: crate::quant::pack_yaw(std::f32::consts::PI),
+                    motion_flags: 0x94,
+                }],
+                removed: Vec::new(),
+                full: true,
             },
         ]
     }
@@ -773,5 +852,180 @@ mod tests {
             Some(off),
             "SetAgentStream(false) 帧往返相等"
         );
+    }
+
+    /// REQ-014 M04a T1:AgentMeta(15)/AgentStatesCompact(16)/AgentStatesLite(17)
+    /// 往返相等、声明序判别值与整帧 golden 字节钉死。
+    #[test]
+    fn m04a_t1_new_variants_roundtrip_and_discriminants() {
+        // (a) AgentMeta(判别值 15,整帧 17B)
+        let meta = S2C::AgentMeta {
+            entries: vec![(
+                EntityId::from_parts(0, 300),
+                types::BodyHash([1, 2, 3, 4, 5, 6, 7, 8]),
+            )],
+        };
+        let meta_frame = encode_frame(&meta);
+        assert_eq!(meta_frame[4], 15, "AgentMeta 判别值 = 15");
+        assert_eq!(
+            meta_frame,
+            vec![
+                0x0D, 0, 0, 0, 0x0F, 0x01, 0xFB, 0x2C, 0x01, 1, 2, 3, 4, 5, 6, 7, 8
+            ],
+            "AgentMeta 17B 整帧 golden"
+        );
+        assert_eq!(decode_frame(&meta_frame), Some(meta), "AgentMeta 往返");
+
+        // (b) AgentStatesCompact quad 形(判别值 16,整帧 185B)
+        let quad_compact = S2C::AgentStatesCompact {
+            tick: Tick(300),
+            tier: 1,
+            states: vec![CompactAgentPose {
+                entity: EntityId::from_parts(0, 300),
+                root_pos: [8.0, -60.0, 8.0],
+                root_rot: crate::quant::pack_quat(Quat::IDENTITY),
+                root_linvel: crate::quant::pack_linvel(Vec3::ZERO),
+                child_links: vec![crate::quant::pack_child_link(Vec3::ZERO, Quat::IDENTITY); 12],
+            }],
+            removed: vec![EntityId::from_parts(0, 9)],
+            full: false,
+        };
+        let compact_frame = encode_frame(&quad_compact);
+        assert_eq!(compact_frame[4], 16, "AgentStatesCompact 判别值 = 16");
+        let mut expected_compact = Vec::with_capacity(185);
+        expected_compact.extend_from_slice(&[0xB5, 0, 0, 0]);
+        expected_compact.push(0x10);
+        expected_compact.extend_from_slice(&[0xFB, 0x2C, 0x01]);
+        expected_compact.push(0x01);
+        expected_compact.push(0x01);
+        expected_compact.extend_from_slice(&[0xFB, 0x2C, 0x01]);
+        expected_compact.extend_from_slice(&[0, 0, 0, 0x41, 0, 0, 0x70, 0xC2, 0, 0, 0, 0x41]);
+        expected_compact.extend_from_slice(&[0x03, 0, 0x01, 0x80, 0, 0x40]);
+        expected_compact.extend_from_slice(&[0; 6]);
+        expected_compact.push(0x0C);
+        for _ in 0..12 {
+            expected_compact
+                .extend_from_slice(&[0, 0x80, 0, 0x80, 0, 0x80, 0x03, 0, 0x01, 0x80, 0, 0x40]);
+        }
+        expected_compact.extend_from_slice(&[0x01, 0x09]);
+        expected_compact.push(0x00);
+        assert_eq!(expected_compact.len(), 185, "quad compact 期望整帧长 185B");
+        assert_eq!(
+            compact_frame, expected_compact,
+            "AgentStatesCompact quad 形 185B 整帧 golden"
+        );
+        assert_eq!(
+            decode_frame(&compact_frame),
+            Some(quad_compact),
+            "AgentStatesCompact quad 形往返"
+        );
+
+        // (c) AgentStatesCompact capsule 形(child_links 空,tier=0,removed 空,整帧 40B)
+        let capsule_compact = S2C::AgentStatesCompact {
+            tick: Tick(300),
+            tier: 0,
+            states: vec![CompactAgentPose {
+                entity: EntityId::from_parts(0, 300),
+                root_pos: [8.0, -60.0, 8.0],
+                root_rot: crate::quant::pack_quat(Quat::IDENTITY),
+                root_linvel: crate::quant::pack_linvel(Vec3::ZERO),
+                child_links: Vec::new(),
+            }],
+            removed: Vec::new(),
+            full: false,
+        };
+        let capsule_frame = encode_frame(&capsule_compact);
+        assert_eq!(capsule_frame[4], 16, "capsule compact 判别值 = 16");
+        assert_eq!(capsule_frame.len(), 40, "capsule compact 整帧长 = 40B");
+        assert_eq!(
+            decode_frame(&capsule_frame),
+            Some(capsule_compact),
+            "AgentStatesCompact capsule 形往返"
+        );
+
+        // (d) AgentStatesLite(判别值 17,整帧 31B)
+        let lite = S2C::AgentStatesLite {
+            tick: Tick(300),
+            origin_chunk: crate::quant::pack_origin_chunk(-3, 7),
+            states: vec![LiteAgentPose {
+                entity: EntityId::from_parts(0, 300),
+                rel_pos: crate::quant::pack_lite_pos(Vec3::new(1.5, -2.25, 1023.96875)),
+                yaw: crate::quant::pack_yaw(std::f32::consts::PI),
+                motion_flags: 0x94,
+            }],
+            removed: Vec::new(),
+            full: true,
+        };
+        let lite_frame = encode_frame(&lite);
+        assert_eq!(lite_frame[4], 17, "AgentStatesLite 判别值 = 17");
+        let expected_lite = vec![
+            0x1B, 0, 0, 0, 0x11, 0xFB, 0x2C, 0x01, 0xFD, 0xFF, 0xFF, 0xFF, 0x07, 0, 0, 0, 0x01,
+            0xFB, 0x2C, 0x01, 0x30, 0x80, 0xB8, 0x7F, 0xFF, 0xFF, 0x00, 0x80, 0x94, 0x00, 0x01,
+        ];
+        assert_eq!(expected_lite.len(), 31, "lite 期望整帧长 31B");
+        assert_eq!(lite_frame, expected_lite, "AgentStatesLite 31B 整帧 golden");
+        assert_eq!(
+            decode_frame(&lite_frame),
+            Some(lite),
+            "AgentStatesLite 往返"
+        );
+
+        // (e) 空表变体往返
+        let empty_meta = S2C::AgentMeta {
+            entries: Vec::new(),
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&empty_meta)),
+            Some(empty_meta),
+            "空 AgentMeta 往返"
+        );
+        let empty_compact = S2C::AgentStatesCompact {
+            tick: Tick(0),
+            tier: 1,
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: true,
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&empty_compact)),
+            Some(empty_compact),
+            "空 AgentStatesCompact 往返"
+        );
+        let empty_lite = S2C::AgentStatesLite {
+            tick: Tick(0),
+            origin_chunk: [0; 8],
+            states: Vec::new(),
+            removed: Vec::new(),
+            full: true,
+        };
+        assert_eq!(
+            decode_frame(&encode_frame(&empty_lite)),
+            Some(empty_lite),
+            "空 AgentStatesLite 往返"
+        );
+    }
+
+    /// REQ-014 M04a T2:追加三个 S2C 变体后,旧帧逐位不变。
+    #[test]
+    fn m04a_t2_old_goldens_unchanged() {
+        assert_eq!(encode_c2s_frame(&C2S::Ping), vec![1, 0, 0, 0, 4]);
+        assert_eq!(encode_frame(&S2C::Pong), vec![1, 0, 0, 0, 5]);
+        assert_eq!(
+            encode_c2s_frame(&C2S::Hello { client_id: 1 }),
+            vec![2, 0, 0, 0, 0, 1]
+        );
+        assert_eq!(
+            encode_c2s_frame(&C2S::SetAgentStream { lod: true }),
+            vec![2, 0, 0, 0, 13, 1]
+        );
+        let perf = S2C::PerfStats {
+            tick: Tick(120),
+            sim_p95_ms: 3.25,
+            sim_samples: 60,
+            policy_infer_count: 15,
+            policy_total_us: 12_345,
+            policy_max_us: 2_500,
+        };
+        assert_eq!(encode_frame(&perf)[4], 14, "PerfStats 判别值仍 = 14");
     }
 }

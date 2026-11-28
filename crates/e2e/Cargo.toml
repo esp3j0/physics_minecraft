@@ -25,6 +25,8 @@ tokio = { version = "1", features = ["macros", "rt", "time", "sync", "test-util"
 # (client 模块零 macroquad 依赖,README 决策 1;viewer 为此增补 lib target,
 # 架构师决议授权)。
 viewer = { path = "../viewer" }
+# REQ-014 M04a(任务书授权内部依赖边):T9 静姿 FK↔内核一致性锚。
+client-core = { path = "../client-core" }
 tempfile = "3"
 bincode = { version = "2", features = ["serde"] }
 # S02 压力基线(总架构师放行评论授权增补):report.json 序列化。

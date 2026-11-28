@@ -13,6 +13,7 @@
 
 pub mod log;
 pub mod proto;
+pub mod quant;
 pub mod replay;
 pub mod session;
 pub mod snapshot;

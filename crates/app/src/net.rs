@@ -417,9 +417,12 @@ fn route_priority(msg: &S2C) -> OutboundPriority {
         | S2C::ChunkUnload { .. }
         | S2C::EntityShapes { .. }
         | S2C::InputAck { .. }
-        | S2C::Correction { .. } => OutboundPriority::P1,
+        | S2C::Correction { .. }
+        | S2C::AgentMeta { .. } => OutboundPriority::P1,
         S2C::EntityStates { .. }
         | S2C::AgentStates { .. }
+        | S2C::AgentStatesCompact { .. }
+        | S2C::AgentStatesLite { .. }
         | S2C::DebugStats { .. }
         | S2C::PerfStats { .. } => OutboundPriority::P2,
         S2C::ChunkData { .. } => OutboundPriority::P3,
