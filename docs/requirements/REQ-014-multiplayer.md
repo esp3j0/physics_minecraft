@@ -2,7 +2,8 @@
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
   架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
-  M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`;M03 已验收 `f117835`)
+  M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`;M03 已验收 `f117835`;
+  M04a 已验收 `8b5c112`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -134,6 +135,19 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   Cargo.lock,零新依赖;M05 实测突发后决定是否立项 M05b)。
 - 帧开销(估算):Compact 14B、Lite 21B、Meta 6B(含 4B 长度前缀;vec 长 >250
   时 +2B/字段,公式按最坏另计)。
+
+**M04a 落地注记(2026-11-27 验收,`8b5c112`)**:schema/量化/FK 全部落地为纯函数
+(sim-api `quant.rs` 8 对 pack/unpack + client-core `bodies.rs::static_link_transforms`),
+零发送路径改动(ACM8 由既有 golden + e2e 回归锚住)。单狗样本整帧实测:
+Meta 17B / Compact-quad 185B / Compact-capsule 40B / Lite 31B(tick=300、
+entity seq=300 口径;多狗摊薄与含头带宽 M05 实测)。四元数最小三元 15bit:
+10000 LCG 样本扫描断言 ≤2.5e-4 rad 通过,架构师 f64 独立参考扫描最大 ≈1.2e-4 rad;
+取整语义钉死 f32::round(半值远离零)、先钳制后转型;linvel 对称钳 ±32767
+(不出 −32768)。静姿 FK 与内核零角生成+电机 default_angle 语义对齐,
+T9 零重力 600 拍 PD 落定后逐连杆比对 ≤2e-3 m / 2e-3 rad 通过。
+变异 B8(旋转复合顺序交换)存活:现有测试链均单轴/零角可交换,
+多轴非零链缺口如实记录(B8b 位置复合丢父旋转已补杀 T7+T8);
+unpack 末归一化为防御性步骤,去之存活(无独立锚),如实记录。
 
 **带宽场景表(估算,32 只可见 13 连杆全移动狗/客户端;M05 实测校准)**:
 
@@ -280,6 +294,13 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
 - **M04a schema 与量化数学**:C2S=13、S2C=15/16/17 追加 + [u8;N] 编解码往返
   golden(判别值钉死)+ 四元数/位置量化误差界实测钉死 + 静姿 FK 纯单测。
   验收:ACM8 + 误差界测试。
+  **已验收**(2026-11-27,`8b5c112`;C2S=13 已于 M02a-1 落地不重复追加;
+  sim-api 75 / client-core 266 / e2e 全绿,T1–T9 全过;架构师全量门禁
+  workspace 测试/clippy/fmt 绿(首跑遇 D 盘满,清 incremental 缓存后
+  CARGO_INCREMENTAL=0 复跑绿);变异 B1–B7、B9–B12 共 11 杀(B10 兼杀既有
+  t3_c01b3),B8 旋转顺序交换存活(测试链单轴/零角可交换,缺口如实记录,
+  B8b 丢父旋转补杀),S1 去 unpack 末归一化预期存活;e2e→client-core
+  内部 dev-dep 边任务书授权,Cargo.lock 无新第三方包)。
 - **M04b LOD 状态机与客户端表现**:三重防抖/K_L1/错峰/分档自愈/换档补闪;
   L0/L1 迁 Compact;客户端 150ms 混合 + L2 静姿摆腿;能力门控。
   验收:ACM3/7/8 + M03 回归。
