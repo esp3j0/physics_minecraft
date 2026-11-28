@@ -30,6 +30,8 @@ use bevy::render::view::screenshot::{Screenshot, ScreenshotCaptured, save_to_dis
 use bevy::tasks::{AsyncComputeTaskPool, Task, futures::check_ready};
 use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow, WindowResolution};
 use client_core::client::{ViewEvent, localize_disconnect_reason, s2c_to_event};
+use client_core::entities::{AgentView, SolidView};
+use client_core::interp::{DEFAULT_BUFFER_TICKS, InterpBuffer, RenderClock};
 use client_core::mesh::{
     ChunkSnapshot, OutlineMesh, SubchunkMesh, mesh_subchunk_snapshot, outline_subchunk_snapshot,
     snapshot,
@@ -507,6 +509,26 @@ struct PossessRes {
     was_possessed: bool,
 }
 
+/// 客户端快照插值状态资源(REQ-014 M02b §2:单机/网络两模式均插入,`enabled = cli.connect.is_some()`)。
+#[derive(Resource)]
+pub(crate) struct InterpRes {
+    pub(crate) enabled: bool,
+    pub(crate) agents: InterpBuffer<AgentView>,
+    pub(crate) solids: InterpBuffer<SolidView>,
+    pub(crate) clock: RenderClock,
+}
+
+impl InterpRes {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            agents: InterpBuffer::new(),
+            solids: InterpBuffer::new(),
+            clock: RenderClock::new(DEFAULT_BUFFER_TICKS),
+        }
+    }
+}
+
 /// HUD 根容器节点标记组件(REQ-013 C02-2 D3:脚本模式按 `shot.hud` 切换显隐)。
 #[derive(Component)]
 struct HudRoot;
@@ -782,6 +804,7 @@ fn main() {
     .insert_resource(ToolRes::default())
     .insert_resource(PossessRes::default())
     .insert_resource(EntityMirrorRes::default())
+    .insert_resource(InterpRes::new(cli.connect.is_some()))
     .insert_resource(BodiesDirRes(bodies_dir))
     .insert_resource(ObserverTracker::default())
     .insert_resource(ScreenshotState {
@@ -1419,6 +1442,7 @@ struct DrainOptionalRes<'w> {
     server_perf: Option<ResMut<'w, ServerPerfRes>>,
     possess: Option<ResMut<'w, PossessRes>>,
     entity_mirror: Option<ResMut<'w, EntityMirrorRes>>,
+    interp: Option<ResMut<'w, InterpRes>>,
     disconnect_hud: Option<ResMut<'w, DisconnectHud>>,
     script_mode: Option<ResMut<'w, ScriptModeRes>>,
 }
@@ -1448,6 +1472,60 @@ fn drain_transport_system(
     for msg in msgs {
         if let Some(em) = opt.entity_mirror.as_mut() {
             em.0.apply(&msg);
+        }
+        if let Some(interp) = opt.interp.as_mut()
+            && interp.enabled
+        {
+            match &msg {
+                S2C::AgentStates {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                } => {
+                    if *full {
+                        let keep: BTreeSet<EntityId> = states.iter().map(|(id, ..)| *id).collect();
+                        interp.agents.retain(&keep);
+                    }
+                    for (id, hash, poses) in states {
+                        interp.agents.push(
+                            tick.0,
+                            *id,
+                            AgentView {
+                                hash: *hash,
+                                poses: poses.clone(),
+                            },
+                        );
+                    }
+                    for id in removed {
+                        interp.agents.remove(*id);
+                    }
+                    interp.clock.on_snapshot(tick.0);
+                }
+                S2C::EntityStates {
+                    tick,
+                    states,
+                    removed,
+                    full,
+                } => {
+                    if *full {
+                        let keep: BTreeSet<EntityId> = states.iter().map(|(id, _)| *id).collect();
+                        interp.solids.retain(&keep);
+                    }
+                    if let Some(em) = opt.entity_mirror.as_ref() {
+                        for (id, _) in states {
+                            if let Some(view) = em.0.solids.get(id) {
+                                interp.solids.push(tick.0, *id, view.clone());
+                            }
+                        }
+                    }
+                    for id in removed {
+                        interp.solids.remove(*id);
+                    }
+                    interp.clock.on_snapshot(tick.0);
+                }
+                _ => {}
+            }
         }
         if let Some(script) = opt.script_mode.as_mut()
             && let Some(ev) = s2c_to_event(msg.clone())

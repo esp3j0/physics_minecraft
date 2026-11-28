@@ -7,6 +7,7 @@
 pub mod bodies;
 pub mod client;
 pub mod entities;
+pub mod interp;
 pub mod mesh;
 pub mod mirror;
 pub mod net_transport;

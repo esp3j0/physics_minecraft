@@ -15,9 +15,10 @@ use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::prelude::*;
 use client_core::bodies::{BodyShapeTable, LinkShape};
 use client_core::entities::{ENTITY_CUBE_SIZE, EntityMirror};
+use client_core::interp::{TICKS_PER_SEC, resolve_view};
 use types::{BodyHash, CompoundShape, EntityId};
 
-use crate::{PossessRes, conv};
+use crate::{InterpRes, PossessRes, conv};
 
 /// 普通主体色(品红;与 `viewer/src/render.rs:374` `AGENT_COLOR` 同源)。
 pub(crate) const AGENT_COLOR: Color = Color::srgb(228.0 / 255.0, 92.0 / 255.0, 240.0 / 255.0);
@@ -254,22 +255,41 @@ pub(crate) fn solid_mesh(compound: Option<&CompoundShape>) -> Mesh {
     merged
 }
 
-/// 每帧对账系统(C03-1 D3/D4/D5;挂 `Update` 且在 `drain_transport_system` 之后,两模式均挂)。
+/// 每帧对账系统(C03-1 D3/D4/D5 + REQ-014 M02b;挂 `Update` 且在 `drain_transport_system` 之后,两模式均挂)。
 ///
 /// 对比 [`EntityMirrorRes`] 与 [`EntityRenderRes`]:
 /// - 移除或结构变更的实体:`despawn` + 逐句柄 `meshes.remove`(PM35 靶点);
 /// - 新增实体:按层级 spawn 并分配 1:1 `Handle<Mesh>`;
-/// - 既有实体:直接写入最新 `Transform`(零插值)并在附身切换时更新材质句柄。
+/// - 位姿来源:网络模式非附身实体经 [`InterpRes`] 采样插值/钳制外推,单机与附身实体旁路直写最新态;
+/// - 附身切换时同步更新材质句柄。
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn sync_entities_system(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
+    time: Res<Time>,
     entity_mirror: Res<EntityMirrorRes>,
     mut entity_render: ResMut<EntityRenderRes>,
     possess_res: Option<Res<PossessRes>>,
+    mut interp_res: Option<ResMut<InterpRes>>,
     mut tf_q: Query<&mut Transform>,
     mut mat_q: Query<&mut MeshMaterial3d<StandardMaterial>>,
 ) {
+    if let Some(interp) = interp_res.as_mut()
+        && interp.enabled
+    {
+        interp
+            .clock
+            .advance(time.delta_secs_f64() * f64::from(TICKS_PER_SEC));
+    }
+    let (interp_enabled, render_tick, agents_buf, solids_buf) = match interp_res.as_deref() {
+        Some(interp) => (
+            interp.enabled,
+            interp.clock.now(),
+            Some(&interp.agents),
+            Some(&interp.solids),
+        ),
+        None => (false, 0.0, None, None),
+    };
     let possessed_id = possess_res.as_ref().and_then(|p| p.possessed);
     let mirror = &entity_mirror.0;
 
@@ -298,8 +318,20 @@ pub(crate) fn sync_entities_system(
     let agent_mat = entity_render.agent_material.clone();
     for (&id, view) in &mirror.agents {
         let is_possessed = possessed_id == Some(id);
+        let resolved = resolve_view(
+            agents_buf,
+            render_tick,
+            id,
+            view,
+            !interp_enabled || is_possessed,
+        );
+        let poses = if resolved.poses.len() == view.poses.len() {
+            &resolved.poses
+        } else {
+            &view.poses
+        };
         if let Some(rec) = entity_render.agents.get_mut(&id) {
-            for (&link_entity, pose) in rec.links.iter().zip(&view.poses) {
+            for (&link_entity, pose) in rec.links.iter().zip(poses) {
                 if let Ok(mut tf) = tf_q.get_mut(link_entity) {
                     tf.translation = conv::to_bevy_vec3(pose.translation);
                     tf.rotation = conv::to_bevy_quat(pose.rotation);
@@ -339,7 +371,7 @@ pub(crate) fn sync_entities_system(
         let mut shape_entities = Vec::new();
         let mut mesh_handles = Vec::new();
 
-        for (link_idx, pose) in view.poses.iter().enumerate() {
+        for (link_idx, pose) in poses.iter().enumerate() {
             let link_tf = Transform::from_translation(conv::to_bevy_vec3(pose.translation))
                 .with_rotation(conv::to_bevy_quat(pose.rotation));
             let link_entity = commands
@@ -422,8 +454,15 @@ pub(crate) fn sync_entities_system(
 
     // 4. 更新既有 solid 位姿或 spawn 新 solid。
     for (&id, view) in &mirror.solids {
-        let tf_pos = conv::to_bevy_vec3(view.state.translation);
-        let tf_rot = conv::to_bevy_quat(view.state.rotation);
+        let resolved = resolve_view(
+            solids_buf,
+            render_tick,
+            id,
+            view,
+            !interp_enabled || possessed_id == Some(id),
+        );
+        let tf_pos = conv::to_bevy_vec3(resolved.state.translation);
+        let tf_rot = conv::to_bevy_quat(resolved.state.rotation);
         if let Some(rec) = entity_render.solids.get(&id) {
             if let Ok(mut tf) = tf_q.get_mut(rec.entity) {
                 tf.translation = tf_pos;
