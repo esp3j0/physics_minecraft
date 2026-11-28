@@ -2,7 +2,7 @@
 
 - 状态:**定稿**(2026-11-26 用户拍板;[#28](https://github.com/esp3j0/physics_minecraft/issues/28);
   架构师合稿 gemini 独立分析;M01 已验收 `11229ab`;M02a-1 已验收 `4fe3a7b`;
-  M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`)
+  M02a-2 已验收 `8e58db9`+`1722640`;M02b 已验收 `ecb9654`;M03 已验收 `f117835`)
 - 上游:REQ-013 §2/§3(多人预设计承诺:权威表、Transport trait、枚举只追加、
   Sequenced/InputAck/Correction 预留、ObserveCadence、兴趣裁剪、≤64KB/s 初始目标)
 - 独立分析:gemini + 架构师双独立稿合稿;逐条裁决与代码核实见 §12 索引
@@ -168,7 +168,7 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   **已落地**(M02b):client 仅 `--connect` 网络模式启用 InterpRes;
   bypass = 单机 || 附身实体,`resolve_view` 直写最新态;结构对账/possess/
   脚本 WorldState 仍按服务器最新态,仅渲染 Transform 换源。
-  ACM7「无 6/10Hz 抽搐」目视/实测留 M03 双客户端与 M05。
+  ACM7「无 6/10Hz 抽搐」:M03 已钉双客户端语义 e2e(T1/T3);目视/实测留 M05。
 - 换档混合 ≤150ms(§4);L2 静姿+程序化摆腿(§4);附身青绿高亮现网保留。
 - 断连 HUD + 重连入口(M01);重连 = 新连接新身体,全量自愈(ACM3)。
 
@@ -185,6 +185,12 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   M03 用例钉死(ACM4)。
 - F4 **handle_left panic**(driver.rs:1617,另 :1627):断线移除失败拖垮整服
   → 待清理队列下拍重试,绝不 panic;M03(ACM2)。
+  **已落地**(M03 `f117835`):`pending_disconnect_bodies` 每连接至多一条,
+  session.tick 后、net up 消费前重试;三分支:Ok 销账计数 /
+  owner 无且非在途 → gone 销账 / 其余挂队列。观察者移除改 `if let Ok`。
+  真实触发面 = Left 消费时 inbox 满(Route Err),T4 用 inbox_capacity=1 +
+  同批 [SetBlock, Goodbye] 确定性复现;迁移窗口在途分支无 e2e 用例
+  (A9 去 in_transit 检查存活,如实记录;迁移窗口断线用例留后续)。
 - F5 **TCP_NODELAY 缺失** → 两端开启;M01。
 - F6 **agent_root_state O(A·L) 克隆整片**(scheduler.rs:1447;drive_policies
   逐只调用)→ 单主体 O(log A) 查询(ownership 直定位分片);M02a。
@@ -241,7 +247,7 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
 - **M01 网络传输与握手加固**:NetTransport(TCP)+ --connect + 断连 HUD;
   F1/F2/F5;F3 热块优先读。验收:ACM4 结构 + 握手/断连单测 + 旧流不变。
   **已验收**(2026-11-27,`11229ab`;四包 552 绿 + e2e 5 绿;变异 MA–ME 击杀、
-  MF 拆批存活 = 既有套件无 TCP 批边界锚,覆盖缺口留 M02a/M03 补;
+  MF 拆批存活 = 既有套件无 TCP 批边界锚,缺口已由 M03 T7/T8 闭环;
   T5 Welcome 锚经 R1 裁决纠正为两阶段恰 2 条,架构师原锚错误认账)。
 - **M02a 服务端专流与队列隔离**:ClientSession/Arc<TickSnapshot>;Outbound
   P0–P3 + P3 限速;L0 60Hz 专流(过渡用现网 AgentStates 单实体);F6/F7/F8;
@@ -263,6 +269,14 @@ lite 的 motion_flags(低 7 位水平速率量化 0..6.35m/s、最高位 frozen/
   单机旁路逐位等价为硬锚;ACM7 目视/实测部分留 M03/M05)。
 - **M03 双客户端权威 e2e**:编辑互见/附身互斥/迟到者活跃块编辑/带负荷断线
   不 panic(F4)。验收:ACM1/2/4。
+  **已验收**(2026-11-27,`f117835`;app 229 / client-core 264 / e2e 全绿,
+  m03 七测:T1 编辑互见 ≤2 tick+RTT、T2 迟到者热块、T3 硬断线带负荷、
+  T4 inbox 满重试、T5 重试/gone、T7 单 write 批锚、T8 cut_frame 排空;
+  架构师变异 A1–A8 8/8 击杀(A4 兼杀既有 acn3),A9 去 in_transit 检查
+  存活 = 无迁移窗口断线用例,缺口如实记录;M01 MF 拆批缺口就此闭环
+  (T7 WriteRecorder 钉死单次 write_all + T8 多帧排空);
+  实施方全量门禁遇 D 盘满按纪律停下回报,架构师清 16G incremental 缓存
+  后复跑绿并代为提交)。
 - **M04a schema 与量化数学**:C2S=13、S2C=15/16/17 追加 + [u8;N] 编解码往返
   golden(判别值钉死)+ 四元数/位置量化误差界实测钉死 + 静姿 FK 纯单测。
   验收:ACM8 + 误差界测试。
